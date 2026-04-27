@@ -1,13 +1,12 @@
-use super::helpers::run_agent_streaming;
+use super::helpers::{run_agent_streaming, update_status};
 use crate::task_runner::{
-    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStore,
+    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStatus, TaskStore,
 };
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::prompts;
 use harness_core::types::ExecutionPhase;
 use std::collections::HashMap;
 use std::path::Path;
-use tokio::time::Duration;
 
 /// Run a plan step for a complex prompt-only task when the planning gate has
 /// forced `TaskPhase::Plan`.
@@ -91,6 +90,7 @@ pub(crate) async fn run_triage_plan_pipeline(
         state.phase = TaskPhase::Triage;
     })
     .await?;
+    update_status(store, task_id, TaskStatus::Triaging, 0).await?;
 
     let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
     let triage_req = AgentRequest {
@@ -158,6 +158,7 @@ pub(crate) async fn run_triage_plan_pipeline(
         state.phase = TaskPhase::Plan;
     })
     .await?;
+    update_status(store, task_id, TaskStatus::Planning, 0).await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
     let plan_req = AgentRequest {
@@ -251,100 +252,4 @@ pub(crate) async fn run_replan_for_issue(
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "replan phase complete");
     Ok(plan_text)
-}
-
-/// Fire a single agent turn to rebase a conflicting PR onto `origin/main`.
-///
-/// Returns `true` if the agent reported `REBASE_OK` (i.e. a new commit was
-/// force-pushed), `false` in every other case.  Errors are not propagated —
-/// a rebase failure is not fatal; the review loop will handle the PR.
-pub(crate) async fn run_rebase_turn(
-    agent: &dyn CodeAgent,
-    pr_num: u64,
-    project: &std::path::Path,
-    repo: &str,
-    turn_timeout: Duration,
-    cargo_env: &HashMap<String, String>,
-) -> bool {
-    // Fetch the branch name from GitHub so the prompt has an exact ref.
-    let branch = {
-        let out = tokio::process::Command::new("gh")
-            .current_dir(project)
-            .args([
-                "pr",
-                "view",
-                &pr_num.to_string(),
-                "--json",
-                "headRefName",
-                "--jq",
-                ".headRefName",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await;
-        match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .trim_matches('"')
-                .to_string(),
-            _ => {
-                tracing::warn!(
-                    pr = pr_num,
-                    "run_rebase_turn: could not fetch branch name; skipping"
-                );
-                return false;
-            }
-        }
-    };
-
-    // Reject branch names that contain shell metacharacters.  The branch
-    // name is embedded inside single-quoted shell commands in the agent
-    // prompt; a single-quote in the name would break out of the quoting.
-    if !branch
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '@' | '~' | '+' | ':'))
-    {
-        tracing::warn!(
-            pr = pr_num,
-            branch = %branch,
-            "run_rebase_turn: branch name contains unsafe characters; skipping"
-        );
-        return false;
-    }
-
-    let prompt = harness_core::prompts::rebase_conflicting_pr(pr_num, &branch, repo, project);
-    let req = AgentRequest {
-        prompt,
-        project_root: project.to_path_buf(),
-        env_vars: cargo_env.clone(),
-        execution_phase: Some(harness_core::types::ExecutionPhase::Rebase),
-        ..Default::default()
-    };
-
-    match tokio::time::timeout(turn_timeout, agent.execute(req)).await {
-        Ok(Ok(resp)) => {
-            let last = resp.output.lines().next_back().unwrap_or("").trim();
-            if last.contains("REBASE_OK") {
-                tracing::info!(pr = pr_num, "rebase turn: REBASE_OK");
-                true
-            } else {
-                tracing::warn!(
-                    pr = pr_num,
-                    last_line = last,
-                    "rebase turn: REBASE_FAILED or unexpected output"
-                );
-                false
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(pr = pr_num, error = %e, "rebase turn: agent error");
-            false
-        }
-        Err(_) => {
-            tracing::warn!(pr = pr_num, "rebase turn: timed out");
-            false
-        }
-    }
 }

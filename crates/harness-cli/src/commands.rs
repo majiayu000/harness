@@ -2,6 +2,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod exec;
+mod reconcile;
 mod serve;
 
 #[derive(Parser)]
@@ -114,6 +115,16 @@ pub enum Command {
 
     /// Display the current version
     Version,
+
+    /// Reconcile harness task state against GitHub PR/issue state
+    Reconcile {
+        /// Report transitions without applying them
+        #[arg(long)]
+        dry_run: bool,
+        /// Project directory (defaults to current directory)
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -543,6 +554,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 anyhow::bail!("Version field not found in Cargo.toml");
             }
+        }
+
+        Command::Reconcile { dry_run, project } => {
+            reconcile::run(dry_run, project, &config).await?;
         }
     }
 

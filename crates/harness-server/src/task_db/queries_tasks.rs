@@ -735,7 +735,8 @@ impl TaskDb {
         let sql = if project.is_some() {
             format!(
                 "SELECT {TASK_ROW_COLUMNS} FROM tasks \
-                 WHERE status IN ('implementing', 'review_generating', 'review_waiting', \
+                 WHERE status IN ('triaging', 'planning', 'implementing', \
+                                  'review_generating', 'review_waiting', \
                                   'planner_generating', 'planner_waiting', 'agent_review', \
                                   'waiting', 'reviewing') \
                  AND external_id IS NOT NULL \
@@ -745,7 +746,8 @@ impl TaskDb {
         } else {
             format!(
                 "SELECT {TASK_ROW_COLUMNS} FROM tasks \
-                 WHERE status IN ('implementing', 'review_generating', 'review_waiting', \
+                 WHERE status IN ('triaging', 'planning', 'implementing', \
+                                  'review_generating', 'review_waiting', \
                                   'planner_generating', 'planner_waiting', 'agent_review', \
                                   'waiting', 'reviewing') \
                  AND external_id IS NOT NULL \

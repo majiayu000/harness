@@ -633,6 +633,8 @@ where
         }
 
         // If workspace isolation is configured, create a per-task git worktree.
+        // Save the canonical root before it may be moved into run_project.
+        let canonical_project_root = project_root.clone();
         let run_project = if let Some(ref wmgr) = workspace_mgr {
             let project_config = harness_core::config::project::load_project_config(&project_root)
                 .map_err(|e| {
@@ -715,6 +717,7 @@ where
                 interceptors.clone(),
                 &req,
                 run_project.clone(),
+                canonical_project_root.clone(),
                 server_config.as_ref(),
                 issue_workflow_store.clone(),
                 &mut total_turns_used,
@@ -1406,6 +1409,20 @@ mod tests {
         }
     }
 
+    async fn wait_for_captured_phases(
+        agent: &PhaseCapturingAgent,
+        min_count: usize,
+    ) -> Vec<Option<ExecutionPhase>> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let phases = agent.captured_phases().await;
+            if phases.len() >= min_count || Instant::now() >= deadline {
+                return phases;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[async_trait]
     impl harness_core::agent::CodeAgent for PhaseCapturingAgent {
         fn name(&self) -> &str {
@@ -1487,9 +1504,7 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let phases = agent.captured_phases().await;
+        let phases = wait_for_captured_phases(agent.as_ref(), 1).await;
         assert!(
             !phases.is_empty(),
             "expected at least one agent call, got none"
@@ -1545,9 +1560,7 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let phases = agent.captured_phases().await;
+        let phases = wait_for_captured_phases(agent.as_ref(), 2).await;
         assert!(
             phases.len() >= 2,
             "expected at least 2 agent calls (implementation + review check), got {}",

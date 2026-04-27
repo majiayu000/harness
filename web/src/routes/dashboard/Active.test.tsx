@@ -134,7 +134,7 @@ describe("<Active>", () => {
       data: [
         makeTask("planner-task", "harness", "planner_waiting", "planner"),
         makeTask("review-task", "harness", "review_generating", "review"),
-        makeTask("impl-task", "harness", "implementing", "issue"),
+        makeTask("impl-task", "harness", "triaging", "issue"),
       ],
       isLoading: false,
       isError: false,

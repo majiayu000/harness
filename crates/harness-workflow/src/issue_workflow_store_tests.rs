@@ -259,3 +259,146 @@ async fn record_merge_approved_transitions_workflow_to_done() -> anyhow::Result<
     assert_eq!(updated.state, IssueLifecycleState::Done);
     Ok(())
 }
+
+#[tokio::test]
+async fn update_project_path_patches_project_id_field() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let old_project_id = "/tmp/old-project-path-test";
+    store
+        .record_issue_scheduled(
+            old_project_id,
+            Some("owner/repo"),
+            101,
+            "task-up",
+            &[],
+            false,
+        )
+        .await?;
+
+    let before = store
+        .get_by_issue(old_project_id, Some("owner/repo"), 101)
+        .await?
+        .expect("workflow before update");
+    let before_state = before.state;
+
+    store
+        .update_project_path(&before.id, "/tmp/new-project-path-test")
+        .await?;
+
+    let after = store
+        .get_by_issue("/tmp/new-project-path-test", Some("owner/repo"), 101)
+        .await?
+        .expect("workflow after update");
+    assert_eq!(after.project_id, "/tmp/new-project-path-test");
+    assert_eq!(after.state, before_state);
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_project_path_noop_on_missing_id() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    store
+        .update_project_path("nonexistent-workflow-id", "/tmp/any-path")
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn repair_project_id_rekeys_row() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let corrupt_id = "/data/workspaces/abc-uuid-repair-test";
+    store
+        .record_issue_scheduled(corrupt_id, Some("owner/repo"), 9001, "task-r", &[], false)
+        .await?;
+
+    let workflow = store
+        .get_by_issue(corrupt_id, Some("owner/repo"), 9001)
+        .await?
+        .expect("row should exist");
+    let old_row_id = workflow.id.clone();
+
+    let canonical = "/real/canonical/root";
+    store.repair_project_id(&old_row_id, canonical).await?;
+
+    let old = store
+        .get_by_issue(corrupt_id, Some("owner/repo"), 9001)
+        .await?;
+    assert!(old.is_none(), "old project_id should no longer resolve");
+
+    let new = store
+        .get_by_issue(canonical, Some("owner/repo"), 9001)
+        .await?
+        .expect("new row should exist");
+    assert_eq!(new.project_id, canonical);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mark_workflow_failed_with_reason_sets_state() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/project-mark-failed-test";
+    store
+        .record_issue_scheduled(project_id, Some("owner/repo"), 9002, "task-f", &[], false)
+        .await?;
+    let workflow = store
+        .get_by_issue(project_id, Some("owner/repo"), 9002)
+        .await?
+        .expect("row should exist");
+
+    store
+        .mark_workflow_failed_with_reason(&workflow.id, "project root not found")
+        .await?;
+
+    let updated = store
+        .get_by_issue(project_id, Some("owner/repo"), 9002)
+        .await?
+        .expect("row should still exist");
+    assert_eq!(updated.state, IssueLifecycleState::Failed);
+    assert_eq!(
+        updated
+            .last_event
+            .as_ref()
+            .and_then(|event| event.detail.as_deref()),
+        Some("project root not found")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_with_worktree_project_ids_filters_correctly() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let corrupt = "/data/workspaces/xyz-uuid-list-test";
+    let canonical = "/tmp/canonical-list-test";
+
+    store
+        .record_issue_scheduled(corrupt, Some("owner/repo"), 9003, "task-l1", &[], false)
+        .await?;
+    store
+        .record_issue_scheduled(canonical, Some("owner/repo"), 9004, "task-l2", &[], false)
+        .await?;
+
+    let corrupt_rows = store.list_with_worktree_project_ids().await?;
+    assert!(
+        corrupt_rows
+            .iter()
+            .any(|workflow| workflow.project_id == corrupt),
+        "worktree row should appear"
+    );
+    assert!(
+        !corrupt_rows
+            .iter()
+            .any(|workflow| workflow.project_id == canonical),
+        "canonical row should not appear"
+    );
+    Ok(())
+}
