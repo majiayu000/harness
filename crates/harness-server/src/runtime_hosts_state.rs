@@ -30,12 +30,6 @@ impl RuntimeHostManager {
 
     pub fn restore_state(&self, hosts: Vec<PersistedRuntimeHost>) -> usize {
         self.hosts.clear();
-        self.leases.clear();
-        self.host_leases.clear();
-        self.lease_expirations
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clear();
 
         for host in hosts {
             self.hosts.insert(

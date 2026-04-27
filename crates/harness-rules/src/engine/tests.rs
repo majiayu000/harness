@@ -9,7 +9,7 @@ fn make_engine_with_content(content: &str) -> anyhow::Result<RuleEngine> {
 #[test]
 fn parse_rule_file_extracts_security_rule() -> anyhow::Result<()> {
     // Leading newline required: parser splits on "\n## "
-    let md = "\n## SEC-01: SQL injection\n\n严重 — use params.\n";
+    let md = "\n## SEC-01: SQL injection\n\ncritical — use params.\n";
     let engine = make_engine_with_content(md)?;
     assert_eq!(engine.rules().len(), 1);
     assert_eq!(engine.rules()[0].id, RuleId::from_str("SEC-01"));
@@ -21,7 +21,7 @@ fn parse_rule_file_extracts_security_rule() -> anyhow::Result<()> {
 
 #[test]
 fn parse_rule_file_extracts_multiple_rules() -> anyhow::Result<()> {
-    let md = "\n## SEC-01: First rule\n\n严重\n\n## SEC-02: Second rule\n\nhigh severity\n";
+    let md = "\n## SEC-01: First rule\n\ncritical\n\n## SEC-02: Second rule\n\nhigh severity\n";
     let engine = make_engine_with_content(md)?;
     assert_eq!(engine.rules().len(), 2);
     Ok(())

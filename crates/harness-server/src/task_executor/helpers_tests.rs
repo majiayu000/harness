@@ -611,33 +611,6 @@ fn truncate_long_error_includes_summary() {
     assert!(result.contains("(output truncated, 200 chars total)"));
 }
 
-#[test]
-fn parse_porcelain_z_paths_uses_rename_destination() {
-    let raw = b"R  old.txt\0new.txt\0";
-    let paths = parse_porcelain_z_paths(raw);
-    assert_eq!(paths, vec![std::path::PathBuf::from("new.txt")]);
-}
-
-#[test]
-fn parse_porcelain_z_paths_ignores_deletions() {
-    let raw = b"D  gone.txt\0";
-    let paths = parse_porcelain_z_paths(raw);
-    assert!(paths.is_empty());
-}
-
-#[test]
-fn parse_porcelain_z_paths_keeps_modified_and_untracked() {
-    let raw = b" M src/lib.rs\0?? new_file.rs\0";
-    let paths = parse_porcelain_z_paths(raw);
-    assert_eq!(
-        paths,
-        vec![
-            std::path::PathBuf::from("src/lib.rs"),
-            std::path::PathBuf::from("new_file.rs")
-        ]
-    );
-}
-
 // ── process_stream_item: ApprovalRequest ─────────────────────────────────────
 
 #[tokio::test]

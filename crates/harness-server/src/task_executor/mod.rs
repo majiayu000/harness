@@ -729,64 +729,15 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    // Conflict resolution gate: intercept CONFLICTING PRs before the review loop.
-    // Only runs on the resume/recovery path — fresh PRs cannot be conflicting yet.
-    let mut rebase_pushed = false;
-    let mut conflict_was_detected = false;
+    // Conflict resolution gate: host-side GitHub/git inspection is disabled by
+    // project policy. On resume paths, ask the agent/reviewer loop to inspect
+    // and resolve any conflicts instead of probing from the server process.
     if was_resumed_pr {
         use conflict_resolver::{assess_pr_conflict, PrConflictSize};
-        let conflict_size = assess_pr_conflict(pr_num, &project).await;
-        match conflict_size {
-            PrConflictSize::Small {
-                file_count,
-                region_count,
-            } => {
-                tracing::info!(
-                    pr = pr_num,
-                    file_count,
-                    region_count,
-                    "conflict: small — attempting auto-rebase"
-                );
-                conflict_was_detected = true;
-                rebase_pushed = triage_pipeline::run_rebase_turn(
-                    agent,
-                    pr_num,
-                    &project,
-                    &repo_slug,
-                    turn_timeout,
-                    &cargo_env,
-                )
-                .await;
-            }
-            PrConflictSize::Large {
-                file_count,
-                region_count,
-            } => {
-                tracing::warn!(
-                    pr = pr_num,
-                    file_count,
-                    region_count,
-                    "conflict: too large for auto-rebase — deferring to review agent"
-                );
-                conflict_was_detected = true;
-            }
-            PrConflictSize::Clean | PrConflictSize::Unknown(_) => {}
-        }
-
-        // Gate B: a detected conflict that was not resolved by a successful rebase
-        // must not silently proceed to review. Mark Failed so the operator can
-        // re-queue after manual resolution rather than getting a false Done.
-        if conflict_was_detected && !rebase_pushed {
-            mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Failed;
-                s.error = Some(format!(
-                    "pr:{pr_num} is conflicting and rebase was not pushed; manual resolution required"
-                ));
-            })
-            .await?;
-            return Ok(());
-        }
+        let PrConflictSize::Unknown(reason) = assess_pr_conflict(pr_num, &project).await;
+        tracing::debug!(pr = pr_num, reason, "conflict assessment delegated");
     }
+    let rebase_pushed = false;
 
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
