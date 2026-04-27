@@ -357,6 +357,8 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
 
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
+        let mut warned_unresolvable: std::collections::HashSet<(String, Option<String>)> =
+            std::collections::HashSet::new();
         loop {
             let state = match weak_state.upgrade() {
                 Some(s) => s,
@@ -423,9 +425,55 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                     }
                 }
 
+                // Short-circuit if path is healthy (avoids a registry DB query on every tick).
+                let project_path = if tokio::fs::metadata(&workflow.project_id).await.is_ok() {
+                    warned_unresolvable.remove(&project_key);
+                    std::path::PathBuf::from(&workflow.project_id)
+                } else if let Some(registry) = state.core.project_registry.as_deref() {
+                    match registry.resolve_path(&workflow.project_id).await {
+                        Ok(None) | Err(_) => {
+                            if warned_unresolvable.insert(project_key.clone()) {
+                                tracing::warn!(
+                                    project_id = %workflow.project_id,
+                                    "sweeper: project path unresolvable, skipping"
+                                );
+                            }
+                            incomplete_projects.insert(project_key.clone());
+                            let _ = issue_workflows
+                                .release_feedback_claim(
+                                    &workflow.project_id,
+                                    workflow.repo.as_deref(),
+                                    pr_number,
+                                    "sweeper: project path unresolvable",
+                                )
+                                .await;
+                            continue;
+                        }
+                        Ok(Some(resolved))
+                            if resolved.as_path() != std::path::Path::new(&workflow.project_id) =>
+                        {
+                            if let Err(e) = issue_workflows
+                                .update_project_path(&workflow.id, &resolved.to_string_lossy())
+                                .await
+                            {
+                                tracing::error!(
+                                    workflow_id = %workflow.id,
+                                    error = %e,
+                                    "sweeper: failed to update project path"
+                                );
+                            }
+                            warned_unresolvable.remove(&project_key);
+                            resolved
+                        }
+                        Ok(Some(resolved)) => resolved,
+                    }
+                } else {
+                    std::path::PathBuf::from(&workflow.project_id)
+                };
+
                 let req = crate::task_runner::CreateTaskRequest {
                     pr: Some(pr_number),
-                    project: Some(std::path::PathBuf::from(&workflow.project_id)),
+                    project: Some(project_path),
                     repo: workflow.repo.clone(),
                     source: Some("workflow_feedback".to_string()),
                     ..Default::default()
@@ -1262,5 +1310,25 @@ mod tests {
         let mut pending_without_pr = pending_with_pr;
         pending_without_pr.pr_url = None;
         assert!(!task_is_pr_recovery_candidate(&pending_without_pr));
+    }
+
+    #[test]
+    fn warn_dedup_insert_returns_true_first_time_only() {
+        let mut warned: std::collections::HashSet<(String, Option<String>)> =
+            std::collections::HashSet::new();
+        let key = ("/dead/path".to_string(), Some("owner/repo".to_string()));
+        assert!(
+            warned.insert(key.clone()),
+            "first insert should return true (first tick should warn)"
+        );
+        assert!(
+            !warned.insert(key.clone()),
+            "second insert should return false (dedup suppresses warn)"
+        );
+        warned.remove(&key);
+        assert!(
+            warned.insert(key.clone()),
+            "after removal (path recovered), insert returns true again"
+        );
     }
 }

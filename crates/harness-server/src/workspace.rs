@@ -32,8 +32,12 @@ const GIT_LOCAL_ENV_VARS: &[&str] = &[
 
 const OWNER_RECORD_FILE: &str = "harness-workspace-owner.json";
 
+fn git_binary() -> String {
+    std::env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string())
+}
+
 fn git_command() -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = tokio::process::Command::new(git_binary());
     for key in GIT_LOCAL_ENV_VARS {
         cmd.env_remove(key);
     }
@@ -903,7 +907,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn git_command_std() -> std::process::Command {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = std::process::Command::new(git_binary());
         for key in GIT_LOCAL_ENV_VARS {
             cmd.env_remove(key);
         }

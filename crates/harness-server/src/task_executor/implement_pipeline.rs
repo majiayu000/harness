@@ -119,6 +119,9 @@ pub(crate) async fn run_implement_phase(
     git: Option<&harness_core::config::project::GitConfig>,
     repo_slug: &str,
     project: &Path,
+    // Canonical project root for project_id derivation. Separate from `project`
+    // because workspace isolation makes `project` a worktree path, not the canonical root.
+    project_root: &Path,
     plan_output: Option<String>,
     resumed_pr_url: Option<String>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
@@ -542,7 +545,7 @@ pub(crate) async fn run_implement_phase(
                 if let (Some(workflows), Some(issue_number)) =
                     (issue_workflow_store.as_ref(), req.issue)
                 {
-                    let project_id = project.to_string_lossy().into_owned();
+                    let project_id = project_root.to_string_lossy().into_owned();
                     if let Err(e) = workflows
                         .record_plan_issue_detected(
                             &project_id,

@@ -10,6 +10,7 @@ pub mod operator_snapshot;
 pub mod overview;
 pub mod preflight;
 pub mod projects;
+pub mod reconcile;
 pub mod rules;
 pub mod runtime_hosts;
 pub mod runtime_project_cache;

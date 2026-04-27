@@ -63,6 +63,8 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 ### Prerequisites
 
 - Rust 1.88+
+- Bun 1.1+ for release builds that embed the web dashboard. If `web/dist` is
+  already built, release builds can reuse it.
 - At least one agent runtime:
   - [`codex`](https://github.com/openai/codex) CLI
   - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI
@@ -366,10 +368,10 @@ curl http://127.0.0.1:9800/tasks/{task_id}/stream
 
 ```bash
 # List registered projects
-curl http://127.0.0.1:9800/api/projects
+curl http://127.0.0.1:9800/projects
 
 # Register a new project at runtime
-curl -X POST http://127.0.0.1:9800/api/projects \
+curl -X POST http://127.0.0.1:9800/projects \
   -H "Content-Type: application/json" \
   -d '{
     "id": "my-project",
@@ -378,7 +380,7 @@ curl -X POST http://127.0.0.1:9800/api/projects \
   }'
 
 # Remove a project
-curl -X DELETE http://127.0.0.1:9800/api/projects/my-project
+curl -X DELETE http://127.0.0.1:9800/projects/my-project
 ```
 
 ### Dashboard
@@ -452,15 +454,15 @@ Each task runs in an isolated git worktree, so multiple agents can work on the s
 
 ## JSON-RPC API
 
-Harness exposes 38 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
+Harness exposes 42 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
 
 | Category | Methods |
 |---|---|
 | Lifecycle | `initialize`, `initialized` |
 | Threads | `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/delete`, `thread/compact` |
-| Turns | `turn/start`, `turn/steer`, `turn/cancel`, `turn/status` |
+| Turns | `turn/start`, `turn/steer`, `turn/cancel`, `turn/status`, `turn/respond_approval` |
 | GC | `gc/run`, `gc/status`, `gc/drafts`, `gc/adopt`, `gc/reject` |
-| Skills | `skill/create`, `skill/list`, `skill/get`, `skill/delete` |
+| Skills | `skill/create`, `skill/list`, `skill/get`, `skill/delete`, `skill/governance/view`, `skill/governance/history`, `skill/stale` |
 | Rules | `rule/load`, `rule/check` |
 | ExecPlan | `exec_plan/init`, `exec_plan/update`, `exec_plan/status` |
 | Observability | `event/log`, `event/query`, `metrics/collect`, `metrics/query` |

@@ -100,75 +100,17 @@ pub(crate) async fn run_post_tool_use(
     None
 }
 
-/// Detect files added or modified in `project_root` via `git status --porcelain`.
+/// Detect files added or modified in `project_root`.
 ///
-/// Deleted entries are excluded. Returns an empty list when git is unavailable
-/// or `project_root` is not inside a git repository.
+/// Host-side git inspection is disabled by project policy, so this returns an
+/// empty list. Agents remain responsible for reporting modified files in their
+/// final output and validation prompts.
 pub(crate) async fn detect_modified_files(project_root: &Path) -> Vec<std::path::PathBuf> {
-    let output = tokio::process::Command::new("git")
-        .args(["status", "--porcelain", "-z"])
-        .current_dir(project_root)
-        .output()
-        .await;
-    match output {
-        Ok(out) => {
-            if !out.status.success() {
-                tracing::debug!(
-                    project_root = %project_root.display(),
-                    status = ?out.status.code(),
-                    "detect_modified_files: git status failed"
-                );
-                return Vec::new();
-            }
-            parse_porcelain_z_paths(&out.stdout)
-        }
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                project_root = %project_root.display(),
-                "detect_modified_files: git status unavailable"
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn parse_porcelain_z_paths(stdout: &[u8]) -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
-    let mut records = stdout.split(|b| *b == 0).filter(|r| !r.is_empty());
-    while let Some(record) = records.next() {
-        if record.len() < 3 {
-            continue;
-        }
-
-        let x = record[0] as char;
-        let y = record[1] as char;
-        let is_rename_or_copy = matches!(x, 'R' | 'C');
-
-        if x == 'D' || y == 'D' {
-            if is_rename_or_copy {
-                let _ = records.next();
-            }
-            continue;
-        }
-
-        let mut path_bytes = &record[3..];
-        if is_rename_or_copy {
-            if let Some(new_path) = records.next() {
-                path_bytes = new_path;
-            } else {
-                continue;
-            }
-        }
-
-        if path_bytes.is_empty() {
-            continue;
-        }
-        paths.push(std::path::PathBuf::from(
-            String::from_utf8_lossy(path_bytes).into_owned(),
-        ));
-    }
-    paths
+    tracing::debug!(
+        project_root = %project_root.display(),
+        "detect_modified_files: host-side git inspection disabled"
+    );
+    Vec::new()
 }
 
 pub(crate) fn emit_runtime_notification(

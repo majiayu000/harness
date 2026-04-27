@@ -66,50 +66,15 @@ pub async fn loop_pr(
     run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
 }
 
-/// Resolve `owner/repo` slug from a PR URL or by querying `gh pr view`.
-///
-/// Returns an error if `pr_url` is `None` and `gh pr view` fails, so callers
-/// always receive a real slug or a descriptive error — never the literal
-/// `{owner}/{repo}` placeholder.
+/// Resolve `owner/repo` slug from a PR URL.
 async fn resolve_repo_slug(pr: u64, pr_url: Option<&str>) -> anyhow::Result<String> {
     if let Some(url) = pr_url {
         return Ok(prompts::repo_slug_from_pr_url(Some(url)));
     }
 
-    // No URL supplied — ask gh for the PR URL, then parse the slug from it.
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr.to_string(),
-            "--json",
-            "url",
-            "--jq",
-            ".url",
-        ])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to run `gh pr view {pr}`: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "`gh pr view {pr}` failed (exit {:?}): {stderr}",
-            output.status.code()
-        ));
-    }
-
-    let fetched_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let slug = prompts::repo_slug_from_pr_url(Some(&fetched_url));
-
-    // Guard: if parsing still produced the placeholder the URL was unparseable.
-    if slug == "{owner}/{repo}" {
-        return Err(anyhow::anyhow!(
-            "Could not parse owner/repo from `gh pr view` output: {fetched_url:?}"
-        ));
-    }
-
-    Ok(slug)
+    Err(anyhow::anyhow!(
+        "PR URL is required for PR #{pr}; Harness CLI no longer invokes gh to resolve repository metadata"
+    ))
 }
 
 async fn run_review_loop(

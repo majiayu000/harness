@@ -8,10 +8,10 @@ use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::types::{Event, ExecutionPhase, SessionId};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{sleep, Duration, Instant};
 
 /// External state of a PR as observed via `gh`. Used to short-circuit the
@@ -25,64 +25,64 @@ enum PrExternalState {
     Unknown,
 }
 
-/// Query `gh pr view <pr> --json state,mergedAt` with a 10 s timeout and
-/// classify the result. Returns [`PrExternalState::Unknown`] on any transient
+#[derive(Debug, Deserialize)]
+struct GitHubPullState {
+    state: String,
+    merged_at: Option<String>,
+}
+
+/// Query the GitHub REST API with a 10 s timeout and classify the result.
+/// Returns [`PrExternalState::Unknown`] on any transient
 /// failure so callers do not abort a healthy review loop because of a flaky
 /// network call.
 async fn fetch_pr_external_state(pr_num: u64, project: &Path) -> PrExternalState {
-    // kill_on_drop(true) so the gh subprocess is reaped if the timeout
-    // future is dropped — without it, hung gh invocations (network/auth
-    // stalls) accumulate as orphaned children across repeated review
-    // rounds and degrade the server. Mirrors the pattern used by
-    // task_runner/store.rs::validate_recovered_tasks.
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        Command::new("gh")
-            .current_dir(project)
-            .args([
-                "pr",
-                "view",
-                &pr_num.to_string(),
-                "--json",
-                "state,mergedAt",
-                "--jq",
-                ".state + \"|\" + ((.mergedAt // \"\")|tostring)",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-    let output = match result {
-        Ok(Ok(o)) if o.status.success() => o,
-        Ok(Ok(o)) => {
-            tracing::debug!(pr = pr_num, exit = ?o.status.code(), "gh pr state check failed");
+    let Some(repo) = super::pr_detection::detect_repo_slug(project).await else {
+        tracing::debug!(
+            pr = pr_num,
+            "PR state check skipped because repository slug is unavailable"
+        );
+        return PrExternalState::Unknown;
+    };
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(format!(
+            "https://api.github.com/repos/{repo}/pulls/{pr_num}"
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        if !token.trim().is_empty() {
+            request = request.bearer_auth(token);
+        }
+    }
+    let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
+        Ok(Ok(response)) if response.status().is_success() => response,
+        Ok(Ok(response)) => {
+            tracing::debug!(pr = pr_num, status = %response.status(), "GitHub PR state check failed");
             return PrExternalState::Unknown;
         }
         Ok(Err(e)) => {
-            tracing::debug!(pr = pr_num, error = %e, "gh pr state check invocation error");
+            tracing::debug!(pr = pr_num, error = %e, "GitHub PR state check invocation error");
             return PrExternalState::Unknown;
         }
         Err(_) => {
-            tracing::debug!(pr = pr_num, "gh pr state check timed out after 10s");
+            tracing::debug!(pr = pr_num, "GitHub PR state check timed out after 10s");
             return PrExternalState::Unknown;
         }
     };
-    let raw = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .trim_matches('"')
-        .to_string();
-    let (state, merged_at) = raw.split_once('|').unwrap_or((raw.as_str(), ""));
-    match (state.trim(), merged_at.trim().is_empty()) {
-        ("OPEN", _) => PrExternalState::Open,
-        ("MERGED", _) => PrExternalState::Merged,
+    let Ok(state) = response.json::<GitHubPullState>().await else {
+        tracing::debug!(pr = pr_num, "GitHub PR state response was not parseable");
+        return PrExternalState::Unknown;
+    };
+    let merged_at_empty = state.merged_at.as_deref().unwrap_or("").trim().is_empty();
+    match (state.state.as_str(), merged_at_empty) {
+        ("open", _) => PrExternalState::Open,
+        ("merged", _) => PrExternalState::Merged,
         // GitHub occasionally reports merged PRs as CLOSED with a non-empty
         // `mergedAt`; treat that as a merge so we do not cancel a completed
         // task by mistake.
-        ("CLOSED", false) => PrExternalState::Merged,
-        ("CLOSED", true) => PrExternalState::Closed,
+        ("closed", false) => PrExternalState::Merged,
+        ("closed", true) => PrExternalState::Closed,
         _ => PrExternalState::Unknown,
     }
 }

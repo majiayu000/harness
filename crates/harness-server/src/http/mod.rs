@@ -141,6 +141,24 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Spawn background watcher for AwaitingDeps tasks.
     background::spawn_awaiting_deps_watcher(&state);
 
+    // Run one reconciliation tick against GitHub before any recovery so that
+    // recovery decisions are made on fresh GitHub truth.
+    {
+        let max_calls = state
+            .core
+            .server
+            .config
+            .reconciliation
+            .max_gh_calls_per_minute;
+        crate::reconciliation::run_once(
+            &state.core.tasks,
+            &state.core.project_root,
+            max_calls,
+            false,
+        )
+        .await;
+    }
+
     // Re-dispatch tasks that were recovered to pending after server restart.
     // These had PRs when the server crashed and need their review loop re-started.
     background::spawn_pr_recovery(&state);

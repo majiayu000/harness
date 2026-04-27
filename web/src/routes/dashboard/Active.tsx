@@ -27,7 +27,7 @@ const COLUMNS: Column[] = [
     key: "implementing",
     label: "Implementing",
     workflowStates: ["implementing"],
-    fallbackTaskStatuses: ["implementing", "running", "triage", "plan"],
+    fallbackTaskStatuses: ["implementing", "running", "triaging", "planning", "triage", "plan"],
   },
   {
     key: "planning",
