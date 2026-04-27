@@ -453,13 +453,13 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                             if resolved.as_path() != std::path::Path::new(&workflow.project_id) =>
                         {
                             if let Err(e) = issue_workflows
-                                .update_project_path(&workflow.id, &resolved.to_string_lossy())
+                                .repair_project_id(&workflow.id, &resolved.to_string_lossy())
                                 .await
                             {
                                 tracing::error!(
                                     workflow_id = %workflow.id,
                                     error = %e,
-                                    "sweeper: failed to update project path"
+                                    "sweeper: failed to repair project_id (rekey row)"
                                 );
                             }
                             warned_unresolvable.remove(&project_key);

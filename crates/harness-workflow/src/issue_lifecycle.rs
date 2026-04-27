@@ -630,10 +630,13 @@ impl IssueWorkflowStore {
         .await
     }
 
-    /// Patches only the `project_id` field inside the JSONB blob without replacing the whole row.
-    /// Note: the embedded `id` field inside the JSON may diverge from the stored `project_id` after
-    /// this patch. This is harmless because all sweep/claim queries select by
-    /// `data::jsonb->>'project_id'`, not the embedded `id`.
+    /// Patches only the `project_id` field inside the JSONB blob without rekeying the row.
+    /// WARNING: the primary key (`id`) embeds the project_id; after this patch the row id is stale.
+    /// Any later call that computes `workflow_id(new_path, ...)` will not find this row and will
+    /// instead insert a duplicate placeholder, losing all prior workflow state.
+    /// Use `repair_project_id` for sweeper/reconciliation paths where re-entry with the canonical
+    /// path is possible. Only use this function where the old row id is never re-derived from the
+    /// new path.
     /// Returns `Ok(())` even when no row matches `workflow_id` (zero rows affected is not an error).
     pub async fn update_project_path(
         &self,
