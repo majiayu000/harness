@@ -722,84 +722,14 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    // Gate B: ensure the PR branch is rebased onto origin/main before review.
-    // Fresh pr:N tasks use the proactive rebase gate that detects "behind but
-    // conflict-free" and delegates the rebase to the agent.  Resumed issue
-    // tasks keep the legacy conflict detector as a defense-in-depth fallback.
-    let mut rebase_pushed = false;
-    if req.pr.is_some() {
-        use conflict_resolver::{run_pr_rebase_gate, PrRebaseGateOutcome};
-        match run_pr_rebase_gate(
-            store,
-            task_id,
-            agent,
-            pr_num,
-            &project,
-            &repo_slug,
-            turn_timeout,
-            &cargo_env,
-            &events,
-        )
-        .await?
-        {
-            PrRebaseGateOutcome::Proceed {
-                rebase_pushed: pushed,
-            } => rebase_pushed = pushed,
-            PrRebaseGateOutcome::TaskFailed => return Ok(()),
-            // Command failure — legacy gate below will make one more attempt.
-            PrRebaseGateOutcome::Unknown => {}
-        }
-    } else if was_resumed_pr {
+    // Gate B: conflict and rebase probing is delegated to the agent prompt.
+    // Harness must not run local git/GitHub commands from the server process.
+    if was_resumed_pr {
         use conflict_resolver::{assess_pr_conflict, PrConflictSize};
-        let conflict_size = assess_pr_conflict(pr_num, &project).await;
-        let mut conflict_was_detected = false;
-        match conflict_size {
-            PrConflictSize::Small {
-                file_count,
-                region_count,
-            } => {
-                tracing::info!(
-                    pr = pr_num,
-                    file_count,
-                    region_count,
-                    "conflict: small — attempting auto-rebase"
-                );
-                conflict_was_detected = true;
-                rebase_pushed = triage_pipeline::run_rebase_turn(
-                    agent,
-                    pr_num,
-                    &project,
-                    &repo_slug,
-                    turn_timeout,
-                    &cargo_env,
-                )
-                .await;
-            }
-            PrConflictSize::Large {
-                file_count,
-                region_count,
-            } => {
-                tracing::warn!(
-                    pr = pr_num,
-                    file_count,
-                    region_count,
-                    "conflict: too large for auto-rebase — deferring to review agent"
-                );
-                conflict_was_detected = true;
-            }
-            PrConflictSize::Clean | PrConflictSize::Unknown(_) => {}
-        }
-        if conflict_was_detected && !rebase_pushed {
-            mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Failed;
-                s.error = Some(format!(
-                    "pr:{pr_num} is conflicting and rebase was not pushed; manual resolution required"
-                ));
-            })
-            .await?;
-            return Ok(());
-        }
+        let PrConflictSize::Unknown(reason) = assess_pr_conflict(pr_num, &project).await;
+        tracing::debug!(pr = pr_num, reason, "conflict assessment delegated");
     }
+    let rebase_pushed = false;
 
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
@@ -900,7 +830,6 @@ pub(crate) async fn run_task(
         task_start,
         repo_slug_for_review,
         jaccard_threshold,
-        "gh",
     )
     .await
 }

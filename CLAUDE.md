@@ -68,4 +68,3 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 - U-16 exempt: `**/prompts.rs` → 1200-line limit, `**/dispatch.rs` → 1000-line limit, `task_executor/mod.rs` → 1400-line limit
 - L1 exempt: new files matching `src/**/{mod,lib,main}.rs` (standard Rust module files)
 - gh/git guard: CLAUDE.md rule is semantic (agent prompts only); bash guard should not double-block `cargo test` subprocesses
-- ARCH-GH exempt: `reconciliation.rs` and `task_executor/review_loop.rs` — infrastructure state-polling only (read PR/issue state to avoid burning agent turns on stale work). Both use injectable `gh_bin: &str` for testability (mock shell scripts in tests); all failures return `Unknown` (graceful degradation, no agent action triggered). New `Command::new("gh")` calls anywhere else remain forbidden.

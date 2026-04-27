@@ -8,10 +8,10 @@ use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::types::{Event, ExecutionPhase, SessionId};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{sleep, Duration, Instant};
 
 /// Tracks which review bot tier is active in the review loop.
@@ -34,67 +34,83 @@ enum PrExternalState {
     Open,
     Merged,
     Closed,
-    /// `gh` call failed or returned an unrecognised value; proceed normally.
+    /// GitHub state check failed or returned an unrecognised value; proceed normally.
     Unknown,
 }
 
-/// Query GitHub for the current state of a PR via the `gh` CLI.
-///
-/// The `gh_bin` parameter is injectable so that tests can substitute a mock
-/// shell script without requiring a real GitHub token or network access.
+#[derive(Debug, Deserialize)]
+struct GitHubPullState {
+    state: String,
+    merged_at: Option<String>,
+}
+
+fn classify_pr_external_state(state: &GitHubPullState) -> PrExternalState {
+    let merged_at_empty = state.merged_at.as_deref().unwrap_or("").trim().is_empty();
+    match (state.state.as_str(), merged_at_empty) {
+        ("open", _) | ("OPEN", _) => PrExternalState::Open,
+        ("merged", _) | ("MERGED", _) | ("closed", false) | ("CLOSED", false) => {
+            PrExternalState::Merged
+        }
+        ("closed", true) | ("CLOSED", true) => PrExternalState::Closed,
+        _ => PrExternalState::Unknown,
+    }
+}
+
+fn github_api_base_url() -> String {
+    std::env::var("HARNESS_GITHUB_API_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Query GitHub for the current state of a PR via the REST API.
 ///
 /// All failure paths return [`PrExternalState::Unknown`] so that a transient
-/// `gh` error never blocks the review loop — unknown state is treated as
-/// "proceed with normal review" (graceful degradation).
-async fn fetch_pr_external_state(pr_num: u64, project: &Path, gh_bin: &str) -> PrExternalState {
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        Command::new(gh_bin)
-            .current_dir(project)
-            .args([
-                "pr",
-                "view",
-                &pr_num.to_string(),
-                "--json",
-                "state",
-                "--jq",
-                ".state",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(out)) if out.status.success() => out,
-        Ok(Ok(out)) => {
+/// network or auth error never blocks the review loop. Unknown state is treated
+/// as "proceed with normal review" for graceful degradation.
+async fn fetch_pr_external_state(pr_num: u64, repo_slug: &str) -> PrExternalState {
+    if repo_slug.trim().is_empty() || repo_slug.contains('{') {
+        return PrExternalState::Unknown;
+    }
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(format!(
+            "{}/repos/{repo_slug}/pulls/{pr_num}",
+            github_api_base_url()
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        if !token.trim().is_empty() {
+            request = request.bearer_auth(token);
+        }
+    }
+    let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
+        Ok(Ok(response)) if response.status().is_success() => response,
+        Ok(Ok(response)) => {
             tracing::debug!(
                 pr = pr_num,
-                stderr = %String::from_utf8_lossy(&out.stderr),
-                "fetch_pr_external_state: gh returned non-zero"
+                status = %response.status(),
+                "fetch_pr_external_state: GitHub API returned non-success"
             );
             return PrExternalState::Unknown;
         }
         Ok(Err(e)) => {
-            tracing::debug!(pr = pr_num, error = %e, "fetch_pr_external_state: gh failed");
+            tracing::debug!(pr = pr_num, error = %e, "fetch_pr_external_state: GitHub API failed");
             return PrExternalState::Unknown;
         }
         Err(_) => {
-            tracing::debug!(pr = pr_num, "fetch_pr_external_state: gh timed out");
+            tracing::debug!(pr = pr_num, "fetch_pr_external_state: GitHub API timed out");
             return PrExternalState::Unknown;
         }
     };
-    let raw = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .trim_matches('"')
-        .to_uppercase();
-    match raw.as_str() {
-        "OPEN" => PrExternalState::Open,
-        "MERGED" => PrExternalState::Merged,
-        "CLOSED" => PrExternalState::Closed,
-        _ => PrExternalState::Unknown,
-    }
+    response
+        .json::<GitHubPullState>()
+        .await
+        .map(|state| classify_pr_external_state(&state))
+        .unwrap_or(PrExternalState::Unknown)
 }
 
 /// Returns `true` when the trailing three entries of `counts` are all `Some`
@@ -142,13 +158,12 @@ pub(crate) async fn run_review_loop(
     task_start: Instant,
     repo_slug: String,
     jaccard_threshold: f64,
-    gh_bin: &str,
 ) -> anyhow::Result<()> {
     let review_phase_start = Instant::now();
 
     // Fast-path: if the PR is already merged or closed on GitHub, skip the
     // review loop entirely to avoid burning agent turns on stale work.
-    match fetch_pr_external_state(pr_num, project, gh_bin).await {
+    match fetch_pr_external_state(pr_num, &repo_slug).await {
         PrExternalState::Merged => {
             tracing::info!(
                 task_id = %task_id,
