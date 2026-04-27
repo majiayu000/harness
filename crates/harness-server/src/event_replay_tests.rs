@@ -530,3 +530,49 @@ async fn replay_terminal_failed_overrides_implementing() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// Surface 4 regression guard: every TaskEvent variant serialises to JSONL
+// containing only task_id, ts, and variant-specific scalar fields.
+// No workspace path must ever appear in the wire format.
+#[test]
+fn surface4_task_event_jsonl_has_no_workspace_paths() {
+    let events = [
+        TaskEvent::Created {
+            task_id: "t1".into(),
+            ts: 0,
+        },
+        TaskEvent::StatusChanged {
+            task_id: "t1".into(),
+            ts: 1,
+            status: "implementing".into(),
+            turn: 1,
+        },
+        TaskEvent::Failed {
+            task_id: "t1".into(),
+            ts: 2,
+            reason: "something went wrong".into(),
+        },
+        TaskEvent::Completed {
+            task_id: "t1".into(),
+            ts: 3,
+        },
+        TaskEvent::PrDetected {
+            task_id: "t1".into(),
+            ts: 4,
+            pr_url: "https://github.com/o/r/pull/1".into(),
+        },
+        TaskEvent::RoundCompleted {
+            task_id: "t1".into(),
+            ts: 5,
+            round: 1,
+            result: "passed".into(),
+        },
+    ];
+    for event in &events {
+        let json = serde_json::to_string(event).expect("TaskEvent must serialise");
+        assert!(
+            !json.contains("/workspaces/"),
+            "TaskEvent JSON must not contain a workspace path: {json}"
+        );
+    }
+}
