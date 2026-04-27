@@ -70,6 +70,7 @@ pub(crate) async fn build_services(
         interceptors.clone(),
         registry.workspace_mgr.clone(),
         intake.task_queue.clone(),
+        intake.review_task_queue.clone(),
         intake.completion_callback.clone(),
         registry.issue_workflow_store.clone(),
         Some(registry.project_registry.clone()),

@@ -122,6 +122,7 @@ async fn make_test_state_with_project_root(
         vec![],
         None,
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         None,
         None,
         None,

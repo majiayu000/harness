@@ -16,7 +16,36 @@ use harness_skills::store::SkillStore;
 use harness_workflow::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueDomain {
+    Primary,
+    Review,
+}
+
+impl QueueDomain {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Review => "review",
+        }
+    }
+}
+
+pub struct EnqueueBackgroundOptions {
+    pub(crate) queue_domain: QueueDomain,
+    pub(crate) group_sem: Option<Arc<Semaphore>>,
+}
+
+impl Default for EnqueueBackgroundOptions {
+    fn default() -> Self {
+        Self {
+            queue_domain: QueueDomain::Primary,
+            group_sem: None,
+        }
+    }
+}
 
 /// Error returned by [`ExecutionService::enqueue`] and
 /// [`ExecutionService::enqueue_background`].
@@ -62,12 +91,26 @@ pub trait ExecutionService: Send + Sync {
     /// the background and returns its ID.
     async fn enqueue(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError>;
 
+    /// Enqueue a task in a specific queue domain.
+    async fn enqueue_in_domain(
+        &self,
+        req: CreateTaskRequest,
+        queue_domain: QueueDomain,
+    ) -> Result<TaskId, EnqueueTaskError>;
+
     /// Register a task immediately and begin execution in the background.
     ///
     /// Returns the task ID without waiting for a concurrency permit. A
     /// background tokio task handles permit acquisition and execution, keeping
     /// HTTP handlers responsive under load.
     async fn enqueue_background(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError>;
+
+    /// Register a task immediately with background execution options.
+    async fn enqueue_background_with_options(
+        &self,
+        req: CreateTaskRequest,
+        options: EnqueueBackgroundOptions,
+    ) -> Result<TaskId, EnqueueTaskError>;
 }
 
 /// All dependencies required to execute a task end-to-end.
@@ -80,16 +123,131 @@ pub struct DefaultExecutionService {
     interceptors: Vec<Arc<dyn TurnInterceptor>>,
     workspace_mgr: Option<Arc<WorkspaceManager>>,
     task_queue: Arc<TaskQueue>,
+    review_task_queue: Arc<TaskQueue>,
     completion_callback: Option<CompletionCallback>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     project_registry: Option<Arc<ProjectRegistry>>,
     allowed_project_roots: Vec<PathBuf>,
 }
 
-enum WorkflowReuseStrategy {
+pub(crate) enum WorkflowReuseStrategy {
     ActiveTask(TaskId),
     PrExternalId(String),
     None,
+}
+
+pub(crate) fn workflow_state_allows_reuse(state: IssueLifecycleState) -> bool {
+    !matches!(
+        state,
+        IssueLifecycleState::Failed | IssueLifecycleState::Cancelled
+    )
+}
+
+pub(crate) fn workflow_reuse_strategy(workflow: &IssueWorkflowInstance) -> WorkflowReuseStrategy {
+    if !workflow_state_allows_reuse(workflow.state) {
+        return WorkflowReuseStrategy::None;
+    }
+    if let Some(task_id) = workflow.active_task_id.as_ref() {
+        return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
+    }
+    if let Some(pr_number) = workflow.pr_number {
+        return WorkflowReuseStrategy::PrExternalId(format!("pr:{pr_number}"));
+    }
+    WorkflowReuseStrategy::None
+}
+
+pub(crate) async fn resolve_project_from_registry(
+    registry: Option<&ProjectRegistry>,
+    project: Option<PathBuf>,
+) -> Result<(Option<PathBuf>, Option<String>), EnqueueTaskError> {
+    let (Some(registry), Some(project_path)) = (registry, project.clone()) else {
+        return Ok((project, None));
+    };
+
+    if project_path.is_dir() {
+        return Ok((Some(project_path), None));
+    }
+
+    let id = project_path.to_string_lossy();
+    match registry.get(&id).await {
+        Ok(Some(project)) => return Ok((Some(project.root), project.default_agent)),
+        Ok(None) => {}
+        Err(e) => return Err(EnqueueTaskError::Internal(e.to_string())),
+    }
+    match registry.get_by_name(&id).await {
+        Ok(Some(project)) => Ok((Some(project.root), project.default_agent)),
+        Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
+            "project '{id}' not found in registry and is not a valid directory"
+        ))),
+        Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
+    }
+}
+
+pub(crate) fn queue_timeout_message(
+    queue: &TaskQueue,
+    project_id: &str,
+    domain: QueueDomain,
+) -> String {
+    let diag = queue.diagnostics(project_id);
+    let project_holding = diag.project_running + diag.project_awaiting_global;
+    let project_full = project_holding >= diag.project_limit;
+    let global_full = diag.global_running >= diag.global_limit;
+    let reason = match (global_full, project_full, domain) {
+        (_, _, QueueDomain::Review) => "review capacity domain full",
+        (true, true, _) => "global and project capacity saturated",
+        (true, false, _) => "global capacity saturated",
+        (false, true, _) => "project capacity saturated",
+        (false, false, _) => "permit wait exceeded timeout",
+    };
+    format!(
+        "{reason} (domain={}, global_running={}, global_queued={}, global_limit={}, project_running={}, project_waiting={}, project_awaiting_global={}, project_limit={})",
+        domain.label(),
+        diag.global_running,
+        diag.global_queued,
+        diag.global_limit,
+        diag.project_running,
+        diag.project_waiting_for_project,
+        diag.project_awaiting_global,
+        diag.project_limit,
+    )
+}
+
+pub(crate) fn select_agent(
+    req: &CreateTaskRequest,
+    registry: &AgentRegistry,
+    registry_agent: Option<&str>,
+) -> Result<Arc<dyn CodeAgent>, EnqueueTaskError> {
+    if let Some(name) = &req.agent {
+        return registry
+            .get(name)
+            .ok_or_else(|| EnqueueTaskError::BadRequest(format!("agent '{name}' not registered")));
+    }
+
+    if let Some(project_root) = &req.project {
+        let project_cfg = harness_core::config::project::load_project_config(project_root)
+            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+        if let Some(agent_name) = project_cfg.agent.as_ref().and_then(|a| a.default.as_ref()) {
+            if agent_name != "auto" {
+                return registry.get(agent_name).ok_or_else(|| {
+                    EnqueueTaskError::BadRequest(format!("agent '{agent_name}' not registered"))
+                });
+            }
+        }
+    }
+
+    if let Some(name) = registry_agent {
+        if name != "auto" {
+            return registry.get(name).ok_or_else(|| {
+                EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
+            });
+        }
+    }
+
+    let classification =
+        complexity_router::classify(req.prompt.as_deref().unwrap_or_default(), req.issue, req.pr);
+    registry
+        .dispatch(&classification)
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))
 }
 
 impl DefaultExecutionService {
@@ -103,6 +261,7 @@ impl DefaultExecutionService {
         interceptors: Vec<Arc<dyn TurnInterceptor>>,
         workspace_mgr: Option<Arc<WorkspaceManager>>,
         task_queue: Arc<TaskQueue>,
+        review_task_queue: Arc<TaskQueue>,
         completion_callback: Option<CompletionCallback>,
         issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
         project_registry: Option<Arc<ProjectRegistry>>,
@@ -117,6 +276,7 @@ impl DefaultExecutionService {
             interceptors,
             workspace_mgr,
             task_queue,
+            review_task_queue,
             completion_callback,
             issue_workflow_store,
             project_registry,
@@ -134,29 +294,7 @@ impl DefaultExecutionService {
         &self,
         project: Option<PathBuf>,
     ) -> Result<(Option<PathBuf>, Option<String>), EnqueueTaskError> {
-        let (Some(registry), Some(project_path)) =
-            (self.project_registry.as_ref(), project.clone())
-        else {
-            return Ok((project, None));
-        };
-
-        if project_path.is_dir() {
-            return Ok((Some(project_path), None));
-        }
-
-        let id = project_path.to_string_lossy();
-        match registry.get(&id).await {
-            Ok(Some(project)) => return Ok((Some(project.root), project.default_agent)),
-            Ok(None) => {}
-            Err(e) => return Err(EnqueueTaskError::Internal(e.to_string())),
-        }
-        match registry.get_by_name(&id).await {
-            Ok(Some(project)) => Ok((Some(project.root), project.default_agent)),
-            Ok(None) => Err(EnqueueTaskError::BadRequest(format!(
-                "project '{id}' not found in registry and is not a valid directory"
-            ))),
-            Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
-        }
+        resolve_project_from_registry(self.project_registry.as_deref(), project).await
     }
 
     /// Validate the request has at least one task specifier and a valid priority.
@@ -182,27 +320,11 @@ impl DefaultExecutionService {
             .map_err(EnqueueTaskError::BadRequest)
     }
 
-    fn queue_timeout_message(&self, project_id: &str) -> String {
-        let diag = self.task_queue.diagnostics(project_id);
-        let project_holding = diag.project_running + diag.project_awaiting_global;
-        let project_full = project_holding >= diag.project_limit;
-        let global_full = diag.global_running >= diag.global_limit;
-        let reason = match (global_full, project_full) {
-            (true, true) => "global and project capacity saturated",
-            (true, false) => "global capacity saturated",
-            (false, true) => "project capacity saturated",
-            (false, false) => "permit wait exceeded timeout",
-        };
-        format!(
-            "{reason} (domain=primary, global_running={}, global_queued={}, global_limit={}, project_running={}, project_waiting={}, project_awaiting_global={}, project_limit={})",
-            diag.global_running,
-            diag.global_queued,
-            diag.global_limit,
-            diag.project_running,
-            diag.project_waiting_for_project,
-            diag.project_awaiting_global,
-            diag.project_limit,
-        )
+    fn queue_for(&self, domain: QueueDomain) -> Arc<TaskQueue> {
+        match domain {
+            QueueDomain::Primary => self.task_queue.clone(),
+            QueueDomain::Review => self.review_task_queue.clone(),
+        }
     }
 
     fn populate_external_id(req: &mut CreateTaskRequest) {
@@ -229,26 +351,6 @@ impl DefaultExecutionService {
         }
     }
 
-    fn workflow_state_allows_reuse(state: IssueLifecycleState) -> bool {
-        !matches!(
-            state,
-            IssueLifecycleState::Failed | IssueLifecycleState::Cancelled
-        )
-    }
-
-    fn workflow_reuse_strategy(workflow: &IssueWorkflowInstance) -> WorkflowReuseStrategy {
-        if !Self::workflow_state_allows_reuse(workflow.state) {
-            return WorkflowReuseStrategy::None;
-        }
-        if let Some(task_id) = workflow.active_task_id.as_ref() {
-            return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
-        }
-        if let Some(pr_number) = workflow.pr_number {
-            return WorkflowReuseStrategy::PrExternalId(format!("pr:{pr_number}"));
-        }
-        WorkflowReuseStrategy::None
-    }
-
     async fn check_workflow_duplicate(
         &self,
         project_id: &str,
@@ -271,7 +373,7 @@ impl DefaultExecutionService {
             None
         }?;
 
-        match Self::workflow_reuse_strategy(&workflow) {
+        match workflow_reuse_strategy(&workflow) {
             WorkflowReuseStrategy::ActiveTask(task_id) => {
                 if self
                     .tasks
@@ -349,48 +451,6 @@ impl DefaultExecutionService {
         false
     }
 
-    /// Select the agent for this request (explicit, project default, or complexity-routed).
-    fn select_agent(
-        &self,
-        req: &CreateTaskRequest,
-        registry_agent: Option<&str>,
-    ) -> Result<Arc<dyn CodeAgent>, EnqueueTaskError> {
-        if let Some(name) = &req.agent {
-            return self.agent_registry.get(name).ok_or_else(|| {
-                EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
-            });
-        }
-
-        if let Some(project_root) = &req.project {
-            let project_cfg = harness_core::config::project::load_project_config(project_root)
-                .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
-            if let Some(agent_name) = project_cfg.agent.as_ref().and_then(|a| a.default.as_ref()) {
-                if agent_name != "auto" {
-                    return self.agent_registry.get(agent_name).ok_or_else(|| {
-                        EnqueueTaskError::BadRequest(format!("agent '{agent_name}' not registered"))
-                    });
-                }
-            }
-        }
-
-        if let Some(name) = registry_agent {
-            if name != "auto" {
-                return self.agent_registry.get(name).ok_or_else(|| {
-                    EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
-                });
-            }
-        }
-
-        let classification = complexity_router::classify(
-            req.prompt.as_deref().unwrap_or_default(),
-            req.issue,
-            req.pr,
-        );
-        self.agent_registry
-            .dispatch(&classification)
-            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))
-    }
-
     async fn track_issue_workflow(
         &self,
         project_id: &str,
@@ -442,7 +502,15 @@ impl DefaultExecutionService {
 
 #[async_trait]
 impl ExecutionService for DefaultExecutionService {
-    async fn enqueue(&self, mut req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
+    async fn enqueue(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
+        self.enqueue_in_domain(req, QueueDomain::Primary).await
+    }
+
+    async fn enqueue_in_domain(
+        &self,
+        mut req: CreateTaskRequest,
+        queue_domain: QueueDomain,
+    ) -> Result<TaskId, EnqueueTaskError> {
         let now = chrono::Utc::now();
         if self.server_config.maintenance_window.in_quiet_window(now) {
             let retry_after_secs = self
@@ -488,15 +556,22 @@ impl ExecutionService for DefaultExecutionService {
         }
         req.depends_on.clear();
 
+        let queue = self.queue_for(queue_domain);
         let permit = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.task_queue.acquire(&project_id, req.priority),
+            queue.acquire(&project_id, req.priority),
         )
         .await
-        .map_err(|_| EnqueueTaskError::Internal(self.queue_timeout_message(&project_id)))?
+        .map_err(|_| {
+            EnqueueTaskError::Internal(queue_timeout_message(&queue, &project_id, queue_domain))
+        })?
         .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
-        let agent = self.select_agent(&req, registry_default_agent.as_deref())?;
+        let agent = select_agent(
+            &req,
+            &self.agent_registry,
+            registry_default_agent.as_deref(),
+        )?;
         let (reviewer, _) = resolve_reviewer(
             &self.agent_registry,
             &self.server_config.agents.review,
@@ -526,9 +601,15 @@ impl ExecutionService for DefaultExecutionService {
         Ok(task_id)
     }
 
-    async fn enqueue_background(
+    async fn enqueue_background(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
+        self.enqueue_background_with_options(req, EnqueueBackgroundOptions::default())
+            .await
+    }
+
+    async fn enqueue_background_with_options(
         &self,
         mut req: CreateTaskRequest,
+        options: EnqueueBackgroundOptions,
     ) -> Result<TaskId, EnqueueTaskError> {
         let now = chrono::Utc::now();
         if self.server_config.maintenance_window.in_quiet_window(now) {
@@ -553,7 +634,11 @@ impl ExecutionService for DefaultExecutionService {
         req.project = Some(canonical);
         task_runner::fill_missing_repo_from_project(&mut req).await;
 
-        let agent = self.select_agent(&req, registry_default_agent.as_deref())?;
+        let agent = select_agent(
+            &req,
+            &self.agent_registry,
+            registry_default_agent.as_deref(),
+        )?;
         let (reviewer, _) = resolve_reviewer(
             &self.agent_registry,
             &self.server_config.agents.review,
@@ -584,6 +669,12 @@ impl ExecutionService for DefaultExecutionService {
 
         let server_config = self.server_config.clone();
 
+        tracing::info!(
+            project = %req.project.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "None".to_string()),
+            domain = options.queue_domain.label(),
+            "execution service: resolved project for background task"
+        );
+
         // Register the task immediately so the caller gets an ID without blocking.
         let task_id = task_runner::register_pending_task(self.tasks.clone(), &req).await;
 
@@ -593,12 +684,19 @@ impl ExecutionService for DefaultExecutionService {
         let events = self.events.clone();
         let interceptors = self.interceptors.clone();
         let workspace_mgr = self.workspace_mgr.clone();
-        let task_queue = self.task_queue.clone();
+        let queue_domain = options.queue_domain;
+        let task_queue = self.queue_for(queue_domain);
+        let group_sem = options.group_sem;
         let completion_callback = self.completion_callback.clone();
         let issue_workflow_store = self.issue_workflow_store.clone();
         let task_id2 = task_id.clone();
         self.track_issue_workflow(&project_id, &req, &task_id).await;
         tokio::spawn(async move {
+            let group_permit = if let Some(sem) = group_sem {
+                sem.acquire_owned().await.ok()
+            } else {
+                None
+            };
             match task_queue.acquire(&project_id, req.priority).await {
                 Ok(permit) => {
                     task_runner::spawn_preregistered_task(
@@ -615,15 +713,25 @@ impl ExecutionService for DefaultExecutionService {
                         permit,
                         completion_callback,
                         issue_workflow_store,
-                        None,
+                        group_permit,
                     )
                     .await;
                 }
                 Err(e) => {
+                    let queue_error =
+                        format!("{} queue admission failed: {e}", queue_domain.label());
+                    tracing::error!(
+                        task_id = %task_id2.0,
+                        project = %project_id,
+                        domain = queue_domain.label(),
+                        error = %queue_error,
+                        "background task admission failed"
+                    );
                     if let Err(persist_err) =
                         task_runner::mutate_and_persist(&tasks, &task_id2, |s| {
                             s.status = task_runner::TaskStatus::Failed;
-                            s.error = Some(format!("task queue full: {e}"));
+                            s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
+                            s.error = Some(queue_error.clone());
                         })
                         .await
                     {
@@ -670,9 +778,27 @@ mod tests {
             Ok(harness_core::types::TaskId("mock-task".to_string()))
         }
 
+        async fn enqueue_in_domain(
+            &self,
+            _req: CreateTaskRequest,
+            _queue_domain: QueueDomain,
+        ) -> Result<TaskId, EnqueueTaskError> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(harness_core::types::TaskId("mock-task".to_string()))
+        }
+
         async fn enqueue_background(
             &self,
             _req: CreateTaskRequest,
+        ) -> Result<TaskId, EnqueueTaskError> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(harness_core::types::TaskId("mock-bg-task".to_string()))
+        }
+
+        async fn enqueue_background_with_options(
+            &self,
+            _req: CreateTaskRequest,
+            _options: EnqueueBackgroundOptions,
         ) -> Result<TaskId, EnqueueTaskError> {
             self.called.store(true, Ordering::SeqCst);
             Ok(harness_core::types::TaskId("mock-bg-task".to_string()))
@@ -839,6 +965,7 @@ mod tests {
             vec![],
             None,
             make_task_queue(),
+            make_task_queue(),
             None,
             None,
             registry,
@@ -860,6 +987,7 @@ mod tests {
             make_event_store_noop().await,
             vec![],
             None,
+            make_task_queue(),
             make_task_queue(),
             None,
             None,
