@@ -180,6 +180,12 @@ async fn resolve_project_root_with(
 /// This function only resolves symlinks — it does NOT enforce the HOME-boundary
 /// restriction applied by `validate_project_root`. Full validation still
 /// happens inside `spawn_task` once the task is running.
+/// Returns true when `external_id` marks this as an issue- or PR-keyed task.
+/// Issue/PR-keyed workspaces are reused across consecutive tasks (issue #969).
+fn is_issue_pr_task(eid: Option<&str>) -> bool {
+    eid.is_some_and(|id| id.starts_with("issue:") || id.starts_with("pr:"))
+}
+
 pub async fn resolve_canonical_project(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let raw = resolve_project_root_with(project, detect_main_worktree).await?;
     // Best-effort canonicalize: if the path doesn't exist yet (e.g. in tests
@@ -786,7 +792,9 @@ where
         // Cleanup workspace when task ends.
         // On failure: always remove to prevent stale worktrees from polluting subsequent
         // tasks (the root cause of cross-task PR pollution, issue #799).
-        // On success: respect auto_cleanup so users can inspect the worktree post-run.
+        // On success for issue/PR-keyed tasks: skip cleanup so consecutive tasks on the
+        // same issue/PR reuse the same workspace (issue #969). UUID/prompt-only tasks
+        // keep the existing auto_cleanup behaviour.
         if let Some(wmgr) = workspace_mgr {
             // Also force cleanup when the task ended with Failed status even though the
             // executor returned Ok(()) — the worktree-collision path sets TaskStatus::Failed
@@ -794,7 +802,13 @@ where
             let task_is_failed = store
                 .get(&id)
                 .is_some_and(|s| s.status == TaskStatus::Failed);
-            if task_result.is_err() || task_is_failed || wmgr.config.auto_cleanup {
+            let is_issue_pr = store
+                .get(&id)
+                .is_some_and(|s| is_issue_pr_task(s.external_id.as_deref()));
+            let should_cleanup = task_result.is_err()
+                || task_is_failed
+                || (wmgr.config.auto_cleanup && !is_issue_pr);
+            if should_cleanup {
                 if let Err(e) = wmgr.remove_workspace(&id).await {
                     tracing::warn!("workspace cleanup failed for {id:?}: {e}");
                 }
