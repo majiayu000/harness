@@ -5,6 +5,7 @@ use harness_core::interceptor::{
     InterceptResult, PostExecuteResult, PostToolUseResult, ToolUseEvent, TurnInterceptor,
 };
 use harness_core::types::{Decision, TokenUsage};
+use harness_observe::event_store::EventStore;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
@@ -499,7 +500,14 @@ fn make_skill_store_with_two_matching() -> harness_skills::store::SkillStore {
 #[tokio::test]
 async fn inject_skills_multiple_matches_all_usage_counts_incremented() {
     let skills = RwLock::new(make_skill_store_with_two_matching());
-    inject_skills_into_prompt(&skills, "please do a code review").await;
+    let events = EventStore::new_noop_for_tests();
+    augment_prompt_with_skills(
+        &skills,
+        &events,
+        &TaskId::new(),
+        "please do a code review".to_string(),
+    )
+    .await;
     let guard = skills.read().await;
     for skill in guard.list() {
         assert_eq!(
@@ -534,7 +542,14 @@ async fn inject_skills_retired_skill_not_included() {
         );
     }
     let skills = RwLock::new(store);
-    let result = inject_skills_into_prompt(&skills, "please do a code review").await;
+    let events = EventStore::new_noop_for_tests();
+    let result = augment_prompt_with_skills(
+        &skills,
+        &events,
+        &TaskId::new(),
+        "please do a code review".to_string(),
+    )
+    .await;
     assert!(
         !result.contains("Retired review content."),
         "retired skill content must not appear in prompt"
@@ -569,9 +584,12 @@ async fn inject_skills_quarantine_injection_is_deterministic() {
         },
     );
     let skills = RwLock::new(store);
-    let prompt = "please do a code review";
-    let result1 = inject_skills_into_prompt(&skills, prompt).await;
-    let result2 = inject_skills_into_prompt(&skills, prompt).await;
+    let events = EventStore::new_noop_for_tests();
+    let prompt = "please do a code review".to_string();
+    let result1 =
+        augment_prompt_with_skills(&skills, &events, &TaskId::new(), prompt.clone()).await;
+    let result2 =
+        augment_prompt_with_skills(&skills, &events, &TaskId::new(), prompt.clone()).await;
     assert_eq!(
         result1, result2,
         "injection result must be deterministic for the same prompt"

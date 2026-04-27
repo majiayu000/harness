@@ -385,28 +385,26 @@ pub(crate) async fn matched_skills_for_prompt(
         .collect()
 }
 
-/// Augment a prompt with matching skills: match once, record usage, log `skill_used` events,
-/// and return the augmented prompt string. Replaces the repeated
-/// `matched_skills_for_prompt` + `inject_skills_into_prompt` + event-log loop pattern.
-pub(crate) async fn augment_prompt_with_skills(
+/// Collect matched skills and all skills from the store, record usage for
+/// matches, and return both.
+///
+/// Lock discipline: holds read lock briefly to collect data, drops it, then
+/// acquires write lock only if there are matches. Never holds both locks
+/// simultaneously.
+async fn collect_and_record_skill_matches(
     skills: &RwLock<harness_skills::store::SkillStore>,
-    events: &EventStore,
-    task_id: &TaskId,
-    prompt: String,
-) -> String {
-    // Early return when store is empty — avoids acquiring locks unnecessarily.
+    prompt: &str,
+) -> (Vec<(SkillId, String, String)>, Vec<(String, String)>) {
     {
         let guard = skills.read().await;
         if guard.list().is_empty() {
-            return prompt;
+            return (vec![], vec![]);
         }
     }
-
-    // Single read pass: collect matched (id, name, content) and all skills (name, desc).
-    let (matched, all_skills) = {
+    let (matched, all) = {
         let guard = skills.read().await;
         let matched: Vec<(SkillId, String, String)> = guard
-            .match_prompt(&prompt)
+            .match_prompt(prompt)
             .into_iter()
             .map(|s| (s.id.clone(), s.name.clone(), s.content.clone()))
             .collect();
@@ -417,16 +415,26 @@ pub(crate) async fn augment_prompt_with_skills(
             .collect();
         (matched, all)
     };
-
-    // Record usage for matched skills (brief write lock).
     if !matched.is_empty() {
         let mut guard = skills.write().await;
         for (id, _, _) in &matched {
             guard.record_use(id);
         }
     }
+    (matched, all)
+}
 
-    // Log skill_used events.
+/// Augment a prompt with matching skills: match once, record usage, log `skill_used` events,
+/// and return the augmented prompt string. Replaces the repeated
+/// `matched_skills_for_prompt` + `inject_skills_into_prompt` + event-log loop pattern.
+pub(crate) async fn augment_prompt_with_skills(
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
+    task_id: &TaskId,
+    prompt: String,
+) -> String {
+    let (matched, all_skills) = collect_and_record_skill_matches(skills, &prompt).await;
+
     for (skill_id, skill_name, _) in &matched {
         let mut ev = Event::new(
             SessionId::new(),
@@ -445,7 +453,6 @@ pub(crate) async fn augment_prompt_with_skills(
         }
     }
 
-    // Build prompt addition.
     let listing = harness_core::prompts::build_available_skills_listing(
         all_skills.iter().map(|(n, d)| (n.as_str(), d.as_str())),
     );
@@ -474,47 +481,12 @@ pub(crate) async fn augment_prompt_with_skills(
 ///
 /// Returns an empty string when the store is empty (no sections added).
 /// The "Relevant Skills" section is omitted when no skills match.
-///
-/// Lock discipline: holds read lock briefly, drops it, then acquires write lock
-/// only if there are matched skills to record usage for. Never holds both locks
-/// simultaneously.
 pub(crate) async fn inject_skills_into_prompt(
     skills: &RwLock<harness_skills::store::SkillStore>,
     prompt: &str,
 ) -> String {
-    // Early return when the store is empty — avoids acquiring locks unnecessarily.
-    {
-        let guard = skills.read().await;
-        if guard.list().is_empty() {
-            return String::new();
-        }
-    }
+    let (matched_data, all_skills) = collect_and_record_skill_matches(skills, prompt).await;
 
-    // Read phase: collect all needed data while holding read lock minimally.
-    let (matched_data, all_skills) = {
-        let guard = skills.read().await;
-        let matched: Vec<(harness_core::types::SkillId, String, String)> = guard
-            .match_prompt(prompt)
-            .into_iter()
-            .map(|s| (s.id.clone(), s.name.clone(), s.content.clone()))
-            .collect();
-        let all: Vec<(String, String)> = guard
-            .list()
-            .iter()
-            .map(|s| (s.name.clone(), s.description.clone()))
-            .collect();
-        (matched, all)
-    };
-
-    // Write phase: record usage for matched skills (brief write lock).
-    if !matched_data.is_empty() {
-        let mut guard = skills.write().await;
-        for (id, _, _) in &matched_data {
-            guard.record_use(id);
-        }
-    }
-
-    // Build prompt additions.
     let listing = harness_core::prompts::build_available_skills_listing(
         all_skills.iter().map(|(n, d)| (n.as_str(), d.as_str())),
     );
