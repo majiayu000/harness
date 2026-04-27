@@ -11,12 +11,18 @@ use super::{is_prompt_only_task, persist_artifact, TurnExecutionFailure, TurnExe
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RunAgentStreamingOptions {
     pub persist_artifacts: bool,
+    /// Scan agent output for CREATED_ISSUE= sentinels and back-fill the task's
+    /// external_id.  Must be set explicitly by the implement phase for auto-fix
+    /// tasks; left false for review/planning turns to prevent reviewer output
+    /// from accidentally corrupting external_id.
+    pub backfill_auto_fix_issue: bool,
 }
 
 impl Default for RunAgentStreamingOptions {
     fn default() -> Self {
         Self {
             persist_artifacts: true,
+            backfill_auto_fix_issue: false,
         }
     }
 }
@@ -115,11 +121,10 @@ pub(crate) async fn run_agent_streaming_with_options(
     // CREATED_ISSUE= so each MessageDelta only scans newly appended lines,
     // keeping the overall scan cost O(N) instead of O(N²).
     let mut issue_scan_pos: usize = 0;
-    // Pre-check whether this task is auto-fix to avoid a cache lookup on every
-    // MessageDelta.  The source field is immutable after creation.
-    // Backfill is restricted to execution phase to prevent reviewer/planner
-    // output that mentions CREATED_ISSUE= from corrupting external_id.
-    let is_auto_fix_execution = phase_str == "execution"
+    // Pre-check whether this task should scan for CREATED_ISSUE= sentinels.
+    // Controlled by the caller via options.backfill_auto_fix_issue so that
+    // review/planning turns never corrupt external_id with false-positive matches.
+    let is_auto_fix_execution = options.backfill_auto_fix_issue
         && store
             .get(task_id)
             .is_some_and(|s| s.source.as_deref() == Some("auto-fix"));
@@ -160,6 +165,10 @@ pub(crate) async fn run_agent_streaming_with_options(
                                 item: Item::AgentReasoning { content },
                             } => {
                                 output = content.clone();
+                                // Reset scan position to end of new content so subsequent
+                                // MessageDelta items don't use a stale byte offset into
+                                // the replaced string.
+                                issue_scan_pos = output.len();
                                 if first_output_at.is_none() && !content.is_empty() {
                                     first_output_at = Some(Utc::now());
                                 }
@@ -198,6 +207,18 @@ pub(crate) async fn run_agent_streaming_with_options(
         if exec_result.is_some() && channel_closed {
             break;
         }
+    }
+
+    // Final scan for any trailing output that didn't end in a newline and
+    // was therefore not covered by a MessageDelta or ItemCompleted event.
+    if is_auto_fix_execution && output.len() > issue_scan_pos {
+        backfill_issue_if_found(
+            &output[issue_scan_pos..],
+            &mut last_backfilled_issue,
+            store,
+            task_id,
+        )
+        .await;
     }
 
     let completed_at = Utc::now();

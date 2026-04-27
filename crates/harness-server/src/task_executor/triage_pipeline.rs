@@ -142,6 +142,7 @@ pub(crate) async fn run_plan_for_prompt(
             agent_started_at,
             RunAgentStreamingOptions {
                 persist_artifacts: false,
+                backfill_auto_fix_issue: false,
             },
         ),
     )

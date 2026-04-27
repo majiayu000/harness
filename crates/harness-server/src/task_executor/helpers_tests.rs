@@ -683,6 +683,7 @@ async fn run_agent_streaming_can_skip_artifact_persistence() {
         chrono::Utc::now(),
         RunAgentStreamingOptions {
             persist_artifacts: false,
+            backfill_auto_fix_issue: false,
         },
     )
     .await

@@ -1,7 +1,8 @@
 use super::helpers::{
     build_task_event, collect_context_items, detect_modified_files, inject_skills_into_prompt,
-    matched_skills_for_prompt, run_agent_streaming, run_on_error, run_post_execute,
+    matched_skills_for_prompt, run_agent_streaming_with_options, run_on_error, run_post_execute,
     run_post_tool_use, run_pre_execute, telemetry_for_timeout, update_status,
+    RunAgentStreamingOptions,
 };
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, TaskFailureKind, TaskId, TaskStatus, TaskStore,
@@ -363,6 +364,13 @@ pub(crate) async fn run_implement_phase(
             .unwrap_or(2);
         let mut validation_attempt = 0u32;
         let mut impl_req = first_req.clone();
+        let is_auto_fix = store
+            .get(task_id)
+            .is_some_and(|s| s.source.as_deref() == Some("auto-fix"));
+        let impl_options = RunAgentStreamingOptions {
+            persist_artifacts: true,
+            backfill_auto_fix_issue: is_auto_fix,
+        };
 
         let resp = loop {
             if let Some(max) = effective_max_turns {
@@ -378,7 +386,7 @@ pub(crate) async fn run_implement_phase(
             let agent_started_at = Utc::now();
             let raw = tokio::time::timeout(
                 turn_timeout,
-                run_agent_streaming(
+                run_agent_streaming_with_options(
                     agent,
                     impl_req.clone(),
                     task_id,
@@ -386,6 +394,7 @@ pub(crate) async fn run_implement_phase(
                     1,
                     prompt_built_at,
                     agent_started_at,
+                    impl_options,
                 ),
             )
             .await;
