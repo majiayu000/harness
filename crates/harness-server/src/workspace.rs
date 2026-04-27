@@ -2181,7 +2181,7 @@ mod tests {
         let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr_a");
         let uuid_id = harness_core::types::TaskId("uuid-task-migration-123".to_string());
         let uuid_lease = mgr_a
-            .create_workspace(&uuid_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&uuid_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create uuid workspace");
 
@@ -2194,6 +2194,7 @@ mod tests {
                 task_id: "issue:42".to_string(),
                 run_generation: 1,
                 owner_session: "test-session".to_string(),
+                workspace_key: None,
             })
             .expect("serialize"),
         )
@@ -2241,7 +2242,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("orphan-uuid-task".to_string());
 
         let lease = mgr_a
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create workspace");
 
@@ -2275,7 +2276,7 @@ mod tests {
         let task_id = harness_core::types::TaskId("some-uuid-task".to_string());
 
         let lease = mgr
-            .create_workspace(&task_id, source.path(), "origin", &branch, 1)
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
             .await
             .expect("create workspace");
         mgr.active.remove(&task_id);
@@ -2313,6 +2314,7 @@ mod tests {
                 task_id: "issue:42".to_string(),
                 run_generation: 1,
                 owner_session: "s".to_string(),
+                workspace_key: None,
             })
             .expect("serialize"),
         )
@@ -2357,6 +2359,7 @@ mod tests {
                 task_id: "issue:7".to_string(),
                 run_generation: 1,
                 owner_session: "s".to_string(),
+                workspace_key: None,
             })
             .expect("serialize"),
         )
