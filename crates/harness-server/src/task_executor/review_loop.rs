@@ -24,10 +24,6 @@ enum ReviewTier {
     Codex,
 }
 
-/// Codex bot GitHub login, used as reviewer_name in tier B.
-const CODEX_REVIEWER_NAME: &str = "chatgpt-codex-connector[bot]";
-/// PR comment trigger for Codex review, used as review_bot_command in tier B.
-const CODEX_REVIEW_BOT_COMMAND: &str = "@codex";
 
 /// External state of a PR as observed via the GitHub API.
 ///
@@ -525,8 +521,8 @@ pub(crate) async fn run_review_loop(
                         // Escalate to Tier B: switch active bot to Codex.
                         tier = ReviewTier::Codex;
                         quota_exhausted_rounds = 0;
-                        active_review_bot_command = CODEX_REVIEW_BOT_COMMAND;
-                        active_reviewer_name = CODEX_REVIEWER_NAME;
+                        active_review_bot_command = &review_config.codex_review_bot_command;
+                        active_reviewer_name = &review_config.codex_reviewer_name;
                         tracing::info!(
                             task_id = %task_id,
                             quota_exhausted_rounds,
@@ -883,8 +879,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_constants_are_nonempty() {
-        assert!(!CODEX_REVIEWER_NAME.is_empty());
-        assert!(!CODEX_REVIEW_BOT_COMMAND.is_empty());
+    fn codex_config_defaults_are_nonempty() {
+        let cfg = harness_core::config::agents::AgentReviewConfig::default();
+        assert!(!cfg.codex_reviewer_name.is_empty());
+        assert!(!cfg.codex_review_bot_command.is_empty());
     }
 }

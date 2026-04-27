@@ -193,6 +193,12 @@ pub struct AgentReviewConfig {
     /// Agent name to resolve from the registry for Codex fallback (tier B).
     #[serde(default = "default_codex_fallback_agent")]
     pub codex_fallback_agent: String,
+    /// GitHub login of the Codex fallback bot (tier B reviewer_name).
+    #[serde(default = "default_codex_reviewer_name")]
+    pub codex_reviewer_name: String,
+    /// PR comment command to trigger Codex review (tier B review_bot_command).
+    #[serde(default = "default_codex_review_bot_command")]
+    pub codex_review_bot_command: String,
     /// Consecutive quota-exhausted rounds before escalating to Codex (tier B).
     #[serde(default = "default_quota_handoff_threshold")]
     pub quota_handoff_threshold: u32,
@@ -212,6 +218,8 @@ impl Default for AgentReviewConfig {
             reviewer_name: default_reviewer_name(),
             codex_fallback_enabled: false,
             codex_fallback_agent: default_codex_fallback_agent(),
+            codex_reviewer_name: default_codex_reviewer_name(),
+            codex_review_bot_command: default_codex_review_bot_command(),
             quota_handoff_threshold: default_quota_handoff_threshold(),
             silence_handoff_rounds: default_silence_handoff_rounds(),
         }
@@ -236,6 +244,14 @@ fn default_max_agent_review_rounds() -> u32 {
 
 fn default_codex_fallback_agent() -> String {
     "codex".to_string()
+}
+
+fn default_codex_reviewer_name() -> String {
+    "chatgpt-codex-connector[bot]".to_string()
+}
+
+fn default_codex_review_bot_command() -> String {
+    "@codex".to_string()
 }
 
 fn default_quota_handoff_threshold() -> u32 {
