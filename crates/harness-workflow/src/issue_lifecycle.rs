@@ -631,9 +631,15 @@ impl IssueWorkflowStore {
     }
 
     /// Patches only the `project_id` field inside the JSONB blob without replacing the whole row.
-    /// Note: the embedded `id` field inside the JSON may diverge from the stored `project_id` after
-    /// this patch. This is harmless because all sweep/claim queries select by
-    /// `data::jsonb->>'project_id'`, not the embedded `id`.
+    ///
+    /// WARNING: the row primary key (`id`) is NOT updated by this function. The `id` column embeds
+    /// the project_id, so after this patch the primary key will be stale and diverge from the JSON
+    /// `project_id` field. Subsequent lookups via the canonical path will compute a different
+    /// `workflow_id`, causing `ON CONFLICT DO NOTHING` to create duplicate orphan rows.
+    ///
+    /// Callers that resolve a canonical path MUST use [`IssueWorkflowStore::repair_project_id`]
+    /// instead, which performs a correct delete-then-insert in a single transaction.
+    ///
     /// Returns `Ok(())` even when no row matches `workflow_id` (zero rows affected is not an error).
     pub async fn update_project_path(
         &self,
