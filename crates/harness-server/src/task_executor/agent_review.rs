@@ -1,13 +1,12 @@
 use super::helpers::{
-    inject_skills_into_prompt, matched_skills_for_prompt, run_on_error, run_post_execute,
-    run_pre_execute, update_status,
+    augment_prompt_with_skills, run_on_error, run_post_execute, run_pre_execute, update_status,
 };
 use crate::task_runner::{mutate_and_persist, RoundResult, TaskId, TaskStatus, TaskStore};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
-use harness_core::types::{ContextItem, Decision, Event, ExecutionPhase, SessionId};
+use harness_core::types::{ContextItem, Event, ExecutionPhase, SessionId};
 use harness_observe::event_store::EventStore;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -65,7 +64,7 @@ pub(crate) async fn run_agent_review(
     pr_url: &str,
     project_type: &str,
     events: &EventStore,
-    skills: &Arc<RwLock<harness_skills::store::SkillStore>>,
+    skills: &RwLock<harness_skills::store::SkillStore>,
     cargo_env: &HashMap<String, String>,
     effective_max_turns: Option<u32>,
     turns_used: &mut u32,
@@ -81,30 +80,7 @@ pub(crate) async fn run_agent_review(
         // Reviewer evaluates the PR diff — read-only except Bash for `gh pr diff`.
         let base = prompts::agent_review_prompt(pr_url, agent_round, project_type);
         let note = prompts::agent_review_capability_note();
-        let matched_skills = matched_skills_for_prompt(skills, &base).await;
-        let skill_additions = inject_skills_into_prompt(skills, &base).await;
-        let augmented_base = if skill_additions.is_empty() {
-            base
-        } else {
-            base + &skill_additions
-        };
-        for (skill_id, skill_name) in matched_skills {
-            let mut skill_event = Event::new(
-                SessionId::new(),
-                "skill_used",
-                "task_runner",
-                Decision::Pass,
-            );
-            skill_event.reason = Some(skill_name);
-            skill_event.detail = Some(format!(
-                "task_id={} skill_id={}",
-                task_id.as_str(),
-                skill_id.as_str()
-            ));
-            if let Err(err) = events.log(&skill_event).await {
-                tracing::warn!(error = %err, "failed to log skill_used event");
-            }
-        }
+        let augmented_base = augment_prompt_with_skills(skills, events, task_id, base).await;
         let review_req = AgentRequest {
             prompt: format!("{note}\n\n{augmented_base}"),
             project_root: project.to_path_buf(),

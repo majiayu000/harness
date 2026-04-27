@@ -4,8 +4,10 @@ use harness_core::error::HarnessError;
 use harness_core::interceptor::{ToolUseEvent, TurnInterceptor};
 use harness_core::prompts;
 use harness_core::types::{
-    ContextItem, Decision, Item, SkillId, ThreadId, TokenUsage, TurnId, TurnStatus,
+    ContextItem, Decision, Event, Item, SessionId, SkillId, ThreadId, TokenUsage, TurnId,
+    TurnStatus,
 };
+use harness_observe::event_store::EventStore;
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::path::Path;
 use std::sync::Arc;
@@ -381,6 +383,83 @@ pub(crate) async fn matched_skills_for_prompt(
         .into_iter()
         .map(|s| (s.id.clone(), s.name.clone()))
         .collect()
+}
+
+/// Augment a prompt with matching skills: match once, record usage, log `skill_used` events,
+/// and return the augmented prompt string. Replaces the repeated
+/// `matched_skills_for_prompt` + `inject_skills_into_prompt` + event-log loop pattern.
+pub(crate) async fn augment_prompt_with_skills(
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
+    task_id: &TaskId,
+    prompt: String,
+) -> String {
+    // Early return when store is empty — avoids acquiring locks unnecessarily.
+    {
+        let guard = skills.read().await;
+        if guard.list().is_empty() {
+            return prompt;
+        }
+    }
+
+    // Single read pass: collect matched (id, name, content) and all skills (name, desc).
+    let (matched, all_skills) = {
+        let guard = skills.read().await;
+        let matched: Vec<(SkillId, String, String)> = guard
+            .match_prompt(&prompt)
+            .into_iter()
+            .map(|s| (s.id.clone(), s.name.clone(), s.content.clone()))
+            .collect();
+        let all: Vec<(String, String)> = guard
+            .list()
+            .iter()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect();
+        (matched, all)
+    };
+
+    // Record usage for matched skills (brief write lock).
+    if !matched.is_empty() {
+        let mut guard = skills.write().await;
+        for (id, _, _) in &matched {
+            guard.record_use(id);
+        }
+    }
+
+    // Log skill_used events.
+    for (skill_id, skill_name, _) in &matched {
+        let mut ev = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
+        ev.reason = Some(skill_name.clone());
+        ev.detail = Some(format!(
+            "task_id={} skill_id={}",
+            task_id.as_str(),
+            skill_id.as_str()
+        ));
+        if let Err(err) = events.log(&ev).await {
+            tracing::warn!(error = %err, "failed to log skill_used event");
+        }
+    }
+
+    // Build prompt addition.
+    let listing = harness_core::prompts::build_available_skills_listing(
+        all_skills.iter().map(|(n, d)| (n.as_str(), d.as_str())),
+    );
+    let section = harness_core::prompts::build_matched_skills_section(
+        matched.iter().map(|(_, n, c)| (n.as_str(), c.as_str())),
+    );
+    let mut additions = listing;
+    additions.push_str(&section);
+
+    if additions.is_empty() {
+        prompt
+    } else {
+        prompt + &additions
+    }
 }
 
 /// Match skills against the prompt, record usage for each match, and return a
