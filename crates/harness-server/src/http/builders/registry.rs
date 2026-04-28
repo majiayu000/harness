@@ -391,12 +391,11 @@ async fn migrate_issue_workflows_if_needed(
     let mut copied = 0usize;
     let mut skipped_existing = 0usize;
     for workflow in &legacy_rows {
-        if target_store.contains_id(&workflow.id).await? {
+        if target_store.insert_if_absent(workflow).await? {
+            copied += 1;
+        } else {
             skipped_existing += 1;
-            continue;
         }
-        target_store.upsert(workflow).await?;
-        copied += 1;
     }
     tracing::info!(
         legacy_count = legacy_rows.len(),
@@ -434,12 +433,11 @@ async fn migrate_project_workflows_if_needed(
     let mut copied = 0usize;
     let mut skipped_existing = 0usize;
     for workflow in &legacy_rows {
-        if target_store.contains_id(&workflow.id).await? {
+        if target_store.insert_if_absent(workflow).await? {
+            copied += 1;
+        } else {
             skipped_existing += 1;
-            continue;
         }
-        target_store.upsert(workflow).await?;
-        copied += 1;
     }
     tracing::info!(
         legacy_count = legacy_rows.len(),

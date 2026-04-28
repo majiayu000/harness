@@ -289,14 +289,17 @@ impl IssueWorkflowStore {
         Ok(())
     }
 
-    pub async fn contains_id(&self, workflow_id: &str) -> anyhow::Result<bool> {
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM issue_workflows WHERE id = $1)",
+    pub async fn insert_if_absent(&self, workflow: &IssueWorkflowInstance) -> anyhow::Result<bool> {
+        let data = serde_json::to_string(workflow)?;
+        let result = sqlx::query(
+            "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO NOTHING",
         )
-        .bind(workflow_id)
-        .fetch_one(&self.pool)
+        .bind(&workflow.id)
+        .bind(&data)
+        .execute(&self.pool)
         .await?;
-        Ok(exists)
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn get_by_issue(
@@ -849,8 +852,7 @@ impl IssueWorkflowStore {
         let new_data = serde_json::to_string(&new_workflow)?;
         sqlx::query(
             "INSERT INTO issue_workflows (id, data, created_at) VALUES ($1, $2, $3)
-             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
-                 updated_at = CURRENT_TIMESTAMP",
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(&new_workflow.id)
         .bind(&new_data)
@@ -1219,6 +1221,69 @@ mod tests {
             .await?
             .expect("new row should exist");
         assert_eq!(new.project_id, canonical);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_project_id_preserves_existing_canonical_row() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let corrupt_id = "/data/workspaces/abc-uuid-repair-conflict-test";
+        let canonical = "/real/canonical/conflict-root";
+
+        store
+            .record_issue_scheduled(
+                canonical,
+                Some("owner/repo"),
+                9003,
+                "target-task",
+                &[],
+                false,
+            )
+            .await?;
+        store
+            .record_pr_detected(
+                canonical,
+                Some("owner/repo"),
+                9003,
+                "target-pr-task",
+                99003,
+                "https://github.com/owner/repo/pull/99003",
+            )
+            .await?;
+        store
+            .record_issue_scheduled(
+                corrupt_id,
+                Some("owner/repo"),
+                9003,
+                "legacy-task",
+                &[],
+                false,
+            )
+            .await?;
+
+        let corrupt = store
+            .get_by_issue(corrupt_id, Some("owner/repo"), 9003)
+            .await?
+            .expect("corrupt row should exist");
+
+        store.repair_project_id(&corrupt.id, canonical).await?;
+
+        assert!(
+            store
+                .get_by_issue(corrupt_id, Some("owner/repo"), 9003)
+                .await?
+                .is_none(),
+            "corrupt row should be removed"
+        );
+        let preserved = store
+            .get_by_issue(canonical, Some("owner/repo"), 9003)
+            .await?
+            .expect("canonical row should remain present");
+        assert_eq!(preserved.state, IssueLifecycleState::PrOpen);
+        assert_eq!(preserved.pr_number, Some(99003));
+        assert_eq!(preserved.active_task_id.as_deref(), Some("target-pr-task"));
         Ok(())
     }
 

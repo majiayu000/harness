@@ -222,14 +222,20 @@ impl ProjectWorkflowStore {
         Ok(())
     }
 
-    pub async fn contains_id(&self, workflow_id: &str) -> anyhow::Result<bool> {
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM project_workflows WHERE id = $1)",
+    pub async fn insert_if_absent(
+        &self,
+        workflow: &ProjectWorkflowInstance,
+    ) -> anyhow::Result<bool> {
+        let data = serde_json::to_string(workflow)?;
+        let result = sqlx::query(
+            "INSERT INTO project_workflows (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO NOTHING",
         )
-        .bind(workflow_id)
-        .fetch_one(&self.pool)
+        .bind(&workflow.id)
+        .bind(&data)
+        .execute(&self.pool)
         .await?;
-        Ok(exists)
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn get_by_project(
