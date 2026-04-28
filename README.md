@@ -5,8 +5,18 @@
 **An orchestration layer for AI coding agents — govern, observe, and improve agent workflows at scale.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.88+-orange.svg)](https://www.rust-lang.org)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml)
 [![CI](https://img.shields.io/github/actions/workflow/status/majiayu000/harness/ci.yml?branch=main&label=CI)](https://github.com/majiayu000/harness/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/majiayu000/harness?include_prereleases&label=release)](https://github.com/majiayu000/harness/releases)
+[![Issues](https://img.shields.io/github/issues/majiayu000/harness?label=issues)](https://github.com/majiayu000/harness/issues)
+[![Pull Requests](https://img.shields.io/github/issues-pr/majiayu000/harness?label=PRs)](https://github.com/majiayu000/harness/pulls)
+[![Security Policy](https://img.shields.io/badge/security-policy-brightgreen.svg)](SECURITY.md)
+
+![AI Agents](https://img.shields.io/badge/AI_Agents-222222.svg)
+![Multi-Agent Orchestration](https://img.shields.io/badge/Multi--Agent-Orchestration-4c6fff.svg)
+![Policy Engine](https://img.shields.io/badge/Policy-Engine-0f766e.svg)
+![Observability](https://img.shields.io/badge/Observability-OTLP-7c3aed.svg)
+![MCP Server](https://img.shields.io/badge/MCP-Server-2563eb.svg)
 
 [Documentation](docs/) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
