@@ -331,7 +331,7 @@ pub(crate) async fn run_implement_phase(
             project_root: project.to_path_buf(),
             context: context_items.clone(),
             max_budget_usd: req.max_budget_usd,
-            execution_phase: Some(ExecutionPhase::Planning),
+            execution_phase: Some(ExecutionPhase::Execution),
             allowed_tools: initial_allowed_tools.clone(),
             env_vars: cargo_env.clone(),
             ..Default::default()
