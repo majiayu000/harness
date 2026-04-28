@@ -128,7 +128,7 @@ jobs:
           bun run build
       - run: cargo test --workspace
         env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/harness_test
+          HARNESS_DATABASE_URL: postgres://postgres:postgres@localhost:5432/harness_test
 
   audit:
     name: Security Audit
