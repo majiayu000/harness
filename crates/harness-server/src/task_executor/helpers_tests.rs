@@ -484,6 +484,27 @@ async fn inject_skills_empty_store_returns_empty_string() {
     );
 }
 
+#[test]
+fn inject_project_context_appends_agents_and_claude_instructions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "Always run cargo check").unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "Use English only").unwrap();
+
+    let result = inject_project_context_into_prompt(dir.path(), "Base task".to_string());
+
+    assert!(result.contains("Base task"));
+    assert!(result.contains("## Project Instructions"));
+    assert!(result.contains("Always run cargo check"));
+    assert!(result.contains("Use English only"));
+}
+
+#[test]
+fn inject_project_context_noops_without_instruction_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = inject_project_context_into_prompt(dir.path(), "Base task".to_string());
+    assert_eq!(result, "Base task");
+}
+
 fn make_skill_store_with_two_matching() -> harness_skills::store::SkillStore {
     let mut store = harness_skills::store::SkillStore::new();
     store.create(

@@ -313,6 +313,25 @@ pub(crate) async fn collect_context_items(
     items
 }
 
+/// Inject project instruction files directly into the prompt text.
+///
+/// Harness currently invokes CLI agents in single-turn mode (`claude -p` /
+/// `codex ...`), and `AgentRequest.context` is retained for observability rather
+/// than automatically forwarded to the CLI. Embed AGENTS.md / CLAUDE.md content
+/// in the prompt so agents actually see project-specific rules.
+pub(crate) fn inject_project_context_into_prompt(project_root: &Path, prompt: String) -> String {
+    let project_context = harness_core::agents_md::load_agents_md(project_root);
+    if project_context.trim().is_empty() {
+        return prompt;
+    }
+
+    format!(
+        "{prompt}\n\n## Project Instructions\n\
+         The following trusted project instructions were loaded from AGENTS.md / CLAUDE.md files. \
+         Follow them for this task.\n\n{project_context}"
+    )
+}
+
 /// Return all skills whose trigger patterns match `prompt`, including their IDs
 /// and names for observability/event logging.
 pub(crate) async fn matched_skills_for_prompt(

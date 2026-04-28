@@ -193,6 +193,7 @@ async fn run_non_implementation_task(
         system_input.prompt().to_string(),
         server_config.server.constitution_enabled,
     );
+    prompt = helpers::inject_project_context_into_prompt(project, prompt);
     let skill_additions = helpers::inject_skills_into_prompt(skills, &prompt).await;
     if !skill_additions.is_empty() {
         prompt.push_str(&skill_additions);

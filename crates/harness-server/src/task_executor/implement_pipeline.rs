@@ -1,7 +1,7 @@
 use super::helpers::{
-    collect_context_items, detect_modified_files, inject_skills_into_prompt,
-    matched_skills_for_prompt, run_agent_streaming, run_on_error, run_post_execute,
-    run_post_tool_use, run_pre_execute, update_status,
+    collect_context_items, detect_modified_files, inject_project_context_into_prompt,
+    inject_skills_into_prompt, matched_skills_for_prompt, run_agent_streaming, run_on_error,
+    run_post_execute, run_post_tool_use, run_pre_execute, update_status,
 };
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, TaskFailureKind, TaskId, TaskStatus, TaskStore,
@@ -232,6 +232,11 @@ pub(crate) async fn run_implement_phase(
     // Prepend the Golden Principles constitution when enabled.
     let first_prompt =
         prepend_constitution(first_prompt, server_config.server.constitution_enabled);
+
+    // Inject project instructions directly into the prompt text.
+    // AgentRequest.context is retained for observability, but CLI agents do not
+    // receive it automatically in single-turn mode.
+    let first_prompt = inject_project_context_into_prompt(project, first_prompt);
 
     // Inject skill content directly into the prompt text.
     // Since harness uses single-turn `claude -p`, context items are not visible
