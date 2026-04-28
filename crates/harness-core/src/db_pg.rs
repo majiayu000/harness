@@ -68,18 +68,42 @@ fn database_url_config_paths() -> anyhow::Result<Vec<PathBuf>> {
         paths.push(path);
     }
 
-    let mut dir = std::env::current_dir()?;
-    loop {
-        let local_default = dir.join("config/default.toml");
-        if local_default.is_file() && !paths.iter().any(|path| path == &local_default) {
-            paths.push(local_default);
-            break;
-        }
-        if !dir.pop() {
-            break;
+    if let Some(path) = repository_default_config_from_dir(std::env::current_dir()?) {
+        push_unique_path(&mut paths, path);
+    }
+
+    // Unit tests may temporarily change the process CWD while other tests open
+    // stores concurrently. The test binary path is stable, so this preserves the
+    // repository config fallback without reading the generic DATABASE_URL.
+    if std::env::var_os("XDG_CONFIG_HOME").is_none() {
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(parent) = current_exe.parent() {
+                if let Some(path) = repository_default_config_from_dir(parent) {
+                    push_unique_path(&mut paths, path);
+                }
+            }
         }
     }
     Ok(paths)
+}
+
+fn repository_default_config_from_dir(start: impl AsRef<Path>) -> Option<PathBuf> {
+    let mut dir = start.as_ref().to_path_buf();
+    loop {
+        let local_default = dir.join("config/default.toml");
+        if local_default.is_file() {
+            return Some(local_default);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
 fn load_database_url_from_path(path: &Path) -> anyhow::Result<Option<String>> {
