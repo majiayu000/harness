@@ -484,6 +484,56 @@ async fn inject_skills_empty_store_returns_empty_string() {
     );
 }
 
+#[test]
+fn inject_project_context_appends_agents_and_claude_instructions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "Always run cargo check").unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "Use English only").unwrap();
+
+    let result = inject_project_context_into_prompt(dir.path(), "Base task".to_string());
+
+    assert!(result.contains("Base task"));
+    assert!(result.contains("## Project Instructions"));
+    assert!(result.contains("Always run cargo check"));
+    assert!(result.contains("Use English only"));
+}
+
+#[test]
+fn inject_project_context_noops_without_instruction_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = inject_project_context_into_prompt(dir.path(), "Base task".to_string());
+    assert_eq!(result, "Base task");
+}
+
+#[tokio::test]
+async fn project_context_text_does_not_cause_skill_match_when_matching_original_prompt() {
+    let mut store = harness_skills::store::SkillStore::new();
+    store.create(
+        "review".to_string(),
+        "# Review\n<!-- trigger-patterns: code review -->\nReview code carefully.".to_string(),
+    );
+    let skills = RwLock::new(store);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "please do a code review").unwrap();
+
+    let original_prompt = "implement feature X".to_string();
+    let injected_prompt = inject_project_context_into_prompt(dir.path(), original_prompt.clone());
+
+    let matched_original = matched_skills_for_prompt(&skills, &original_prompt).await;
+    let matched_injected = matched_skills_for_prompt(&skills, &injected_prompt).await;
+
+    assert!(
+        matched_original.is_empty(),
+        "task prompt alone should not match the review skill"
+    );
+    assert_eq!(
+        matched_injected.len(),
+        1,
+        "project instruction content would falsely match without preserving the original task prompt"
+    );
+}
+
 fn make_skill_store_with_two_matching() -> harness_skills::store::SkillStore {
     let mut store = harness_skills::store::SkillStore::new();
     store.create(
