@@ -150,13 +150,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             .config
             .reconciliation
             .max_gh_calls_per_minute;
-        crate::reconciliation::run_once(
-            &state.core.tasks,
-            &state.core.project_root,
-            max_calls,
-            false,
-        )
-        .await;
+        crate::reconciliation::run_once(&state.core.tasks, max_calls, false).await;
     }
 
     // Re-dispatch tasks that were recovered to pending after server restart.
