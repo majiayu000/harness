@@ -68,8 +68,10 @@ fn database_url_config_paths() -> anyhow::Result<Vec<PathBuf>> {
         paths.push(path);
     }
 
-    if let Some(path) = repository_default_config_from_dir(std::env::current_dir()?) {
-        push_unique_path(&mut paths, path);
+    if let Ok(current_dir) = std::env::current_dir() {
+        if let Some(path) = repository_default_config_from_dir(current_dir) {
+            push_unique_path(&mut paths, path);
+        }
     }
 
     // Unit tests may temporarily change the process CWD while other tests open
@@ -526,6 +528,46 @@ mod tests {
                 assert_eq!(
                     resolved,
                     "postgres://repo-user:repo-pass@repo-host:5432/repodb"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn discovered_config_survives_deleted_current_dir() {
+        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let xdg = home.path().join("xdg");
+        let harness_dir = xdg.join("harness");
+        std::fs::create_dir_all(&harness_dir).expect("create config dir");
+
+        let mut config = crate::config::HarnessConfig::default();
+        config.server.database_url =
+            Some("postgres://file-user:file-pass@file-host:5432/filedb".to_string());
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let cwd_path = cwd.path().to_path_buf();
+        let _cwd = CurrentDirGuard::enter(&cwd_path);
+        drop(cwd);
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.path().to_str().expect("utf8 home"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let resolved =
+                    resolve_database_url(None).expect("config database URL should resolve");
+                assert_eq!(
+                    resolved,
+                    "postgres://file-user:file-pass@file-host:5432/filedb"
                 );
             },
         );

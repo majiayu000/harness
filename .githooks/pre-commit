@@ -13,12 +13,12 @@ echo "=== pre-commit: clippy ==="
 RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets
 
 echo "=== pre-commit: test ==="
-# harness-server lib tests require a live Postgres instance (DATABASE_URL).
-# Run them when DATABASE_URL is set; otherwise skip them and let CI catch failures.
-if [ -n "${DATABASE_URL:-}" ]; then
+# harness-server lib tests require a live Postgres instance.
+# Run them when a Harness database URL is set; otherwise skip them and let CI catch failures.
+if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
     cargo test --workspace --lib
 else
-    echo "DATABASE_URL not set — skipping Postgres-dependent lib tests (harness-server, harness-observe, harness-workflow)"
+    echo "HARNESS_DATABASE_URL not set — skipping Postgres-dependent lib tests (harness-server, harness-observe, harness-workflow)"
     cargo test --workspace --lib --exclude harness-server --exclude harness-observe --exclude harness-workflow
 fi
 
