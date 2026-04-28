@@ -845,6 +845,50 @@ async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn create_task_with_unresolved_dependencies_returns_awaiting_deps() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let dep = task_runner::TaskState::new(task_runner::TaskId::new());
+    let dep_id = dep.id.clone();
+    state.core.tasks.insert(&dep).await;
+
+    let app = task_app(state.clone());
+    let body = serde_json::json!({
+        "prompt": "fix the bug after deps",
+        "depends_on": [dep_id.0.clone()],
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let resp = response_json(response).await?;
+    assert_eq!(resp["status"], "awaiting_deps");
+
+    let task_id = harness_core::types::TaskId(
+        resp["task_id"]
+            .as_str()
+            .expect("task_id should be string")
+            .to_string(),
+    );
+    let task = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must be inserted into the task store");
+    assert!(matches!(task.status, task_runner::TaskStatus::AwaitingDeps));
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_task_empty_request_returns_bad_request() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
