@@ -222,6 +222,16 @@ impl ProjectWorkflowStore {
         Ok(())
     }
 
+    pub async fn contains_id(&self, workflow_id: &str) -> anyhow::Result<bool> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM project_workflows WHERE id = $1)",
+        )
+        .bind(workflow_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     pub async fn get_by_project(
         &self,
         project_id: &str,
