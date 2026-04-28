@@ -154,11 +154,8 @@ mod tests {
         );
     }
 
-    // Serialize env-var tests to prevent races when cargo runs tests in parallel.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::process_env_lock();
         // Save originals.
         let saved: Vec<(&str, Option<String>)> = vars
             .iter()

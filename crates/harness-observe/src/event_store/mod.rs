@@ -1,9 +1,6 @@
 use chrono::{DateTime, Utc};
 use harness_core::config::misc::OtelConfig;
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{Migration, PgStoreContext};
 use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     SessionId, Severity, Violation,
@@ -73,23 +70,10 @@ impl EventStore {
         std::fs::create_dir_all(data_dir)?;
         let data_dir = data_dir.to_path_buf();
 
-        let database_url = resolve_database_url(configured_database_url)?;
-        use sha2::{Digest, Sha256};
         let events_path = data_dir.join("events.db");
-        let path_utf8 = events_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", events_path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
-
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, EVENT_MIGRATIONS).run().await?;
+        let pool = PgStoreContext::from_path(&events_path, configured_database_url)?
+            .open_migrated_pool(EVENT_MIGRATIONS)
+            .await?;
 
         let store = Self {
             pool,

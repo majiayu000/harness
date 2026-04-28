@@ -75,6 +75,12 @@ impl CodeAgent for MockPrAgent {
 // Helpers
 // ---------------------------------------------------------------------------
 
+static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn db_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    DB_TEST_LOCK.lock().await
+}
+
 async fn make_state(root: &Path) -> anyhow::Result<harness_server::http::AppState> {
     make_state_with_auto_pr(root, true).await
 }
@@ -145,6 +151,7 @@ fn make_draft(artifact_path: &Path, content: &str) -> Draft {
 /// gc_adopt writes artifact files and dispatches an agent task.
 #[tokio::test]
 async fn gc_adopt_dispatches_task_with_prompt() -> anyhow::Result<()> {
+    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-pipeline-")?;
     let state = make_state(sandbox.path()).await?;
 
@@ -174,6 +181,7 @@ async fn gc_adopt_dispatches_task_with_prompt() -> anyhow::Result<()> {
 /// gc_adopt returns adopted=true with null task_id when there are no artifacts.
 #[tokio::test]
 async fn gc_adopt_no_artifacts_returns_null_task_id() -> anyhow::Result<()> {
+    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-no-artifacts-")?;
     let state = make_state(sandbox.path()).await?;
 
@@ -208,6 +216,7 @@ async fn gc_adopt_no_artifacts_returns_null_task_id() -> anyhow::Result<()> {
 /// gc_adopt returns NOT_FOUND for an unknown draft ID.
 #[tokio::test]
 async fn gc_adopt_unknown_draft_returns_not_found() -> anyhow::Result<()> {
+    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-not-found-")?;
     let state = make_state(sandbox.path()).await?;
 
@@ -226,6 +235,7 @@ async fn gc_adopt_unknown_draft_returns_not_found() -> anyhow::Result<()> {
 /// gc_adopt with auto_pr=false skips task dispatch and returns null task_id.
 #[tokio::test]
 async fn gc_adopt_auto_pr_false_skips_task_dispatch() -> anyhow::Result<()> {
+    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-no-auto-pr-")?;
     let state = make_state_with_auto_pr(sandbox.path(), false).await?;
 
@@ -254,6 +264,7 @@ async fn gc_adopt_auto_pr_false_skips_task_dispatch() -> anyhow::Result<()> {
 /// gc_adopt with auto_pr=true (default) dispatches a task when artifacts exist.
 #[tokio::test]
 async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
+    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-auto-pr-true-")?;
     let state = make_state_with_auto_pr(sandbox.path(), true).await?;
 
@@ -282,6 +293,7 @@ async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
 /// gc_adopt with auto_pr=true fails before adopt when no default agent is registered.
 #[tokio::test]
 async fn gc_adopt_auto_pr_requires_default_agent() -> anyhow::Result<()> {
+    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-no-default-agent-")?;
     let state = make_state_without_default_agent(sandbox.path()).await?;
 
@@ -372,6 +384,7 @@ impl CodeAgent for CapturingAgent {
 /// runs directly against the project_root (no git worktree indirection).
 #[tokio::test]
 async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
+    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-project-root-")?;
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
@@ -467,6 +480,7 @@ async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
 /// Covers the repeat-adopt and reject/adopt-race scenarios identified in review round 1.
 #[tokio::test]
 async fn gc_adopt_non_pending_draft_returns_conflict() -> anyhow::Result<()> {
+    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-non-pending-")?;
     let state = make_state(sandbox.path()).await?;
 

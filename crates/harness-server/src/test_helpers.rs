@@ -5,7 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use harness_core::db::pg_open_pool;
+use harness_core::db::{pg_open_pool, resolve_database_url};
 use tokio::sync::OnceCell;
 
 /// Serialises every test that reads or mutates the process-global `HOME` env
@@ -54,7 +54,6 @@ impl Drop for HomeGuard {
 use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
-use sha2::{Digest, Sha256};
 
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
@@ -75,13 +74,13 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
 }
 
 pub async fn db_tests_enabled() -> bool {
-    if std::env::var("DATABASE_URL").is_err() {
+    if resolve_database_url(None).is_err() {
         return false;
     }
 
     *DB_AVAILABLE
         .get_or_init(|| async {
-            let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            let Ok(database_url) = resolve_database_url(None) else {
                 return false;
             };
             match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {
@@ -117,13 +116,7 @@ pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> 
 pub async fn drop_tasks_table(dir: &std::path::Path) -> anyhow::Result<()> {
     let db_path = harness_core::config::dirs::default_db_path(dir, "tasks");
     let database_url = harness_core::db::resolve_database_url(None)?;
-    let path_utf8 = db_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", db_path))?;
-    let digest = Sha256::digest(path_utf8.as_bytes());
-    let mut schema_bytes = [0u8; 8];
-    schema_bytes.copy_from_slice(&digest[..8]);
-    let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
+    let schema = harness_core::db::pg_schema_for_path(&db_path)?;
     let pool = harness_core::db::pg_open_pool_schematized(&database_url, &schema).await?;
     sqlx::query("DROP TABLE tasks CASCADE")
         .execute(&pool)

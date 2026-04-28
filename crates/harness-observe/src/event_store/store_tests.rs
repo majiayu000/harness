@@ -1,7 +1,7 @@
 use super::*;
 use harness_core::{
     config::misc::OtelExporter,
-    db::pg_open_pool,
+    db::{pg_open_pool, resolve_database_url},
     types::{AutoFixAttempt, RuleId},
 };
 use std::path::Path;
@@ -22,13 +22,13 @@ fn db_semaphore() -> Arc<tokio::sync::Semaphore> {
 }
 
 async fn db_tests_enabled() -> bool {
-    if std::env::var("DATABASE_URL").is_err() {
+    if resolve_database_url(None).is_err() {
         return false;
     }
 
     *DB_AVAILABLE
         .get_or_init(|| async {
-            let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            let Ok(database_url) = resolve_database_url(None) else {
                 return false;
             };
             match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {

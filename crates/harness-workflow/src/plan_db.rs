@@ -1,7 +1,4 @@
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{Migration, PgStoreContext};
 use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use harness_exec::plan::ExecPlan;
 use sqlx::postgres::PgPool;
@@ -50,22 +47,9 @@ impl PlanDb {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let database_url = resolve_database_url(configured_database_url)?;
-        use sha2::{Digest, Sha256};
-        let path_utf8 = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
-
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, PLAN_MIGRATIONS).run().await?;
+        let pool = PgStoreContext::from_path(path, configured_database_url)?
+            .open_migrated_pool(PLAN_MIGRATIONS)
+            .await?;
         Ok(Self {
             pool,
             update_lock: tokio::sync::Mutex::new(()),
@@ -215,6 +199,10 @@ impl PlanDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::db::{
+        pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, pg_schema_for_path,
+        resolve_database_url, PgMigrator,
+    };
     use harness_core::types::ExecPlanStatus;
     use std::sync::OnceLock;
     use tokio::sync::{Semaphore, SemaphorePermit};
@@ -229,7 +217,7 @@ mod tests {
 
     async fn open_test_store(
     ) -> anyhow::Result<Option<(PlanDb, tempfile::TempDir, SemaphorePermit<'static>)>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let permit = db_gate().acquire().await?;
@@ -421,27 +409,18 @@ mod tests {
     /// pre-existing TEXT rows survive the `USING data::jsonb` cast.
     #[tokio::test]
     async fn migration_contract_text_to_jsonb_gin() -> anyhow::Result<()> {
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        let Ok(database_url) = resolve_database_url(None) else {
             return Ok(());
         };
         let _permit = db_gate().acquire().await?;
 
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("migrate_contract");
-        use sha2::{Digest, Sha256};
-        let path_utf8 = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
+        let schema = pg_schema_for_path(&path)?;
 
         let setup = pg_open_pool(&database_url).await?;
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
-            .execute(&setup)
-            .await?;
-        drop(setup);
+        pg_create_schema_if_not_exists(&setup, &schema).await?;
+        setup.close().await;
 
         let pool = pg_open_pool_schematized(&database_url, &schema).await?;
 

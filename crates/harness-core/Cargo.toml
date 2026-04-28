@@ -17,6 +17,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 anyhow = { workspace = true }
 sqlx = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

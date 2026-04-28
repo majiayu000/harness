@@ -1,16 +1,17 @@
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use crate::db::Migration;
 
-const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
+const DEFAULT_PG_MAX_CONNECTIONS: u32 = 1;
 const SUPABASE_POOLER_MAX_CONNECTIONS: u32 = 1;
 
 fn pg_max_connections(database_url: &str) -> u32 {
-    // Supabase's session pooler has a tight session cap relative to the
-    // number of independent Postgres-backed stores the workspace tests create.
-    // Budget one session per store there to avoid test-time pool starvation.
+    // Harness currently opens independent pools per logical store. Keep the
+    // per-store default conservative so parallel startup/tests do not multiply
+    // a modest Postgres connection budget into pool starvation.
     if database_url.contains(".pooler.supabase.com") {
         SUPABASE_POOLER_MAX_CONNECTIONS
     } else {
@@ -22,7 +23,9 @@ fn pg_max_connections(database_url: &str) -> u32 {
 ///
 /// Precedence:
 /// 1. Explicit configured URL (for example `server.database_url` from TOML)
-/// 2. Legacy `DATABASE_URL` environment variable fallback
+/// 2. `HARNESS_DATABASE_URL` config override
+/// 3. Discovered Harness config file
+/// 4. Repository-local `config/default.toml`
 pub fn resolve_database_url(configured_database_url: Option<&str>) -> anyhow::Result<String> {
     if let Some(url) = configured_database_url
         .map(str::trim)
@@ -30,20 +33,193 @@ pub fn resolve_database_url(configured_database_url: Option<&str>) -> anyhow::Re
     {
         return Ok(url.to_string());
     }
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        let url = url.trim();
-        if !url.is_empty() {
-            return Ok(url.to_string());
-        }
+
+    if let Some(url) = configured_database_url_from_config()? {
+        return Ok(url);
     }
+
     anyhow::bail!(
-        "database URL is not configured; set server.database_url in TOML or DATABASE_URL in the environment"
+        "database URL is not configured; set server.database_url in TOML or HARNESS_DATABASE_URL in the environment"
     )
 }
 
-/// Create a Postgres connection pool for the given DATABASE_URL.
+fn configured_database_url_from_config() -> anyhow::Result<Option<String>> {
+    if let Some(url) = configured_database_url_from_env("HARNESS_DATABASE_URL") {
+        return Ok(Some(url));
+    }
+    for path in database_url_config_paths()? {
+        if let Some(url) = load_database_url_from_path(&path)? {
+            return Ok(Some(url));
+        }
+    }
+    Ok(None)
+}
+
+fn configured_database_url_from_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+}
+
+fn database_url_config_paths() -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if let Some(path) = crate::config::dirs::find_config_file() {
+        paths.push(path);
+    }
+
+    if let Some(path) = repository_default_config_from_dir(std::env::current_dir()?) {
+        push_unique_path(&mut paths, path);
+    }
+
+    // Unit tests may temporarily change the process CWD while other tests open
+    // stores concurrently. The test binary path is stable, so this preserves the
+    // repository config fallback without reading the generic DATABASE_URL.
+    if std::env::var_os("XDG_CONFIG_HOME").is_none() {
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(parent) = current_exe.parent() {
+                if let Some(path) = repository_default_config_from_dir(parent) {
+                    push_unique_path(&mut paths, path);
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn repository_default_config_from_dir(start: impl AsRef<Path>) -> Option<PathBuf> {
+    let mut dir = start.as_ref().to_path_buf();
+    loop {
+        let local_default = dir.join("config/default.toml");
+        if local_default.is_file() {
+            return Some(local_default);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn load_database_url_from_path(path: &Path) -> anyhow::Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct DatabaseConfigFile {
+        #[serde(default)]
+        server: DatabaseServerConfig,
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    struct DatabaseServerConfig {
+        #[serde(default)]
+        database_url: Option<String>,
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    let config: DatabaseConfigFile = toml::from_str(&content)?;
+    Ok(config
+        .server
+        .database_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned))
+}
+
+/// Derive the legacy per-store Postgres schema name from a store identity path.
 ///
-/// Uses 8 max connections by default, or 1 for Supabase pooler URLs, with a
+/// Historical SQLite-backed stores accepted a database file path. The Postgres
+/// backend preserves that identity boundary by hashing the path into a stable
+/// schema name, so existing data remains addressable after this helper is used
+/// by all stores.
+pub fn pg_schema_for_path(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let path_utf8 = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
+    let digest = Sha256::digest(path_utf8.as_bytes());
+    let mut schema_bytes = [0u8; 8];
+    schema_bytes.copy_from_slice(&digest[..8]);
+    Ok(format!("h{:016x}", u64::from_le_bytes(schema_bytes)))
+}
+
+/// Postgres context for a single logical store.
+///
+/// This centralizes the strategy that used to be repeated by every store:
+/// resolve the configured URL, derive or validate the schema, create the
+/// schema, open a schematized pool, and optionally run migrations.
+#[derive(Clone)]
+pub struct PgStoreContext {
+    database_url: String,
+    schema: String,
+}
+
+impl std::fmt::Debug for PgStoreContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgStoreContext")
+            .field("database_url", &"[REDACTED]")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl PgStoreContext {
+    pub fn from_path(path: &Path, configured_database_url: Option<&str>) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
+        Self::new(database_url, pg_schema_for_path(path)?)
+    }
+
+    pub fn from_schema(
+        schema: &str,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
+        Self::new(database_url, schema.to_string())
+    }
+
+    pub fn new(database_url: impl Into<String>, schema: impl Into<String>) -> anyhow::Result<Self> {
+        let database_url = database_url.into().trim().to_string();
+        if database_url.is_empty() {
+            anyhow::bail!("database URL must not be empty");
+        }
+        let schema = schema.into();
+        validate_schema_name(&schema)?;
+        Ok(Self {
+            database_url,
+            schema,
+        })
+    }
+
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub async fn open_pool(&self) -> anyhow::Result<PgPool> {
+        let setup = pg_open_pool(&self.database_url).await?;
+        pg_create_schema_if_not_exists(&setup, &self.schema).await?;
+        setup.close().await;
+        pg_open_pool_schematized(&self.database_url, &self.schema).await
+    }
+
+    pub async fn open_migrated_pool(&self, migrations: &[Migration]) -> anyhow::Result<PgPool> {
+        let pool = self.open_pool().await?;
+        PgMigrator::new(&pool, migrations).run().await?;
+        Ok(pool)
+    }
+}
+
+/// Create a Postgres connection pool for the given connection string.
+///
+/// Uses 1 max connection per logical store by default, with a
 /// 10-second acquire timeout.
 pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
@@ -225,8 +401,29 @@ impl<'a> PgMigrator<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        pg_max_connections, resolve_database_url, validate_schema_name, DEFAULT_PG_MAX_CONNECTIONS,
+        pg_max_connections, pg_schema_for_path, resolve_database_url, validate_schema_name,
+        PgStoreContext, DEFAULT_PG_MAX_CONNECTIONS,
     };
+    use crate::test_support::process_env_lock;
+    use std::path::Path;
+
+    struct CurrentDirGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &std::path::Path) -> Self {
+            let original = std::env::current_dir().expect("current dir");
+            std::env::set_current_dir(path).expect("set current dir");
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).expect("restore current dir");
+        }
+    }
 
     #[test]
     fn valid_schema_names() {
@@ -294,12 +491,70 @@ mod tests {
     }
 
     #[test]
-    fn configured_database_url_wins_over_environment() {
+    fn pg_schema_for_path_preserves_legacy_hash_format() {
+        let schema = pg_schema_for_path(Path::new("/tmp/harness/tasks.db"))
+            .expect("path schema should resolve");
+
+        assert_eq!(schema, "h1b76aa87802f7705");
+    }
+
+    #[test]
+    fn pg_store_context_from_path_uses_configured_url_and_path_schema() {
+        let context = PgStoreContext::from_path(
+            Path::new("/tmp/harness/tasks.db"),
+            Some(" postgres://user:pass@localhost:5432/harness "),
+        )
+        .expect("store context should resolve");
+
+        assert_eq!(
+            context.database_url(),
+            "postgres://user:pass@localhost:5432/harness"
+        );
+        assert_eq!(context.schema(), "h1b76aa87802f7705");
+    }
+
+    #[test]
+    fn pg_store_context_debug_redacts_database_url() {
+        let context = PgStoreContext::new(
+            "postgres://user:secret@localhost:5432/harness",
+            "h1b76aa87802f7705",
+        )
+        .expect("store context should resolve");
+        let debug = format!("{context:?}");
+
+        assert!(debug.contains("database_url: \"[REDACTED]\""));
+        assert!(debug.contains("schema: \"h1b76aa87802f7705\""));
+        assert!(
+            !debug.contains("secret"),
+            "debug output must not expose database credentials: {debug}"
+        );
+    }
+
+    #[test]
+    fn pg_store_context_rejects_invalid_schema() {
+        let err = PgStoreContext::new("postgres://user:pass@localhost:5432/harness", "bad-schema")
+            .expect_err("invalid schema should fail");
+
+        assert!(
+            err.to_string().contains("ASCII letters"),
+            "error should explain schema validation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn configured_database_url_wins_over_config_sources() {
+        let _lock = process_env_lock();
         temp_env::with_vars(
-            [(
-                "DATABASE_URL",
-                Some("postgres://env-user:env-pass@env-host:5432/envdb"),
-            )],
+            [
+                (
+                    "HARNESS_DATABASE_URL",
+                    Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://ignored-user:ignored-pass@ignored-host:5432/ignoreddb"),
+                ),
+            ],
             || {
                 let resolved =
                     resolve_database_url(Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb"))
@@ -310,28 +565,158 @@ mod tests {
     }
 
     #[test]
-    fn environment_database_url_used_as_fallback() {
+    fn harness_database_url_used_as_config_override() {
+        let _lock = process_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
         temp_env::with_vars(
-            [(
-                "DATABASE_URL",
-                Some("postgres://env-user:env-pass@env-host:5432/envdb"),
-            )],
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                (
+                    "HARNESS_DATABASE_URL",
+                    Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://ignored-user:ignored-pass@ignored-host:5432/ignoreddb"),
+                ),
+            ],
             || {
                 let resolved =
-                    resolve_database_url(None).expect("environment database URL should resolve");
+                    resolve_database_url(None).expect("HARNESS_DATABASE_URL should resolve");
                 assert_eq!(resolved, "postgres://env-user:env-pass@env-host:5432/envdb");
             },
         );
     }
 
     #[test]
+    fn discovered_config_database_url_used_as_fallback() {
+        let _lock = process_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
+        let harness_dir = xdg.join("harness");
+        std::fs::create_dir_all(&harness_dir).expect("create config dir");
+
+        let mut config = crate::config::HarnessConfig::default();
+        config.server.database_url =
+            Some("postgres://file-user:file-pass@file-host:5432/filedb".to_string());
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://ignored-user:ignored-pass@ignored-host:5432/ignoreddb"),
+                ),
+            ],
+            || {
+                let resolved =
+                    resolve_database_url(None).expect("config database URL should resolve");
+                assert_eq!(
+                    resolved,
+                    "postgres://file-user:file-pass@file-host:5432/filedb"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn repository_default_config_database_url_used_as_fallback() {
+        let _lock = process_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("xdg");
+        let repo_config = dir.path().join("config");
+        let nested_cwd = dir.path().join("crates/harness-core");
+        std::fs::create_dir_all(&repo_config).expect("create repo config dir");
+        std::fs::create_dir_all(&nested_cwd).expect("create nested cwd");
+        std::fs::write(
+            repo_config.join("default.toml"),
+            r#"
+                [server]
+                database_url = "postgres://repo-user:repo-pass@repo-host:5432/repodb"
+            "#,
+        )
+        .expect("write repo config");
+
+        let _cwd = CurrentDirGuard::enter(&nested_cwd);
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://ignored-user:ignored-pass@ignored-host:5432/ignoreddb"),
+                ),
+            ],
+            || {
+                let resolved =
+                    resolve_database_url(None).expect("repo config database URL should resolve");
+                assert_eq!(
+                    resolved,
+                    "postgres://repo-user:repo-pass@repo-host:5432/repodb"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn bare_database_url_is_ignored_without_config() {
+        let _lock = process_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+                ),
+            ],
+            || {
+                let err =
+                    resolve_database_url(None).expect_err("bare DATABASE_URL should not resolve");
+                assert!(
+                    err.to_string().contains("server.database_url"),
+                    "error should mention the TOML config path, got: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn missing_database_url_returns_error() {
-        temp_env::with_vars([("DATABASE_URL", None::<&str>)], || {
-            let err = resolve_database_url(None).expect_err("missing database URL should fail");
-            assert!(
-                err.to_string().contains("server.database_url"),
-                "error should mention the TOML config path, got: {err}"
-            );
-        });
+        let _lock = process_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let err = resolve_database_url(None).expect_err("missing database URL should fail");
+                assert!(
+                    err.to_string().contains("server.database_url"),
+                    "error should mention the TOML config path, got: {err}"
+                );
+            },
+        );
     }
 }

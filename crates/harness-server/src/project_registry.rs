@@ -1,7 +1,4 @@
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{Migration, PgStoreContext};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
 use std::path::PathBuf;
@@ -63,22 +60,9 @@ impl ProjectRegistry {
         path: &std::path::Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Arc<Self>> {
-        let database_url = resolve_database_url(configured_database_url)?;
-        use sha2::{Digest, Sha256};
-        let path_utf8 = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
-
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, PROJECT_MIGRATIONS).run().await?;
+        let pool = PgStoreContext::from_path(path, configured_database_url)?
+            .open_migrated_pool(PROJECT_MIGRATIONS)
+            .await?;
         Ok(Arc::new(Self { pool }))
     }
 
@@ -194,9 +178,10 @@ pub fn validate_project_root(root: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::db::resolve_database_url;
 
     async fn open_test_registry(name: &str) -> anyhow::Result<Option<Arc<ProjectRegistry>>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;
@@ -314,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn survives_reopen() -> anyhow::Result<()> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
