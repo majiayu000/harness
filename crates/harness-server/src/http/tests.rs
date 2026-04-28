@@ -393,7 +393,8 @@ async fn wait_for_task_project_root(
     task_id: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
     let task_id = harness_core::types::TaskId(task_id.to_string());
-    for _ in 0..50 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
         if let Some(task) = state.core.tasks.get_with_db_fallback(&task_id).await? {
             if let Some(project_root) = task.project_root {
                 return Ok(project_root);

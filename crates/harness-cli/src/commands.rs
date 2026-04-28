@@ -121,7 +121,8 @@ pub enum Command {
         /// Report transitions without applying them
         #[arg(long)]
         dry_run: bool,
-        /// Project directory (defaults to current directory)
+        /// Deprecated: reconciliation uses each task's stored project root;
+        /// passing this flag returns an error.
         #[arg(long)]
         project: Option<PathBuf>,
     },
