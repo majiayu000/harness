@@ -153,7 +153,6 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             .max_gh_calls_per_minute;
         crate::reconciliation::run_once_with_token(
             &state.core.tasks,
-            &state.core.project_root,
             max_calls,
             false,
             state.core.server.config.server.github_token.as_deref(),
