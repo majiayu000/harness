@@ -2,7 +2,7 @@ use crate::types::Grade;
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::dirs::dirs_data_dir;
 
@@ -12,7 +12,7 @@ use super::dirs::dirs_data_dir;
 /// preventing merge conflicts when multiple agents edit the same project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
-    /// Root directory for all task worktrees. Default: `~/.local/share/harness/workspaces`.
+    /// Root directory for all task worktrees. Runtime default: `[server.data_dir]/workspaces`.
     #[serde(default = "default_workspace_root")]
     pub root: PathBuf,
     /// Shell script run after worktree creation (cwd = workspace). Fatal on failure.
@@ -29,7 +29,7 @@ pub struct WorkspaceConfig {
     pub auto_cleanup: bool,
 }
 
-fn default_workspace_root() -> PathBuf {
+pub fn default_workspace_root() -> PathBuf {
     dirs_data_dir().join("harness").join("workspaces")
 }
 
@@ -49,6 +49,18 @@ impl Default for WorkspaceConfig {
             before_remove_hook: None,
             hook_timeout_secs: default_hook_timeout_secs(),
             auto_cleanup: default_auto_cleanup(),
+        }
+    }
+}
+
+impl WorkspaceConfig {
+    pub fn root_for_data_dir(data_dir: &Path) -> PathBuf {
+        data_dir.join("workspaces")
+    }
+
+    pub fn use_data_dir_default_root(&mut self, data_dir: &Path) {
+        if self.root == default_workspace_root() {
+            self.root = Self::root_for_data_dir(data_dir);
         }
     }
 }

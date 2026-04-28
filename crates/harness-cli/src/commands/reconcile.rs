@@ -12,11 +12,12 @@ pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig
     let db_path = default_db_path(&config.server.data_dir, "tasks");
     let store = harness_server::task_runner::TaskStore::open(&db_path).await?;
 
-    let report = harness_server::reconciliation::run_once(
+    let report = harness_server::reconciliation::run_once_with_token(
         &store,
         &project_root,
         config.reconciliation.max_gh_calls_per_minute,
         dry_run,
+        config.server.github_token.as_deref(),
     )
     .await;
 

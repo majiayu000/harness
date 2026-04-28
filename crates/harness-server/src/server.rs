@@ -16,10 +16,11 @@ pub struct HarnessServer {
 
 impl HarnessServer {
     pub fn new(
-        config: HarnessConfig,
+        mut config: HarnessConfig,
         thread_manager: ThreadManager,
         agent_registry: AgentRegistry,
     ) -> Self {
+        config.apply_derived_defaults();
         Self {
             config,
             thread_manager,

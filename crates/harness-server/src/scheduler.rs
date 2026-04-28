@@ -60,7 +60,12 @@ impl Scheduler {
                         .reconciliation
                         .max_gh_calls_per_minute;
                     let summary = wmgr
-                        .reconcile_disk_workspaces(&wgc_state.core.project_root, "gh", max_rate)
+                        .reconcile_disk_workspaces(
+                            &wgc_state.core.project_root,
+                            "gh",
+                            max_rate,
+                            wgc_state.core.server.config.server.github_token.as_deref(),
+                        )
                         .await;
                     tracing::info!(
                         scanned = summary.scanned,

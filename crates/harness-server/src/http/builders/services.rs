@@ -50,9 +50,12 @@ pub(crate) async fn build_services(
             engines.events.clone(),
             hook_enforcement,
         )),
-        Arc::new(crate::post_validator::PostExecutionValidator::new(
-            server.config.validation.clone(),
-        )),
+        Arc::new(
+            crate::post_validator::PostExecutionValidator::new_with_github_token(
+                server.config.validation.clone(),
+                server.config.server.github_token.clone(),
+            ),
+        ),
     ];
 
     // ── Service layer ─────────────────────────────────────────────────────────
@@ -134,9 +137,10 @@ pub(crate) async fn build_services(
     {
         let tasks_for_recovery = storage.tasks.clone();
         let cb_for_recovery = intake.completion_callback.clone();
+        let github_token = server.config.server.github_token.clone();
         tokio::spawn(async move {
             tasks_for_recovery
-                .validate_recovered_tasks(cb_for_recovery)
+                .validate_recovered_tasks_with_token(cb_for_recovery, github_token.as_deref())
                 .await;
         });
     }
