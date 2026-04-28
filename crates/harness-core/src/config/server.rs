@@ -107,16 +107,22 @@ impl ServerConfig {
                 self.api_token = Some(v);
             }
         }
-        if let Some(v) = std::env::var("GITHUB_TOKEN")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| {
-                std::env::var("GH_TOKEN")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-            })
+        if self
+            .github_token
+            .as_deref()
+            .is_none_or(|v| v.trim().is_empty())
         {
-            self.github_token = Some(v);
+            if let Some(v) = std::env::var("GITHUB_TOKEN")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("GH_TOKEN")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                })
+            {
+                self.github_token = Some(v);
+            }
         }
         if let Ok(v) = std::env::var("GITHUB_WEBHOOK_SECRET") {
             if !v.is_empty() {
@@ -448,6 +454,24 @@ mod tests {
                 };
                 cfg.apply_env_overrides().unwrap();
                 assert_eq!(cfg.github_token, Some("gh-real".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_github_token_does_not_override_toml_token() {
+        temp_env::with_vars(
+            [
+                ("GITHUB_TOKEN", Some("github-env")),
+                ("GH_TOKEN", Some("gh-env")),
+            ],
+            || {
+                let mut cfg = ServerConfig {
+                    github_token: Some("configured-token".to_string()),
+                    ..ServerConfig::default()
+                };
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.github_token, Some("configured-token".to_string()));
             },
         );
     }
