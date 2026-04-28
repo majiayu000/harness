@@ -1,5 +1,6 @@
-use crate::{http::AppState, validate_root};
-use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
+use crate::{handlers::error as rpc_error, http::AppState, validate_root};
+use harness_protocol::methods::RpcResponse;
+use harness_rules::engine::{WARN_EMPTY_SCAN_INPUT, WARN_NO_GUARDS_REGISTERED};
 use std::path::PathBuf;
 
 pub async fn rule_load(
@@ -14,7 +15,7 @@ pub async fn rule_load(
             let count = rules.rules().len();
             RpcResponse::success(id, serde_json::json!({ "rules_count": count }))
         }
-        Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+        Err(e) => rpc_error::internal(id, e.to_string()),
     }
 }
 
@@ -36,7 +37,7 @@ pub async fn rule_check(
             for file in &f {
                 match crate::handlers::validate_file_in_root(file, &project_root) {
                     Ok(p) => validated.push(p),
-                    Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+                    Err(e) => return rpc_error::invalid_params(id, e),
                 }
             }
             Some(validated)
@@ -58,7 +59,14 @@ pub async fn rule_check(
                 error = %err,
                 "rule/check rejected before scan"
             );
-            return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
+            let message = err.to_string();
+            if message.contains(WARN_EMPTY_SCAN_INPUT) {
+                return rpc_error::invalid_params(id, message);
+            }
+            if message.contains(WARN_NO_GUARDS_REGISTERED) {
+                return rpc_error::validation(id, message);
+            }
+            return rpc_error::internal(id, message);
         }
         rules.snapshot()
     }; // read lock released here
@@ -86,7 +94,7 @@ pub async fn rule_check(
                 .await;
             match serde_json::to_value(&violations) {
                 Ok(v) => RpcResponse::success(id, v),
-                Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+                Err(e) => rpc_error::internal(id, e.to_string()),
             }
         }
         Err(e) => {
@@ -96,7 +104,7 @@ pub async fn rule_check(
                 error = %e,
                 "rule/check scan failed"
             );
-            RpcResponse::error(id, INTERNAL_ERROR, e.to_string())
+            rpc_error::internal(id, e.to_string())
         }
     }
 }
@@ -105,7 +113,7 @@ pub async fn rule_check(
 mod tests {
     use super::rule_check;
     use harness_core::{types::EventFilters, types::GuardId, types::Language};
-    use harness_protocol::methods::INTERNAL_ERROR;
+    use harness_protocol::methods::{INVALID_PARAMS, VALIDATION_ERROR};
     use harness_rules::engine::{Guard, WARN_EMPTY_SCAN_INPUT, WARN_NO_GUARDS_REGISTERED};
     use std::path::PathBuf;
 
@@ -126,7 +134,7 @@ mod tests {
             .error
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("expected rule/check to fail without guards"))?;
-        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.code, VALIDATION_ERROR);
         assert!(
             error.message.contains(WARN_NO_GUARDS_REGISTERED),
             "expected warning message in error: {}",
@@ -232,7 +240,7 @@ mod tests {
             .error
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("expected rule/check to fail for empty scan input"))?;
-        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.code, INVALID_PARAMS);
         assert!(
             error.message.contains(WARN_EMPTY_SCAN_INPUT),
             "expected warning message in error: {}",

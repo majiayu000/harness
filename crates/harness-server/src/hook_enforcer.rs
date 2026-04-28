@@ -40,8 +40,12 @@ use crate::circuit_breaker::CircuitBreaker;
 /// - `enabled` is `false` (controlled by `rules.hook_enforcement` in config)
 /// - `CI` environment variable is set
 /// - no guards are registered
-/// - no files were modified during the turn
+/// - no affected files are supplied by telemetry
 /// - the circuit breaker is open (consecutive-block limit reached)
+///
+/// Important: host-side git inspection is intentionally disabled by project
+/// policy. Until agent/file-write telemetry supplies `affected_files`, this is
+/// not a complete closed-loop rule-enforcement mechanism.
 pub struct HookEnforcer {
     rules: Arc<RwLock<RuleEngine>>,
     events: Arc<EventStore>,
