@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { PaletteFab } from "@/components/PaletteFab";
+import { DOCS_URL } from "@/lib/links";
 import { useWorktrees, useOverview } from "@/lib/queries";
 import { apiFetch, TOKEN_KEY } from "@/lib/api";
 import type { WorktreeCard } from "@/lib/queries";
@@ -176,7 +177,7 @@ export function Worktrees() {
     },
     {
       label: "Reference",
-      items: [{ id: "docs", label: "Docs", href: "/" }],
+      items: [{ id: "docs", label: "Docs", href: DOCS_URL }],
     },
   ];
 

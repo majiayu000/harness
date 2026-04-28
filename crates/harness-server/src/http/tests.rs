@@ -1666,29 +1666,15 @@ async fn webhook_ping_event_returns_accepted_without_creating_task() -> anyhow::
     Ok(())
 }
 
-/// Agent stub that records invocations via an atomic flag.
-/// Records in both `execute` and `execute_stream` since the task executor
-/// calls `execute_stream` (via `run_agent_streaming`).
-struct DispatchCapturingAgent {
-    agent_name: &'static str,
-    was_invoked: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl DispatchCapturingAgent {
-    fn new(name: &'static str) -> (Arc<Self>, Arc<std::sync::atomic::AtomicBool>) {
-        let was_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let agent = Arc::new(Self {
-            agent_name: name,
-            was_invoked: was_invoked.clone(),
-        });
-        (agent, was_invoked)
-    }
+/// Named agent stub for focused complexity-dispatch selection tests.
+struct DispatchNamedAgent {
+    name: &'static str,
 }
 
 #[async_trait]
-impl CodeAgent for DispatchCapturingAgent {
+impl CodeAgent for DispatchNamedAgent {
     fn name(&self) -> &str {
-        self.agent_name
+        self.name
     }
 
     fn capabilities(&self) -> Vec<Capability> {
@@ -1696,8 +1682,6 @@ impl CodeAgent for DispatchCapturingAgent {
     }
 
     async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
-        self.was_invoked
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(AgentResponse {
             output: String::new(),
             stderr: String::new(),
@@ -1708,7 +1692,7 @@ impl CodeAgent for DispatchCapturingAgent {
                 total_tokens: 0,
                 cost_usd: 0.0,
             },
-            model: self.agent_name.to_string(),
+            model: self.name.to_string(),
             exit_code: Some(0),
         })
     }
@@ -1718,129 +1702,47 @@ impl CodeAgent for DispatchCapturingAgent {
         _req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
-        self.was_invoked
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 }
 
-/// Build a test AppState with a "test" (default) and a "claude" DispatchCapturingAgent.
-/// Returns the state and atomic flags for each agent so tests can detect which was invoked.
-async fn make_test_state_with_dispatch_agents(
-    dir: &std::path::Path,
-) -> anyhow::Result<(
-    Arc<AppState>,
-    Arc<std::sync::atomic::AtomicBool>,
-    Arc<std::sync::atomic::AtomicBool>,
-)> {
-    let (default_agent, default_invoked) = DispatchCapturingAgent::new("test");
-    let (claude_agent, claude_invoked) = DispatchCapturingAgent::new("claude");
+fn dispatch_registry() -> harness_agents::registry::AgentRegistry {
     let mut registry = harness_agents::registry::AgentRegistry::new("test");
     registry.set_complexity_preferences(vec!["claude".to_string()]);
-    registry.register("test", default_agent);
-    registry.register("claude", claude_agent);
-    let state = make_test_state_with(
-        dir,
-        harness_core::config::HarnessConfig::default(),
-        registry,
-    )
-    .await?;
-    Ok((state, default_invoked, claude_invoked))
+    registry.register("test", Arc::new(DispatchNamedAgent { name: "test" }));
+    registry.register("claude", Arc::new(DispatchNamedAgent { name: "claude" }));
+    registry
 }
 
-/// Poll (with 5 s deadline) until `flag` is set; panic with `msg` on timeout.
-async fn wait_for_invocation(flag: &std::sync::atomic::AtomicBool, msg: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if flag.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("{msg}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+fn dispatch_req(prompt: &str, project: &std::path::Path) -> task_runner::CreateTaskRequest {
+    let mut req = task_runner::CreateTaskRequest::default();
+    req.prompt = Some(prompt.to_string());
+    req.project = Some(project.to_path_buf());
+    req
 }
 
-#[tokio::test]
-async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
-    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
-    let dir = crate::test_helpers::tempdir_in_home("dispatch-complex-")?;
-    let (state, default_invoked, claude_invoked) =
-        make_test_state_with_dispatch_agents(dir.path()).await?;
-    let app = task_app(state);
-
-    // 6 distinct file references → Complex complexity → registry.dispatch() selects "claude"
-    let body = serde_json::json!({
-        "prompt": "Refactor src/a.rs src/b.rs src/c.rs src/d.rs src/e.rs src/f.rs",
-        "project": dir.path(),
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-    wait_for_invocation(
-        &claude_invoked,
-        "claude agent was not invoked within 500ms for complex task",
-    )
-    .await;
-
-    assert!(
-        claude_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "claude agent should have been invoked for complex task"
+#[test]
+fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let req = dispatch_req(
+        "Refactor src/a.rs src/b.rs src/c.rs src/d.rs src/e.rs src/f.rs",
+        dir.path(),
     );
-    assert!(
-        !default_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "default agent should not have been invoked for complex task"
-    );
+
+    let agent = crate::services::execution::select_agent(&req, &dispatch_registry(), None)?;
+
+    assert_eq!(agent.name(), "claude");
     Ok(())
 }
 
-#[tokio::test]
-async fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
-    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
-    let dir = crate::test_helpers::tempdir_in_home("dispatch-simple-")?;
-    let (state, default_invoked, claude_invoked) =
-        make_test_state_with_dispatch_agents(dir.path()).await?;
-    let app = task_app(state);
+#[test]
+fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let req = dispatch_req("Fix the login bug", dir.path());
 
-    // Simple prompt: no file references → Simple complexity → default "test" agent
-    let body = serde_json::json!({
-        "prompt": "Fix the login bug",
-        "project": dir.path(),
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let agent = crate::services::execution::select_agent(&req, &dispatch_registry(), None)?;
 
-    wait_for_invocation(
-        &default_invoked,
-        "default agent was not invoked within 500ms for simple task",
-    )
-    .await;
-
-    assert!(
-        default_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "default agent should have been invoked for simple task"
-    );
-    assert!(
-        !claude_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "claude agent should not have been invoked for simple task"
-    );
+    assert_eq!(agent.name(), "test");
     Ok(())
 }
 

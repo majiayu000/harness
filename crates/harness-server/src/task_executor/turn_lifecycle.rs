@@ -74,9 +74,9 @@ pub(crate) async fn run_turn_lifecycle(
     let adapter_opt = server.agent_registry.get_adapter(&agent_name);
 
     // Register as live adapter (RAII guard for cleanup on turn exit).
-    // When an adapter is available, execution goes through adapter.start_turn()
-    // (see below), so the adapter's stdin is initialized before any
-    // steer/respond_approval call arrives.
+    // Adapters may be control-only (Claude: interrupt/steer/approval side
+    // channel only) or turn-executing (Codex: App Server JSON-RPC owns the
+    // full turn). The strategy is selected at agent registration time.
     let _adapter_guard = adapter_opt.as_ref().map(|adapter_arc| {
         server
             .thread_manager
@@ -90,15 +90,11 @@ pub(crate) async fn run_turn_lifecycle(
     let stall_timeout = Duration::from_secs(server.config.concurrency.stall_timeout_secs);
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
 
-    // Only Codex uses the adapter for turn execution (initializes stdin so that
-    // subsequent steer/respond_approval calls can find a live process).
-    // Other adapters (e.g., ClaudeAdapter) exist for interrupt/steer only and must
-    // not override the configured CodeAgent execution path — ClaudeCodeAgent carries
-    // config-level settings (model, sandbox) that ClaudeAdapter does not replicate.
-    let execution_adapter = adapter_opt
-        .as_ref()
-        .filter(|a| a.name() == "codex")
-        .cloned();
+    // Use the adapter for turn execution only when its registered strategy says
+    // it owns the full lifecycle. This is the strategy pattern boundary between
+    // Codex's App Server adapter and Claude's control-only adapter; avoid
+    // branching on agent names here.
+    let execution_adapter = server.agent_registry.turn_execution_adapter(&agent_name);
     let mut execution: std::pin::Pin<
         Box<dyn std::future::Future<Output = harness_core::error::Result<()>> + Send>,
     > = if let Some(adapter_arc) = execution_adapter {

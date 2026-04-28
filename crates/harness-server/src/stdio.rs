@@ -176,16 +176,24 @@ mod tests {
     }
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
+        let database_url = crate::test_helpers::test_database_url()?;
         let server = Arc::new(HarnessServer::new(
             HarnessConfig::default(),
             ThreadManager::new(),
             AgentRegistry::new("test"),
         ));
-        let tasks = crate::task_runner::TaskStore::open(
+        let tasks = crate::task_runner::TaskStore::open_with_database_url(
             &harness_core::config::dirs::default_db_path(dir, "tasks"),
+            Some(&database_url),
         )
         .await?;
-        let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+        let events = Arc::new(
+            harness_observe::event_store::EventStore::new_with_database_url(
+                dir,
+                Some(&database_url),
+            )
+            .await?,
+        );
         let signal_detector = harness_gc::signal_detector::SignalDetector::new(
             server.config.gc.signal_thresholds.clone().into(),
             harness_core::types::ProjectId::new(),
@@ -197,12 +205,14 @@ mod tests {
             draft_store,
             dir.to_path_buf(),
         ));
-        let thread_db = crate::thread_db::ThreadDb::open(
+        let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
             &harness_core::config::dirs::default_db_path(dir, "threads"),
+            Some(&database_url),
         )
         .await?;
-        let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+        let _project_svc_tmp = crate::project_registry::ProjectRegistry::open_with_database_url(
             &harness_core::config::dirs::default_db_path(dir, "projects"),
+            Some(&database_url),
         )
         .await?;
         let project_svc = crate::services::project::DefaultProjectService::new(

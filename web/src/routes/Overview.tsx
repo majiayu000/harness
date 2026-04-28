@@ -12,6 +12,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { PaletteFab } from "@/components/PaletteFab";
 import { EvolutionCard } from "@/components/EvolutionCard";
 import { useOperatorSnapshot, useOverview } from "@/lib/queries";
+import { DOCS_URL } from "@/lib/links";
 import { OperatorPanel } from "./overview/OperatorPanel";
 import { fmtInt, fmtPct, fmtScore } from "@/lib/format";
 
@@ -48,7 +49,7 @@ export function Overview() {
     },
     {
       label: "Reference",
-      items: [{ id: "docs", label: "Docs", href: "/" }],
+      items: [{ id: "docs", label: "Docs", href: DOCS_URL }],
     },
   ];
 
