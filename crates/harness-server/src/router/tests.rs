@@ -7,7 +7,7 @@ use crate::{
 };
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
-use harness_protocol::{methods::Method, methods::RpcRequest, methods::INTERNAL_ERROR};
+use harness_protocol::{methods::Method, methods::RpcRequest, methods::VALIDATION_ERROR};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -569,7 +569,7 @@ async fn rule_check_returns_warning_when_no_guards_loaded() -> anyhow::Result<()
         .error
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("expected warning error response"))?;
-    assert_eq!(error.code, INTERNAL_ERROR);
+    assert_eq!(error.code, VALIDATION_ERROR);
     assert!(
         error
             .message

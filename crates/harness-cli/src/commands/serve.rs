@@ -198,12 +198,13 @@ pub async fn run(
     claude_agent = claude_agent.with_stream_timeout(serve_config.agents.stream_timeout_secs);
     agent_registry.register("claude", Arc::new(claude_agent));
     agent_registry
-        .register_adapter(
+        .register_adapter_with_strategy(
             "claude",
             Arc::new(harness_agents::claude_adapter::ClaudeAdapter::new(
                 serve_config.agents.claude.cli_path.clone(),
                 serve_config.agents.claude.default_model.clone(),
             )),
+            harness_agents::registry::AdapterExecutionStrategy::ControlOnly,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     agent_registry.register(
@@ -217,11 +218,12 @@ pub async fn run(
         ),
     );
     agent_registry
-        .register_adapter(
+        .register_adapter_with_strategy(
             "codex",
             Arc::new(harness_agents::codex_adapter::CodexAdapter::new(
                 serve_config.agents.codex.cli_path.clone(),
             )),
+            harness_agents::registry::AdapterExecutionStrategy::ExecuteTurns,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
