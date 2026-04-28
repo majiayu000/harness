@@ -161,7 +161,7 @@ mod tests {
     use super::*;
 
     async fn open_test_store() -> anyhow::Result<Option<RuntimeStateStore>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;
@@ -201,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_state_store_rejects_newer_schema_snapshot_after_reopen() -> anyhow::Result<()>
     {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -221,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_state_store_survives_reopen() -> anyhow::Result<()> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(());
         }
         let dir = tempfile::tempdir()?;

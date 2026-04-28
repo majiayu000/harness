@@ -238,7 +238,7 @@ mod tests {
     use tempfile::tempdir;
 
     async fn open_test_store() -> anyhow::Result<Option<(QValueStore, tempfile::TempDir)>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempdir()?;

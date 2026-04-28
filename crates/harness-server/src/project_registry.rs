@@ -196,7 +196,7 @@ mod tests {
     use super::*;
 
     async fn open_test_registry(name: &str) -> anyhow::Result<Option<Arc<ProjectRegistry>>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;
@@ -314,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn survives_reopen() -> anyhow::Result<()> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(());
         }
         let dir = tempfile::tempdir()?;

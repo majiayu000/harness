@@ -1,5 +1,6 @@
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use crate::db::Migration;
@@ -22,7 +23,9 @@ fn pg_max_connections(database_url: &str) -> u32 {
 ///
 /// Precedence:
 /// 1. Explicit configured URL (for example `server.database_url` from TOML)
-/// 2. Legacy `DATABASE_URL` environment variable fallback
+/// 2. `HARNESS_DATABASE_URL` config override
+/// 3. Discovered Harness config file
+/// 4. Repository-local `config/default.toml`
 pub fn resolve_database_url(configured_database_url: Option<&str>) -> anyhow::Result<String> {
     if let Some(url) = configured_database_url
         .map(str::trim)
@@ -30,18 +33,106 @@ pub fn resolve_database_url(configured_database_url: Option<&str>) -> anyhow::Re
     {
         return Ok(url.to_string());
     }
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        let url = url.trim();
-        if !url.is_empty() {
-            return Ok(url.to_string());
-        }
+
+    if let Some(url) = configured_database_url_from_config()? {
+        return Ok(url);
     }
+
     anyhow::bail!(
-        "database URL is not configured; set server.database_url in TOML or DATABASE_URL in the environment"
+        "database URL is not configured; set server.database_url in TOML or HARNESS_DATABASE_URL in the environment"
     )
 }
 
-/// Create a Postgres connection pool for the given DATABASE_URL.
+fn configured_database_url_from_config() -> anyhow::Result<Option<String>> {
+    if let Some(url) = configured_database_url_from_env("HARNESS_DATABASE_URL") {
+        return Ok(Some(url));
+    }
+    for path in database_url_config_paths()? {
+        if let Some(url) = load_database_url_from_path(&path)? {
+            return Ok(Some(url));
+        }
+    }
+    Ok(None)
+}
+
+fn configured_database_url_from_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+}
+
+fn database_url_config_paths() -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if let Some(path) = crate::config::dirs::find_config_file() {
+        paths.push(path);
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        if let Some(path) = repository_default_config_from_dir(current_dir) {
+            push_unique_path(&mut paths, path);
+        }
+    }
+
+    // Unit tests may temporarily change the process CWD while other tests open
+    // stores concurrently. The test binary path is stable, so this preserves the
+    // repository config fallback without reading the generic DATABASE_URL.
+    if std::env::var_os("XDG_CONFIG_HOME").is_none() {
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(parent) = current_exe.parent() {
+                if let Some(path) = repository_default_config_from_dir(parent) {
+                    push_unique_path(&mut paths, path);
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn repository_default_config_from_dir(start: impl AsRef<Path>) -> Option<PathBuf> {
+    let mut dir = start.as_ref().to_path_buf();
+    loop {
+        let local_default = dir.join("config/default.toml");
+        if local_default.is_file() {
+            return Some(local_default);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn load_database_url_from_path(path: &Path) -> anyhow::Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct DatabaseConfigFile {
+        #[serde(default)]
+        server: DatabaseServerConfig,
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    struct DatabaseServerConfig {
+        #[serde(default)]
+        database_url: Option<String>,
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    let config: DatabaseConfigFile = toml::from_str(&content)?;
+    Ok(config
+        .server
+        .database_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned))
+}
+
+/// Create a Postgres connection pool for the given connection string.
 ///
 /// Uses 8 max connections by default, or 1 for Supabase pooler URLs, with a
 /// 10-second acquire timeout.
@@ -228,6 +319,26 @@ mod tests {
         pg_max_connections, resolve_database_url, validate_schema_name, DEFAULT_PG_MAX_CONNECTIONS,
     };
 
+    static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CurrentDirGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &std::path::Path) -> Self {
+            let original = std::env::current_dir().expect("current dir");
+            std::env::set_current_dir(path).expect("set current dir");
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).expect("restore current dir");
+        }
+    }
+
     #[test]
     fn valid_schema_names() {
         for name in ["public", "_priv", "h1a2b3c4d5e6f7a8", "schema_1", "A"] {
@@ -294,12 +405,19 @@ mod tests {
     }
 
     #[test]
-    fn configured_database_url_wins_over_environment() {
+    fn configured_database_url_wins_over_config_sources() {
+        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
         temp_env::with_vars(
-            [(
-                "DATABASE_URL",
-                Some("postgres://env-user:env-pass@env-host:5432/envdb"),
-            )],
+            [
+                (
+                    "HARNESS_DATABASE_URL",
+                    Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://ignored-user:ignored-pass@ignored-host:5432/ignoreddb"),
+                ),
+            ],
             || {
                 let resolved =
                     resolve_database_url(Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb"))
@@ -310,28 +428,198 @@ mod tests {
     }
 
     #[test]
-    fn environment_database_url_used_as_fallback() {
+    fn harness_database_url_used_as_config_override() {
+        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
         temp_env::with_vars(
-            [(
-                "DATABASE_URL",
-                Some("postgres://env-user:env-pass@env-host:5432/envdb"),
-            )],
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                (
+                    "HARNESS_DATABASE_URL",
+                    Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://ignored-user:ignored-pass@ignored-host:5432/ignoreddb"),
+                ),
+            ],
             || {
                 let resolved =
-                    resolve_database_url(None).expect("environment database URL should resolve");
+                    resolve_database_url(None).expect("HARNESS_DATABASE_URL should resolve");
                 assert_eq!(resolved, "postgres://env-user:env-pass@env-host:5432/envdb");
             },
         );
     }
 
     #[test]
+    fn discovered_config_database_url_used_as_fallback() {
+        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
+        let harness_dir = xdg.join("harness");
+        std::fs::create_dir_all(&harness_dir).expect("create config dir");
+
+        let mut config = crate::config::HarnessConfig::default();
+        config.server.database_url =
+            Some("postgres://file-user:file-pass@file-host:5432/filedb".to_string());
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://ignored-user:ignored-pass@ignored-host:5432/ignoreddb"),
+                ),
+            ],
+            || {
+                let resolved =
+                    resolve_database_url(None).expect("config database URL should resolve");
+                assert_eq!(
+                    resolved,
+                    "postgres://file-user:file-pass@file-host:5432/filedb"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn repository_default_config_database_url_used_as_fallback() {
+        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("xdg");
+        let repo_config = dir.path().join("config");
+        let nested_cwd = dir.path().join("crates/harness-core");
+        std::fs::create_dir_all(&repo_config).expect("create repo config dir");
+        std::fs::create_dir_all(&nested_cwd).expect("create nested cwd");
+        std::fs::write(
+            repo_config.join("default.toml"),
+            r#"
+                [server]
+                database_url = "postgres://repo-user:repo-pass@repo-host:5432/repodb"
+            "#,
+        )
+        .expect("write repo config");
+
+        let _cwd = CurrentDirGuard::enter(&nested_cwd);
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://ignored-user:ignored-pass@ignored-host:5432/ignoreddb"),
+                ),
+            ],
+            || {
+                let resolved =
+                    resolve_database_url(None).expect("repo config database URL should resolve");
+                assert_eq!(
+                    resolved,
+                    "postgres://repo-user:repo-pass@repo-host:5432/repodb"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn discovered_config_survives_deleted_current_dir() {
+        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let xdg = home.path().join("xdg");
+        let harness_dir = xdg.join("harness");
+        std::fs::create_dir_all(&harness_dir).expect("create config dir");
+
+        let mut config = crate::config::HarnessConfig::default();
+        config.server.database_url =
+            Some("postgres://file-user:file-pass@file-host:5432/filedb".to_string());
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let cwd_path = cwd.path().to_path_buf();
+        let _cwd = CurrentDirGuard::enter(&cwd_path);
+        drop(cwd);
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.path().to_str().expect("utf8 home"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let resolved =
+                    resolve_database_url(None).expect("config database URL should resolve");
+                assert_eq!(
+                    resolved,
+                    "postgres://file-user:file-pass@file-host:5432/filedb"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn bare_database_url_is_ignored_without_config() {
+        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://env-user:env-pass@env-host:5432/envdb"),
+                ),
+            ],
+            || {
+                let err =
+                    resolve_database_url(None).expect_err("bare DATABASE_URL should not resolve");
+                assert!(
+                    err.to_string().contains("server.database_url"),
+                    "error should mention the TOML config path, got: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn missing_database_url_returns_error() {
-        temp_env::with_vars([("DATABASE_URL", None::<&str>)], || {
-            let err = resolve_database_url(None).expect_err("missing database URL should fail");
-            assert!(
-                err.to_string().contains("server.database_url"),
-                "error should mention the TOML config path, got: {err}"
-            );
-        });
+        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let err = resolve_database_url(None).expect_err("missing database URL should fail");
+                assert!(
+                    err.to_string().contains("server.database_url"),
+                    "error should mention the TOML config path, got: {err}"
+                );
+            },
+        );
     }
 }

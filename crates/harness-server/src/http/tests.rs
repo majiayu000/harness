@@ -75,6 +75,7 @@ async fn make_test_state_with_project_root(
     config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
+    let db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
     let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
         (cfg.enabled && crate::intake::feishu::has_verification_token(cfg))
             .then(|| Arc::new(crate::intake::feishu::FeishuIntake::new(cfg.clone())))
@@ -169,7 +170,7 @@ async fn make_test_state_with_project_root(
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
+        _db_state_guard: Some(db_state_guard),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -1421,6 +1422,7 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
 
 #[tokio::test]
 async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-repo-a-")?;
     let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-repo-b-")?;
     let secret = "secret";
@@ -1476,6 +1478,7 @@ async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::R
 
 #[tokio::test]
 async fn webhook_routes_prompt_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-a-")?;
     let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-b-")?;
     let secret = "secret";
