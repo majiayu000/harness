@@ -39,9 +39,11 @@ pub(crate) async fn build_services(
     let hook_enforcement = server.config.rules.hook_enforcement;
     let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> = vec![
         Arc::new(crate::contract_validator::ContractValidator::new()),
-        // RuleEnforcer disabled: false-positives on test fixtures in other repo
-        // worktrees (SEC-02 hardcoded secrets in test code) block periodic_review
-        // tasks. Re-enable after adding source-aware filtering or allowlists.
+        // RuleEnforcer intentionally disabled: false-positives on test fixtures
+        // in other repo worktrees (SEC-02 hardcoded secrets in test code)
+        // block periodic_review tasks. Until source-aware filtering or
+        // allowlists exist, rule checks are available through explicit scans and
+        // post-tool hooks only; they are not a full pre-turn enforcement gate.
         // Arc::new(crate::rule_enforcer::RuleEnforcer::new(
         //     engines.rules.clone(),
         // )),

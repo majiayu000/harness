@@ -5,13 +5,34 @@ use harness_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Describes how an optional interactive adapter participates in turn execution.
+///
+/// `ControlOnly` adapters are registered only for side-channel operations such as
+/// interrupt, steer, or approval response. `ExecuteTurns` adapters are the
+/// canonical turn executor for the agent. This keeps agent-specific behavior at
+/// registration time instead of branching on agent names at runtime.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterExecutionStrategy {
+    #[default]
+    ControlOnly,
+    ExecuteTurns,
+}
+
+impl AdapterExecutionStrategy {
+    pub fn executes_turns(self) -> bool {
+        matches!(self, Self::ExecuteTurns)
+    }
+}
+
 /// Bundles an agent executor with an optional interactive adapter.
 ///
 /// A descriptor is created with `adapter: None` on plain `register()` calls.
-/// Call `register_adapter()` to attach an adapter after the agent is registered.
+/// Call `register_adapter()` or `register_adapter_with_strategy()` to attach an
+/// adapter after the agent is registered.
 pub struct AgentDescriptor {
     pub agent: Arc<dyn CodeAgent>,
     pub adapter: Option<Arc<dyn AgentAdapter>>,
+    pub adapter_strategy: AdapterExecutionStrategy,
 }
 
 pub struct AgentRegistry {
@@ -44,7 +65,9 @@ impl AgentRegistry {
         // Preserve any previously attached adapter so that hot-reload cannot
         // accidentally clear the adapter by re-registering the agent under the
         // same name (the old split-registry design had this property naturally).
-        let existing_adapter = self.entries.get(&name).and_then(|d| d.adapter.clone());
+        let existing = self.entries.get(&name);
+        let existing_adapter = existing.and_then(|d| d.adapter.clone());
+        let existing_strategy = existing.map(|d| d.adapter_strategy).unwrap_or_default();
         if !self.entries.contains_key(&name) {
             self.registration_order.push(name.clone());
         }
@@ -53,11 +76,12 @@ impl AgentRegistry {
             AgentDescriptor {
                 agent,
                 adapter: existing_adapter,
+                adapter_strategy: existing_strategy,
             },
         );
     }
 
-    /// Attach an adapter to an already-registered agent.
+    /// Attach a control-only adapter to an already-registered agent.
     ///
     /// Returns `Err(HarnessError::AgentNotFound)` if the agent name is unknown,
     /// so misconfiguration fails loudly instead of silently (U-23).
@@ -66,9 +90,24 @@ impl AgentRegistry {
         name: &str,
         adapter: Arc<dyn AgentAdapter>,
     ) -> harness_core::error::Result<()> {
+        self.register_adapter_with_strategy(name, adapter, AdapterExecutionStrategy::ControlOnly)
+    }
+
+    /// Attach an adapter with an explicit execution strategy.
+    ///
+    /// Use `ExecuteTurns` only when the adapter owns the full turn lifecycle for
+    /// the agent. Use `ControlOnly` when the adapter exists for side-channel
+    /// control while the legacy `CodeAgent` remains the turn executor.
+    pub fn register_adapter_with_strategy(
+        &mut self,
+        name: &str,
+        adapter: Arc<dyn AgentAdapter>,
+        strategy: AdapterExecutionStrategy,
+    ) -> harness_core::error::Result<()> {
         match self.entries.get_mut(name) {
             Some(descriptor) => {
                 descriptor.adapter = Some(adapter);
+                descriptor.adapter_strategy = strategy;
                 Ok(())
             }
             None => Err(HarnessError::AgentNotFound(format!(
@@ -85,6 +124,21 @@ impl AgentRegistry {
     /// Return the adapter registered for the given agent name, if any.
     pub fn get_adapter(&self, name: &str) -> Option<Arc<dyn AgentAdapter>> {
         self.entries.get(name).and_then(|d| d.adapter.clone())
+    }
+
+    /// Return the adapter execution strategy for the given agent name.
+    pub fn adapter_strategy(&self, name: &str) -> Option<AdapterExecutionStrategy> {
+        self.entries.get(name).map(|d| d.adapter_strategy)
+    }
+
+    /// Return the adapter only when its strategy says it should execute turns.
+    pub fn turn_execution_adapter(&self, name: &str) -> Option<Arc<dyn AgentAdapter>> {
+        let descriptor = self.entries.get(name)?;
+        if descriptor.adapter_strategy.executes_turns() {
+            descriptor.adapter.clone()
+        } else {
+            None
+        }
     }
 
     pub fn resolved_default_agent_name(&self) -> Option<&str> {
@@ -377,6 +431,47 @@ mod tests {
     }
 
     #[test]
+    fn register_adapter_defaults_to_control_only_strategy() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+        registry
+            .register_adapter(
+                "mock",
+                Arc::new(StubAdapter {
+                    adapter_name: "mock",
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.adapter_strategy("mock"),
+            Some(AdapterExecutionStrategy::ControlOnly)
+        );
+        assert!(registry.turn_execution_adapter("mock").is_none());
+    }
+
+    #[test]
+    fn register_adapter_with_execute_strategy_enables_turn_execution() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+        registry
+            .register_adapter_with_strategy(
+                "mock",
+                Arc::new(StubAdapter {
+                    adapter_name: "mock",
+                }),
+                AdapterExecutionStrategy::ExecuteTurns,
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.adapter_strategy("mock"),
+            Some(AdapterExecutionStrategy::ExecuteTurns)
+        );
+        assert!(registry.turn_execution_adapter("mock").is_some());
+    }
+
+    #[test]
     fn register_creates_descriptor_with_no_adapter() {
         let mut registry = AgentRegistry::new("mock");
         registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
@@ -406,15 +501,16 @@ mod tests {
     }
 
     #[test]
-    fn re_register_preserves_existing_adapter() {
+    fn re_register_preserves_existing_adapter_and_strategy() {
         let mut registry = AgentRegistry::new("mock");
         registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
         registry
-            .register_adapter(
+            .register_adapter_with_strategy(
                 "mock",
                 Arc::new(StubAdapter {
                     adapter_name: "mock",
                 }),
+                AdapterExecutionStrategy::ExecuteTurns,
             )
             .unwrap();
 
@@ -432,6 +528,11 @@ mod tests {
             "adapter must survive re-registration of the same agent name"
         );
         assert_eq!(adapter.unwrap().name(), "mock");
+        assert_eq!(
+            registry.adapter_strategy("mock"),
+            Some(AdapterExecutionStrategy::ExecuteTurns),
+            "adapter strategy must survive re-registration"
+        );
         // The agent itself must be updated.
         assert_eq!(registry.get("mock").unwrap().name(), "mock-v2");
     }

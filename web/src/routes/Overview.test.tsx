@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { Overview } from "./Overview";
 import { PaletteProvider } from "@/lib/palette";
+import { DOCS_URL } from "@/lib/links";
 import type { OperatorSnapshotPayload, OverviewPayload } from "@/types";
 
 vi.mock("@/lib/queries", () => ({
@@ -129,5 +130,20 @@ describe("<Overview>", () => {
 
     expect(screen.getByText(/all systems nominal/i)).toBeInTheDocument();
     expect(screen.queryByText(/connection lost/i)).not.toBeInTheDocument();
+  });
+
+  it("links Docs to the repository documentation", () => {
+    mockUseOverview.mockReturnValue({
+      data: makeOverview(),
+      isError: false,
+    });
+    mockUseOperatorSnapshot.mockReturnValue({
+      data: makeSnapshot(),
+      isError: false,
+    });
+
+    wrap(<Overview />);
+
+    expect(screen.getByRole("link", { name: "Docs" })).toHaveAttribute("href", DOCS_URL);
   });
 });
