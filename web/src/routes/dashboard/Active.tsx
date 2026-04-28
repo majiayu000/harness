@@ -78,6 +78,11 @@ function columnOf(taskStatus: string, workflowState?: string | null): string {
   return "other";
 }
 
+function shouldShowTask(task: Task): boolean {
+  if (task.workflow?.state === "ready_to_merge") return true;
+  return !TERMINAL_STATUSES.has(task.status);
+}
+
 function TaskCard({
   task,
   workflow,
@@ -93,47 +98,46 @@ function TaskCard({
 }) {
   const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
   return (
-    <button
-      type="button"
+    <div
       className="w-full text-left border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors cursor-pointer"
-      onClick={onClick}
     >
-      <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
-        {title}
-      </div>
-      {workflow && (
-        <div className="mt-1 flex flex-wrap items-center gap-1">
-          <span className="border border-line bg-bg-1 px-1.5 py-[1px] font-mono text-[10px] text-ink-2">
-            wf {workflowLabel(workflow.state)}
-          </span>
-          {workflow.pr_number ? (
-            <span className="font-mono text-[10px] text-ink-3">PR #{workflow.pr_number}</span>
-          ) : null}
-          {workflow.force_execute ? (
-            <span className="border border-rust/40 bg-rust/10 px-1.5 py-[1px] font-mono text-[10px] text-rust">
-              force-execute
+      <button type="button" className="block w-full text-left" onClick={onClick}>
+        <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
+          {title}
+        </div>
+        {workflow && (
+          <div className="mt-1 flex flex-wrap items-center gap-1">
+            <span className="border border-line bg-bg-1 px-1.5 py-[1px] font-mono text-[10px] text-ink-2">
+              wf {workflowLabel(workflow.state)}
             </span>
-          ) : null}
+            {workflow.pr_number ? (
+              <span className="font-mono text-[10px] text-ink-3">PR #{workflow.pr_number}</span>
+            ) : null}
+            {workflow.force_execute ? (
+              <span className="border border-rust/40 bg-rust/10 px-1.5 py-[1px] font-mono text-[10px] text-rust">
+                force-execute
+              </span>
+            ) : null}
+          </div>
+        )}
+        <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
+          <span className="truncate">{task.repo ?? "—"}</span>
+          {task.turn > 0 && <span>turn {task.turn}</span>}
         </div>
-      )}
-      <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
-        <span className="truncate">{task.repo ?? "—"}</span>
-        {task.turn > 0 && <span>turn {task.turn}</span>}
-      </div>
-      {workflow?.plan_concern && (
-        <div
-          className="mt-1 block font-mono text-[10px] text-rust truncate"
-          title={workflow.plan_concern}
-        >
-          concern: {workflow.plan_concern}
-        </div>
-      )}
+        {workflow?.plan_concern && (
+          <div
+            className="mt-1 block font-mono text-[10px] text-rust truncate"
+            title={workflow.plan_concern}
+          >
+            concern: {workflow.plan_concern}
+          </div>
+        )}
+      </button>
       {task.pr_url && (
         <a
           href={task.pr_url}
           target="_blank"
           rel="noreferrer"
-          onClick={(e) => e.stopPropagation()}
           className="mt-1 block font-mono text-[10px] text-rust hover:underline truncate"
         >
           {task.pr_url.replace(/^https:\/\/github\.com\//, "")}
@@ -152,7 +156,7 @@ function TaskCard({
           {merging ? "Merging…" : "Merge"}
         </button>
       )}
-    </button>
+    </div>
   );
 }
 
@@ -186,7 +190,7 @@ export function Active({ projectFilter }: Props) {
     : null;
 
   const active = (data ?? [])
-    .filter((t) => !TERMINAL_STATUSES.has(t.status))
+    .filter(shouldShowTask)
     .filter((t) => !resolvedRoot || t.project === resolvedRoot);
   const grouped: Record<string, Task[]> = {};
   for (const c of COLUMNS) grouped[c.key] = [];
