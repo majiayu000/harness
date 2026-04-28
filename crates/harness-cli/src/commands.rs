@@ -312,6 +312,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // HARNESS_PROJECT_ROOT, etc. are respected by gc, rule check, and skill
     // commands — not just `serve`.
     config.apply_env_overrides()?;
+    harness_core::db::configure_pg_pool_from_server(&config.server);
 
     match cli.command {
         Command::Serve {

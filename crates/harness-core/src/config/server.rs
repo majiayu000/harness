@@ -18,6 +18,18 @@ pub struct ServerConfig {
     /// `HARNESS_DATABASE_URL` can override this field during config loading.
     #[serde(default)]
     pub database_url: Option<String>,
+    /// Maximum connections for each Postgres-backed logical store pool.
+    ///
+    /// Harness opens separate pools per store, so this is intentionally
+    /// per-store rather than process-wide. Leave unset to use the conservative
+    /// built-in default.
+    #[serde(default)]
+    pub database_pool_max_connections: Option<u32>,
+    /// Seconds to wait for a Postgres pool connection before failing.
+    ///
+    /// Leave unset to use the built-in default.
+    #[serde(default)]
+    pub database_pool_acquire_timeout_secs: Option<u64>,
     #[serde(default)]
     pub github_webhook_secret: Option<String>,
     #[serde(default = "default_notification_broadcast_capacity")]
@@ -83,6 +95,8 @@ impl ServerConfig {
     /// - `HARNESS_DATA_DIR`        — `data_dir`
     /// - `HARNESS_PROJECT_ROOT`    — `project_root`
     /// - `HARNESS_DATABASE_URL`    — `database_url`
+    /// - `HARNESS_DATABASE_POOL_MAX_CONNECTIONS` — `database_pool_max_connections`
+    /// - `HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS` — `database_pool_acquire_timeout_secs`
     /// - `HARNESS_API_TOKEN`       — `api_token`
     /// - `GITHUB_TOKEN` / `GH_TOKEN` — `github_token`
     /// - `GITHUB_WEBHOOK_SECRET`   — `github_webhook_secret`
@@ -100,6 +114,24 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("HARNESS_DATABASE_URL") {
             if !v.is_empty() {
                 self.database_url = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("HARNESS_DATABASE_POOL_MAX_CONNECTIONS") {
+            if !v.is_empty() {
+                self.database_pool_max_connections = Some(v.parse().map_err(|e| {
+                    anyhow::anyhow!(
+                        "HARNESS_DATABASE_POOL_MAX_CONNECTIONS={v:?} is not a valid u32: {e}"
+                    )
+                })?);
+            }
+        }
+        if let Ok(v) = std::env::var("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS") {
+            if !v.is_empty() {
+                self.database_pool_acquire_timeout_secs = Some(v.parse().map_err(|e| {
+                    anyhow::anyhow!(
+                        "HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS={v:?} is not a valid u64: {e}"
+                    )
+                })?);
             }
         }
         if let Ok(v) = std::env::var("HARNESS_API_TOKEN") {
@@ -161,6 +193,8 @@ impl fmt::Debug for ServerConfig {
             data_dir,
             project_root,
             database_url,
+            database_pool_max_connections,
+            database_pool_acquire_timeout_secs,
             github_webhook_secret,
             notification_broadcast_capacity,
             notification_lag_log_every,
@@ -180,6 +214,14 @@ impl fmt::Debug for ServerConfig {
             .field("data_dir", data_dir)
             .field("project_root", project_root)
             .field("database_url", &database_url.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "database_pool_max_connections",
+                database_pool_max_connections,
+            )
+            .field(
+                "database_pool_acquire_timeout_secs",
+                database_pool_acquire_timeout_secs,
+            )
             .field(
                 "github_webhook_secret",
                 &github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
@@ -213,6 +255,8 @@ impl Default for ServerConfig {
             data_dir: dirs_data_dir().join("harness"),
             project_root: default_project_root(),
             database_url: None,
+            database_pool_max_connections: None,
+            database_pool_acquire_timeout_secs: None,
             github_webhook_secret: None,
             notification_broadcast_capacity: default_notification_broadcast_capacity(),
             notification_lag_log_every: default_notification_lag_log_every(),
@@ -272,6 +316,14 @@ fn default_constitution_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_env_vars<const N: usize, F>(vars: [(&str, Option<&str>); N], f: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = crate::test_support::process_env_lock();
+        temp_env::with_vars(vars, f);
+    }
 
     // --- env override tests ---
 
@@ -353,6 +405,42 @@ mod tests {
                 Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb".to_string())
             );
         });
+    }
+
+    #[test]
+    fn env_override_database_pool_settings() {
+        with_env_vars(
+            [
+                ("HARNESS_DATABASE_POOL_MAX_CONNECTIONS", Some("8")),
+                ("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS", Some("30")),
+            ],
+            || {
+                let mut cfg = ServerConfig::default();
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.database_pool_max_connections, Some(8));
+                assert_eq!(cfg.database_pool_acquire_timeout_secs, Some(30));
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_empty_database_pool_settings_do_not_override_toml() {
+        with_env_vars(
+            [
+                ("HARNESS_DATABASE_POOL_MAX_CONNECTIONS", Some("")),
+                ("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS", Some("")),
+            ],
+            || {
+                let mut cfg = ServerConfig {
+                    database_pool_max_connections: Some(4),
+                    database_pool_acquire_timeout_secs: Some(20),
+                    ..ServerConfig::default()
+                };
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.database_pool_max_connections, Some(4));
+                assert_eq!(cfg.database_pool_acquire_timeout_secs, Some(20));
+            },
+        );
     }
 
     #[test]
@@ -505,6 +593,8 @@ mod tests {
                 ("HARNESS_DATA_DIR", None::<&str>),
                 ("HARNESS_PROJECT_ROOT", None::<&str>),
                 ("HARNESS_DATABASE_URL", None::<&str>),
+                ("HARNESS_DATABASE_POOL_MAX_CONNECTIONS", None::<&str>),
+                ("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS", None::<&str>),
                 ("HARNESS_API_TOKEN", None::<&str>),
                 ("GITHUB_TOKEN", None::<&str>),
             ],
@@ -518,6 +608,8 @@ mod tests {
                 assert_eq!(cfg.http_addr, http_addr_before);
                 assert_eq!(cfg.data_dir, data_dir_before);
                 assert_eq!(cfg.database_url, None);
+                assert_eq!(cfg.database_pool_max_connections, None);
+                assert_eq!(cfg.database_pool_acquire_timeout_secs, None);
                 assert_eq!(cfg.api_token, None);
                 assert_eq!(cfg.github_token, None);
             },
@@ -532,12 +624,16 @@ mod tests {
             data_dir = "/tmp/harness"
             project_root = "/tmp/project"
             database_url = "postgres://harness:harness@localhost:5432/harness"
+            database_pool_max_connections = 8
+            database_pool_acquire_timeout_secs = 30
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(
             config.database_url.as_deref(),
             Some("postgres://harness:harness@localhost:5432/harness")
         );
+        assert_eq!(config.database_pool_max_connections, Some(8));
+        assert_eq!(config.database_pool_acquire_timeout_secs, Some(30));
     }
 
     // --- existing tests ---

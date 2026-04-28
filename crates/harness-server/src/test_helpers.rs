@@ -99,6 +99,10 @@ pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
     db_state_lock().lock_owned().await
 }
 
+pub fn test_database_url() -> anyhow::Result<String> {
+    resolve_database_url(None)
+}
+
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
     err.to_string()
         .contains("pool timed out while waiting for an open connection")
