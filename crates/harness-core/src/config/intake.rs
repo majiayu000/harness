@@ -66,6 +66,20 @@ impl GitHubIntakeConfig {
         }
         result
     }
+
+    pub fn find_repo_config(&self, repo: &str) -> Option<GitHubRepoConfig> {
+        self.repos
+            .iter()
+            .find(|config| config.repo == repo)
+            .cloned()
+            .or_else(|| {
+                (self.repo == repo).then(|| GitHubRepoConfig {
+                    repo: self.repo.clone(),
+                    label: self.label.clone(),
+                    project_root: None,
+                })
+            })
+    }
 }
 
 fn default_intake_label() -> String {
@@ -104,7 +118,7 @@ impl Default for GitHubIntakeConfig {
     }
 }
 
-/// Feishu (飞书) Bot intake configuration.
+/// Feishu Bot intake configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FeishuIntakeConfig {
     /// Enable Feishu bot webhook. Default: false.
@@ -200,6 +214,49 @@ mod tests {
             debug_output.contains("None"),
             "absent secrets should show as None"
         );
+    }
+
+    #[test]
+    fn github_find_repo_config_prefers_exact_multi_repo_match() {
+        let config = GitHubIntakeConfig {
+            repo: "owner/default".to_string(),
+            repos: vec![
+                GitHubRepoConfig {
+                    repo: "owner/default".to_string(),
+                    label: "default".to_string(),
+                    project_root: Some("/srv/default".to_string()),
+                },
+                GitHubRepoConfig {
+                    repo: "owner/other".to_string(),
+                    label: "other".to_string(),
+                    project_root: Some("/srv/other".to_string()),
+                },
+            ],
+            ..GitHubIntakeConfig::default()
+        };
+
+        let repo = config
+            .find_repo_config("owner/other")
+            .expect("repo config should exist");
+        assert_eq!(repo.repo, "owner/other");
+        assert_eq!(repo.label, "other");
+        assert_eq!(repo.project_root.as_deref(), Some("/srv/other"));
+    }
+
+    #[test]
+    fn github_find_repo_config_supports_single_repo_shorthand() {
+        let config = GitHubIntakeConfig {
+            repo: "owner/default".to_string(),
+            label: "triage".to_string(),
+            ..GitHubIntakeConfig::default()
+        };
+
+        let repo = config
+            .find_repo_config("owner/default")
+            .expect("repo config should exist");
+        assert_eq!(repo.repo, "owner/default");
+        assert_eq!(repo.label, "triage");
+        assert_eq!(repo.project_root, None);
     }
 }
 

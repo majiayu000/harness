@@ -20,6 +20,7 @@ web/dist/
 # SDK build artifacts (TypeScript bindings)
 sdk/typescript/node_modules/
 sdk/typescript/dist/
+sdk/typescript/bun.lock
 
 # macOS finder metadata
 .DS_Store

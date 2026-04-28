@@ -3,7 +3,9 @@ use super::helpers::{
     matched_skills_for_prompt, run_agent_streaming, run_on_error, run_post_execute,
     run_post_tool_use, run_pre_execute, update_status,
 };
-use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskStatus, TaskStore};
+use crate::task_runner::{
+    mutate_and_persist, CreateTaskRequest, TaskFailureKind, TaskId, TaskStatus, TaskStore,
+};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::interceptor::ToolUseEvent;
 use harness_core::tool_isolation::validate_tool_usage;
@@ -65,10 +67,10 @@ pub(crate) fn prepend_constitution(prompt: String, enabled: bool) -> String {
 }
 
 /// Returns true when the task type requires the agent to emit a `PR_URL=…` line.
-/// Issue-backed tasks and `pr:N` review tasks must produce a PR URL; prompt-only
-/// tasks (periodic_review, etc.) may produce output without creating a PR.
+/// Issue-backed tasks and `pr:N` review tasks must produce a PR URL; generic
+/// prompt-only implementation tasks may complete without creating one.
 pub(crate) fn task_needs_pr_url(req: &CreateTaskRequest) -> bool {
-    req.issue.is_some() || req.pr.is_some()
+    req.task_kind().requires_pr_url()
 }
 
 /// Outcome of the implement phase.
@@ -76,6 +78,13 @@ pub(crate) fn task_needs_pr_url(req: &CreateTaskRequest) -> bool {
 pub(crate) enum ImplementOutcome {
     /// Task is fully complete (success or failure already persisted) — caller returns Ok(()).
     Done,
+    /// Implementation reported that the current plan is incomplete and the
+    /// caller should choose between replan or force-execute retry.
+    Replan {
+        issue: u64,
+        plan_issue: String,
+        prior_plan: Option<String>,
+    },
     /// Implementation succeeded — proceed to conflict resolution and review.
     Proceed {
         pr_url: Option<String>,
@@ -110,8 +119,12 @@ pub(crate) async fn run_implement_phase(
     git: Option<&harness_core::config::project::GitConfig>,
     repo_slug: &str,
     project: &Path,
+    // Canonical project root for project_id derivation. Separate from `project`
+    // because workspace isolation makes `project` a worktree path, not the canonical root.
+    project_root: &Path,
     plan_output: Option<String>,
     resumed_pr_url: Option<String>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     turn_timeout: Duration,
     effective_max_turns: Option<u32>,
     turns_used: &mut u32,
@@ -119,16 +132,6 @@ pub(crate) async fn run_implement_phase(
     task_start: Instant,
 ) -> anyhow::Result<ImplementOutcome> {
     use crate::task_runner::RoundResult;
-    use harness_core::config::agents::CapabilityProfile;
-
-    fn restricted_tools(profile: CapabilityProfile) -> anyhow::Result<Vec<String>> {
-        profile.tools().ok_or_else(|| {
-            anyhow::anyhow!(
-                "capability profile {:?} returned None from tools() — misconfiguration",
-                profile
-            )
-        })
-    }
 
     // Resume normal flow — update status to Implementing for the main turn.
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
@@ -169,12 +172,6 @@ pub(crate) async fn run_implement_phase(
             &review_config.reviewer_name,
             false,
         )
-    } else if matches!(
-        req.source.as_deref(),
-        Some("periodic_review") | Some("sprint_planner")
-    ) {
-        // Review/planner tasks use their prompt as-is — no "create PR" wrapper.
-        req.prompt.clone().unwrap_or_default()
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
@@ -267,23 +264,8 @@ pub(crate) async fn run_implement_phase(
 
     let context_items = collect_context_items(skills, project, &first_prompt).await;
 
-    // Periodic review tasks need Bash to run guard check commands but should
-    // not have unrestricted write access — use Standard profile. All other
-    // tasks (implementation) keep Full (None → --dangerously-skip-permissions).
-    //
-    // Some(tools) causes claude.rs to pass --allowedTools to the CLI (hard
-    // enforcement). None → --dangerously-skip-permissions (full access).
-    let (initial_allowed_tools, capability_prompt_note): (Option<Vec<String>>, _) = if matches!(
-        req.source.as_deref(),
-        Some("periodic_review") | Some("sprint_planner")
-    ) {
-        (
-            Some(restricted_tools(CapabilityProfile::Standard)?),
-            CapabilityProfile::Standard.prompt_note(),
-        )
-    } else {
-        (None, None)
-    };
+    let initial_allowed_tools: Option<Vec<String>> = None;
+    let capability_prompt_note: Option<&'static str> = None;
 
     // Prepend capability restriction note so the agent knows which tools are
     // permitted. This is the primary enforcement path now that --allowedTools
@@ -511,6 +493,15 @@ pub(crate) async fn run_implement_phase(
             tracing::warn!(stderr = %stderr, "agent stderr during implementation");
         }
 
+        // Append stderr to output so that sentinel parsers (parse_pr_url, etc.) see
+        // the full combined text. For streaming adapters stderr is always empty here;
+        // for non-streaming adapters (execute path) it carries real process output.
+        let output = if !stderr.is_empty() {
+            format!("{output}\n--- stderr ---\n{stderr}")
+        } else {
+            output
+        };
+
         // Fast-fail: if the agent observed a stale worktree managed by another harness
         // session, abort immediately. This prevents the task from pushing commits to the
         // wrong PR (issue #799).
@@ -527,16 +518,17 @@ pub(crate) async fn run_implement_phase(
             );
             mutate_and_persist(store, task_id, |s| {
                 s.status = TaskStatus::Failed;
+                s.failure_kind = Some(TaskFailureKind::WorkspaceLifecycle);
                 s.turn = 1;
                 s.pr_url = collision_pr_url.clone();
                 s.error = Some(
-                    "WorktreeCollision: agent observed worktree managed by another harness session"
+                    "WorktreeCollision: agent observed worktree managed by another harness session; reconciliation required"
                         .into(),
                 );
                 s.rounds.push(RoundResult {
                     turn: 1,
                     action: "implement".into(),
-                    result: "worktree_collision".into(),
+                    result: "workspace_lifecycle_collision".into(),
                     detail: if output.is_empty() {
                         None
                     } else {
@@ -557,87 +549,94 @@ pub(crate) async fn run_implement_phase(
             return Ok(ImplementOutcome::Done);
         }
 
-        // Review-only tasks produce a report, not a PR.
-        // Persist the output and return immediately — no PR parsing or review loop.
-        let is_review_task = store.get(task_id).is_some_and(|s| {
-            matches!(
-                s.source.as_deref(),
-                Some("periodic_review") | Some("sprint_planner")
-            )
-        });
+        let (mut pr_url, mut pr_num, created_issue_num) =
+            match parse_implementation_outcome(&output) {
+                ImplementationOutcome::PlanIssue(plan_issue) => {
+                    if let (Some(workflows), Some(issue_number)) =
+                        (issue_workflow_store.as_ref(), req.issue)
+                    {
+                        let project_id = project_root.to_string_lossy().into_owned();
+                        if let Err(e) = workflows
+                            .record_plan_issue_detected(
+                                &project_id,
+                                req.repo.as_deref(),
+                                issue_number,
+                                &task_id.0,
+                                &plan_issue,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                issue = issue_number,
+                                task_id = %task_id.0,
+                                "issue workflow PLAN_ISSUE tracking failed: {e}"
+                            );
+                        }
+                    }
+                    if let Some(issue_number) = req.issue {
+                        return Ok(ImplementOutcome::Replan {
+                            issue: issue_number,
+                            plan_issue,
+                            prior_plan: plan_output.clone(),
+                        });
+                    }
+                    tracing::error!(
+                        task_id = %task_id,
+                        plan_issue = %plan_issue,
+                        "implementation returned PLAN_ISSUE; marking task failed"
+                    );
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.turn = 2;
+                        s.error = Some(plan_issue.clone());
+                        s.rounds.push(RoundResult {
+                            turn: 1,
+                            action: "implement".into(),
+                            result: "plan_issue".into(),
+                            detail: if output.is_empty() {
+                                None
+                            } else {
+                                Some(output.clone())
+                            },
+                            first_token_latency_ms: impl_first_token_ms,
+                        });
+                    })
+                    .await?;
+                    tracing::info!(
+                        task_id = %task_id,
+                        status = "failed",
+                        turns = 2,
+                        pr_url = tracing::field::Empty,
+                        total_elapsed_secs = task_start.elapsed().as_secs(),
+                        "task_completed"
+                    );
+                    return Ok(ImplementOutcome::Done);
+                }
+                ImplementationOutcome::ParsedPr {
+                    pr_url,
+                    pr_num,
+                    created_issue_num,
+                } => (pr_url, pr_num, created_issue_num),
+            };
 
-        if is_review_task {
-            mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Done;
-                s.turn = 1;
-                s.rounds.push(RoundResult {
-                    turn: 1,
-                    action: "review".into(),
-                    result: "completed".into(),
-                    detail: if output.is_empty() {
-                        None
-                    } else {
-                        Some(output.clone())
-                    },
-                    first_token_latency_ms: impl_first_token_ms,
-                });
-            })
-            .await?;
-            store.log_event(crate::event_replay::TaskEvent::Completed {
-                task_id: task_id.0.clone(),
-                ts: crate::event_replay::now_ts(),
-            });
-            tracing::info!(
-                task_id = %task_id,
-                status = "done",
-                turns = 1,
-                pr_url = tracing::field::Empty,
-                total_elapsed_secs = task_start.elapsed().as_secs(),
-                "task_completed"
-            );
-            return Ok(ImplementOutcome::Done);
-        }
-
-        let (pr_url, pr_num, created_issue_num) = match parse_implementation_outcome(&output) {
-            ImplementationOutcome::PlanIssue(plan_issue) => {
-                tracing::error!(
-                    task_id = %task_id,
-                    plan_issue = %plan_issue,
-                    "implementation returned PLAN_ISSUE; marking task failed"
-                );
-                mutate_and_persist(store, task_id, |s| {
-                    s.status = TaskStatus::Failed;
-                    s.turn = 2;
-                    s.error = Some(plan_issue.clone());
-                    s.rounds.push(RoundResult {
-                        turn: 1,
-                        action: "implement".into(),
-                        result: "plan_issue".into(),
-                        detail: if output.is_empty() {
-                            None
-                        } else {
-                            Some(output.clone())
-                        },
-                        first_token_latency_ms: impl_first_token_ms,
-                    });
-                })
-                .await?;
+        // Fallback: if the agent produced no PR_URL= sentinel, try to recover from
+        // the current branch via GitHub REST. This handles the regression where
+        // ANSI codes or unexpected output channels caused sentinel parsing to miss
+        // an already-created PR (issue #982).
+        if pr_url.is_none() && task_needs_pr_url(req) {
+            if let Some((fallback_num, fallback_url)) =
+                super::pr_detection::fallback_find_pr_by_branch(project).await
+            {
                 tracing::info!(
                     task_id = %task_id,
-                    status = "failed",
-                    turns = 2,
-                    pr_url = tracing::field::Empty,
-                    total_elapsed_secs = task_start.elapsed().as_secs(),
-                    "task_completed"
+                    pr_number = fallback_num,
+                    pr_url = %fallback_url,
+                    "PR_URL sentinel missing from output; recovered via GitHub REST"
                 );
-                return Ok(ImplementOutcome::Done);
+                pr_url = Some(fallback_url);
+                pr_num = Some(fallback_num);
             }
-            ImplementationOutcome::ParsedPr {
-                pr_url,
-                pr_num,
-                created_issue_num,
-            } => (pr_url, pr_num, created_issue_num),
-        };
+        }
 
         mutate_and_persist(store, task_id, |s| {
             s.pr_url = pr_url.clone();
@@ -688,6 +687,29 @@ pub(crate) async fn run_implement_phase(
 
         // Emit PrDetected event so crash recovery can reconstruct pr_url.
         if let Some(pr_url_str) = pr_url.as_deref() {
+            if let (Some(workflows), Some(issue_number), Some(pr_number)) =
+                (issue_workflow_store.as_ref(), req.issue, pr_num)
+            {
+                let project_id = project.to_string_lossy().into_owned();
+                if let Err(e) = workflows
+                    .record_pr_detected(
+                        &project_id,
+                        req.repo.as_deref(),
+                        issue_number,
+                        &task_id.0,
+                        pr_number,
+                        pr_url_str,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        issue = issue_number,
+                        pr = pr_number,
+                        task_id = %task_id.0,
+                        "issue workflow PR binding failed: {e}"
+                    );
+                }
+            }
             store.log_event(crate::event_replay::TaskEvent::PrDetected {
                 task_id: task_id.0.clone(),
                 ts: crate::event_replay::now_ts(),
@@ -746,8 +768,7 @@ pub(crate) async fn run_implement_phase(
             }
             // Issue tasks and pr:N tasks must produce a PR URL. Mark Failed so the issue
             // is removed from the dispatched set by on_task_complete and can be re-queued.
-            // Prompt-only tasks (periodic_review, etc.) may legitimately produce output
-            // without a PR — Done is correct there.
+            // Generic prompt-only implementation tasks may legitimately finish without a PR.
             if task_needs_pr_url(req) {
                 tracing::warn!(
                     task_id = %task_id,

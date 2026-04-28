@@ -66,6 +66,15 @@ async fn make_test_state_with(
     config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
+    make_test_state_with_project_root(dir, dir, config, agent_registry).await
+}
+
+async fn make_test_state_with_project_root(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+    agent_registry: harness_agents::registry::AgentRegistry,
+) -> anyhow::Result<Arc<AppState>> {
     let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
         (cfg.enabled && crate::intake::feishu::has_verification_token(cfg))
             .then(|| Arc::new(crate::intake::feishu::FeishuIntake::new(cfg.clone())))
@@ -89,7 +98,7 @@ async fn make_test_state_with(
         server.config.gc.clone(),
         signal_detector,
         draft_store,
-        dir.to_path_buf(),
+        project_root.to_path_buf(),
     ));
     let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
         dir, "threads",
@@ -99,8 +108,10 @@ async fn make_test_state_with(
         &harness_core::config::dirs::default_db_path(dir, "projects"),
     )
     .await?;
-    let project_svc =
-        crate::services::project::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
+    let project_svc = crate::services::project::DefaultProjectService::new(
+        _project_svc_tmp,
+        project_root.to_path_buf(),
+    );
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
@@ -111,6 +122,8 @@ async fn make_test_state_with(
         vec![],
         None,
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        None,
         None,
         None,
         vec![],
@@ -118,14 +131,16 @@ async fn make_test_state_with(
     Ok(Arc::new(AppState {
         core: crate::http::CoreServices {
             server,
-            project_root: dir.to_path_buf(),
+            project_root: project_root.to_path_buf(),
             home_dir: std::env::var("HOME")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| dir.to_path_buf()),
+                .unwrap_or_else(|_| project_root.to_path_buf()),
             tasks,
             thread_db: Some(thread_db),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            issue_workflow_store: None,
+            project_workflow_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -153,6 +168,8 @@ async fn make_test_state_with(
             review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
+        #[cfg(test)]
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -221,13 +238,48 @@ async fn make_test_state_with_agent(
 ) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
     let mut config = harness_core::config::HarnessConfig::default();
     config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
+    build_test_state_with_agent(dir, dir, config).await
+}
 
+async fn make_test_state_with_agent_and_repo(
+    dir: &std::path::Path,
+    webhook_secret: Option<&str>,
+    repo: &str,
+) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: repo.to_string(),
+        ..Default::default()
+    });
+    build_test_state_with_agent(dir, dir, config).await
+}
+
+async fn make_test_state_with_agent_and_config(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
+    build_test_state_with_agent(dir, project_root, config).await
+}
+
+async fn build_test_state_with_agent(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
     let capturing = CapturingAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("test");
     registry.register("test", capturing.clone());
 
-    let state = make_test_state_with(dir, config, registry).await?;
+    let state = make_test_state_with_project_root(dir, project_root, config, registry).await?;
     Ok((state, capturing))
+}
+
+fn init_fake_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root.join(".git"))?;
+    Ok(())
 }
 
 fn task_app(state: Arc<AppState>) -> Router {
@@ -334,6 +386,23 @@ async fn response_json(response: axum::response::Response) -> anyhow::Result<ser
     use http_body_util::BodyExt;
     let body = response.into_body().collect().await?.to_bytes();
     Ok(serde_json::from_slice(&body)?)
+}
+
+async fn wait_for_task_project_root(
+    state: &Arc<AppState>,
+    task_id: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let task_id = harness_core::types::TaskId(task_id.to_string());
+    for _ in 0..50 {
+        if let Some(task) = state.core.tasks.get_with_db_fallback(&task_id).await? {
+            if let Some(project_root) = task.project_root {
+                return Ok(project_root);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    anyhow::bail!("task {task_id} did not resolve a project root")
 }
 
 fn webhook_signature(secret: &str, payload: &[u8]) -> String {
@@ -465,7 +534,8 @@ async fn token_usage_route_is_registered() -> anyhow::Result<()> {
 async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -499,7 +569,8 @@ async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
 async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -533,7 +604,8 @@ async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
 async fn webhook_fix_ci_on_pr_creates_fix_ci_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -848,6 +920,55 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
     let get_body = get_resp.into_body().collect().await?.to_bytes();
     let task_json: serde_json::Value = serde_json::from_slice(&get_body)?;
     assert_eq!(task_json["id"], task_id);
+    assert!(task_json["scheduler"]["authority_state"].is_string());
+    assert!(task_json["scheduler"]["run_generation"].is_number());
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
+    use axum::response::IntoResponse;
+
+    let dir = tempfile::tempdir()?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Review,
+        status: task_runner::TaskStatus::ReviewWaiting,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("periodic_review".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("periodic review".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Review,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    let task_id = task.id.to_string();
+
+    let response = axum::Json(task).into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let task_json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(task_json["id"], task_id);
+    assert!(task_json.get("system_input").is_none());
     Ok(())
 }
 
@@ -1082,6 +1203,93 @@ async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state.clone());
+
+    let review_task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Review,
+        status: task_runner::TaskStatus::ReviewWaiting,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("periodic_review".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("periodic review".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Review,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    let planner_task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Planner,
+        status: task_runner::TaskStatus::PlannerGenerating,
+        turn: 1,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("sprint_planner".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: None,
+        repo: Some("owner/repo".to_string()),
+        description: Some("sprint planner".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Plan,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    state.core.tasks.insert(&review_task).await;
+    state.core.tasks.insert(&planner_task).await;
+
+    let response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let tasks: serde_json::Value = serde_json::from_slice(&body)?;
+    let tasks = tasks.as_array().expect("tasks array");
+    assert!(tasks
+        .iter()
+        .any(|task| { task["task_kind"] == "review" && task["status"] == "review_waiting" }));
+    assert!(tasks
+        .iter()
+        .any(|task| { task["task_kind"] == "planner" && task["status"] == "planner_generating" }));
+    Ok(())
+}
+
+#[tokio::test]
 async fn feishu_webhook_returns_service_unavailable_when_token_missing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state_with_feishu(dir.path(), None).await?;
@@ -1176,8 +1384,10 @@ async fn feishu_webhook_rejects_invalid_token() -> anyhow::Result<()> {
 #[tokio::test]
 async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1186,7 +1396,8 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
         "issue": {
             "number": 77,
             "body": "@harness please implement this feature"
-        }
+        },
+        "repository": { "full_name": "org/repo" }
     });
     let payload_body = payload.to_string();
     let signature = webhook_signature(secret, payload_body.as_bytes());
@@ -1209,10 +1420,184 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+    let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-repo-a-")?;
+    let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-repo-b-")?;
+    let secret = "secret";
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        repos: vec![harness_core::config::intake::GitHubRepoConfig {
+            repo: "org/repo-b".to_string(),
+            label: "harness".to_string(),
+            project_root: Some(repo_b_dir.path().display().to_string()),
+        }],
+        ..Default::default()
+    });
+
+    let (state, _agent) =
+        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 77,
+            "body": "@harness please implement this feature"
+        },
+        "repository": { "full_name": "org/repo-b" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issues")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = response_json(response).await?;
+    let task_root = wait_for_task_project_root(
+        &state,
+        json["task_id"].as_str().expect("task id should be present"),
+    )
+    .await?;
+    assert_eq!(task_root.canonicalize()?, repo_b_dir.path().canonicalize()?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_routes_prompt_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+    let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-a-")?;
+    let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-b-")?;
+    let secret = "secret";
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        repos: vec![harness_core::config::intake::GitHubRepoConfig {
+            repo: "org/repo-b".to_string(),
+            label: "harness".to_string(),
+            project_root: Some(repo_b_dir.path().display().to_string()),
+        }],
+        ..Default::default()
+    });
+
+    let (state, _agent) =
+        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "created",
+        "issue": {
+            "number": 42,
+            "html_url": "https://github.com/org/repo-b/pull/42",
+            "pull_request": { "url": "https://api.github.com/repos/org/repo-b/pulls/42" }
+        },
+        "comment": {
+            "body": "@harness fix ci",
+            "html_url": "https://github.com/org/repo-b/issues/42#issuecomment-1"
+        },
+        "repository": { "full_name": "org/repo-b" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issue_comment")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = response_json(response).await?;
+    let task_root = wait_for_task_project_root(
+        &state,
+        json["task_id"].as_str().expect("task id should be present"),
+    )
+    .await?;
+    assert_eq!(task_root.canonicalize()?, repo_b_dir.path().canonicalize()?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_ignores_issue_tasks_when_repo_is_unmapped() -> anyhow::Result<()> {
+    let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-fallback-a-")?;
+    let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-fallback-b-")?;
+    let secret = "secret";
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        repos: vec![harness_core::config::intake::GitHubRepoConfig {
+            repo: "org/repo-b".to_string(),
+            label: "harness".to_string(),
+            project_root: Some(repo_b_dir.path().display().to_string()),
+        }],
+        ..Default::default()
+    });
+
+    let (state, _agent) =
+        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 78,
+            "body": "@harness please implement this feature"
+        },
+        "repository": { "full_name": "org/unmapped" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issues")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "ignored");
+    assert!(
+        json["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not configured"),
+        "reason should explain why the repo was ignored"
+    );
+    assert_eq!(state.core.tasks.count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn webhook_pull_request_review_changes_requested_creates_task() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
+    let (state, _agent) =
+        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1541,7 +1926,9 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Pr,
         status: task_runner::TaskStatus::Pending,
+        failure_kind: None,
         turn: 0,
         pr_url: Some("not-a-valid-pr-url".to_string()),
         rounds: vec![],
@@ -1552,15 +1939,20 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         depends_on: vec![],
         subtask_ids: vec![],
         project_root: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
         issue: None,
         repo: None,
         description: None,
         created_at: None,
+        updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -1602,15 +1994,16 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
+async fn pr_recovery_redispatches_prompt_tasks_with_pr_urls() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Prompt,
         status: task_runner::TaskStatus::Pending,
         turn: 0,
-        pr_url: None,
+        pr_url: Some("not-a-valid-pr-url".to_string()),
         rounds: vec![],
         error: None,
         source: None,
@@ -1621,13 +2014,93 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         project_root: None,
         issue: None,
         repo: None,
-        description: Some("prompt task".to_string()),
+        description: None,
         created_at: None,
+        updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
         request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_pr_recovery(&state);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("prompt task was not re-dispatched within 5 seconds after pr_recovery");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert!(matches!(
+        final_state.status,
+        task_runner::TaskStatus::Failed
+    ));
+    assert!(
+        final_state
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unparseable pr_url"),
+        "error should mention unparseable pr_url, got: {:?}",
+        final_state.error
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Prompt,
+        status: task_runner::TaskStatus::Pending,
+        failure_kind: None,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        issue: None,
+        repo: None,
+        description: Some("prompt task".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -1672,5 +2145,225 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         "error should mention prompt task recovery failure, got: {:?}",
         final_state.error
     );
+    Ok(())
+}
+
+#[test]
+fn recovery_queue_domain_routes_review_tasks_to_review_capacity() {
+    assert_eq!(
+        super::background::recovery_queue_domain(task_runner::TaskKind::Review),
+        super::task_routes::QueueDomain::Review
+    );
+    assert_eq!(
+        super::background::recovery_queue_domain(task_runner::TaskKind::Planner),
+        super::task_routes::QueueDomain::Primary
+    );
+}
+
+#[tokio::test]
+async fn get_task_exposes_workspace_lifecycle_metadata() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = crate::test_helpers::tempdir_in_home("harness-test-task-metadata-")?;
+    let state = make_test_state(dir.path()).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        status: task_runner::TaskStatus::Failed,
+        failure_kind: Some(task_runner::TaskFailureKind::WorkspaceLifecycle),
+        turn: 1,
+        pr_url: None,
+        rounds: vec![],
+        error: Some("workspace lifecycle reconciliation failed".to_string()),
+        source: Some("github".to_string()),
+        external_id: Some("issue:899".to_string()),
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        workspace_path: Some(dir.path().join("workspaces/task-899")),
+        workspace_owner: Some("session-899".to_string()),
+        run_generation: 3,
+        issue: Some(899),
+        repo: Some("majiayu000/harness".to_string()),
+        description: Some("workspace failure".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Implement,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        task_kind: task_runner::TaskKind::Issue,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    let app = task_app(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{}", task_id.0))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = response_json(response).await?;
+    assert_eq!(json["failure_kind"], "workspace_lifecycle");
+    assert_eq!(json["workspace_owner"], "session-899");
+    assert_eq!(json["run_generation"], 3);
+    assert!(json["workspace_path"]
+        .as_str()
+        .unwrap_or("")
+        .ends_with("workspaces/task-899"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let mut task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::default(),
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: Some("not-a-valid-pr-url".to_string()),
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: None,
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    task.scheduler.claim_runtime_host(
+        "host-a",
+        chrono::Utc::now() + chrono::TimeDelta::milliseconds(75),
+    );
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_pr_recovery(&state);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("task was not recovered within 5 seconds after lease expiry");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert_eq!(final_state.scheduler.runtime_host_id(), None);
+    assert!(matches!(
+        final_state.scheduler.authority_state,
+        task_runner::SchedulerAuthorityState::Failed
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let mut task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::default(),
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        issue: None,
+        repo: None,
+        description: Some("prompt task".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    task.scheduler.claim_runtime_host(
+        "host-a",
+        chrono::Utc::now() + chrono::TimeDelta::milliseconds(75),
+    );
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+    state
+        .core
+        .tasks
+        .write_checkpoint(&task_id, None, Some("plan output"), None, "plan")
+        .await?;
+
+    super::background::spawn_checkpoint_recovery(&state).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(t) = state.core.tasks.get(&task_id) {
+            if matches!(t.status, task_runner::TaskStatus::Failed) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("checkpoint task was not recovered within 5 seconds after lease expiry");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let final_state = state
+        .core
+        .tasks
+        .get(&task_id)
+        .expect("task must still exist");
+    assert_eq!(final_state.scheduler.runtime_host_id(), None);
+    assert!(matches!(
+        final_state.scheduler.authority_state,
+        task_runner::SchedulerAuthorityState::Failed
+    ));
     Ok(())
 }

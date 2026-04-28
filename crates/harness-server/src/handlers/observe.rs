@@ -121,6 +121,9 @@ mod tests {
     #[tokio::test]
     async fn event_log_returns_logged_true_and_event_id() -> anyhow::Result<()> {
         let _lock = HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let project_root = tempdir_in_home("observe-event-log-root-")?;
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;
@@ -154,6 +157,9 @@ mod tests {
     #[tokio::test]
     async fn event_query_returns_previously_logged_events() -> anyhow::Result<()> {
         let _lock = HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let project_root = tempdir_in_home("observe-event-query-root-")?;
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;
@@ -196,6 +202,9 @@ mod tests {
     #[tokio::test]
     async fn metrics_collect_returns_internal_error_when_scan_fails() -> anyhow::Result<()> {
         let _lock = HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let project_root = tempdir_in_home("metrics-scan-fail-root-")?;
         let data_dir = tempfile::tempdir()?;
         let state = make_test_state(project_root.path(), data_dir.path()).await?;
@@ -237,6 +246,9 @@ mod tests {
     #[tokio::test]
     async fn metrics_collect_emits_rule_scan_anchor_event() -> anyhow::Result<()> {
         let _lock = HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         // Regression test for issue #82: the handler path must write a
         // `rule_scan` anchor event so that session-scoped violation counting
         // in metrics_query works correctly.

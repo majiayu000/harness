@@ -1,5 +1,4 @@
 use crate::http::AppState;
-use crate::runtime_hosts::{ClaimCandidate, ClaimTaskError};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -83,13 +82,7 @@ pub async fn deregister_runtime_host(
     State(state): State<Arc<AppState>>,
     Path(host_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if state.runtime_hosts.deregister(&host_id) {
-        state.runtime_project_cache.clear_host(&host_id);
-        if let Err(response) = persist_runtime_state(&state).await {
-            return response;
-        }
-        (StatusCode::OK, Json(json!({ "deregistered": true })))
-    } else {
+    if !state.runtime_hosts.hosts.contains_key(&host_id) {
         // Host already gone from memory (idempotent retry).  If a prior
         // deregister mutated memory but failed to persist, converge now.
         if state.is_runtime_state_dirty() {
@@ -101,6 +94,43 @@ pub async fn deregister_runtime_host(
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "runtime host not found" })),
         )
+    } else {
+        match state.core.tasks.release_runtime_host_claims(&host_id).await {
+            Ok(released) => {
+                if !released.is_empty() {
+                    tracing::info!(
+                        host_id = %host_id,
+                        released_tasks = released.len(),
+                        "runtime host deregistration released pending scheduler leases"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    error = %e,
+                    "failed to release runtime-host-owned task leases during deregistration"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!("failed to release task leases for runtime host: {e}")
+                    })),
+                );
+            }
+        }
+
+        if !state.runtime_hosts.deregister(&host_id) {
+            tracing::warn!(
+                host_id = %host_id,
+                "runtime host disappeared during deregistration after task lease release"
+            );
+        }
+        state.runtime_project_cache.clear_host(&host_id);
+        if let Err(response) = persist_runtime_state(&state).await {
+            return response;
+        }
+        (StatusCode::OK, Json(json!({ "deregistered": true })))
     }
 }
 
@@ -122,28 +152,25 @@ pub async fn claim_task_for_runtime_host(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    let mut tasks: Vec<ClaimCandidate> = state
+    let mut tasks: Vec<(crate::task_runner::TaskId, Option<String>, Option<String>)> = state
         .core
         .tasks
         .list_all()
         .into_iter()
         .filter(|task| task.status.as_ref() == "pending")
-        .map(|task| ClaimCandidate {
-            task_id: task.id,
-            status: task.status,
-            created_at: task.created_at,
-            project: task.project_root.map(|p| p.to_string_lossy().into_owned()),
+        .map(|task| {
+            (
+                task.id,
+                task.created_at,
+                task.project_root.map(|p| p.to_string_lossy().into_owned()),
+            )
         })
-        .filter(|candidate| match project_filter {
-            Some(filter) => candidate.project.as_deref() == Some(filter),
+        .filter(|(_, _, project)| match project_filter {
+            Some(filter) => project.as_deref() == Some(filter),
             None => true,
         })
         .collect();
-    tasks.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
-    });
+    tasks.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
 
     let lease_secs = match req.lease_secs {
         Some(value) => match i64::try_from(value) {
@@ -158,28 +185,14 @@ pub async fn claim_task_for_runtime_host(
         None => None,
     };
 
-    for candidate in tasks {
-        let live_claim = state
+    for (task_id, _, _) in tasks {
+        match state
             .core
             .tasks
-            .with_task_if_pending(&candidate.task_id, || {
-                state
-                    .runtime_hosts
-                    .claim_task_id(&host_id, &candidate.task_id, lease_secs)
-            });
-        let Some(claim_result) = live_claim else {
-            continue;
-        };
-        match claim_result {
+            .claim_for_runtime_host(&task_id, &host_id, lease_secs)
+            .await
+        {
             Ok(Some(claim)) => {
-                if let Err((_, Json(error_body))) = persist_runtime_state(&state).await {
-                    tracing::error!(
-                        host_id = %host_id,
-                        task_id = %claim.task_id,
-                        error = %error_body["error"].as_str().unwrap_or("unknown persistence error"),
-                        "runtime claim persisted in memory but runtime state persistence failed"
-                    );
-                }
                 return (
                     StatusCode::OK,
                     Json(json!({
@@ -190,27 +203,26 @@ pub async fn claim_task_for_runtime_host(
                 );
             }
             Ok(None) => continue,
-            Err(e) => return claim_task_error_response(e),
+            Err(e) => {
+                let message = e.to_string();
+                if message.contains("too large to compute a valid expiration timestamp") {
+                    return (StatusCode::BAD_REQUEST, Json(json!({ "error": message })));
+                }
+                tracing::error!(
+                    host_id = %host_id,
+                    task_id = %task_id,
+                    error = %message,
+                    "runtime host claim failed to persist authoritative scheduler state"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to claim task: {message}") })),
+                );
+            }
         }
     }
 
-    if let Err(response) = persist_runtime_state(&state).await {
-        return response;
-    }
     (StatusCode::OK, Json(json!({ "claimed": false })))
-}
-
-fn claim_task_error_response(e: ClaimTaskError) -> (StatusCode, Json<serde_json::Value>) {
-    match e {
-        ClaimTaskError::HostNotRegistered(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": e.to_string() })),
-        ),
-        ClaimTaskError::LeaseTtlOutOfRange(_) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        ),
-    }
 }
 
 async fn persist_runtime_state(

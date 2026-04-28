@@ -1,11 +1,14 @@
-use super::helpers::run_agent_streaming;
-use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskPhase, TaskStore};
+use super::helpers::{augment_prompt_with_skills, run_agent_streaming, update_status};
+use crate::task_runner::{
+    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskPhase, TaskStatus, TaskStore,
+};
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::prompts;
 use harness_core::types::ExecutionPhase;
+use harness_observe::event_store::EventStore;
 use std::collections::HashMap;
 use std::path::Path;
-use tokio::time::Duration;
+use tokio::sync::RwLock;
 
 /// Run a plan step for a complex prompt-only task when the planning gate has
 /// forced `TaskPhase::Plan`.
@@ -20,6 +23,8 @@ pub(crate) async fn run_plan_for_prompt(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     let prompt_text = req.prompt.as_deref().unwrap_or_default();
     tracing::info!(task_id = %task_id, "pipeline: starting plan phase for prompt-only task");
@@ -30,6 +35,7 @@ pub(crate) async fn run_plan_for_prompt(
     .await?;
 
     let plan_prompt = prompts::plan_for_prompt_task(prompt_text);
+    let plan_prompt = augment_prompt_with_skills(skills, events, task_id, plan_prompt).await;
 
     let plan_req = AgentRequest {
         prompt: plan_prompt,
@@ -82,6 +88,8 @@ pub(crate) async fn run_triage_plan_pipeline(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     // --- Phase 1: Triage ---
     tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
@@ -89,8 +97,10 @@ pub(crate) async fn run_triage_plan_pipeline(
         state.phase = TaskPhase::Triage;
     })
     .await?;
+    update_status(store, task_id, TaskStatus::Triaging, 0).await?;
 
     let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
+    let triage_prompt = augment_prompt_with_skills(skills, events, task_id, triage_prompt).await;
     let triage_req = AgentRequest {
         prompt: triage_prompt,
         project_root: project.to_path_buf(),
@@ -156,8 +166,10 @@ pub(crate) async fn run_triage_plan_pipeline(
         state.phase = TaskPhase::Plan;
     })
     .await?;
+    update_status(store, task_id, TaskStatus::Planning, 0).await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
+    let plan_prompt = augment_prompt_with_skills(skills, events, task_id, plan_prompt).await;
     let plan_req = AgentRequest {
         prompt: plan_prompt,
         project_root: project.to_path_buf(),
@@ -191,98 +203,65 @@ pub(crate) async fn run_triage_plan_pipeline(
     Ok((Some(plan_text), complexity, 2))
 }
 
-/// Fire a single agent turn to rebase a conflicting PR onto `origin/main`.
+/// Run a repair-plan step after an implementation attempt emitted `PLAN_ISSUE=...`.
 ///
-/// Returns `true` if the agent reported `REBASE_OK` (i.e. a new commit was
-/// force-pushed), `false` in every other case.  Errors are not propagated —
-/// a rebase failure is not fatal; the review loop will handle the PR.
-pub(crate) async fn run_rebase_turn(
+/// Returns the corrected plan text and advances the task phase back to
+/// `Implement`. The caller decides whether to retry implementation or fail.
+pub(crate) async fn run_replan_for_issue(
     agent: &dyn CodeAgent,
-    pr_num: u64,
-    project: &std::path::Path,
-    repo: &str,
-    turn_timeout: Duration,
+    store: &TaskStore,
+    task_id: &TaskId,
+    issue: u64,
+    prior_plan: Option<&str>,
+    plan_issue: &str,
     cargo_env: &HashMap<String, String>,
-) -> bool {
-    // Fetch the branch name from GitHub so the prompt has an exact ref.
-    let branch = {
-        let out = tokio::process::Command::new("gh")
-            .current_dir(project)
-            .args([
-                "pr",
-                "view",
-                &pr_num.to_string(),
-                "--json",
-                "headRefName",
-                "--jq",
-                ".headRefName",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await;
-        match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .trim_matches('"')
-                .to_string(),
-            _ => {
-                tracing::warn!(
-                    pr = pr_num,
-                    "run_rebase_turn: could not fetch branch name; skipping"
-                );
-                return false;
-            }
-        }
-    };
+    project: &Path,
+    req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
+) -> anyhow::Result<String> {
+    tracing::info!(task_id = %task_id, issue, "pipeline: starting replan phase");
+    mutate_and_persist(store, task_id, |state| {
+        state.phase = TaskPhase::Plan;
+    })
+    .await?;
 
-    // Reject branch names that contain shell metacharacters.  The branch
-    // name is embedded inside single-quoted shell commands in the agent
-    // prompt; a single-quote in the name would break out of the quoting.
-    if !branch
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '@' | '~' | '+' | ':'))
-    {
-        tracing::warn!(
-            pr = pr_num,
-            branch = %branch,
-            "run_rebase_turn: branch name contains unsafe characters; skipping"
-        );
-        return false;
-    }
-
-    let prompt = harness_core::prompts::rebase_conflicting_pr(pr_num, &branch, repo, project);
-    let req = AgentRequest {
+    let prompt = prompts::replan_prompt(issue, prior_plan, plan_issue).to_prompt_string();
+    let prompt = augment_prompt_with_skills(skills, events, task_id, prompt).await;
+    let plan_req = AgentRequest {
         prompt,
         project_root: project.to_path_buf(),
         env_vars: cargo_env.clone(),
-        execution_phase: Some(harness_core::types::ExecutionPhase::Rebase),
+        execution_phase: Some(ExecutionPhase::Planning),
         ..Default::default()
     };
 
-    match tokio::time::timeout(turn_timeout, agent.execute(req)).await {
-        Ok(Ok(resp)) => {
-            let last = resp.output.lines().next_back().unwrap_or("").trim();
-            if last.contains("REBASE_OK") {
-                tracing::info!(pr = pr_num, "rebase turn: REBASE_OK");
-                true
-            } else {
-                tracing::warn!(
-                    pr = pr_num,
-                    last_line = last,
-                    "rebase turn: REBASE_FAILED or unexpected output"
-                );
-                false
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(pr = pr_num, error = %e, "rebase turn: agent error");
-            false
-        }
-        Err(_) => {
-            tracing::warn!(pr = pr_num, "rebase turn: timed out");
-            false
-        }
+    let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
+    let plan_resp = tokio::time::timeout(turn_timeout, agent.execute(plan_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("replan phase timed out after {}s", req.turn_timeout_secs))?
+        .map_err(|e| anyhow::anyhow!("replan phase agent error: {e}"))?;
+
+    let plan_text = plan_resp.output.clone();
+    mutate_and_persist(store, task_id, |state| {
+        state.plan_output = Some(plan_text.clone());
+        state.phase = TaskPhase::Implement;
+        state.rounds.push(RoundResult {
+            turn: state.turn,
+            action: "replan".into(),
+            result: "plan_ready".into(),
+            detail: Some(plan_text.clone()),
+            first_token_latency_ms: None,
+        });
+    })
+    .await?;
+    if let Err(e) = store
+        .write_checkpoint(task_id, None, Some(&plan_text), None, "replan_done")
+        .await
+    {
+        tracing::warn!(task_id = %task_id, "failed to write replan checkpoint: {e}");
     }
+
+    tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "replan phase complete");
+    Ok(plan_text)
 }

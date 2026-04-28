@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::AppState;
-use crate::task_runner::{TaskId, TaskStatus};
+use crate::task_runner::{TaskFailureKind, TaskId, TaskStatus};
 
 pub mod feishu;
 pub mod github_issues;
@@ -35,6 +35,7 @@ pub struct IncomingIssue {
 /// Result passed to `IntakeSource::on_task_complete`.
 pub struct TaskCompletionResult {
     pub status: TaskStatus,
+    pub failure_kind: Option<TaskFailureKind>,
     pub pr_url: Option<String>,
     pub error: Option<String>,
     pub summary: String,
@@ -165,6 +166,26 @@ impl IntakeOrchestrator {
         // 2. Run a separate sprint planner per repo, all in parallel.
         let mut handles = Vec::new();
         for (repo, issues) in by_repo {
+            let project_root = issues
+                .first()
+                .and_then(|(_, i)| i.project_root.clone())
+                .unwrap_or_else(|| state.core.project_root.clone());
+            let project_id =
+                match crate::task_runner::resolve_canonical_project(Some(project_root)).await {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(_) => state.core.project_root.to_string_lossy().into_owned(),
+                };
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_poll_started(&project_id, Some(&repo))
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        "intake: failed to mark project workflow poll state: {e}"
+                    );
+                }
+            }
             let state = Arc::clone(state);
             let planner_agent = self.planner_agent.clone();
             let sprint_timeout = self.sprint_timeout;
@@ -271,6 +292,166 @@ fn validate_dag(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedTaskSkip {
+    issue: u64,
+    upstream: u64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SprintPlanNormalization {
+    tasks: Vec<harness_core::prompts::SprintTask>,
+    dropped_completed_edges: Vec<(u64, u64)>,
+    skipped_tasks: Vec<NormalizedTaskSkip>,
+}
+
+fn normalize_sprint_tasks(
+    tasks: Vec<harness_core::prompts::SprintTask>,
+    planner_skips: &std::collections::HashSet<u64>,
+    completed_issues: &std::collections::HashSet<u64>,
+) -> SprintPlanNormalization {
+    let mut tasks = tasks;
+    let mut removed_tasks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut dropped_completed_edges = Vec::new();
+    let mut skipped_tasks = Vec::new();
+
+    loop {
+        let current_issues: std::collections::HashSet<u64> =
+            tasks.iter().map(|t| t.issue).collect();
+        let mut changed = false;
+        let mut next_tasks = Vec::with_capacity(tasks.len());
+
+        for mut task in tasks {
+            let mut filtered_deps = Vec::with_capacity(task.depends_on.len());
+            let mut skip_detail: Option<NormalizedTaskSkip> = None;
+
+            for dep in task.depends_on {
+                if planner_skips.contains(&dep) {
+                    continue;
+                }
+                if removed_tasks.contains(&dep) {
+                    skip_detail = Some(NormalizedTaskSkip {
+                        issue: task.issue,
+                        upstream: dep,
+                        reason: format!(
+                            "upstream issue {dep} was removed from this sprint during intake normalization"
+                        ),
+                    });
+                    break;
+                }
+                if current_issues.contains(&dep) {
+                    filtered_deps.push(dep);
+                    continue;
+                }
+                if completed_issues.contains(&dep) {
+                    dropped_completed_edges.push((task.issue, dep));
+                    changed = true;
+                    continue;
+                }
+                skip_detail = Some(NormalizedTaskSkip {
+                    issue: task.issue,
+                    upstream: dep,
+                    reason: format!(
+                        "upstream issue {dep} is outside the sprint plan and not completed"
+                    ),
+                });
+                break;
+            }
+
+            if let Some(skip) = skip_detail {
+                removed_tasks.insert(task.issue);
+                skipped_tasks.push(skip);
+                changed = true;
+                continue;
+            }
+
+            task.depends_on = filtered_deps;
+            next_tasks.push(task);
+        }
+
+        if !changed {
+            return SprintPlanNormalization {
+                tasks: next_tasks,
+                dropped_completed_edges,
+                skipped_tasks,
+            };
+        }
+
+        tasks = next_tasks;
+    }
+}
+
+fn parse_issue_external_id(external_id: &str) -> Option<u64> {
+    external_id
+        .strip_prefix("issue:")
+        .unwrap_or(external_id)
+        .parse()
+        .ok()
+}
+
+fn latest_timestamp_at_least(candidate: Option<&str>, existing: Option<&str>) -> bool {
+    match (candidate, existing) {
+        (Some(candidate), Some(existing)) => candidate >= existing,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
+}
+
+fn latest_unblocking_issue_numbers(
+    external_statuses: std::collections::HashMap<
+        String,
+        (Option<String>, crate::task_runner::TaskStatus),
+    >,
+) -> std::collections::HashSet<u64> {
+    let mut latest_by_issue: std::collections::HashMap<
+        u64,
+        (Option<String>, crate::task_runner::TaskStatus),
+    > = std::collections::HashMap::new();
+
+    for (external_id, (created_at, status)) in external_statuses {
+        let Some(issue) = parse_issue_external_id(&external_id) else {
+            continue;
+        };
+        let should_replace = latest_by_issue
+            .get(&issue)
+            .map(|(existing_created_at, _)| {
+                latest_timestamp_at_least(created_at.as_deref(), existing_created_at.as_deref())
+            })
+            .unwrap_or(true);
+        if should_replace {
+            latest_by_issue.insert(issue, (created_at, status));
+        }
+    }
+
+    latest_by_issue
+        .into_iter()
+        .filter_map(|(issue, (_, status))| status_unblocks_dependents(&status).then_some(issue))
+        .collect()
+}
+
+async fn completed_issue_numbers_for_project(
+    tasks: &crate::task_runner::TaskStore,
+    project_id: &str,
+    repo: Option<&str>,
+) -> std::collections::HashSet<u64> {
+    match tasks
+        .list_latest_external_statuses_by_project_and_repo(project_id, repo)
+        .await
+    {
+        Ok(external_statuses) => latest_unblocking_issue_numbers(external_statuses),
+        Err(e) => {
+            tracing::warn!(
+                project = project_id,
+                repo,
+                "intake: failed to inspect latest task statuses during sprint normalization: {e}"
+            );
+            std::collections::HashSet::new()
+        }
+    }
+}
+
 fn ready_issues(
     all_task_issues: &std::collections::HashSet<u64>,
     completed: &std::collections::HashSet<u64>,
@@ -303,35 +484,89 @@ async fn run_repo_sprint(
     retry_backoff_base: Duration,
     retry_backoff_max: Duration,
 ) {
+    let project_root = issues
+        .first()
+        .and_then(|(_, i)| i.project_root.clone())
+        .unwrap_or_else(|| state.core.project_root.clone());
+    let project_id = match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
+        .await
+    {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                "intake: failed to canonicalize project root for workflow lookup, using raw path: {e}"
+            );
+            project_root.to_string_lossy().into_owned()
+        }
+    };
+
+    if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+        if let Err(e) = workflows
+            .record_planning_started(&project_id, Some(repo))
+            .await
+        {
+            tracing::warn!(
+                repo,
+                "intake: failed to mark project workflow planning state: {e}"
+            );
+        }
+    }
+
     tracing::info!(
         repo,
         count = issues.len(),
         "intake: planning sprint for repo"
     );
 
-    let project_root = issues
-        .first()
-        .and_then(|(_, i)| i.project_root.clone())
-        .unwrap_or_else(|| state.core.project_root.clone());
-
     // 1. Run sprint planner.
     let issue_summary = build_issue_summary(&issues);
     let planner_prompt = harness_core::prompts::sprint_plan_prompt(&issue_summary);
 
     let planner_req = crate::task_runner::CreateTaskRequest {
-        prompt: Some(planner_prompt),
+        prompt: Some(planner_prompt.clone()),
         agent: planner_agent.map(String::from),
         project: Some(project_root.clone()),
         source: Some("sprint_planner".to_string()),
+        system_input: Some(crate::task_runner::SystemTaskInput::SprintPlanner {
+            prompt: planner_prompt,
+        }),
         ..Default::default()
     };
 
     let planner_task_id = match crate::http::task_routes::enqueue_task(state, planner_req).await {
         Ok(id) => {
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_planner_enqueued(&project_id, Some(repo), &id.0)
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        task_id = %id,
+                        "intake: failed to record planner enqueue on project workflow: {e}"
+                    );
+                }
+            }
             tracing::info!(repo, task_id = %id, "intake: sprint planner enqueued");
             id
         }
         Err(e) => {
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(track_err) = workflows
+                    .record_degraded(
+                        &project_id,
+                        Some(repo),
+                        &format!("failed to enqueue sprint planner: {e:?}"),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        "intake: failed to record degraded project workflow state: {track_err}"
+                    );
+                }
+            }
             tracing::error!(repo, "intake: failed to enqueue sprint planner: {e:?}");
             return;
         }
@@ -340,11 +575,33 @@ async fn run_repo_sprint(
     let Some(planner_output) =
         poll_task_output(&state.core.tasks, &planner_task_id, sprint_timeout).await
     else {
+        if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+            if let Err(e) = workflows
+                .record_degraded(&project_id, Some(repo), "sprint planner failed")
+                .await
+            {
+                tracing::warn!(
+                    repo,
+                    "intake: failed to record degraded project workflow state: {e}"
+                );
+            }
+        }
         tracing::error!(repo, task_id = %planner_task_id, "intake: sprint planner failed");
         return;
     };
 
-    let Some(plan) = harness_core::prompts::parse_sprint_plan(&planner_output) else {
+    let Some(mut plan) = harness_core::prompts::parse_sprint_plan(&planner_output) else {
+        if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+            if let Err(e) = workflows
+                .record_degraded(&project_id, Some(repo), "failed to parse sprint plan")
+                .await
+            {
+                tracing::warn!(
+                    repo,
+                    "intake: failed to record degraded project workflow state: {e}"
+                );
+            }
+        }
         tracing::error!(repo, task_id = %planner_task_id, "intake: failed to parse sprint plan");
         return;
     };
@@ -363,7 +620,48 @@ async fn run_repo_sprint(
             .map(|(src, issue)| (issue.external_id.clone(), (src, issue)))
             .collect();
 
-    // 2. Mark skipped.
+    let project_id = match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
+        .await
+    {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                "intake: failed to canonicalize project root for slot limit lookup, using raw path: {e}"
+            );
+            project_root.to_string_lossy().into_owned()
+        }
+    };
+
+    let completed_issues =
+        completed_issue_numbers_for_project(state.core.tasks.as_ref(), &project_id, Some(repo))
+            .await;
+    let planner_skip_set: std::collections::HashSet<u64> =
+        plan.skip.iter().map(|skip| skip.issue).collect();
+    let normalized =
+        normalize_sprint_tasks(plan.tasks.clone(), &planner_skip_set, &completed_issues);
+    for (issue, upstream) in &normalized.dropped_completed_edges {
+        tracing::info!(
+            repo,
+            issue = *issue,
+            upstream = *upstream,
+            normalization = "drop_completed_upstream_edge",
+            "intake: repaired sprint dependency outside plan"
+        );
+    }
+    for skip in &normalized.skipped_tasks {
+        tracing::warn!(
+            repo,
+            issue = skip.issue,
+            upstream = skip.upstream,
+            normalization = "skip_task_missing_upstream",
+            reason = %skip.reason,
+            "intake: skipped task during sprint normalization"
+        );
+    }
+    plan.tasks = normalized.tasks;
+
+    // 2. Mark planner-directed skips.
     for skip in &plan.skip {
         let ext_id = skip.issue.to_string();
         if let Some((source, _)) = issue_map.get(&ext_id) {
@@ -384,43 +682,20 @@ async fn run_repo_sprint(
     let all_task_issues: std::collections::HashSet<u64> =
         plan.tasks.iter().map(|t| t.issue).collect();
 
-    // Build the dep map, filtering out any dep IDs that belong to skipped issues
-    // so they are not flagged as missing upstreams.
-    let skip_set: std::collections::HashSet<u64> = plan.skip.iter().map(|s| s.issue).collect();
     let deps: std::collections::HashMap<u64, Vec<u64>> = plan
         .tasks
         .iter()
-        .map(|t| {
-            let filtered: Vec<u64> = t
-                .depends_on
-                .iter()
-                .copied()
-                .filter(|dep| !skip_set.contains(dep))
-                .collect();
-            (t.issue, filtered)
-        })
+        .map(|t| (t.issue, t.depends_on.clone()))
         .collect();
 
-    // Validate DAG before starting execution.
+    // Validate DAG after normalization.
     if let Err(e) = validate_dag(&all_task_issues, &deps) {
-        tracing::error!(repo, error = %e, "intake: invalid sprint DAG — aborting");
+        tracing::error!(repo, error = %e, "intake: invalid sprint DAG after normalization — aborting");
         return;
     }
-
-    let project_id = match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
-        .await
-    {
-        Ok(path) => path.to_string_lossy().into_owned(),
-        Err(e) => {
-            tracing::warn!(
-                repo,
-                "intake: failed to canonicalize project root for slot limit lookup, using raw path: {e}"
-            );
-            project_root.to_string_lossy().into_owned()
-        }
-    };
     let start = tokio::time::Instant::now();
     let mut transient_retry_count = 0u32;
+    let mut project_workflow_monitoring_started = false;
 
     'sprint: loop {
         // All done?
@@ -447,6 +722,19 @@ async fn run_repo_sprint(
         // Fill available slots.
         let available =
             sprint_available_slots(&state.concurrency.task_queue.diagnostics(&project_id));
+        if available > 0 {
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_dispatch_started(&project_id, Some(repo))
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        "intake: failed to mark project workflow dispatching state: {e}"
+                    );
+                }
+            }
+        }
         for &issue_num in ready.iter().take(available) {
             let ext_id = issue_num.to_string();
             let Some((source, issue)) = issue_map.get(&ext_id) else {
@@ -463,6 +751,15 @@ async fn run_repo_sprint(
             }
 
             let req = crate::task_runner::CreateTaskRequest {
+                force_execute: {
+                    let workflow_cfg =
+                        harness_core::config::workflow::load_workflow_config(&project_root)
+                            .unwrap_or_default();
+                    issue
+                        .labels
+                        .iter()
+                        .any(|label| label == &workflow_cfg.issue_workflow.force_execute_label)
+                },
                 issue: issue.external_id.parse().ok(),
                 project: issue
                     .project_root
@@ -471,6 +768,7 @@ async fn run_repo_sprint(
                 source: Some(source.name().to_string()),
                 external_id: Some(issue.external_id.clone()),
                 repo: Some(repo.to_string()),
+                labels: issue.labels.clone(),
                 ..Default::default()
             };
 
@@ -556,10 +854,45 @@ async fn run_repo_sprint(
         }
 
         // Wait for any running task to complete.
+        if !running.is_empty() && !project_workflow_monitoring_started {
+            if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_monitoring_started(&project_id, Some(repo))
+                    .await
+                {
+                    tracing::warn!(
+                        repo,
+                        "intake: failed to mark project workflow monitoring state: {e}"
+                    );
+                }
+            }
+            project_workflow_monitoring_started = true;
+        }
         tokio::time::sleep(TASK_POLL_INTERVAL).await;
         let mut newly_done = Vec::new();
         let mut cancelled = Vec::new();
         for (&issue_num, task_id) in &running {
+            if let Some(outcome) = workflow_sprint_issue_outcome(
+                state.core.issue_workflow_store.as_deref(),
+                &project_id,
+                repo,
+                issue_num,
+            )
+            .await
+            {
+                tracing::info!(
+                    repo,
+                    external_id = issue_num,
+                    task_id = %task_id,
+                    workflow_outcome = outcome.as_str(),
+                    "intake: workflow state resolved running issue outcome"
+                );
+                match outcome {
+                    SprintIssueOutcome::UnblocksDependents => newly_done.push(issue_num),
+                    SprintIssueOutcome::Cancelled => cancelled.push(issue_num),
+                }
+                continue;
+            }
             if let Some(task) = state.core.tasks.get(task_id) {
                 if task.status.is_terminal() {
                     tracing::info!(
@@ -613,6 +946,29 @@ async fn run_repo_sprint(
         "intake: repo sprint complete"
     );
 
+    if let Some(workflows) = state.core.project_workflow_store.as_ref() {
+        let result = if stranded.is_empty() {
+            workflows.record_idle(&project_id, Some(repo)).await
+        } else {
+            workflows
+                .record_degraded(
+                    &project_id,
+                    Some(repo),
+                    &format!(
+                        "repo sprint ended with unresolved tasks: {}",
+                        stranded.len()
+                    ),
+                )
+                .await
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                repo,
+                "intake: failed to finalize project workflow state: {e}"
+            );
+        }
+    }
+
     if !stranded.is_empty() {
         tracing::error!(
             repo,
@@ -644,6 +1000,63 @@ fn build_issue_summary(issues: &[(Arc<dyn IntakeSource>, IncomingIssue)]) -> Str
 
 fn status_unblocks_dependents(status: &TaskStatus) -> bool {
     matches!(status, TaskStatus::Done | TaskStatus::Failed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SprintIssueOutcome {
+    UnblocksDependents,
+    Cancelled,
+}
+
+impl SprintIssueOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnblocksDependents => "unblocks_dependents",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+fn workflow_state_unblocks_dependents(
+    state: harness_workflow::issue_lifecycle::IssueLifecycleState,
+) -> bool {
+    matches!(
+        state,
+        harness_workflow::issue_lifecycle::IssueLifecycleState::ReadyToMerge
+            | harness_workflow::issue_lifecycle::IssueLifecycleState::Done
+            | harness_workflow::issue_lifecycle::IssueLifecycleState::Failed
+    )
+}
+
+async fn workflow_sprint_issue_outcome(
+    store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
+    project_id: &str,
+    repo: &str,
+    issue_num: u64,
+) -> Option<SprintIssueOutcome> {
+    let store = store?;
+    let workflow = match store.get_by_issue(project_id, Some(repo), issue_num).await {
+        Ok(workflow) => workflow,
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                issue = issue_num,
+                "intake: failed to load workflow state for running issue: {e}"
+            );
+            return None;
+        }
+    }?;
+
+    if workflow_state_unblocks_dependents(workflow.state) {
+        Some(SprintIssueOutcome::UnblocksDependents)
+    } else if matches!(
+        workflow.state,
+        harness_workflow::issue_lifecycle::IssueLifecycleState::Cancelled
+    ) {
+        Some(SprintIssueOutcome::Cancelled)
+    } else {
+        None
+    }
 }
 
 /// Poll a task until terminal state, return its output.
@@ -906,6 +1319,83 @@ mod tests {
         assert!(validate_dag(&issues, &deps).is_ok());
     }
 
+    fn make_tasks(pairs: &[(u64, &[u64])]) -> Vec<harness_core::prompts::SprintTask> {
+        pairs
+            .iter()
+            .map(|&(issue, deps)| harness_core::prompts::SprintTask {
+                issue,
+                depends_on: deps.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn normalize_sprint_tasks_drops_completed_missing_upstream() {
+        let normalized = normalize_sprint_tasks(
+            make_tasks(&[(1, &[]), (2, &[99])]),
+            &std::collections::HashSet::new(),
+            &make_issues(&[99]),
+        );
+
+        assert!(normalized.skipped_tasks.is_empty());
+        assert_eq!(normalized.dropped_completed_edges, vec![(2, 99)]);
+        assert_eq!(normalized.tasks, make_tasks(&[(1, &[]), (2, &[])]));
+    }
+
+    #[test]
+    fn normalize_sprint_tasks_skips_unresolved_missing_upstream() {
+        let normalized = normalize_sprint_tasks(
+            make_tasks(&[(1, &[]), (2, &[99])]),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(normalized.dropped_completed_edges.is_empty());
+        assert_eq!(normalized.tasks, make_tasks(&[(1, &[])]));
+        assert_eq!(
+            normalized.skipped_tasks,
+            vec![NormalizedTaskSkip {
+                issue: 2,
+                upstream: 99,
+                reason: "upstream issue 99 is outside the sprint plan and not completed"
+                    .to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_sprint_tasks_handles_mixed_valid_and_invalid_edges() {
+        let normalized = normalize_sprint_tasks(
+            make_tasks(&[(1, &[]), (2, &[1]), (3, &[7]), (4, &[99]), (5, &[4])]),
+            &std::collections::HashSet::new(),
+            &make_issues(&[7]),
+        );
+
+        assert_eq!(normalized.dropped_completed_edges, vec![(3, 7)]);
+        assert_eq!(
+            normalized.tasks,
+            make_tasks(&[(1, &[]), (2, &[1]), (3, &[])])
+        );
+        assert_eq!(
+            normalized.skipped_tasks,
+            vec![
+                NormalizedTaskSkip {
+                    issue: 4,
+                    upstream: 99,
+                    reason: "upstream issue 99 is outside the sprint plan and not completed"
+                        .to_string(),
+                },
+                NormalizedTaskSkip {
+                    issue: 5,
+                    upstream: 4,
+                    reason:
+                        "upstream issue 4 was removed from this sprint during intake normalization"
+                            .to_string(),
+                },
+            ]
+        );
+    }
+
     #[test]
     fn ready_issues_returns_root_when_dependency_not_completed() {
         let issues = make_issues(&[41, 42]);
@@ -944,6 +1434,147 @@ mod tests {
     fn done_and_failed_tasks_still_count_as_completed_dependencies() {
         assert!(status_unblocks_dependents(&TaskStatus::Done));
         assert!(status_unblocks_dependents(&TaskStatus::Failed));
+    }
+
+    #[tokio::test]
+    async fn completed_issue_numbers_for_project_uses_repo_and_latest_status() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let project_root = std::path::PathBuf::from("/projects/alpha");
+        let other_project_root = std::path::PathBuf::from("/projects/beta");
+        let repo = "owner/current";
+
+        for (id, issue, status, root, task_repo, created_at) in [
+            (
+                "done",
+                41_u64,
+                TaskStatus::Done,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:00:00Z"),
+            ),
+            (
+                "failed",
+                42_u64,
+                TaskStatus::Failed,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:05:00Z"),
+            ),
+            (
+                "cancelled",
+                43_u64,
+                TaskStatus::Cancelled,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:10:00Z"),
+            ),
+            (
+                "other-project",
+                44_u64,
+                TaskStatus::Done,
+                &other_project_root,
+                repo,
+                Some("2026-04-22T09:15:00Z"),
+            ),
+            (
+                "other-repo",
+                45_u64,
+                TaskStatus::Done,
+                &project_root,
+                "owner/other",
+                Some("2026-04-22T09:20:00Z"),
+            ),
+            (
+                "done-old-attempt",
+                46_u64,
+                TaskStatus::Done,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:25:00Z"),
+            ),
+            (
+                "retry-latest",
+                46_u64,
+                TaskStatus::Implementing,
+                &project_root,
+                repo,
+                Some("2026-04-22T09:30:00Z"),
+            ),
+        ] {
+            let mut task =
+                crate::task_runner::TaskState::new(harness_core::types::TaskId(id.to_string()));
+            task.status = status;
+            task.project_root = Some(root.clone());
+            task.repo = Some(task_repo.to_string());
+            task.external_id = Some(format!("issue:{issue}"));
+            task.created_at = created_at.map(str::to_string);
+            store.insert(&task).await;
+        }
+
+        let completed = completed_issue_numbers_for_project(
+            store.as_ref(),
+            &project_root.to_string_lossy(),
+            Some(repo),
+        )
+        .await;
+
+        assert_eq!(completed, make_issues(&[41, 42]));
+        Ok(())
+    }
+
+    #[test]
+    fn latest_unblocking_issue_numbers_prefers_latest_issue_id_format() {
+        let completed = latest_unblocking_issue_numbers(std::collections::HashMap::from([
+            (
+                "42".to_string(),
+                (Some("2026-04-22T09:00:00Z".to_string()), TaskStatus::Done),
+            ),
+            (
+                "issue:42".to_string(),
+                (
+                    Some("2026-04-22T09:05:00Z".to_string()),
+                    TaskStatus::Implementing,
+                ),
+            ),
+            (
+                "issue:43".to_string(),
+                (Some("2026-04-22T09:10:00Z".to_string()), TaskStatus::Done),
+            ),
+        ]));
+
+        assert_eq!(completed, make_issues(&[43]));
+    }
+
+    #[test]
+    fn workflow_ready_to_merge_and_terminals_unblock_dependents() {
+        use harness_workflow::issue_lifecycle::IssueLifecycleState;
+
+        assert!(workflow_state_unblocks_dependents(
+            IssueLifecycleState::ReadyToMerge
+        ));
+        assert!(workflow_state_unblocks_dependents(
+            IssueLifecycleState::Done
+        ));
+        assert!(workflow_state_unblocks_dependents(
+            IssueLifecycleState::Failed
+        ));
+        assert!(!workflow_state_unblocks_dependents(
+            IssueLifecycleState::Cancelled
+        ));
+        assert!(!workflow_state_unblocks_dependents(
+            IssueLifecycleState::AddressingFeedback
+        ));
+    }
+
+    #[test]
+    fn sprint_issue_outcome_labels_are_stable() {
+        assert_eq!(
+            SprintIssueOutcome::UnblocksDependents.as_str(),
+            "unblocks_dependents"
+        );
+        assert_eq!(SprintIssueOutcome::Cancelled.as_str(), "cancelled");
     }
 
     #[test]

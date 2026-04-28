@@ -9,6 +9,9 @@ pub(crate) struct RegistryBundle {
     pub thread_db: crate::thread_db::ThreadDb,
     pub plan_db: crate::plan_db::PlanDb,
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    pub project_workflow_store:
+        Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
     pub project_registry: Arc<crate::project_registry::ProjectRegistry>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
@@ -26,6 +29,9 @@ pub(crate) async fn build_registry(
     tasks: &Arc<crate::task_runner::TaskStore>,
 ) -> anyhow::Result<RegistryBundle> {
     let configured_database_url = server.config.server.database_url.as_deref();
+    let workflow_config =
+        harness_core::config::workflow::load_workflow_config(project_root).unwrap_or_default();
+    let workflow_ns = workflow_config.storage.schema_namespace;
     // ── Thread DB ─────────────────────────────────────────────────────────────
     let thread_db_path = harness_core::config::dirs::default_db_path(data_dir, "threads");
     let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
@@ -73,6 +79,88 @@ pub(crate) async fn build_registry(
         }
         Err(e) => tracing::warn!("plan cache: failed to load plans on startup: {e}"),
     }
+
+    // ── Issue workflow store ──────────────────────────────────────────────────
+    let issue_workflows_db_path =
+        harness_core::config::dirs::default_db_path(data_dir, "issue_workflows");
+    let issue_workflow_store = {
+        let schema = format!("{workflow_ns}_issue");
+        match harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url_and_schema(
+            configured_database_url,
+            &schema,
+        )
+        .await
+        {
+            Ok(store) => {
+                if let Err(e) = migrate_issue_workflows_if_needed(
+                    configured_database_url,
+                    &issue_workflows_db_path,
+                    &schema,
+                    &store,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        schema = %schema,
+                        "issue workflow migration check failed: {e}"
+                    );
+                }
+                let (rewritten, failed, skipped) =
+                    repair_corrupt_project_ids(&store, project_root).await;
+                tracing::info!(
+                    rewritten,
+                    failed,
+                    skipped,
+                    "startup repair of corrupt issue workflow project_ids complete"
+                );
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    schema = %schema,
+                    "issue workflow store init failed, issue lifecycle state will not persist: {e}"
+                );
+                None
+            }
+        }
+    };
+
+    // ── Project workflow store ────────────────────────────────────────────────
+    let project_workflows_db_path =
+        harness_core::config::dirs::default_db_path(data_dir, "project_workflows");
+    let project_workflow_store = {
+        let schema = format!("{workflow_ns}_project");
+        match harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url_and_schema(
+            configured_database_url,
+            &schema,
+        )
+        .await
+        {
+            Ok(store) => {
+                if let Err(e) = migrate_project_workflows_if_needed(
+                    configured_database_url,
+                    &project_workflows_db_path,
+                    &schema,
+                    &store,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        schema = %schema,
+                        "project workflow migration check failed: {e}"
+                    );
+                }
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    schema = %schema,
+                    "project workflow store init failed, project lifecycle state will not persist: {e}"
+                );
+                None
+            }
+        }
+    };
 
     // ── Project registry ──────────────────────────────────────────────────────
     let project_registry = crate::project_registry::ProjectRegistry::open_with_database_url(
@@ -165,17 +253,27 @@ pub(crate) async fn build_registry(
             }
         };
 
-    // Cleanup orphan worktrees from any previous crash.
-    // Terminal tasks are no longer held in the in-memory cache, so query DB directly.
+    // Reconcile stale workspaces from any previous crash before new task admission.
     if let Some(ref wmgr) = workspace_mgr {
-        match tasks.list_terminal_ids_from_db().await {
-            Ok(terminal_ids) => {
-                wmgr.cleanup_orphan_worktrees(project_root, &terminal_ids)
-                    .await;
+        match tasks.list_all_summaries_with_terminal().await {
+            Ok(task_summaries) => {
+                match wmgr.reconcile_startup(project_root, &task_summaries).await {
+                    Ok(summary) => {
+                        tracing::info!(
+                            removed = summary.removed,
+                            preserved = summary.preserved,
+                            migrated = summary.migrated,
+                            "workspace startup reconciliation complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("workspace startup reconciliation failed: {e}");
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to load terminal tasks for orphan worktree cleanup: {e}; skipping cleanup"
+                    "Failed to load task summaries for workspace reconciliation: {e}; skipping cleanup"
                 );
             }
         }
@@ -206,10 +304,134 @@ pub(crate) async fn build_registry(
         thread_db,
         plan_db,
         plan_cache,
+        issue_workflow_store,
+        project_workflow_store,
         project_registry,
         runtime_state_store,
         workspace_mgr,
     })
+}
+
+/// Walk all `issue_workflows` rows. For each row whose `project_id` contains
+/// `/workspaces/` (a corrupt worktree path), replace it with `canonical_root`.
+/// Returns `(rewritten, failed, skipped)` counts.
+async fn repair_corrupt_project_ids(
+    store: &harness_workflow::issue_lifecycle::IssueWorkflowStore,
+    canonical_root: &std::path::Path,
+) -> (u64, u64, u64) {
+    let corrupt_rows = match store.list_with_worktree_project_ids().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("startup repair: failed to list corrupt issue workflows: {e}");
+            return (0, 0, 0);
+        }
+    };
+    let total_count = store.row_count().await.unwrap_or(0);
+
+    let new_project_id = canonical_root.to_string_lossy().into_owned();
+    let (mut rewritten, mut failed) = (0u64, 0u64);
+    let skipped = (total_count as u64).saturating_sub(corrupt_rows.len() as u64);
+
+    for workflow in corrupt_rows {
+        tracing::info!(
+            row_id = %workflow.id,
+            old_project_id = %workflow.project_id,
+            new_project_id = %new_project_id,
+            "startup repair: rewriting corrupt workflow project_id"
+        );
+        match store.repair_project_id(&workflow.id, &new_project_id).await {
+            Ok(()) => rewritten += 1,
+            Err(e) => {
+                tracing::error!(
+                    row_id = %workflow.id,
+                    "startup repair: failed to rewrite project_id: {e}; marking workflow failed"
+                );
+                if let Err(e2) = store
+                    .mark_workflow_failed_with_reason(
+                        &workflow.id,
+                        "failed to repair project_id during startup",
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        row_id = %workflow.id,
+                        "startup repair: also failed to mark workflow as failed: {e2}"
+                    );
+                }
+                failed += 1;
+            }
+        }
+    }
+
+    (rewritten, failed, skipped)
+}
+
+async fn migrate_issue_workflows_if_needed(
+    configured_database_url: Option<&str>,
+    legacy_path: &Path,
+    target_schema: &str,
+    target_store: &harness_workflow::issue_lifecycle::IssueWorkflowStore,
+) -> anyhow::Result<()> {
+    let legacy_schema = harness_workflow::issue_lifecycle::legacy_schema_for_path(legacy_path)?;
+    if legacy_schema == target_schema || target_store.row_count().await? > 0 {
+        return Ok(());
+    }
+
+    let legacy_store =
+        harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
+            legacy_path,
+            configured_database_url,
+        )
+        .await?;
+    let legacy_rows = legacy_store.list().await?;
+    if legacy_rows.is_empty() {
+        return Ok(());
+    }
+
+    for workflow in &legacy_rows {
+        target_store.upsert(workflow).await?;
+    }
+    tracing::info!(
+        count = legacy_rows.len(),
+        legacy_schema = %legacy_schema,
+        target_schema = %target_schema,
+        "workflow migration: copied legacy issue workflow rows into namespaced schema"
+    );
+    Ok(())
+}
+
+async fn migrate_project_workflows_if_needed(
+    configured_database_url: Option<&str>,
+    legacy_path: &Path,
+    target_schema: &str,
+    target_store: &harness_workflow::project_lifecycle::ProjectWorkflowStore,
+) -> anyhow::Result<()> {
+    let legacy_schema = harness_workflow::project_lifecycle::legacy_schema_for_path(legacy_path)?;
+    if legacy_schema == target_schema || target_store.row_count().await? > 0 {
+        return Ok(());
+    }
+
+    let legacy_store =
+        harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url(
+            legacy_path,
+            configured_database_url,
+        )
+        .await?;
+    let legacy_rows = legacy_store.list().await?;
+    if legacy_rows.is_empty() {
+        return Ok(());
+    }
+
+    for workflow in &legacy_rows {
+        target_store.upsert(workflow).await?;
+    }
+    tracing::info!(
+        count = legacy_rows.len(),
+        legacy_schema = %legacy_schema,
+        target_schema = %target_schema,
+        "workflow migration: copied legacy project workflow rows into namespaced schema"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -277,5 +499,119 @@ mod tests {
             bundle.plan_cache.contains_key(&plan_id),
             "plan should be hydrated into cache"
         );
+    }
+
+    async fn open_test_issue_store(
+    ) -> anyhow::Result<Option<harness_workflow::issue_lifecycle::IssueWorkflowStore>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir()?;
+        match harness_workflow::issue_lifecycle::IssueWorkflowStore::open(
+            &dir.path().join("issue_workflows.db"),
+        )
+        .await
+        {
+            Ok(store) => Ok(Some(store)),
+            Err(e) => {
+                tracing::warn!("issue workflow store test skipped: {e}");
+                Ok(None)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_rewrites_worktree_paths() -> anyhow::Result<()> {
+        let Some(store) = open_test_issue_store().await? else {
+            return Ok(());
+        };
+        let corrupt = "/data/workspaces/abc-uuid-reg-test";
+        let canonical = std::path::Path::new("/real/canonical/reg-root");
+
+        store
+            .record_issue_scheduled(corrupt, Some("owner/repo"), 8001, "task-reg1", &[], false)
+            .await?;
+        store
+            .record_issue_scheduled(corrupt, Some("owner/repo"), 8002, "task-reg2", &[], false)
+            .await?;
+
+        let (rewritten, failed, skipped) = repair_corrupt_project_ids(&store, canonical).await;
+        assert_eq!(rewritten, 2, "both worktree rows should be rewritten");
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 0);
+
+        let canonical_str = canonical.to_string_lossy();
+        let r1 = store
+            .get_by_issue(&canonical_str, Some("owner/repo"), 8001)
+            .await?;
+        assert!(r1.is_some(), "row 8001 should have canonical project_id");
+        let r2 = store
+            .get_by_issue(&canonical_str, Some("owner/repo"), 8002)
+            .await?;
+        assert!(r2.is_some(), "row 8002 should have canonical project_id");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_skips_canonical_rows() -> anyhow::Result<()> {
+        let Some(store) = open_test_issue_store().await? else {
+            return Ok(());
+        };
+        let canonical_id = "/tmp/already-canonical-skip-test";
+        let canonical_root = std::path::Path::new("/any/root");
+
+        store
+            .record_issue_scheduled(
+                canonical_id,
+                Some("owner/repo"),
+                8003,
+                "task-skip1",
+                &[],
+                false,
+            )
+            .await?;
+
+        let (rewritten, failed, skipped) = repair_corrupt_project_ids(&store, canonical_root).await;
+        assert_eq!(skipped, 1, "canonical row should be skipped");
+        assert_eq!(rewritten, 0);
+        assert_eq!(failed, 0);
+
+        // Row untouched: project_id unchanged
+        let row = store
+            .get_by_issue(canonical_id, Some("owner/repo"), 8003)
+            .await?
+            .expect("row should still exist");
+        assert_eq!(row.project_id, canonical_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_counts_all_categories() -> anyhow::Result<()> {
+        let Some(store) = open_test_issue_store().await? else {
+            return Ok(());
+        };
+        let corrupt = "/data/workspaces/mix-uuid-reg-test";
+        let canonical_id = "/tmp/canonical-mix-test";
+        let canonical_root = std::path::Path::new("/real/mix-root");
+
+        store
+            .record_issue_scheduled(corrupt, Some("owner/repo"), 8010, "task-mix1", &[], false)
+            .await?;
+        store
+            .record_issue_scheduled(
+                canonical_id,
+                Some("owner/repo"),
+                8011,
+                "task-mix2",
+                &[],
+                false,
+            )
+            .await?;
+
+        let (rewritten, failed, skipped) = repair_corrupt_project_ids(&store, canonical_root).await;
+        assert_eq!(rewritten, 1);
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 1);
+        Ok(())
     }
 }

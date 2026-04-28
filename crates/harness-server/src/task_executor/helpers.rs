@@ -4,8 +4,10 @@ use harness_core::error::HarnessError;
 use harness_core::interceptor::{ToolUseEvent, TurnInterceptor};
 use harness_core::prompts;
 use harness_core::types::{
-    ContextItem, Decision, Item, SkillId, ThreadId, TokenUsage, TurnId, TurnStatus,
+    ContextItem, Decision, Event, Item, SessionId, SkillId, ThreadId, TokenUsage, TurnId,
+    TurnStatus,
 };
+use harness_observe::event_store::EventStore;
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::path::Path;
 use std::sync::Arc;
@@ -100,75 +102,17 @@ pub(crate) async fn run_post_tool_use(
     None
 }
 
-/// Detect files added or modified in `project_root` via `git status --porcelain`.
+/// Detect files added or modified in `project_root`.
 ///
-/// Deleted entries are excluded. Returns an empty list when git is unavailable
-/// or `project_root` is not inside a git repository.
+/// Host-side git inspection is disabled by project policy, so this returns an
+/// empty list. Agents remain responsible for reporting modified files in their
+/// final output and validation prompts.
 pub(crate) async fn detect_modified_files(project_root: &Path) -> Vec<std::path::PathBuf> {
-    let output = tokio::process::Command::new("git")
-        .args(["status", "--porcelain", "-z"])
-        .current_dir(project_root)
-        .output()
-        .await;
-    match output {
-        Ok(out) => {
-            if !out.status.success() {
-                tracing::debug!(
-                    project_root = %project_root.display(),
-                    status = ?out.status.code(),
-                    "detect_modified_files: git status failed"
-                );
-                return Vec::new();
-            }
-            parse_porcelain_z_paths(&out.stdout)
-        }
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                project_root = %project_root.display(),
-                "detect_modified_files: git status unavailable"
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn parse_porcelain_z_paths(stdout: &[u8]) -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
-    let mut records = stdout.split(|b| *b == 0).filter(|r| !r.is_empty());
-    while let Some(record) = records.next() {
-        if record.len() < 3 {
-            continue;
-        }
-
-        let x = record[0] as char;
-        let y = record[1] as char;
-        let is_rename_or_copy = matches!(x, 'R' | 'C');
-
-        if x == 'D' || y == 'D' {
-            if is_rename_or_copy {
-                let _ = records.next();
-            }
-            continue;
-        }
-
-        let mut path_bytes = &record[3..];
-        if is_rename_or_copy {
-            if let Some(new_path) = records.next() {
-                path_bytes = new_path;
-            } else {
-                continue;
-            }
-        }
-
-        if path_bytes.is_empty() {
-            continue;
-        }
-        paths.push(std::path::PathBuf::from(
-            String::from_utf8_lossy(path_bytes).into_owned(),
-        ));
-    }
-    paths
+    tracing::debug!(
+        project_root = %project_root.display(),
+        "detect_modified_files: host-side git inspection disabled"
+    );
+    Vec::new()
 }
 
 pub(crate) fn emit_runtime_notification(
@@ -383,6 +327,90 @@ pub(crate) async fn matched_skills_for_prompt(
         .collect()
 }
 
+/// Collect matched skills and all skills from the store, record usage for
+/// matches, and return both.
+///
+/// Lock discipline: holds read lock briefly to collect data, drops it, then
+/// acquires write lock only if there are matches. Never holds both locks
+/// simultaneously.
+async fn collect_and_record_skill_matches(
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    prompt: &str,
+) -> (Vec<(SkillId, String, String)>, Vec<(String, String)>) {
+    {
+        let guard = skills.read().await;
+        if guard.list().is_empty() {
+            return (vec![], vec![]);
+        }
+    }
+    let (matched, all) = {
+        let guard = skills.read().await;
+        let matched: Vec<(SkillId, String, String)> = guard
+            .match_prompt(prompt)
+            .into_iter()
+            .map(|s| (s.id.clone(), s.name.clone(), s.content.clone()))
+            .collect();
+        let all: Vec<(String, String)> = guard
+            .list()
+            .iter()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect();
+        (matched, all)
+    };
+    if !matched.is_empty() {
+        let mut guard = skills.write().await;
+        for (id, _, _) in &matched {
+            guard.record_use(id);
+        }
+    }
+    (matched, all)
+}
+
+/// Augment a prompt with matching skills: match once, record usage, log `skill_used` events,
+/// and return the augmented prompt string. Replaces the repeated
+/// `matched_skills_for_prompt` + `inject_skills_into_prompt` + event-log loop pattern.
+pub(crate) async fn augment_prompt_with_skills(
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
+    task_id: &TaskId,
+    prompt: String,
+) -> String {
+    let (matched, all_skills) = collect_and_record_skill_matches(skills, &prompt).await;
+
+    for (skill_id, skill_name, _) in &matched {
+        let mut ev = Event::new(
+            SessionId::new(),
+            "skill_used",
+            "task_runner",
+            Decision::Pass,
+        );
+        ev.reason = Some(skill_name.clone());
+        ev.detail = Some(format!(
+            "task_id={} skill_id={}",
+            task_id.as_str(),
+            skill_id.as_str()
+        ));
+        if let Err(err) = events.log(&ev).await {
+            tracing::warn!(error = %err, "failed to log skill_used event");
+        }
+    }
+
+    let listing = harness_core::prompts::build_available_skills_listing(
+        all_skills.iter().map(|(n, d)| (n.as_str(), d.as_str())),
+    );
+    let section = harness_core::prompts::build_matched_skills_section(
+        matched.iter().map(|(_, n, c)| (n.as_str(), c.as_str())),
+    );
+    let mut additions = listing;
+    additions.push_str(&section);
+
+    if additions.is_empty() {
+        prompt
+    } else {
+        prompt + &additions
+    }
+}
+
 /// Match skills against the prompt, record usage for each match, and return a
 /// string to append directly to the agent prompt.
 ///
@@ -395,47 +423,12 @@ pub(crate) async fn matched_skills_for_prompt(
 ///
 /// Returns an empty string when the store is empty (no sections added).
 /// The "Relevant Skills" section is omitted when no skills match.
-///
-/// Lock discipline: holds read lock briefly, drops it, then acquires write lock
-/// only if there are matched skills to record usage for. Never holds both locks
-/// simultaneously.
 pub(crate) async fn inject_skills_into_prompt(
     skills: &RwLock<harness_skills::store::SkillStore>,
     prompt: &str,
 ) -> String {
-    // Early return when the store is empty — avoids acquiring locks unnecessarily.
-    {
-        let guard = skills.read().await;
-        if guard.list().is_empty() {
-            return String::new();
-        }
-    }
+    let (matched_data, all_skills) = collect_and_record_skill_matches(skills, prompt).await;
 
-    // Read phase: collect all needed data while holding read lock minimally.
-    let (matched_data, all_skills) = {
-        let guard = skills.read().await;
-        let matched: Vec<(harness_core::types::SkillId, String, String)> = guard
-            .match_prompt(prompt)
-            .into_iter()
-            .map(|s| (s.id.clone(), s.name.clone(), s.content.clone()))
-            .collect();
-        let all: Vec<(String, String)> = guard
-            .list()
-            .iter()
-            .map(|s| (s.name.clone(), s.description.clone()))
-            .collect();
-        (matched, all)
-    };
-
-    // Write phase: record usage for matched skills (brief write lock).
-    if !matched_data.is_empty() {
-        let mut guard = skills.write().await;
-        for (id, _, _) in &matched_data {
-            guard.record_use(id);
-        }
-    }
-
-    // Build prompt additions.
     let listing = harness_core::prompts::build_available_skills_listing(
         all_skills.iter().map(|(n, d)| (n.as_str(), d.as_str())),
     );
@@ -559,7 +552,7 @@ pub(crate) async fn run_agent_streaming(
     // and must not be written at rest (per the privacy contract in task_runner.rs).
     let is_prompt_only = store
         .get(task_id)
-        .map(|s| s.description.as_deref() == Some("prompt task"))
+        .map(|s| matches!(s.task_kind, crate::task_runner::TaskKind::Prompt))
         .unwrap_or(false);
     let phase_str = req
         .execution_phase

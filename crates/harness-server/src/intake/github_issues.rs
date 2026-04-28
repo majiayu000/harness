@@ -24,6 +24,7 @@ impl DispatchedTaskChecker for crate::task_runner::TaskStore {
 pub struct GitHubIssuesPoller {
     repo: String,
     label: String,
+    client: reqwest::Client,
     project_root: Option<PathBuf>,
     dispatched: DashMap<String, TaskId>,
     persist_path: Option<PathBuf>,
@@ -41,6 +42,7 @@ impl GitHubIssuesPoller {
         Self {
             repo: repo_config.repo.clone(),
             label: repo_config.label.clone(),
+            client: reqwest::Client::new(),
             project_root: repo_config.project_root.as_ref().map(PathBuf::from),
             dispatched,
             persist_path,
@@ -178,15 +180,17 @@ fn dispatched_contains_issue(dispatched: &DashMap<String, TaskId>, issue_id: &st
     dispatched.contains_key(issue_id) || dispatched.contains_key(&format!("issue:{issue_id}"))
 }
 
-/// Raw GitHub issue fields returned by `gh issue list --json`.
+/// Raw GitHub issue fields returned by the GitHub REST API.
 #[derive(Debug, Deserialize)]
 struct GhIssue {
     number: u64,
     title: String,
     body: Option<String>,
+    #[serde(alias = "html_url")]
     url: String,
+    #[serde(default)]
     labels: Vec<GhLabel>,
-    #[serde(rename = "createdAt")]
+    #[serde(alias = "createdAt")]
     created_at: Option<DateTime<Utc>>,
 }
 
@@ -195,7 +199,7 @@ struct GhLabel {
     name: String,
 }
 
-/// Parsed result from `gh issue list` output.
+/// Parsed result from GitHub issue-list output.
 struct ParsedGhOutput {
     /// New issues not yet dispatched.
     new_issues: Vec<IncomingIssue>,
@@ -203,7 +207,7 @@ struct ParsedGhOutput {
     open_issue_ids: std::collections::HashSet<String>,
 }
 
-/// Parse the JSON output of `gh issue list --json number,title,body,url,labels,createdAt`
+/// Parse the JSON output of the GitHub issue list API
 /// into new issues (filtering out dispatched) and the full set of open issue IDs.
 fn parse_gh_output(
     json: &[u8],
@@ -247,34 +251,29 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
-        let mut args = vec![
-            "issue",
-            "list",
-            "--repo",
-            &self.repo,
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,url,labels,createdAt",
-            "--limit",
-            "1000",
-        ];
+        let url = format!("https://api.github.com/repos/{}/issues", self.repo);
+        let mut request = self
+            .client
+            .get(url)
+            .query(&[("state", "open"), ("per_page", "100")])
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::USER_AGENT, "harness-server");
         if !self.label.is_empty() {
-            args.push("--label");
-            args.push(&self.label);
+            request = request.query(&[("labels", self.label.as_str())]);
         }
-        let output = tokio::process::Command::new("gh")
-            .args(&args)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh issue list failed: {stderr}");
+        if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+            if !token.trim().is_empty() {
+                request = request.bearer_auth(token);
+            }
         }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!("GitHub issue list failed with status {}", response.status());
+        }
+        let body = response.bytes().await?;
 
         let parsed = parse_gh_output(
-            &output.stdout,
+            &body,
             &self.repo,
             &self.dispatched,
             self.project_root.as_deref(),
@@ -332,10 +331,16 @@ impl IntakeSource for GitHubIssuesPoller {
             .as_deref()
             .map(|e| e.contains("manual resolution required"))
             .unwrap_or(false);
+        let is_workspace_lifecycle = matches!(
+            result.failure_kind,
+            Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle)
+        );
         // Remove transient failed or cancelled issues from dispatched so the poller can
         // retry them later if they remain open. Done tasks and permanent failures stay
         // dispatched to avoid re-processing.
-        if (result.status.is_failure() || result.status.is_cancelled()) && !needs_manual {
+        if ((result.status.is_failure() && is_workspace_lifecycle) || result.status.is_cancelled())
+            && !needs_manual
+        {
             self.dispatched
                 .remove(&normalize_issue_external_id(external_id));
             self.persist_dispatched();
@@ -509,6 +514,7 @@ mod tests {
 
         let result = TaskCompletionResult {
             status: TaskStatus::Cancelled,
+            failure_kind: None,
             pr_url: None,
             error: Some("cancelled".to_string()),
             summary: "cancelled".to_string(),
@@ -537,6 +543,7 @@ mod tests {
 
         let result = TaskCompletionResult {
             status: TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
             pr_url: None,
             error: Some(
                 "pr:77 is conflicting and rebase was not pushed; manual resolution required"
@@ -570,6 +577,7 @@ mod tests {
 
         let result = TaskCompletionResult {
             status: TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
             pr_url: None,
             error: Some("no PR number found in agent output; task requires PR_URL".to_string()),
             summary: "transient failure".to_string(),
@@ -598,6 +606,7 @@ mod tests {
 
         let result = TaskCompletionResult {
             status: TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
             pr_url: None,
             error: Some("triage phase agent error".to_string()),
             summary: "transient failure".to_string(),
@@ -608,6 +617,35 @@ mod tests {
         assert!(
             !poller.dispatched.contains_key("88"),
             "canonical external_id should remove the raw GitHub issue key"
+        );
+    }
+
+    #[test]
+    fn on_task_complete_task_failure_keeps_dispatched() {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
+        poller.dispatched.insert(
+            "99".to_string(),
+            harness_core::types::TaskId("task-99".to_string()),
+        );
+
+        let result = TaskCompletionResult {
+            status: TaskStatus::Failed,
+            failure_kind: Some(crate::task_runner::TaskFailureKind::Task),
+            pr_url: None,
+            error: Some("implementation test failure".to_string()),
+            summary: "task failure".to_string(),
+        };
+
+        futures::executor::block_on(poller.on_task_complete("99", &result)).unwrap();
+
+        assert!(
+            poller.dispatched.contains_key("99"),
+            "non-lifecycle task failures should stay dispatched"
         );
     }
 
@@ -681,5 +719,43 @@ mod tests {
 
         assert_eq!(pruned, 0);
         assert!(poller.dispatched.contains_key("1"));
+    }
+
+    // Surface 3 regression guard: the dispatched JSON file stores only
+    // {issue_id → task_id} pairs.  No workspace path must ever be written.
+    #[test]
+    fn surface3_dispatched_json_has_no_path_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, Some(tmp.path()));
+        poller.dispatched.insert(
+            "42".to_string(),
+            harness_core::types::TaskId("task-abc123".to_string()),
+        );
+        poller.dispatched.insert(
+            "99".to_string(),
+            harness_core::types::TaskId("task-xyz456".to_string()),
+        );
+        poller.persist_dispatched();
+
+        let persist_path = tmp.path().join("github_dispatched_owner_repo.json");
+        let json = std::fs::read_to_string(&persist_path)
+            .expect("dispatched file should have been written");
+        assert!(
+            !json.contains("/workspaces/"),
+            "dispatched JSON must not contain workspace paths, got: {json}"
+        );
+        let map: HashMap<String, String> =
+            serde_json::from_str(&json).expect("dispatched JSON must parse");
+        assert_eq!(map.len(), 2, "both entries should be persisted");
+        assert!(
+            map.values()
+                .all(|v| !v.contains('/') || v.starts_with("skip-")),
+            "task IDs must not be filesystem paths"
+        );
     }
 }

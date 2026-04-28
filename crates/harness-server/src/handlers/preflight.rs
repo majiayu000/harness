@@ -397,6 +397,9 @@ COMPLEXITY: complex"
 
     #[tokio::test]
     async fn run_preflight_uses_scan_result_from_event_store() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let temp = tempfile::tempdir()?;
         let events = Arc::new(harness_observe::event_store::EventStore::new(temp.path()).await?);
         let session_id = SessionId::new();
@@ -449,6 +452,9 @@ COMPLEXITY: complex"
 
     #[tokio::test]
     async fn run_preflight_errors_when_no_scan_result_exists() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let temp = tempfile::tempdir()?;
         let err = run_preflight(
             Arc::new(StaticAgent {
@@ -473,6 +479,9 @@ COMPLEXITY: complex"
 
     #[tokio::test]
     async fn run_preflight_errors_when_event_store_query_fails() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let temp = tempfile::tempdir()?;
 
         let err = run_preflight(

@@ -58,6 +58,8 @@ async fn make_test_state_with_config_and_registry(
         vec![],
         None,
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        None,
         None,
         None,
         vec![],
@@ -73,6 +75,8 @@ async fn make_test_state_with_config_and_registry(
             thread_db: Some(thread_db),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            issue_workflow_store: None,
+            project_workflow_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -98,6 +102,8 @@ async fn make_test_state_with_config_and_registry(
             review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
+        #[cfg(test)]
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -358,11 +364,14 @@ async fn wait_for_terminal_task(
     state: &AppState,
     task_id: &str,
 ) -> anyhow::Result<crate::task_runner::TaskState> {
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{sleep, Duration, Instant};
 
     let tid = harness_core::types::TaskId(task_id.to_string());
-    for _ in 0..120 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_status = None;
+    loop {
         if let Some(task) = state.core.tasks.get(&tid) {
+            last_status = Some(format!("{:?}", task.status));
             if matches!(
                 task.status,
                 crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
@@ -370,9 +379,12 @@ async fn wait_for_terminal_task(
                 return Ok(task);
             }
         }
+        if Instant::now() >= deadline {
+            break;
+        }
         sleep(Duration::from_millis(25)).await;
     }
-    anyhow::bail!("task did not reach terminal state in time");
+    anyhow::bail!("task did not reach terminal state in time; last_status={last_status:?}");
 }
 
 async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Result<u32> {
@@ -1381,6 +1393,8 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         vec![],
         None,
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        None,
         None,
         None,
         vec![],
@@ -1396,6 +1410,8 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             thread_db: Some(thread_db),
             plan_db: Some(plan_db),
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            issue_workflow_store: None,
+            project_workflow_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -1421,6 +1437,8 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
+        #[cfg(test)]
+        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),

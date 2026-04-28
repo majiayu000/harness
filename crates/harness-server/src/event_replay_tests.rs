@@ -402,6 +402,7 @@ fn compact_lock_is_not_stale_for_live_process_with_correct_start_time() {
 
 #[tokio::test]
 async fn replay_and_recover_integration() -> anyhow::Result<()> {
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("tasks.db");
     let db = TaskDb::open(&db_path).await?;
@@ -448,6 +449,7 @@ async fn replay_and_recover_integration() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn replay_skips_phantom_task_not_in_db() -> anyhow::Result<()> {
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("tasks.db");
     let db = TaskDb::open(&db_path).await?;
@@ -472,6 +474,7 @@ async fn replay_skips_phantom_task_not_in_db() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn replay_event_log_has_pr_url_checkpoint_has_none() -> anyhow::Result<()> {
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("tasks.db");
     let db = TaskDb::open(&db_path).await?;
@@ -500,6 +503,7 @@ async fn replay_event_log_has_pr_url_checkpoint_has_none() -> anyhow::Result<()>
 
 #[tokio::test]
 async fn replay_terminal_failed_overrides_implementing() -> anyhow::Result<()> {
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("tasks.db");
     let db = TaskDb::open(&db_path).await?;
@@ -525,4 +529,50 @@ async fn replay_terminal_failed_overrides_implementing() -> anyhow::Result<()> {
     assert!(matches!(t.status, TaskStatus::Failed));
 
     Ok(())
+}
+
+// Surface 4 regression guard: every TaskEvent variant serialises to JSONL
+// containing only task_id, ts, and variant-specific scalar fields.
+// No workspace path must ever appear in the wire format.
+#[test]
+fn surface4_task_event_jsonl_has_no_workspace_paths() {
+    let events = [
+        TaskEvent::Created {
+            task_id: "t1".into(),
+            ts: 0,
+        },
+        TaskEvent::StatusChanged {
+            task_id: "t1".into(),
+            ts: 1,
+            status: "implementing".into(),
+            turn: 1,
+        },
+        TaskEvent::Failed {
+            task_id: "t1".into(),
+            ts: 2,
+            reason: "something went wrong".into(),
+        },
+        TaskEvent::Completed {
+            task_id: "t1".into(),
+            ts: 3,
+        },
+        TaskEvent::PrDetected {
+            task_id: "t1".into(),
+            ts: 4,
+            pr_url: "https://github.com/o/r/pull/1".into(),
+        },
+        TaskEvent::RoundCompleted {
+            task_id: "t1".into(),
+            ts: 5,
+            round: 1,
+            result: "passed".into(),
+        },
+    ];
+    for event in &events {
+        let json = serde_json::to_string(event).expect("TaskEvent must serialise");
+        assert!(
+            !json.contains("/workspaces/"),
+            "TaskEvent JSON must not contain a workspace path: {json}"
+        );
+    }
 }

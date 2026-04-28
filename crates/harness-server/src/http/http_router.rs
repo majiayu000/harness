@@ -7,7 +7,8 @@ use axum::{
 use std::sync::Arc;
 
 use super::{
-    auth, get_task, get_task_artifacts, get_task_prompts, github_webhook, handle_rpc, health_check,
+    auth, get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
+    get_task, get_task_artifacts, get_task_prompts, github_webhook, handle_rpc, health_check,
     ingest_signal, intake_status, list_tasks, password_reset, project_queue_stats, state::AppState,
     stream_task_sse, task_routes,
 };
@@ -46,7 +47,20 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/projects/queue-stats", get(project_queue_stats))
         .route("/api/dashboard", get(crate::handlers::dashboard::dashboard))
         .route("/api/overview", get(crate::handlers::overview::overview))
+        .route(
+            "/api/operator-snapshot",
+            get(crate::handlers::operator_snapshot::operator_snapshot),
+        )
         .route("/api/intake", get(intake_status))
+        .route(
+            "/api/workflows/issues/by-issue",
+            get(get_issue_workflow_by_issue),
+        )
+        .route("/api/workflows/issues/by-pr", get(get_issue_workflow_by_pr))
+        .route(
+            "/api/workflows/projects/by-project",
+            get(get_project_workflow_by_project),
+        )
         .route(
             "/api/runtime-hosts",
             get(crate::handlers::runtime_hosts::list_runtime_hosts),
@@ -98,6 +112,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/auth/reset-password", post(password_reset))
+        .route("/reconcile", post(crate::handlers::reconcile::handle))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::api_auth_middleware,

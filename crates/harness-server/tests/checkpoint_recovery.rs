@@ -8,12 +8,14 @@
 
 use harness_core::types::TaskId as CoreTaskId;
 use harness_server::task_db::TaskDb;
-use harness_server::task_runner::{TaskPhase, TaskState, TaskStatus, TaskStore};
+use harness_server::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus, TaskStore};
 
 fn make_task(id: &str, status: TaskStatus) -> TaskState {
     TaskState {
         id: CoreTaskId(id.to_string()),
+        task_kind: TaskKind::Prompt,
         status,
+        failure_kind: None,
         turn: 0,
         pr_url: None,
         rounds: vec![],
@@ -24,15 +26,20 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         depends_on: vec![],
         subtask_ids: vec![],
         project_root: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
         issue: None,
         description: None,
         created_at: None,
+        updated_at: None,
         priority: 0,
         phase: TaskPhase::default(),
         triage_output: None,
         plan_output: None,
         repo: None,
         request_settings: None,
+        scheduler: harness_server::task_runner::TaskSchedulerState::queued(),
     }
 }
 
@@ -261,6 +268,29 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn restart_review_task_without_system_input_fails() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        let mut task = make_task("t-review-missing-input", TaskStatus::ReviewGenerating);
+        task.task_kind = TaskKind::Review;
+        db.insert(&task).await?;
+        Ok(())
+    })
+    .await?;
+
+    let task = store
+        .get_with_db_fallback(&CoreTaskId("t-review-missing-input".into()))
+        .await?
+        .expect("task should be fetchable from DB");
+    assert!(
+        matches!(task.status, TaskStatus::Failed),
+        "review task without persisted input should fail on restart, got {:?}",
+        task.status
+    );
+    assert!(task.error.is_some());
+    Ok(())
+}
+
 /// Tasks that crashed mid-transient-retry (status=pending, error starts with
 /// "retrying after transient failure") must become Failed on restart.
 #[tokio::test]
@@ -361,6 +391,38 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
         }
     }
     assert_eq!(failed_count, 2, "two tasks should have been failed");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_marks_resumed_task_as_recovering_in_scheduler_state() -> anyhow::Result<()> {
+    let store = setup_store(|db| async move {
+        db.insert(&make_task("t-recovering", TaskStatus::Implementing))
+            .await?;
+        db.write_checkpoint("t-recovering", None, Some("plan text"), None, "plan_done")
+            .await?;
+        Ok(())
+    })
+    .await?;
+
+    let recovered = store
+        .get(&CoreTaskId("t-recovering".into()))
+        .expect("recovered task should remain active");
+    assert!(matches!(recovered.status, TaskStatus::Pending));
+    assert!(matches!(
+        recovered.scheduler.authority_state,
+        harness_server::task_runner::SchedulerAuthorityState::Recovering
+    ));
+    assert_eq!(recovered.scheduler.recovery_generation, 1);
+    assert_eq!(
+        recovered
+            .scheduler
+            .owner
+            .as_ref()
+            .map(|owner| owner.id.as_str()),
+        Some("startup-recovery")
+    );
 
     Ok(())
 }

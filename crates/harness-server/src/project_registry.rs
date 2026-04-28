@@ -30,16 +30,24 @@ fn default_active() -> bool {
     true
 }
 
-static PROJECT_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "create projects table",
-    sql: "CREATE TABLE IF NOT EXISTS projects (
-        id         TEXT PRIMARY KEY,
-        data       TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )",
-}];
+static PROJECT_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "create projects table",
+        sql: "CREATE TABLE IF NOT EXISTS projects (
+            id         TEXT PRIMARY KEY,
+            data       TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    },
+    Migration {
+        version: 2,
+        description: "index project name lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_projects_name_created_at
+              ON projects ((data::jsonb ->> 'name'), created_at DESC)",
+    },
+];
 
 /// Registry of projects backed by Postgres. Survives server restarts.
 pub struct ProjectRegistry {
@@ -128,10 +136,20 @@ impl ProjectRegistry {
 
     /// Find a project by its configured `name` field. Returns the first match.
     pub async fn get_by_name(&self, name: &str) -> anyhow::Result<Option<Project>> {
-        let projects = self.list().await?;
-        Ok(projects
-            .into_iter()
-            .find(|p| p.name.as_deref() == Some(name)))
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data
+             FROM projects
+             WHERE data::jsonb ->> 'name' = $1
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
+            None => Ok(None),
+        }
     }
 }
 

@@ -81,6 +81,39 @@ pub fn plan_prompt(issue: u64, triage_assessment: &str) -> PromptParts {
     }
 }
 
+/// Build a replan prompt after an implementation attempt reports `PLAN_ISSUE=...`.
+///
+/// This is used when the current implementation plan proved incomplete or wrong
+/// during execution. The architect must produce a corrected plan rather than
+/// letting the executor silently diverge.
+pub fn replan_prompt(issue: u64, prior_plan: Option<&str>, plan_issue: &str) -> PromptParts {
+    let prior_plan_section = prior_plan
+        .map(wrap_external_data)
+        .map(|safe_plan| format!("Previous implementation plan:\n{safe_plan}\n\n"))
+        .unwrap_or_default();
+    let safe_plan_issue = wrap_external_data(plan_issue);
+    PromptParts {
+        static_instructions: format!(
+            "You are a Software Architect repairing the implementation plan for GitHub issue #{issue}.\n\n\
+             A previous implementation attempt refused to proceed because the current plan was incomplete or wrong.\n\n\
+             {prior_plan_section}\
+             Implementation concern raised by the executor:\n\
+             {safe_plan_issue}\n\n\
+             Produce a corrected implementation plan:\n\n\
+             1. **Files to modify** — list each file with a one-line rationale\n\
+             2. **Files to create** — only if truly needed\n\
+             3. **Key changes** — the 2-3 most important code changes\n\
+             4. **Test plan** — what to test and edge cases\n\
+             5. **Risk corrections** — what the previous plan missed and how this new plan fixes it\n\n\
+             Keep the plan actionable and minimal.\n\
+             Do NOT write code.\n\n\
+             On the LAST line, print: PLAN=READY"
+        ),
+        context: String::new(),
+        dynamic_payload: String::new(),
+    }
+}
+
 /// Build prompt parts: implement from a GitHub issue, create PR.
 ///
 /// When `plan` is provided, the engineer follows the plan instead of figuring
@@ -232,6 +265,14 @@ mod tests {
             p.contains("Closes #42"),
             "prompt must tell the agent to include `Closes #N` in the body"
         );
+    }
+
+    #[test]
+    fn test_replan_prompt() {
+        let p = replan_prompt(42, Some("old plan"), "missed auth bypass").to_prompt_string();
+        assert!(p.contains("repairing the implementation plan"));
+        assert!(p.contains("missed auth bypass"));
+        assert!(p.contains("PLAN=READY"));
     }
 
     #[test]

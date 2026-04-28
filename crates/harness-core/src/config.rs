@@ -5,6 +5,7 @@ pub mod misc;
 pub mod project;
 pub mod resolve;
 pub mod server;
+pub mod workflow;
 
 use self::agents::*;
 use self::intake::*;
@@ -51,6 +52,8 @@ pub struct HarnessConfig {
     pub review: ReviewConfig,
     #[serde(default)]
     pub retry_scheduler: RetrySchedulerConfig,
+    #[serde(default)]
+    pub reconciliation: ReconciliationConfig,
     #[serde(default)]
     pub maintenance_window: MaintenanceWindowConfig,
     /// Projects declared in the config file. Registered on server startup.

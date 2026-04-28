@@ -140,7 +140,9 @@ mod tests {
         let id = harness_core::types::TaskId("test-task".to_string());
         let mut state = crate::task_runner::TaskState {
             id: id.clone(),
+            task_kind: crate::task_runner::TaskKind::Prompt,
             status: TaskStatus::Pending,
+            failure_kind: None,
             turn: 0,
             pr_url: None,
             rounds: vec![],
@@ -151,15 +153,20 @@ mod tests {
             depends_on: vec![],
             subtask_ids: vec![],
             project_root: None,
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             issue: None,
             description: None,
             created_at: None,
+            updated_at: None,
             priority: 0,
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
             repo: None,
             request_settings: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         state.source = Some("github".to_string());
         store.insert(&state).await;
@@ -181,7 +188,9 @@ mod tests {
 
         let parent_state = crate::task_runner::TaskState {
             id: parent_id.clone(),
+            task_kind: crate::task_runner::TaskKind::Prompt,
             status: TaskStatus::Pending,
+            failure_kind: None,
             turn: 0,
             pr_url: None,
             rounds: vec![],
@@ -192,21 +201,28 @@ mod tests {
             depends_on: vec![],
             subtask_ids: vec![child_id.clone()],
             project_root: None,
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             issue: None,
             description: None,
             created_at: None,
+            updated_at: None,
             priority: 0,
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
             repo: None,
             request_settings: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         store.insert(&parent_state).await;
 
         let child_state = crate::task_runner::TaskState {
             id: child_id.clone(),
+            task_kind: crate::task_runner::TaskKind::Prompt,
             status: TaskStatus::Pending,
+            failure_kind: None,
             turn: 0,
             pr_url: None,
             rounds: vec![],
@@ -217,15 +233,20 @@ mod tests {
             depends_on: vec![],
             subtask_ids: vec![],
             project_root: None,
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
             issue: None,
             description: None,
             created_at: None,
+            updated_at: None,
             priority: 0,
             phase: crate::task_runner::TaskPhase::default(),
             triage_output: None,
             plan_output: None,
             repo: None,
             request_settings: None,
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
         };
         store.insert(&child_state).await;
 

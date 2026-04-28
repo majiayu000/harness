@@ -10,7 +10,7 @@ use super::request::{
 };
 use super::state::{RoundResult, TaskState};
 use super::store::{mutate_and_persist, TaskStore};
-use super::types::{TaskId, TaskPhase, TaskStatus};
+use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
 use super::CompletionCallback;
 
 /// Patterns that indicate a transient (retryable) failure rather than a permanent one.
@@ -81,8 +81,30 @@ pub fn prompt_requires_plan(prompt: &str) -> bool {
     file_path_count >= 3
 }
 
+fn classify_task_kind(req: &CreateTaskRequest) -> TaskKind {
+    req.task_kind()
+}
+
+fn refresh_preregistered_task_metadata(
+    entry: &mut TaskState,
+    req: &CreateTaskRequest,
+    project_root: PathBuf,
+    description: Option<String>,
+) {
+    entry.task_kind = classify_task_kind(req);
+    entry.source = req.source.clone();
+    entry.external_id = req.external_id.clone();
+    entry.repo = req.repo.clone();
+    entry.parent_id = req.parent_task_id.clone();
+    entry.depends_on = req.depends_on.clone();
+    entry.project_root = Some(project_root);
+    entry.issue = req.issue;
+    entry.description = description;
+}
+
+#[cfg(test)]
 pub(super) fn is_non_decomposable_prompt_source(source: Option<&str>) -> bool {
-    matches!(source, Some("periodic_review") | Some("sprint_planner"))
+    TaskKind::classify(source, None, None).is_non_decomposable_prompt()
 }
 
 /// Check if an error message indicates a transient failure that may succeed on retry.
@@ -158,6 +180,12 @@ async fn resolve_project_root_with(
 /// This function only resolves symlinks — it does NOT enforce the HOME-boundary
 /// restriction applied by `validate_project_root`. Full validation still
 /// happens inside `spawn_task` once the task is running.
+/// Returns true when `external_id` marks this as an issue- or PR-keyed task.
+/// Issue/PR-keyed workspaces are reused across consecutive tasks (issue #969).
+fn is_issue_pr_task(eid: Option<&str>) -> bool {
+    eid.is_some_and(|id| id.starts_with("issue:") || id.starts_with("pr:"))
+}
+
 pub async fn resolve_canonical_project(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let raw = resolve_project_root_with(project, detect_main_worktree).await?;
     // Best-effort canonicalize: if the path doesn't exist yet (e.g. in tests
@@ -199,7 +227,9 @@ async fn record_task_failure(
     });
     if let Err(e) = mutate_and_persist(store, task_id, |s| {
         s.status = TaskStatus::Failed;
+        s.failure_kind = Some(TaskFailureKind::Task);
         s.error = Some(reason);
+        s.scheduler.mark_terminal(&TaskStatus::Failed);
     })
     .await
     {
@@ -241,6 +271,7 @@ pub async fn spawn_task(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
         store,
@@ -255,6 +286,7 @@ pub async fn spawn_task(
         workspace_mgr,
         permit,
         completion_callback,
+        issue_workflow_store,
         None,
         None,
     )
@@ -267,6 +299,7 @@ pub async fn spawn_task(
 pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskRequest) -> TaskId {
     let task_id = TaskId::new();
     let mut state = TaskState::new(task_id.clone());
+    state.task_kind = classify_task_kind(req);
     state.source = req.source.clone();
     state.external_id = req.external_id.clone();
     state.repo = req.repo.clone();
@@ -274,6 +307,7 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.depends_on = req.depends_on.clone();
     state.priority = req.priority;
     state.issue = req.issue;
+    state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(req);
     state.request_settings = Some(PersistedRequestSettings::from_req(req));
     store.insert(&state).await;
@@ -299,6 +333,7 @@ pub async fn spawn_preregistered_task(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
     spawn_task_with_worktree_detector(
@@ -314,6 +349,7 @@ pub async fn spawn_preregistered_task(
         workspace_mgr,
         permit,
         completion_callback,
+        issue_workflow_store,
         Some(task_id),
         group_permit,
     )
@@ -333,6 +369,7 @@ pub(super) async fn spawn_task_with_worktree_detector<F>(
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     preregistered_id: Option<TaskId>,
     group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> TaskId
@@ -346,10 +383,12 @@ where
     } else {
         let task_id = TaskId::new();
         let mut state = TaskState::new(task_id.clone());
+        state.task_kind = classify_task_kind(&req);
         state.source = req.source.clone();
         state.external_id = req.external_id.clone();
         state.repo = req.repo.clone();
         state.priority = req.priority;
+        state.phase = state.task_kind.default_phase();
         state.request_settings = Some(PersistedRequestSettings::from_req(&req));
         store.insert(&state).await;
         // Register stream channel before spawning so SSE clients can subscribe immediately.
@@ -388,15 +427,33 @@ where
         }
         let description = summarize_request_description(&req);
         if let Some(mut entry) = store.cache.get_mut(&id) {
-            entry.source = req.source.clone();
-            entry.external_id = req.external_id.clone();
-            entry.repo = req.repo.clone();
-            entry.parent_id = req.parent_task_id.clone();
-            entry.depends_on = req.depends_on.clone();
-            entry.project_root = Some(project_root.clone());
-            entry.issue = req.issue;
-            entry.description = description;
+            refresh_preregistered_task_metadata(
+                &mut entry,
+                &req,
+                project_root.clone(),
+                description.clone(),
+            );
         }
+        mutate_and_persist(&store, &id, |s| {
+            s.source = req.source.clone();
+            s.external_id = req.external_id.clone();
+            s.repo = req.repo.clone();
+            s.parent_id = req.parent_task_id.clone();
+            s.depends_on = req.depends_on.clone();
+            s.project_root = Some(project_root.clone());
+            s.issue = req.issue;
+            s.description = description.clone();
+            s.run_generation = s.run_generation.saturating_add(1);
+            s.failure_kind = None;
+            s.workspace_path = None;
+            s.workspace_owner = None;
+            s.error = None;
+        })
+        .await?;
+        let run_generation = store
+            .get(&id)
+            .map(|state| state.run_generation)
+            .unwrap_or(1);
 
         // Parallel dispatch for Complex+ prompt-only tasks when workspace isolation is active.
         // Issue and PR tasks have their own structured prompt flow and are not decomposed.
@@ -410,8 +467,12 @@ where
             harness_core::agent::TaskComplexity::Complex
                 | harness_core::agent::TaskComplexity::Critical
         );
-        let is_non_decomposable_source = is_non_decomposable_prompt_source(req.source.as_deref());
-        if req.issue.is_none() && req.pr.is_none() && is_complex && !is_non_decomposable_source {
+        let task_kind = classify_task_kind(&req);
+        if req.issue.is_none()
+            && req.pr.is_none()
+            && is_complex
+            && !task_kind.is_non_decomposable_prompt()
+        {
             if let Some(ref wmgr) = workspace_mgr {
                 let mut subtask_specs = match crate::parallel_dispatch::decompose(
                     req.prompt.as_deref().unwrap_or_default(),
@@ -421,6 +482,7 @@ where
                         tracing::warn!(task_id = %id.0, "parallel_dispatch rejected: {}", msg);
                         mutate_and_persist(&store, &id, |s| {
                             s.status = TaskStatus::Failed;
+                            s.scheduler.mark_terminal(&TaskStatus::Failed);
                             s.error = Some(msg);
                         })
                         .await?;
@@ -527,6 +589,7 @@ where
                         }
                         if succeeded {
                             s.status = TaskStatus::Done;
+                            s.scheduler.mark_terminal(&TaskStatus::Done);
                         } else {
                             let failed_count = run_result
                                 .results
@@ -535,6 +598,7 @@ where
                                 .count();
                             let total_count = run_result.results.len();
                             s.status = TaskStatus::Failed;
+                            s.scheduler.mark_terminal(&TaskStatus::Failed);
                             s.error = Some(if run_result.is_sequential {
                                 format!(
                                     "{}/{} sequential subtasks failed; remaining steps were skipped",
@@ -557,10 +621,7 @@ where
         // Planning gate: complex prompt-only tasks must go through the Plan phase
         // before implementation to reduce drift.
         // Heuristic: prompt longer than 200 words OR containing 3+ file path tokens.
-        if req.issue.is_none()
-            && req.pr.is_none()
-            && !is_non_decomposable_prompt_source(req.source.as_deref())
-        {
+        if req.issue.is_none() && req.pr.is_none() && !task_kind.is_non_decomposable_prompt() {
             if let Some(ref prompt) = req.prompt {
                 if prompt_requires_plan(prompt) {
                     mutate_and_persist(&store, &id, |s| {
@@ -578,6 +639,8 @@ where
         }
 
         // If workspace isolation is configured, create a per-task git worktree.
+        // Save the canonical root before it may be moved into run_project.
+        let canonical_project_root = project_root.clone();
         let run_project = if let Some(ref wmgr) = workspace_mgr {
             let project_config = harness_core::config::project::load_project_config(&project_root)
                 .map_err(|e| {
@@ -586,13 +649,58 @@ where
                         project_root.display()
                     )
                 })?;
-            wmgr.create_workspace(
-                &id,
-                &project_root,
-                &project_config.git.remote,
-                &project_config.git.base_branch,
-            )
-            .await?
+            let lease = match wmgr
+                .create_workspace(
+                    &id,
+                    &project_root,
+                    &project_config.git.remote,
+                    &project_config.git.base_branch,
+                    run_generation,
+                    req.external_id.as_deref(),
+                    req.repo.as_deref(),
+                )
+                .await
+            {
+                Ok(lease) => lease,
+                Err(err) => {
+                    let error_message = err.to_string();
+                    let workspace_path = err.workspace_path().to_path_buf();
+                    let workspace_owner =
+                        err.workspace_owner().map(std::string::ToString::to_string);
+                    mutate_and_persist(&store, &id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.failure_kind = Some(TaskFailureKind::WorkspaceLifecycle);
+                        s.error = Some(error_message.clone());
+                        s.workspace_path = Some(workspace_path.clone());
+                        s.workspace_owner = workspace_owner.clone();
+                        s.rounds.push(RoundResult {
+                            turn: s.turn.saturating_add(1),
+                            action: "workspace_admission".into(),
+                            result: "workspace_lifecycle_failure".into(),
+                            detail: Some(error_message.clone()),
+                            first_token_latency_ms: None,
+                        });
+                    })
+                    .await?;
+                    tracing::warn!(task_id = %id.0, error = %error_message, "workspace admission failed");
+                    return Ok(());
+                }
+            };
+            tracing::info!(
+                task_id = %id.0,
+                workspace_path = %lease.workspace_path.display(),
+                workspace_owner = %lease.owner_session,
+                run_generation = lease.run_generation,
+                workspace_decision = ?lease.decision,
+                "workspace admitted"
+            );
+            mutate_and_persist(&store, &id, |s| {
+                s.workspace_path = Some(lease.workspace_path.clone());
+                s.workspace_owner = Some(lease.owner_session.clone());
+                s.run_generation = lease.run_generation;
+            })
+            .await?;
+            lease.workspace_path
         } else {
             project_root
         };
@@ -617,7 +725,9 @@ where
                 interceptors.clone(),
                 &req,
                 run_project.clone(),
+                canonical_project_root.clone(),
                 server_config.as_ref(),
+                issue_workflow_store.clone(),
                 &mut total_turns_used,
             )
             .await;
@@ -665,6 +775,8 @@ where
                             first_token_latency_ms: None,
                         });
                         s.status = TaskStatus::Pending;
+                        s.failure_kind = None;
+                        s.scheduler.mark_retry_backoff();
                         s.error = Some(format!(
                             "retrying after transient failure (attempt {transient_attempts}): {reason}"
                         ));
@@ -682,7 +794,9 @@ where
         // Cleanup workspace when task ends.
         // On failure: always remove to prevent stale worktrees from polluting subsequent
         // tasks (the root cause of cross-task PR pollution, issue #799).
-        // On success: respect auto_cleanup so users can inspect the worktree post-run.
+        // On success for issue/PR-keyed tasks: skip cleanup so consecutive tasks on the
+        // same issue/PR reuse the same workspace (issue #969). UUID/prompt-only tasks
+        // keep the existing auto_cleanup behaviour.
         if let Some(wmgr) = workspace_mgr {
             // Also force cleanup when the task ended with Failed status even though the
             // executor returned Ok(()) — the worktree-collision path sets TaskStatus::Failed
@@ -690,10 +804,18 @@ where
             let task_is_failed = store
                 .get(&id)
                 .is_some_and(|s| s.status == TaskStatus::Failed);
-            if task_result.is_err() || task_is_failed || wmgr.config.auto_cleanup {
+            let is_issue_pr = store
+                .get(&id)
+                .is_some_and(|s| is_issue_pr_task(s.external_id.as_deref()));
+            let should_cleanup = task_result.is_err()
+                || task_is_failed
+                || (wmgr.config.auto_cleanup && !is_issue_pr);
+            if should_cleanup {
                 if let Err(e) = wmgr.remove_workspace(&id).await {
                     tracing::warn!("workspace cleanup failed for {id:?}: {e}");
                 }
+            } else {
+                wmgr.release_workspace(&id);
             }
         }
 
@@ -765,12 +887,14 @@ pub async fn spawn_task_awaiting_deps(
     }
 
     let mut state = TaskState::new(task_id.clone());
+    state.task_kind = classify_task_kind(&req);
     state.depends_on = depends_on;
     state.source = req.source.clone();
     state.external_id = req.external_id.clone();
     state.repo = req.repo.clone();
     state.priority = req.priority;
     state.issue = req.issue;
+    state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(&req);
     state.request_settings = Some(PersistedRequestSettings::from_req(&req));
     // Persist the caller's resolved project root so that duplicate detection
@@ -783,6 +907,7 @@ pub async fn spawn_task_awaiting_deps(
 
     if !all_done && !state.depends_on.is_empty() {
         state.status = TaskStatus::AwaitingDeps;
+        state.scheduler = crate::task_runner::TaskSchedulerState::awaiting_dependencies();
     }
 
     store.insert(&state).await;
@@ -862,6 +987,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
             // cancel or status transition must not be clobbered.
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Failed;
+                entry.scheduler.mark_terminal(&TaskStatus::Failed);
                 entry.error = Some(format!("dependency {} {}", failed_dep_id.0, label));
                 newly_failed.push(task_id.clone());
             }
@@ -876,6 +1002,7 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
         if let Some(mut entry) = store.cache.get_mut(task_id) {
             if matches!(entry.status, TaskStatus::AwaitingDeps) {
                 entry.status = TaskStatus::Pending;
+                entry.scheduler.clear_to_queued();
                 actually_ready.push(task_id.clone());
             }
         }
@@ -886,11 +1013,12 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
 
 #[cfg(test)]
 mod tests {
+    use super::super::request::SystemTaskInput;
     use super::*;
     use async_trait::async_trait;
     use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
     use harness_core::types::{Capability, ContextItem, EventFilters, ExecutionPhase, TokenUsage};
-    use tokio::time::Duration;
+    use tokio::time::{sleep, Duration, Instant};
 
     fn tid(s: &str) -> harness_core::types::TaskId {
         harness_core::types::TaskId(s.to_string())
@@ -905,6 +1033,22 @@ mod tests {
             Arc::new(Self {
                 captured: tokio::sync::Mutex::new(Vec::new()),
             })
+        }
+    }
+
+    async fn wait_until(
+        timeout: Duration,
+        mut predicate: impl FnMut() -> bool,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if predicate() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("condition not met within {:?}", timeout);
+            }
+            sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -997,10 +1141,18 @@ mod tests {
             None,
             permit,
             None,
+            None,
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until(Duration::from_secs(3), || {
+            agent
+                .captured
+                .try_lock()
+                .map(|captured| !captured.is_empty())
+                .unwrap_or(false)
+        })
+        .await?;
 
         let captured = agent.captured.lock().await;
         assert!(
@@ -1071,11 +1223,16 @@ mod tests {
             None,
             permit,
             None,
+            None,
         )
         .await;
 
-        // Allow async task to complete.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until(Duration::from_secs(3), || {
+            store
+                .get(&task_id)
+                .is_some_and(|state| matches!(state.status, TaskStatus::Failed))
+        })
+        .await?;
 
         let state = store.get(&task_id).ok_or_else(|| {
             anyhow::anyhow!("task not found in store — possible concurrent deletion")
@@ -1165,10 +1322,16 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until(Duration::from_secs(3), || {
+            store
+                .get(&task_id)
+                .is_some_and(|state| matches!(state.status, TaskStatus::Failed))
+        })
+        .await?;
 
         let state = store.get(&task_id).ok_or_else(|| {
             anyhow::anyhow!("task not found in store — possible concurrent deletion")
@@ -1264,6 +1427,20 @@ mod tests {
         }
     }
 
+    async fn wait_for_captured_phases(
+        agent: &PhaseCapturingAgent,
+        min_count: usize,
+    ) -> Vec<Option<ExecutionPhase>> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let phases = agent.captured_phases().await;
+            if phases.len() >= min_count || Instant::now() >= deadline {
+                return phases;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[async_trait]
     impl harness_core::agent::CodeAgent for PhaseCapturingAgent {
         fn name(&self) -> &str {
@@ -1341,12 +1518,11 @@ mod tests {
             None,
             permit,
             None,
+            None,
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let phases = agent.captured_phases().await;
+        let phases = wait_for_captured_phases(agent.as_ref(), 1).await;
         assert!(
             !phases.is_empty(),
             "expected at least one agent call, got none"
@@ -1398,12 +1574,11 @@ mod tests {
             None,
             permit,
             None,
+            None,
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let phases = agent.captured_phases().await;
+        let phases = wait_for_captured_phases(agent.as_ref(), 2).await;
         assert!(
             phases.len() >= 2,
             "expected at least 2 agent calls (implementation + review check), got {}",
@@ -1420,6 +1595,30 @@ mod tests {
             "review loop turn must use Execution phase (agent needs write access to fix bot comments)"
         );
         Ok(())
+    }
+
+    #[test]
+    fn preregistered_metadata_refresh_preserves_persisted_phase() {
+        let mut state = TaskState::new(TaskId::new());
+        state.phase = TaskPhase::Plan;
+
+        let req = CreateTaskRequest {
+            prompt: Some("small prompt".into()),
+            project: Some(PathBuf::from("/tmp/recovered-project")),
+            repo: Some("owner/repo".into()),
+            ..Default::default()
+        };
+
+        refresh_preregistered_task_metadata(
+            &mut state,
+            &req,
+            PathBuf::from("/tmp/recovered-project"),
+            Some("small prompt".into()),
+        );
+
+        assert_eq!(state.phase, TaskPhase::Plan);
+        assert_eq!(state.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(state.description.as_deref(), Some("small prompt"));
     }
 
     #[test]
@@ -1545,6 +1744,51 @@ mod tests {
         assert!(is_non_decomposable_prompt_source(Some("sprint_planner")));
         assert!(!is_non_decomposable_prompt_source(Some("github")));
         assert!(!is_non_decomposable_prompt_source(None));
+    }
+
+    #[test]
+    fn request_task_kind_trusts_only_internal_system_input() {
+        let spoofed = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(spoofed.task_kind(), TaskKind::Prompt);
+
+        let trusted = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            system_input: Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(trusted.task_kind(), TaskKind::Review);
+    }
+
+    #[test]
+    fn system_input_for_request_clones_only_explicit_internal_metadata() {
+        let spoofed = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(spoofed.system_input.clone(), None);
+
+        let trusted = CreateTaskRequest {
+            prompt: Some("review this".to_string()),
+            source: Some("periodic_review".to_string()),
+            system_input: Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            trusted.system_input.clone(),
+            Some(SystemTaskInput::PeriodicReview {
+                prompt: "review this".to_string(),
+            })
+        );
     }
 
     // --- dependency scheduling tests ---
@@ -1813,5 +2057,27 @@ mod tests {
             "cancelled task must not be in failed_ids"
         );
         Ok(())
+    }
+
+    // ── GC trigger demotion tests (issue #969) ────────────────────────────
+
+    #[test]
+    fn is_issue_pr_task_classifies_external_ids() {
+        assert!(
+            is_issue_pr_task(Some("issue:42")),
+            "issue-keyed task must be classified as issue/PR"
+        );
+        assert!(
+            is_issue_pr_task(Some("pr:123")),
+            "pr-keyed task must be classified as issue/PR"
+        );
+        assert!(
+            !is_issue_pr_task(Some("7f3a8b2c-1234-5678-abcd-ef0123456789")),
+            "UUID task must not be classified as issue/PR"
+        );
+        assert!(
+            !is_issue_pr_task(None),
+            "prompt-only task (no external_id) must not be classified as issue/PR"
+        );
     }
 }

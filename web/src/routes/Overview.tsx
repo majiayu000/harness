@@ -10,7 +10,9 @@ import { Feed } from "@/components/Feed";
 import { AlertList } from "@/components/AlertList";
 import { StatusBadge } from "@/components/StatusBadge";
 import { PaletteFab } from "@/components/PaletteFab";
-import { useOverview } from "@/lib/queries";
+import { EvolutionCard } from "@/components/EvolutionCard";
+import { useOperatorSnapshot, useOverview } from "@/lib/queries";
+import { OperatorPanel } from "./overview/OperatorPanel";
 import { fmtInt, fmtPct, fmtScore } from "@/lib/format";
 
 const SERIES_COLORS = [
@@ -24,6 +26,8 @@ const SERIES_COLORS = [
 
 export function Overview() {
   const { data, isError } = useOverview();
+  const { isError: isOperatorSnapshotError } = useOperatorSnapshot();
+  const isSystemHealthy = !isError && !isOperatorSnapshotError;
 
   const sections: SidebarSection[] = [
     {
@@ -71,7 +75,7 @@ export function Overview() {
               {data ? `${data.projects.length} projects · ${data.runtimes.length} runtimes` : "loading…"}
             </span>
             <div className="ml-auto flex gap-2 items-center">
-              <StatusBadge ok={!isError} />
+              <StatusBadge ok={isSystemHealthy} />
             </div>
           </div>
 
@@ -149,6 +153,10 @@ export function Overview() {
               </Panel>
             </Panel>
           </div>
+
+          <EvolutionCard evolution={data?.evolution ?? null} />
+
+          <OperatorPanel />
         </div>
       </main>
       <PaletteFab />

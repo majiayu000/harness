@@ -20,6 +20,9 @@ pub struct CoreServices {
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    pub project_workflow_store:
+        Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     /// Q-value store for MemRL rule utility tracking. None when unavailable.
@@ -90,6 +93,8 @@ pub struct AppState {
     pub engines: EngineServices,
     pub observability: ObservabilityServices,
     pub concurrency: ConcurrencyServices,
+    #[cfg(test)]
+    pub _db_state_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     pub runtime_hosts: Arc<crate::runtime_hosts::RuntimeHostManager>,
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
     /// Serializes runtime snapshot writes to avoid out-of-order persistence.
@@ -142,9 +147,9 @@ impl AppState {
         let Some(store) = self.core.runtime_state_store.as_ref() else {
             return Ok(());
         };
-        let (hosts, leases) = self.runtime_hosts.snapshot_state();
+        let hosts = self.runtime_hosts.snapshot_state();
         let project_caches = self.runtime_project_cache.snapshot_state();
-        match store.persist_snapshot(hosts, leases, project_caches).await {
+        match store.persist_snapshot(hosts, project_caches).await {
             Ok(()) => {
                 self.runtime_state_dirty.store(false, Ordering::Release);
                 Ok(())

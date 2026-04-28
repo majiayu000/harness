@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::types::TaskId;
+use super::types::{TaskId, TaskKind};
 
 /// Maximum allowed scheduling priority. Values above this are rejected at the
 /// API boundary to prevent scheduler-level starvation of normal-priority tasks.
@@ -14,6 +14,14 @@ pub struct CreateTaskRequest {
     pub prompt: Option<String>,
     /// GitHub issue number to implement from.
     pub issue: Option<u64>,
+    /// When true, issue-backed tasks bypass the triage/plan pipeline and go
+    /// straight to implementation using the legacy direct-implement path.
+    #[serde(default)]
+    pub skip_triage: bool,
+    /// When true, agent-raised plan concerns must not block implementation.
+    /// The concern is recorded, but the issue contract remains authoritative.
+    #[serde(default)]
+    pub force_execute: bool,
     /// GitHub PR number to review/fix.
     pub pr: Option<u64>,
     /// Explicit agent name; if omitted, uses the default agent.
@@ -57,6 +65,9 @@ pub struct CreateTaskRequest {
     /// Repository slug (e.g. "owner/repo"). Stored in TaskState for traceability.
     #[serde(default)]
     pub repo: Option<String>,
+    /// Snapshot of source labels for workflow policy decisions.
+    #[serde(default)]
+    pub labels: Vec<String>,
     /// Explicit parent task ID.
     #[serde(default)]
     pub parent_task_id: Option<TaskId>,
@@ -67,6 +78,40 @@ pub struct CreateTaskRequest {
     /// Higher values are served first when multiple tasks are waiting for a slot.
     #[serde(default)]
     pub priority: u8,
+    /// Restart-safe metadata for trusted system-generated prompt tasks.
+    /// Never accepted from or exposed to external HTTP callers.
+    #[serde(skip)]
+    pub system_input: Option<SystemTaskInput>,
+}
+
+impl CreateTaskRequest {
+    /// Classify task kind using only trusted internal metadata for system tasks.
+    ///
+    /// External callers may set `source`, but they cannot populate `system_input`
+    /// because the field is `#[serde(skip)]`. That makes `system_input` the trust
+    /// boundary for review/planner lifecycle selection.
+    pub fn task_kind(&self) -> TaskKind {
+        match self.system_input.as_ref() {
+            Some(SystemTaskInput::PeriodicReview { .. }) => TaskKind::Review,
+            Some(SystemTaskInput::SprintPlanner { .. }) => TaskKind::Planner,
+            None => TaskKind::classify(None, self.issue, self.pr),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SystemTaskInput {
+    PeriodicReview { prompt: String },
+    SprintPlanner { prompt: String },
+}
+
+impl SystemTaskInput {
+    pub fn prompt(&self) -> &str {
+        match self {
+            Self::PeriodicReview { prompt } | Self::SprintPlanner { prompt } => prompt,
+        }
+    }
 }
 
 /// Execution limits that survive a server restart.
@@ -82,6 +127,12 @@ pub struct PersistedRequestSettings {
     pub max_rounds: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub skip_triage: bool,
+    #[serde(default)]
+    pub force_execute: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_budget_usd: Option<f64>,
     pub wait_secs: u64,
@@ -117,6 +168,9 @@ impl PersistedRequestSettings {
             agent: req.agent.clone(),
             max_rounds: req.max_rounds,
             max_turns: req.max_turns,
+            skip_triage: req.skip_triage,
+            force_execute: req.force_execute,
+            labels: req.labels.clone(),
             max_budget_usd: req.max_budget_usd,
             wait_secs: req.wait_secs,
             retry_base_backoff_ms: req.retry_base_backoff_ms,
@@ -146,6 +200,9 @@ impl PersistedRequestSettings {
         req.agent = self.agent.clone();
         req.max_rounds = self.max_rounds;
         req.max_turns = self.max_turns;
+        req.skip_triage = self.skip_triage;
+        req.force_execute = self.force_execute;
+        req.labels = self.labels.clone();
         req.max_budget_usd = self.max_budget_usd;
         req.wait_secs = self.wait_secs;
         req.retry_base_backoff_ms = self.retry_base_backoff_ms;
@@ -168,6 +225,8 @@ impl Default for CreateTaskRequest {
         Self {
             prompt: None,
             issue: None,
+            skip_triage: false,
+            force_execute: false,
             pr: None,
             agent: None,
             project: None,
@@ -182,14 +241,17 @@ impl Default for CreateTaskRequest {
             source: None,
             external_id: None,
             repo: None,
+            labels: Vec::new(),
             parent_task_id: None,
             depends_on: Vec::new(),
             priority: 0,
+            system_input: None,
         }
     }
 }
 
 pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
+    let task_kind = req.task_kind();
     // Only persist structured safe labels — never raw prompt text, which may contain
     // credentials or customer data.
     if let Some(n) = req.issue {
@@ -198,12 +260,12 @@ pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<S
     if let Some(n) = req.pr {
         return Some(format!("PR #{n}"));
     }
-    // Prompt-only tasks: store a generic label so that:
-    //   (a) sibling-awareness can include them (prevents parallel agents stomping the same files),
-    //   (b) operators can identify crashed tasks in the DB/dashboard after a restart.
-    // The prompt itself is deliberately not stored.
     if req.prompt.is_some() {
-        return Some("prompt task".to_string());
+        return Some(match task_kind {
+            TaskKind::Review => "periodic review".to_string(),
+            TaskKind::Planner => "sprint planner".to_string(),
+            TaskKind::Issue | TaskKind::Pr | TaskKind::Prompt => "prompt task".to_string(),
+        });
     }
     None
 }
@@ -218,26 +280,54 @@ pub async fn fill_missing_repo_from_project(req: &mut CreateTaskRequest) {
     req.repo = crate::task_executor::pr_detection::detect_repo_slug(project).await;
 }
 
-/// Detect the main git worktree root using a blocking subprocess call.
-/// Must be called via `tokio::task::spawn_blocking` in async contexts.
+/// Detect the main workspace root without launching git.
 pub(super) fn detect_main_worktree() -> PathBuf {
-    std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            s.lines()
-                .next()
-                .and_then(|line| line.strip_prefix("worktree "))
-                .map(|p| PathBuf::from(p.trim()))
+    let cwd = std::env::current_dir().unwrap_or_else(|e| {
+        tracing::warn!("detect_main_worktree: current_dir failed, falling back to '.': {e}");
+        PathBuf::from(".")
+    });
+    find_main_worktree_from(&cwd).unwrap_or(cwd)
+}
+
+fn find_main_worktree_from(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_dir() {
+        Some(start)
+    } else {
+        start.parent()
+    };
+    let mut first_manifest_dir: Option<PathBuf> = None;
+    let mut workspace_manifest_dir: Option<PathBuf> = None;
+
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file() {
+            if first_manifest_dir.is_none() {
+                first_manifest_dir = Some(dir.to_path_buf());
+            }
+            if cargo_manifest_declares_workspace(&manifest) {
+                workspace_manifest_dir = Some(dir.to_path_buf());
+            }
+        }
+
+        current = dir.parent();
+    }
+
+    workspace_manifest_dir.or(first_manifest_dir)
+}
+
+fn cargo_manifest_declares_workspace(manifest: &Path) -> bool {
+    std::fs::read_to_string(manifest)
+        .map(|contents| {
+            contents.lines().any(|line| {
+                let line = line.trim();
+                line == "[workspace]" || line.starts_with("[workspace.")
+            })
         })
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                "detect_main_worktree: could not detect git worktree root, falling back to '.'"
-            );
-            PathBuf::from(".")
-        })
+        .unwrap_or(false)
 }
 
 pub(super) fn default_wait() -> u64 {
@@ -261,4 +351,74 @@ pub(super) fn default_turn_timeout() -> u64 {
 
 pub(super) fn default_stall_timeout() -> u64 {
     300
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_task_request_deserializes_skip_triage() {
+        let req: CreateTaskRequest =
+            serde_json::from_str(r#"{"issue": 749, "skip_triage": true}"#).expect("deserialize");
+        assert_eq!(req.issue, Some(749));
+        assert!(req.skip_triage);
+    }
+
+    #[test]
+    fn create_task_request_default_skip_triage_is_false() {
+        let req = CreateTaskRequest::default();
+        assert!(!req.skip_triage);
+        assert!(!req.force_execute);
+    }
+
+    #[test]
+    fn persisted_request_settings_roundtrip_preserves_skip_triage() {
+        let req = CreateTaskRequest {
+            issue: Some(42),
+            skip_triage: true,
+            force_execute: true,
+            ..CreateTaskRequest::default()
+        };
+        let settings = PersistedRequestSettings::from_req(&req);
+        assert!(settings.skip_triage);
+        assert!(settings.force_execute);
+
+        let mut restored = CreateTaskRequest::default();
+        settings.apply_to_req(&mut restored);
+        assert!(restored.skip_triage);
+        assert!(restored.force_execute);
+    }
+
+    #[test]
+    fn find_main_worktree_walks_up_to_git_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join(".git")).expect("create git dir");
+        let nested = tmp.path().join("crates/server/src");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+
+        assert_eq!(
+            find_main_worktree_from(&nested),
+            Some(tmp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn find_main_worktree_falls_back_to_workspace_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("write workspace manifest");
+        let crate_dir = tmp.path().join("crates/server");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("create crate dir");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"server\"\n",
+        )
+        .expect("write crate manifest");
+
+        assert_eq!(
+            find_main_worktree_from(&crate_dir.join("src")),
+            Some(tmp.path().to_path_buf())
+        );
+    }
 }

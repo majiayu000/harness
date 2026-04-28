@@ -314,6 +314,8 @@ mod tests {
             vec![],
             None,
             Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            None,
             None,
             None,
             vec![],
@@ -329,6 +331,8 @@ mod tests {
                 thread_db: Some(thread_db),
                 plan_db: None,
                 plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+                issue_workflow_store: None,
+                project_workflow_store: None,
                 project_registry: None,
                 runtime_state_store: None,
                 q_values: None,
@@ -354,6 +358,8 @@ mod tests {
                 review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
                 workspace_mgr: None,
             },
+            #[cfg(test)]
+            _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
             runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
             runtime_project_cache: Arc::new(
                 crate::runtime_project_cache::RuntimeProjectCacheManager::new(),

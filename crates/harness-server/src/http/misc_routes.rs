@@ -1,12 +1,13 @@
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use harness_protocol::methods::RpcRequest;
 use serde_json::json;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
@@ -60,6 +61,113 @@ pub(crate) async fn project_queue_stats(
     }))
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct IssueWorkflowByIssueQuery {
+    pub project_id: String,
+    pub repo: Option<String>,
+    pub issue: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct IssueWorkflowByPrQuery {
+    pub project_id: String,
+    pub repo: Option<String>,
+    pub pr: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ProjectWorkflowByProjectQuery {
+    pub project_id: String,
+    pub repo: Option<String>,
+}
+
+pub(crate) async fn get_issue_workflow_by_issue(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<IssueWorkflowByIssueQuery>,
+) -> Response {
+    let Some(store) = state.core.issue_workflow_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "issue workflow store unavailable" })),
+        )
+            .into_response();
+    };
+    match store
+        .get_by_issue(&query.project_id, query.repo.as_deref(), query.issue)
+        .await
+    {
+        Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "issue workflow not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn get_issue_workflow_by_pr(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<IssueWorkflowByPrQuery>,
+) -> Response {
+    let Some(store) = state.core.issue_workflow_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "issue workflow store unavailable" })),
+        )
+            .into_response();
+    };
+    match store
+        .get_by_pr(&query.project_id, query.repo.as_deref(), query.pr)
+        .await
+    {
+        Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "issue workflow not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn get_project_workflow_by_project(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProjectWorkflowByProjectQuery>,
+) -> Response {
+    let Some(store) = state.core.project_workflow_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "project workflow store unavailable" })),
+        )
+            .into_response();
+    };
+    match store
+        .get_by_project(&query.project_id, query.repo.as_deref())
+        .await
+    {
+        Ok(Some(workflow)) => (StatusCode::OK, Json(json!(workflow))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "project workflow not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn handle_rpc(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RpcRequest>,
@@ -67,6 +175,183 @@ pub(crate) async fn handle_rpc(
     match router::handle_request(&state, req).await {
         Some(resp) => (StatusCode::OK, Json(resp)).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+fn configured_github_webhook_project_root(
+    github: Option<&harness_core::config::intake::GitHubIntakeConfig>,
+    default_root: &StdPath,
+    repo: &str,
+) -> Option<PathBuf> {
+    github?
+        .effective_repos()
+        .into_iter()
+        .find(|repo_cfg| repo_cfg.repo == repo)
+        .map(|repo_cfg| {
+            repo_cfg
+                .project_root
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_root.to_path_buf())
+        })
+}
+
+enum GitHubWebhookProjectRootError {
+    RepoNotConfigured(String),
+    RegistryLookup(String),
+}
+
+fn github_webhook_project_root_error_response(
+    error: GitHubWebhookProjectRootError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        // Treat unknown repositories as ignored so GitHub does not retry
+        // an event for a repo this harness instance is not configured to
+        // serve. Registry failures remain internal errors.
+        GitHubWebhookProjectRootError::RepoNotConfigured(reason) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ignored", "reason": reason })),
+        ),
+        GitHubWebhookProjectRootError::RegistryLookup(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        ),
+    }
+}
+
+async fn resolve_github_webhook_project_root(
+    state: &Arc<AppState>,
+    repo: &str,
+) -> Result<PathBuf, GitHubWebhookProjectRootError> {
+    if let Some(project_root) = configured_github_webhook_project_root(
+        state.core.server.config.intake.github.as_ref(),
+        &state.core.project_root,
+        repo,
+    ) {
+        return Ok(project_root);
+    }
+
+    if let Some(registry) = state.core.project_registry.as_deref() {
+        if let Some(project) = registry.get(repo).await.map_err(|error| {
+            GitHubWebhookProjectRootError::RegistryLookup(format!(
+                "project registry lookup failed: {error}"
+            ))
+        })? {
+            return Ok(project.root);
+        }
+        if let Some(project) = registry.get_by_name(repo).await.map_err(|error| {
+            GitHubWebhookProjectRootError::RegistryLookup(format!(
+                "project registry lookup failed: {error}"
+            ))
+        })? {
+            return Ok(project.root);
+        }
+    }
+
+    Err(GitHubWebhookProjectRootError::RepoNotConfigured(format!(
+        "webhook repository '{repo}' is not configured in intake.github and was not found in the project registry"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        configured_github_webhook_project_root, github_webhook_project_root_error_response,
+        GitHubWebhookProjectRootError,
+    };
+    use axum::http::StatusCode;
+    use harness_core::config::intake::{GitHubIntakeConfig, GitHubRepoConfig};
+    use std::path::PathBuf;
+
+    #[test]
+    fn multi_repo_github_webhook_uses_repo_specific_project_root_override() {
+        let default_root = PathBuf::from("/srv/repo-a");
+        let github = GitHubIntakeConfig {
+            enabled: true,
+            repos: vec![
+                GitHubRepoConfig {
+                    repo: "org/repo-a".to_string(),
+                    label: "harness".to_string(),
+                    project_root: None,
+                },
+                GitHubRepoConfig {
+                    repo: "org/repo-b".to_string(),
+                    label: "harness".to_string(),
+                    project_root: Some("/srv/repo-b".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let resolved =
+            configured_github_webhook_project_root(Some(&github), &default_root, "org/repo-b");
+
+        assert_eq!(resolved, Some(PathBuf::from("/srv/repo-b")));
+    }
+
+    #[test]
+    fn configured_github_repo_without_override_falls_back_to_default_project_root() {
+        let default_root = PathBuf::from("/srv/repo-a");
+        let github = GitHubIntakeConfig {
+            enabled: true,
+            repos: vec![GitHubRepoConfig {
+                repo: "org/repo-a".to_string(),
+                label: "harness".to_string(),
+                project_root: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved =
+            configured_github_webhook_project_root(Some(&github), &default_root, "org/repo-a");
+
+        assert_eq!(resolved, Some(default_root));
+    }
+
+    #[test]
+    fn unconfigured_github_repo_has_no_configured_project_root() {
+        let default_root = PathBuf::from("/srv/repo-a");
+        let github = GitHubIntakeConfig {
+            enabled: true,
+            repos: vec![GitHubRepoConfig {
+                repo: "org/repo-a".to_string(),
+                label: "harness".to_string(),
+                project_root: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved =
+            configured_github_webhook_project_root(Some(&github), &default_root, "org/repo-b");
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn unconfigured_github_repo_returns_ignored_response() {
+        let (status, body) = github_webhook_project_root_error_response(
+            GitHubWebhookProjectRootError::RepoNotConfigured(
+                "webhook repository 'org/repo-b' is not configured".to_string(),
+            ),
+        );
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["status"], "ignored");
+        assert!(body.0["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not configured"));
+    }
+
+    #[test]
+    fn registry_lookup_failures_return_internal_server_error() {
+        let (status, body) = github_webhook_project_root_error_response(
+            GitHubWebhookProjectRootError::RegistryLookup(
+                "project registry lookup failed: boom".to_string(),
+            ),
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0["error"], "project registry lookup failed: boom");
     }
 }
 
@@ -152,7 +437,13 @@ pub(crate) async fn github_webhook(
     };
 
     if req.project.is_none() {
-        req.project = Some(state.core.project_root.clone());
+        req.project = Some(match req.repo.as_deref() {
+            Some(repo) => match resolve_github_webhook_project_root(&state, repo).await {
+                Ok(project_root) => project_root,
+                Err(error) => return github_webhook_project_root_error_response(error),
+            },
+            None => state.core.project_root.clone(),
+        });
     }
 
     match task_routes::enqueue_task(&state, req).await {
@@ -180,136 +471,47 @@ pub(crate) async fn github_webhook(
     }
 }
 
-pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
-    match state.core.tasks.list_all_summaries_with_terminal().await {
-        Ok(summaries) => Json(summaries).into_response(),
-        Err(e) => {
-            tracing::error!("list_tasks: database error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-pub(crate) async fn get_task(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    match state
-        .core
-        .tasks
-        .get_with_db_fallback(&harness_core::types::TaskId(id))
-        .await
-    {
-        Ok(Some(task)) => Json(task).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "task not found"})),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!("get_task: database error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// GET /tasks/{id}/artifacts — all persisted artifacts for a task.
-pub(crate) async fn get_task_artifacts(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    let task_id = harness_core::types::TaskId(id);
-    match state.core.tasks.get_with_db_fallback(&task_id).await {
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "task not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("get_task_artifacts: database error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
-        }
-        Ok(Some(_)) => {}
-    }
-    match state.core.tasks.list_artifacts(&task_id).await {
-        Ok(artifacts) => Json(artifacts).into_response(),
-        Err(e) => {
-            tracing::error!("get_task_artifacts: list artifacts error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// GET /tasks/{id}/prompts — all persisted redacted prompts for a task.
-pub(crate) async fn get_task_prompts(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    let task_id = harness_core::types::TaskId(id);
-    match state.core.tasks.get_with_db_fallback(&task_id).await {
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "task not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("get_task_prompts: database error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
-        }
-        Ok(Some(_)) => {}
-    }
-    match state.core.tasks.get_prompts(&task_id).await {
-        Ok(prompts) => Json(prompts).into_response(),
-        Err(e) => {
-            tracing::error!("get_task_prompts: query error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
-    }
-}
-
 /// GET /api/intake — current status of all intake channels and recent dispatches.
 pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let intake_config = &state.core.server.config.intake;
     let all_tasks = state.core.tasks.list_all();
 
-    let github_active: u64 = all_tasks
-        .iter()
-        .filter(|t| {
-            t.source.as_deref() == Some("github")
-                && !matches!(
-                    t.status,
-                    task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
-                )
-        })
-        .count() as u64;
+    let github_active: u64 = if let Some(store) = state.core.issue_workflow_store.as_ref() {
+        match store.list().await {
+            Ok(workflows) => workflows
+                .into_iter()
+                .filter(|workflow| {
+                    !matches!(
+                        workflow.state,
+                        harness_workflow::issue_lifecycle::IssueLifecycleState::Done
+                            | harness_workflow::issue_lifecycle::IssueLifecycleState::Failed
+                            | harness_workflow::issue_lifecycle::IssueLifecycleState::Cancelled
+                    )
+                })
+                .count() as u64,
+            Err(_) => all_tasks
+                .iter()
+                .filter(|t| {
+                    t.source.as_deref() == Some("github")
+                        && !matches!(
+                            t.status,
+                            task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
+                        )
+                })
+                .count() as u64,
+        }
+    } else {
+        all_tasks
+            .iter()
+            .filter(|t| {
+                t.source.as_deref() == Some("github")
+                    && !matches!(
+                        t.status,
+                        task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
+                    )
+            })
+            .count() as u64
+    };
 
     let feishu_active: u64 = all_tasks
         .iter()
@@ -516,45 +718,64 @@ pub(crate) struct PasswordResetRequest {
     pub(crate) email: String,
 }
 
-/// POST /auth/reset-password — initiate a password reset.
+pub(crate) fn prepare_password_reset_request(
+    rate_limiter: &crate::http::rate_limit::PasswordResetRateLimiter,
+    limit: u32,
+    email: &str,
+) -> Result<String, (StatusCode, serde_json::Value)> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({"error": "email is required"}),
+        ));
+    }
+
+    if !rate_limiter.check_and_increment(&email) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({
+                "error": format!(
+                    "rate limit exceeded: max {} password reset requests per hour",
+                    limit
+                )
+            }),
+        ));
+    }
+
+    Ok(email)
+}
+
+pub(crate) fn disabled_password_reset_response() -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        json!({"error": "password reset is not yet implemented"}),
+    )
+}
+
+/// POST /auth/reset-password — temporarily disabled until email delivery exists.
 ///
-/// Rate-limited per email address to prevent enumeration and brute-force.
-/// Always returns a generic success response regardless of whether the email
-/// exists, to avoid leaking account information.
+/// Requests are still validated, rate-limited, and logged so the auth-exempt
+/// endpoint retains its abuse protections while the actual reset flow is
+/// unavailable.
 pub(crate) async fn password_reset(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PasswordResetRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let email = req.email.trim().to_lowercase();
-    if email.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "email is required"})),
-        );
-    }
-
     let limit = state
         .core
         .server
         .config
         .server
         .password_reset_rate_limit_per_hour;
-
-    if !state
-        .observability
-        .password_reset_rate_limiter
-        .check_and_increment(&email)
-    {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "error": format!(
-                    "rate limit exceeded: max {} password reset requests per hour",
-                    limit
-                )
-            })),
-        );
-    }
+    let email = match prepare_password_reset_request(
+        &state.observability.password_reset_rate_limiter,
+        limit,
+        &req.email,
+    ) {
+        Ok(email) => email,
+        Err((status, body)) => return (status, Json(body)),
+    };
 
     tracing::info!(
         email_hash = %format!("{:x}", {
@@ -563,13 +784,10 @@ pub(crate) async fn password_reset(
             email.hash(&mut h);
             h.finish()
         }),
-        "password reset requested"
+        "password reset requested while endpoint disabled"
     );
 
-    (
-        StatusCode::OK,
-        Json(
-            json!({"status": "ok", "message": "If that email is registered, a reset link has been sent."}),
-        ),
-    )
+    // TODO: wire up SMTP/transactional email before enabling this endpoint.
+    let (status, body) = disabled_password_reset_response();
+    (status, Json(body))
 }

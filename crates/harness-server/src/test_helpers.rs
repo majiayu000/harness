@@ -1,8 +1,12 @@
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64},
-    Arc,
+    Arc, OnceLock,
 };
+use std::time::Duration;
+
+use harness_core::db::pg_open_pool;
+use tokio::sync::OnceCell;
 
 /// Serialises every test that reads or mutates the process-global `HOME` env
 /// var.  `tokio::test` runs tests concurrently in the same process; without
@@ -10,6 +14,14 @@ use std::sync::{
 /// that calls `validate_project_root` (which reads `HOME`), leading to
 /// spurious "project root must be within HOME" failures.
 pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
+static DB_STATE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+
+fn db_state_lock() -> Arc<tokio::sync::Mutex<()>> {
+    DB_STATE_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// RAII guard that restores `HOME` on drop, **including on panic**.
 pub struct HomeGuard {
@@ -42,6 +54,7 @@ impl Drop for HomeGuard {
 use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
+use sha2::{Digest, Sha256};
 
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
@@ -61,15 +74,69 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
         .map_err(Into::into)
 }
 
+pub async fn db_tests_enabled() -> bool {
+    if std::env::var("DATABASE_URL").is_err() {
+        return false;
+    }
+
+    *DB_AVAILABLE
+        .get_or_init(|| async {
+            let Ok(database_url) = std::env::var("DATABASE_URL") else {
+                return false;
+            };
+            match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {
+                Ok(Ok(pool)) => {
+                    pool.close().await;
+                    true
+                }
+                _ => false,
+            }
+        })
+        .await
+}
+
+pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
+    db_state_lock().lock_owned().await
+}
+
+pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("pool timed out while waiting for an open connection")
+}
+
 pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
-    make_state_inner(dir, dir, AgentRegistry::new("test")).await
+    make_state_inner(
+        dir,
+        dir,
+        AgentRegistry::new("test"),
+        HarnessConfig::default(),
+    )
+    .await
+}
+
+pub async fn drop_tasks_table(dir: &std::path::Path) -> anyhow::Result<()> {
+    let db_path = harness_core::config::dirs::default_db_path(dir, "tasks");
+    let database_url = harness_core::db::resolve_database_url(None)?;
+    let path_utf8 = db_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", db_path))?;
+    let digest = Sha256::digest(path_utf8.as_bytes());
+    let mut schema_bytes = [0u8; 8];
+    schema_bytes.copy_from_slice(&digest[..8]);
+    let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
+    let pool = harness_core::db::pg_open_pool_schematized(&database_url, &schema).await?;
+    sqlx::query("DROP TABLE tasks CASCADE")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
 }
 
 pub async fn make_test_state_with_registry(
     dir: &std::path::Path,
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
-    make_state_inner(dir, dir, agent_registry).await
+    make_state_inner(dir, dir, agent_registry, HarnessConfig::default()).await
 }
 
 /// Build a test `AppState` wrapped in `Arc`, using separate data and project-root directories.
@@ -81,7 +148,13 @@ pub async fn make_test_state_with_project_root(
     project_root: &std::path::Path,
 ) -> anyhow::Result<Arc<AppState>> {
     Ok(Arc::new(
-        make_state_inner(dir, project_root, AgentRegistry::new("test")).await?,
+        make_state_inner(
+            dir,
+            project_root,
+            AgentRegistry::new("test"),
+            HarnessConfig::default(),
+        )
+        .await?,
     ))
 }
 
@@ -89,12 +162,16 @@ async fn make_state_inner(
     dir: &std::path::Path,
     project_root: &std::path::Path,
     agent_registry: AgentRegistry,
+    config: HarnessConfig,
 ) -> anyhow::Result<AppState> {
+    #[cfg(test)]
+    let db_state_guard = Some(acquire_db_state_guard().await);
     let server = Arc::new(HarnessServer::new(
-        HarnessConfig::default(),
+        config,
         ThreadManager::new(),
         agent_registry,
     ));
+    let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
     let tasks = crate::task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
         dir, "tasks",
     ))
@@ -137,6 +214,8 @@ async fn make_state_inner(
         vec![],
         None,
         task_queue.clone(),
+        task_queue.clone(),
+        None,
         None,
         None,
         vec![],
@@ -153,6 +232,8 @@ async fn make_state_inner(
             thread_db: Some(thread_db),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+            issue_workflow_store: None,
+            project_workflow_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -167,7 +248,7 @@ async fn make_state_inner(
             events,
             signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
             password_reset_rate_limiter: Arc::new(
-                crate::http::rate_limit::PasswordResetRateLimiter::new(5),
+                crate::http::rate_limit::PasswordResetRateLimiter::new(password_reset_rate_limit),
             ),
             review_store: None,
         },
@@ -176,6 +257,8 @@ async fn make_state_inner(
             review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             workspace_mgr: None,
         },
+        #[cfg(test)]
+        _db_state_guard: db_state_guard,
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),

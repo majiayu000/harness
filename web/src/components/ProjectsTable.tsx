@@ -1,6 +1,9 @@
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import type { OverviewProject } from "@/types";
 import { fmtInt, fmtScore } from "@/lib/format";
+import { RegisterProjectModal } from "./RegisterProjectModal";
 
 interface Props {
   projects: OverviewProject[];
@@ -25,12 +28,35 @@ function trendSvg(arr: number[]): string {
 
 export function ProjectsTable({ projects }: Props) {
   const nav = useNavigate();
+  const qc = useQueryClient();
+  const [modalOpen, setModalOpen] = useState(false);
 
   if (!projects.length) {
     return (
-      <div className="px-5 py-5 text-ink-4 font-mono text-[11px]">
-        no projects registered yet — register one via POST /projects
-      </div>
+      <>
+        <div className="flex flex-col items-center justify-center py-16 px-8">
+          <div className="border border-line bg-bg-1 p-8 text-center max-w-sm w-full">
+            <div className="font-semibold text-ink text-[15px] mb-2">Add your first project</div>
+            <div className="font-mono text-[11px] text-ink-3 mb-6">
+              Register a local repository to start delegating tasks.
+            </div>
+            <button
+              onClick={() => setModalOpen(true)}
+              className="px-4 py-1.5 bg-rust text-white border-0 font-mono text-[12px] cursor-pointer"
+            >
+              Add Project
+            </button>
+          </div>
+        </div>
+        <RegisterProjectModal
+          open={modalOpen}
+          onClose={() => setModalOpen(false)}
+          onSuccess={() => {
+            qc.invalidateQueries({ queryKey: ["overview"] });
+            setModalOpen(false);
+          }}
+        />
+      </>
     );
   }
 

@@ -14,10 +14,10 @@ use crate::circuit_breaker::CircuitBreaker;
 
 /// Post-tool-use hook enforcer.
 ///
-/// When `enabled`, this interceptor fires after each agent turn, detects files
-/// that were modified (via `git status --porcelain`), scans them with all
-/// registered guards, logs a `hook_enforcement` event to the [`EventStore`],
-/// and returns any violations as feedback for the agent's next turn prompt.
+/// When `enabled`, this interceptor fires after each agent turn, scans known
+/// modified files with all registered guards, logs a `hook_enforcement` event
+/// to the [`EventStore`], and returns any violations as feedback for the
+/// agent's next turn prompt.
 ///
 /// ## Infinite-loop protection (circuit breaker)
 ///
@@ -59,41 +59,16 @@ impl HookEnforcer {
         }
     }
 
-    /// Detect files added or modified in `project_root` using `git status --porcelain`.
+    /// Detect files added or modified in `project_root`.
     ///
-    /// Deleted files are excluded. Returns an empty list when git is unavailable
-    /// or `project_root` is not a git repository.
+    /// Host-side git inspection is disabled by project policy, so this returns
+    /// an empty list until file changes are supplied by agent telemetry.
     pub async fn detect_modified_files(project_root: &Path) -> Vec<PathBuf> {
-        let output = tokio::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(project_root)
-            .output()
-            .await;
-        match output {
-            Ok(out) => String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| {
-                    // git status --porcelain format: "XY filename" (at least 4 chars)
-                    let line = line.trim();
-                    if line.len() < 4 {
-                        return None;
-                    }
-                    // Skip deleted entries
-                    if line[..2].contains('D') {
-                        return None;
-                    }
-                    Some(PathBuf::from(line[3..].trim()))
-                })
-                .collect(),
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    project_root = %project_root.display(),
-                    "hook_enforcer: git status unavailable"
-                );
-                Vec::new()
-            }
-        }
+        tracing::debug!(
+            project_root = %project_root.display(),
+            "hook_enforcer: host-side git inspection disabled"
+        );
+        Vec::new()
     }
 
     /// Returns the circuit-breaker key for a session.
@@ -290,6 +265,7 @@ mod tests {
     async fn post_tool_use_returns_violations_when_guard_fires() -> anyhow::Result<()> {
         let _env_lock = CI_ENV_LOCK.lock().await;
         let _ci_guard = with_ci_env(None);
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -319,6 +295,7 @@ mod tests {
     async fn post_tool_use_disabled_passes_through() -> anyhow::Result<()> {
         let _env_lock = CI_ENV_LOCK.lock().await;
         let _ci_guard = with_ci_env(None);
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -343,6 +320,7 @@ mod tests {
     async fn post_tool_use_empty_files_returns_clean() -> anyhow::Result<()> {
         let _env_lock = CI_ENV_LOCK.lock().await;
         let _ci_guard = with_ci_env(None);
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -362,6 +340,7 @@ mod tests {
     async fn post_tool_use_logs_event_to_store() -> anyhow::Result<()> {
         let _env_lock = CI_ENV_LOCK.lock().await;
         let _ci_guard = with_ci_env(None);
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
         let dir = tempdir()?;
         let event_store = Arc::new(EventStore::new(dir.path()).await?);
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -394,6 +373,7 @@ mod tests {
     async fn post_tool_use_no_guards_passes_through() -> anyhow::Result<()> {
         let _env_lock = CI_ENV_LOCK.lock().await;
         let _ci_guard = with_ci_env(None);
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = Arc::new(RwLock::new(RuleEngine::new()));
@@ -414,6 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn interceptor_name_is_hook_enforcer() -> anyhow::Result<()> {
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = Arc::new(RwLock::new(RuleEngine::new()));
@@ -426,6 +407,7 @@ mod tests {
     async fn circuit_breaker_opens_after_repeated_blocks() -> anyhow::Result<()> {
         let _env_lock = CI_ENV_LOCK.lock().await;
         let _ci_guard = with_ci_env(None);
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");
@@ -465,6 +447,7 @@ mod tests {
     async fn ci_env_skips_enforcement() -> anyhow::Result<()> {
         let _env_lock = CI_ENV_LOCK.lock().await;
         let _ci_guard = with_ci_env(Some("true"));
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
         let dir = tempdir()?;
         let events = make_event_store(dir.path()).await;
         let rules = make_engine_with_guard(dir.path(), "U-16", "medium");

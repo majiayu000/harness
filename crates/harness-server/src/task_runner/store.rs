@@ -1,8 +1,11 @@
 use crate::task_db::TaskDb;
+use chrono::Utc;
 use dashmap::DashMap;
+use futures::StreamExt;
 use harness_core::agent::StreamItem;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
@@ -13,6 +16,22 @@ use super::CompletionCallback;
 /// Broadcast channel capacity for per-task stream events.
 /// When the buffer is full, the oldest events are dropped for lagging receivers.
 const TASK_STREAM_CAPACITY: usize = 512;
+const RECOVERED_PR_VIEW_TIMEOUT: Duration = Duration::from_secs(10);
+const RECOVERED_PR_VALIDATION_CONCURRENCY: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveredPrCandidate {
+    task_id: TaskId,
+    pr_url: String,
+}
+
+#[derive(Debug)]
+struct RecoveredPrStatusUpdate {
+    task_id: TaskId,
+    pr_url: String,
+    state: String,
+    status: TaskStatus,
+}
 
 pub struct TaskStore {
     pub(crate) cache: DashMap<TaskId, TaskState>,
@@ -88,7 +107,13 @@ impl TaskStore {
         let active_statuses = &[
             "pending",
             "awaiting_deps",
+            "triaging",
+            "planning",
             "implementing",
+            "review_generating",
+            "review_waiting",
+            "planner_generating",
+            "planner_waiting",
             "agent_review",
             "waiting",
             "reviewing",
@@ -332,17 +357,202 @@ impl TaskStore {
         Ok(by_id)
     }
 
-    /// Run `f` only if the task still exists and is live-`pending`.
+    /// Return the latest status for each `external_id` in a single project/repo namespace.
     ///
-    /// Holding the mutable cache guard across `f` prevents a concurrent status
-    /// transition from changing this task out of `pending` between the check
-    /// and a follow-up side effect such as runtime-host lease insertion.
-    pub(crate) fn with_task_if_pending<R>(&self, id: &TaskId, f: impl FnOnce() -> R) -> Option<R> {
-        let entry = self.cache.get_mut(id)?;
-        if !matches!(entry.status, TaskStatus::Pending) {
-            return None;
+    /// The database query collapses historical attempts down to the newest row per
+    /// issue. In-memory cache entries then override the DB result when the server
+    /// is holding a newer status transition that has not been re-read from storage.
+    pub async fn list_latest_external_statuses_by_project_and_repo(
+        &self,
+        project_id: &str,
+        repo: Option<&str>,
+    ) -> anyhow::Result<HashMap<String, (Option<String>, TaskStatus)>> {
+        let mut by_external_id: HashMap<String, (Option<String>, TaskStatus)> = self
+            .db
+            .list_latest_external_statuses_by_project_and_repo(project_id, repo)
+            .await?
+            .into_iter()
+            .filter_map(|(external_id, status, created_at)| {
+                status
+                    .parse::<TaskStatus>()
+                    .ok()
+                    .map(|parsed| (external_id, (created_at, parsed)))
+            })
+            .collect();
+        for entry in self.cache.iter() {
+            let task = entry.value();
+            let same_project = task
+                .project_root
+                .as_ref()
+                .map(|path| path.to_string_lossy() == project_id)
+                .unwrap_or(false);
+            let same_repo = match (repo, task.repo.as_deref()) {
+                (Some(expected), Some(actual)) => expected == actual,
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_project || !same_repo {
+                continue;
+            }
+            let Some(external_id) = task.external_id.clone() else {
+                continue;
+            };
+            let should_replace = by_external_id
+                .get(&external_id)
+                .map(|(existing_created_at, _)| {
+                    latest_timestamp_at_least(
+                        task.created_at.as_deref(),
+                        existing_created_at.as_deref(),
+                    )
+                })
+                .unwrap_or(true);
+            if should_replace {
+                by_external_id.insert(external_id, (task.created_at.clone(), task.status.clone()));
+            }
         }
-        Some(f())
+
+        Ok(by_external_id)
+    }
+
+    /// Count live runtime-host leases from the authoritative scheduler state
+    /// carried on active task rows.
+    pub(crate) fn active_runtime_host_lease_count(&self, host_id: &str) -> usize {
+        let now = Utc::now();
+        self.cache
+            .iter()
+            .filter(|entry| {
+                let scheduler = &entry.value().scheduler;
+                scheduler.runtime_host_id() == Some(host_id)
+                    && scheduler.has_live_runtime_host_lease(now)
+            })
+            .count()
+    }
+
+    /// Attempt to claim a pending task for a runtime host by updating the
+    /// authoritative scheduler state on the task row itself.
+    pub(crate) async fn claim_for_runtime_host(
+        &self,
+        id: &TaskId,
+        host_id: &str,
+        lease_secs: Option<i64>,
+    ) -> anyhow::Result<Option<crate::runtime_hosts::TaskClaimResult>> {
+        let ttl = lease_secs
+            .unwrap_or(crate::runtime_hosts::DEFAULT_LEASE_SECS)
+            .max(0);
+        let lease_duration = chrono::TimeDelta::try_seconds(ttl).ok_or_else(|| {
+            anyhow::anyhow!(
+                "lease_secs value {ttl} is too large to compute a valid expiration timestamp"
+            )
+        })?;
+        let now = Utc::now();
+        let expires_at = now.checked_add_signed(lease_duration).ok_or_else(|| {
+            anyhow::anyhow!(
+                "lease_secs value {ttl} is too large to compute a valid expiration timestamp"
+            )
+        })?;
+        let lock = self
+            .persist_locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let Some(mut entry) = self.cache.get_mut(id) else {
+            return Ok(None);
+        };
+        if !matches!(entry.status, TaskStatus::Pending) {
+            return Ok(None);
+        }
+        let original_scheduler = entry.scheduler.clone();
+        if entry.scheduler.owner.is_some() {
+            // Scheduler owner: never allow a runtime host to steal the task.
+            // RuntimeHost with live lease: the claim is still active.
+            if entry.scheduler.runtime_host_id().is_none()
+                || entry.scheduler.has_live_runtime_host_lease(now)
+            {
+                return Ok(None);
+            }
+            // RuntimeHost with a stale lease: safe to clear and re-claim.
+            entry.scheduler.clear_to_queued();
+        }
+
+        entry.scheduler.claim_runtime_host(host_id, expires_at);
+        let snapshot = entry.value().clone();
+        drop(entry);
+        if let Err(e) = self.db.update(&snapshot).await {
+            if let Some(mut rollback) = self.cache.get_mut(id) {
+                rollback.scheduler = original_scheduler;
+            }
+            return Err(e);
+        }
+        Ok(Some(crate::runtime_hosts::TaskClaimResult {
+            task_id: id.clone(),
+            lease_expires_at: expires_at.to_rfc3339(),
+        }))
+    }
+
+    /// Clear a pending runtime-host lease from the authoritative scheduler state.
+    ///
+    /// Returns `true` only when the task still belonged to `host_id` and was
+    /// rewritten back to the queued state.
+    pub(crate) async fn release_runtime_host_claim(
+        &self,
+        id: &TaskId,
+        host_id: &str,
+    ) -> anyhow::Result<bool> {
+        let lock = self
+            .persist_locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let Some(mut entry) = self.cache.get_mut(id) else {
+            return Ok(false);
+        };
+        if !matches!(entry.status, TaskStatus::Pending) {
+            return Ok(false);
+        }
+        if entry.scheduler.runtime_host_id() != Some(host_id) {
+            return Ok(false);
+        }
+
+        let original_scheduler = entry.scheduler.clone();
+        entry.scheduler.clear_to_queued();
+        let snapshot = entry.value().clone();
+        drop(entry);
+        if let Err(e) = self.db.update(&snapshot).await {
+            if let Some(mut rollback) = self.cache.get_mut(id) {
+                rollback.scheduler = original_scheduler;
+            }
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Release every pending task lease owned by `host_id`.
+    pub(crate) async fn release_runtime_host_claims(
+        &self,
+        host_id: &str,
+    ) -> anyhow::Result<Vec<TaskId>> {
+        let candidate_ids: Vec<TaskId> = self
+            .cache
+            .iter()
+            .filter_map(|entry| {
+                let task = entry.value();
+                (matches!(task.status, TaskStatus::Pending)
+                    && task.scheduler.runtime_host_id() == Some(host_id))
+                .then(|| task.id.clone())
+            })
+            .collect();
+
+        let mut released = Vec::new();
+        for task_id in candidate_ids {
+            if self.release_runtime_host_claim(&task_id, host_id).await? {
+                released.push(task_id);
+            }
+        }
+        Ok(released)
     }
 
     /// Return the `pr_url` of the most recently created Done task, ordered by `created_at DESC`
@@ -727,11 +937,13 @@ impl TaskStore {
     }
 
     pub(crate) async fn insert(&self, state: &TaskState) {
+        let mut state = state.clone();
+        state.reconcile_scheduler_with_status();
         self.persist_locks
             .entry(state.id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())));
         self.cache.insert(state.id.clone(), state.clone());
-        if let Err(e) = self.db.insert(state).await {
+        if let Err(e) = self.db.insert(&state).await {
             tracing::error!("task_db insert failed: {e}");
         }
         self.log_event(crate::event_replay::TaskEvent::Created {
@@ -808,7 +1020,12 @@ impl TaskStore {
             .clone();
         let _guard = lock.lock().await;
 
-        let snapshot = self.cache.get(id).map(|state| state.value().clone());
+        let snapshot = if let Some(mut state) = self.cache.get_mut(id) {
+            state.value_mut().reconcile_scheduler_with_status();
+            Some(state.value().clone())
+        } else {
+            None
+        };
         if let Some(state) = snapshot {
             self.db.update(&state).await?;
 
@@ -842,11 +1059,22 @@ impl TaskStore {
         id: &TaskId,
         status: TaskStatus,
     ) -> anyhow::Result<()> {
+        let mut scheduler_json = None;
         if let Some(mut entry) = self.cache.get_mut(id) {
             entry.value_mut().status = status.clone();
+            entry.value_mut().reconcile_scheduler_with_status();
+            scheduler_json = Some(serde_json::to_string(&entry.value().scheduler)?);
         }
+        let default_scheduler_json =
+            serde_json::to_string(&crate::task_runner::TaskSchedulerState::queued())?;
         self.db
-            .update_status_only(id.0.as_str(), status.as_ref())
+            .update_status_only(
+                id.0.as_str(),
+                status.as_ref(),
+                scheduler_json
+                    .as_deref()
+                    .unwrap_or(default_scheduler_json.as_str()),
+            )
             .await
     }
 
@@ -860,23 +1088,18 @@ impl TaskStore {
     ///   remove the issue from their `dispatched` map and allow retry)
     /// - OPEN   → leave as Pending
     ///
-    /// `gh` CLI failures are treated as transient network errors; the task is left
+    /// GitHub API failures are treated as transient network errors; the task is left
     /// Pending so it will be retried normally.
     pub async fn validate_recovered_tasks(&self, completion_callback: Option<CompletionCallback>) {
-        let candidates: Vec<(TaskId, String)> = self
-            .cache
-            .iter()
-            .filter_map(|e| {
-                let task = e.value();
-                if matches!(task.status, TaskStatus::Pending) {
-                    task.pr_url
-                        .as_ref()
-                        .map(|url| (task.id.clone(), url.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        self.validate_recovered_tasks_with_github(completion_callback)
+            .await;
+    }
+
+    async fn validate_recovered_tasks_with_github(
+        &self,
+        completion_callback: Option<CompletionCallback>,
+    ) {
+        let candidates = self.collect_recovered_pr_candidates();
 
         if candidates.is_empty() {
             return;
@@ -887,101 +1110,178 @@ impl TaskStore {
             candidates.len()
         );
 
-        for (task_id, pr_url) in candidates {
-            let Some((owner, repo, number)) = super::spawn::parse_pr_url(&pr_url) else {
-                tracing::warn!(
-                    task_id = %task_id.0,
-                    pr_url,
-                    "could not parse PR URL; leaving pending"
-                );
+        // Probe PR states concurrently, but keep persistence and callbacks
+        // serialized so terminal-state side effects preserve their current order.
+        let mut results = futures::stream::iter(candidates)
+            .map(check_recovered_pr_state)
+            .buffer_unordered(RECOVERED_PR_VALIDATION_CONCURRENCY);
+
+        while let Some(result) = results.next().await {
+            let Some(RecoveredPrStatusUpdate {
+                task_id,
+                pr_url,
+                state,
+                status,
+            }) = result
+            else {
                 continue;
             };
 
-            let pr_ref = format!("{owner}/{repo}#{number}");
-            // kill_on_drop(true) ensures the child process is killed when the
-            // timeout future is dropped, preventing zombie `gh` processes during
-            // startup when many tasks are recovered concurrently.
-            let mut cmd = tokio::process::Command::new("gh");
-            cmd.args(["pr", "view", &pr_ref, "--json", "state", "--jq", ".state"])
-                .kill_on_drop(true);
-            let gh_result =
-                tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
-
-            let output = match gh_result {
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        pr_url,
-                        "gh pr view timed out after 10s; leaving pending"
-                    );
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        pr_url,
-                        "gh CLI error: {e}; leaving pending"
-                    );
-                    continue;
-                }
-                Ok(Ok(out)) => out,
-            };
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(
+            if let Some(mut entry) = self.cache.get_mut(&task_id) {
+                entry.status = status;
+            }
+            // Persist before invoking the callback. If persist fails the task
+            // remains `pending` in SQLite; firing the callback anyway would push
+            // external state (Feishu notifications, GitHub intake cleanup) into a
+            // terminal state while the DB still thinks the task is pending. On
+            // the next restart the same task would be recovered and trigger the
+            // same side-effects again (state split). Skip the callback so the
+            // task can be safely retried on the next restart.
+            if let Err(e) = self.persist(&task_id).await {
+                tracing::error!(
                     task_id = %task_id.0,
-                    pr_url,
-                    "gh pr view failed: {stderr}; leaving pending"
+                    "failed to persist PR state update: {e}; skipping completion callback to avoid state split"
                 );
                 continue;
             }
-
-            let state = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_uppercase();
-            let new_status = match state.as_str() {
-                "MERGED" => Some(TaskStatus::Done),
-                "CLOSED" => Some(TaskStatus::Failed),
-                _ => None,
-            };
-
-            if let Some(status) = new_status {
-                if let Some(mut entry) = self.cache.get_mut(&task_id) {
-                    entry.status = status;
+            tracing::info!(
+                task_id = %task_id.0,
+                pr_url,
+                "startup recovery: PR state {state} → task status updated"
+            );
+            if let Some(cb) = &completion_callback {
+                if let Some(final_state) = self.get(&task_id) {
+                    cb(final_state).await;
                 }
-                // Persist before invoking the callback. If persist fails the task
-                // remains `pending` in SQLite; firing the callback anyway would push
-                // external state (Feishu notifications, GitHub intake cleanup) into a
-                // terminal state while the DB still thinks the task is pending. On
-                // the next restart the same task would be recovered and trigger the
-                // same side-effects again (state split). Skip the callback so the
-                // task can be safely retried on the next restart.
-                if let Err(e) = self.persist(&task_id).await {
-                    tracing::error!(
-                        task_id = %task_id.0,
-                        "failed to persist PR state update: {e}; skipping completion callback to avoid state split"
-                    );
-                    continue;
-                }
-                tracing::info!(
-                    task_id = %task_id.0,
-                    pr_url,
-                    "startup recovery: PR state {state} → task status updated"
-                );
-                if let Some(cb) = &completion_callback {
-                    if let Some(final_state) = self.get(&task_id) {
-                        cb(final_state).await;
-                    }
-                }
-            } else {
-                tracing::info!(
-                    task_id = %task_id.0,
-                    pr_url,
-                    "startup recovery: PR state {state} → leaving pending"
-                );
             }
         }
+    }
+
+    fn collect_recovered_pr_candidates(&self) -> Vec<RecoveredPrCandidate> {
+        self.cache
+            .iter()
+            .filter_map(|entry| recovered_pr_candidate(entry.value()))
+            .collect()
+    }
+}
+
+fn recovered_pr_candidate(task: &TaskState) -> Option<RecoveredPrCandidate> {
+    if !matches!(task.status, TaskStatus::Pending) {
+        return None;
+    }
+    let pr_url = task.pr_url.as_ref()?.clone();
+    if super::spawn::parse_pr_url(&pr_url).is_none() {
+        tracing::warn!(
+            task_id = %task.id.0,
+            pr_url,
+            "could not parse PR URL; leaving pending"
+        );
+        return None;
+    }
+    Some(RecoveredPrCandidate {
+        task_id: task.id.clone(),
+        pr_url,
+    })
+}
+
+async fn check_recovered_pr_state(
+    candidate: RecoveredPrCandidate,
+) -> Option<RecoveredPrStatusUpdate> {
+    let RecoveredPrCandidate { task_id, pr_url } = candidate;
+    let Some((owner, repo, pr_number)) = super::spawn::parse_pr_url(&pr_url) else {
+        tracing::warn!(
+            task_id = %task_id.0,
+            pr_url,
+            "could not parse PR URL during startup recovery; leaving pending"
+        );
+        return None;
+    };
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(format!(
+            "https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        if !token.trim().is_empty() {
+            request = request.bearer_auth(token);
+        }
+    }
+    let response = match tokio::time::timeout(RECOVERED_PR_VIEW_TIMEOUT, request.send()).await {
+        Err(_elapsed) => {
+            tracing::warn!(
+                task_id = %task_id.0,
+                pr_url,
+                "GitHub PR lookup timed out after 10s; leaving pending"
+            );
+            return None;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                task_id = %task_id.0,
+                pr_url,
+                "GitHub PR lookup error: {e}; leaving pending"
+            );
+            return None;
+        }
+        Ok(Ok(response)) => response,
+    };
+
+    if !response.status().is_success() {
+        tracing::warn!(
+            task_id = %task_id.0,
+            pr_url,
+            status = %response.status(),
+            "GitHub PR lookup failed; leaving pending"
+        );
+        return None;
+    }
+
+    let body = match response.json::<serde_json::Value>().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(
+                task_id = %task_id.0,
+                pr_url,
+                "GitHub PR lookup response parse failed: {e}; leaving pending"
+            );
+            return None;
+        }
+    };
+    let state = body
+        .get("state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let merged = body
+        .get("merged_at")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    let new_status = match (state.as_str(), merged) {
+        ("closed", true) => Some(TaskStatus::Done),
+        ("closed", false) => Some(TaskStatus::Failed),
+        _ => None,
+    };
+
+    if let Some(status) = new_status {
+        Some(RecoveredPrStatusUpdate {
+            task_id,
+            pr_url,
+            state: if merged {
+                "MERGED".to_string()
+            } else {
+                state.to_ascii_uppercase()
+            },
+            status,
+        })
+    } else {
+        tracing::info!(
+            task_id = %task_id.0,
+            pr_url,
+            "startup recovery: PR state {state} → leaving pending"
+        );
+        None
     }
 }
 
@@ -993,8 +1293,28 @@ pub async fn update_status(
 ) -> anyhow::Result<()> {
     let status_str = status.as_ref().to_string();
     mutate_and_persist(store, task_id, |s| {
-        s.status = status;
+        s.status = status.clone();
         s.turn = turn;
+        match status {
+            TaskStatus::Pending => s.scheduler.clear_to_queued(),
+            TaskStatus::AwaitingDeps => {
+                s.scheduler = crate::task_runner::TaskSchedulerState::awaiting_dependencies()
+            }
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
+                s.scheduler.mark_terminal(&status)
+            }
+            _ => {
+                if matches!(
+                    s.scheduler.authority_state,
+                    crate::task_runner::SchedulerAuthorityState::Queued
+                        | crate::task_runner::SchedulerAuthorityState::Recovering
+                        | crate::task_runner::SchedulerAuthorityState::RetryBackoff
+                        | crate::task_runner::SchedulerAuthorityState::AwaitingDependencies
+                ) {
+                    s.scheduler.claim_scheduler("local-scheduler");
+                }
+            }
+        }
     })
     .await?;
     store.log_event(crate::event_replay::TaskEvent::StatusChanged {
@@ -1018,10 +1338,49 @@ pub async fn mutate_and_persist(
     store.persist(id).await
 }
 
+fn latest_timestamp_at_least(candidate: Option<&str>, existing: Option<&str>) -> bool {
+    match (candidate, existing) {
+        (Some(candidate), Some(existing)) => candidate >= existing,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::state::TaskState;
     use super::*;
+
+    #[test]
+    fn collect_recovered_pr_candidates_filters_invalid_urls() {
+        let mut valid = TaskState::new(harness_core::types::TaskId("valid".to_string()));
+        valid.pr_url = Some("https://github.com/acme/myrepo/pull/42".to_string());
+
+        let mut invalid = TaskState::new(harness_core::types::TaskId("invalid".to_string()));
+        invalid.pr_url = Some("not-a-pr-url".to_string());
+
+        let mut inflight = TaskState::new(harness_core::types::TaskId("inflight".to_string()));
+        inflight.status = TaskStatus::Implementing;
+        inflight.pr_url = Some("https://github.com/acme/myrepo/pull/7".to_string());
+
+        let pending_without_pr = TaskState::new(harness_core::types::TaskId("no-pr".to_string()));
+        let tasks = [valid, invalid, inflight, pending_without_pr];
+        let candidates: Vec<_> = tasks.iter().filter_map(recovered_pr_candidate).collect();
+        assert_eq!(
+            candidates,
+            vec![RecoveredPrCandidate {
+                task_id: harness_core::types::TaskId("valid".to_string()),
+                pr_url: "https://github.com/acme/myrepo/pull/42".to_string(),
+            }]
+        );
+    }
+
+    fn pending_task(id: &str) -> TaskState {
+        let mut task = TaskState::new(harness_core::types::TaskId(id.to_string()));
+        task.status = TaskStatus::Pending;
+        task
+    }
 
     #[tokio::test]
     async fn task_stream_subscribe_and_publish() -> anyhow::Result<()> {
@@ -1226,8 +1585,46 @@ mod tests {
                 false,
                 false,
             ),
+            (TaskStatus::Triaging, false, true, true, false, false, false),
+            (TaskStatus::Planning, false, true, true, false, false, false),
             (
                 TaskStatus::Implementing,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::ReviewGenerating,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::ReviewWaiting,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::PlannerGenerating,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                TaskStatus::PlannerWaiting,
                 false,
                 true,
                 true,
@@ -1286,7 +1683,18 @@ mod tests {
         );
         assert_eq!(
             TaskStatus::resumable_statuses(),
-            &["implementing", "agent_review", "waiting", "reviewing"]
+            &[
+                "triaging",
+                "planning",
+                "implementing",
+                "review_generating",
+                "review_waiting",
+                "planner_generating",
+                "planner_waiting",
+                "agent_review",
+                "waiting",
+                "reviewing",
+            ]
         );
     }
 
@@ -1376,6 +1784,86 @@ mod tests {
         let key = root.to_string_lossy().into_owned();
         assert_eq!(counts.by_project[&key].done, 1);
         assert_eq!(counts.by_project[&key].failed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_runtime_host_claims_clears_pending_scheduler_owner() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut leased = pending_task("leased");
+        leased.scheduler.claim_runtime_host("host-a", Utc::now());
+        let leased_id = leased.id.clone();
+        store.insert(&leased).await;
+
+        let mut other_host = pending_task("other-host");
+        other_host
+            .scheduler
+            .claim_runtime_host("host-b", Utc::now());
+        let other_host_id = other_host.id.clone();
+        store.insert(&other_host).await;
+
+        let mut non_pending = pending_task("non-pending");
+        non_pending.status = TaskStatus::Implementing;
+        non_pending
+            .scheduler
+            .claim_runtime_host("host-a", Utc::now());
+        let non_pending_id = non_pending.id.clone();
+        store.insert(&non_pending).await;
+
+        let released = store.release_runtime_host_claims("host-a").await?;
+        assert_eq!(released, vec![leased_id.clone()]);
+
+        let released_task = store
+            .get(&leased_id)
+            .expect("released task should remain cached");
+        assert_eq!(released_task.scheduler.runtime_host_id(), None);
+        assert!(matches!(
+            released_task.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Queued
+        ));
+
+        let other_task = store
+            .get(&other_host_id)
+            .expect("other-host task should remain cached");
+        assert_eq!(other_task.scheduler.runtime_host_id(), Some("host-b"));
+
+        let non_pending_task = store
+            .get(&non_pending_id)
+            .expect("non-pending task should remain cached");
+        assert_eq!(non_pending_task.scheduler.runtime_host_id(), Some("host-a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_for_runtime_host_rolls_back_cache_when_persist_fails() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let task = pending_task("leased");
+        let task_id = task.id.clone();
+        store.insert(&task).await;
+
+        crate::test_helpers::drop_tasks_table(dir.path()).await?;
+
+        let result = store
+            .claim_for_runtime_host(&task_id, "host-a", Some(30))
+            .await;
+        assert!(
+            result.is_err(),
+            "claim should fail once the tasks table is gone"
+        );
+
+        let task = store
+            .get(&task_id)
+            .expect("task should remain cached after failed claim");
+        assert_eq!(task.scheduler.runtime_host_id(), None);
+        assert!(matches!(
+            task.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Queued
+        ));
+        assert_eq!(task.scheduler.run_generation, 0);
         Ok(())
     }
 

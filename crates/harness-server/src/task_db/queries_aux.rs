@@ -139,9 +139,10 @@ impl TaskDb {
         &self,
     ) -> anyhow::Result<Vec<(TaskState, TaskCheckpoint)>> {
         let rows = sqlx::query_as::<_, PendingCheckpointRow>(
-            "SELECT t.id, t.status, t.turn, t.pr_url, t.rounds, t.error, t.source, \
-                    t.external_id, t.parent_id, t.created_at, t.repo, t.depends_on, \
+            "SELECT t.id, t.task_kind, t.status, t.turn, t.pr_url, t.rounds, t.error, t.source, \
+                    t.external_id, t.parent_id, t.created_at, t.updated_at, t.repo, t.depends_on, \
                     t.project, t.priority, t.phase, t.description, t.request_settings, \
+                    t.scheduler_state, \
                     c.triage_output, c.plan_output, c.pr_url AS ck_pr_url, \
                     c.last_phase, \
                     TO_CHAR(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ck_updated_at \
@@ -159,7 +160,9 @@ impl TaskDb {
             let task_id = row.id.clone();
             let task_row = TaskRow {
                 id: row.id,
+                task_kind: row.task_kind,
                 status: row.status,
+                failure_kind: None,
                 turn: row.turn,
                 pr_url: row.pr_url,
                 rounds: row.rounds,
@@ -168,13 +171,18 @@ impl TaskDb {
                 external_id: row.external_id,
                 parent_id: row.parent_id,
                 created_at: row.created_at,
+                updated_at: row.updated_at,
                 repo: row.repo,
                 depends_on: row.depends_on,
                 project: row.project,
+                workspace_path: None,
+                workspace_owner: None,
+                run_generation: 0,
                 priority: row.priority,
                 phase: row.phase,
                 description: row.description,
                 request_settings: row.request_settings,
+                scheduler_state: row.scheduler_state,
             };
             let task_state = match task_row.try_into_task_state() {
                 Ok(s) => s,

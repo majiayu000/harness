@@ -70,7 +70,9 @@ pub(crate) async fn build_services(
         interceptors.clone(),
         registry.workspace_mgr.clone(),
         intake.task_queue.clone(),
+        intake.review_task_queue.clone(),
         intake.completion_callback.clone(),
+        registry.issue_workflow_store.clone(),
         Some(registry.project_registry.clone()),
         server.config.server.allowed_project_roots.clone(),
     );
@@ -85,12 +87,11 @@ pub(crate) async fn build_services(
     if let Some(store) = registry.runtime_state_store.as_ref() {
         match store.try_load_snapshot().await {
             Ok((Some(snapshot), crate::runtime_state_store::LoadSnapshotOutcome::Loaded)) => {
-                let restored_hosts = runtime_hosts.restore_state(snapshot.hosts, snapshot.leases);
+                let restored_hosts = runtime_hosts.restore_state(snapshot.hosts);
                 let restored_project_caches =
                     runtime_project_cache.restore_state(snapshot.project_caches);
                 tracing::info!(
-                    restored_hosts = restored_hosts.0,
-                    restored_leases = restored_hosts.1,
+                    restored_hosts,
                     restored_project_caches,
                     "runtime state restored from persistent snapshot"
                 );

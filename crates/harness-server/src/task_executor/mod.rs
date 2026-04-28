@@ -7,23 +7,24 @@ pub(crate) mod review_loop;
 pub(crate) mod triage_pipeline;
 pub(crate) mod turn_lifecycle;
 
-use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskStatus, TaskStore};
+use crate::task_runner::{
+    mutate_and_persist, CreateTaskRequest, TaskId, TaskKind, TaskStatus, TaskStore,
+};
 use anyhow::Context;
-use harness_core::agent::CodeAgent;
+use harness_core::agent::{AgentRequest, CodeAgent};
+use harness_core::config::agents::CapabilityProfile;
+use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::{config::project::load_project_config, lang_detect, prompts};
 use std::collections::HashMap;
 
 use helpers::update_status;
 
-#[cfg(test)]
-use harness_core::config::agents::CapabilityProfile;
 /// Extract tool list from a capability profile, returning an error if the
 /// profile unexpectedly returns `None` (which means Full/unrestricted).
 /// A misconfigured profile causes a hard failure rather than silent degradation,
 /// per U-23 (no silent capability downgrade).
 // Re-export so existing call sites in handlers/ don't need updating.
 pub(crate) use turn_lifecycle::run_turn_lifecycle;
-#[cfg(test)]
 fn restricted_tools(profile: CapabilityProfile) -> anyhow::Result<Vec<String>> {
     profile.tools().ok_or_else(|| {
         anyhow::anyhow!(
@@ -71,6 +72,10 @@ pub(crate) struct TaskContext {
     pub turns_used: u32,
     pub cargo_env: std::collections::HashMap<String, String>,
     pub project: std::path::PathBuf,
+}
+
+fn should_run_issue_triage(skip_triage: bool, has_existing_pr: bool) -> bool {
+    !skip_triage && !has_existing_pr
 }
 
 /// Run the project's test commands as a hard gate before accepting LGTM.
@@ -156,6 +161,226 @@ async fn run_test_gate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_non_implementation_task(
+    store: &TaskStore,
+    task_id: &TaskId,
+    task_kind: TaskKind,
+    agent: &dyn CodeAgent,
+    req: &CreateTaskRequest,
+    project: &std::path::Path,
+    server_config: &harness_core::config::HarnessConfig,
+    interceptors: &Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
+    events: &Arc<harness_observe::event_store::EventStore>,
+    skills: &Arc<RwLock<harness_skills::store::SkillStore>>,
+    cargo_env: &HashMap<String, String>,
+    turn_timeout: Duration,
+    effective_max_turns: Option<u32>,
+    turns_used: &mut u32,
+    turns_used_acc: &mut u32,
+    task_start: Instant,
+) -> anyhow::Result<()> {
+    let Some(system_input) = req.system_input.as_ref() else {
+        anyhow::bail!(
+            "{} task is missing restart-safe input metadata",
+            task_kind.as_ref()
+        );
+    };
+
+    update_status(store, task_id, task_kind.execution_status(), 1).await?;
+
+    let mut prompt = implement_pipeline::prepend_constitution(
+        system_input.prompt().to_string(),
+        server_config.server.constitution_enabled,
+    );
+    let skill_additions = helpers::inject_skills_into_prompt(skills, &prompt).await;
+    if !skill_additions.is_empty() {
+        prompt.push_str(&skill_additions);
+    }
+    let context_items = helpers::collect_context_items(skills, project, &prompt).await;
+    let allowed_tools = Some(restricted_tools(CapabilityProfile::Standard)?);
+    if let Some(note) = CapabilityProfile::Standard.prompt_note() {
+        prompt = format!("{note}\n\n{prompt}");
+    }
+
+    let initial_req = AgentRequest {
+        prompt,
+        project_root: project.to_path_buf(),
+        context: context_items,
+        max_budget_usd: req.max_budget_usd,
+        execution_phase: Some(harness_core::types::ExecutionPhase::Planning),
+        allowed_tools: allowed_tools.clone(),
+        env_vars: cargo_env.clone(),
+        ..Default::default()
+    };
+    let first_req = helpers::run_pre_execute(interceptors, initial_req).await?;
+    let max_validation_retries: u32 = interceptors
+        .iter()
+        .filter_map(|i| i.max_validation_retries())
+        .max()
+        .unwrap_or(2);
+    let mut validation_attempt = 0u32;
+    let mut turn_req = first_req.clone();
+
+    let (resp, first_token_latency_ms) = loop {
+        if let Some(max) = effective_max_turns {
+            if *turns_used >= max {
+                anyhow::bail!(
+                    "Turn budget exhausted: used {} of {} allowed turns",
+                    turns_used,
+                    max
+                );
+            }
+        }
+        let raw = tokio::time::timeout(
+            turn_timeout,
+            helpers::run_agent_streaming(agent, turn_req.clone(), task_id, store, 1),
+        )
+        .await;
+        *turns_used += 1;
+        *turns_used_acc = *turns_used;
+        match raw {
+            Ok(Ok((response, latency_ms))) => {
+                let turn_tools = turn_req.allowed_tools.as_deref().unwrap_or(&[]);
+                let tool_violations = validate_tool_usage(&response.output, turn_tools);
+                let violation_err: Option<String> = if tool_violations.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "[VALIDATION ERROR] Tool isolation violation: agent used disallowed tools: [{}]. Only [{}] are permitted.",
+                        tool_violations.join(", "),
+                        turn_tools.join(", ")
+                    ))
+                };
+                let hook_err = {
+                    let modified = helpers::detect_modified_files(project).await;
+                    if modified.is_empty() {
+                        None
+                    } else {
+                        let hook_event = harness_core::interceptor::ToolUseEvent {
+                            tool_name: "file_write".to_string(),
+                            affected_files: modified,
+                            session_id: None,
+                        };
+                        helpers::run_post_tool_use(interceptors, &hook_event, project).await
+                    }
+                };
+                let post_err = helpers::run_post_execute(interceptors, &turn_req, &response).await;
+                if let Some(err) = violation_err.or(hook_err).or(post_err) {
+                    if validation_attempt < max_validation_retries {
+                        validation_attempt += 1;
+                        let backoff_ms = implement_pipeline::compute_backoff_ms(
+                            req.retry_base_backoff_ms,
+                            req.retry_max_backoff_ms,
+                            validation_attempt,
+                        );
+                        let truncated = helpers::truncate_validation_error(&err, 2000);
+                        turn_req.prompt = prompts::validation_retry_prompt(
+                            &first_req.prompt,
+                            validation_attempt,
+                            max_validation_retries,
+                            &truncated,
+                        );
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    helpers::run_on_error(interceptors, &turn_req, &err).await;
+                    anyhow::bail!(
+                        "Post-execution validation failed after {} attempts: {}",
+                        max_validation_retries,
+                        err
+                    );
+                }
+                break (response, latency_ms);
+            }
+            Ok(Err(err)) => {
+                helpers::run_on_error(interceptors, &turn_req, &err.to_string()).await;
+                return Err(err.into());
+            }
+            Err(_) => {
+                let msg = format!(
+                    "{} timed out after {}s",
+                    task_kind.as_ref(),
+                    turn_timeout.as_secs()
+                );
+                helpers::run_on_error(interceptors, &turn_req, &msg).await;
+                anyhow::bail!(msg);
+            }
+        }
+    };
+
+    if implement_pipeline::contains_worktree_collision_sentinel(&resp.output) {
+        mutate_and_persist(store, task_id, |s| {
+            s.status = TaskStatus::Failed;
+            s.turn = 1;
+            s.error = Some(
+                "WorktreeCollision: agent observed worktree managed by another harness session"
+                    .into(),
+            );
+            s.rounds.push(crate::task_runner::RoundResult {
+                turn: 1,
+                action: task_kind.as_ref().to_string(),
+                result: "worktree_collision".into(),
+                detail: if resp.output.is_empty() {
+                    None
+                } else {
+                    Some(resp.output.clone())
+                },
+                first_token_latency_ms,
+            });
+        })
+        .await?;
+        tracing::info!(
+            task_id = %task_id,
+            task_kind = task_kind.as_ref(),
+            status = "failed",
+            total_elapsed_secs = task_start.elapsed().as_secs(),
+            "task_completed"
+        );
+        return Ok(());
+    }
+
+    mutate_and_persist(store, task_id, |s| {
+        s.status = TaskStatus::Done;
+        s.turn = 1;
+        s.rounds.push(crate::task_runner::RoundResult {
+            turn: 1,
+            action: task_kind.as_ref().to_string(),
+            result: "completed".into(),
+            detail: if resp.output.is_empty() {
+                None
+            } else {
+                Some(resp.output.clone())
+            },
+            first_token_latency_ms,
+        });
+    })
+    .await?;
+    store.log_event(crate::event_replay::TaskEvent::Completed {
+        task_id: task_id.0.clone(),
+        ts: crate::event_replay::now_ts(),
+    });
+    let event_name = format!("task_{}", task_kind.as_ref());
+    let mut ev = harness_core::types::Event::new(
+        harness_core::types::SessionId::new(),
+        &event_name,
+        "task_runner",
+        harness_core::types::Decision::Complete,
+    );
+    ev.detail = Some(format!("task_id={}", task_id.as_str()));
+    if let Err(err) = events.log(&ev).await {
+        tracing::warn!("failed to log {} event: {err}", task_kind.as_ref());
+    }
+    tracing::info!(
+        task_id = %task_id,
+        task_kind = task_kind.as_ref(),
+        status = "done",
+        total_elapsed_secs = task_start.elapsed().as_secs(),
+        "task_completed"
+    );
+    Ok(())
+}
+
 pub(crate) async fn run_task(
     store: &TaskStore,
     task_id: &TaskId,
@@ -166,7 +391,11 @@ pub(crate) async fn run_task(
     interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
     req: &CreateTaskRequest,
     project: PathBuf,
+    // Canonical project root used for project_id derivation in issue workflow records.
+    // Distinct from `project` when workspace isolation is active (worktree != canonical root).
+    project_root: PathBuf,
     server_config: &harness_core::config::HarnessConfig,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     // Accumulated turn count from previous transient-retry attempts.
     // Ensures the max_turns budget is global across the full task lifecycle,
     // not reset on each retry (fix for budget-reset-on-retry bug).
@@ -207,6 +436,36 @@ pub(crate) async fn run_task(
     let repo_slug = detect_repo_slug(&project)
         .await
         .unwrap_or_else(|| "{owner}/{repo}".to_string());
+    let task_kind = store
+        .get(task_id)
+        .map(|state| state.task_kind)
+        .unwrap_or_else(|| req.task_kind());
+    let effective_max_turns: Option<u32> = req.max_turns.or(server_config.concurrency.max_turns);
+    let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
+
+    if matches!(task_kind, TaskKind::Review | TaskKind::Planner) {
+        let mut turns_used = *turns_used_acc;
+        run_non_implementation_task(
+            store,
+            task_id,
+            task_kind,
+            agent,
+            req,
+            &project,
+            server_config,
+            &interceptors,
+            &events,
+            &skills,
+            &cargo_env,
+            turn_timeout,
+            effective_max_turns,
+            &mut turns_used,
+            turns_used_acc,
+            task_start,
+        )
+        .await?;
+        return Ok(());
+    }
 
     // --- Checkpoint-based resume detection ---
     // Load checkpoint and task state to determine if we can skip phases.
@@ -265,15 +524,22 @@ pub(crate) async fn run_task(
             .ok()
             .flatten()
             .is_some();
-        if !has_existing_pr {
-            triage_pipeline::run_triage_plan_pipeline(
-                agent, store, task_id, issue, &cargo_env, &project, req,
-            )
-            .await?
-        } else {
+        if has_existing_pr {
             // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
             was_resumed_pr = true;
             (None, prompts::TriageComplexity::Medium, 0u32)
+        } else if !should_run_issue_triage(req.skip_triage, has_existing_pr) {
+            tracing::info!(
+                task_id = %task_id,
+                issue,
+                "issue request opted to skip triage/plan pipeline"
+            );
+            (None, prompts::TriageComplexity::Medium, 0u32)
+        } else {
+            triage_pipeline::run_triage_plan_pipeline(
+                agent, store, task_id, issue, &cargo_env, &project, req, &skills, &events,
+            )
+            .await?
         }
     } else {
         // Planning gate (task_runner) may have forced TaskPhase::Plan for a
@@ -284,13 +550,14 @@ pub(crate) async fn run_task(
             .map(|s| s.phase == crate::task_runner::TaskPhase::Plan)
             .unwrap_or(false);
         if forced_plan && req.issue.is_none() && req.pr.is_none() {
-            // Set to Implementing BEFORE the plan phase so that a crash during planning
-            // leaves the task in 'implementing' status. The startup recovery code will catch
-            // it and fail-close it (no pr_url → mark failed), rather than leaving it stuck
-            // as a plain 'pending' that is never re-dispatched.
-            update_status(store, task_id, TaskStatus::Implementing, 1).await?;
-            triage_pipeline::run_plan_for_prompt(agent, store, task_id, &cargo_env, &project, req)
-                .await?
+            // Set to Planning so operators can see the agent is actively working.
+            // Planning is in resumable_statuses, so a crash here will be caught by
+            // startup recovery: no pr_url/plan checkpoint → mark failed, re-queue manually.
+            update_status(store, task_id, TaskStatus::Planning, 0).await?;
+            triage_pipeline::run_plan_for_prompt(
+                agent, store, task_id, &cargo_env, &project, req, &skills, &events,
+            )
+            .await?
         } else {
             (None, prompts::TriageComplexity::Medium, 0u32)
         }
@@ -307,7 +574,6 @@ pub(crate) async fn run_task(
     let effective_max_rounds = req.max_rounds.unwrap_or(triage_default_rounds);
     // max_turns: per-request override wins; global config is the fallback.
     // Counts every agent API call (impl + validation retries + review rounds).
-    let effective_max_turns: Option<u32> = req.max_turns.or(server_config.concurrency.max_turns);
     // Start from accumulated turns (prior transient-retry attempts + pipeline phases)
     // so the budget is global across the full task lifecycle.
     let mut turns_used: u32 = *turns_used_acc + pipeline_turns;
@@ -324,40 +590,129 @@ pub(crate) async fn run_task(
 
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
 
-    // Run the implement phase (prompt construction + agent execution + PR detection).
-    let outcome = implement_pipeline::run_implement_phase(
-        store,
-        task_id,
-        agent,
-        req,
-        server_config,
-        &project_config,
-        review_config,
-        &interceptors,
-        &events,
-        &skills,
-        &cargo_env,
-        git,
-        &repo_slug,
-        &project,
-        plan_output,
-        resumed_pr_url,
-        turn_timeout,
-        effective_max_turns,
-        &mut turns_used,
-        turns_used_acc,
-        task_start,
-    )
-    .await?;
+    if let (Some(workflows), Some(issue_number)) = (issue_workflow_store.as_ref(), req.issue) {
+        let project_id = project_root.to_string_lossy().into_owned();
+        if let Err(e) = workflows
+            .record_implement_started(&project_id, req.repo.as_deref(), issue_number, &task_id.0)
+            .await
+        {
+            tracing::warn!(
+                issue = issue_number,
+                task_id = %task_id.0,
+                "issue workflow implement-start tracking failed: {e}"
+            );
+        }
+    }
 
-    let (pr_url, pr_num, context_items) = match outcome {
-        implement_pipeline::ImplementOutcome::Done => return Ok(()),
-        implement_pipeline::ImplementOutcome::Proceed {
-            pr_url,
-            pr_num,
-            context_items,
-            ..
-        } => (pr_url, pr_num, context_items),
+    let mut current_plan_output = plan_output;
+    let mut replan_attempted = false;
+    let (pr_url, pr_num, context_items) = loop {
+        let outcome = implement_pipeline::run_implement_phase(
+            store,
+            task_id,
+            agent,
+            req,
+            server_config,
+            &project_config,
+            review_config,
+            &interceptors,
+            &events,
+            &skills,
+            &cargo_env,
+            git,
+            &repo_slug,
+            &project,
+            &project_root,
+            current_plan_output.clone(),
+            resumed_pr_url.clone(),
+            issue_workflow_store.clone(),
+            turn_timeout,
+            effective_max_turns,
+            &mut turns_used,
+            turns_used_acc,
+            task_start,
+        )
+        .await?;
+
+        match outcome {
+            implement_pipeline::ImplementOutcome::Done => return Ok(()),
+            implement_pipeline::ImplementOutcome::Proceed {
+                pr_url,
+                pr_num,
+                context_items,
+                ..
+            } => break (pr_url, pr_num, context_items),
+            implement_pipeline::ImplementOutcome::Replan {
+                issue,
+                plan_issue,
+                prior_plan,
+            } => {
+                if replan_attempted {
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(format!("PLAN_ISSUE persisted after replan: {plan_issue}"));
+                    })
+                    .await?;
+                    return Ok(());
+                }
+
+                let workflow_cfg = harness_core::config::workflow::load_workflow_config(&project)
+                    .unwrap_or_default();
+
+                if req.force_execute {
+                    let forced_plan = match prior_plan.or(current_plan_output.clone()) {
+                        Some(plan) => format!(
+                            "{plan}\n\nExecution override: this issue is force_execute.\n\
+                             Previous plan concern:\n{}",
+                            prompts::wrap_external_data(&plan_issue)
+                        ),
+                        None => format!(
+                            "Execution override: this issue is force_execute.\n\
+                             Previous plan concern:\n{}",
+                            prompts::wrap_external_data(&plan_issue)
+                        ),
+                    };
+                    current_plan_output = Some(forced_plan);
+                } else if workflow_cfg.issue_workflow.auto_replan_on_plan_issue {
+                    if let Some(max) = effective_max_turns {
+                        if turns_used >= max {
+                            return Err(anyhow::anyhow!(
+                                "Turn budget exhausted before replan: used {} of {} allowed turns",
+                                turns_used,
+                                max
+                            ));
+                        }
+                    }
+                    let new_plan = triage_pipeline::run_replan_for_issue(
+                        agent,
+                        store,
+                        task_id,
+                        issue,
+                        prior_plan.as_deref().or(current_plan_output.as_deref()),
+                        &plan_issue,
+                        &cargo_env,
+                        &project,
+                        req,
+                        &skills,
+                        &events,
+                    )
+                    .await?;
+                    turns_used += 1;
+                    *turns_used_acc = turns_used;
+                    current_plan_output = Some(new_plan);
+                } else {
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.error = Some(format!(
+                            "PLAN_ISSUE encountered and auto_replan_on_plan_issue=false: {plan_issue}"
+                        ));
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                replan_attempted = true;
+            }
+        }
     };
 
     // Gate A: require pr_url when the implement phase extracted a pr_num.
@@ -374,64 +729,15 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    // Conflict resolution gate: intercept CONFLICTING PRs before the review loop.
-    // Only runs on the resume/recovery path — fresh PRs cannot be conflicting yet.
-    let mut rebase_pushed = false;
-    let mut conflict_was_detected = false;
+    // Conflict resolution gate: host-side GitHub/git inspection is disabled by
+    // project policy. On resume paths, ask the agent/reviewer loop to inspect
+    // and resolve any conflicts instead of probing from the server process.
     if was_resumed_pr {
         use conflict_resolver::{assess_pr_conflict, PrConflictSize};
-        let conflict_size = assess_pr_conflict(pr_num, &project).await;
-        match conflict_size {
-            PrConflictSize::Small {
-                file_count,
-                region_count,
-            } => {
-                tracing::info!(
-                    pr = pr_num,
-                    file_count,
-                    region_count,
-                    "conflict: small — attempting auto-rebase"
-                );
-                conflict_was_detected = true;
-                rebase_pushed = triage_pipeline::run_rebase_turn(
-                    agent,
-                    pr_num,
-                    &project,
-                    &repo_slug,
-                    turn_timeout,
-                    &cargo_env,
-                )
-                .await;
-            }
-            PrConflictSize::Large {
-                file_count,
-                region_count,
-            } => {
-                tracing::warn!(
-                    pr = pr_num,
-                    file_count,
-                    region_count,
-                    "conflict: too large for auto-rebase — deferring to review agent"
-                );
-                conflict_was_detected = true;
-            }
-            PrConflictSize::Clean | PrConflictSize::Unknown(_) => {}
-        }
-
-        // Gate B: a detected conflict that was not resolved by a successful rebase
-        // must not silently proceed to review. Mark Failed so the operator can
-        // re-queue after manual resolution rather than getting a false Done.
-        if conflict_was_detected && !rebase_pushed {
-            mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Failed;
-                s.error = Some(format!(
-                    "pr:{pr_num} is conflicting and rebase was not pushed; manual resolution required"
-                ));
-            })
-            .await?;
-            return Ok(());
-        }
+        let PrConflictSize::Unknown(reason) = assess_pr_conflict(pr_num, &project).await;
+        tracing::debug!(pr = pr_num, reason, "conflict assessment delegated");
     }
+    let rebase_pushed = false;
 
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
@@ -451,6 +757,7 @@ pub(crate) async fn run_task(
                 pr_url.as_deref().unwrap_or(""),
                 project_config.review_type.as_str(),
                 &events,
+                &skills,
                 &cargo_env,
                 effective_max_turns,
                 &mut turns_used,
@@ -720,6 +1027,13 @@ mod tests {
             implement_pipeline::task_needs_pr_url(&req),
             "issue task must require PR_URL"
         );
+    }
+
+    #[test]
+    fn issue_triage_runs_only_when_not_skipped_and_no_existing_pr() {
+        assert!(should_run_issue_triage(false, false));
+        assert!(!should_run_issue_triage(true, false));
+        assert!(!should_run_issue_triage(false, true));
     }
 
     #[test]

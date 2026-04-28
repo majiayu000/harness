@@ -102,6 +102,12 @@ export interface OverviewGlobal {
   max_concurrent: number;
 }
 
+export interface OverviewEvolution {
+  drafts_pending: number;
+  drafts_auto_adopted: number;
+  skills_invoked_in_window: number;
+}
+
 export interface OverviewPayload {
   window: OverviewWindow;
   kpi: OverviewKpi;
@@ -112,5 +118,6 @@ export interface OverviewPayload {
   heatmap: OverviewHeatmap;
   feed: OverviewFeedEntry[];
   alerts: OverviewAlert[];
+  evolution: OverviewEvolution | null;
   global: OverviewGlobal;
 }

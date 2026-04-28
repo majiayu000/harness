@@ -1,7 +1,7 @@
 use crate::http::AppState;
 use crate::router;
 use harness_protocol::{codec, methods::RpcResponse};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 async fn process_line(state: &AppState, line: &str) -> anyhow::Result<Option<String>> {
@@ -50,15 +50,7 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
     // Stdout writer: single task owns stdout to prevent concurrent writes.
     tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
-        while let Some(line) = out_rx.recv().await {
-            if stdout.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-            if stdout.write_all(b"\n").await.is_err() {
-                break;
-            }
-            let _ = stdout.flush().await;
-        }
+        write_output_lines(&mut stdout, &mut out_rx).await;
     });
 
     tracing::info!("harness: stdio server started");
@@ -95,6 +87,26 @@ pub async fn serve(mut state: AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn write_output_lines<W>(stdout: &mut W, out_rx: &mut mpsc::Receiver<String>)
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(line) = out_rx.recv().await {
+        if let Err(e) = stdout.write_all(line.as_bytes()).await {
+            tracing::error!(transport = "stdio", stream = "stdout", error = %e, "stdio stdout write failed");
+            break;
+        }
+        if let Err(e) = stdout.write_all(b"\n").await {
+            tracing::error!(transport = "stdio", stream = "stdout", error = %e, "stdio stdout newline write failed");
+            break;
+        }
+        if let Err(e) = stdout.flush().await {
+            tracing::error!(transport = "stdio", stream = "stdout", error = %e, "stdio stdout flush failed");
+            break;
+        }
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -126,8 +138,42 @@ mod tests {
     use harness_agents::registry::AgentRegistry;
     use harness_core::config::HarnessConfig;
     use harness_protocol::{methods::Method, methods::RpcRequest};
-    use std::sync::Arc;
+    use std::{
+        io,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
     use tokio::sync::RwLock;
+
+    #[derive(Default)]
+    struct FlushFailWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for FlushFailWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "flush failed",
+            )))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
         let server = Arc::new(HarnessServer::new(
@@ -173,6 +219,8 @@ mod tests {
             vec![],
             None,
             Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            None,
             None,
             None,
             vec![],
@@ -189,6 +237,8 @@ mod tests {
                 thread_db: Some(thread_db),
                 plan_db: None,
                 plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
+                issue_workflow_store: None,
+                project_workflow_store: None,
                 project_registry: None,
                 runtime_state_store: None,
                 q_values: None,
@@ -214,6 +264,8 @@ mod tests {
                 review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
                 workspace_mgr: None,
             },
+            #[cfg(test)]
+            _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
             runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
             runtime_project_cache: Arc::new(
                 crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -288,6 +340,22 @@ mod tests {
             initialized_out.is_none(),
             "initialized notification (id=None) should produce no response"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stdout_writer_stops_on_flush_error() -> anyhow::Result<()> {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send("first".to_string()).await?;
+        tx.send("second".to_string()).await?;
+        drop(tx);
+
+        let mut writer = FlushFailWriter::default();
+        write_output_lines(&mut writer, &mut rx).await;
+
+        assert_eq!(writer.bytes, b"first\n");
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(rx.try_recv()?, "second");
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use crate::task_runner::{TaskState, TaskStatus};
+use crate::task_runner::{TaskKind, TaskState, TaskStatus};
 use chrono::{DateTime, Utc};
 use harness_core::error::TaskDbDecodeError;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,7 @@ pub(super) struct RecoveryRow {
     pub(super) status: String,
     pub(super) turn: i64,
     pub(super) task_pr_url: Option<String>,
+    pub(super) scheduler_state: String,
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
     pub(super) ck_pr_url: Option<String>,
@@ -77,12 +78,14 @@ pub(super) struct RecoveryRow {
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-pub(super) const TASK_ROW_COLUMNS: &str = "id, status, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, repo, depends_on, project, priority, phase, description, request_settings";
+pub(super) const TASK_ROW_COLUMNS: &str = "id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, workspace_path, workspace_owner, run_generation, priority, phase, description, request_settings, scheduler_state";
 
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskRow {
     pub(super) id: String,
+    pub(super) task_kind: String,
     pub(super) status: String,
+    pub(super) failure_kind: Option<String>,
     pub(super) turn: i64,
     pub(super) pr_url: Option<String>,
     pub(super) rounds: String,
@@ -91,13 +94,18 @@ pub(super) struct TaskRow {
     pub(super) external_id: Option<String>,
     pub(super) parent_id: Option<String>,
     pub(super) created_at: Option<DateTime<Utc>>,
+    pub(super) updated_at: Option<DateTime<Utc>>,
     pub(super) repo: Option<String>,
     pub(super) depends_on: String,
     pub(super) project: Option<String>,
+    pub(super) workspace_path: Option<String>,
+    pub(super) workspace_owner: Option<String>,
+    pub(super) run_generation: i64,
     pub(super) priority: i64,
     pub(super) phase: String,
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
+    pub(super) scheduler_state: String,
 }
 
 /// Combined row for the pending-tasks-with-checkpoint JOIN query.
@@ -108,6 +116,7 @@ pub(super) struct TaskRow {
 pub(super) struct PendingCheckpointRow {
     // Task columns
     pub(super) id: String,
+    pub(super) task_kind: String,
     pub(super) status: String,
     pub(super) turn: i64,
     pub(super) pr_url: Option<String>,
@@ -117,6 +126,7 @@ pub(super) struct PendingCheckpointRow {
     pub(super) external_id: Option<String>,
     pub(super) parent_id: Option<String>,
     pub(super) created_at: Option<DateTime<Utc>>,
+    pub(super) updated_at: Option<DateTime<Utc>>,
     pub(super) repo: Option<String>,
     pub(super) depends_on: String,
     pub(super) project: Option<String>,
@@ -124,6 +134,7 @@ pub(super) struct PendingCheckpointRow {
     pub(super) phase: String,
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
+    pub(super) scheduler_state: String,
     // Checkpoint columns (aliased)
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
@@ -136,7 +147,9 @@ pub(super) struct PendingCheckpointRow {
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskSummaryRow {
     pub(super) id: String,
+    pub(super) task_kind: String,
     pub(super) status: String,
+    pub(super) failure_kind: Option<String>,
     pub(super) turn: i64,
     pub(super) pr_url: Option<String>,
     pub(super) error: Option<String>,
@@ -147,15 +160,42 @@ pub(super) struct TaskSummaryRow {
     pub(super) repo: Option<String>,
     pub(super) depends_on: String,
     pub(super) project: Option<String>,
+    pub(super) workspace_path: Option<String>,
+    pub(super) workspace_owner: Option<String>,
+    pub(super) run_generation: i64,
     pub(super) phase: String,
     pub(super) description: Option<String>,
+    pub(super) scheduler_state: String,
+}
+
+/// Lightweight row for operator snapshot recent-failure queries.
+#[derive(sqlx::FromRow)]
+pub(super) struct RecentFailureRow {
+    pub(super) id: String,
+    pub(super) failure_kind: Option<String>,
+    pub(super) external_id: Option<String>,
+    pub(super) project: Option<String>,
+    pub(super) workspace_path: Option<String>,
+    pub(super) workspace_owner: Option<String>,
+    pub(super) run_generation: i64,
+    pub(super) error: Option<String>,
+    pub(super) updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+pub(super) struct ExternalStatusRow {
+    pub(super) external_id: String,
+    pub(super) status: String,
+    pub(super) created_at: Option<DateTime<Utc>>,
 }
 
 impl TaskRow {
     pub(super) fn try_into_task_state(self) -> anyhow::Result<TaskState> {
         let Self {
             id,
+            task_kind,
             status,
+            failure_kind,
             turn,
             pr_url,
             rounds,
@@ -164,19 +204,30 @@ impl TaskRow {
             external_id,
             parent_id,
             created_at,
+            updated_at,
             repo,
             depends_on,
             project,
+            workspace_path,
+            workspace_owner,
+            run_generation,
             priority,
             phase,
             description,
             request_settings,
+            scheduler_state,
         } = self;
 
         let decoded_request_settings: Option<crate::task_runner::PersistedRequestSettings> =
             request_settings
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
+        let decoded_task_kind = TaskKind::from_persisted(
+            Some(&task_kind),
+            source.as_deref(),
+            external_id.as_deref(),
+            description.as_deref(),
+        )?;
 
         let decoded_rounds = serde_json::from_str(&rounds).map_err(|source| {
             TaskDbDecodeError::RoundsDeserialize {
@@ -197,10 +248,19 @@ impl TaskRow {
                     source,
                 }
             })?;
+        let decoded_scheduler =
+            serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&scheduler_state)
+                .unwrap_or_default();
 
         Ok(TaskState {
             id: harness_core::types::TaskId(id),
+            task_kind: decoded_task_kind,
             status: status.parse::<TaskStatus>()?,
+            failure_kind: failure_kind
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .unwrap_or(None),
             turn: turn as u32,
             pr_url,
             rounds: decoded_rounds,
@@ -211,15 +271,20 @@ impl TaskRow {
             depends_on: decoded_depends_on,
             subtask_ids: Vec::new(),
             project_root: project.map(PathBuf::from),
+            workspace_path: workspace_path.map(PathBuf::from),
+            workspace_owner,
+            run_generation: run_generation.max(0) as u32,
             issue: None,
             description,
             created_at: created_at.map(|dt| dt.to_rfc3339()),
+            updated_at: updated_at.map(|dt| dt.to_rfc3339()),
             priority: priority.clamp(0, 255) as u8,
             phase: decoded_phase,
             triage_output: None,
             plan_output: None,
             repo,
             request_settings: decoded_request_settings,
+            scheduler: decoded_scheduler,
         })
     }
 }
@@ -240,9 +305,24 @@ impl TaskSummaryRow {
                     source,
                 },
             )?;
+        let decoded_task_kind = TaskKind::from_persisted(
+            Some(&self.task_kind),
+            self.source.as_deref(),
+            self.external_id.as_deref(),
+            self.description.as_deref(),
+        )?;
+        let scheduler =
+            serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&self.scheduler_state)
+                .unwrap_or_default();
         Ok(crate::task_runner::TaskSummary {
             id: TaskId(self.id),
+            task_kind: decoded_task_kind,
             status: self.status.parse::<crate::task_runner::TaskStatus>()?,
+            failure_kind: match self.failure_kind.as_deref() {
+                Some(kind) => Some(kind.parse::<crate::task_runner::TaskFailureKind>()?),
+                None if self.status == "failed" => Some(crate::task_runner::TaskFailureKind::Task),
+                None => None,
+            },
             turn: self.turn as u32,
             pr_url: self.pr_url,
             error: self.error,
@@ -256,6 +336,68 @@ impl TaskSummaryRow {
             depends_on,
             subtask_ids: Vec::new(),
             project: self.project,
+            workspace_path: self.workspace_path,
+            workspace_owner: self.workspace_owner,
+            run_generation: self.run_generation.max(0) as u32,
+            workflow: None,
+            scheduler,
         })
+    }
+}
+
+impl RecentFailureRow {
+    pub(super) fn into_recent_failure(self) -> crate::task_runner::RecentFailureTask {
+        crate::task_runner::RecentFailureTask {
+            id: harness_core::types::TaskId(self.id),
+            failure_kind: match self.failure_kind.as_deref() {
+                Some(kind) => kind.parse::<crate::task_runner::TaskFailureKind>().ok(),
+                None => Some(crate::task_runner::TaskFailureKind::Task),
+            },
+            external_id: self.external_id,
+            project: self.project,
+            workspace_path: self.workspace_path,
+            workspace_owner: self.workspace_owner,
+            run_generation: self.run_generation.max(0) as u32,
+            error: self.error,
+            failed_at: self.updated_at.map(|dt| dt.to_rfc3339()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RecentFailureRow;
+    use chrono::TimeZone;
+
+    #[test]
+    fn recent_failure_row_maps_updated_at_to_failed_at() {
+        let row = RecentFailureRow {
+            id: "task-123".to_string(),
+            failure_kind: None,
+            external_id: Some("issue:123".to_string()),
+            project: Some("/tmp/project-a".to_string()),
+            workspace_path: Some("/tmp/ws/task-123".to_string()),
+            workspace_owner: Some("session-a".to_string()),
+            run_generation: 3,
+            error: Some("boom".to_string()),
+            updated_at: Some(chrono::Utc.with_ymd_and_hms(2026, 4, 21, 5, 34, 0).unwrap()),
+        };
+
+        let mapped = row.into_recent_failure();
+        assert_eq!(mapped.id.0, "task-123");
+        assert_eq!(
+            mapped.failure_kind,
+            Some(crate::task_runner::TaskFailureKind::Task)
+        );
+        assert_eq!(mapped.external_id.as_deref(), Some("issue:123"));
+        assert_eq!(mapped.project.as_deref(), Some("/tmp/project-a"));
+        assert_eq!(mapped.workspace_path.as_deref(), Some("/tmp/ws/task-123"));
+        assert_eq!(mapped.workspace_owner.as_deref(), Some("session-a"));
+        assert_eq!(mapped.run_generation, 3);
+        assert_eq!(mapped.error.as_deref(), Some("boom"));
+        assert_eq!(
+            mapped.failed_at.as_deref(),
+            Some("2026-04-21T05:34:00+00:00")
+        );
     }
 }

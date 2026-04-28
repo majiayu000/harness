@@ -144,7 +144,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         .map_or(0, |m| m.live_count());
     let mut worktrees_used: u64 = local_worktrees;
     for host in &runtime_hosts {
-        let active_leases = state.runtime_hosts.active_lease_count(&host.id) as u64;
+        let active_leases = state.core.tasks.active_runtime_host_lease_count(&host.id) as u64;
         worktrees_used = worktrees_used.saturating_add(active_leases);
         let watched_projects = state
             .runtime_project_cache
@@ -187,6 +187,13 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
 
     let feed = build_feed(&events, now);
     let alerts = build_alerts(&events, &runtime_hosts);
+
+    let evolution: Value = events
+        .iter()
+        .filter(|e| e.hook == "self_evolution_tick")
+        .max_by_key(|e| e.ts)
+        .and_then(|e| parse_evolution_from_reason(e.reason.as_deref()))
+        .unwrap_or(Value::Null);
 
     // Cluster heatmap: per-project 24-bucket intensity (normalised to the
     // project's peak hour). Runtime-dimension is collapsed because task rows
@@ -249,6 +256,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         },
         "feed": feed,
         "alerts": alerts,
+        "evolution": evolution,
         "global": {
             "uptime_secs": uptime_secs,
             "running": running,
@@ -399,6 +407,29 @@ fn build_alerts(events: &[Event], hosts: &[crate::runtime_hosts::RuntimeHostInfo
     out
 }
 
+/// Parse `drafts_pending`, `drafts_adopted`, and `skills_invoked` from the
+/// space-separated `key=value` reason string of a `self_evolution_tick` event.
+///
+/// Returns `None` when any of the three required fields are absent — this
+/// gracefully degrades old events (pre-#972) to `null` on the dashboard.
+fn parse_evolution_from_reason(reason: Option<&str>) -> Option<Value> {
+    let reason = reason?;
+    let mut map = std::collections::HashMap::new();
+    for part in reason.split_whitespace() {
+        if let Some((k, v)) = part.split_once('=') {
+            map.insert(k, v);
+        }
+    }
+    let drafts_pending = map.get("drafts_pending")?.parse::<u64>().ok()?;
+    let drafts_auto_adopted = map.get("drafts_adopted")?.parse::<u64>().ok()?;
+    let skills_invoked_in_window = map.get("skills_invoked")?.parse::<u64>().ok()?;
+    Some(json!({
+        "drafts_pending": drafts_pending,
+        "drafts_auto_adopted": drafts_auto_adopted,
+        "skills_invoked_in_window": skills_invoked_in_window,
+    }))
+}
+
 /// Human-readable delta such as `14s`, `3m`, `2h`, `1d` — matches the feed
 /// column spacing in the design.
 fn relative_ago(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
@@ -445,9 +476,29 @@ mod tests {
         assert_eq!(compute_rule_fail_rate_pct(&[]), 0.0);
     }
 
+    #[test]
+    fn parse_evolution_returns_none_for_old_reason_format() {
+        // Old events without the new fields must degrade to None, not panic.
+        let old_reason = "rules=0 skills=0 scored=0 quarantine=0 retired=0";
+        assert!(parse_evolution_from_reason(Some(old_reason)).is_none());
+        assert!(parse_evolution_from_reason(None).is_none());
+    }
+
+    #[test]
+    fn parse_evolution_extracts_three_fields() {
+        let reason = "rules=2 skills=1 scored=5 quarantine=0 retired=1 drafts_pending=3 drafts_adopted=2 skills_invoked=7";
+        let v = parse_evolution_from_reason(Some(reason)).expect("should parse");
+        assert_eq!(v["drafts_pending"], 3u64);
+        assert_eq!(v["drafts_auto_adopted"], 2u64);
+        assert_eq!(v["skills_invoked_in_window"], 7u64);
+    }
+
     #[tokio::test]
     async fn overview_returns_expected_shape() -> anyhow::Result<()> {
         let _lock = test_helpers::HOME_LOCK.lock().await;
+        if !test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let dir = test_helpers::tempdir_in_home("harness-test-overview-")?;
         let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
 
@@ -495,6 +546,9 @@ mod tests {
     #[tokio::test]
     async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()> {
         let _lock = test_helpers::HOME_LOCK.lock().await;
+        if !test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let dir = test_helpers::tempdir_in_home("harness-test-overview-wt-")?;
         let mut state = test_helpers::make_test_state(dir.path()).await?;
 
@@ -510,6 +564,8 @@ mod tests {
                 crate::workspace::ActiveWorkspace {
                     workspace_path: dir.path().join(format!("ws/fake-{i}")),
                     source_repo: dir.path().to_path_buf(),
+                    owner_session: format!("session-{i}"),
+                    run_generation: 1,
                 },
             );
         }
