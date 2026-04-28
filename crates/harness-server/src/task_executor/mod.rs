@@ -540,10 +540,18 @@ pub(crate) async fn run_task(
             );
             (None, prompts::TriageComplexity::Medium, 0u32)
         } else {
-            triage_pipeline::run_triage_plan_pipeline(
+            match triage_pipeline::run_triage_plan_pipeline(
                 agent, store, task_id, issue, &cargo_env, &project, req, &skills, &events,
             )
             .await?
+            {
+                triage_pipeline::TriagePlanPipelineOutcome::Continue {
+                    plan_output,
+                    complexity,
+                    turns,
+                } => (plan_output, complexity, turns),
+                triage_pipeline::TriagePlanPipelineOutcome::Skipped => return Ok(()),
+            }
         }
     } else {
         // Planning gate (task_runner) may have forced TaskPhase::Plan for a

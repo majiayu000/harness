@@ -2,13 +2,63 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
+use std::sync::Mutex;
 
 use crate::db::Migration;
 
 const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
+const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 const SUPABASE_POOLER_MAX_CONNECTIONS: u32 = 1;
 
-fn pg_max_connections(database_url: &str) -> u32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PgPoolSettings {
+    max_connections: u32,
+    acquire_timeout: std::time::Duration,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PgPoolConfig {
+    max_connections: Option<u32>,
+    acquire_timeout_secs: Option<u64>,
+}
+
+impl PgPoolConfig {
+    fn apply_missing_from(&mut self, other: Self) {
+        if self.max_connections.is_none() {
+            self.max_connections = other.max_connections;
+        }
+        if self.acquire_timeout_secs.is_none() {
+            self.acquire_timeout_secs = other.acquire_timeout_secs;
+        }
+    }
+}
+
+static PG_POOL_CONFIG_OVERRIDE: Mutex<PgPoolConfig> = Mutex::new(PgPoolConfig {
+    max_connections: None,
+    acquire_timeout_secs: None,
+});
+
+/// Install server-level Postgres pool settings for subsequently opened stores.
+///
+/// Store constructors intentionally receive only the database URL for
+/// backwards compatibility, so the CLI calls this once after loading the
+/// server config. Environment variables are still read at pool-open time and
+/// remain the highest-precedence override.
+pub fn configure_pg_pool_from_server(server: &crate::config::server::ServerConfig) {
+    let mut config = PG_POOL_CONFIG_OVERRIDE
+        .lock()
+        .expect("Postgres pool config mutex poisoned");
+    config.max_connections = server.database_pool_max_connections;
+    config.acquire_timeout_secs = server.database_pool_acquire_timeout_secs;
+}
+
+fn pg_pool_config_override() -> PgPoolConfig {
+    *PG_POOL_CONFIG_OVERRIDE
+        .lock()
+        .expect("Postgres pool config mutex poisoned")
+}
+
+fn default_pg_max_connections(database_url: &str) -> u32 {
     // Supabase's session pooler has a tight session cap relative to the
     // number of independent Postgres-backed stores the workspace tests create.
     // Budget one session per store there to avoid test-time pool starvation.
@@ -17,6 +67,28 @@ fn pg_max_connections(database_url: &str) -> u32 {
     } else {
         DEFAULT_PG_MAX_CONNECTIONS
     }
+}
+
+fn pg_pool_settings(database_url: &str) -> anyhow::Result<PgPoolSettings> {
+    let config = configured_pg_pool_config()?;
+    let max_connections = config
+        .max_connections
+        .unwrap_or_else(|| default_pg_max_connections(database_url));
+    if max_connections == 0 {
+        anyhow::bail!("database_pool_max_connections must be greater than 0");
+    }
+
+    let acquire_timeout_secs = config
+        .acquire_timeout_secs
+        .unwrap_or(DEFAULT_PG_ACQUIRE_TIMEOUT_SECS);
+    if acquire_timeout_secs == 0 {
+        anyhow::bail!("database_pool_acquire_timeout_secs must be greater than 0");
+    }
+
+    Ok(PgPoolSettings {
+        max_connections,
+        acquire_timeout: std::time::Duration::from_secs(acquire_timeout_secs),
+    })
 }
 
 /// Resolve the effective Postgres connection string.
@@ -48,11 +120,35 @@ fn configured_database_url_from_config() -> anyhow::Result<Option<String>> {
         return Ok(Some(url));
     }
     for path in database_url_config_paths()? {
-        if let Some(url) = load_database_url_from_path(&path)? {
+        if let Some(url) = load_database_config_from_path(&path)?.database_url {
             return Ok(Some(url));
         }
     }
     Ok(None)
+}
+
+fn configured_pg_pool_config() -> anyhow::Result<PgPoolConfig> {
+    let mut config = PgPoolConfig::default();
+    for path in database_url_config_paths()? {
+        config.apply_missing_from(load_database_config_from_path(&path)?.pool);
+    }
+    let override_config = pg_pool_config_override();
+    if let Some(max_connections) = override_config.max_connections {
+        config.max_connections = Some(max_connections);
+    }
+    if let Some(acquire_timeout_secs) = override_config.acquire_timeout_secs {
+        config.acquire_timeout_secs = Some(acquire_timeout_secs);
+    }
+    if let Some(max_connections) = configured_u32_from_env("HARNESS_DATABASE_POOL_MAX_CONNECTIONS")?
+    {
+        config.max_connections = Some(max_connections);
+    }
+    if let Some(acquire_timeout_secs) =
+        configured_u64_from_env("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS")?
+    {
+        config.acquire_timeout_secs = Some(acquire_timeout_secs);
+    }
+    Ok(config)
 }
 
 fn configured_database_url_from_env(name: &str) -> Option<String> {
@@ -60,6 +156,28 @@ fn configured_database_url_from_env(name: &str) -> Option<String> {
         .ok()
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
+}
+
+fn configured_u32_from_env(name: &str) -> anyhow::Result<Option<u32>> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{name}={value:?} is not a valid u32: {e}")),
+        _ => Ok(None),
+    }
+}
+
+fn configured_u64_from_env(name: &str) -> anyhow::Result<Option<u64>> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{name}={value:?} is not a valid u64: {e}")),
+        _ => Ok(None),
+    }
 }
 
 fn database_url_config_paths() -> anyhow::Result<Vec<PathBuf>> {
@@ -108,7 +226,12 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn load_database_url_from_path(path: &Path) -> anyhow::Result<Option<String>> {
+struct LoadedDatabaseConfig {
+    database_url: Option<String>,
+    pool: PgPoolConfig,
+}
+
+fn load_database_config_from_path(path: &Path) -> anyhow::Result<LoadedDatabaseConfig> {
     #[derive(serde::Deserialize)]
     struct DatabaseConfigFile {
         #[serde(default)]
@@ -119,27 +242,125 @@ fn load_database_url_from_path(path: &Path) -> anyhow::Result<Option<String>> {
     struct DatabaseServerConfig {
         #[serde(default)]
         database_url: Option<String>,
+        #[serde(default)]
+        database_pool_max_connections: Option<u32>,
+        #[serde(default)]
+        database_pool_acquire_timeout_secs: Option<u64>,
     }
 
     let content = std::fs::read_to_string(path)?;
     let config: DatabaseConfigFile = toml::from_str(&content)?;
-    Ok(config
-        .server
-        .database_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(ToOwned::to_owned))
+    Ok(LoadedDatabaseConfig {
+        database_url: config
+            .server
+            .database_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned),
+        pool: PgPoolConfig {
+            max_connections: config.server.database_pool_max_connections,
+            acquire_timeout_secs: config.server.database_pool_acquire_timeout_secs,
+        },
+    })
+}
+
+/// Derive the legacy per-store Postgres schema name from a store identity path.
+///
+/// Historical SQLite-backed stores accepted a database file path. The Postgres
+/// backend preserves that identity boundary by hashing the path into a stable
+/// schema name, so existing data remains addressable after this helper is used
+/// by all stores.
+pub fn pg_schema_for_path(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let path_utf8 = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
+    let digest = Sha256::digest(path_utf8.as_bytes());
+    let mut schema_bytes = [0u8; 8];
+    schema_bytes.copy_from_slice(&digest[..8]);
+    Ok(format!("h{:016x}", u64::from_le_bytes(schema_bytes)))
+}
+
+/// Postgres context for a single logical store.
+///
+/// This centralizes the strategy that used to be repeated by every store:
+/// resolve the configured URL, derive or validate the schema, create the
+/// schema, open a schematized pool, and optionally run migrations.
+#[derive(Clone)]
+pub struct PgStoreContext {
+    database_url: String,
+    schema: String,
+}
+
+impl std::fmt::Debug for PgStoreContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgStoreContext")
+            .field("database_url", &"[REDACTED]")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl PgStoreContext {
+    pub fn from_path(path: &Path, configured_database_url: Option<&str>) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
+        Self::new(database_url, pg_schema_for_path(path)?)
+    }
+
+    pub fn from_schema(
+        schema: &str,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
+        Self::new(database_url, schema.to_string())
+    }
+
+    pub fn new(database_url: impl Into<String>, schema: impl Into<String>) -> anyhow::Result<Self> {
+        let database_url = database_url.into().trim().to_string();
+        if database_url.is_empty() {
+            anyhow::bail!("database URL must not be empty");
+        }
+        let schema = schema.into();
+        validate_schema_name(&schema)?;
+        Ok(Self {
+            database_url,
+            schema,
+        })
+    }
+
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub async fn open_pool(&self) -> anyhow::Result<PgPool> {
+        let setup = pg_open_pool(&self.database_url).await?;
+        pg_create_schema_if_not_exists(&setup, &self.schema).await?;
+        setup.close().await;
+        pg_open_pool_schematized(&self.database_url, &self.schema).await
+    }
+
+    pub async fn open_migrated_pool(&self, migrations: &[Migration]) -> anyhow::Result<PgPool> {
+        let pool = self.open_pool().await?;
+        PgMigrator::new(&pool, migrations).run().await?;
+        Ok(pool)
+    }
 }
 
 /// Create a Postgres connection pool for the given connection string.
 ///
-/// Uses 8 max connections by default, or 1 for Supabase pooler URLs, with a
-/// 10-second acquire timeout.
+/// Uses a configurable max connection budget, with a Supabase-specific
+/// single-session default for pooler URLs.
 pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
+    let settings = pg_pool_settings(database_url)?;
     let pool = PgPoolOptions::new()
-        .max_connections(pg_max_connections(database_url))
-        .acquire_timeout(std::time::Duration::from_secs(10))
+        .max_connections(settings.max_connections)
+        .acquire_timeout(settings.acquire_timeout)
         .connect(database_url)
         .await?;
     Ok(pool)
@@ -209,10 +430,11 @@ pub async fn pg_create_schema_if_not_exists(pool: &PgPool, schema: &str) -> anyh
 pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyhow::Result<PgPool> {
     validate_schema_name(schema)?;
     let opts = PgConnectOptions::from_str(database_url)?;
+    let settings = pg_pool_settings(database_url)?;
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
-        .max_connections(pg_max_connections(database_url))
-        .acquire_timeout(std::time::Duration::from_secs(10))
+        .max_connections(settings.max_connections)
+        .acquire_timeout(settings.acquire_timeout)
         .after_connect(move |conn, _meta| {
             let schema = schema_for_hook.clone();
             Box::pin(async move {
@@ -316,10 +538,13 @@ impl<'a> PgMigrator<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        pg_max_connections, resolve_database_url, validate_schema_name, DEFAULT_PG_MAX_CONNECTIONS,
+        configure_pg_pool_from_server, pg_pool_settings, pg_schema_for_path, resolve_database_url,
+        validate_schema_name, PgStoreContext, DEFAULT_PG_ACQUIRE_TIMEOUT_SECS,
+        DEFAULT_PG_MAX_CONNECTIONS,
     };
-
-    static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::config::server::ServerConfig;
+    use crate::test_support::process_env_lock;
+    use std::path::Path;
 
     struct CurrentDirGuard {
         original: std::path::PathBuf,
@@ -337,6 +562,34 @@ mod tests {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.original).expect("restore current dir");
         }
+    }
+
+    fn with_isolated_pool_config<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        let _lock = process_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::enter(dir.path());
+        let xdg = dir.path().join("xdg");
+        let server = ServerConfig {
+            database_pool_max_connections: None,
+            database_pool_acquire_timeout_secs: None,
+            ..Default::default()
+        };
+        configure_pg_pool_from_server(&server);
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().to_str().expect("utf8 tempdir"))),
+                ("XDG_CONFIG_HOME", Some(xdg.to_str().expect("utf8 xdg"))),
+                ("HARNESS_DATABASE_POOL_MAX_CONNECTIONS", None::<&str>),
+                ("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS", None::<&str>),
+            ],
+            || {
+                f();
+                configure_pg_pool_from_server(&ServerConfig::default());
+            },
+        );
     }
 
     #[test]
@@ -393,20 +646,142 @@ mod tests {
     }
 
     #[test]
+    fn pg_schema_for_path_preserves_legacy_hash_format() {
+        let schema = pg_schema_for_path(Path::new("/tmp/harness/tasks.db"))
+            .expect("path schema should resolve");
+
+        assert_eq!(schema, "h1b76aa87802f7705");
+    }
+
+    #[test]
+    fn pg_store_context_from_path_uses_configured_url_and_path_schema() {
+        let context = PgStoreContext::from_path(
+            Path::new("/tmp/harness/tasks.db"),
+            Some(" postgres://user:pass@localhost:5432/harness "),
+        )
+        .expect("store context should resolve");
+
+        assert_eq!(
+            context.database_url(),
+            "postgres://user:pass@localhost:5432/harness"
+        );
+        assert_eq!(context.schema(), "h1b76aa87802f7705");
+    }
+
+    #[test]
+    fn pg_store_context_debug_redacts_database_url() {
+        let context = PgStoreContext::new(
+            "postgres://user:secret@localhost:5432/harness",
+            "h1b76aa87802f7705",
+        )
+        .expect("store context should resolve");
+        let debug = format!("{context:?}");
+
+        assert!(debug.contains("database_url: \"[REDACTED]\""));
+        assert!(debug.contains("schema: \"h1b76aa87802f7705\""));
+        assert!(
+            !debug.contains("secret"),
+            "debug output must not expose database credentials: {debug}"
+        );
+    }
+
+    #[test]
+    fn pg_store_context_rejects_invalid_schema() {
+        let err = PgStoreContext::new("postgres://user:pass@localhost:5432/harness", "bad-schema")
+            .expect_err("invalid schema should fail");
+
+        assert!(
+            err.to_string().contains("ASCII letters"),
+            "error should explain schema validation, got: {err}"
+        );
+    }
+
+    #[test]
     fn supabase_pooler_urls_use_single_connection() {
-        let url = "postgresql://user:pass@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres";
-        assert_eq!(pg_max_connections(url), 1);
+        with_isolated_pool_config(|| {
+            let url =
+                "postgresql://user:pass@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres";
+            let settings = pg_pool_settings(url).expect("pool settings should resolve");
+            assert_eq!(settings.max_connections, 1);
+        });
     }
 
     #[test]
     fn direct_postgres_urls_keep_default_connection_budget() {
-        let url = "postgresql://user:pass@db.example.internal:5432/postgres";
-        assert_eq!(pg_max_connections(url), DEFAULT_PG_MAX_CONNECTIONS);
+        with_isolated_pool_config(|| {
+            let url = "postgresql://user:pass@db.example.internal:5432/postgres";
+            let settings = pg_pool_settings(url).expect("pool settings should resolve");
+            assert_eq!(settings.max_connections, DEFAULT_PG_MAX_CONNECTIONS);
+            assert_eq!(
+                settings.acquire_timeout,
+                std::time::Duration::from_secs(DEFAULT_PG_ACQUIRE_TIMEOUT_SECS)
+            );
+        });
+    }
+
+    #[test]
+    fn server_pool_config_overrides_default_connection_budget() {
+        with_isolated_pool_config(|| {
+            let server = ServerConfig {
+                database_pool_max_connections: Some(8),
+                database_pool_acquire_timeout_secs: Some(30),
+                ..Default::default()
+            };
+            configure_pg_pool_from_server(&server);
+
+            let settings = pg_pool_settings("postgres://user:pass@localhost:5432/harness")
+                .expect("pool settings should resolve");
+            assert_eq!(settings.max_connections, 8);
+            assert_eq!(settings.acquire_timeout, std::time::Duration::from_secs(30));
+        });
+    }
+
+    #[test]
+    fn env_pool_config_overrides_server_config() {
+        with_isolated_pool_config(|| {
+            let server = ServerConfig {
+                database_pool_max_connections: Some(4),
+                database_pool_acquire_timeout_secs: Some(20),
+                ..Default::default()
+            };
+            configure_pg_pool_from_server(&server);
+
+            temp_env::with_vars(
+                [
+                    ("HARNESS_DATABASE_POOL_MAX_CONNECTIONS", Some("12")),
+                    ("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS", Some("45")),
+                ],
+                || {
+                    let settings = pg_pool_settings("postgres://user:pass@localhost:5432/harness")
+                        .expect("pool settings should resolve");
+                    assert_eq!(settings.max_connections, 12);
+                    assert_eq!(settings.acquire_timeout, std::time::Duration::from_secs(45));
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn zero_pool_config_is_rejected() {
+        with_isolated_pool_config(|| {
+            let server = ServerConfig {
+                database_pool_max_connections: Some(0),
+                ..Default::default()
+            };
+            configure_pg_pool_from_server(&server);
+
+            let err = pg_pool_settings("postgres://user:pass@localhost:5432/harness")
+                .expect_err("zero max connections should fail");
+            assert!(
+                err.to_string().contains("greater than 0"),
+                "error should explain invalid pool size: {err}"
+            );
+        });
     }
 
     #[test]
     fn configured_database_url_wins_over_config_sources() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         temp_env::with_vars(
             [
                 (
@@ -429,7 +804,7 @@ mod tests {
 
     #[test]
     fn harness_database_url_used_as_config_override() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::enter(dir.path());
         let xdg = dir.path().join("xdg");
@@ -456,7 +831,7 @@ mod tests {
 
     #[test]
     fn discovered_config_database_url_used_as_fallback() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::enter(dir.path());
         let xdg = dir.path().join("xdg");
@@ -495,7 +870,7 @@ mod tests {
 
     #[test]
     fn repository_default_config_database_url_used_as_fallback() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let xdg = dir.path().join("xdg");
         let repo_config = dir.path().join("config");
@@ -535,7 +910,7 @@ mod tests {
 
     #[test]
     fn discovered_config_survives_deleted_current_dir() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let home = tempfile::tempdir().expect("home tempdir");
         let cwd = tempfile::tempdir().expect("cwd tempdir");
         let xdg = home.path().join("xdg");
@@ -575,7 +950,7 @@ mod tests {
 
     #[test]
     fn bare_database_url_is_ignored_without_config() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::enter(dir.path());
         let xdg = dir.path().join("xdg");
@@ -602,7 +977,7 @@ mod tests {
 
     #[test]
     fn missing_database_url_returns_error() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::enter(dir.path());
         let xdg = dir.path().join("xdg");

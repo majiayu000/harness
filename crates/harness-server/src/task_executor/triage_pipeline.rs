@@ -75,11 +75,24 @@ pub(crate) async fn run_plan_for_prompt(
     Ok((Some(plan_text), prompts::TriageComplexity::Medium, 1))
 }
 
+/// Result of the triage and optional plan pipeline.
+pub(crate) enum TriagePlanPipelineOutcome {
+    /// Triage chose to continue into implementation, optionally with a plan.
+    Continue {
+        plan_output: Option<String>,
+        complexity: prompts::TriageComplexity,
+        turns: u32,
+    },
+    /// Triage intentionally skipped the issue. The task has already been marked
+    /// as a successful terminal state and must not continue into implementation.
+    Skipped,
+}
+
 /// Run triage → plan pipeline for a fresh issue-based task.
 ///
-/// Returns `Some(plan_text)` if the triage decided a plan is needed and the plan
-/// phase completed. Returns `None` only when triage says PROCEED (trivial issue,
-/// skip planning). All failures propagate as errors — no silent fallbacks.
+/// Returns `Continue` if the triage decided implementation should proceed.
+/// Returns `Skipped` when triage says SKIP. Agent and parsing failures still
+/// propagate as errors.
 pub(crate) async fn run_triage_plan_pipeline(
     agent: &dyn CodeAgent,
     store: &TaskStore,
@@ -90,7 +103,7 @@ pub(crate) async fn run_triage_plan_pipeline(
     req: &CreateTaskRequest,
     skills: &RwLock<harness_skills::store::SkillStore>,
     events: &EventStore,
-) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
+) -> anyhow::Result<TriagePlanPipelineOutcome> {
     // --- Phase 1: Triage ---
     tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
     mutate_and_persist(store, task_id, |state| {
@@ -141,10 +154,12 @@ pub(crate) async fn run_triage_plan_pipeline(
             mutate_and_persist(store, task_id, |state| {
                 state.status = crate::task_runner::TaskStatus::Done;
                 state.phase = TaskPhase::Terminal;
-                state.error = Some("Triage: skipped — not worth implementing".to_string());
+                state.error = Some(format!(
+                    "Triage skipped issue #{issue}: not worth implementing"
+                ));
             })
             .await?;
-            anyhow::bail!("triage decided to skip issue #{issue}");
+            return Ok(TriagePlanPipelineOutcome::Skipped);
         }
         prompts::TriageDecision::NeedsClarification => {
             // Treat as ProceedWithPlan — let the planner figure out ambiguities
@@ -153,7 +168,11 @@ pub(crate) async fn run_triage_plan_pipeline(
         }
         prompts::TriageDecision::Proceed => {
             tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
-            return Ok((None, complexity, 1));
+            return Ok(TriagePlanPipelineOutcome::Continue {
+                plan_output: None,
+                complexity,
+                turns: 1,
+            });
         }
         prompts::TriageDecision::ProceedWithPlan => {
             // Fall through to plan phase.
@@ -200,7 +219,11 @@ pub(crate) async fn run_triage_plan_pipeline(
     }
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
-    Ok((Some(plan_text), complexity, 2))
+    Ok(TriagePlanPipelineOutcome::Continue {
+        plan_output: Some(plan_text),
+        complexity,
+        turns: 2,
+    })
 }
 
 /// Run a repair-plan step after an implementation attempt emitted `PLAN_ISSUE=...`.
@@ -264,4 +287,113 @@ pub(crate) async fn run_replan_for_issue(
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "replan phase complete");
     Ok(plan_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use harness_core::agent::{AgentResponse, StreamItem};
+    use harness_core::types::{Capability, TokenUsage};
+
+    struct StaticStreamAgent {
+        output: String,
+    }
+
+    impl StaticStreamAgent {
+        fn new(output: &str) -> Self {
+            Self {
+                output: output.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CodeAgent for StaticStreamAgent {
+        fn name(&self) -> &str {
+            "static-stream-agent"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            Vec::new()
+        }
+
+        async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+            Ok(AgentResponse {
+                output: self.output.clone(),
+                stderr: String::new(),
+                items: Vec::new(),
+                token_usage: TokenUsage::default(),
+                model: "test".to_string(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::error::Result<()> {
+            tx.send(StreamItem::MessageDelta {
+                text: self.output.clone(),
+            })
+            .await
+            .map_err(|e| harness_core::error::HarnessError::AgentExecution(e.to_string()))?;
+            tx.send(StreamItem::Done)
+                .await
+                .map_err(|e| harness_core::error::HarnessError::AgentExecution(e.to_string()))?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn triage_skip_returns_successful_terminal_outcome() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
+        let task_id = TaskId::new();
+        let mut state = crate::task_runner::TaskState::new(task_id.clone());
+        state.task_kind = crate::task_runner::TaskKind::Issue;
+        store.insert(&state).await;
+
+        let agent = StaticStreamAgent::new("Not actionable.\nCOMPLEXITY=low\nTRIAGE=SKIP");
+        let req = CreateTaskRequest {
+            issue: Some(123),
+            turn_timeout_secs: 30,
+            ..CreateTaskRequest::default()
+        };
+        let skills = RwLock::new(harness_skills::store::SkillStore::new());
+        let events = EventStore::new_noop_for_tests();
+
+        let outcome = run_triage_plan_pipeline(
+            &agent,
+            &store,
+            &task_id,
+            123,
+            &HashMap::new(),
+            dir.path(),
+            &req,
+            &skills,
+            &events,
+        )
+        .await?;
+
+        assert!(matches!(outcome, TriagePlanPipelineOutcome::Skipped));
+        let final_state = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task must exist"))?;
+        assert_eq!(final_state.status, TaskStatus::Done);
+        assert_eq!(final_state.phase, TaskPhase::Terminal);
+        assert!(final_state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Triage skipped issue #123")));
+        assert_eq!(
+            final_state.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Done
+        );
+        Ok(())
+    }
 }

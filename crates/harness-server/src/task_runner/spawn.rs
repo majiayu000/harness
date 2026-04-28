@@ -186,6 +186,25 @@ fn is_issue_pr_task(eid: Option<&str>) -> bool {
     eid.is_some_and(|id| id.starts_with("issue:") || id.starts_with("pr:"))
 }
 
+fn is_issue_pr_task_state(state: &TaskState) -> bool {
+    is_issue_pr_task(state.external_id.as_deref())
+        || state.issue.is_some()
+        || matches!(state.task_kind, TaskKind::Issue | TaskKind::Pr)
+}
+
+fn should_remove_workspace_after_task(state: Option<&TaskState>, auto_cleanup: bool) -> bool {
+    let Some(state) = state else {
+        return auto_cleanup;
+    };
+    if !state.status.is_terminal() {
+        return false;
+    }
+    if state.status == TaskStatus::Failed {
+        return true;
+    }
+    auto_cleanup && !is_issue_pr_task_state(state)
+}
+
 pub async fn resolve_canonical_project(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let raw = resolve_project_root_with(project, detect_main_worktree).await?;
     // Best-effort canonicalize: if the path doesn't exist yet (e.g. in tests
@@ -234,6 +253,39 @@ async fn record_task_failure(
     .await
     {
         tracing::error!("failed to persist task failure for {task_id:?}: {e}");
+    }
+}
+
+async fn record_workspace_lifecycle_failure(
+    store: &TaskStore,
+    events: &harness_observe::event_store::EventStore,
+    task_id: &TaskId,
+    workspace_path: PathBuf,
+    reason: String,
+) {
+    log_task_failure_event(events, task_id, &reason).await;
+    store.log_event(crate::event_replay::TaskEvent::Failed {
+        task_id: task_id.0.clone(),
+        ts: crate::event_replay::now_ts(),
+        reason: reason.clone(),
+    });
+    if let Err(e) = mutate_and_persist(store, task_id, |s| {
+        s.status = TaskStatus::Failed;
+        s.failure_kind = Some(TaskFailureKind::WorkspaceLifecycle);
+        s.error = Some(reason.clone());
+        s.workspace_path = Some(workspace_path.clone());
+        s.scheduler.mark_terminal(&TaskStatus::Failed);
+        s.rounds.push(RoundResult {
+            turn: s.turn.saturating_add(1),
+            action: "workspace_lifecycle".into(),
+            result: "missing_workspace".into(),
+            detail: Some(reason.clone()),
+            first_token_latency_ms: None,
+        });
+    })
+    .await
+    {
+        tracing::error!("failed to persist workspace lifecycle failure for {task_id:?}: {e}");
     }
 }
 
@@ -408,6 +460,7 @@ where
     let store_for_abort = store.clone();
     let id_for_abort = id.clone();
 
+    let captured_home_dir = std::env::var("HOME").ok().map(PathBuf::from);
     let handle = tokio::spawn(async move {
         // Hold both permits for the task's lifetime so that the group serialisation
         // semaphore is not released until actual execution completes (not just until
@@ -417,9 +470,9 @@ where
         let detect_worktree = detect_worktree.clone();
         let raw_project =
             resolve_project_root_with(req.project.clone(), move || detect_worktree()).await?;
-        let home_dir = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| raw_project.clone());
+        let home_dir = captured_home_dir
+            .clone()
+            .unwrap_or_else(|| raw_project.clone());
         let project_root = crate::handlers::validate_project_root(&raw_project, &home_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -674,6 +727,7 @@ where
                         s.error = Some(error_message.clone());
                         s.workspace_path = Some(workspace_path.clone());
                         s.workspace_owner = workspace_owner.clone();
+                        s.scheduler.mark_terminal(&TaskStatus::Failed);
                         s.rounds.push(RoundResult {
                             turn: s.turn.saturating_add(1),
                             action: "workspace_admission".into(),
@@ -716,6 +770,23 @@ where
             // Wait if global rate-limit circuit breaker is active (another task hit the limit).
             store.wait_for_rate_limit().await;
 
+            if workspace_mgr.is_some() && !run_project.exists() {
+                let reason = format!(
+                    "WorkspaceLifecycle: workspace path missing before task turn: {}",
+                    run_project.display()
+                );
+                record_workspace_lifecycle_failure(
+                    &store,
+                    &events,
+                    &id,
+                    run_project.clone(),
+                    reason.clone(),
+                )
+                .await;
+                tracing::warn!(task_id = %id.0, workspace_path = %run_project.display(), "workspace path missing before task turn");
+                break Ok(());
+            }
+
             let result = crate::task_executor::run_task(
                 &store,
                 &id,
@@ -735,6 +806,23 @@ where
 
             match result {
                 ok @ Ok(()) => break ok,
+                Err(ref e) if workspace_mgr.is_some() && !run_project.exists() => {
+                    let reason = format!(
+                        "WorkspaceLifecycle: workspace path disappeared during task execution: {} ({:#})",
+                        run_project.display(),
+                        e
+                    );
+                    record_workspace_lifecycle_failure(
+                        &store,
+                        &events,
+                        &id,
+                        run_project.clone(),
+                        reason.clone(),
+                    )
+                    .await;
+                    tracing::warn!(task_id = %id.0, workspace_path = %run_project.display(), error = %reason, "workspace path disappeared during task execution");
+                    break Ok(());
+                }
                 Err(ref e)
                     if is_transient_error(&format!("{:#}", e))
                         && transient_attempts < MAX_TRANSIENT_RETRIES =>
@@ -792,26 +880,21 @@ where
             }
         };
 
+        let task_result: anyhow::Result<()> = match task_result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                record_task_failure(&store, &events, &id, format!("{:#}", err)).await;
+                Ok(())
+            }
+        };
+
         // Cleanup workspace when task ends.
-        // On failure: always remove to prevent stale worktrees from polluting subsequent
-        // tasks (the root cause of cross-task PR pollution, issue #799).
-        // On success for issue/PR-keyed tasks: skip cleanup so consecutive tasks on the
-        // same issue/PR reuse the same workspace (issue #969). UUID/prompt-only tasks
-        // keep the existing auto_cleanup behaviour.
+        // Cleanup is based on the persisted task status, not the raw executor
+        // result, so waiting/review/validation workspaces cannot be removed
+        // before the task has reached a true terminal state.
         if let Some(wmgr) = workspace_mgr {
-            // Also force cleanup when the task ended with Failed status even though the
-            // executor returned Ok(()) — the worktree-collision path sets TaskStatus::Failed
-            // then returns Ok(ImplementOutcome::Done) so task_result.is_err() is false.
-            let task_is_failed = store
-                .get(&id)
-                .is_some_and(|s| s.status == TaskStatus::Failed);
-            let is_issue_pr = store
-                .get(&id)
-                .is_some_and(|s| is_issue_pr_task(s.external_id.as_deref()));
-            let should_cleanup = task_result.is_err()
-                || task_is_failed
-                || (wmgr.config.auto_cleanup && !is_issue_pr);
-            if should_cleanup {
+            let final_state = store.get(&id);
+            if should_remove_workspace_after_task(final_state.as_ref(), wmgr.config.auto_cleanup) {
                 if let Err(e) = wmgr.remove_workspace(&id).await {
                     tracing::warn!("workspace cleanup failed for {id:?}: {e}");
                 }
@@ -1025,6 +1108,63 @@ mod tests {
         harness_core::types::TaskId(s.to_string())
     }
 
+    fn cleanup_state(
+        status: TaskStatus,
+        task_kind: TaskKind,
+        external_id: Option<&str>,
+        issue: Option<u64>,
+    ) -> TaskState {
+        let mut state = TaskState::new(tid("cleanup-task"));
+        state.status = status;
+        state.task_kind = task_kind;
+        state.external_id = external_id.map(str::to_string);
+        state.issue = issue;
+        state
+    }
+
+    #[test]
+    fn workspace_cleanup_keeps_inflight_issue_workspace() {
+        let state = cleanup_state(
+            TaskStatus::Waiting,
+            TaskKind::Issue,
+            Some("issue:42"),
+            Some(42),
+        );
+        assert!(
+            !should_remove_workspace_after_task(Some(&state), true),
+            "waiting issue workspaces must survive follow-up phases"
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_recognizes_issue_kind_without_external_id() {
+        let state = cleanup_state(TaskStatus::Done, TaskKind::Issue, None, Some(42));
+        assert!(
+            !should_remove_workspace_after_task(Some(&state), true),
+            "issue/PR lifecycle detection must not rely only on normalized external_id"
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_removes_failed_issue_after_terminal_state() {
+        let state = cleanup_state(
+            TaskStatus::Failed,
+            TaskKind::Issue,
+            Some("issue:42"),
+            Some(42),
+        );
+        assert!(
+            should_remove_workspace_after_task(Some(&state), true),
+            "failed issue workspaces may be cleaned after terminal failure"
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_removes_done_prompt_when_auto_cleanup_enabled() {
+        let state = cleanup_state(TaskStatus::Done, TaskKind::Prompt, None, None);
+        assert!(should_remove_workspace_after_task(Some(&state), true));
+    }
+
     struct CapturingAgent {
         captured: tokio::sync::Mutex<Vec<ContextItem>>,
     }
@@ -1102,7 +1242,10 @@ mod tests {
     async fn skills_are_injected_into_agent_context() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
-        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
 
         let mut skill_store = harness_skills::store::SkillStore::new();
         skill_store.create(
@@ -1127,7 +1270,13 @@ mod tests {
             ..Default::default()
         };
 
-        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+        let events = Arc::new(
+            harness_observe::event_store::EventStore::new_with_database_url(
+                dir.path(),
+                Some(&database_url),
+            )
+            .await?,
+        );
         let queue = crate::task_queue::TaskQueue::unbounded();
         let permit = queue.acquire("test", 0).await?;
         spawn_task(
@@ -1189,10 +1338,19 @@ mod tests {
     async fn blocking_interceptor_fails_task() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
-        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
         let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
         let agent = CapturingAgent::new();
-        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+        let events = Arc::new(
+            harness_observe::event_store::EventStore::new_with_database_url(
+                dir.path(),
+                Some(&database_url),
+            )
+            .await?,
+        );
 
         let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> =
             vec![Arc::new(BlockingInterceptor)];
@@ -1488,9 +1646,18 @@ mod tests {
     async fn execution_phase_is_set_on_initial_implementation_turn() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
-        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
         let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
-        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+        let events = Arc::new(
+            harness_observe::event_store::EventStore::new_with_database_url(
+                dir.path(),
+                Some(&database_url),
+            )
+            .await?,
+        );
 
         // Agent returns empty output (no PR URL) → task completes after implementation.
         let agent = PhaseCapturingAgent::new(vec![String::new()]);
@@ -1540,9 +1707,18 @@ mod tests {
     async fn validation_phase_is_set_on_review_loop_turns() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
-        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
         let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
-        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+        let events = Arc::new(
+            harness_observe::event_store::EventStore::new_with_database_url(
+                dir.path(),
+                Some(&database_url),
+            )
+            .await?,
+        );
 
         // Call 1 (execute_stream): return a PR URL to trigger the review loop.
         // Call 2 (execute): return LGTM to complete the review loop.

@@ -9,6 +9,8 @@ pub mod interceptor;
 pub mod lang_detect;
 pub mod prompts;
 pub mod shell_safety;
+#[cfg(test)]
+mod test_support;
 pub mod tool_isolation;
 pub mod types;
 
