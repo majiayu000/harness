@@ -388,11 +388,19 @@ async fn migrate_issue_workflows_if_needed(
         return Ok(());
     }
 
+    let mut copied = 0usize;
+    let mut skipped_existing = 0usize;
     for workflow in &legacy_rows {
-        target_store.upsert(workflow).await?;
+        if target_store.insert_if_absent(workflow).await? {
+            copied += 1;
+        } else {
+            skipped_existing += 1;
+        }
     }
     tracing::info!(
-        count = legacy_rows.len(),
+        legacy_count = legacy_rows.len(),
+        copied,
+        skipped_existing,
         legacy_schema = %legacy_schema,
         target_schema = %target_schema,
         "workflow migration: copied legacy issue workflow rows into namespaced schema"
@@ -422,11 +430,19 @@ async fn migrate_project_workflows_if_needed(
         return Ok(());
     }
 
+    let mut copied = 0usize;
+    let mut skipped_existing = 0usize;
     for workflow in &legacy_rows {
-        target_store.upsert(workflow).await?;
+        if target_store.insert_if_absent(workflow).await? {
+            copied += 1;
+        } else {
+            skipped_existing += 1;
+        }
     }
     tracing::info!(
-        count = legacy_rows.len(),
+        legacy_count = legacy_rows.len(),
+        copied,
+        skipped_existing,
         legacy_schema = %legacy_schema,
         target_schema = %target_schema,
         "workflow migration: copied legacy project workflow rows into namespaced schema"
@@ -666,9 +682,19 @@ mod tests {
                 "/tmp/project",
                 Some("owner/repo"),
                 9101,
-                "task-9101",
+                "target-task-9101",
                 &[],
                 false,
+            )
+            .await?;
+        target_store
+            .record_pr_detected(
+                "/tmp/project",
+                Some("owner/repo"),
+                9101,
+                "target-pr-task-9101",
+                99101,
+                "https://github.com/owner/repo/pull/99101",
             )
             .await?;
 
@@ -680,12 +706,19 @@ mod tests {
         )
         .await?;
 
-        assert!(
-            target_store
-                .get_by_issue("/tmp/project", Some("owner/repo"), 9101)
-                .await?
-                .is_some(),
-            "existing target row should remain present"
+        let existing = target_store
+            .get_by_issue("/tmp/project", Some("owner/repo"), 9101)
+            .await?
+            .expect("existing target row should remain present");
+        assert_eq!(
+            existing.state,
+            harness_workflow::issue_lifecycle::IssueLifecycleState::PrOpen,
+            "existing target row state should not be overwritten"
+        );
+        assert_eq!(existing.pr_number, Some(99101));
+        assert_eq!(
+            existing.active_task_id.as_deref(),
+            Some("target-pr-task-9101")
         );
         assert!(
             target_store
@@ -729,6 +762,9 @@ mod tests {
         target_store
             .record_poll_started("/tmp/project", Some("owner/repo"))
             .await?;
+        target_store
+            .record_degraded("/tmp/project", Some("owner/repo"), "target is canonical")
+            .await?;
 
         migrate_project_workflows_if_needed(
             configured_database_url.as_deref(),
@@ -738,12 +774,18 @@ mod tests {
         )
         .await?;
 
-        assert!(
-            target_store
-                .get_by_project("/tmp/project", Some("owner/repo"))
-                .await?
-                .is_some(),
-            "existing target row should remain present"
+        let existing = target_store
+            .get_by_project("/tmp/project", Some("owner/repo"))
+            .await?
+            .expect("existing target row should remain present");
+        assert_eq!(
+            existing.state,
+            harness_workflow::project_lifecycle::ProjectWorkflowState::Degraded,
+            "existing target row state should not be overwritten"
+        );
+        assert_eq!(
+            existing.degraded_reason.as_deref(),
+            Some("target is canonical")
         );
         assert!(
             target_store
