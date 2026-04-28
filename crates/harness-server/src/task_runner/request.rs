@@ -299,8 +299,15 @@ fn find_main_worktree_from(start: &Path) -> Option<PathBuf> {
     let mut workspace_manifest_dir: Option<PathBuf> = None;
 
     while let Some(dir) = current {
-        if dir.join(".git").exists() {
+        let dotgit = dir.join(".git");
+        if dotgit.is_dir() {
             return Some(dir.to_path_buf());
+        }
+        if dotgit.is_file() {
+            return Some(
+                linked_main_worktree_root_from_gitfile(&dotgit)
+                    .unwrap_or_else(|| dir.to_path_buf()),
+            );
         }
 
         let manifest = dir.join("Cargo.toml");
@@ -317,6 +324,32 @@ fn find_main_worktree_from(start: &Path) -> Option<PathBuf> {
     }
 
     workspace_manifest_dir.or(first_manifest_dir)
+}
+
+fn linked_main_worktree_root_from_gitfile(dotgit: &Path) -> Option<PathBuf> {
+    let gitdir = gitdir_from_file(dotgit)?;
+    let worktrees_dir = gitdir.parent()?;
+    if worktrees_dir.file_name()? != "worktrees" {
+        return None;
+    }
+    let common_git_dir = worktrees_dir.parent()?;
+    let main_root = if common_git_dir.file_name()? == ".git" {
+        common_git_dir.parent()?
+    } else {
+        common_git_dir
+    };
+    Some(std::fs::canonicalize(main_root).unwrap_or_else(|_| main_root.to_path_buf()))
+}
+
+fn gitdir_from_file(dotgit: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(dotgit).ok()?;
+    let raw_gitdir = contents.trim().strip_prefix("gitdir:")?.trim();
+    let gitdir = PathBuf::from(raw_gitdir);
+    if gitdir.is_absolute() {
+        Some(gitdir)
+    } else {
+        dotgit.parent().map(|parent| parent.join(gitdir))
+    }
 }
 
 fn cargo_manifest_declares_workspace(manifest: &Path) -> bool {
@@ -419,6 +452,52 @@ mod tests {
         assert_eq!(
             find_main_worktree_from(&crate_dir.join("src")),
             Some(tmp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn find_main_worktree_resolves_linked_worktree_to_main_checkout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_checkout = tmp.path().join("main");
+        let linked_worktree = tmp.path().join("linked");
+        let worktree_gitdir = main_checkout.join(".git/worktrees/linked");
+        std::fs::create_dir_all(&worktree_gitdir).expect("create linked gitdir");
+        std::fs::create_dir_all(linked_worktree.join("src")).expect("create linked source dir");
+        std::fs::write(
+            linked_worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_gitdir.display()),
+        )
+        .expect("write linked worktree gitdir file");
+        let expected_main_checkout = main_checkout
+            .canonicalize()
+            .unwrap_or_else(|_| main_checkout.clone());
+
+        assert_eq!(
+            find_main_worktree_from(&linked_worktree.join("src")),
+            Some(expected_main_checkout)
+        );
+    }
+
+    #[test]
+    fn find_main_worktree_resolves_bare_repo_linked_worktree_to_git_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare_repo = tmp.path().join("main.git");
+        let linked_worktree = tmp.path().join("linked");
+        let worktree_gitdir = bare_repo.join("worktrees/linked");
+        std::fs::create_dir_all(&worktree_gitdir).expect("create linked gitdir");
+        std::fs::create_dir_all(linked_worktree.join("src")).expect("create linked source dir");
+        std::fs::write(
+            linked_worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_gitdir.display()),
+        )
+        .expect("write linked worktree gitdir file");
+        let expected_bare_repo = bare_repo
+            .canonicalize()
+            .unwrap_or_else(|_| bare_repo.clone());
+
+        assert_eq!(
+            find_main_worktree_from(&linked_worktree.join("src")),
+            Some(expected_bare_repo)
         );
     }
 }
