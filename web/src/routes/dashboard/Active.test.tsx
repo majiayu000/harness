@@ -147,11 +147,19 @@ describe("<Active>", () => {
     expect(screen.getByText("impl-task")).toBeInTheDocument();
   });
 
-  it("clicking a TaskCard opens the slide-over with that task's id", () => {
+  it("clicking a standard task card opens the slide-over with that task's id", () => {
     mockUseTasks.mockReturnValue({ data: [makeTask("t1", "proj")], isLoading: false, isError: false });
     wrap(<Active />);
     fireEvent.click(screen.getByText("t1"));
     expect(screen.getByTestId("task-slideover")).toHaveAttribute("data-task-id", "t1");
+  });
+
+  it("clicking a prompt task card opens the shared slide-over", () => {
+    const promptTask = makeTask("prompt-task", "proj", "planning", "prompt");
+    mockUseTasks.mockReturnValue({ data: [promptTask], isLoading: false, isError: false });
+    wrap(<Active />);
+    fireEvent.click(screen.getByText("prompt-task"));
+    expect(screen.getByTestId("task-slideover")).toHaveAttribute("data-task-id", "prompt-task");
   });
 
   it("calling onClose from the slide-over hides it", () => {

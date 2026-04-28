@@ -150,7 +150,7 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
             </>
           )}
           {activeTab === "prompts" && (
-            <RawJsonContent data={prompts} label="prompts" isError={isPromptsError} />
+            <PromptHistoryContent data={prompts} isError={isPromptsError} />
           )}
           {activeTab === "artifacts" && (
             <RawJsonContent data={artifacts} label="artifacts" isError={isArtifactsError} />
@@ -214,5 +214,61 @@ function RawJsonContent({ data, label, isError }: { data: unknown; label: string
     <pre className="font-mono text-[11px] text-ink whitespace-pre-wrap break-words">
       {JSON.stringify(data, null, 2)}
     </pre>
+  );
+}
+
+function PromptHistoryContent({
+  data,
+  isError,
+}: {
+  data: TaskPrompt[] | undefined;
+  isError?: boolean;
+}) {
+  if (isError) {
+    return (
+      <div className="font-mono text-[11px] text-rust" role="alert">
+        Failed to load prompts.
+      </div>
+    );
+  }
+
+  if (data === undefined) {
+    return <div className="font-mono text-[11px] text-ink-3">Loading prompts…</div>;
+  }
+
+  if (data.length === 0) {
+    return <div className="font-mono text-[11px] text-ink-3">No prompts recorded.</div>;
+  }
+
+  const prompts = [...data].sort((a, b) => {
+    const createdAtDiff = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+    if (createdAtDiff !== 0) return createdAtDiff;
+    if (a.turn !== b.turn) return a.turn - b.turn;
+    return a.phase.localeCompare(b.phase);
+  });
+
+  return (
+    <div className="flex flex-col gap-3">
+      {prompts.map((prompt, index) => (
+        <section
+          key={`${prompt.task_id}-${prompt.turn}-${prompt.phase}-${prompt.created_at}-${index}`}
+          className="border border-line bg-bg-1"
+        >
+          <header className="border-b border-line px-3 py-2 font-mono text-[10px] text-ink-3">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="text-ink">{prompt.phase}</span>
+              <span>turn {prompt.turn}</span>
+              <span>{prompt.created_at}</span>
+            </div>
+          </header>
+          <pre
+            data-testid={`prompt-body-${index}`}
+            className="max-h-72 overflow-auto p-3 font-mono text-[11px] text-ink whitespace-pre-wrap break-words"
+          >
+            {prompt.prompt}
+          </pre>
+        </section>
+      ))}
+    </div>
   );
 }
