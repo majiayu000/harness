@@ -1485,7 +1485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planning_phase_is_set_on_initial_implementation_turn() -> anyhow::Result<()> {
+    async fn execution_phase_is_set_on_initial_implementation_turn() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
         let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
@@ -1530,8 +1530,8 @@ mod tests {
         );
         assert_eq!(
             phases[0],
-            Some(ExecutionPhase::Planning),
-            "initial implementation turn must use Planning phase"
+            Some(ExecutionPhase::Execution),
+            "initial implementation turn must use Execution phase"
         );
         Ok(())
     }
@@ -1587,8 +1587,8 @@ mod tests {
         );
         assert_eq!(
             phases[0],
-            Some(ExecutionPhase::Planning),
-            "implementation turn must use Planning phase"
+            Some(ExecutionPhase::Execution),
+            "implementation turn must use Execution phase"
         );
         assert_eq!(
             phases[1],
