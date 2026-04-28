@@ -503,7 +503,7 @@ mod tests {
 
     async fn open_test_issue_store(
     ) -> anyhow::Result<Option<harness_workflow::issue_lifecycle::IssueWorkflowStore>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if harness_core::db::resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;

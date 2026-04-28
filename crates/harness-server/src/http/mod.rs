@@ -545,27 +545,11 @@ mod startup_tests {
     #[tokio::test]
     async fn startup_grade_uses_latest_rule_scan_session_for_violation_count() -> anyhow::Result<()>
     {
-        let _lock = HOME_LOCK.lock().await;
         let sandbox = tempfile::tempdir()?;
         let project_root = sandbox.path().join("project");
         std::fs::create_dir_all(&project_root)?;
         let data_dir = sandbox.path().join("data");
-
-        // Redirect HOME so build_app_state does not read from the real user home.
-        let fake_home = sandbox.path().join("home");
-        std::fs::create_dir_all(&fake_home)?;
-        // SAFETY: HOME_LOCK is held above; HomeGuard::drop restores HOME unconditionally.
-        let _env_guard = unsafe { HomeGuard::set(&fake_home) };
-
-        let mut config = HarnessConfig::default();
-        config.server.project_root = project_root.clone();
-        config.server.data_dir = data_dir;
-        let server = Arc::new(HarnessServer::new(
-            config,
-            ThreadManager::new(),
-            AgentRegistry::new("test"),
-        ));
-        let state = build_app_state(server).await?;
+        let events = harness_observe::event_store::EventStore::new(&data_dir).await?;
 
         // First scan: persist 5 violations (old session — must NOT count at startup).
         let old_violations: Vec<Violation> = (0..5)
@@ -577,9 +561,7 @@ mod startup_tests {
                 severity: Severity::Low,
             })
             .collect();
-        state
-            .observability
-            .events
+        events
             .persist_rule_scan(&project_root, &old_violations)
             .await;
 
@@ -600,16 +582,12 @@ mod startup_tests {
                 severity: Severity::High,
             },
         ];
-        state
-            .observability
-            .events
+        events
             .persist_rule_scan(&project_root, &new_violations)
             .await;
 
         // Replicate the exact startup grade logic from serve() (lines 687-697).
-        let events = state
-            .observability
-            .events
+        let events = events
             .query(&EventFilters::default())
             .await
             .unwrap_or_default();
@@ -635,7 +613,5 @@ mod startup_tests {
         );
 
         Ok(())
-        // _env_guard dropped here → HOME restored unconditionally
-        // _lock dropped here → next test may proceed
     }
 }

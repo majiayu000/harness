@@ -857,19 +857,36 @@ impl IssueWorkflowStore {
             return Ok(());
         }
 
+        if let Some(existing_workflow) = self
+            .load_for_update_by_id(&mut tx, &new_workflow.id)
+            .await?
+        {
+            anyhow::bail!(
+                "cannot repair workflow row '{old_row_id}' to canonical id '{}': canonical row already exists in state {:?} (updated_at {})",
+                new_workflow.id,
+                existing_workflow.state,
+                existing_workflow.updated_at,
+            );
+        }
+
         new_workflow.updated_at = chrono::Utc::now();
 
         let new_data = serde_json::to_string(&new_workflow)?;
-        sqlx::query(
+        let insert_result = sqlx::query(
             "INSERT INTO issue_workflows (id, data, created_at) VALUES ($1, $2, $3)
-             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
-                 updated_at = CURRENT_TIMESTAMP",
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(&new_workflow.id)
         .bind(&new_data)
         .bind(old_workflow.created_at)
         .execute(&mut *tx)
         .await?;
+        if insert_result.rows_affected() != 1 {
+            anyhow::bail!(
+                "cannot repair workflow row '{old_row_id}' to canonical id '{}': canonical row appeared during repair",
+                new_workflow.id,
+            );
+        }
 
         sqlx::query("DELETE FROM issue_workflows WHERE id = $1")
             .bind(old_row_id)
@@ -930,7 +947,7 @@ mod tests {
     use super::*;
 
     async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;
@@ -1231,6 +1248,78 @@ mod tests {
             .await?
             .expect("new row should exist");
         assert_eq!(new.project_id, canonical);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_project_id_refuses_to_overwrite_existing_canonical_row() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let corrupt_project_id = "/data/workspaces/abc-uuid-conflict-test";
+        let canonical_project_id = "/real/canonical/conflict-root";
+
+        store
+            .record_issue_scheduled(
+                corrupt_project_id,
+                Some("owner/repo"),
+                9005,
+                "task-corrupt",
+                &[],
+                false,
+            )
+            .await?;
+        store
+            .record_issue_scheduled(
+                canonical_project_id,
+                Some("owner/repo"),
+                9005,
+                "task-canonical",
+                &[],
+                false,
+            )
+            .await?;
+        store
+            .record_pr_detected(
+                canonical_project_id,
+                Some("owner/repo"),
+                9005,
+                "task-canonical",
+                45,
+                "https://github.com/owner/repo/pull/45",
+            )
+            .await?;
+
+        let corrupt_before = store
+            .get_by_issue(corrupt_project_id, Some("owner/repo"), 9005)
+            .await?
+            .expect("corrupt row should exist");
+        let canonical_before = store
+            .get_by_issue(canonical_project_id, Some("owner/repo"), 9005)
+            .await?
+            .expect("canonical row should exist");
+
+        let err = store
+            .repair_project_id(&corrupt_before.id, canonical_project_id)
+            .await
+            .expect_err("repair should fail when canonical row already exists");
+        assert!(
+            err.to_string().contains("canonical row already exists"),
+            "unexpected error: {err}",
+        );
+
+        let corrupt_after = store
+            .get_by_issue(corrupt_project_id, Some("owner/repo"), 9005)
+            .await?
+            .expect("corrupt row should remain for manual remediation");
+        let canonical_after = store
+            .get_by_issue(canonical_project_id, Some("owner/repo"), 9005)
+            .await?
+            .expect("canonical row should remain unchanged");
+
+        assert_eq!(store.row_count().await?, 2);
+        assert_eq!(corrupt_after, corrupt_before);
+        assert_eq!(canonical_after, canonical_before);
         Ok(())
     }
 
