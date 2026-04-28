@@ -233,17 +233,22 @@ pub(crate) async fn run_implement_phase(
     let first_prompt =
         prepend_constitution(first_prompt, server_config.server.constitution_enabled);
 
-    // Inject project instructions directly into the prompt text.
-    // AgentRequest.context is retained for observability, but CLI agents do not
-    // receive it automatically in single-turn mode.
-    let first_prompt = inject_project_context_into_prompt(project, first_prompt);
-
     // Inject skill content directly into the prompt text.
     // Since harness uses single-turn `claude -p`, context items are not visible
     // to the agent — we must embed skill content in the prompt string itself.
     // Also records usage for any matched skills via record_use().
-    let matched_skills = matched_skills_for_prompt(skills, &first_prompt).await;
-    let skill_additions = inject_skills_into_prompt(skills, &first_prompt).await;
+    //
+    // Match against the task prompt before appending project instruction files.
+    // Otherwise AGENTS.md / CLAUDE.md trigger phrases can cause unrelated skills
+    // to be injected and logged as used.
+    let skill_match_prompt = first_prompt.clone();
+    let matched_skills = matched_skills_for_prompt(skills, &skill_match_prompt).await;
+    let skill_additions = inject_skills_into_prompt(skills, &skill_match_prompt).await;
+
+    // Inject project instructions directly into the prompt text.
+    // AgentRequest.context is retained for observability, but CLI agents do not
+    // receive it automatically in single-turn mode.
+    let first_prompt = inject_project_context_into_prompt(project, first_prompt);
     let first_prompt = if skill_additions.is_empty() {
         first_prompt
     } else {
@@ -267,7 +272,7 @@ pub(crate) async fn run_implement_phase(
         }
     }
 
-    let context_items = collect_context_items(skills, project, &first_prompt).await;
+    let context_items = collect_context_items(skills, project, &skill_match_prompt).await;
 
     let initial_allowed_tools: Option<Vec<String>> = None;
     let capability_prompt_note: Option<&'static str> = None;
