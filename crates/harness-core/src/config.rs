@@ -756,6 +756,48 @@ mod tests {
     }
 
     #[test]
+    fn derived_workspace_root_preserves_explicit_legacy_workspace_root() {
+        let legacy_root = WorkspaceConfig::default().root;
+        let toml_str = format!(
+            r#"
+            root = "{}"
+        "#,
+            legacy_root.display()
+        );
+        let mut config = HarnessConfig {
+            server: ServerConfig {
+                data_dir: PathBuf::from("/tmp/harness-two"),
+                ..ServerConfig::default()
+            },
+            workspace: toml::from_str(&toml_str).unwrap(),
+            ..HarnessConfig::default()
+        };
+        config.apply_derived_defaults();
+        assert_eq!(config.workspace.root, legacy_root);
+    }
+
+    #[test]
+    fn derived_workspace_root_tracks_custom_data_dir_when_toml_root_is_absent() {
+        let toml_str = r#"
+            auto_cleanup = false
+        "#;
+        let mut config = HarnessConfig {
+            server: ServerConfig {
+                data_dir: PathBuf::from("/tmp/harness-two"),
+                ..ServerConfig::default()
+            },
+            workspace: toml::from_str(toml_str).unwrap(),
+            ..HarnessConfig::default()
+        };
+        config.apply_derived_defaults();
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/harness-two/workspaces")
+        );
+        assert!(!config.workspace.auto_cleanup);
+    }
+
+    #[test]
     fn harness_config_includes_workspace() {
         let config = HarnessConfig::default();
         assert!(config.workspace.auto_cleanup);

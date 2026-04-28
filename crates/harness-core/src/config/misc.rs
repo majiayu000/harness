@@ -1,6 +1,6 @@
 use crate::types::Grade;
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -10,11 +10,16 @@ use super::dirs::dirs_data_dir;
 ///
 /// WorkspaceManager provisions an isolated git worktree per task,
 /// preventing merge conflicts when multiple agents edit the same project.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceConfig {
     /// Root directory for all task worktrees. Runtime default: `[server.data_dir]/workspaces`.
     #[serde(default = "default_workspace_root")]
     pub root: PathBuf,
+    /// Tracks whether `root` came from config so derived defaults do not rewrite
+    /// an explicit legacy root value.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub root_configured: bool,
     /// Shell script run after worktree creation (cwd = workspace). Fatal on failure.
     #[serde(default)]
     pub after_create_hook: Option<String>,
@@ -45,11 +50,44 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             root: default_workspace_root(),
+            root_configured: false,
             after_create_hook: None,
             before_remove_hook: None,
             hook_timeout_secs: default_hook_timeout_secs(),
             auto_cleanup: default_auto_cleanup(),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WorkspaceConfigToml {
+            #[serde(default)]
+            root: Option<PathBuf>,
+            #[serde(default)]
+            after_create_hook: Option<String>,
+            #[serde(default)]
+            before_remove_hook: Option<String>,
+            #[serde(default = "default_hook_timeout_secs")]
+            hook_timeout_secs: u64,
+            #[serde(default = "default_auto_cleanup")]
+            auto_cleanup: bool,
+        }
+
+        let toml = WorkspaceConfigToml::deserialize(deserializer)?;
+        let root_configured = toml.root.is_some();
+        Ok(Self {
+            root: toml.root.unwrap_or_else(default_workspace_root),
+            root_configured,
+            after_create_hook: toml.after_create_hook,
+            before_remove_hook: toml.before_remove_hook,
+            hook_timeout_secs: toml.hook_timeout_secs,
+            auto_cleanup: toml.auto_cleanup,
+        })
     }
 }
 
@@ -59,7 +97,7 @@ impl WorkspaceConfig {
     }
 
     pub fn use_data_dir_default_root(&mut self, data_dir: &Path) {
-        if self.root == default_workspace_root() {
+        if !self.root_configured && self.root == default_workspace_root() {
             self.root = Self::root_for_data_dir(data_dir);
         }
     }
