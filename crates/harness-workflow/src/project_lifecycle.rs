@@ -519,7 +519,7 @@ mod tests {
     use super::*;
 
     async fn open_test_store() -> anyhow::Result<Option<ProjectWorkflowStore>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;

@@ -14,8 +14,8 @@ pub struct ServerConfig {
     pub project_root: PathBuf,
     /// Postgres connection string for all persistent server stores.
     ///
-    /// When set, this wins over the legacy `DATABASE_URL` environment variable
-    /// fallback used by lower-level store initializers.
+    /// When set, this is passed explicitly to lower-level store initializers.
+    /// `HARNESS_DATABASE_URL` can override this field during config loading.
     #[serde(default)]
     pub database_url: Option<String>,
     #[serde(default)]

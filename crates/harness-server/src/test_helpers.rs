@@ -5,7 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use harness_core::db::pg_open_pool;
+use harness_core::db::{pg_open_pool, resolve_database_url};
 use tokio::sync::OnceCell;
 
 /// Serialises every test that reads or mutates the process-global `HOME` env
@@ -75,13 +75,13 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
 }
 
 pub async fn db_tests_enabled() -> bool {
-    if std::env::var("DATABASE_URL").is_err() {
+    if resolve_database_url(None).is_err() {
         return false;
     }
 
     *DB_AVAILABLE
         .get_or_init(|| async {
-            let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            let Ok(database_url) = resolve_database_url(None) else {
                 return false;
             };
             match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {

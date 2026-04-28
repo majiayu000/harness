@@ -137,11 +137,12 @@ database_url = "postgres://user:password@host:5432/dbname"
 **Running tests against a real database:**
 
 ```bash
-DATABASE_URL=postgres://harness:harness@localhost:5432/harness cargo test --workspace
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness cargo test --workspace
 ```
 
 Integration tests that require a database (e.g. `runtime_state_store`,
-`thread_db`, `q_value_store`) skip automatically when `DATABASE_URL` is unset.
+`thread_db`, `q_value_store`) skip automatically when no Harness database URL
+is configured.
 
 ### Run
 

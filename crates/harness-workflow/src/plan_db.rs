@@ -229,7 +229,7 @@ mod tests {
 
     async fn open_test_store(
     ) -> anyhow::Result<Option<(PlanDb, tempfile::TempDir, SemaphorePermit<'static>)>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let permit = db_gate().acquire().await?;
@@ -421,7 +421,7 @@ mod tests {
     /// pre-existing TEXT rows survive the `USING data::jsonb` cast.
     #[tokio::test]
     async fn migration_contract_text_to_jsonb_gin() -> anyhow::Result<()> {
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        let Ok(database_url) = resolve_database_url(None) else {
             return Ok(());
         };
         let _permit = db_gate().acquire().await?;
