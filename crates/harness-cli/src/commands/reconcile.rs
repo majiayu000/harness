@@ -1,9 +1,16 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use harness_core::config::dirs::default_db_path;
 use harness_core::config::HarnessConfig;
 use std::path::PathBuf;
 
-pub async fn run(dry_run: bool, _project: Option<PathBuf>, config: &HarnessConfig) -> Result<()> {
+pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig) -> Result<()> {
+    if let Some(project_root) = project {
+        bail!(
+            "`harness reconcile --project {}` is no longer supported; reconciliation now uses each task's stored project root",
+            project_root.display()
+        );
+    }
+
     let db_path = default_db_path(&config.server.data_dir, "tasks");
     let store = harness_server::task_runner::TaskStore::open(&db_path).await?;
 
