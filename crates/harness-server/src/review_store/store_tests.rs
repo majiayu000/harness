@@ -2,7 +2,7 @@ use super::*;
 use chrono::Utc;
 
 async fn open_test_store() -> anyhow::Result<Option<ReviewStore>> {
-    if std::env::var("DATABASE_URL").is_err() {
+    if resolve_database_url(None).is_err() {
         return Ok(None);
     }
     let dir = tempfile::tempdir()?;
