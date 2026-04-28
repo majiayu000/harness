@@ -3,7 +3,7 @@ use crate::task_runner::{mutate_and_persist, TaskId, TaskStatus, TaskStore};
 use harness_core::config::misc::ReconciliationConfig;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -13,6 +13,7 @@ struct Candidate {
     id: TaskId,
     pr_url: Option<String>,
     repo: Option<String>,
+    project_root: Option<PathBuf>,
     /// Numeric issue or PR from `external_id` (e.g. `issue:42` → 42).
     issue_num: Option<u64>,
     /// Numeric PR from `external_id` `pr:N` when no `pr_url` is present.
@@ -114,6 +115,7 @@ fn candidate_from_task(task: &crate::task_runner::TaskState) -> Option<Candidate
         id: task.id.clone(),
         pr_url: task.pr_url.clone(),
         repo: task.repo.clone(),
+        project_root: task.project_root.clone(),
         issue_num,
         pr_num_from_ext,
     })
@@ -236,7 +238,6 @@ pub(crate) async fn fetch_issue_state(repo_slug: &str, issue_num: u64) -> GitHub
 /// Core reconciliation logic. Callable from the periodic loop and HTTP handler.
 pub async fn run_once(
     store: &Arc<TaskStore>,
-    project: &Path,
     max_gh_calls_per_minute: u32,
     dry_run: bool,
 ) -> ReconciliationReport {
@@ -245,7 +246,7 @@ pub async fn run_once(
     let mut transitions = Vec::new();
 
     for candidate in &candidates {
-        let gh_state = resolve_github_state(candidate, project, &mut rate).await;
+        let gh_state = resolve_github_state(candidate, &mut rate).await;
 
         let new_status = transition_for_github_state(gh_state);
 
@@ -299,21 +300,14 @@ fn transition_for_github_state(gh_state: GitHubState) -> Option<(TaskStatus, &'s
 }
 
 /// Determine the current GitHub state for one candidate, consuming rate-limit budget.
-async fn resolve_github_state(
-    candidate: &Candidate,
-    project: &Path,
-    rate: &mut RateLimiter,
-) -> GitHubState {
+async fn resolve_github_state(candidate: &Candidate, rate: &mut RateLimiter) -> GitHubState {
     // PR URL takes precedence — most candidates in `implementing`/`reviewing`
     // will have one.
     if let Some(pr_url) = &candidate.pr_url {
         rate.acquire().await;
         return fetch_pr_state_by_url(pr_url).await;
     }
-    let repo_slug = match candidate.repo.as_deref() {
-        Some(repo) if !repo.trim().is_empty() => Some(repo.to_string()),
-        _ => crate::task_executor::pr_detection::detect_repo_slug(project).await,
-    };
+    let repo_slug = resolve_repo_slug(candidate).await;
     let Some(repo_slug) = repo_slug else {
         tracing::debug!(
             task_id = %candidate.id.0,
@@ -330,6 +324,18 @@ async fn resolve_github_state(
         return fetch_issue_state(&repo_slug, issue_num).await;
     }
     GitHubState::Unknown
+}
+
+async fn resolve_repo_slug(candidate: &Candidate) -> Option<String> {
+    match candidate.repo.as_deref() {
+        Some(repo) if !repo.trim().is_empty() => Some(repo.to_string()),
+        _ => match candidate.project_root.as_deref() {
+            Some(project_root) => {
+                crate::task_executor::pr_detection::detect_repo_slug(project_root).await
+            }
+            None => None,
+        },
+    }
 }
 
 /// Apply a status transition to a task, returning `true` on success.
@@ -386,13 +392,7 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
     sleep(Duration::from_secs(15)).await;
 
     loop {
-        let report = run_once(
-            &state.core.tasks,
-            &state.core.project_root,
-            config.max_gh_calls_per_minute,
-            false,
-        )
-        .await;
+        let report = run_once(&state.core.tasks, config.max_gh_calls_per_minute, false).await;
 
         // Clean up workspaces for tasks that were just terminated by reconciliation,
         // so the workspace is gone within the same tick (issue #969).
@@ -490,11 +490,61 @@ mod tests {
     }
 
     #[test]
+    fn candidate_from_task_carries_project_root() {
+        let mut t = make_task("x", TaskStatus::Pending, None, Some("issue:9"));
+        t.project_root = Some(PathBuf::from("/tmp/projects/alpha"));
+        let c = candidate_from_task(&t).unwrap();
+        assert_eq!(c.project_root, Some(PathBuf::from("/tmp/projects/alpha")));
+    }
+
+    #[test]
     fn candidate_from_task_picks_issue_external_id() {
         let t = make_task("x", TaskStatus::Pending, None, Some("issue:9"));
         let c = candidate_from_task(&t).unwrap();
         assert_eq!(c.issue_num, Some(9));
         assert!(c.pr_url.is_none());
+    }
+
+    fn init_git_repo_with_origin(path: &std::path::Path, origin: &str) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .expect("git command should spawn");
+            assert!(
+                output.status.success(),
+                "git command failed: args={args:?}, stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run(&["init"]);
+        run(&["remote", "add", "origin", origin]);
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_slug_uses_candidate_project_root_when_repo_missing() {
+        let repo_a = tempfile::tempdir().expect("repo a tempdir");
+        let repo_b = tempfile::tempdir().expect("repo b tempdir");
+        init_git_repo_with_origin(repo_a.path(), "https://github.com/example/repo-a.git");
+        init_git_repo_with_origin(repo_b.path(), "https://github.com/example/repo-b.git");
+        assert_eq!(
+            crate::task_executor::pr_detection::detect_repo_slug(repo_a.path()).await,
+            Some("example/repo-a".to_string())
+        );
+
+        let candidate = Candidate {
+            id: TaskId("task-1".to_string()),
+            pr_url: None,
+            repo: None,
+            project_root: Some(repo_b.path().to_path_buf()),
+            issue_num: Some(9),
+            pr_num_from_ext: None,
+        };
+
+        let repo_slug = resolve_repo_slug(&candidate).await;
+        assert_eq!(repo_slug, Some("example/repo-b".to_string()));
     }
 
     #[test]

@@ -24,13 +24,8 @@ pub async fn handle(
         .reconciliation
         .max_gh_calls_per_minute;
 
-    let report = crate::reconciliation::run_once(
-        &state.core.tasks,
-        &state.core.project_root,
-        max_calls,
-        params.dry_run,
-    )
-    .await;
+    let report =
+        crate::reconciliation::run_once(&state.core.tasks, max_calls, params.dry_run).await;
 
     Ok(Json(report))
 }
