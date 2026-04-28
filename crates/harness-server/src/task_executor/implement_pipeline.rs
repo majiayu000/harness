@@ -549,94 +549,74 @@ pub(crate) async fn run_implement_phase(
             return Ok(ImplementOutcome::Done);
         }
 
-        let (mut pr_url, mut pr_num, created_issue_num) =
-            match parse_implementation_outcome(&output) {
-                ImplementationOutcome::PlanIssue(plan_issue) => {
-                    if let (Some(workflows), Some(issue_number)) =
-                        (issue_workflow_store.as_ref(), req.issue)
+        let (pr_url, pr_num, created_issue_num) = match parse_implementation_outcome(&output) {
+            ImplementationOutcome::PlanIssue(plan_issue) => {
+                if let (Some(workflows), Some(issue_number)) =
+                    (issue_workflow_store.as_ref(), req.issue)
+                {
+                    let project_id = project_root.to_string_lossy().into_owned();
+                    if let Err(e) = workflows
+                        .record_plan_issue_detected(
+                            &project_id,
+                            req.repo.as_deref(),
+                            issue_number,
+                            &task_id.0,
+                            &plan_issue,
+                        )
+                        .await
                     {
-                        let project_id = project_root.to_string_lossy().into_owned();
-                        if let Err(e) = workflows
-                            .record_plan_issue_detected(
-                                &project_id,
-                                req.repo.as_deref(),
-                                issue_number,
-                                &task_id.0,
-                                &plan_issue,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                issue = issue_number,
-                                task_id = %task_id.0,
-                                "issue workflow PLAN_ISSUE tracking failed: {e}"
-                            );
-                        }
+                        tracing::warn!(
+                            issue = issue_number,
+                            task_id = %task_id.0,
+                            "issue workflow PLAN_ISSUE tracking failed: {e}"
+                        );
                     }
-                    if let Some(issue_number) = req.issue {
-                        return Ok(ImplementOutcome::Replan {
-                            issue: issue_number,
-                            plan_issue,
-                            prior_plan: plan_output.clone(),
-                        });
-                    }
-                    tracing::error!(
-                        task_id = %task_id,
-                        plan_issue = %plan_issue,
-                        "implementation returned PLAN_ISSUE; marking task failed"
-                    );
-                    mutate_and_persist(store, task_id, |s| {
-                        s.status = TaskStatus::Failed;
-                        s.turn = 2;
-                        s.error = Some(plan_issue.clone());
-                        s.rounds.push(RoundResult {
-                            turn: 1,
-                            action: "implement".into(),
-                            result: "plan_issue".into(),
-                            detail: if output.is_empty() {
-                                None
-                            } else {
-                                Some(output.clone())
-                            },
-                            first_token_latency_ms: impl_first_token_ms,
-                        });
-                    })
-                    .await?;
-                    tracing::info!(
-                        task_id = %task_id,
-                        status = "failed",
-                        turns = 2,
-                        pr_url = tracing::field::Empty,
-                        total_elapsed_secs = task_start.elapsed().as_secs(),
-                        "task_completed"
-                    );
-                    return Ok(ImplementOutcome::Done);
                 }
-                ImplementationOutcome::ParsedPr {
-                    pr_url,
-                    pr_num,
-                    created_issue_num,
-                } => (pr_url, pr_num, created_issue_num),
-            };
-
-        // Fallback: if the agent produced no PR_URL= sentinel, try to recover from
-        // the current branch via GitHub REST. This handles the regression where
-        // ANSI codes or unexpected output channels caused sentinel parsing to miss
-        // an already-created PR (issue #982).
-        if pr_url.is_none() && task_needs_pr_url(req) {
-            if let Some((fallback_num, fallback_url)) =
-                super::pr_detection::fallback_find_pr_by_branch(project).await
-            {
+                if let Some(issue_number) = req.issue {
+                    return Ok(ImplementOutcome::Replan {
+                        issue: issue_number,
+                        plan_issue,
+                        prior_plan: plan_output.clone(),
+                    });
+                }
+                tracing::error!(
+                    task_id = %task_id,
+                    plan_issue = %plan_issue,
+                    "implementation returned PLAN_ISSUE; marking task failed"
+                );
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.turn = 2;
+                    s.error = Some(plan_issue.clone());
+                    s.rounds.push(RoundResult {
+                        turn: 1,
+                        action: "implement".into(),
+                        result: "plan_issue".into(),
+                        detail: if output.is_empty() {
+                            None
+                        } else {
+                            Some(output.clone())
+                        },
+                        first_token_latency_ms: impl_first_token_ms,
+                    });
+                })
+                .await?;
                 tracing::info!(
                     task_id = %task_id,
-                    pr_number = fallback_num,
-                    pr_url = %fallback_url,
-                    "PR_URL sentinel missing from output; recovered via GitHub REST"
+                    status = "failed",
+                    turns = 2,
+                    pr_url = tracing::field::Empty,
+                    total_elapsed_secs = task_start.elapsed().as_secs(),
+                    "task_completed"
                 );
-                pr_url = Some(fallback_url);
-                pr_num = Some(fallback_num);
+                return Ok(ImplementOutcome::Done);
             }
-        }
+            ImplementationOutcome::ParsedPr {
+                pr_url,
+                pr_num,
+                created_issue_num,
+            } => (pr_url, pr_num, created_issue_num),
+        };
 
         mutate_and_persist(store, task_id, |s| {
             s.pr_url = pr_url.clone();
