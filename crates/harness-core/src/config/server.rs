@@ -62,10 +62,11 @@ pub struct ServerConfig {
     /// Default: true.
     #[serde(default = "default_constitution_enabled")]
     pub constitution_enabled: bool,
-    /// GitHub personal access token for review bot auto-trigger.
+    /// GitHub personal access token for GitHub API clients.
     ///
-    /// Used to post comments on PRs (e.g. `@gemini-code-assist review`).
-    /// Falls back to `GITHUB_TOKEN` env var when not configured.
+    /// Used for issue intake, reconciliation, workspace GC, and review bot
+    /// auto-trigger. Falls back to `GITHUB_TOKEN` and then `GH_TOKEN` env vars
+    /// when not configured.
     #[serde(default)]
     pub github_token: Option<String>,
 }
@@ -83,7 +84,7 @@ impl ServerConfig {
     /// - `HARNESS_PROJECT_ROOT`    — `project_root`
     /// - `HARNESS_DATABASE_URL`    — `database_url`
     /// - `HARNESS_API_TOKEN`       — `api_token`
-    /// - `GITHUB_TOKEN`            — `github_token`
+    /// - `GITHUB_TOKEN` / `GH_TOKEN` — `github_token`
     /// - `GITHUB_WEBHOOK_SECRET`   — `github_webhook_secret`
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
         if let Ok(v) = std::env::var("HARNESS_DATA_DIR") {
@@ -106,10 +107,16 @@ impl ServerConfig {
                 self.api_token = Some(v);
             }
         }
-        if let Ok(v) = std::env::var("GITHUB_TOKEN") {
-            if !v.is_empty() {
-                self.github_token = Some(v);
-            }
+        if let Some(v) = std::env::var("GITHUB_TOKEN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("GH_TOKEN")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+        {
+            self.github_token = Some(v);
         }
         if let Ok(v) = std::env::var("GITHUB_WEBHOOK_SECRET") {
             if !v.is_empty() {
@@ -353,11 +360,59 @@ mod tests {
 
     #[test]
     fn env_override_github_token_fallback() {
-        temp_env::with_vars([("GITHUB_TOKEN", Some("gh-test"))], || {
-            let mut cfg = ServerConfig::default();
-            cfg.apply_env_overrides().unwrap();
-            assert_eq!(cfg.github_token, Some("gh-test".to_string()));
-        });
+        temp_env::with_vars(
+            [
+                ("GITHUB_TOKEN", Some("gh-test")),
+                ("GH_TOKEN", None::<&str>),
+            ],
+            || {
+                let mut cfg = ServerConfig::default();
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.github_token, Some("gh-test".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_gh_token_fallback() {
+        temp_env::with_vars(
+            [
+                ("GITHUB_TOKEN", None::<&str>),
+                ("GH_TOKEN", Some("gh-test")),
+            ],
+            || {
+                let mut cfg = ServerConfig::default();
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.github_token, Some("gh-test".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_github_token_precedes_gh_token() {
+        temp_env::with_vars(
+            [
+                ("GITHUB_TOKEN", Some("github-test")),
+                ("GH_TOKEN", Some("gh-test")),
+            ],
+            || {
+                let mut cfg = ServerConfig::default();
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.github_token, Some("github-test".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_empty_github_token_falls_back_to_gh_token() {
+        temp_env::with_vars(
+            [("GITHUB_TOKEN", Some("")), ("GH_TOKEN", Some("gh-test"))],
+            || {
+                let mut cfg = ServerConfig::default();
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.github_token, Some("gh-test".to_string()));
+            },
+        );
     }
 
     #[test]
@@ -384,14 +439,17 @@ mod tests {
 
     #[test]
     fn env_override_empty_github_token_does_not_override_toml_token() {
-        temp_env::with_vars([("GITHUB_TOKEN", Some(""))], || {
-            let mut cfg = ServerConfig {
-                github_token: Some("gh-real".to_string()),
-                ..ServerConfig::default()
-            };
-            cfg.apply_env_overrides().unwrap();
-            assert_eq!(cfg.github_token, Some("gh-real".to_string()));
-        });
+        temp_env::with_vars(
+            [("GITHUB_TOKEN", Some("")), ("GH_TOKEN", None::<&str>)],
+            || {
+                let mut cfg = ServerConfig {
+                    github_token: Some("gh-real".to_string()),
+                    ..ServerConfig::default()
+                };
+                cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.github_token, Some("gh-real".to_string()));
+            },
+        );
     }
 
     #[test]

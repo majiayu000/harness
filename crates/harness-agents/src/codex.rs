@@ -143,7 +143,12 @@ impl CodeAgent for CodexAgent {
         }
 
         let child = cmd.spawn().map_err(|err| {
-            harness_core::error::HarnessError::AgentExecution(format!("failed to run codex: {err}"))
+            harness_core::error::HarnessError::AgentExecution(format_spawn_error(
+                "codex",
+                &err,
+                &wrapped_command.program,
+                &req.project_root,
+            ))
         })?;
         let output = child.wait_with_output().await.map_err(|err| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -238,8 +243,11 @@ impl CodeAgent for CodexAgent {
         }
 
         let mut child = cmd.spawn().map_err(|error| {
-            harness_core::error::HarnessError::AgentExecution(format!(
-                "failed to run codex: {error}"
+            harness_core::error::HarnessError::AgentExecution(format_spawn_error(
+                "codex",
+                &error,
+                &wrapped_command.program,
+                &req.project_root,
             ))
         })?;
 
@@ -267,6 +275,25 @@ fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
         SandboxMode::DangerFullAccess => "danger-full-access",
     }
 }
+
+fn format_spawn_error(
+    agent_name: &str,
+    err: &std::io::Error,
+    program: &Path,
+    cwd: &Path,
+) -> String {
+    let cwd_status = match std::fs::metadata(cwd) {
+        Ok(metadata) if metadata.is_dir() => "exists".to_string(),
+        Ok(_) => "exists but is not a directory".to_string(),
+        Err(metadata_err) => format!("unavailable: {metadata_err}"),
+    };
+    format!(
+        "failed to run {agent_name}: {err}; program={}; cwd={}; cwd_status={cwd_status}",
+        program.display(),
+        cwd.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,6 +888,17 @@ printf 'third\n'
             codex_sandbox_mode(SandboxMode::DangerFullAccess),
             "danger-full-access"
         );
+    }
+
+    #[test]
+    fn spawn_error_reports_program_and_cwd() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing executable");
+        let message = format_spawn_error("codex", &err, Path::new("/missing/codex"), dir.path());
+
+        assert!(message.contains("program=/missing/codex"));
+        assert!(message.contains("cwd="));
+        assert!(message.contains("cwd_status=exists"));
     }
 
     #[test]

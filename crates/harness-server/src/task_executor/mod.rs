@@ -37,7 +37,7 @@ fn restricted_tools(profile: CapabilityProfile) -> anyhow::Result<Vec<String>> {
 use pr_detection::{
     build_fix_ci_prompt, parse_harness_mention_command, HarnessMentionCommand, PromptBuilder,
 };
-use pr_detection::{detect_repo_slug, find_existing_pr_for_issue};
+use pr_detection::{detect_repo_slug, find_existing_pr_for_issue_with_token};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -519,11 +519,15 @@ pub(crate) async fn run_task(
         (Some(plan), prompts::TriageComplexity::Medium, 0u32)
     } else if let Some(issue) = req.issue {
         // Only triage fresh issues (no existing PR to continue).
-        let has_existing_pr = find_existing_pr_for_issue(&project, issue)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
+        let has_existing_pr = find_existing_pr_for_issue_with_token(
+            &project,
+            issue,
+            server_config.server.github_token.as_deref(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
         if has_existing_pr {
             // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
             was_resumed_pr = true;
@@ -839,6 +843,7 @@ pub(crate) async fn run_task(
         task_start,
         repo_slug_for_review,
         jaccard_threshold,
+        server_config.server.github_token.as_deref(),
     )
     .await
 }

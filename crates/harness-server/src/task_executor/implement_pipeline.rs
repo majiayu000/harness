@@ -137,7 +137,13 @@ pub(crate) async fn run_implement_phase(
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
 
     let first_prompt = if let Some(issue) = req.issue {
-        let base = match super::pr_detection::find_existing_pr_for_issue(project, issue).await {
+        let base = match super::pr_detection::find_existing_pr_for_issue_with_token(
+            project,
+            issue,
+            server_config.server.github_token.as_deref(),
+        )
+        .await
+        {
             Ok(Some((pr_num, branch, pr_url))) => {
                 tracing::info!(
                     "reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}"
@@ -625,7 +631,11 @@ pub(crate) async fn run_implement_phase(
         // an already-created PR (issue #982).
         if pr_url.is_none() && task_needs_pr_url(req) {
             if let Some((fallback_num, fallback_url)) =
-                super::pr_detection::fallback_find_pr_by_branch(project).await
+                super::pr_detection::fallback_find_pr_by_branch_with_token(
+                    project,
+                    server_config.server.github_token.as_deref(),
+                )
+                .await
             {
                 tracing::info!(
                     task_id = %task_id,

@@ -1124,6 +1124,7 @@ pub fn build_orchestrator(
     data_dir: Option<&std::path::Path>,
     feishu_intake: Option<Arc<feishu::FeishuIntake>>,
     github_sources: Vec<Arc<dyn IntakeSource>>,
+    github_token: Option<String>,
 ) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
     let mut poll_interval = Duration::from_secs(30);
@@ -1152,7 +1153,11 @@ pub fn build_orchestrator(
                         label = %repo_cfg.label,
                         "intake: GitHub Issues poller registered (fallback)"
                     );
-                    let poller = github_issues::GitHubIssuesPoller::new(&repo_cfg, data_dir);
+                    let poller = github_issues::GitHubIssuesPoller::new_with_token(
+                        &repo_cfg,
+                        data_dir,
+                        github_token.clone(),
+                    );
                     sources.push(Arc::new(poller));
                 }
             } else {
@@ -1657,7 +1662,7 @@ mod tests {
     #[test]
     fn build_orchestrator_with_no_config_returns_empty_orchestrator() {
         let config = harness_core::config::intake::IntakeConfig::default();
-        let orchestrator = build_orchestrator(&config, None, None, vec![]);
+        let orchestrator = build_orchestrator(&config, None, None, vec![], None);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -1669,7 +1674,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None, None, vec![]);
+        let orchestrator = build_orchestrator(&config, None, None, vec![], None);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -1686,7 +1691,7 @@ mod tests {
             retry_backoff_max_secs: 90,
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None, None, vec![]);
+        let orchestrator = build_orchestrator(&config, None, None, vec![], None);
         assert_eq!(orchestrator.sources.len(), 1);
         assert_eq!(orchestrator.sources[0].name(), "github");
         assert_eq!(orchestrator.poll_interval, Duration::from_secs(60));
@@ -1707,7 +1712,7 @@ mod tests {
             default_repo: None,
         });
 
-        let orchestrator = build_orchestrator(&config, None, None, vec![]);
+        let orchestrator = build_orchestrator(&config, None, None, vec![], None);
         assert!(orchestrator.sources.is_empty());
     }
 }

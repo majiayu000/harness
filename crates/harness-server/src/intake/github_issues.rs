@@ -29,12 +29,21 @@ pub struct GitHubIssuesPoller {
     dispatched: DashMap<String, TaskId>,
     persist_path: Option<PathBuf>,
     task_checker: Option<Arc<dyn DispatchedTaskChecker>>,
+    github_token: Option<String>,
 }
 
 impl GitHubIssuesPoller {
     pub fn new(
         repo_config: &harness_core::config::intake::GitHubRepoConfig,
         data_dir: Option<&Path>,
+    ) -> Self {
+        Self::new_with_token(repo_config, data_dir, None)
+    }
+
+    pub fn new_with_token(
+        repo_config: &harness_core::config::intake::GitHubRepoConfig,
+        data_dir: Option<&Path>,
+        github_token: Option<String>,
     ) -> Self {
         let repo_slug = repo_config.repo.replace('/', "_");
         let persist_path = data_dir.map(|d| d.join(format!("github_dispatched_{repo_slug}.json")));
@@ -47,6 +56,7 @@ impl GitHubIssuesPoller {
             dispatched,
             persist_path,
             task_checker: None,
+            github_token,
         }
     }
 
@@ -261,10 +271,9 @@ impl IntakeSource for GitHubIssuesPoller {
         if !self.label.is_empty() {
             request = request.query(&[("labels", self.label.as_str())]);
         }
-        if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-            if !token.trim().is_empty() {
-                request = request.bearer_auth(token);
-            }
+        if let Some(token) = crate::github_auth::resolve_github_token(self.github_token.as_deref())
+        {
+            request = request.bearer_auth(token);
         }
         let response = request.send().await?;
         if !response.status().is_success() {
@@ -685,6 +694,27 @@ mod tests {
         };
         let poller = GitHubIssuesPoller::new(&repo_cfg, None);
         assert_eq!(poller.name(), "github");
+    }
+
+    #[test]
+    fn github_issues_poller_accepts_configured_token() {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller =
+            GitHubIssuesPoller::new_with_token(&repo_cfg, None, Some(" configured ".to_string()));
+
+        assert_eq!(
+            crate::github_auth::resolve_github_token_from_sources(
+                poller.github_token.as_deref(),
+                Some("env-github"),
+                Some("env-gh"),
+            )
+            .as_deref(),
+            Some("configured")
+        );
     }
 
     #[tokio::test]

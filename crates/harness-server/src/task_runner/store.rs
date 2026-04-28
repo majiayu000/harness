@@ -1091,13 +1091,23 @@ impl TaskStore {
     /// GitHub API failures are treated as transient network errors; the task is left
     /// Pending so it will be retried normally.
     pub async fn validate_recovered_tasks(&self, completion_callback: Option<CompletionCallback>) {
-        self.validate_recovered_tasks_with_github(completion_callback)
+        self.validate_recovered_tasks_with_github(completion_callback, None)
+            .await;
+    }
+
+    pub async fn validate_recovered_tasks_with_token(
+        &self,
+        completion_callback: Option<CompletionCallback>,
+        github_token: Option<&str>,
+    ) {
+        self.validate_recovered_tasks_with_github(completion_callback, github_token)
             .await;
     }
 
     async fn validate_recovered_tasks_with_github(
         &self,
         completion_callback: Option<CompletionCallback>,
+        github_token: Option<&str>,
     ) {
         let candidates = self.collect_recovered_pr_candidates();
 
@@ -1113,7 +1123,7 @@ impl TaskStore {
         // Probe PR states concurrently, but keep persistence and callbacks
         // serialized so terminal-state side effects preserve their current order.
         let mut results = futures::stream::iter(candidates)
-            .map(check_recovered_pr_state)
+            .map(|candidate| check_recovered_pr_state(candidate, github_token))
             .buffer_unordered(RECOVERED_PR_VALIDATION_CONCURRENCY);
 
         while let Some(result) = results.next().await {
@@ -1186,6 +1196,7 @@ fn recovered_pr_candidate(task: &TaskState) -> Option<RecoveredPrCandidate> {
 
 async fn check_recovered_pr_state(
     candidate: RecoveredPrCandidate,
+    github_token: Option<&str>,
 ) -> Option<RecoveredPrStatusUpdate> {
     let RecoveredPrCandidate { task_id, pr_url } = candidate;
     let Some((owner, repo, pr_number)) = super::spawn::parse_pr_url(&pr_url) else {
@@ -1203,10 +1214,8 @@ async fn check_recovered_pr_state(
         ))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header(reqwest::header::USER_AGENT, "harness-server");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-        if !token.trim().is_empty() {
-            request = request.bearer_auth(token);
-        }
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
     }
     let response = match tokio::time::timeout(RECOVERED_PR_VIEW_TIMEOUT, request.send()).await {
         Err(_elapsed) => {

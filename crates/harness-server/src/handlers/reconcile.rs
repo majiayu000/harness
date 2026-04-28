@@ -24,11 +24,12 @@ pub async fn handle(
         .reconciliation
         .max_gh_calls_per_minute;
 
-    let report = crate::reconciliation::run_once(
+    let report = crate::reconciliation::run_once_with_token(
         &state.core.tasks,
         &state.core.project_root,
         max_calls,
         params.dry_run,
+        state.core.server.config.server.github_token.as_deref(),
     )
     .await;
 

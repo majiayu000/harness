@@ -154,16 +154,14 @@ fn github_api_base_url() -> String {
         .to_string()
 }
 
-async fn github_get_json<T: DeserializeOwned>(path: &str) -> Option<T> {
+async fn github_get_json<T: DeserializeOwned>(path: &str, github_token: Option<&str>) -> Option<T> {
     let client = reqwest::Client::new();
     let mut request = client
         .get(format!("{}{}", github_api_base_url(), path))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header(reqwest::header::USER_AGENT, "harness-server");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-        if !token.trim().is_empty() {
-            request = request.bearer_auth(token);
-        }
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
     }
     let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
         Ok(Ok(response)) if response.status().is_success() => response,
@@ -204,29 +202,40 @@ fn classify_issue_state(state: &GitHubIssueState) -> GitHubState {
 }
 
 /// Fetch GitHub PR state from a full URL (e.g. `https://github.com/.../pull/42`).
-async fn fetch_pr_state_by_url(pr_url: &str) -> GitHubState {
+async fn fetch_pr_state_by_url(pr_url: &str, github_token: Option<&str>) -> GitHubState {
     let Some((owner, repo, pr_number)) = harness_core::prompts::parse_github_pr_url(pr_url) else {
         tracing::debug!(pr_url, "GitHub PR state check skipped for unparseable URL");
         return GitHubState::Unknown;
     };
-    fetch_pr_state_by_slug(&format!("{owner}/{repo}"), pr_number).await
+    fetch_pr_state_by_slug_with_token(&format!("{owner}/{repo}"), pr_number, github_token).await
 }
 
-/// Fetch GitHub PR state by repository slug and number.
-pub(crate) async fn fetch_pr_state_by_slug(repo_slug: &str, pr_num: u64) -> GitHubState {
-    let Some(state) =
-        github_get_json::<GitHubPullState>(&format!("/repos/{repo_slug}/pulls/{pr_num}")).await
+pub(crate) async fn fetch_pr_state_by_slug_with_token(
+    repo_slug: &str,
+    pr_num: u64,
+    github_token: Option<&str>,
+) -> GitHubState {
+    let Some(state) = github_get_json::<GitHubPullState>(
+        &format!("/repos/{repo_slug}/pulls/{pr_num}"),
+        github_token,
+    )
+    .await
     else {
         return GitHubState::Unknown;
     };
     classify_pr_state(&state)
 }
 
-/// Fetch issue state by repository slug and number.
-pub(crate) async fn fetch_issue_state(repo_slug: &str, issue_num: u64) -> GitHubState {
-    let Some(state) =
-        github_get_json::<GitHubIssueState>(&format!("/repos/{repo_slug}/issues/{issue_num}"))
-            .await
+pub(crate) async fn fetch_issue_state_with_token(
+    repo_slug: &str,
+    issue_num: u64,
+    github_token: Option<&str>,
+) -> GitHubState {
+    let Some(state) = github_get_json::<GitHubIssueState>(
+        &format!("/repos/{repo_slug}/issues/{issue_num}"),
+        github_token,
+    )
+    .await
     else {
         return GitHubState::Unknown;
     };
@@ -240,12 +249,22 @@ pub async fn run_once(
     max_gh_calls_per_minute: u32,
     dry_run: bool,
 ) -> ReconciliationReport {
+    run_once_with_token(store, project, max_gh_calls_per_minute, dry_run, None).await
+}
+
+pub async fn run_once_with_token(
+    store: &Arc<TaskStore>,
+    project: &Path,
+    max_gh_calls_per_minute: u32,
+    dry_run: bool,
+    github_token: Option<&str>,
+) -> ReconciliationReport {
     let (candidates, skipped_terminal) = collect_candidates(store);
     let mut rate = RateLimiter::new(max_gh_calls_per_minute);
     let mut transitions = Vec::new();
 
     for candidate in &candidates {
-        let gh_state = resolve_github_state(candidate, project, &mut rate).await;
+        let gh_state = resolve_github_state(candidate, project, &mut rate, github_token).await;
 
         let new_status = transition_for_github_state(gh_state);
 
@@ -303,12 +322,13 @@ async fn resolve_github_state(
     candidate: &Candidate,
     project: &Path,
     rate: &mut RateLimiter,
+    github_token: Option<&str>,
 ) -> GitHubState {
     // PR URL takes precedence — most candidates in `implementing`/`reviewing`
     // will have one.
     if let Some(pr_url) = &candidate.pr_url {
         rate.acquire().await;
-        return fetch_pr_state_by_url(pr_url).await;
+        return fetch_pr_state_by_url(pr_url, github_token).await;
     }
     let repo_slug = match candidate.repo.as_deref() {
         Some(repo) if !repo.trim().is_empty() => Some(repo.to_string()),
@@ -323,11 +343,11 @@ async fn resolve_github_state(
     };
     if let Some(pr_num) = candidate.pr_num_from_ext {
         rate.acquire().await;
-        return fetch_pr_state_by_slug(&repo_slug, pr_num).await;
+        return fetch_pr_state_by_slug_with_token(&repo_slug, pr_num, github_token).await;
     }
     if let Some(issue_num) = candidate.issue_num {
         rate.acquire().await;
-        return fetch_issue_state(&repo_slug, issue_num).await;
+        return fetch_issue_state_with_token(&repo_slug, issue_num, github_token).await;
     }
     GitHubState::Unknown
 }
@@ -386,11 +406,12 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
     sleep(Duration::from_secs(15)).await;
 
     loop {
-        let report = run_once(
+        let report = run_once_with_token(
             &state.core.tasks,
             &state.core.project_root,
             config.max_gh_calls_per_minute,
             false,
+            state.core.server.config.server.github_token.as_deref(),
         )
         .await;
 

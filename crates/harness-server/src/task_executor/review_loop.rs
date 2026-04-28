@@ -35,7 +35,11 @@ struct GitHubPullState {
 /// Returns [`PrExternalState::Unknown`] on any transient
 /// failure so callers do not abort a healthy review loop because of a flaky
 /// network call.
-async fn fetch_pr_external_state(pr_num: u64, project: &Path) -> PrExternalState {
+async fn fetch_pr_external_state(
+    pr_num: u64,
+    project: &Path,
+    github_token: Option<&str>,
+) -> PrExternalState {
     let Some(repo) = super::pr_detection::detect_repo_slug(project).await else {
         tracing::debug!(
             pr = pr_num,
@@ -50,10 +54,8 @@ async fn fetch_pr_external_state(pr_num: u64, project: &Path) -> PrExternalState
         ))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header(reqwest::header::USER_AGENT, "harness-server");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-        if !token.trim().is_empty() {
-            request = request.bearer_auth(token);
-        }
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
     }
     let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
         Ok(Ok(response)) if response.status().is_success() => response,
@@ -132,6 +134,7 @@ pub(crate) async fn run_review_loop(
     task_start: Instant,
     repo_slug: String,
     jaccard_threshold: f64,
+    github_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let review_phase_start = Instant::now();
 
@@ -172,7 +175,7 @@ pub(crate) async fn run_review_loop(
         // against stale work — short-circuit to the appropriate terminal
         // status. Unknown/transient failures fall through and continue the
         // normal review flow.
-        match fetch_pr_external_state(pr_num, project).await {
+        match fetch_pr_external_state(pr_num, project, github_token).await {
             PrExternalState::Merged => {
                 tracing::info!(
                     task_id = %task_id,

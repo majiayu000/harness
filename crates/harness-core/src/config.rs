@@ -69,7 +69,17 @@ impl HarnessConfig {
     /// precedence.
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
         self.server.apply_env_overrides()?;
+        self.apply_derived_defaults();
         Ok(())
+    }
+
+    /// Apply defaults that depend on other config fields.
+    ///
+    /// Serde field defaults cannot see sibling fields, so cross-field defaults
+    /// are resolved after loading, rebasing, and environment overrides.
+    pub fn apply_derived_defaults(&mut self) {
+        self.workspace
+            .use_data_dir_default_root(&self.server.data_dir);
     }
 
     /// Rebase all relative `PathBuf` fields against `base`.
@@ -720,6 +730,29 @@ mod tests {
         assert_eq!(config.before_remove_hook.as_deref(), Some("echo cleanup"));
         assert_eq!(config.hook_timeout_secs, 30);
         assert!(!config.auto_cleanup);
+    }
+
+    #[test]
+    fn derived_workspace_root_tracks_custom_data_dir_when_default() {
+        let mut config = HarnessConfig::default();
+        config.server.data_dir = PathBuf::from("/tmp/harness-two");
+        config.apply_derived_defaults();
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/harness-two/workspaces")
+        );
+    }
+
+    #[test]
+    fn derived_workspace_root_preserves_explicit_workspace_root() {
+        let mut config = HarnessConfig::default();
+        config.server.data_dir = PathBuf::from("/tmp/harness-two");
+        config.workspace.root = PathBuf::from("/tmp/shared-harness-workspaces");
+        config.apply_derived_defaults();
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/shared-harness-workspaces")
+        );
     }
 
     #[test]

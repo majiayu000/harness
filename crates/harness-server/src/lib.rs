@@ -19,6 +19,7 @@ pub mod contract_validator;
 pub mod dashboard;
 pub mod db;
 pub mod event_replay;
+pub(crate) mod github_auth;
 pub mod handlers;
 pub mod hook_enforcer;
 pub mod http;
