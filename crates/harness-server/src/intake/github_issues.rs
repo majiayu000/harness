@@ -186,8 +186,8 @@ struct GhIssue {
     number: u64,
     title: String,
     body: Option<String>,
-    #[serde(alias = "html_url")]
     url: String,
+    html_url: Option<String>,
     #[serde(default)]
     labels: Vec<GhLabel>,
     #[serde(alias = "createdAt")]
@@ -231,7 +231,7 @@ fn parse_gh_output(
             title: issue.title,
             description: issue.body,
             repo: Some(repo.to_string()),
-            url: Some(issue.url),
+            url: Some(issue.html_url.unwrap_or(issue.url)),
             priority: None,
             labels: issue.labels.into_iter().map(|l| l.name).collect(),
             created_at: issue.created_at,
@@ -268,7 +268,11 @@ impl IntakeSource for GitHubIssuesPoller {
         }
         let response = request.send().await?;
         if !response.status().is_success() {
-            anyhow::bail!("GitHub issue list failed with status {}", response.status());
+            anyhow::bail!(
+                "GitHub issue list failed for {} with status {}",
+                self.repo,
+                response.status()
+            );
         }
         let body = response.bytes().await?;
 
@@ -412,6 +416,29 @@ mod tests {
             Some("https://github.com/owner/repo/issues/42")
         );
         assert_eq!(issue.labels, vec!["harness", "bug"]);
+    }
+
+    #[test]
+    fn parse_gh_output_accepts_api_url_and_html_url() {
+        let json = br#"[
+            {
+                "number": 42,
+                "title": "Fix login bug",
+                "body": null,
+                "url": "https://api.github.com/repos/owner/repo/issues/42",
+                "html_url": "https://github.com/owner/repo/issues/42",
+                "labels": []
+            }
+        ]"#;
+
+        let dispatched = DashMap::new();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
+
+        assert_eq!(parsed.new_issues.len(), 1);
+        assert_eq!(
+            parsed.new_issues[0].url.as_deref(),
+            Some("https://github.com/owner/repo/issues/42")
+        );
     }
 
     #[test]
