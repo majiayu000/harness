@@ -1,8 +1,5 @@
 use anyhow::Context;
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{Migration, PgStoreContext};
 use harness_core::{types::Thread, types::ThreadId, types::ThreadStatus};
 use sqlx::postgres::PgPool;
 use std::path::Path;
@@ -35,22 +32,9 @@ impl ThreadDb {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let database_url = resolve_database_url(configured_database_url)?;
-        use sha2::{Digest, Sha256};
-        let path_utf8 = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
-
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, THREAD_MIGRATIONS).run().await?;
+        let pool = PgStoreContext::from_path(path, configured_database_url)?
+            .open_migrated_pool(THREAD_MIGRATIONS)
+            .await?;
         Ok(Self { pool })
     }
 
@@ -148,6 +132,7 @@ impl ThreadRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::db::resolve_database_url;
     use std::path::PathBuf;
 
     async fn open_test_db() -> anyhow::Result<Option<ThreadDb>> {

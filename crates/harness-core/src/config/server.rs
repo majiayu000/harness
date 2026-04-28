@@ -260,11 +260,19 @@ fn default_constitution_enabled() -> bool {
 mod tests {
     use super::*;
 
+    fn with_env_vars<const N: usize, F>(vars: [(&str, Option<&str>); N], f: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = crate::test_support::process_env_lock();
+        temp_env::with_vars(vars, f);
+    }
+
     // --- env override tests ---
 
     #[test]
     fn env_override_http_addr() {
-        temp_env::with_vars([("HARNESS_HTTP_ADDR", Some("127.0.0.1:9801"))], || {
+        with_env_vars([("HARNESS_HTTP_ADDR", Some("127.0.0.1:9801"))], || {
             let mut cfg = ServerConfig::default();
             cfg.apply_serve_env_overrides().unwrap();
             assert_eq!(cfg.http_addr.port(), 9801);
@@ -273,7 +281,7 @@ mod tests {
 
     #[test]
     fn env_override_http_addr_empty_leaves_default() {
-        temp_env::with_vars([("HARNESS_HTTP_ADDR", Some(""))], || {
+        with_env_vars([("HARNESS_HTTP_ADDR", Some(""))], || {
             let mut cfg = ServerConfig::default();
             cfg.apply_serve_env_overrides().unwrap();
             assert_eq!(cfg.http_addr.port(), 9800);
@@ -282,7 +290,7 @@ mod tests {
 
     #[test]
     fn env_override_data_dir() {
-        temp_env::with_vars([("HARNESS_DATA_DIR", Some("/tmp/testdir"))], || {
+        with_env_vars([("HARNESS_DATA_DIR", Some("/tmp/testdir"))], || {
             let mut cfg = ServerConfig::default();
             cfg.apply_env_overrides().unwrap();
             assert_eq!(cfg.data_dir, std::path::PathBuf::from("/tmp/testdir"));
@@ -291,7 +299,7 @@ mod tests {
 
     #[test]
     fn env_override_empty_data_dir_does_not_override() {
-        temp_env::with_vars([("HARNESS_DATA_DIR", Some(""))], || {
+        with_env_vars([("HARNESS_DATA_DIR", Some(""))], || {
             let default = ServerConfig::default();
             let mut cfg = ServerConfig::default();
             cfg.apply_env_overrides().unwrap();
@@ -301,7 +309,7 @@ mod tests {
 
     #[test]
     fn env_override_empty_project_root_does_not_override() {
-        temp_env::with_vars([("HARNESS_PROJECT_ROOT", Some(""))], || {
+        with_env_vars([("HARNESS_PROJECT_ROOT", Some(""))], || {
             let default = ServerConfig::default();
             let mut cfg = ServerConfig::default();
             cfg.apply_env_overrides().unwrap();
@@ -311,7 +319,7 @@ mod tests {
 
     #[test]
     fn env_override_database_url() {
-        temp_env::with_vars(
+        with_env_vars(
             [(
                 "HARNESS_DATABASE_URL",
                 Some("postgres://env-user:env-pass@env-host:5432/envdb"),
@@ -329,7 +337,7 @@ mod tests {
 
     #[test]
     fn env_override_empty_database_url_does_not_override_toml_url() {
-        temp_env::with_vars([("HARNESS_DATABASE_URL", Some(""))], || {
+        with_env_vars([("HARNESS_DATABASE_URL", Some(""))], || {
             let mut cfg = ServerConfig {
                 database_url: Some("postgres://cfg-user:cfg-pass@cfg-host:5432/cfgdb".to_string()),
                 ..ServerConfig::default()
@@ -344,7 +352,7 @@ mod tests {
 
     #[test]
     fn env_override_api_token() {
-        temp_env::with_vars([("HARNESS_API_TOKEN", Some("tok-test"))], || {
+        with_env_vars([("HARNESS_API_TOKEN", Some("tok-test"))], || {
             let mut cfg = ServerConfig::default();
             cfg.apply_env_overrides().unwrap();
             assert_eq!(cfg.api_token, Some("tok-test".to_string()));
@@ -353,7 +361,7 @@ mod tests {
 
     #[test]
     fn env_override_github_token_fallback() {
-        temp_env::with_vars([("GITHUB_TOKEN", Some("gh-test"))], || {
+        with_env_vars([("GITHUB_TOKEN", Some("gh-test"))], || {
             let mut cfg = ServerConfig::default();
             cfg.apply_env_overrides().unwrap();
             assert_eq!(cfg.github_token, Some("gh-test".to_string()));
@@ -362,7 +370,7 @@ mod tests {
 
     #[test]
     fn env_override_invalid_addr_returns_error() {
-        temp_env::with_vars([("HARNESS_HTTP_ADDR", Some("not-an-addr"))], || {
+        with_env_vars([("HARNESS_HTTP_ADDR", Some("not-an-addr"))], || {
             let mut cfg = ServerConfig::default();
             let result = cfg.apply_serve_env_overrides();
             assert!(result.is_err());
@@ -371,7 +379,7 @@ mod tests {
 
     #[test]
     fn env_override_empty_api_token_does_not_override_toml_token() {
-        temp_env::with_vars([("HARNESS_API_TOKEN", Some(""))], || {
+        with_env_vars([("HARNESS_API_TOKEN", Some(""))], || {
             let mut cfg = ServerConfig {
                 api_token: Some("real-token".to_string()),
                 ..ServerConfig::default()
@@ -384,7 +392,7 @@ mod tests {
 
     #[test]
     fn env_override_empty_github_token_does_not_override_toml_token() {
-        temp_env::with_vars([("GITHUB_TOKEN", Some(""))], || {
+        with_env_vars([("GITHUB_TOKEN", Some(""))], || {
             let mut cfg = ServerConfig {
                 github_token: Some("gh-real".to_string()),
                 ..ServerConfig::default()
@@ -396,7 +404,7 @@ mod tests {
 
     #[test]
     fn env_override_github_webhook_secret() {
-        temp_env::with_vars([("GITHUB_WEBHOOK_SECRET", Some("wh-secret-env"))], || {
+        with_env_vars([("GITHUB_WEBHOOK_SECRET", Some("wh-secret-env"))], || {
             let mut cfg = ServerConfig::default();
             cfg.apply_env_overrides().unwrap();
             assert_eq!(cfg.github_webhook_secret, Some("wh-secret-env".to_string()));
@@ -405,7 +413,7 @@ mod tests {
 
     #[test]
     fn env_override_empty_github_webhook_secret_does_not_override_toml_secret() {
-        temp_env::with_vars([("GITHUB_WEBHOOK_SECRET", Some(""))], || {
+        with_env_vars([("GITHUB_WEBHOOK_SECRET", Some(""))], || {
             let mut cfg = ServerConfig {
                 github_webhook_secret: Some("wh-real".to_string()),
                 ..ServerConfig::default()
@@ -417,7 +425,7 @@ mod tests {
 
     #[test]
     fn env_override_absent_vars_leave_defaults() {
-        temp_env::with_vars(
+        with_env_vars(
             [
                 ("HARNESS_HTTP_ADDR", None::<&str>),
                 ("HARNESS_DATA_DIR", None::<&str>),

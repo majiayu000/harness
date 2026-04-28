@@ -5,13 +5,13 @@ use std::str::FromStr as _;
 
 use crate::db::Migration;
 
-const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
+const DEFAULT_PG_MAX_CONNECTIONS: u32 = 1;
 const SUPABASE_POOLER_MAX_CONNECTIONS: u32 = 1;
 
 fn pg_max_connections(database_url: &str) -> u32 {
-    // Supabase's session pooler has a tight session cap relative to the
-    // number of independent Postgres-backed stores the workspace tests create.
-    // Budget one session per store there to avoid test-time pool starvation.
+    // Harness currently opens independent pools per logical store. Keep the
+    // per-store default conservative so parallel startup/tests do not multiply
+    // a modest Postgres connection budget into pool starvation.
     if database_url.contains(".pooler.supabase.com") {
         SUPABASE_POOLER_MAX_CONNECTIONS
     } else {
@@ -130,9 +130,87 @@ fn load_database_url_from_path(path: &Path) -> anyhow::Result<Option<String>> {
         .map(ToOwned::to_owned))
 }
 
+/// Derive the legacy per-store Postgres schema name from a store identity path.
+///
+/// Historical SQLite-backed stores accepted a database file path. The Postgres
+/// backend preserves that identity boundary by hashing the path into a stable
+/// schema name, so existing data remains addressable after this helper is used
+/// by all stores.
+pub fn pg_schema_for_path(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let path_utf8 = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
+    let digest = Sha256::digest(path_utf8.as_bytes());
+    let mut schema_bytes = [0u8; 8];
+    schema_bytes.copy_from_slice(&digest[..8]);
+    Ok(format!("h{:016x}", u64::from_le_bytes(schema_bytes)))
+}
+
+/// Postgres context for a single logical store.
+///
+/// This centralizes the strategy that used to be repeated by every store:
+/// resolve the configured URL, derive or validate the schema, create the
+/// schema, open a schematized pool, and optionally run migrations.
+#[derive(Clone, Debug)]
+pub struct PgStoreContext {
+    database_url: String,
+    schema: String,
+}
+
+impl PgStoreContext {
+    pub fn from_path(path: &Path, configured_database_url: Option<&str>) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
+        Self::new(database_url, pg_schema_for_path(path)?)
+    }
+
+    pub fn from_schema(
+        schema: &str,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let database_url = resolve_database_url(configured_database_url)?;
+        Self::new(database_url, schema.to_string())
+    }
+
+    pub fn new(database_url: impl Into<String>, schema: impl Into<String>) -> anyhow::Result<Self> {
+        let database_url = database_url.into().trim().to_string();
+        if database_url.is_empty() {
+            anyhow::bail!("database URL must not be empty");
+        }
+        let schema = schema.into();
+        validate_schema_name(&schema)?;
+        Ok(Self {
+            database_url,
+            schema,
+        })
+    }
+
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub async fn open_pool(&self) -> anyhow::Result<PgPool> {
+        let setup = pg_open_pool(&self.database_url).await?;
+        pg_create_schema_if_not_exists(&setup, &self.schema).await?;
+        setup.close().await;
+        pg_open_pool_schematized(&self.database_url, &self.schema).await
+    }
+
+    pub async fn open_migrated_pool(&self, migrations: &[Migration]) -> anyhow::Result<PgPool> {
+        let pool = self.open_pool().await?;
+        PgMigrator::new(&pool, migrations).run().await?;
+        Ok(pool)
+    }
+}
+
 /// Create a Postgres connection pool for the given connection string.
 ///
-/// Uses 8 max connections by default, or 1 for Supabase pooler URLs, with a
+/// Uses 1 max connection per logical store by default, with a
 /// 10-second acquire timeout.
 pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
@@ -314,10 +392,11 @@ impl<'a> PgMigrator<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        pg_max_connections, resolve_database_url, validate_schema_name, DEFAULT_PG_MAX_CONNECTIONS,
+        pg_max_connections, pg_schema_for_path, resolve_database_url, validate_schema_name,
+        PgStoreContext, DEFAULT_PG_MAX_CONNECTIONS,
     };
-
-    static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_support::process_env_lock;
+    use std::path::Path;
 
     struct CurrentDirGuard {
         original: std::path::PathBuf,
@@ -403,8 +482,42 @@ mod tests {
     }
 
     #[test]
+    fn pg_schema_for_path_preserves_legacy_hash_format() {
+        let schema = pg_schema_for_path(Path::new("/tmp/harness/tasks.db"))
+            .expect("path schema should resolve");
+
+        assert_eq!(schema, "h1b76aa87802f7705");
+    }
+
+    #[test]
+    fn pg_store_context_from_path_uses_configured_url_and_path_schema() {
+        let context = PgStoreContext::from_path(
+            Path::new("/tmp/harness/tasks.db"),
+            Some(" postgres://user:pass@localhost:5432/harness "),
+        )
+        .expect("store context should resolve");
+
+        assert_eq!(
+            context.database_url(),
+            "postgres://user:pass@localhost:5432/harness"
+        );
+        assert_eq!(context.schema(), "h1b76aa87802f7705");
+    }
+
+    #[test]
+    fn pg_store_context_rejects_invalid_schema() {
+        let err = PgStoreContext::new("postgres://user:pass@localhost:5432/harness", "bad-schema")
+            .expect_err("invalid schema should fail");
+
+        assert!(
+            err.to_string().contains("ASCII letters"),
+            "error should explain schema validation, got: {err}"
+        );
+    }
+
+    #[test]
     fn configured_database_url_wins_over_config_sources() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         temp_env::with_vars(
             [
                 (
@@ -427,7 +540,7 @@ mod tests {
 
     #[test]
     fn harness_database_url_used_as_config_override() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::enter(dir.path());
         let xdg = dir.path().join("xdg");
@@ -454,7 +567,7 @@ mod tests {
 
     #[test]
     fn discovered_config_database_url_used_as_fallback() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::enter(dir.path());
         let xdg = dir.path().join("xdg");
@@ -493,7 +606,7 @@ mod tests {
 
     #[test]
     fn repository_default_config_database_url_used_as_fallback() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let xdg = dir.path().join("xdg");
         let repo_config = dir.path().join("config");
@@ -533,7 +646,7 @@ mod tests {
 
     #[test]
     fn bare_database_url_is_ignored_without_config() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::enter(dir.path());
         let xdg = dir.path().join("xdg");
@@ -560,7 +673,7 @@ mod tests {
 
     #[test]
     fn missing_database_url_returns_error() {
-        let _lock = CONFIG_ENV_LOCK.lock().expect("config env lock");
+        let _lock = process_env_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CurrentDirGuard::enter(dir.path());
         let xdg = dir.path().join("xdg");

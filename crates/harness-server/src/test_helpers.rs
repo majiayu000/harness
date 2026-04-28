@@ -54,7 +54,6 @@ impl Drop for HomeGuard {
 use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
-use sha2::{Digest, Sha256};
 
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
@@ -117,13 +116,7 @@ pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> 
 pub async fn drop_tasks_table(dir: &std::path::Path) -> anyhow::Result<()> {
     let db_path = harness_core::config::dirs::default_db_path(dir, "tasks");
     let database_url = harness_core::db::resolve_database_url(None)?;
-    let path_utf8 = db_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", db_path))?;
-    let digest = Sha256::digest(path_utf8.as_bytes());
-    let mut schema_bytes = [0u8; 8];
-    schema_bytes.copy_from_slice(&digest[..8]);
-    let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
+    let schema = harness_core::db::pg_schema_for_path(&db_path)?;
     let pool = harness_core::db::pg_open_pool_schematized(&database_url, &schema).await?;
     sqlx::query("DROP TABLE tasks CASCADE")
         .execute(&pool)

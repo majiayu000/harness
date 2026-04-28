@@ -1,10 +1,6 @@
 use chrono::{DateTime, Utc};
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{pg_schema_for_path, Migration, PgStoreContext};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
 use sqlx::Postgres;
 use std::path::Path;
@@ -246,13 +242,7 @@ pub fn workflow_id(project_id: &str, repo: Option<&str>, issue_number: u64) -> S
 }
 
 pub fn legacy_schema_for_path(path: &Path) -> anyhow::Result<String> {
-    let path_utf8 = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-    let digest = Sha256::digest(path_utf8.as_bytes());
-    let mut schema_bytes = [0u8; 8];
-    schema_bytes.copy_from_slice(&digest[..8]);
-    Ok(format!("h{:016x}", u64::from_le_bytes(schema_bytes)))
+    pg_schema_for_path(path)
 }
 
 pub struct IssueWorkflowStore {
@@ -268,16 +258,9 @@ impl IssueWorkflowStore {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let database_url = resolve_database_url(configured_database_url)?;
         let schema = legacy_schema_for_path(path)?;
-
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, ISSUE_WORKFLOW_MIGRATIONS)
-            .run()
+        let pool = PgStoreContext::from_schema(&schema, configured_database_url)?
+            .open_migrated_pool(ISSUE_WORKFLOW_MIGRATIONS)
             .await?;
         Ok(Self { pool })
     }
@@ -286,14 +269,8 @@ impl IssueWorkflowStore {
         configured_database_url: Option<&str>,
         schema: &str,
     ) -> anyhow::Result<Self> {
-        let database_url = resolve_database_url(configured_database_url)?;
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, schema).await?;
-        PgMigrator::new(&pool, ISSUE_WORKFLOW_MIGRATIONS)
-            .run()
+        let pool = PgStoreContext::from_schema(schema, configured_database_url)?
+            .open_migrated_pool(ISSUE_WORKFLOW_MIGRATIONS)
             .await?;
         Ok(Self { pool })
     }
@@ -928,6 +905,7 @@ impl IssueWorkflowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::db::resolve_database_url;
 
     async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
         if resolve_database_url(None).is_err() {
