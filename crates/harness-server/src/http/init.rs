@@ -322,9 +322,8 @@ pub(crate) fn build_completion_callback(
                         if let Some((owner, repo, pr_num)) =
                             harness_core::prompts::parse_github_pr_url(pr_url)
                         {
-                            let resolved_token = github_token
-                                .or_else(|| std::env::var("GITHUB_TOKEN").ok())
-                                .filter(|t| !t.is_empty());
+                            let resolved_token =
+                                crate::github_auth::resolve_github_token(github_token.as_deref());
                             match resolved_token {
                                 Some(token) => {
                                     if let Err(e) = post_review_bot_comment(
@@ -351,7 +350,7 @@ pub(crate) fn build_completion_callback(
                                 _ => {
                                     tracing::warn!(
                                         pr_url,
-                                        "review_bot_auto_trigger: GITHUB_TOKEN not set or empty; skipping"
+                                        "review_bot_auto_trigger: GitHub token not configured; skipping"
                                     );
                                 }
                             }

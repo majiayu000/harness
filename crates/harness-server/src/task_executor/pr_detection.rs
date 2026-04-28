@@ -218,9 +218,10 @@ pub(crate) fn build_pr_approved_prompt(
 /// closing relationship** to the issue are returned. The match is any of:
 /// - a closing keyword in title or body: `closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve #N`
 /// - the `(#N)` suffix pattern that harness uses in its own PR titles
-pub(crate) async fn find_existing_pr_for_issue(
+pub(crate) async fn find_existing_pr_for_issue_with_token(
     project: &Path,
     issue: u64,
+    github_token: Option<&str>,
 ) -> anyhow::Result<Option<(u64, String, String)>> {
     let Some(repo_slug) = detect_repo_slug(project).await else {
         tracing::debug!(
@@ -237,10 +238,8 @@ pub(crate) async fn find_existing_pr_for_issue(
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header(reqwest::header::USER_AGENT, "harness-server");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-        if !token.trim().is_empty() {
-            request = request.bearer_auth(token);
-        }
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
     }
     let response =
         match tokio::time::timeout(std::time::Duration::from_secs(10), request.send()).await {

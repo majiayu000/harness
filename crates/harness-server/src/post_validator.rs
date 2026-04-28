@@ -18,6 +18,7 @@ pub struct PostExecutionValidator {
     config: ValidationConfig,
     /// Deprecated test-only field retained for struct literal compatibility.
     gh_bin: String,
+    github_token: Option<String>,
 }
 
 /// Classify a command string into a human-readable error prefix.
@@ -91,9 +92,14 @@ pub(crate) fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
 
 impl PostExecutionValidator {
     pub fn new(config: ValidationConfig) -> Self {
+        Self::new_with_github_token(config, None)
+    }
+
+    pub fn new_with_github_token(config: ValidationConfig, github_token: Option<String>) -> Self {
         Self {
             config,
             gh_bin: "gh".to_string(),
+            github_token,
         }
     }
 
@@ -103,6 +109,7 @@ impl PostExecutionValidator {
         pr_url: &str,
         _project: &Path,
         timeout_secs: u64,
+        github_token: Option<&str>,
     ) -> Result<(), String> {
         let (repo, pr_number) = parse_github_pr_url(pr_url)
             .ok_or_else(|| format!("Could not parse GitHub PR URL: {pr_url}"))?;
@@ -113,10 +120,8 @@ impl PostExecutionValidator {
             ))
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(reqwest::header::USER_AGENT, "harness-server");
-        if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-            if !token.trim().is_empty() {
-                request = request.bearer_auth(token);
-            }
+        if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+            request = request.bearer_auth(token);
         }
 
         let result = timeout(Duration::from_secs(timeout_secs), request.send()).await;
@@ -151,11 +156,13 @@ impl PostExecutionValidator {
         pr_url: &str,
         project: &Path,
         timeout_secs: u64,
+        github_token: Option<&str>,
     ) -> Result<(), String> {
         let max_attempts = 3;
         let mut last_err = String::new();
         for attempt in 1..=max_attempts {
-            match Self::verify_pr_exists(gh_bin, pr_url, project, timeout_secs).await {
+            match Self::verify_pr_exists(gh_bin, pr_url, project, timeout_secs, github_token).await
+            {
                 Ok(()) => return Ok(()),
                 Err(e) if !Self::is_transient_error(&e) => return Err(e),
                 Err(e) => {
@@ -286,7 +293,7 @@ impl TurnInterceptor for PostExecutionValidator {
         }
 
         // PR existence verification: if the agent output contains a PR_URL,
-        // verify via `gh pr view` that the PR actually exists on GitHub.
+        // verify via the GitHub REST API that the PR actually exists on GitHub.
         // This prevents silently succeeding when an agent claims to have created
         // a PR that does not exist. Runs only when all other validations pass
         // to avoid noisy failures from incomplete code.
@@ -295,8 +302,8 @@ impl TurnInterceptor for PostExecutionValidator {
                 // Guard: only verify URLs that look like a real GitHub PR
                 // (contain /pull/{number}).  Non-PR URLs are silently skipped.
                 if prompts::extract_pr_number(&pr_url).is_some() {
-                    // Use the full URL so `gh` resolves the exact repo the
-                    // agent targeted, not the repo of the current checkout.
+                    // Use the full URL so the API targets the exact repo the
+                    // agent used, not the repo of the current checkout.
                     // This prevents false passes (same PR number in local repo)
                     // and false failures (PR opened against a fork or different
                     // repo).
@@ -309,6 +316,7 @@ impl TurnInterceptor for PostExecutionValidator {
                         &pr_url,
                         project,
                         self.config.timeout_secs,
+                        self.github_token.as_deref(),
                     )
                     .await
                     {
@@ -760,6 +768,7 @@ mod tests {
             "https://example.com/not-a-pr",
             dir.path(),
             1,
+            None,
         )
         .await
         .unwrap_err();

@@ -416,6 +416,7 @@ fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
         SandboxMode::DangerFullAccess => "danger-full-access",
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

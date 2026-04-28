@@ -776,6 +776,7 @@ impl WorkspaceManager {
         source_repo: &Path,
         _gh_bin: &str,
         max_rate: u32,
+        github_token: Option<&str>,
     ) -> DiskReconciliationSummary {
         let mut summary = DiskReconciliationSummary::default();
         let read_dir = match std::fs::read_dir(&self.config.root) {
@@ -829,10 +830,16 @@ impl WorkspaceManager {
 
             let gh_state = if let Some(n) = issue_num {
                 rate.acquire().await;
-                crate::reconciliation::fetch_issue_state(&repo_slug, n).await
+                crate::reconciliation::fetch_issue_state_with_token(&repo_slug, n, github_token)
+                    .await
             } else if let Some(n) = pr_num {
                 rate.acquire().await;
-                crate::reconciliation::fetch_pr_state_by_slug(&repo_slug, n).await
+                crate::reconciliation::fetch_pr_state_by_slug_with_token(
+                    &repo_slug,
+                    n,
+                    github_token,
+                )
+                .await
             } else {
                 crate::reconciliation::GitHubState::Unknown
             };
@@ -2470,7 +2477,9 @@ mod tests {
             .expect("create workspace");
         mgr.release_workspace(&task_id);
 
-        let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
+        let summary = mgr
+            .reconcile_disk_workspaces(source.path(), "gh", 20, None)
+            .await;
 
         assert_eq!(summary.skipped_uuid, 1);
         assert_eq!(summary.removed, 0);
@@ -2514,7 +2523,9 @@ mod tests {
             github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
         let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
-        let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
+        let summary = mgr
+            .reconcile_disk_workspaces(source.path(), "gh", 20, None)
+            .await;
 
         assert_eq!(summary.removed, 1);
         assert!(!issue_dir.exists(), "closed issue workspace removed");
@@ -2552,7 +2563,9 @@ mod tests {
             github_state_server("/repos/myorg/my-repo/issues/7", r#"{"state":"open"}"#).await;
         let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
-        let summary = mgr.reconcile_disk_workspaces(source.path(), "gh", 20).await;
+        let summary = mgr
+            .reconcile_disk_workspaces(source.path(), "gh", 20, None)
+            .await;
 
         assert_eq!(summary.removed, 0);
         assert_eq!(summary.skipped_open, 1);

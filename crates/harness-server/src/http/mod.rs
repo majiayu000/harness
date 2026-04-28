@@ -150,11 +150,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             .config
             .reconciliation
             .max_gh_calls_per_minute;
-        crate::reconciliation::run_once(
+        crate::reconciliation::run_once_with_token(
             &state.core.tasks,
             &state.core.project_root,
             max_calls,
             false,
+            state.core.server.config.server.github_token.as_deref(),
         )
         .await;
     }
@@ -207,6 +208,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         )),
         state.intake.feishu_intake.clone(),
         github_sources,
+        state.core.server.config.server.github_token.clone(),
     )
     .start(state.clone());
 
