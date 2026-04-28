@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { render, screen, within, fireEvent } from "@testing-library/react";
+import { render, screen, within, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Active } from "./Active";
 import type { Task } from "@/types";
@@ -28,10 +28,16 @@ vi.mock("@/components/TaskDetailSlideover", () => ({
   },
 }));
 
+vi.mock("@/lib/api", () => ({
+  apiFetch: vi.fn(() => Promise.resolve(undefined)),
+}));
+
 import { useTasks, useDashboard } from "@/lib/queries";
+import { apiFetch } from "@/lib/api";
 
 const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
 const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
+const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 
 function makeTask(id: string, project: string | null, status = "running", task_kind = "issue"): Task {
   return {
@@ -79,6 +85,7 @@ const tasks = [
 
 describe("<Active>", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     mockUseDashboard.mockReturnValue({ data: undefined });
   });
 
@@ -127,6 +134,27 @@ describe("<Active>", () => {
     expect(columnCount("Feedback")).toBe("1");
     expect(columnCount("Implementing")).toBe("0");
     expect(columnCount("Pending")).toBe("0");
+  });
+
+  it("keeps ready-to-merge terminal tasks visible and mergeable", async () => {
+    const ready = {
+      ...makeTask("ready-task", "harness", "done"),
+      pr_url: "https://github.com/owner/repo/pull/123",
+      workflow: { state: "ready_to_merge", pr_number: 123 },
+    };
+    mockUseTasks.mockReturnValue({ data: [ready], isLoading: false, isError: false });
+
+    wrap(<Active projectFilter="harness" />);
+
+    expect(screen.getByText("wf Ready To Merge")).toBeInTheDocument();
+    expect(columnCount("Ready")).toBe("1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith("/tasks/ready-task/merge", { method: "POST" });
+    });
+    expect(screen.queryByTestId("task-slideover")).not.toBeInTheDocument();
   });
 
   it("groups planner and review lifecycle statuses outside implementing", () => {
