@@ -153,10 +153,19 @@ pub fn pg_schema_for_path(path: &Path) -> anyhow::Result<String> {
 /// This centralizes the strategy that used to be repeated by every store:
 /// resolve the configured URL, derive or validate the schema, create the
 /// schema, open a schematized pool, and optionally run migrations.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PgStoreContext {
     database_url: String,
     schema: String,
+}
+
+impl std::fmt::Debug for PgStoreContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgStoreContext")
+            .field("database_url", &"[REDACTED]")
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 impl PgStoreContext {
@@ -502,6 +511,23 @@ mod tests {
             "postgres://user:pass@localhost:5432/harness"
         );
         assert_eq!(context.schema(), "h1b76aa87802f7705");
+    }
+
+    #[test]
+    fn pg_store_context_debug_redacts_database_url() {
+        let context = PgStoreContext::new(
+            "postgres://user:secret@localhost:5432/harness",
+            "h1b76aa87802f7705",
+        )
+        .expect("store context should resolve");
+        let debug = format!("{context:?}");
+
+        assert!(debug.contains("database_url: \"[REDACTED]\""));
+        assert!(debug.contains("schema: \"h1b76aa87802f7705\""));
+        assert!(
+            !debug.contains("secret"),
+            "debug output must not expose database credentials: {debug}"
+        );
     }
 
     #[test]
