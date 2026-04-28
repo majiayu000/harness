@@ -241,6 +241,67 @@ pub fn workflow_id(project_id: &str, repo: Option<&str>, issue_number: u64) -> S
     )
 }
 
+fn state_progress_rank(state: IssueLifecycleState) -> u8 {
+    match state {
+        IssueLifecycleState::Discovered => 0,
+        IssueLifecycleState::Scheduled => 1,
+        IssueLifecycleState::Implementing => 2,
+        IssueLifecycleState::PrOpen => 3,
+        IssueLifecycleState::AwaitingFeedback => 4,
+        IssueLifecycleState::AddressingFeedback => 5,
+        IssueLifecycleState::ReadyToMerge | IssueLifecycleState::Blocked => 6,
+        IssueLifecycleState::Done
+        | IssueLifecycleState::Failed
+        | IssueLifecycleState::Cancelled => 7,
+    }
+}
+
+fn repaired_workflow_supersedes_existing(
+    existing: &IssueWorkflowInstance,
+    repaired: &IssueWorkflowInstance,
+) -> bool {
+    let existing_rank = state_progress_rank(existing.state);
+    let repaired_rank = state_progress_rank(repaired.state);
+    repaired_rank > existing_rank
+        || (repaired_rank == existing_rank && repaired.updated_at > existing.updated_at)
+}
+
+fn merge_repaired_workflow_conflict(
+    existing: &IssueWorkflowInstance,
+    repaired: &IssueWorkflowInstance,
+) -> IssueWorkflowInstance {
+    let repaired_wins = repaired_workflow_supersedes_existing(existing, repaired);
+    let mut merged = if repaired_wins {
+        repaired.clone()
+    } else {
+        existing.clone()
+    };
+    let fallback = if repaired_wins { existing } else { repaired };
+
+    if merged.repo.is_none() {
+        merged.repo = fallback.repo.clone();
+    }
+    if merged.pr_number.is_none() {
+        merged.pr_number = fallback.pr_number;
+    }
+    if merged.pr_url.is_none() {
+        merged.pr_url = fallback.pr_url.clone();
+    }
+    if merged.labels_snapshot.is_empty() && !fallback.labels_snapshot.is_empty() {
+        merged.labels_snapshot = fallback.labels_snapshot.clone();
+    }
+    merged.force_execute |= fallback.force_execute;
+    if merged.plan_concern.is_none() {
+        merged.plan_concern = fallback.plan_concern.clone();
+    }
+    if fallback.created_at < merged.created_at {
+        merged.created_at = fallback.created_at;
+    }
+    merged.id = existing.id.clone();
+    merged.project_id = existing.project_id.clone();
+    merged
+}
+
 pub fn legacy_schema_for_path(path: &Path) -> anyhow::Result<String> {
     pg_schema_for_path(path)
 }
@@ -759,6 +820,25 @@ impl IssueWorkflowStore {
             .map_err(Into::into)
     }
 
+    async fn insert_with_created_at_if_absent_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        workflow: &IssueWorkflowInstance,
+        created_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let data = serde_json::to_string(workflow)?;
+        let result = sqlx::query(
+            "INSERT INTO issue_workflows (id, data, created_at) VALUES ($1, $2, $3)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&workflow.id)
+        .bind(&data)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn load_for_update_by_pr(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -823,7 +903,8 @@ impl IssueWorkflowStore {
     }
 
     /// Replace a workflow row's `project_id` with `new_project_id`, rekeying the
-    /// primary key (which embeds the project_id). Old row is deleted; new row is inserted.
+    /// primary key (which embeds the project_id). If the canonical row already
+    /// exists, merge the duplicate rows before deleting the corrupt source row.
     pub async fn repair_project_id(
         &self,
         old_row_id: &str,
@@ -847,18 +928,31 @@ impl IssueWorkflowStore {
             return Ok(());
         }
 
-        new_workflow.updated_at = chrono::Utc::now();
-
-        let new_data = serde_json::to_string(&new_workflow)?;
-        sqlx::query(
-            "INSERT INTO issue_workflows (id, data, created_at) VALUES ($1, $2, $3)
-             ON CONFLICT(id) DO NOTHING",
-        )
-        .bind(&new_workflow.id)
-        .bind(&new_data)
-        .bind(old_workflow.created_at)
-        .execute(&mut *tx)
-        .await?;
+        let mut inserted_workflow = new_workflow.clone();
+        inserted_workflow.updated_at = chrono::Utc::now();
+        if !self
+            .insert_with_created_at_if_absent_in_tx(
+                &mut tx,
+                &inserted_workflow,
+                old_workflow.created_at,
+            )
+            .await?
+        {
+            let existing = self
+                .load_for_update_by_id(&mut tx, &new_workflow.id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow row '{}' conflicted during repair but was not found",
+                        new_workflow.id
+                    )
+                })?;
+            let mut merged = merge_repaired_workflow_conflict(&existing, &new_workflow);
+            if merged != existing {
+                merged.updated_at = chrono::Utc::now();
+                self.upsert_in_tx(&mut tx, &merged).await?;
+            }
+        }
 
         sqlx::query("DELETE FROM issue_workflows WHERE id = $1")
             .bind(old_row_id)
@@ -931,6 +1025,32 @@ mod tests {
                 Ok(None)
             }
         }
+    }
+
+    #[test]
+    fn repair_conflict_keeps_newer_same_state_existing() {
+        let mut existing = IssueWorkflowInstance::new(
+            "/tmp/canonical-conflict-unit",
+            Some("owner/repo".to_string()),
+            42,
+        );
+        existing.state = IssueLifecycleState::AddressingFeedback;
+        existing.active_task_id = Some("new-claim".to_string());
+        existing.updated_at = Utc::now();
+
+        let mut repaired = IssueWorkflowInstance::new(
+            "/tmp/corrupt-conflict-unit",
+            Some("owner/repo".to_string()),
+            42,
+        );
+        repaired.id = existing.id.clone();
+        repaired.project_id = existing.project_id.clone();
+        repaired.state = IssueLifecycleState::AddressingFeedback;
+        repaired.active_task_id = Some("old-claim".to_string());
+        repaired.updated_at = existing.updated_at - chrono::Duration::minutes(5);
+
+        let merged = merge_repaired_workflow_conflict(&existing, &repaired);
+        assert_eq!(merged.active_task_id.as_deref(), Some("new-claim"));
     }
 
     #[tokio::test]
@@ -1284,6 +1404,86 @@ mod tests {
         assert_eq!(preserved.state, IssueLifecycleState::PrOpen);
         assert_eq!(preserved.pr_number, Some(99003));
         assert_eq!(preserved.active_task_id.as_deref(), Some("target-pr-task"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_project_id_promotes_active_feedback_source_on_conflict() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let corrupt_id = "/data/workspaces/abc-uuid-repair-feedback-test";
+        let canonical = "/real/canonical/feedback-root";
+        let pr_url = "https://github.com/owner/repo/pull/99004";
+
+        store
+            .record_issue_scheduled(
+                canonical,
+                Some("owner/repo"),
+                9004,
+                "target-task",
+                &[],
+                false,
+            )
+            .await?;
+        store
+            .record_pr_detected(
+                canonical,
+                Some("owner/repo"),
+                9004,
+                "target-pr-task",
+                99004,
+                pr_url,
+            )
+            .await?;
+        store
+            .record_issue_scheduled(
+                corrupt_id,
+                Some("owner/repo"),
+                9004,
+                "legacy-task",
+                &[],
+                false,
+            )
+            .await?;
+        store
+            .record_pr_detected(
+                corrupt_id,
+                Some("owner/repo"),
+                9004,
+                "legacy-pr-task",
+                99004,
+                pr_url,
+            )
+            .await?;
+        store
+            .record_feedback_task_scheduled(corrupt_id, Some("owner/repo"), 99004, "claim-task")
+            .await?
+            .expect("corrupt row should be claimable");
+
+        let corrupt = store
+            .get_by_issue(corrupt_id, Some("owner/repo"), 9004)
+            .await?
+            .expect("corrupt row should exist");
+
+        store.repair_project_id(&corrupt.id, canonical).await?;
+
+        assert!(
+            store
+                .get_by_issue(corrupt_id, Some("owner/repo"), 9004)
+                .await?
+                .is_none(),
+            "corrupt row should be removed"
+        );
+        let preserved = store
+            .get_by_issue(canonical, Some("owner/repo"), 9004)
+            .await?
+            .expect("canonical row should remain present");
+        assert_eq!(preserved.state, IssueLifecycleState::AddressingFeedback);
+        assert_eq!(preserved.pr_number, Some(99004));
+        assert_eq!(preserved.pr_url.as_deref(), Some(pr_url));
+        assert_eq!(preserved.active_task_id.as_deref(), Some("claim-task"));
+        assert!(preserved.feedback_claimed_at.is_some());
         Ok(())
     }
 
