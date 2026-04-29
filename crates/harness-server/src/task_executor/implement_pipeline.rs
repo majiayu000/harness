@@ -6,6 +6,7 @@ use super::helpers::{
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, TaskFailureKind, TaskId, TaskStatus, TaskStore,
 };
+use anyhow::Context;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::interceptor::ToolUseEvent;
 use harness_core::tool_isolation::validate_tool_usage;
@@ -155,8 +156,11 @@ pub(crate) async fn run_implement_phase(
                 prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
             }
             Err(e) => {
-                tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
-                prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to check for an existing PR for issue #{issue}; refusing to create a duplicate PR while lookup is unavailable"
+                    )
+                });
             }
         };
         // If the caller also supplied a description alongside the issue number, include it

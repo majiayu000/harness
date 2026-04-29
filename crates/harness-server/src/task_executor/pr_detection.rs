@@ -269,10 +269,7 @@ async fn find_existing_pr_for_issue_in_repo(
             break;
         }
 
-        let Some(page) = fetch_github_pr_page(client, &url, repo_slug, issue, github_token).await?
-        else {
-            return Ok(None);
-        };
+        let page = fetch_github_pr_page(client, &url, repo_slug, issue, github_token).await?;
 
         if let Some(item) = page
             .items
@@ -306,7 +303,7 @@ async fn fetch_github_pr_page(
     repo_slug: &str,
     issue: u64,
     github_token: Option<&str>,
-) -> anyhow::Result<Option<GitHubPrPage>> {
+) -> anyhow::Result<GitHubPrPage> {
     let mut request = client
         .get(url)
         .header(ACCEPT, "application/vnd.github+json")
@@ -317,23 +314,21 @@ async fn fetch_github_pr_page(
     let response = match tokio::time::timeout(GITHUB_PR_LOOKUP_TIMEOUT, request.send()).await {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => {
-            tracing::debug!(issue, repo = %repo_slug, url = %url, error = %e, "existing PR lookup failed");
-            return Ok(None);
+            anyhow::bail!(
+                "failed to fetch GitHub pull request page for {repo_slug} issue #{issue} at {url}: {e}"
+            );
         }
         Err(_) => {
-            tracing::debug!(issue, repo = %repo_slug, url = %url, "existing PR lookup timed out");
-            return Ok(None);
+            anyhow::bail!(
+                "timed out fetching GitHub pull request page for {repo_slug} issue #{issue} at {url}"
+            );
         }
     };
     if !response.status().is_success() {
-        tracing::debug!(
-            issue,
-            repo = %repo_slug,
-            url = %url,
-            status = %response.status(),
-            "existing PR lookup returned non-success status"
+        anyhow::bail!(
+            "GitHub pull request lookup for {repo_slug} issue #{issue} at {url} returned {}",
+            response.status()
         );
-        return Ok(None);
     }
     let next_url = next_link_from_headers(response.headers());
     let items: Vec<GhPrListItem> = response
@@ -342,7 +337,7 @@ async fn fetch_github_pr_page(
         .map(|items| items.into_iter().map(Into::into).collect())
         .map_err(|e| anyhow::anyhow!("invalid GitHub pull request response: {e}"))?;
 
-    Ok(Some(GitHubPrPage { items, next_url }))
+    Ok(GitHubPrPage { items, next_url })
 }
 
 fn next_link_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -673,7 +668,7 @@ mod tests {
     use super::*;
     use axum::{
         extract::State,
-        http::{header, HeaderMap, HeaderValue, Uri},
+        http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
         response::IntoResponse,
         routing::get,
         Router,
@@ -763,6 +758,10 @@ mod tests {
         (headers, body)
     }
 
+    async fn failing_prs_handler() -> impl IntoResponse {
+        (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+    }
+
     #[tokio::test]
     async fn existing_pr_lookup_follows_next_page() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -798,6 +797,31 @@ mod tests {
             ))
         );
         assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_pr_lookup_errors_when_github_page_fails() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let app = Router::new().route("/repos/owner/repo/pulls", get(failing_prs_handler));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let err = find_existing_pr_for_issue_in_repo(
+            &reqwest::Client::new(),
+            "owner/repo",
+            998,
+            None,
+            &base_url,
+        )
+        .await
+        .expect_err("GitHub lookup failure should not be treated as no PR found");
+
+        server.abort();
+
+        assert!(err.to_string().contains("returned 503"));
         Ok(())
     }
 

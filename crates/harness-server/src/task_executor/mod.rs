@@ -527,8 +527,7 @@ pub(crate) async fn run_task(
             server_config.server.github_token.as_deref(),
         )
         .await
-        .ok()
-        .flatten()
+        .with_context(|| format!("failed to check for an existing PR for issue #{issue}"))?
         .is_some();
         if has_existing_pr {
             // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
