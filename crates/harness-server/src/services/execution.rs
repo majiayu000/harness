@@ -130,6 +130,18 @@ pub struct DefaultExecutionService {
     allowed_project_roots: Vec<PathBuf>,
 }
 
+struct PreparedEnqueue {
+    req: CreateTaskRequest,
+    project_id: String,
+    agent: Arc<dyn CodeAgent>,
+    reviewer: Option<Arc<dyn CodeAgent>>,
+}
+
+enum PreparedEnqueueResult {
+    Existing(TaskId),
+    Ready(Box<PreparedEnqueue>),
+}
+
 pub(crate) enum WorkflowReuseStrategy {
     ActiveTask(TaskId),
     PrExternalId(String),
@@ -502,19 +514,11 @@ impl DefaultExecutionService {
             }
         }
     }
-}
 
-#[async_trait]
-impl ExecutionService for DefaultExecutionService {
-    async fn enqueue(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
-        self.enqueue_in_domain(req, QueueDomain::Primary).await
-    }
-
-    async fn enqueue_in_domain(
+    async fn prepare_enqueue(
         &self,
         mut req: CreateTaskRequest,
-        queue_domain: QueueDomain,
-    ) -> Result<TaskId, EnqueueTaskError> {
+    ) -> Result<PreparedEnqueueResult, EnqueueTaskError> {
         let now = chrono::Utc::now();
         if self.server_config.maintenance_window.in_quiet_window(now) {
             let retry_after_secs = self
@@ -539,14 +543,15 @@ impl ExecutionService for DefaultExecutionService {
 
         task_runner::fill_missing_repo_from_project(&mut req).await;
         Self::populate_external_id(&mut req);
+
         if let Some(existing_id) = self.check_workflow_duplicate(&project_id, &req).await {
-            return Ok(existing_id);
+            return Ok(PreparedEnqueueResult::Existing(existing_id));
         }
         if let Some(existing_id) = self.check_duplicate(&project_id, &req).await {
-            return Ok(existing_id);
+            return Ok(PreparedEnqueueResult::Existing(existing_id));
         }
         if let Some(existing_id) = self.check_pr_duplicate(&project_id, &req).await {
-            return Ok(existing_id);
+            return Ok(PreparedEnqueueResult::Existing(existing_id));
         }
 
         if self.dependencies_blocked(&req).await {
@@ -556,20 +561,9 @@ impl ExecutionService for DefaultExecutionService {
                 .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
             self.track_issue_workflow(&project_id, &workflow_req, &task_id)
                 .await;
-            return Ok(task_id);
+            return Ok(PreparedEnqueueResult::Existing(task_id));
         }
         req.depends_on.clear();
-
-        let queue = self.queue_for(queue_domain);
-        let permit = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            queue.acquire(&project_id, req.priority),
-        )
-        .await
-        .map_err(|_| {
-            EnqueueTaskError::Internal(queue_timeout_message(&queue, &project_id, queue_domain))
-        })?
-        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
 
         let agent = select_agent(
             &req,
@@ -582,16 +576,56 @@ impl ExecutionService for DefaultExecutionService {
             agent.name(),
         );
 
-        let workflow_req = req.clone();
-        let task_id = task_runner::spawn_task(
-            self.tasks.clone(),
+        Ok(PreparedEnqueueResult::Ready(Box::new(PreparedEnqueue {
+            req,
+            project_id,
             agent,
             reviewer,
+        })))
+    }
+}
+
+#[async_trait]
+impl ExecutionService for DefaultExecutionService {
+    async fn enqueue(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
+        self.enqueue_in_domain(req, QueueDomain::Primary).await
+    }
+
+    async fn enqueue_in_domain(
+        &self,
+        req: CreateTaskRequest,
+        queue_domain: QueueDomain,
+    ) -> Result<TaskId, EnqueueTaskError> {
+        let prepared = match self.prepare_enqueue(req).await? {
+            PreparedEnqueueResult::Existing(task_id) => return Ok(task_id),
+            PreparedEnqueueResult::Ready(prepared) => *prepared,
+        };
+
+        let queue = self.queue_for(queue_domain);
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            queue.acquire(&prepared.project_id, prepared.req.priority),
+        )
+        .await
+        .map_err(|_| {
+            EnqueueTaskError::Internal(queue_timeout_message(
+                &queue,
+                &prepared.project_id,
+                queue_domain,
+            ))
+        })?
+        .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
+
+        let workflow_req = prepared.req.clone();
+        let task_id = task_runner::spawn_task(
+            self.tasks.clone(),
+            prepared.agent,
+            prepared.reviewer,
             self.server_config.clone(),
             self.skills.clone(),
             self.events.clone(),
             self.interceptors.clone(),
-            req,
+            prepared.req,
             self.workspace_mgr.clone(),
             permit,
             self.completion_callback.clone(),
@@ -599,7 +633,7 @@ impl ExecutionService for DefaultExecutionService {
         )
         .await;
 
-        self.track_issue_workflow(&project_id, &workflow_req, &task_id)
+        self.track_issue_workflow(&prepared.project_id, &workflow_req, &task_id)
             .await;
 
         Ok(task_id)
@@ -612,75 +646,24 @@ impl ExecutionService for DefaultExecutionService {
 
     async fn enqueue_background_with_options(
         &self,
-        mut req: CreateTaskRequest,
+        req: CreateTaskRequest,
         options: EnqueueBackgroundOptions,
     ) -> Result<TaskId, EnqueueTaskError> {
-        let now = chrono::Utc::now();
-        if self.server_config.maintenance_window.in_quiet_window(now) {
-            let retry_after_secs = self
-                .server_config
-                .maintenance_window
-                .secs_until_window_end(now);
-            return Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs });
-        }
-
-        Self::validate_request(&req)?;
-
-        let (resolved_project, registry_default_agent) = self.resolve_project(req.project).await?;
-        req.project = resolved_project;
-
-        let canonical = task_runner::resolve_canonical_project(req.project.clone())
-            .await
-            .map_err(|e| EnqueueTaskError::Internal(e.to_string()))?;
-        self.check_allowed_roots(&canonical)?;
-
-        let project_id = canonical.to_string_lossy().into_owned();
-        req.project = Some(canonical);
-        task_runner::fill_missing_repo_from_project(&mut req).await;
-
-        let agent = select_agent(
-            &req,
-            &self.agent_registry,
-            registry_default_agent.as_deref(),
-        )?;
-        let (reviewer, _) = resolve_reviewer(
-            &self.agent_registry,
-            &self.server_config.agents.review,
-            agent.name(),
-        );
-
-        Self::populate_external_id(&mut req);
-        if let Some(existing_id) = self.check_workflow_duplicate(&project_id, &req).await {
-            return Ok(existing_id);
-        }
-        if let Some(existing_id) = self.check_duplicate(&project_id, &req).await {
-            return Ok(existing_id);
-        }
-        if let Some(existing_id) = self.check_pr_duplicate(&project_id, &req).await {
-            return Ok(existing_id);
-        }
-
-        if self.dependencies_blocked(&req).await {
-            let workflow_req = req.clone();
-            let task_id = task_runner::spawn_task_awaiting_deps(self.tasks.clone(), req)
-                .await
-                .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
-            self.track_issue_workflow(&project_id, &workflow_req, &task_id)
-                .await;
-            return Ok(task_id);
-        }
-        req.depends_on.clear();
+        let prepared = match self.prepare_enqueue(req).await? {
+            PreparedEnqueueResult::Existing(task_id) => return Ok(task_id),
+            PreparedEnqueueResult::Ready(prepared) => *prepared,
+        };
 
         let server_config = self.server_config.clone();
 
         tracing::info!(
-            project = %req.project.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "None".to_string()),
+            project = %prepared.req.project.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "None".to_string()),
             domain = options.queue_domain.label(),
             "execution service: resolved project for background task"
         );
 
         // Register the task immediately so the caller gets an ID without blocking.
-        let task_id = task_runner::register_pending_task(self.tasks.clone(), &req).await;
+        let task_id = task_runner::register_pending_task(self.tasks.clone(), &prepared.req).await;
 
         // Spawn a background tokio task that waits for a concurrency slot then executes.
         let tasks = self.tasks.clone();
@@ -694,7 +677,12 @@ impl ExecutionService for DefaultExecutionService {
         let completion_callback = self.completion_callback.clone();
         let issue_workflow_store = self.issue_workflow_store.clone();
         let task_id2 = task_id.clone();
-        self.track_issue_workflow(&project_id, &req, &task_id).await;
+        let project_id = prepared.project_id;
+        self.track_issue_workflow(&project_id, &prepared.req, &task_id)
+            .await;
+        let req = prepared.req;
+        let agent = prepared.agent;
+        let reviewer = prepared.reviewer;
         tokio::spawn(async move {
             let group_permit = if let Some(sem) = group_sem {
                 sem.acquire_owned().await.ok()
