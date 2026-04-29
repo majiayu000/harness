@@ -267,11 +267,11 @@ fn load_database_config_from_path(path: &Path) -> anyhow::Result<LoadedDatabaseC
 }
 
 fn schema_hash_path(path: &Path) -> anyhow::Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-
-    let absolute = std::env::current_dir()?.join(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     if let Some(parent) = absolute.parent() {
         if let Ok(canonical_parent) = parent.canonicalize() {
             if let Some(file_name) = absolute.file_name() {
@@ -780,6 +780,24 @@ mod tests {
             pg_schema_for_path(Path::new("../app/tasks.db"))
                 .expect("parent alias schema should resolve"),
             canonical_schema
+        );
+    }
+
+    #[test]
+    fn pg_schema_for_path_normalizes_absolute_aliases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app_dir = dir.path().join("app");
+        std::fs::create_dir(&app_dir).expect("create app dir");
+
+        let canonical_path = app_dir
+            .canonicalize()
+            .expect("canonical app dir")
+            .join("tasks.db");
+        let absolute_alias = app_dir.join("..").join("app").join("tasks.db");
+
+        assert_eq!(
+            pg_schema_for_path(&absolute_alias).expect("absolute alias schema should resolve"),
+            pg_schema_for_path(&canonical_path).expect("canonical path schema should resolve")
         );
     }
 
