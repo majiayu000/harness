@@ -28,6 +28,8 @@ export function useOperatorSnapshot() {
 export function useTasks() {
   return useQuery<Task[], Error>({
     queryKey: ["tasks"],
+    // Task list/detail/stream routes are exposed at `/tasks`; only aggregate
+    // dashboard endpoints are mounted under `/api/*`.
     queryFn: ({ signal }) => apiJson<Task[]>("/tasks", { signal }),
   });
 }

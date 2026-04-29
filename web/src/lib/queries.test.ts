@@ -2,7 +2,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
-import { useWorktrees, useTaskDetail, useTaskStream } from "./queries";
+import { useTasks, useWorktrees, useTaskDetail, useTaskStream } from "./queries";
 import { TOKEN_KEY } from "./api";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -95,6 +95,29 @@ describe("stream URL construction", () => {
 
   it("omits token param when no session token", () => {
     expect(buildStreamUrl("abc-123")).not.toContain("token=");
+  });
+});
+
+// ── useTasks ─────────────────────────────────────────────────────────────────
+
+describe("useTasks", () => {
+  it("fetches the task list from /tasks without an /api prefix", async () => {
+    const task = { id: "t1", status: "implementing", turn: 1, project: null };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([task]), { status: 200 }),
+    );
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useTasks(), { wrapper: makeWrapper() });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/tasks",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Accept: "application/json" }),
+      }),
+    );
+    expect(result.current.data).toMatchObject([{ id: "t1", status: "implementing" }]);
   });
 });
 
