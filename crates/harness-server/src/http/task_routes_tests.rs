@@ -243,7 +243,7 @@ fn workflow_reuse_strategy_prefers_active_task() {
 }
 
 #[test]
-fn workflow_reuse_strategy_falls_back_to_pr_when_active_task_missing() {
+fn workflow_reuse_strategy_reuses_only_active_pr_task_when_active_task_missing() {
     let mut workflow = IssueWorkflowInstance::new(
         "/tmp/project".to_string(),
         Some("owner/repo".to_string()),
@@ -252,8 +252,8 @@ fn workflow_reuse_strategy_falls_back_to_pr_when_active_task_missing() {
     workflow.state = IssueLifecycleState::AwaitingFeedback;
     workflow.pr_number = Some(99);
     match workflow_reuse_strategy(&workflow) {
-        WorkflowReuseStrategy::PrExternalId(ext_id) => assert_eq!(ext_id, "pr:99"),
-        _ => panic!("expected pr-external-id reuse strategy"),
+        WorkflowReuseStrategy::ActivePrExternalId(ext_id) => assert_eq!(ext_id, "pr:99"),
+        _ => panic!("expected active-pr-external-id reuse strategy"),
     }
 }
 
