@@ -264,6 +264,9 @@ curl -N http://127.0.0.1:9800/tasks/{task_id}/stream
 curl http://127.0.0.1:9800/health
 ```
 
+The public health payload includes a `runtime_logs` block with the current
+logging state, retention window, and a redacted `logs/<filename>` hint.
+
 ## Project Management API
 
 ### List Projects
@@ -302,7 +305,7 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 |-------|---------|-------------|
 | `transport` | `"stdio"` | Transport protocol: `stdio`, `http`, or `web_socket` |
 | `http_addr` | `"127.0.0.1:9800"` | HTTP listen address |
-| `data_dir` | `"~/.local/share/harness"` | Data directory for Harness server state and database metadata |
+| `data_dir` | `"~/.local/share/harness"` | Data directory for Harness server state, database metadata, and persisted `harness serve` runtime logs under `logs/` |
 | `project_root` | `"."` | Default project root (single-project mode) |
 | `github_webhook_secret` | — | HMAC-SHA256 secret for GitHub webhook verification |
 | `notification_broadcast_capacity` | `256` | Internal notification channel capacity |

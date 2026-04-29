@@ -54,6 +54,7 @@ pub async fn run(
     project_root: Option<PathBuf>,
     projects: Vec<String>,
     default_project: Option<String>,
+    runtime_logs: harness_server::server::RuntimeLogMetadata,
 ) -> Result<()> {
     // On macOS, sandbox-exec (Seatbelt) with deny-default policy causes SIGTRAP
     // in Claude Code CLI. Only enforce danger-full-access when a Claude path
@@ -242,6 +243,7 @@ pub async fn run(
         thread_manager,
         agent_registry,
     );
+    server.runtime_logs = runtime_logs;
     server.startup_projects = parsed_projects;
     server.startup_default_project = startup_default_project;
 

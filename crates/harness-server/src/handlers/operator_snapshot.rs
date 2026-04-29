@@ -143,6 +143,7 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
 
     // ---- recent failures section ----
     let failures_json: Vec<Value> = failed_tasks.iter().map(recent_failure_json).collect();
+    let runtime_logs = &state.core.server.runtime_logs;
 
     let body = json!({
         "generated_at": generated_at.to_rfc3339(),
@@ -161,6 +162,15 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
             },
         },
         "recent_failures": failures_json,
+        "runtime_logs": {
+            "state": runtime_logs.state.as_str(),
+            "active_path": runtime_logs
+                .active_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            "path_hint": runtime_logs.path_hint.clone(),
+            "retention_days": runtime_logs.retention_days,
+        },
     });
 
     (StatusCode::OK, Json(body))
@@ -199,13 +209,20 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
         let body: serde_json::Value = serde_json::from_slice(&bytes)?;
 
-        for key in ["generated_at", "retry", "rate_limits", "recent_failures"] {
+        for key in [
+            "generated_at",
+            "retry",
+            "rate_limits",
+            "recent_failures",
+            "runtime_logs",
+        ] {
             assert!(body.get(key).is_some(), "missing top-level key: {key}");
         }
         assert!(body["retry"].get("last_tick").is_some());
         assert!(body["retry"].get("stalled_tasks").is_some());
         assert!(body["rate_limits"].get("signal_ingestion").is_some());
         assert!(body["rate_limits"].get("password_reset").is_some());
+        assert_eq!(body["runtime_logs"]["state"], "disabled");
         Ok(())
     }
 
@@ -590,6 +607,77 @@ mod tests {
         let error_str = failures[0]["error"].as_str().expect("string");
         // Result must be valid UTF-8 (serde_json already guarantees this) and bounded.
         assert!(error_str.len() <= MAX_ERROR_LEN + 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_logs_returns_full_active_path_when_enabled() -> anyhow::Result<()> {
+        let _lock = test_helpers::HOME_LOCK.lock().await;
+        let dir = test_helpers::tempdir_in_home("harness-test-op-snap-runtime-log-")?;
+        let mut state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+        let state_mut = Arc::get_mut(&mut state).expect("unique state");
+        let server = Arc::get_mut(&mut state_mut.core.server).expect("unique server");
+        server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(
+            dir.path()
+                .join("logs/harness-serve-20260430T120000Z-pid1.log"),
+            30,
+        );
+
+        let app = Router::new()
+            .route("/api/operator-snapshot", get(operator_snapshot))
+            .with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/operator-snapshot")
+            .body(axum::body::Body::empty())?;
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        assert_eq!(body["runtime_logs"]["state"], "enabled");
+        assert_eq!(
+            body["runtime_logs"]["active_path"],
+            serde_json::Value::String(
+                dir.path()
+                    .join("logs/harness-serve-20260430T120000Z-pid1.log")
+                    .display()
+                    .to_string(),
+            )
+        );
+        assert_eq!(
+            body["runtime_logs"]["path_hint"],
+            serde_json::Value::String("logs/harness-serve-20260430T120000Z-pid1.log".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_logs_reports_degraded_state_without_active_path() -> anyhow::Result<()> {
+        let _lock = test_helpers::HOME_LOCK.lock().await;
+        let dir = test_helpers::tempdir_in_home("harness-test-op-snap-runtime-log-degraded-")?;
+        let mut state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+        let state_mut = Arc::get_mut(&mut state).expect("unique state");
+        let server = Arc::get_mut(&mut state_mut.core.server).expect("unique server");
+        server.runtime_logs = crate::server::RuntimeLogMetadata::degraded(
+            Some("logs/harness-serve-20260430T120000Z-pid1.log".to_string()),
+            30,
+        );
+
+        let app = Router::new()
+            .route("/api/operator-snapshot", get(operator_snapshot))
+            .with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/operator-snapshot")
+            .body(axum::body::Body::empty())?;
+        let resp = tower::ServiceExt::oneshot(app, req).await?;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        assert_eq!(body["runtime_logs"]["state"], "degraded");
+        assert!(body["runtime_logs"]["active_path"].is_null());
+        assert_eq!(
+            body["runtime_logs"]["path_hint"],
+            serde_json::Value::String("logs/harness-serve-20260430T120000Z-pid1.log".to_string())
+        );
         Ok(())
     }
 }

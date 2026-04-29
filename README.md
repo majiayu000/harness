@@ -163,6 +163,11 @@ cargo run -p harness-cli -- serve --transport http --port 9800
 curl http://127.0.0.1:9800/health
 ```
 
+`harness serve` persists its runtime log under `server.data_dir/logs/` as
+`harness-serve-<startup-timestamp>-pid<PID>.log`. `/health` exposes a redacted
+`runtime_logs.path_hint`, while `/api/operator-snapshot` includes the full
+active path for operators.
+
 **Stdio (for MCP integration):**
 
 ```bash
@@ -393,6 +398,10 @@ curl http://127.0.0.1:9800/api/dashboard
 ```bash
 curl http://127.0.0.1:9800/health
 ```
+
+The response includes a `runtime_logs` block with the logging state, retention
+window, and a redacted `logs/<filename>` hint instead of the full absolute
+path.
 
 ## Server Startup
 

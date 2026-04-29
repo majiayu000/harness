@@ -51,9 +51,26 @@ export function OperatorPanel() {
   const sig = data?.rate_limits.signal_ingestion;
   const pw = data?.rate_limits.password_reset;
   const failures = data?.recent_failures ?? [];
+  const runtimeLogs = data?.runtime_logs;
+  const runtimeLogPath = runtimeLogs?.active_path ?? null;
 
   return (
     <Panel title="Operator snapshot" sub="retry · rate limits · recent failures" id="operator">
+      <div className="border-b border-line">
+        <div className="px-4 py-2 font-mono text-[10px] text-ink-3 uppercase tracking-wider border-b border-line">
+          Runtime logs
+        </div>
+        {isError ? (
+          <p className="px-4 py-3 font-mono text-[11px] text-danger">Operator snapshot unavailable.</p>
+        ) : runtimeLogPath ? (
+          <div className="px-4 py-3 font-mono text-[11px] text-ink-1 break-all">{runtimeLogPath}</div>
+        ) : (
+          <p className="px-4 py-3 font-mono text-[11px] text-ink-4">
+            Runtime log path unavailable.
+          </p>
+        )}
+      </div>
+
       {/* Retry pressure */}
       <div className="border-b border-line">
         <div className="px-4 py-2 font-mono text-[10px] text-ink-3 uppercase tracking-wider border-b border-line">
