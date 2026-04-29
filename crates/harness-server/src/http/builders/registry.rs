@@ -373,7 +373,7 @@ async fn migrate_issue_workflows_if_needed(
     target_store: &harness_workflow::issue_lifecycle::IssueWorkflowStore,
 ) -> anyhow::Result<()> {
     let legacy_schema = harness_workflow::issue_lifecycle::legacy_schema_for_path(legacy_path)?;
-    if legacy_schema == target_schema || target_store.row_count().await? > 0 {
+    if legacy_schema == target_schema {
         return Ok(());
     }
 
@@ -388,14 +388,21 @@ async fn migrate_issue_workflows_if_needed(
         return Ok(());
     }
 
+    let mut copied = 0usize;
+    let mut skipped_existing = 0usize;
     for workflow in &legacy_rows {
-        target_store.upsert(workflow).await?;
+        if target_store.insert_if_absent(workflow).await? {
+            copied += 1;
+        } else {
+            skipped_existing += 1;
+        }
     }
     tracing::info!(
-        count = legacy_rows.len(),
+        copied,
+        skipped_existing,
         legacy_schema = %legacy_schema,
         target_schema = %target_schema,
-        "workflow migration: copied legacy issue workflow rows into namespaced schema"
+        "workflow migration: backfilled legacy issue workflow rows into namespaced schema"
     );
     Ok(())
 }
@@ -407,7 +414,7 @@ async fn migrate_project_workflows_if_needed(
     target_store: &harness_workflow::project_lifecycle::ProjectWorkflowStore,
 ) -> anyhow::Result<()> {
     let legacy_schema = harness_workflow::project_lifecycle::legacy_schema_for_path(legacy_path)?;
-    if legacy_schema == target_schema || target_store.row_count().await? > 0 {
+    if legacy_schema == target_schema {
         return Ok(());
     }
 
@@ -422,14 +429,21 @@ async fn migrate_project_workflows_if_needed(
         return Ok(());
     }
 
+    let mut copied = 0usize;
+    let mut skipped_existing = 0usize;
     for workflow in &legacy_rows {
-        target_store.upsert(workflow).await?;
+        if target_store.insert_if_absent(workflow).await? {
+            copied += 1;
+        } else {
+            skipped_existing += 1;
+        }
     }
     tracing::info!(
-        count = legacy_rows.len(),
+        copied,
+        skipped_existing,
         legacy_schema = %legacy_schema,
         target_schema = %target_schema,
-        "workflow migration: copied legacy project workflow rows into namespaced schema"
+        "workflow migration: backfilled legacy project workflow rows into namespaced schema"
     );
     Ok(())
 }
@@ -439,7 +453,10 @@ mod tests {
     use super::*;
     use crate::{server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::registry::AgentRegistry;
-    use harness_core::config::HarnessConfig;
+    use harness_core::{
+        config::HarnessConfig,
+        db::{pg_schema_for_path, resolve_database_url},
+    };
 
     async fn make_test_server_and_tasks(
         dir: &Path,
@@ -612,6 +629,168 @@ mod tests {
         assert_eq!(rewritten, 1);
         assert_eq!(failed, 0);
         assert_eq!(skipped, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_workflow_migration_backfills_partial_target() -> anyhow::Result<()> {
+        let configured_database_url = match resolve_database_url(None) {
+            Ok(url) => Some(url),
+            Err(_) => return Ok(()),
+        };
+        let dir = tempfile::tempdir()?;
+        let legacy_path = dir.path().join("issue_workflows.db");
+        let target_schema = pg_schema_for_path(&dir.path().join("issue_workflows_target.db"))?;
+
+        let legacy_store =
+            harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
+                &legacy_path,
+                configured_database_url.as_deref(),
+            )
+            .await?;
+        let target_store =
+            harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url_and_schema(
+                configured_database_url.as_deref(),
+                &target_schema,
+            )
+            .await?;
+
+        legacy_store
+            .record_issue_scheduled(
+                "/tmp/project",
+                Some("owner/repo"),
+                9101,
+                "task-9101",
+                &[],
+                false,
+            )
+            .await?;
+        legacy_store
+            .record_issue_scheduled(
+                "/tmp/project",
+                Some("owner/repo"),
+                9102,
+                "task-9102",
+                &[],
+                false,
+            )
+            .await?;
+        target_store
+            .record_issue_scheduled(
+                "/tmp/project",
+                Some("owner/repo"),
+                9101,
+                "target-task-9101",
+                &[],
+                false,
+            )
+            .await?;
+        target_store
+            .record_pr_detected(
+                "/tmp/project",
+                Some("owner/repo"),
+                9101,
+                "target-pr-task-9101",
+                99101,
+                "https://github.com/owner/repo/pull/99101",
+            )
+            .await?;
+
+        migrate_issue_workflows_if_needed(
+            configured_database_url.as_deref(),
+            &legacy_path,
+            &target_schema,
+            &target_store,
+        )
+        .await?;
+
+        let existing = target_store
+            .get_by_issue("/tmp/project", Some("owner/repo"), 9101)
+            .await?
+            .expect("existing target row should remain present");
+        assert_eq!(
+            existing.state,
+            harness_workflow::issue_lifecycle::IssueLifecycleState::PrOpen,
+            "existing target row state should not be overwritten"
+        );
+        assert_eq!(existing.pr_number, Some(99101));
+        assert_eq!(
+            existing.active_task_id.as_deref(),
+            Some("target-pr-task-9101")
+        );
+        assert!(
+            target_store
+                .get_by_issue("/tmp/project", Some("owner/repo"), 9102)
+                .await?
+                .is_some(),
+            "missing legacy row should be backfilled even when target is non-empty"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_workflow_migration_backfills_partial_target() -> anyhow::Result<()> {
+        let configured_database_url = match resolve_database_url(None) {
+            Ok(url) => Some(url),
+            Err(_) => return Ok(()),
+        };
+        let dir = tempfile::tempdir()?;
+        let legacy_path = dir.path().join("project_workflows.db");
+        let target_schema = pg_schema_for_path(&dir.path().join("project_workflows_target.db"))?;
+
+        let legacy_store =
+            harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url(
+                &legacy_path,
+                configured_database_url.as_deref(),
+            )
+            .await?;
+        let target_store = harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url_and_schema(
+            configured_database_url.as_deref(),
+            &target_schema,
+        )
+        .await?;
+
+        legacy_store
+            .record_poll_started("/tmp/project", Some("owner/repo"))
+            .await?;
+        legacy_store
+            .record_poll_started("/tmp/project", Some("owner/repo-two"))
+            .await?;
+        target_store
+            .record_poll_started("/tmp/project", Some("owner/repo"))
+            .await?;
+        target_store
+            .record_degraded("/tmp/project", Some("owner/repo"), "target is canonical")
+            .await?;
+
+        migrate_project_workflows_if_needed(
+            configured_database_url.as_deref(),
+            &legacy_path,
+            &target_schema,
+            &target_store,
+        )
+        .await?;
+
+        let existing = target_store
+            .get_by_project("/tmp/project", Some("owner/repo"))
+            .await?
+            .expect("existing target row should remain present");
+        assert_eq!(
+            existing.state,
+            harness_workflow::project_lifecycle::ProjectWorkflowState::Degraded,
+            "existing target row state should not be overwritten"
+        );
+        assert_eq!(
+            existing.degraded_reason.as_deref(),
+            Some("target is canonical")
+        );
+        assert!(
+            target_store
+                .get_by_project("/tmp/project", Some("owner/repo-two"))
+                .await?
+                .is_some(),
+            "missing legacy row should be backfilled even when target is non-empty"
+        );
         Ok(())
     }
 }

@@ -312,6 +312,19 @@ impl IssueWorkflowStore {
         Ok(())
     }
 
+    pub async fn insert_if_absent(&self, workflow: &IssueWorkflowInstance) -> anyhow::Result<bool> {
+        let data = serde_json::to_string(workflow)?;
+        let result = sqlx::query(
+            "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&workflow.id)
+        .bind(&data)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn get_by_issue(
         &self,
         project_id: &str,
