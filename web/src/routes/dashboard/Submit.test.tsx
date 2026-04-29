@@ -105,8 +105,13 @@ describe("<Submit>", () => {
     fireEvent.change(screen.getByPlaceholderText(/123 or/), { target: { value: "not-a-number" } });
     expect(nextBtn).toBeDisabled();
 
-    // valid issue number
+    // valid issue number still needs a project when projects are registered
     fireEvent.change(screen.getByPlaceholderText(/123 or/), { target: { value: "42" } });
+    expect(nextBtn).toBeDisabled();
+
+    fireEvent.change(screen.getByRole("combobox", { name: /Project/ }), {
+      target: { value: "alpha" },
+    });
     expect(nextBtn).not.toBeDisabled();
   });
 
@@ -160,6 +165,9 @@ describe("<Submit>", () => {
 
     goToConfig("Prompt");
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "do something" } });
+    fireEvent.change(screen.getByRole("combobox", { name: /Project/ }), {
+      target: { value: "alpha" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /Next/ }));
     fireEvent.click(screen.getByRole("button", { name: /Submit Task/ }));
 

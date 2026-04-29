@@ -103,10 +103,12 @@ interface StepConfigProps {
 function StepConfig({ state, projects, onChange, onNext, onBack }: StepConfigProps) {
   const agents = projects.find((p) => p.id === state.project)?.agents ?? [];
 
+  const projectSelected = projects.length === 0 || state.project !== "";
   const isValid =
-    (state.mode === "issue" && parseIssueNumber(state.issueInput) !== null) ||
-    (state.mode === "pr" && parsePrNumber(state.prInput) !== null) ||
-    (state.mode === "prompt" && state.promptInput.trim().length > 0);
+    projectSelected &&
+    ((state.mode === "issue" && parseIssueNumber(state.issueInput) !== null) ||
+      (state.mode === "pr" && parsePrNumber(state.prInput) !== null) ||
+      (state.mode === "prompt" && state.promptInput.trim().length > 0));
 
   return (
     <div className="space-y-4">
