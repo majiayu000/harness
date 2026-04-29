@@ -619,7 +619,27 @@ impl WorkspaceManager {
             .map(Path::to_path_buf)
             .or_else(|| self.active.get(task_id).map(|e| e.workspace_path.clone()))
             .unwrap_or_else(|| self.config.root.join(sanitize_task_id(&task_id.0)));
+        if let Some(owner_task) = self.active_paths.get(&target) {
+            if owner_task.value() != task_id {
+                tracing::warn!(
+                    task_id = %task_id.0,
+                    owner_task_id = %owner_task.value().0,
+                    workspace_path = ?target,
+                    "cleanup_workspace_for_retry: skipped deleting workspace reserved by another active task"
+                );
+                return Ok(());
+            }
+        }
         self.remove_active_workspace(task_id);
+        if let Some(owner_task) = self.active_paths.get(&target) {
+            tracing::warn!(
+                task_id = %task_id.0,
+                owner_task_id = %owner_task.value().0,
+                workspace_path = ?target,
+                "cleanup_workspace_for_retry: skipped deleting workspace claimed during retry cleanup"
+            );
+            return Ok(());
+        }
         cleanup_workspace_path(source_repo, &target).await
     }
 
@@ -655,17 +675,12 @@ impl WorkspaceManager {
             .iter()
             .map(|task| (task.id.0.as_str(), task))
             .collect();
-        let path_to_task: std::collections::HashMap<PathBuf, &TaskSummary> = tasks
-            .iter()
-            .map(|task| {
-                let path = task
-                    .workspace_path
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| self.config.root.join(sanitize_task_id(&task.id.0)));
-                (path, task)
-            })
-            .collect();
+        let mut path_to_tasks: std::collections::HashMap<PathBuf, Vec<&TaskSummary>> =
+            std::collections::HashMap::new();
+        for task in tasks {
+            let path = task_summary_workspace_path(&self.config.root, task);
+            path_to_tasks.entry(path).or_default().push(task);
+        }
 
         let read_dir = std::fs::read_dir(&self.config.root)?;
         let mut summary = StartupReconciliation::default();
@@ -682,15 +697,28 @@ impl WorkspaceManager {
             }
 
             let owner_record = read_owner_record(&path);
-            let task = owner_record
+            let mut candidate_tasks = Vec::new();
+            if let Some(task) = owner_record
                 .as_ref()
                 .and_then(|record| task_by_id.get(record.task_id.as_str()).copied())
-                .or_else(|| path_to_task.get(&path).copied());
+            {
+                candidate_tasks.push(task);
+            }
+            if let Some(path_tasks) = path_to_tasks.get(&path) {
+                for path_task in path_tasks {
+                    if !candidate_tasks
+                        .iter()
+                        .any(|candidate: &&TaskSummary| candidate.id == path_task.id)
+                    {
+                        candidate_tasks.push(*path_task);
+                    }
+                }
+            }
 
-            let should_remove = match task {
-                None => true,
-                Some(task) if task.status.is_terminal() => true,
-                Some(task) => {
+            let should_remove = match candidate_tasks.as_slice() {
+                [] => true,
+                [task] if task.status.is_terminal() => true,
+                [task] => {
                     if let Some(owner_record) = owner_record.as_ref() {
                         if owner_record.run_generation != task.run_generation {
                             true
@@ -704,10 +732,16 @@ impl WorkspaceManager {
                         false
                     }
                 }
+                tasks => !tasks.iter().any(|task| !task.status.is_terminal()),
             };
 
             if should_remove {
-                let cleanup_repo = resolve_cleanup_source_repo(source_repo, &path, task).await;
+                let cleanup_repo = resolve_cleanup_source_repo(
+                    source_repo,
+                    &path,
+                    candidate_tasks.first().copied(),
+                )
+                .await;
                 // Classify as migrated when the owner record carries an issue/PR key
                 // (new-key workspace from slice 1), so startup logs show the right breakdown.
                 let is_new_key = owner_record
@@ -735,7 +769,7 @@ impl WorkspaceManager {
             }
         }
 
-        for (path, task) in &path_to_task {
+        for (path, path_tasks) in &path_to_tasks {
             if seen_paths.contains(path)
                 || self.active.iter().any(|e| e.workspace_path == *path)
                 || path.exists()
@@ -743,7 +777,8 @@ impl WorkspaceManager {
                 continue;
             }
 
-            let cleanup_repo = resolve_cleanup_source_repo(source_repo, path, Some(*task)).await;
+            let cleanup_repo =
+                resolve_cleanup_source_repo(source_repo, path, path_tasks.first().copied()).await;
             if !is_registered_worktree(&cleanup_repo, path).await {
                 continue;
             }
@@ -1136,6 +1171,13 @@ fn owner_record_path(workspace_path: &Path) -> anyhow::Result<PathBuf> {
 fn read_owner_record(workspace_path: &Path) -> Option<WorkspaceOwnerRecord> {
     let bytes = std::fs::read(owner_record_path(workspace_path).ok()?).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn task_summary_workspace_path(root: &Path, task: &TaskSummary) -> PathBuf {
+    task.workspace_path
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(sanitize_task_id(&task.id.0)))
 }
 
 fn owner_record_matches_workspace(
@@ -1757,6 +1799,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_workspace_for_retry_skips_path_reserved_by_different_active_task() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let active_task = harness_core::types::TaskId("active-issue-task".to_string());
+        let stale_task = harness_core::types::TaskId("stale-retry-task".to_string());
+
+        let lease = mgr
+            .create_workspace(
+                &active_task,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                Some("issue:42"),
+                Some("owner/repo"),
+            )
+            .await
+            .expect("create active workspace");
+
+        mgr.cleanup_workspace_for_retry(&stale_task, source.path(), Some(&lease.workspace_path))
+            .await
+            .expect("retry cleanup should skip foreign active path");
+
+        assert!(
+            lease.workspace_path.exists(),
+            "retry cleanup must not delete another active task's workspace"
+        );
+        assert!(
+            mgr.get_workspace(&active_task).is_some(),
+            "active task should remain tracked"
+        );
+
+        mgr.remove_workspace(&active_task)
+            .await
+            .expect("remove active");
+    }
+
+    #[tokio::test]
     async fn remove_workspace_idempotent() {
         let workspaces = tempfile::tempdir().expect("tempdir");
         let config = WorkspaceConfig {
@@ -2002,6 +2090,89 @@ mod tests {
             !lease.workspace_path.exists(),
             "generation drift should be cleaned"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_startup_preserves_shared_issue_workspace_when_any_attempt_active() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr_a = WorkspaceManager::new(config.clone()).expect("mgr a");
+        let mgr_b = WorkspaceManager::new(config).expect("mgr b");
+        let active_task_id = harness_core::types::TaskId("active-issue-42-task".to_string());
+
+        let lease = mgr_a
+            .create_workspace(
+                &active_task_id,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                Some("issue:42"),
+                Some("owner/repo"),
+            )
+            .await
+            .expect("create issue workspace");
+        std::fs::remove_file(owner_record_path(&lease.workspace_path).expect("owner path"))
+            .expect("remove owner record");
+
+        let mut active_task = crate::task_runner::TaskSummary {
+            id: active_task_id,
+            status: crate::task_runner::TaskStatus::Implementing,
+            failure_kind: None,
+            turn: 0,
+            pr_url: None,
+            error: None,
+            source: None,
+            parent_id: None,
+            external_id: Some("issue:42".to_string()),
+            repo: Some("owner/repo".to_string()),
+            description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::Implement,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project: Some(source.path().to_string_lossy().into_owned()),
+            workspace_path: Some(lease.workspace_path.to_string_lossy().into_owned()),
+            workspace_owner: Some(mgr_a.owner_session.clone()),
+            run_generation: 1,
+            task_kind: crate::task_runner::TaskKind::Prompt,
+            workflow: None,
+            scheduler: crate::task_runner::TaskSchedulerState::default(),
+        };
+        let terminal_task_id = harness_core::types::TaskId("terminal-issue-42-task".to_string());
+        let terminal_task = crate::task_runner::TaskSummary {
+            id: terminal_task_id,
+            status: crate::task_runner::TaskStatus::Failed,
+            workspace_path: active_task.workspace_path.clone(),
+            workspace_owner: Some(mgr_a.owner_session.clone()),
+            project: active_task.project.clone(),
+            external_id: active_task.external_id.clone(),
+            repo: active_task.repo.clone(),
+            ..active_task.clone()
+        };
+        active_task.status = crate::task_runner::TaskStatus::Implementing;
+
+        let summary = mgr_b
+            .reconcile_startup(source.path(), &[active_task, terminal_task])
+            .await
+            .expect("startup reconcile");
+
+        assert_eq!(summary.preserved, 1);
+        assert!(
+            lease.workspace_path.exists(),
+            "startup reconciliation must not delete a shared issue workspace while any attempt is active"
+        );
+
+        cleanup_workspace_path(source.path(), &lease.workspace_path)
+            .await
+            .expect("cleanup test workspace");
     }
 
     #[tokio::test]
