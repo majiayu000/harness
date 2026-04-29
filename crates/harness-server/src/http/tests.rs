@@ -2922,6 +2922,103 @@ async fn orphan_pr_task_is_redispatched_using_existing_task_row() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn orphan_issue_task_is_redispatched_when_external_id_is_noncanonical() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let (state, agent) = make_test_state_with_agent(dir.path(), Some("secret")).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Issue,
+        status: task_runner::TaskStatus::Pending,
+        failure_kind: None,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("github".to_string()),
+        external_id: Some("legacy-issue-944".to_string()),
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        issue: Some(944),
+        repo: Some("majiayu000/harness".to_string()),
+        description: Some("issue #944".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_orphan_pending_recovery(&state).await;
+
+    let final_state = wait_for_task_to_leave_pending(&state, &task_id).await?;
+    assert_eq!(final_state.id, task_id);
+    assert_ne!(final_state.status, task_runner::TaskStatus::Pending);
+    assert_eq!(state.core.tasks.list_all_with_terminal().await?.len(), 1);
+    assert!(agent.prompts.lock().await.len() <= 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphan_pr_task_is_redispatched_when_external_id_is_noncanonical() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, agent) = make_test_state_with_agent(dir.path(), Some("secret")).await?;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Pr,
+        status: task_runner::TaskStatus::Pending,
+        failure_kind: None,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("github".to_string()),
+        external_id: Some("legacy-pr-944".to_string()),
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        issue: None,
+        repo: Some("majiayu000/harness".to_string()),
+        description: Some("PR #944".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_orphan_pending_recovery(&state).await;
+
+    let final_state = wait_for_task_to_leave_pending(&state, &task_id).await?;
+    assert_eq!(final_state.id, task_id);
+    assert_ne!(final_state.status, task_runner::TaskStatus::Pending);
+    assert_eq!(state.core.tasks.list_all_with_terminal().await?.len(), 1);
+    assert!(agent.prompts.lock().await.len() <= 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn orphan_prompt_only_task_fails_closed_when_prompt_was_not_persisted() -> anyhow::Result<()>
 {
     let dir = tempfile::tempdir()?;
@@ -2968,6 +3065,66 @@ async fn orphan_prompt_only_task_fails_closed_when_prompt_was_not_persisted() ->
         final_state.error.as_deref(),
         Some("orphaned prompt-only task: prompt not persisted")
     );
+    assert!(agent.prompts.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphan_prompt_only_task_waits_for_runtime_host_lease_to_expire_before_failing(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, agent) = make_test_state_with_agent(dir.path(), Some("secret")).await?;
+
+    let mut task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Prompt,
+        status: task_runner::TaskStatus::Pending,
+        failure_kind: None,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        issue: None,
+        repo: None,
+        description: Some("prompt task".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+    };
+    task.scheduler.claim_runtime_host(
+        "host-a",
+        chrono::Utc::now() + chrono::TimeDelta::milliseconds(75),
+    );
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_orphan_pending_recovery(&state).await;
+
+    let final_state =
+        wait_for_task_status(&state, &task_id, task_runner::TaskStatus::Failed).await?;
+    assert_eq!(
+        final_state.error.as_deref(),
+        Some("orphaned prompt-only task: prompt not persisted")
+    );
+    assert_eq!(final_state.scheduler.runtime_host_id(), None);
+    assert!(matches!(
+        final_state.scheduler.authority_state,
+        task_runner::SchedulerAuthorityState::Failed
+    ));
     assert!(agent.prompts.lock().await.is_empty());
     Ok(())
 }

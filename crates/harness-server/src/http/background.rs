@@ -7,7 +7,8 @@ use harness_workflow::issue_lifecycle::{
 };
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
-    task.external_id
+    let (issue_from_external_id, pr_from_external_id) = task
+        .external_id
         .as_deref()
         .map(|eid| {
             if let Some(n) = eid.strip_prefix("issue:") {
@@ -18,7 +19,22 @@ fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
                 (None, None)
             }
         })
-        .unwrap_or((None, None))
+        .unwrap_or((None, None));
+
+    let issue = issue_from_external_id
+        .or(task.issue)
+        .or_else(|| parse_description_number(task.description.as_deref(), "issue #"));
+    let pr = pr_from_external_id
+        .or_else(|| parse_description_number(task.description.as_deref(), "PR #"));
+
+    (issue, pr)
+}
+
+fn parse_description_number(description: Option<&str>, prefix: &str) -> Option<u64> {
+    description
+        .and_then(|text| text.strip_prefix(prefix))
+        .and_then(|tail| tail.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 fn build_recovered_request(
@@ -1351,10 +1367,15 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
     for task in failed {
         let state = state.clone();
         tokio::spawn(async move {
+            let Some(task) = await_startup_recovery_ready_task(&state, &task.id, "orphan").await
+            else {
+                return;
+            };
             let reason = "orphaned prompt-only task: prompt not persisted".to_string();
             tracing::warn!(task_id = ?task.id, "{reason}");
+            let task_id = task.id.clone();
             if let Err(pe) =
-                task_runner::mutate_and_persist(&state.core.tasks, &task.id, move |s| {
+                task_runner::mutate_and_persist(&state.core.tasks, &task_id, move |s| {
                     s.status = task_runner::TaskStatus::Failed;
                     s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
                     s.error = Some(reason);
@@ -1369,7 +1390,7 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
                 return;
             }
             if let Some(cb) = &state.intake.completion_callback {
-                if let Some(final_state) = state.core.tasks.get(&task.id) {
+                if let Some(final_state) = state.core.tasks.get(&task_id) {
                     cb(final_state).await;
                 }
             }
