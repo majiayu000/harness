@@ -1,5 +1,7 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useTasks, useDashboard } from "@/lib/queries";
+import { apiFetch } from "@/lib/api";
 import { TaskDetailSlideover } from "@/components/TaskDetailSlideover";
 import { workflowLabel } from "@/lib/format";
 import type { Task, WorkflowSummary } from "@/types";
@@ -76,64 +78,85 @@ function columnOf(taskStatus: string, workflowState?: string | null): string {
   return "other";
 }
 
+function shouldShowTask(task: Task): boolean {
+  if (task.workflow?.state === "ready_to_merge") return true;
+  return !TERMINAL_STATUSES.has(task.status);
+}
+
 function TaskCard({
   task,
   workflow,
   onClick,
+  onMerge,
+  merging,
 }: {
   task: Task;
   workflow?: WorkflowSummary | null;
   onClick: () => void;
+  onMerge?: (taskId: string) => void;
+  merging?: boolean;
 }) {
   const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
   return (
-    <button
-      type="button"
+    <div
       className="w-full text-left border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors cursor-pointer"
-      onClick={onClick}
     >
-      <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
-        {title}
-      </div>
-      {workflow && (
-        <div className="mt-1 flex flex-wrap items-center gap-1">
-          <span className="border border-line bg-bg-1 px-1.5 py-[1px] font-mono text-[10px] text-ink-2">
-            wf {workflowLabel(workflow.state)}
-          </span>
-          {workflow.pr_number ? (
-            <span className="font-mono text-[10px] text-ink-3">PR #{workflow.pr_number}</span>
-          ) : null}
-          {workflow.force_execute ? (
-            <span className="border border-rust/40 bg-rust/10 px-1.5 py-[1px] font-mono text-[10px] text-rust">
-              force-execute
+      <button type="button" className="block w-full text-left" onClick={onClick}>
+        <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
+          {title}
+        </div>
+        {workflow && (
+          <div className="mt-1 flex flex-wrap items-center gap-1">
+            <span className="border border-line bg-bg-1 px-1.5 py-[1px] font-mono text-[10px] text-ink-2">
+              wf {workflowLabel(workflow.state)}
             </span>
-          ) : null}
+            {workflow.pr_number ? (
+              <span className="font-mono text-[10px] text-ink-3">PR #{workflow.pr_number}</span>
+            ) : null}
+            {workflow.force_execute ? (
+              <span className="border border-rust/40 bg-rust/10 px-1.5 py-[1px] font-mono text-[10px] text-rust">
+                force-execute
+              </span>
+            ) : null}
+          </div>
+        )}
+        <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
+          <span className="truncate">{task.repo ?? "—"}</span>
+          {task.turn > 0 && <span>turn {task.turn}</span>}
         </div>
-      )}
-      <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
-        <span className="truncate">{task.repo ?? "—"}</span>
-        {task.turn > 0 && <span>turn {task.turn}</span>}
-      </div>
-      {workflow?.plan_concern && (
-        <div
-          className="mt-1 block font-mono text-[10px] text-rust truncate"
-          title={workflow.plan_concern}
-        >
-          concern: {workflow.plan_concern}
-        </div>
-      )}
+        {workflow?.plan_concern && (
+          <div
+            className="mt-1 block font-mono text-[10px] text-rust truncate"
+            title={workflow.plan_concern}
+          >
+            concern: {workflow.plan_concern}
+          </div>
+        )}
+      </button>
       {task.pr_url && (
         <a
           href={task.pr_url}
           target="_blank"
           rel="noreferrer"
-          onClick={(e) => e.stopPropagation()}
           className="mt-1 block font-mono text-[10px] text-rust hover:underline truncate"
         >
           {task.pr_url.replace(/^https:\/\/github\.com\//, "")}
         </a>
       )}
-    </button>
+      {workflow?.state === "ready_to_merge" && onMerge && (
+        <button
+          type="button"
+          disabled={merging}
+          onClick={(e) => {
+            e.stopPropagation();
+            onMerge(task.id);
+          }}
+          className="mt-2 w-full border border-line bg-bg-1 px-2 py-1 font-mono text-[10px] text-ink-2 hover:border-line-3 hover:text-ink transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {merging ? "Merging…" : "Merge"}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -143,15 +166,31 @@ interface Props {
 
 export function Active({ projectFilter }: Props) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [merging, setMerging] = useState<Set<string>>(new Set());
   const { data, isLoading, isError } = useTasks();
   const { data: dashboard } = useDashboard();
+  const queryClient = useQueryClient();
+
+  const handleMerge = async (taskId: string) => {
+    setMerging((prev) => new Set(prev).add(taskId));
+    try {
+      await apiFetch(`/tasks/${taskId}/merge`, { method: "POST" });
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    } finally {
+      setMerging((prev) => {
+        const next = new Set(prev);
+        next.delete(taskId);
+        return next;
+      });
+    }
+  };
 
   const resolvedRoot = projectFilter
     ? (dashboard?.projects.find((p) => p.id === projectFilter)?.root ?? projectFilter)
     : null;
 
   const active = (data ?? [])
-    .filter((t) => !TERMINAL_STATUSES.has(t.status))
+    .filter(shouldShowTask)
     .filter((t) => !resolvedRoot || t.project === resolvedRoot);
   const grouped: Record<string, Task[]> = {};
   for (const c of COLUMNS) grouped[c.key] = [];
@@ -189,6 +228,8 @@ export function Active({ projectFilter }: Props) {
                   task={t}
                   workflow={t.workflow ?? null}
                   onClick={() => setSelectedTaskId(t.id)}
+                  onMerge={handleMerge}
+                  merging={merging.has(t.id)}
                 />
               ))}
             </div>
