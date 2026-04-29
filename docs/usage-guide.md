@@ -145,8 +145,11 @@ curl -X POST http://127.0.0.1:9800/tasks \
 Response:
 
 ```json
-{ "status": "running", "task_id": "a1b2c3d4-..." }
+{ "status": "queued", "task_id": "a1b2c3d4-..." }
 ```
+
+The task is accepted immediately and registered as pending work. Use
+`GET /tasks/{task_id}` to observe when execution actually starts.
 
 ### By GitHub Issue
 
@@ -192,7 +195,7 @@ Response:
 
 ```json
 [
-  { "task_id": "...", "status": "running" },
+  { "task_id": "...", "status": "queued" },
   { "task_id": "...", "status": "queued" },
   { "task_id": "...", "status": "queued" },
   { "task_id": "...", "status": "queued" }

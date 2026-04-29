@@ -58,15 +58,6 @@ pub(crate) async fn enqueue_task_background_in_domain(
         .await
 }
 
-fn create_task_status_response(state: &AppState, task_id: &task_runner::TaskId) -> &'static str {
-    match state.core.tasks.get(task_id) {
-        Some(task) if matches!(task.status, task_runner::TaskStatus::AwaitingDeps) => {
-            "awaiting_deps"
-        }
-        _ => "running",
-    }
-}
-
 /// A single task entry in the detailed batch format.
 #[derive(Debug, Deserialize)]
 pub struct BatchTaskItem {
@@ -298,18 +289,15 @@ pub(super) async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<task_runner::CreateTaskRequest>,
 ) -> Response {
-    match enqueue_task(&state, req).await {
-        Ok(task_id) => {
-            let status = create_task_status_response(state.as_ref(), &task_id);
-            (
-                StatusCode::ACCEPTED,
-                Json(json!({
-                    "task_id": task_id.0,
-                    "status": status
-                })),
-            )
-                .into_response()
-        }
+    match enqueue_task_background(state, req, None).await {
+        Ok(task_id) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "task_id": task_id.0,
+                "status": "queued"
+            })),
+        )
+            .into_response(),
         Err(EnqueueTaskError::BadRequest(error)) => {
             (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
         }
