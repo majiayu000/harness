@@ -29,6 +29,8 @@ const TRANSIENT_PATTERNS: &[&str] = &[
     "EOF",
     "stream idle timeout",
     "stream stall",
+    "failed to fetch github",
+    "timed out fetching github",
     "ECONNRESET",
     "ETIMEDOUT",
     // SQLite transient contention — SQLITE_BUSY / SQLITE_LOCKED
@@ -1820,6 +1822,12 @@ mod tests {
         ));
         assert!(is_transient_error(
             "claude exited with exit status: 1: stderr=[] stdout_tail=[You've hit your limit · resets 3pm (Asia/Shanghai)\n]"
+        ));
+        assert!(is_transient_error(
+            "failed to fetch GitHub pull request page for owner/repo issue #998"
+        ));
+        assert!(is_transient_error(
+            "timed out fetching GitHub pull request page for owner/repo issue #998"
         ));
 
         // Negative cases — permanent errors should not match.

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const GITHUB_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_PR_LOOKUP_MAX_PAGES: usize = 20;
 
 #[derive(Debug, Deserialize)]
 struct GhPrListItem {
@@ -257,8 +258,16 @@ async fn find_existing_pr_for_issue_in_repo(
 ) -> anyhow::Result<Option<(u64, String, String)>> {
     let mut next_url = Some(github_pulls_url(api_base_url, repo_slug));
     let mut seen_urls = HashSet::new();
+    let mut page_count = 0usize;
 
     while let Some(url) = next_url {
+        if page_count >= GITHUB_PR_LOOKUP_MAX_PAGES {
+            anyhow::bail!(
+                "GitHub pull request lookup for {repo_slug} issue #{issue} exceeded the {GITHUB_PR_LOOKUP_MAX_PAGES}-page limit"
+            );
+        }
+        page_count += 1;
+
         if !seen_urls.insert(url.clone()) {
             tracing::debug!(
                 issue,
@@ -352,14 +361,26 @@ fn parse_next_link(link: &str) -> Option<String> {
         if !url_segment.starts_with('<') || !url_segment.ends_with('>') {
             return None;
         }
-        if segments.any(|segment| {
-            segment.eq_ignore_ascii_case("rel=\"next\"") || segment.eq_ignore_ascii_case("rel=next")
-        }) {
+        if segments.any(link_segment_has_next_rel) {
             Some(url_segment[1..url_segment.len() - 1].to_string())
         } else {
             None
         }
     })
+}
+
+fn link_segment_has_next_rel(segment: &str) -> bool {
+    let Some((key, value)) = segment.split_once('=') else {
+        return false;
+    };
+    if !key.trim().eq_ignore_ascii_case("rel") {
+        return false;
+    }
+    value
+        .trim()
+        .trim_matches('"')
+        .split_ascii_whitespace()
+        .any(|rel| rel.eq_ignore_ascii_case("next"))
 }
 
 /// Return true iff `item` declares a closing relationship to `issue` — i.e.
@@ -703,9 +724,29 @@ mod tests {
         assert_eq!(parse_next_link(link), None);
     }
 
+    #[test]
+    fn parse_next_link_accepts_whitespace_around_rel_equals() {
+        let link = r#"<https://api.github.com/repos/o/r/pulls?page=2>; rel = "next""#;
+        assert_eq!(
+            parse_next_link(link),
+            Some("https://api.github.com/repos/o/r/pulls?page=2".to_string())
+        );
+    }
+
     struct PaginatedPrState {
         base_url: String,
         requests: AtomicUsize,
+    }
+
+    fn page_from_uri(uri: &Uri) -> usize {
+        uri.query()
+            .and_then(|query| {
+                query.split('&').find_map(|part| {
+                    part.strip_prefix("page=")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+            })
+            .unwrap_or(1)
     }
 
     async fn paginated_prs_handler(
@@ -713,11 +754,7 @@ mod tests {
         uri: Uri,
     ) -> impl IntoResponse {
         state.requests.fetch_add(1, Ordering::SeqCst);
-        let page = if uri.query().is_some_and(|query| query.contains("page=2")) {
-            2
-        } else {
-            1
-        };
+        let page = page_from_uri(&uri);
 
         let body = if page == 1 {
             serde_json::json!([
@@ -755,6 +792,37 @@ mod tests {
                     .expect("valid link header"),
             );
         }
+        (headers, body)
+    }
+
+    async fn endless_prs_handler(
+        State(state): State<Arc<PaginatedPrState>>,
+        uri: Uri,
+    ) -> impl IntoResponse {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        let page = page_from_uri(&uri);
+        let body = serde_json::json!([
+            {
+                "number": page,
+                "html_url": format!("https://github.com/owner/repo/pull/{page}"),
+                "title": format!("mentions #998 on page {page}"),
+                "body": "related to #998 but does not close it",
+                "head": {"ref": format!("docs-998-page-{page}")}
+            }
+        ])
+        .to_string();
+
+        let next_url = format!(
+            "{}/repos/owner/repo/pulls?state=open&per_page=100&page={}",
+            state.base_url,
+            page + 1
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::LINK,
+            HeaderValue::from_str(&format!("<{next_url}>; rel=\"next\""))
+                .expect("valid link header"),
+        );
         (headers, body)
     }
 
@@ -797,6 +865,44 @@ mod tests {
             ))
         );
         assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_pr_lookup_errors_after_page_limit() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let state = Arc::new(PaginatedPrState {
+            base_url: base_url.clone(),
+            requests: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/repos/owner/repo/pulls", get(endless_prs_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let err = find_existing_pr_for_issue_in_repo(
+            &reqwest::Client::new(),
+            "owner/repo",
+            998,
+            None,
+            &base_url,
+        )
+        .await
+        .expect_err("page limit should stop runaway GitHub pagination");
+
+        server.abort();
+
+        assert!(
+            err.to_string().contains("exceeded the 20-page limit"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            state.requests.load(Ordering::SeqCst),
+            GITHUB_PR_LOOKUP_MAX_PAGES
+        );
         Ok(())
     }
 
