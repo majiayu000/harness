@@ -1,5 +1,5 @@
 use harness_core::prompts;
-use reqwest::header::{ACCEPT, LINK, USER_AGENT};
+use reqwest::header::{ACCEPT, LINK, RETRY_AFTER, USER_AGENT};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,7 @@ use std::time::Duration;
 const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const GITHUB_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_PR_LOOKUP_MAX_PAGES: usize = 20;
+const GITHUB_ERROR_BODY_SNIPPET_CHARS: usize = 300;
 
 #[derive(Debug, Deserialize)]
 struct GhPrListItem {
@@ -262,9 +263,13 @@ async fn find_existing_pr_for_issue_in_repo(
 
     while let Some(url) = next_url {
         if page_count >= GITHUB_PR_LOOKUP_MAX_PAGES {
-            anyhow::bail!(
-                "GitHub pull request lookup for {repo_slug} issue #{issue} exceeded the {GITHUB_PR_LOOKUP_MAX_PAGES}-page limit"
+            tracing::warn!(
+                issue,
+                repo = %repo_slug,
+                page_limit = GITHUB_PR_LOOKUP_MAX_PAGES,
+                "existing PR lookup stopped after reaching the GitHub pagination page limit"
             );
+            break;
         }
         page_count += 1;
 
@@ -334,9 +339,30 @@ async fn fetch_github_pr_page(
         }
     };
     if !response.status().is_success() {
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let rate_limit_remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let is_rate_limited = status.as_u16() == 429
+            || retry_after.is_some()
+            || (status.as_u16() == 403 && rate_limit_remaining.as_deref() == Some("0"));
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        let body = error_body_snippet(&body);
+        let rate_limit_context = if is_rate_limited { " rate limit" } else { "" };
+        let retry_after = retry_after.as_deref().unwrap_or("none");
+        let rate_limit_remaining = rate_limit_remaining.as_deref().unwrap_or("unknown");
         anyhow::bail!(
-            "GitHub pull request lookup for {repo_slug} issue #{issue} at {url} returned {}",
-            response.status()
+            "GitHub pull request lookup for {repo_slug} issue #{issue} at {url} returned {status};{rate_limit_context} retry-after={retry_after}; x-ratelimit-remaining={rate_limit_remaining}; body={body}"
         );
     }
     let next_url = next_link_from_headers(response.headers());
@@ -347,6 +373,19 @@ async fn fetch_github_pr_page(
         .map_err(|e| anyhow::anyhow!("invalid GitHub pull request response: {e}"))?;
 
     Ok(GitHubPrPage { items, next_url })
+}
+
+fn error_body_snippet(body: &str) -> String {
+    let mut chars = body.chars();
+    let snippet: String = chars
+        .by_ref()
+        .take(GITHUB_ERROR_BODY_SNIPPET_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        format!("{snippet}...")
+    } else {
+        snippet
+    }
 }
 
 fn next_link_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -830,6 +869,20 @@ mod tests {
         (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
     }
 
+    async fn rate_limited_prs_handler() -> impl IntoResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HeaderName::from_static("x-ratelimit-remaining"),
+            HeaderValue::from_static("0"),
+        );
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        (
+            StatusCode::FORBIDDEN,
+            headers,
+            "API rate limit exceeded for user.",
+        )
+    }
+
     #[tokio::test]
     async fn existing_pr_lookup_follows_next_page() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -869,7 +922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_pr_lookup_errors_after_page_limit() -> anyhow::Result<()> {
+    async fn existing_pr_lookup_stops_after_page_limit_without_error() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("http://{}", listener.local_addr()?);
         let state = Arc::new(PaginatedPrState {
@@ -883,22 +936,18 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let err = find_existing_pr_for_issue_in_repo(
+        let found = find_existing_pr_for_issue_in_repo(
             &reqwest::Client::new(),
             "owner/repo",
             998,
             None,
             &base_url,
         )
-        .await
-        .expect_err("page limit should stop runaway GitHub pagination");
+        .await?;
 
         server.abort();
 
-        assert!(
-            err.to_string().contains("exceeded the 20-page limit"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(found, None);
         assert_eq!(
             state.requests.load(Ordering::SeqCst),
             GITHUB_PR_LOOKUP_MAX_PAGES
@@ -928,6 +977,37 @@ mod tests {
         server.abort();
 
         assert!(err.to_string().contains("returned 503"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_pr_lookup_preserves_rate_limit_context() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let app = Router::new().route("/repos/owner/repo/pulls", get(rate_limited_prs_handler));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let err = find_existing_pr_for_issue_in_repo(
+            &reqwest::Client::new(),
+            "owner/repo",
+            998,
+            None,
+            &base_url,
+        )
+        .await
+        .expect_err("GitHub rate limit failure should be visible to retry classification");
+
+        server.abort();
+
+        let err = err.to_string();
+        assert!(err.contains("rate limit"), "unexpected error: {err}");
+        assert!(err.contains("retry-after=60"), "unexpected error: {err}");
+        assert!(
+            err.contains("x-ratelimit-remaining=0"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 

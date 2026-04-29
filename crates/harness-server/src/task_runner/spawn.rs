@@ -1829,6 +1829,9 @@ mod tests {
         assert!(is_transient_error(
             "timed out fetching GitHub pull request page for owner/repo issue #998"
         ));
+        assert!(is_transient_error(
+            "GitHub pull request lookup for owner/repo issue #998 returned 403 Forbidden; rate limit retry-after=60; x-ratelimit-remaining=0"
+        ));
 
         // Negative cases — permanent errors should not match.
         assert!(!is_transient_error(
