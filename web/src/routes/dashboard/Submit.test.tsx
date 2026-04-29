@@ -154,6 +154,17 @@ describe("<Submit>", () => {
     expect(screen.getByRole("option", { name: "beta" })).toBeInTheDocument();
   });
 
+  it("blocks config advance while the project list is loading", () => {
+    mockUseOverview.mockReturnValue({ data: undefined, isLoading: true });
+    wrap(<Submit />);
+
+    goToConfig("Prompt");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "do something" } });
+
+    expect(screen.getByText("Loading projects…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Next/ })).toBeDisabled();
+  });
+
   it("agent dropdown populates from the selected project's agents array", () => {
     wrap(<Submit />);
     goToConfig("Issue");
@@ -208,6 +219,33 @@ describe("<Submit>", () => {
 
     expect(await screen.findByText("Max turns must be a positive integer")).toBeInTheDocument();
     expect(mockApiFetch).not.toHaveBeenCalled();
+  });
+
+  it("accepts zero turn timeout as no timeout and rejects invalid timeout values", async () => {
+    wrap(<Submit />);
+
+    goToConfig("Issue");
+    fireEvent.change(screen.getByPlaceholderText(/123 or/), { target: { value: "99" } });
+    fireEvent.change(screen.getByRole("combobox", { name: /Project/ }), {
+      target: { value: "alpha" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Next/ }));
+
+    const timeoutInput = screen.getAllByPlaceholderText(/leave blank for default/)[1];
+    fireEvent.change(timeoutInput, { target: { value: "-1" } });
+    fireEvent.click(screen.getByRole("button", { name: /Submit Task/ }));
+
+    expect(
+      await screen.findByText("Turn timeout seconds must be a non-negative integer"),
+    ).toBeInTheDocument();
+    expect(mockApiFetch).not.toHaveBeenCalled();
+
+    fireEvent.change(timeoutInput, { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /Submit Task/ }));
+
+    await waitFor(() => expect(mockApiFetch).toHaveBeenCalled());
+    const body = JSON.parse(mockApiFetch.mock.calls[0][1].body as string);
+    expect(body.turn_timeout_secs).toBe(0);
   });
 
   it("successful submit transitions to the success screen with the returned taskId", async () => {

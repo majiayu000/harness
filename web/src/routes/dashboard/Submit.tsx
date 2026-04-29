@@ -29,6 +29,13 @@ function parsePositiveInteger(input: string): number | null {
   return Number.isSafeInteger(value) ? value : null;
 }
 
+function parseNonNegativeInteger(input: string): number | null {
+  const trimmed = input.trim();
+  if (!/^(0|[1-9]\d*)$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 function parseIssueNumber(input: string): number | null {
   const trimmed = input.trim();
   const direct = parsePositiveInteger(trimmed);
@@ -102,15 +109,23 @@ function StepMode({ mode, onChange, onNext }: StepModeProps) {
 interface StepConfigProps {
   state: WizardState;
   projects: { id: string; agents: string[] }[];
+  projectsLoading: boolean;
   onChange: (patch: Partial<WizardState>) => void;
   onNext: () => void;
   onBack: () => void;
 }
 
-function StepConfig({ state, projects, onChange, onNext, onBack }: StepConfigProps) {
+function StepConfig({
+  state,
+  projects,
+  projectsLoading,
+  onChange,
+  onNext,
+  onBack,
+}: StepConfigProps) {
   const agents = projects.find((p) => p.id === state.project)?.agents ?? [];
 
-  const projectSelected = projects.length === 0 || state.project !== "";
+  const projectSelected = !projectsLoading && (projects.length === 0 || state.project !== "");
   const isValid =
     projectSelected &&
     ((state.mode === "issue" && parseIssueNumber(state.issueInput) !== null) ||
@@ -126,7 +141,9 @@ function StepConfig({ state, projects, onChange, onNext, onBack }: StepConfigPro
         >
           Project
         </label>
-        {projects.length === 0 ? (
+        {projectsLoading ? (
+          <p className="font-mono text-[11px] text-ink-3 py-1">Loading projects…</p>
+        ) : projects.length === 0 ? (
           <p className="font-mono text-[11px] text-ink-3 py-1">No projects registered</p>
         ) : (
           <select
@@ -259,7 +276,7 @@ function StepOptions({ state, onChange, onSubmit, onBack, busy, error }: StepOpt
         </label>
         <input
           type="number"
-          min="1"
+          min="0"
           value={state.turnTimeoutSecs}
           onChange={(e) => onChange({ turnTimeoutSecs: e.target.value })}
           placeholder="leave blank for default"
@@ -316,7 +333,7 @@ export function Submit({ projectFilter }: Props) {
   const [busy, setBusy] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const { data: overview } = useOverview();
+  const { data: overview, isLoading: projectsLoading = false } = useOverview();
   const projects = overview?.projects ?? [];
 
   useEffect(() => {
@@ -354,9 +371,9 @@ export function Submit({ projectFilter }: Props) {
       common.max_turns = n;
     }
     if (wizardState.turnTimeoutSecs.trim() !== "") {
-      const n = parsePositiveInteger(wizardState.turnTimeoutSecs);
+      const n = parseNonNegativeInteger(wizardState.turnTimeoutSecs);
       if (n === null) {
-        setSubmitError("Turn timeout seconds must be a positive integer");
+        setSubmitError("Turn timeout seconds must be a non-negative integer");
         setBusy(false);
         return;
       }
@@ -439,6 +456,7 @@ export function Submit({ projectFilter }: Props) {
           <StepConfig
             state={wizardState}
             projects={projects}
+            projectsLoading={projectsLoading}
             onChange={patchState}
             onNext={() => setStep("options")}
             onBack={() => setStep("mode")}
