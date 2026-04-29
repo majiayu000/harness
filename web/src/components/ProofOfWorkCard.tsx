@@ -79,17 +79,17 @@ export function ProofOfWorkCard({ task, prompts, artifacts }: Props) {
         ) : prompts.length === 0 ? (
           <span className="text-ink-3">No prompts recorded</span>
         ) : (
-          <div className="flex flex-col gap-1">
-            {prompts.map((p, i) => (
-              <details key={i} className="border border-line">
-                <summary className="px-2 py-1 cursor-pointer text-ink-2 hover:bg-bg-1">
-                  {p.phase} (turn {p.turn})
-                </summary>
-                <pre className="p-2 text-ink whitespace-pre-wrap break-words text-[10px]">
-                  {p.prompt.length > 500 ? p.prompt.slice(0, 500) + "…" : p.prompt}
-                </pre>
-              </details>
-            ))}
+          <div className="flex flex-col gap-2">
+            <span className="text-ink">
+              {prompts.length} prompt{prompts.length === 1 ? "" : "s"} recorded
+            </span>
+            <div className="flex flex-col gap-1">
+              {prompts.map((p, i) => (
+                <div key={i} className="border border-line px-2 py-1 text-ink-2">
+                  {p.phase} (turn {p.turn}) · {p.created_at}
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </section>
