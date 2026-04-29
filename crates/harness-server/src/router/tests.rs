@@ -120,6 +120,7 @@ async fn make_test_state_with_config_and_registry(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake: None,
@@ -1455,6 +1456,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake: None,

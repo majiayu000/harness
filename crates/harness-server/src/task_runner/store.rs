@@ -3,6 +3,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use futures::StreamExt;
 use harness_core::agent::StreamItem;
+use harness_core::db::PgStoreContext;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,7 +60,19 @@ impl TaskStore {
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open_with_database_url(db_path, configured_database_url).await?;
+        Self::from_task_db(db, db_path).await
+    }
 
+    pub async fn open_with_context(
+        db_path: &std::path::Path,
+        context: &PgStoreContext,
+        setup_pool: &sqlx::postgres::PgPool,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_with_context(context, setup_pool).await?;
+        Self::from_task_db(db, db_path).await
+    }
+
+    async fn from_task_db(db: TaskDb, db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         // 1. Event replay: runs BEFORE recover_in_progress so event-sourced
         //    data (pr_url, terminal status) wins over checkpoint data.
         let event_log_path = db_path

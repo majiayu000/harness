@@ -7,7 +7,7 @@ use super::{
     builders, rate_limit,
     state::{
         AppState, ConcurrencyServices, CoreServices, EngineServices, IntakeServices,
-        NotificationServices, ObservabilityServices,
+        NotificationServices, ObservabilityServices, StoreStartupResult,
     },
 };
 
@@ -49,6 +49,86 @@ fn parse_external_id_number(prefix: &str, external_id: Option<&str>) -> Option<u
     value.strip_prefix(prefix)?.parse::<u64>().ok()
 }
 
+fn startup_failure_error(startup_statuses: &[StoreStartupResult]) -> Option<anyhow::Error> {
+    let failures: Vec<String> = startup_statuses
+        .iter()
+        .filter(|status| status.is_critical() && !status.ready)
+        .map(|status| {
+            let error = status.error.as_deref().unwrap_or("unknown startup failure");
+            format!("{}: {error}", status.name)
+        })
+        .collect();
+    (!failures.is_empty()).then(|| {
+        anyhow::anyhow!(
+            "critical startup stores failed to initialize: {}",
+            failures.join("; ")
+        )
+    })
+}
+
+async fn build_review_store(
+    data_dir: &std::path::Path,
+    configured_database_url: Option<&str>,
+) -> anyhow::Result<(
+    Option<Arc<crate::review_store::ReviewStore>>,
+    StoreStartupResult,
+)> {
+    let review_db_path = harness_core::config::dirs::default_db_path(data_dir, "reviews");
+    let forced = builders::forced_startup_error("review_store");
+    if let Some(error) = forced {
+        return Ok((
+            None,
+            StoreStartupResult::optional("review_store").failed(error),
+        ));
+    }
+
+    let database_url = match harness_core::db::resolve_database_url(configured_database_url) {
+        Ok(database_url) => database_url,
+        Err(error) => {
+            return Ok((
+                None,
+                StoreStartupResult::optional("review_store").failed(error.to_string()),
+            ));
+        }
+    };
+    let setup_pool = match harness_core::db::pg_open_pool(&database_url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            return Ok((
+                None,
+                StoreStartupResult::optional("review_store").failed(error.to_string()),
+            ));
+        }
+    };
+
+    let context = match harness_core::db::pg_schema_for_path(&review_db_path)
+        .and_then(|schema| harness_core::db::PgStoreContext::new(database_url, schema))
+    {
+        Ok(context) => context,
+        Err(error) => {
+            setup_pool.close().await;
+            return Ok((
+                None,
+                StoreStartupResult::optional("review_store").failed(error.to_string()),
+            ));
+        }
+    };
+    let review_store =
+        crate::review_store::ReviewStore::open_with_context(&context, &setup_pool).await;
+    setup_pool.close().await;
+
+    match review_store {
+        Ok(store) => Ok((
+            Some(Arc::new(store)),
+            StoreStartupResult::optional("review_store"),
+        )),
+        Err(error) => Ok((
+            None,
+            StoreStartupResult::optional("review_store").failed(error.to_string()),
+        )),
+    }
+}
+
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 ///
 /// Initialization is split into five ordered phases — each phase's outputs
@@ -87,22 +167,40 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Some(_) => {}
     }
 
+    let mut startup_statuses = Vec::new();
+
     // Phase 1: storage — dir validation (symlink check, chmod), task DB, q_value DB.
     let storage = builders::storage::build_storage_with_database_url(
         &dir,
         server.config.server.database_url.as_deref(),
     )
     .await?;
+    startup_statuses.extend(storage.startup_results.clone());
+    if let Some(error) = startup_failure_error(&startup_statuses) {
+        return Err(error);
+    }
+    let tasks = storage
+        .tasks
+        .as_ref()
+        .expect("critical task store should be present after startup validation")
+        .clone();
 
     // Phase 2: engines — rule engine, event store (+purge task), GC agent, skill store.
     // Depends on: storage (none directly, but must precede registry which uses storage.tasks).
     let engines = builders::engines::build_engines(&server, &dir, &project_root).await?;
+    startup_statuses.extend(engines.startup_results.clone());
+    if let Some(error) = startup_failure_error(&startup_statuses) {
+        return Err(error);
+    }
 
     // Phase 3: registry — thread DB, plan DB + cache, project registry, workspace manager,
     // runtime state store.
     // Depends on: storage.tasks (orphan-worktree cleanup reads terminal task IDs).
-    let registry =
-        builders::registry::build_registry(&server, &dir, &project_root, &storage.tasks).await?;
+    let registry = builders::registry::build_registry(&server, &dir, &project_root, &tasks).await?;
+    startup_statuses.extend(registry.startup_results.clone());
+    if let Some(error) = startup_failure_error(&startup_statuses) {
+        return Err(error);
+    }
 
     // Phase 4: intake — task queue, Feishu/GitHub pollers, quality trigger, completion callback
     // (including Q-value wrapper).
@@ -150,35 +248,18 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         Arc::new(AtomicBool::new(in_window))
     };
 
-    let review_store = {
-        let review_db_path = harness_core::config::dirs::default_db_path(&dir, "reviews");
-        match crate::review_store::ReviewStore::open_with_database_url(
-            &review_db_path,
-            server.config.server.database_url.as_deref(),
-        )
-        .await
-        {
-            Ok(store) => Some(Arc::new(store)),
-            Err(e) => {
-                tracing::warn!("review store init failed, reviews will not be persisted: {e}");
-                None
-            }
-        }
-    };
+    let (review_store, review_status) =
+        build_review_store(&dir, server.config.server.database_url.as_deref()).await?;
+    startup_statuses.push(review_status);
 
     // NOTE: add a matching entry here whenever a new optional store is added.
-    let mut degraded_subsystems: Vec<&'static str> = Vec::new();
-    if storage.q_values.is_none() {
-        degraded_subsystems.push("q_value_store");
-    }
-    if registry.runtime_state_store.is_none() || services.snapshot_load_failed {
+    let mut degraded_subsystems: Vec<&'static str> = startup_statuses
+        .iter()
+        .filter(|status| !status.ready)
+        .map(|status| status.name)
+        .collect();
+    if services.snapshot_load_failed && !degraded_subsystems.contains(&"runtime_state_store") {
         degraded_subsystems.push("runtime_state_store");
-    }
-    if registry.workspace_mgr.is_none() {
-        degraded_subsystems.push("workspace_manager");
-    }
-    if review_store.is_none() {
-        degraded_subsystems.push("review_store");
     }
 
     Ok(AppState {
@@ -186,13 +267,25 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             server,
             project_root,
             home_dir,
-            tasks: storage.tasks,
-            thread_db: Some(registry.thread_db),
-            plan_db: Some(registry.plan_db),
+            tasks,
+            thread_db: Some(
+                registry
+                    .thread_db
+                    .expect("critical thread DB should be present after startup validation"),
+            ),
+            plan_db: Some(
+                registry
+                    .plan_db
+                    .expect("critical plan DB should be present after startup validation"),
+            ),
             plan_cache: registry.plan_cache,
             issue_workflow_store: registry.issue_workflow_store,
             project_workflow_store: registry.project_workflow_store,
-            project_registry: Some(registry.project_registry),
+            project_registry: Some(
+                registry
+                    .project_registry
+                    .expect("critical project registry should be present after startup validation"),
+            ),
             runtime_state_store: registry.runtime_state_store,
             q_values: storage.q_values,
             maintenance_active,
@@ -203,7 +296,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             gc_agent: engines.gc_agent,
         },
         observability: ObservabilityServices {
-            events: engines.events,
+            events: engines
+                .events
+                .expect("critical event store should be present after startup validation"),
             signal_rate_limiter: Arc::new(rate_limit::SignalRateLimiter::new(signal_rate_limit)),
             password_reset_rate_limiter: Arc::new(rate_limit::PasswordResetRateLimiter::new(
                 password_reset_rate_limit,
@@ -231,6 +326,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             ws_shutdown_tx: broadcast::channel(1).0,
         },
         interceptors: services.interceptors,
+        startup_statuses,
         degraded_subsystems,
         intake: IntakeServices {
             feishu_intake: intake.feishu_intake,
@@ -528,4 +624,73 @@ async fn post_review_bot_comment(
         anyhow::bail!("GitHub API returned {status}: {text}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{server::HarnessServer, thread_manager::ThreadManager};
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::{config::HarnessConfig, db::resolve_database_url};
+
+    fn make_test_server(root: &std::path::Path) -> Arc<HarnessServer> {
+        let mut config = HarnessConfig::default();
+        config.server.data_dir = root.to_path_buf();
+        config.server.project_root = root.to_path_buf();
+        Arc::new(HarnessServer::new(
+            config,
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn build_app_state_aborts_on_pool_timeout_for_critical_task_store() {
+        if resolve_database_url(None).is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = make_test_server(dir.path());
+        let result = builders::with_forced_startup_failures(
+            &[(
+                "tasks",
+                "pool timed out while waiting for an open connection",
+            )],
+            build_app_state(server),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("critical task store failure must abort startup"),
+            Err(err) => err,
+        };
+        assert!(crate::test_helpers::is_pool_timeout(&err));
+        assert!(err.to_string().contains("tasks"));
+    }
+
+    #[tokio::test]
+    async fn build_app_state_records_optional_q_value_failure() {
+        if resolve_database_url(None).is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = make_test_server(dir.path());
+        let state = builders::with_forced_startup_failures(
+            &[(
+                "q_value_store",
+                "pool timed out while waiting for an open connection",
+            )],
+            build_app_state(server),
+        )
+        .await
+        .expect("optional q_value failure should not abort startup");
+        assert!(state.core.q_values.is_none());
+        assert!(state.degraded_subsystems.contains(&"q_value_store"));
+        let status = state
+            .startup_statuses
+            .iter()
+            .find(|status| status.name == "q_value_store")
+            .expect("q_value startup status");
+        assert!(!status.is_critical());
+        assert!(!status.ready);
+    }
 }

@@ -7,6 +7,50 @@ use tokio::sync::{broadcast, Mutex};
 
 use super::rate_limit;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupTier {
+    Critical,
+    Optional,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreStartupResult {
+    pub name: &'static str,
+    pub tier: StartupTier,
+    pub ready: bool,
+    pub error: Option<String>,
+}
+
+impl StoreStartupResult {
+    pub fn critical(name: &'static str) -> Self {
+        Self {
+            name,
+            tier: StartupTier::Critical,
+            ready: true,
+            error: None,
+        }
+    }
+
+    pub fn optional(name: &'static str) -> Self {
+        Self {
+            name,
+            tier: StartupTier::Optional,
+            ready: true,
+            error: None,
+        }
+    }
+
+    pub fn failed(mut self, error: impl Into<String>) -> Self {
+        self.ready = false;
+        self.error = Some(error.into());
+        self
+    }
+
+    pub fn is_critical(&self) -> bool {
+        matches!(self.tier, StartupTier::Critical)
+    }
+}
+
 /// Core services: thread/task management and persistence.
 pub struct CoreServices {
     pub server: Arc<crate::server::HarnessServer>,
@@ -107,6 +151,8 @@ pub struct AppState {
     pub notifications: NotificationServices,
     pub intake: IntakeServices,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    /// Structured startup outcomes for stores and optional subsystems.
+    pub startup_statuses: Vec<StoreStartupResult>,
     /// Subsystem names that degraded to `None` at startup (optional stores only).
     /// Set once during `build_app_state`; read-only thereafter.
     pub degraded_subsystems: Vec<&'static str>,

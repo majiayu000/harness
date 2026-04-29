@@ -187,6 +187,7 @@ async fn make_test_state_with_project_root(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake,
@@ -426,6 +427,20 @@ struct HealthResponse {
 struct PersistenceBlock {
     degraded_subsystems: Vec<String>,
     runtime_state_dirty: bool,
+    startup: StartupBlock,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct StartupBlock {
+    stores: Vec<StoreHealth>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct StoreHealth {
+    name: String,
+    critical: bool,
+    ready: bool,
+    error: Option<String>,
 }
 
 async fn call_health(state: Arc<AppState>) -> anyhow::Result<HealthResponse> {
@@ -450,6 +465,7 @@ async fn health_endpoint_returns_ok_and_task_count() -> anyhow::Result<()> {
     assert_eq!(health.tasks, 0);
     assert!(health.persistence.degraded_subsystems.is_empty());
     assert!(!health.persistence.runtime_state_dirty);
+    assert!(health.persistence.startup.stores.is_empty());
     Ok(())
 }
 
@@ -475,6 +491,33 @@ async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
     assert_eq!(health.status, "degraded");
     assert!(health.persistence.degraded_subsystems.is_empty());
     assert!(health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_test_state(dir.path()).await?;
+    let state_mut = Arc::get_mut(&mut state).unwrap();
+    state_mut.degraded_subsystems = vec!["review_store"];
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("review_store")
+                .failed("failed to connect to postgres://user:secret@db.internal/harness"),
+        ];
+
+    let health = call_health(state).await?;
+    assert_eq!(health.status, "degraded");
+    assert_eq!(health.persistence.startup.stores.len(), 1);
+    let store = &health.persistence.startup.stores[0];
+    assert_eq!(store.name, "review_store");
+    assert!(!store.critical);
+    assert!(!store.ready);
+    assert_eq!(store.error.as_deref(), Some("database_unavailable"));
+    assert!(
+        !format!("{health:?}").contains("secret"),
+        "health response must not expose raw startup error text"
+    );
     Ok(())
 }
 

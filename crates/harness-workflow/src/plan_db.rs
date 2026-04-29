@@ -1,7 +1,4 @@
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{Migration, PgStoreContext};
 use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use harness_exec::plan::ExecPlan;
 use sqlx::postgres::PgPool;
@@ -50,22 +47,21 @@ impl PlanDb {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let database_url = resolve_database_url(configured_database_url)?;
-        use sha2::{Digest, Sha256};
-        let path_utf8 = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
+        let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let pool = context.open_migrated_pool(PLAN_MIGRATIONS).await?;
+        Ok(Self {
+            pool,
+            update_lock: tokio::sync::Mutex::new(()),
+        })
+    }
 
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, PLAN_MIGRATIONS).run().await?;
+    pub async fn open_with_context(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+    ) -> anyhow::Result<Self> {
+        let pool = context
+            .open_migrated_pool_with_setup_pool(setup_pool, PLAN_MIGRATIONS)
+            .await?;
         Ok(Self {
             pool,
             update_lock: tokio::sync::Mutex::new(()),
@@ -215,6 +211,9 @@ impl PlanDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::db::{
+        pg_open_pool, pg_open_pool_schematized, resolve_database_url, PgMigrator,
+    };
     use harness_core::types::ExecPlanStatus;
     use std::sync::OnceLock;
     use tokio::sync::{Semaphore, SemaphorePermit};

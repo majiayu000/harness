@@ -1,9 +1,6 @@
 use chrono::{DateTime, Utc};
 use harness_core::config::misc::OtelConfig;
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{Migration, PgStoreContext};
 use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     SessionId, Severity, Violation,
@@ -72,24 +69,9 @@ impl EventStore {
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let data_dir = data_dir.to_path_buf();
-
-        let database_url = resolve_database_url(configured_database_url)?;
-        use sha2::{Digest, Sha256};
-        let events_path = data_dir.join("events.db");
-        let path_utf8 = events_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", events_path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
-
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, EVENT_MIGRATIONS).run().await?;
+        let context =
+            PgStoreContext::from_path(&data_dir.join("events.db"), configured_database_url)?;
+        let pool = context.open_migrated_pool(EVENT_MIGRATIONS).await?;
 
         let store = Self {
             pool,
@@ -98,6 +80,25 @@ impl EventStore {
             session_renewal_secs: 1800,
         };
 
+        store.migrate_from_jsonl().await;
+        Ok(store)
+    }
+
+    pub async fn new_with_context(
+        data_dir: &Path,
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+    ) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let pool = context
+            .open_migrated_pool_with_setup_pool(setup_pool, EVENT_MIGRATIONS)
+            .await?;
+        let store = Self {
+            pool,
+            data_dir: data_dir.to_path_buf(),
+            otel_pipeline: Mutex::new(None),
+            session_renewal_secs: 1800,
+        };
         store.migrate_from_jsonl().await;
         Ok(store)
     }
@@ -220,13 +221,40 @@ impl EventStore {
         otel_config: &OtelConfig,
     ) -> anyhow::Result<Self> {
         let mut store = Self::new_with_database_url(data_dir, configured_database_url).await?;
-        store.session_renewal_secs = session_renewal_secs;
+        store
+            .apply_policies_and_otel(session_renewal_secs, log_retention_days, otel_config)
+            .await?;
+        Ok(store)
+    }
+
+    pub async fn with_policies_and_otel_with_context(
+        data_dir: &Path,
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        session_renewal_secs: u64,
+        log_retention_days: u32,
+        otel_config: &OtelConfig,
+    ) -> anyhow::Result<Self> {
+        let mut store = Self::new_with_context(data_dir, context, setup_pool).await?;
+        store
+            .apply_policies_and_otel(session_renewal_secs, log_retention_days, otel_config)
+            .await?;
+        Ok(store)
+    }
+
+    async fn apply_policies_and_otel(
+        &mut self,
+        session_renewal_secs: u64,
+        log_retention_days: u32,
+        otel_config: &OtelConfig,
+    ) -> anyhow::Result<()> {
+        self.session_renewal_secs = session_renewal_secs;
         tracing::debug!(
             session_renewal_secs,
             log_retention_days,
             "event store: applying retention policies"
         );
-        if let Err(e) = store.purge_old_events(log_retention_days).await {
+        if let Err(e) = self.purge_old_events(log_retention_days).await {
             tracing::warn!("event store: failed to purge old events: {e}");
         }
         let pipeline = match crate::otel_export::OtelPipeline::from_config(otel_config).await {
@@ -238,11 +266,8 @@ impl EventStore {
                 None
             }
         };
-        *store
-            .otel_pipeline
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = pipeline;
-        Ok(store)
+        *self.otel_pipeline.lock().unwrap_or_else(|e| e.into_inner()) = pipeline;
+        Ok(())
     }
 
     /// Import events from an existing `events.jsonl` file (backward compat).

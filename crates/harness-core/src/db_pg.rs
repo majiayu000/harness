@@ -338,17 +338,75 @@ impl PgStoreContext {
         &self.schema
     }
 
+    pub async fn ensure_schema(&self, setup_pool: &PgPool) -> anyhow::Result<()> {
+        pg_create_schema_if_not_exists(setup_pool, &self.schema)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to ensure Postgres schema '{}' is ready: {error}",
+                    self.schema
+                )
+            })
+    }
+
+    pub async fn open_runtime_pool(&self) -> anyhow::Result<PgPool> {
+        pg_open_pool_schematized(&self.database_url, &self.schema)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to open Postgres runtime pool for schema '{}': {error}",
+                    self.schema
+                )
+            })
+    }
+
+    pub async fn open_pool_with_setup_pool(&self, setup_pool: &PgPool) -> anyhow::Result<PgPool> {
+        self.ensure_schema(setup_pool).await?;
+        self.open_runtime_pool().await
+    }
+
+    pub async fn open_migrated_pool_with_setup_pool(
+        &self,
+        setup_pool: &PgPool,
+        migrations: &[Migration],
+    ) -> anyhow::Result<PgPool> {
+        let pool = self.open_pool_with_setup_pool(setup_pool).await?;
+        PgMigrator::new(&pool, migrations)
+            .run()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to run Postgres migrations for schema '{}': {error}",
+                    self.schema
+                )
+            })?;
+        Ok(pool)
+    }
+
     pub async fn open_pool(&self) -> anyhow::Result<PgPool> {
-        let setup = pg_open_pool(&self.database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &self.schema).await?;
+        let setup = pg_open_pool(&self.database_url).await.map_err(|error| {
+            anyhow::anyhow!(
+                "failed to open Postgres bootstrap pool for schema '{}': {error}",
+                self.schema
+            )
+        })?;
+        let pool = self.open_pool_with_setup_pool(&setup).await;
         setup.close().await;
-        pg_open_pool_schematized(&self.database_url, &self.schema).await
+        pool
     }
 
     pub async fn open_migrated_pool(&self, migrations: &[Migration]) -> anyhow::Result<PgPool> {
-        let pool = self.open_pool().await?;
-        PgMigrator::new(&pool, migrations).run().await?;
-        Ok(pool)
+        let setup = pg_open_pool(&self.database_url).await.map_err(|error| {
+            anyhow::anyhow!(
+                "failed to open Postgres bootstrap pool for schema '{}': {error}",
+                self.schema
+            )
+        })?;
+        let pool = self
+            .open_migrated_pool_with_setup_pool(&setup, migrations)
+            .await;
+        setup.close().await;
+        pool
     }
 }
 
@@ -538,9 +596,9 @@ impl<'a> PgMigrator<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_pg_pool_from_server, pg_pool_settings, pg_schema_for_path, resolve_database_url,
-        validate_schema_name, PgStoreContext, DEFAULT_PG_ACQUIRE_TIMEOUT_SECS,
-        DEFAULT_PG_MAX_CONNECTIONS,
+        configure_pg_pool_from_server, pg_open_pool, pg_pool_settings, pg_schema_for_path,
+        resolve_database_url, validate_schema_name, PgStoreContext,
+        DEFAULT_PG_ACQUIRE_TIMEOUT_SECS, DEFAULT_PG_MAX_CONNECTIONS,
     };
     use crate::config::server::ServerConfig;
     use crate::test_support::process_env_lock;
@@ -694,6 +752,40 @@ mod tests {
             err.to_string().contains("ASCII letters"),
             "error should explain schema validation, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn pg_store_context_runtime_pool_errors_name_the_step() {
+        let context = PgStoreContext::new("not-a-valid-postgres-url", "h1b76aa87802f7705")
+            .expect("context should accept opaque URL strings");
+        let err = context
+            .open_runtime_pool()
+            .await
+            .expect_err("invalid URL should fail before connecting");
+        assert!(
+            err.to_string().contains("runtime pool"),
+            "error should identify the runtime-pool step: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_store_context_can_reuse_shared_setup_pool() {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return;
+        };
+        let setup_pool = match pg_open_pool(&database_url).await {
+            Ok(pool) => pool,
+            Err(_) => return,
+        };
+        let context =
+            PgStoreContext::from_path(Path::new("/tmp/harness/shared.db"), Some(&database_url))
+                .expect("context should resolve");
+        let pool = context
+            .open_pool_with_setup_pool(&setup_pool)
+            .await
+            .expect("shared setup pool should initialize the store");
+        pool.close().await;
+        setup_pool.close().await;
     }
 
     #[test]
