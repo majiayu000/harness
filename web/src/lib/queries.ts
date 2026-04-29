@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiJson, apiFetch } from "./api";
 import type { DashboardPayload, FullTask, OperatorSnapshotPayload, OverviewPayload, StreamItem, Task } from "@/types";
 
@@ -106,6 +106,14 @@ export function useTaskStream(
 
     return () => controller.abort();
   }, [id]);
+}
+
+export function useCancelTask() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => apiFetch(`/tasks/${id}/cancel`, { method: "POST" }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+  });
 }
 
 export interface WorktreeCard {
