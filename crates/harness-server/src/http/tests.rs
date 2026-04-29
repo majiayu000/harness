@@ -187,6 +187,7 @@ async fn make_test_state_with_project_root(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake,

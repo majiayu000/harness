@@ -17,6 +17,18 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
     let count = state.core.tasks.count();
     let dirty = state.is_runtime_state_dirty();
     let degraded = &state.degraded_subsystems;
+    let startup_statuses: Vec<serde_json::Value> = state
+        .startup_statuses
+        .iter()
+        .map(|status| {
+            json!({
+                "name": status.name,
+                "critical": status.is_critical(),
+                "ready": status.ready,
+                "error": status.error,
+            })
+        })
+        .collect();
     let status = if degraded.is_empty() && !dirty {
         "ok"
     } else {
@@ -28,6 +40,9 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
         "persistence": {
             "degraded_subsystems": degraded,
             "runtime_state_dirty": dirty,
+            "startup": {
+                "stores": startup_statuses,
+            }
         }
     }))
 }

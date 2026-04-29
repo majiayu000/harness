@@ -3,14 +3,16 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
+use crate::http::state::StoreStartupResult;
 use crate::server::HarnessServer;
 
 /// Outputs of the engine initialization phase.
 pub(crate) struct EnginesBundle {
     pub rules: Arc<RwLock<harness_rules::engine::RuleEngine>>,
-    pub events: Arc<harness_observe::event_store::EventStore>,
+    pub events: Option<Arc<harness_observe::event_store::EventStore>>,
     pub gc_agent: Arc<harness_gc::gc_agent::GcAgent>,
     pub skills: Arc<RwLock<harness_skills::store::SkillStore>>,
+    pub startup_results: Vec<StoreStartupResult>,
 }
 
 /// Initialize rule engine, event store, GC agent, and skill store.
@@ -86,20 +88,60 @@ pub(crate) async fn build_engines(
         .context("failed to load configured rules.requirements_path")?;
 
     // ── Event store ──────────────────────────────────────────────────────────
-    let events = Arc::new(
-        harness_observe::event_store::EventStore::with_policies_and_otel_with_database_url(
-            data_dir,
-            server.config.server.database_url.as_deref(),
-            server.config.observe.session_renewal_secs,
-            server.config.observe.log_retention_days,
-            &server.config.otel,
-        )
-        .await?,
-    );
+    let (events, event_result) = match super::forced_startup_error("event_store") {
+        Some(error) => (
+            None,
+            StoreStartupResult::critical("event_store").failed(error),
+        ),
+        None => {
+            let database_url = harness_core::db::resolve_database_url(
+                server.config.server.database_url.as_deref(),
+            );
+            match database_url {
+                Ok(database_url) => match harness_core::db::pg_open_pool(&database_url).await {
+                    Ok(setup_pool) => {
+                        let event_context = harness_core::db::PgStoreContext::new(
+                            database_url,
+                            harness_core::db::pg_schema_for_path(&data_dir.join("events.db"))?,
+                        )?;
+                        let store = harness_observe::event_store::EventStore::with_policies_and_otel_with_context(
+                            data_dir,
+                            &event_context,
+                            &setup_pool,
+                            server.config.observe.session_renewal_secs,
+                            server.config.observe.log_retention_days,
+                            &server.config.otel,
+                        )
+                        .await;
+                        setup_pool.close().await;
+                        match store {
+                            Ok(store) => (
+                                Some(Arc::new(store)),
+                                StoreStartupResult::critical("event_store"),
+                            ),
+                            Err(error) => (
+                                None,
+                                StoreStartupResult::critical("event_store")
+                                    .failed(error.to_string()),
+                            ),
+                        }
+                    }
+                    Err(error) => (
+                        None,
+                        StoreStartupResult::critical("event_store").failed(error.to_string()),
+                    ),
+                },
+                Err(error) => (
+                    None,
+                    StoreStartupResult::critical("event_store").failed(error.to_string()),
+                ),
+            }
+        }
+    };
 
     let retention = server.config.observe.log_retention_days;
-    if retention > 0 {
-        let purge_events = Arc::clone(&events);
+    if retention > 0 && events.is_some() {
+        let purge_events = Arc::clone(events.as_ref().expect("checked is_some above"));
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
@@ -114,31 +156,33 @@ pub(crate) async fn build_engines(
     // On first boot after upgrading from file-checkpoint to KV-watermark, seed
     // the KV watermark from gc-checkpoint.json so the first incremental scan
     // doesn't regress to a full O(total-events) scan.
-    let project_key = project_root.to_string_lossy().into_owned();
-    match events.get_scan_watermark(&project_key, "gc").await {
-        Ok(None) => {
-            // No KV watermark yet — try the legacy file checkpoint.
-            let checkpoint_path = harness_gc::checkpoint::default_checkpoint_path(project_root);
-            if let Some(cp) = harness_gc::checkpoint::GcCheckpoint::load(&checkpoint_path) {
-                match events
-                    .set_scan_watermark(&project_key, "gc", cp.last_scan_at)
-                    .await
-                {
-                    Ok(()) => {
-                        tracing::info!(
-                            ts = %cp.last_scan_at,
-                            "gc: migrated legacy checkpoint to KV watermark"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("gc: failed to seed KV watermark from checkpoint: {e}");
+    if let Some(events) = events.as_ref() {
+        let project_key = project_root.to_string_lossy().into_owned();
+        match events.get_scan_watermark(&project_key, "gc").await {
+            Ok(None) => {
+                // No KV watermark yet — try the legacy file checkpoint.
+                let checkpoint_path = harness_gc::checkpoint::default_checkpoint_path(project_root);
+                if let Some(cp) = harness_gc::checkpoint::GcCheckpoint::load(&checkpoint_path) {
+                    match events
+                        .set_scan_watermark(&project_key, "gc", cp.last_scan_at)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                ts = %cp.last_scan_at,
+                                "gc: migrated legacy checkpoint to KV watermark"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("gc: failed to seed KV watermark from checkpoint: {e}");
+                        }
                     }
                 }
             }
-        }
-        Ok(Some(_)) => {} // already seeded — nothing to do
-        Err(e) => {
-            tracing::warn!("gc: failed to read KV watermark during migration check: {e}");
+            Ok(Some(_)) => {} // already seeded — nothing to do
+            Err(e) => {
+                tracing::warn!("gc: failed to read KV watermark during migration check: {e}");
+            }
         }
     }
 
@@ -178,6 +222,7 @@ pub(crate) async fn build_engines(
         events,
         gc_agent,
         skills: Arc::new(RwLock::new(skill_store)),
+        startup_results: vec![event_result],
     })
 }
 
@@ -234,5 +279,24 @@ mod tests {
             !rules.guards().is_empty(),
             "expected builtins even without discovery path"
         );
+    }
+
+    #[tokio::test]
+    async fn event_store_failure_is_recorded_as_critical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = make_test_server(dir.path());
+        let bundle = super::super::with_forced_startup_failures(
+            &[("event_store", "failed to open Postgres bootstrap pool")],
+            build_engines(&server, dir.path(), dir.path()),
+        )
+        .await
+        .expect("build_engines should still return a bundle");
+        assert!(
+            bundle.events.is_none(),
+            "critical event store should be absent"
+        );
+        assert_eq!(bundle.startup_results.len(), 1);
+        assert!(bundle.startup_results[0].is_critical());
+        assert!(!bundle.startup_results[0].ready);
     }
 }

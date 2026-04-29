@@ -100,26 +100,7 @@ pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
 }
 
 pub fn test_database_url() -> anyhow::Result<String> {
-    if let Ok(url) = resolve_database_url(None) {
-        return Ok(url);
-    }
-
-    let config_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.toml");
-    let content = std::fs::read_to_string(&config_path)?;
-
-    content
-        .lines()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            let (_, value) = trimmed.split_once('=')?;
-            if !trimmed.starts_with("database_url") {
-                return None;
-            }
-            let url = value.trim().trim_matches('"').trim().to_string();
-            (!url.is_empty()).then_some(url)
-        })
-        .ok_or_else(|| anyhow::anyhow!("config/default.toml is missing server.database_url"))
+    resolve_database_url(None)
 }
 
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
@@ -194,17 +175,12 @@ async fn make_state_inner(
         ThreadManager::new(),
         agent_registry,
     ));
-    let database_url = test_database_url()?;
     let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
-    let tasks = crate::task_runner::TaskStore::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir, "tasks"),
-        Some(&database_url),
-    )
+    let tasks = crate::task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
+        dir, "tasks",
+    ))
     .await?;
-    let events = Arc::new(
-        harness_observe::event_store::EventStore::new_with_database_url(dir, Some(&database_url))
-            .await?,
-    );
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
         harness_core::types::ProjectId::new(),
@@ -216,10 +192,9 @@ async fn make_state_inner(
         draft_store,
         project_root.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir, "threads"),
-        Some(&database_url),
-    )
+    let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
+        dir, "threads",
+    ))
     .await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new(&Default::default()));
@@ -227,9 +202,8 @@ async fn make_state_inner(
     // Service layer — use concrete defaults backed by the same infrastructure.
     let project_svc = crate::services::project::DefaultProjectService::new(
         // Tests that don't need a registry still get a lightweight one.
-        crate::project_registry::ProjectRegistry::open_with_database_url(
+        crate::project_registry::ProjectRegistry::open(
             &harness_core::config::dirs::default_db_path(dir, "projects"),
-            Some(&database_url),
         )
         .await?,
         project_root.to_path_buf(),
@@ -305,6 +279,7 @@ async fn make_state_inner(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake: None,

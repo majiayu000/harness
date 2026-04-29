@@ -1,8 +1,5 @@
 use chrono::{DateTime, Utc};
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{Migration, PgStoreContext};
 use sqlx::postgres::PgPool;
 use sqlx::Postgres;
 use std::path::Path;
@@ -57,16 +54,10 @@ impl IssueWorkflowStore {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let database_url = resolve_database_url(configured_database_url)?;
-        let schema = legacy_schema_for_path(path)?;
-
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, ISSUE_WORKFLOW_MIGRATIONS)
-            .run()
+        let context =
+            PgStoreContext::from_schema(&legacy_schema_for_path(path)?, configured_database_url)?;
+        let pool = context
+            .open_migrated_pool(ISSUE_WORKFLOW_MIGRATIONS)
             .await?;
         Ok(Self { pool })
     }
@@ -75,14 +66,19 @@ impl IssueWorkflowStore {
         configured_database_url: Option<&str>,
         schema: &str,
     ) -> anyhow::Result<Self> {
-        let database_url = resolve_database_url(configured_database_url)?;
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, schema).await?;
-        setup.close().await;
+        let context = PgStoreContext::from_schema(schema, configured_database_url)?;
+        let pool = context
+            .open_migrated_pool(ISSUE_WORKFLOW_MIGRATIONS)
+            .await?;
+        Ok(Self { pool })
+    }
 
-        let pool = pg_open_pool_schematized(&database_url, schema).await?;
-        PgMigrator::new(&pool, ISSUE_WORKFLOW_MIGRATIONS)
-            .run()
+    pub async fn open_with_context(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+    ) -> anyhow::Result<Self> {
+        let pool = context
+            .open_migrated_pool_with_setup_pool(setup_pool, ISSUE_WORKFLOW_MIGRATIONS)
             .await?;
         Ok(Self { pool })
     }

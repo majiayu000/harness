@@ -376,6 +376,7 @@ mod tests {
                 ws_shutdown_tx,
             },
             interceptors: vec![],
+            startup_statuses: vec![],
             degraded_subsystems: vec![],
             intake: crate::http::IntakeServices {
                 feishu_intake: None,

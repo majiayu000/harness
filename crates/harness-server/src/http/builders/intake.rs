@@ -29,6 +29,17 @@ pub(crate) async fn build_intake(
     project_root: &Path,
     data_dir: &Path,
 ) -> anyhow::Result<IntakeBundle> {
+    let tasks = storage
+        .tasks
+        .as_ref()
+        .expect("build_intake requires a ready task store")
+        .clone();
+    let events = engines
+        .events
+        .as_ref()
+        .expect("build_intake requires a ready event store")
+        .clone();
+
     // ── Task queues ───────────────────────────────────────────────────────────
     let memory_pressure =
         server
@@ -104,7 +115,7 @@ pub(crate) async fn build_intake(
                 Some(data_dir),
                 server.config.server.github_token.clone(),
             )
-            .with_task_checker(storage.tasks.clone());
+            .with_task_checker(tasks.clone());
             match poller.reconcile_dispatched_with_store().await {
                 Ok(pruned) if pruned > 0 => tracing::info!(
                     repo = %repo_cfg.repo,
@@ -153,7 +164,7 @@ pub(crate) async fn build_intake(
             }
         });
         Arc::new(crate::quality_trigger::QualityTrigger::new(
-            engines.events.clone(),
+            events.clone(),
             engines.gc_agent.clone(),
             server.agent_registry.clone(),
             project_root.to_path_buf(),
@@ -276,7 +287,10 @@ async fn runtime_review_concurrency_config(
             1usize,
         );
     }
-    match registry.project_registry.list().await {
+    let Some(project_registry) = registry.project_registry.as_ref() else {
+        return config;
+    };
+    match project_registry.list().await {
         Ok(projects) => {
             for project in projects.into_iter().filter(|project| project.active) {
                 config
@@ -326,10 +340,14 @@ mod tests {
         let engines = crate::http::builders::engines::build_engines(&server, dir, dir)
             .await
             .expect("engines");
-        let registry =
-            crate::http::builders::registry::build_registry(&server, dir, dir, &storage.tasks)
-                .await
-                .expect("registry");
+        let registry = crate::http::builders::registry::build_registry(
+            &server,
+            dir,
+            dir,
+            storage.tasks.as_ref().expect("tasks store"),
+        )
+        .await
+        .expect("registry");
         (server, storage, engines, registry)
     }
 
@@ -446,6 +464,8 @@ mod tests {
         std::fs::create_dir_all(&runtime_project_root).expect("create runtime project");
         registry
             .project_registry
+            .as_ref()
+            .expect("project registry")
             .register(crate::project_registry::Project {
                 id: "runtime-project".to_string(),
                 root: runtime_project_root.clone(),
