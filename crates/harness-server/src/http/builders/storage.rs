@@ -19,6 +19,14 @@ fn failed_storage_startup_results(error: &str) -> Vec<StoreStartupResult> {
     ]
 }
 
+fn failed_storage_bundle(error: &str) -> StorageBundle {
+    StorageBundle {
+        tasks: None,
+        q_values: None,
+        startup_results: failed_storage_startup_results(error),
+    }
+}
+
 /// Initialize persistent storage: validate `data_dir`, open the task DB and
 /// optionally the Q-value DB.
 ///
@@ -62,22 +70,14 @@ pub(crate) async fn build_storage_with_database_url(
         Ok(database_url) => database_url,
         Err(error) => {
             let error = error.to_string();
-            return Ok(StorageBundle {
-                tasks: None,
-                q_values: None,
-                startup_results: failed_storage_startup_results(&error),
-            });
+            return Ok(failed_storage_bundle(&error));
         }
     };
     let setup_pool = match harness_core::db::pg_open_pool(&database_url).await {
         Ok(pool) => pool,
         Err(error) => {
             let error = error.to_string();
-            return Ok(StorageBundle {
-                tasks: None,
-                q_values: None,
-                startup_results: failed_storage_startup_results(&error),
-            });
+            return Ok(failed_storage_bundle(&error));
         }
     };
 

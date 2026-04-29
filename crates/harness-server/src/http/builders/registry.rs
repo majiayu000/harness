@@ -31,6 +31,23 @@ fn failed_registry_startup_results(error: &str) -> Vec<StoreStartupResult> {
     ]
 }
 
+fn failed_registry_bundle(
+    plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    error: &str,
+) -> RegistryBundle {
+    RegistryBundle {
+        thread_db: None,
+        plan_db: None,
+        plan_cache,
+        issue_workflow_store: None,
+        project_workflow_store: None,
+        project_registry: None,
+        runtime_state_store: None,
+        workspace_mgr: None,
+        startup_results: failed_registry_startup_results(error),
+    }
+}
+
 /// Initialize thread DB, plan DB, plan cache, project registry, workspace
 /// manager, and runtime state store.
 ///
@@ -53,34 +70,14 @@ pub(crate) async fn build_registry(
         Ok(database_url) => database_url,
         Err(error) => {
             let error = error.to_string();
-            return Ok(RegistryBundle {
-                thread_db: None,
-                plan_db: None,
-                plan_cache,
-                issue_workflow_store: None,
-                project_workflow_store: None,
-                project_registry: None,
-                runtime_state_store: None,
-                workspace_mgr: None,
-                startup_results: failed_registry_startup_results(&error),
-            });
+            return Ok(failed_registry_bundle(plan_cache, &error));
         }
     };
     let setup_pool = match harness_core::db::pg_open_pool(&database_url).await {
         Ok(pool) => pool,
         Err(error) => {
             let error = error.to_string();
-            return Ok(RegistryBundle {
-                thread_db: None,
-                plan_db: None,
-                plan_cache,
-                issue_workflow_store: None,
-                project_workflow_store: None,
-                project_registry: None,
-                runtime_state_store: None,
-                workspace_mgr: None,
-                startup_results: failed_registry_startup_results(&error),
-            });
+            return Ok(failed_registry_bundle(plan_cache, &error));
         }
     };
 
