@@ -101,10 +101,18 @@ async fn build_review_store(
         }
     };
 
-    let context = harness_core::db::PgStoreContext::new(
-        database_url,
-        harness_core::db::pg_schema_for_path(&review_db_path)?,
-    )?;
+    let context = match harness_core::db::pg_schema_for_path(&review_db_path)
+        .and_then(|schema| harness_core::db::PgStoreContext::new(database_url, schema))
+    {
+        Ok(context) => context,
+        Err(error) => {
+            setup_pool.close().await;
+            return Ok((
+                None,
+                StoreStartupResult::optional("review_store").failed(error.to_string()),
+            ));
+        }
+    };
     let review_store =
         crate::review_store::ReviewStore::open_with_context(&context, &setup_pool).await;
     setup_pool.close().await;

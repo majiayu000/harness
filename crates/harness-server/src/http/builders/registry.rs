@@ -185,51 +185,70 @@ pub(crate) async fn build_registry(
         harness_core::config::dirs::default_db_path(data_dir, "issue_workflows");
     let issue_workflow_store = {
         let schema = format!("{workflow_ns}_issue");
-        let context = harness_core::db::PgStoreContext::new(database_url.clone(), schema.clone())?;
         match super::forced_startup_error("issue_workflow_store") {
             Some(error) => {
                 startup_results
                     .push(StoreStartupResult::optional("issue_workflow_store").failed(error));
                 None
             }
-            None => match harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_context(
-                &context,
-                &setup_pool,
-            )
-            .await
-            {
-                Ok(store) => {
-                    startup_results.push(StoreStartupResult::optional("issue_workflow_store"));
-                    if let Err(e) = migrate_issue_workflows_if_needed(
-                        configured_database_url,
-                        &issue_workflows_db_path,
-                        &schema,
-                        &store,
+            None => match harness_core::db::PgStoreContext::new(
+                database_url.clone(),
+                schema.clone(),
+            ) {
+                Ok(context) => {
+                    match harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_context(
+                        &context,
+                        &setup_pool,
                     )
                     .await
                     {
-                        tracing::warn!(
-                            schema = %schema,
-                            "issue workflow migration check failed: {e}"
-                        );
+                        Ok(store) => {
+                            startup_results
+                                .push(StoreStartupResult::optional("issue_workflow_store"));
+                            if let Err(e) = migrate_issue_workflows_if_needed(
+                                configured_database_url,
+                                &issue_workflows_db_path,
+                                &schema,
+                                &store,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    schema = %schema,
+                                    "issue workflow migration check failed: {e}"
+                                );
+                            }
+                            let (rewritten, failed, skipped) =
+                                repair_corrupt_project_ids(&store, project_root).await;
+                            tracing::info!(
+                                rewritten,
+                                failed,
+                                skipped,
+                                "startup repair of corrupt issue workflow project_ids complete"
+                            );
+                            Some(Arc::new(store))
+                        }
+                        Err(e) => {
+                            startup_results.push(
+                                StoreStartupResult::optional("issue_workflow_store")
+                                    .failed(e.to_string()),
+                            );
+                            tracing::warn!(
+                                schema = %schema,
+                                "issue workflow store init failed, issue lifecycle state will not persist: {e}"
+                            );
+                            None
+                        }
                     }
-                    let (rewritten, failed, skipped) =
-                        repair_corrupt_project_ids(&store, project_root).await;
-                    tracing::info!(
-                        rewritten,
-                        failed,
-                        skipped,
-                        "startup repair of corrupt issue workflow project_ids complete"
-                    );
-                    Some(Arc::new(store))
                 }
-                Err(e) => {
+                Err(error) => {
                     startup_results.push(
-                        StoreStartupResult::optional("issue_workflow_store").failed(e.to_string()),
+                        StoreStartupResult::optional("issue_workflow_store")
+                            .failed(error.to_string()),
                     );
                     tracing::warn!(
                         schema = %schema,
-                        "issue workflow store init failed, issue lifecycle state will not persist: {e}"
+                        "issue workflow store context init failed, issue lifecycle state will not persist: {error}"
                     );
                     None
                 }
@@ -242,51 +261,66 @@ pub(crate) async fn build_registry(
         harness_core::config::dirs::default_db_path(data_dir, "project_workflows");
     let project_workflow_store = {
         let schema = format!("{workflow_ns}_project");
-        let context = harness_core::db::PgStoreContext::new(database_url.clone(), schema.clone())?;
         match super::forced_startup_error("project_workflow_store") {
             Some(error) => {
                 startup_results
                     .push(StoreStartupResult::optional("project_workflow_store").failed(error));
                 None
             }
-            None => {
-                match harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_context(
-                    &context,
-                    &setup_pool,
-                )
-                .await
-                {
-                    Ok(store) => {
-                        startup_results
-                            .push(StoreStartupResult::optional("project_workflow_store"));
-                        if let Err(e) = migrate_project_workflows_if_needed(
-                            configured_database_url,
-                            &project_workflows_db_path,
-                            &schema,
-                            &store,
-                        )
-                        .await
-                        {
+            None => match harness_core::db::PgStoreContext::new(
+                database_url.clone(),
+                schema.clone(),
+            ) {
+                Ok(context) => {
+                    match harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_context(
+                        &context,
+                        &setup_pool,
+                    )
+                    .await
+                    {
+                        Ok(store) => {
+                            startup_results
+                                .push(StoreStartupResult::optional("project_workflow_store"));
+                            if let Err(e) = migrate_project_workflows_if_needed(
+                                configured_database_url,
+                                &project_workflows_db_path,
+                                &schema,
+                                &store,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    schema = %schema,
+                                    "project workflow migration check failed: {e}"
+                                );
+                            }
+                            Some(Arc::new(store))
+                        }
+                        Err(e) => {
+                            startup_results.push(
+                                StoreStartupResult::optional("project_workflow_store")
+                                    .failed(e.to_string()),
+                            );
                             tracing::warn!(
                                 schema = %schema,
-                                "project workflow migration check failed: {e}"
+                                "project workflow store init failed, project lifecycle state will not persist: {e}"
                             );
+                            None
                         }
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        startup_results.push(
-                            StoreStartupResult::optional("project_workflow_store")
-                                .failed(e.to_string()),
-                        );
-                        tracing::warn!(
-                            schema = %schema,
-                            "project workflow store init failed, project lifecycle state will not persist: {e}"
-                        );
-                        None
                     }
                 }
-            }
+                Err(error) => {
+                    startup_results.push(
+                        StoreStartupResult::optional("project_workflow_store")
+                            .failed(error.to_string()),
+                    );
+                    tracing::warn!(
+                        schema = %schema,
+                        "project workflow store context init failed, project lifecycle state will not persist: {error}"
+                    );
+                    None
+                }
+            },
         }
     };
 
@@ -439,30 +473,44 @@ pub(crate) async fn build_registry(
     let runtime_state_store = {
         let runtime_state_db_path =
             harness_core::config::dirs::default_db_path(data_dir, "runtime_state");
-        let context = harness_core::db::PgStoreContext::new(
-            database_url.clone(),
-            harness_core::db::pg_schema_for_path(&runtime_state_db_path)?,
-        )?;
         match super::forced_startup_error("runtime_state_store") {
             Some(error) => {
                 startup_results
                     .push(StoreStartupResult::optional("runtime_state_store").failed(error));
                 None
             }
-            None => match crate::runtime_state_store::RuntimeStateStore::open_with_context(
-                &context,
-                &setup_pool,
-            )
-            .await
-            {
-                Ok(store) => Some(Arc::new(store)),
-                Err(e) => {
+            None => match harness_core::db::pg_schema_for_path(&runtime_state_db_path).and_then(
+                |schema| harness_core::db::PgStoreContext::new(database_url.clone(), schema),
+            ) {
+                Ok(context) => {
+                    match crate::runtime_state_store::RuntimeStateStore::open_with_context(
+                        &context,
+                        &setup_pool,
+                    )
+                    .await
+                    {
+                        Ok(store) => Some(Arc::new(store)),
+                        Err(e) => {
+                            startup_results.push(
+                                StoreStartupResult::optional("runtime_state_store")
+                                    .failed(e.to_string()),
+                            );
+                            tracing::warn!(
+                                path = %runtime_state_db_path.display(),
+                                "runtime state store init failed, runtime host state will not persist: {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
                     startup_results.push(
-                        StoreStartupResult::optional("runtime_state_store").failed(e.to_string()),
+                        StoreStartupResult::optional("runtime_state_store")
+                            .failed(error.to_string()),
                     );
                     tracing::warn!(
                         path = %runtime_state_db_path.display(),
-                        "runtime state store init failed, runtime host state will not persist: {e}"
+                        "runtime state store context init failed, runtime host state will not persist: {error}"
                     );
                     None
                 }
@@ -734,6 +782,38 @@ mod tests {
             .expect("runtime_state_store startup result");
         assert!(!status.is_critical());
         assert!(!status.ready);
+    }
+
+    #[tokio::test]
+    async fn invalid_workflow_schema_namespace_disables_optional_workflow_stores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            "---\nstorage:\n  schema_namespace: invalid-name\n---\n",
+        )
+        .expect("write workflow config");
+        let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+
+        let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
+            .await
+            .expect("optional workflow-store context failures should not abort startup");
+
+        assert!(
+            bundle.project_registry.is_some(),
+            "critical stores should stay ready: {:?}",
+            bundle.startup_results
+        );
+        assert!(bundle.issue_workflow_store.is_none());
+        assert!(bundle.project_workflow_store.is_none());
+        for name in ["issue_workflow_store", "project_workflow_store"] {
+            let status = bundle
+                .startup_results
+                .iter()
+                .find(|status| status.name == name)
+                .unwrap_or_else(|| panic!("{name} startup result should be recorded"));
+            assert!(!status.is_critical());
+            assert!(!status.ready);
+        }
     }
 
     #[tokio::test]
