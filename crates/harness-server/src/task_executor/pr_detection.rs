@@ -1,6 +1,14 @@
 use harness_core::prompts;
+use reqwest::header::{ACCEPT, LINK, RETRY_AFTER, USER_AGENT};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+const GITHUB_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_PR_LOOKUP_MAX_PAGES: usize = 20;
+const GITHUB_ERROR_BODY_SNIPPET_CHARS: usize = 300;
 
 #[derive(Debug, Deserialize)]
 struct GhPrListItem {
@@ -215,9 +223,8 @@ pub(crate) fn build_pr_approved_prompt(
 /// later task for #791 then tried to "continue" on that PR's branch.
 ///
 /// This function now filters results so only PRs that **explicitly declare a
-/// closing relationship** to the issue are returned. The match is any of:
-/// - a closing keyword in title or body: `closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve #N`
-/// - the `(#N)` suffix pattern that harness uses in its own PR titles
+/// closing relationship** to the issue are returned via a closing keyword in
+/// title or body: `closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve #N`.
 pub(crate) async fn find_existing_pr_for_issue_with_token(
     project: &Path,
     issue: u64,
@@ -232,46 +239,187 @@ pub(crate) async fn find_existing_pr_for_issue_with_token(
         return Ok(None);
     };
 
-    let url = format!("https://api.github.com/repos/{repo_slug}/pulls?state=open&per_page=100");
     let client = reqwest::Client::new();
+    find_existing_pr_for_issue_in_repo(
+        &client,
+        &repo_slug,
+        issue,
+        github_token,
+        GITHUB_API_BASE_URL,
+    )
+    .await
+}
+
+async fn find_existing_pr_for_issue_in_repo(
+    client: &reqwest::Client,
+    repo_slug: &str,
+    issue: u64,
+    github_token: Option<&str>,
+    api_base_url: &str,
+) -> anyhow::Result<Option<(u64, String, String)>> {
+    let mut next_url = Some(github_pulls_url(api_base_url, repo_slug));
+    let mut seen_urls = HashSet::new();
+    let mut page_count = 0usize;
+
+    while let Some(url) = next_url {
+        if page_count >= GITHUB_PR_LOOKUP_MAX_PAGES {
+            tracing::warn!(
+                issue,
+                repo = %repo_slug,
+                page_limit = GITHUB_PR_LOOKUP_MAX_PAGES,
+                "existing PR lookup stopped after reaching the GitHub pagination page limit"
+            );
+            break;
+        }
+        page_count += 1;
+
+        if !seen_urls.insert(url.clone()) {
+            tracing::debug!(
+                issue,
+                repo = %repo_slug,
+                url = %url,
+                "existing PR lookup stopped because GitHub pagination repeated a URL"
+            );
+            break;
+        }
+
+        let page = fetch_github_pr_page(client, &url, repo_slug, issue, github_token).await?;
+
+        if let Some(item) = page
+            .items
+            .into_iter()
+            .find(|item| pr_claims_to_close_issue(item, issue, Some(repo_slug)))
+        {
+            return Ok(Some((item.number, item.head_ref_name, item.url)));
+        }
+
+        next_url = page.next_url;
+    }
+
+    Ok(None)
+}
+
+fn github_pulls_url(api_base_url: &str, repo_slug: &str) -> String {
+    format!(
+        "{}/repos/{repo_slug}/pulls?state=open&per_page=100",
+        api_base_url.trim_end_matches('/')
+    )
+}
+
+struct GitHubPrPage {
+    items: Vec<GhPrListItem>,
+    next_url: Option<String>,
+}
+
+async fn fetch_github_pr_page(
+    client: &reqwest::Client,
+    url: &str,
+    repo_slug: &str,
+    issue: u64,
+    github_token: Option<&str>,
+) -> anyhow::Result<GitHubPrPage> {
     let mut request = client
         .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "harness-server");
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, "harness-server");
     if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
         request = request.bearer_auth(token);
     }
-    let response =
-        match tokio::time::timeout(std::time::Duration::from_secs(10), request.send()).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => {
-                tracing::debug!(issue, repo = %repo_slug, error = %e, "existing PR lookup failed");
-                return Ok(None);
-            }
-            Err(_) => {
-                tracing::debug!(issue, repo = %repo_slug, "existing PR lookup timed out");
-                return Ok(None);
-            }
-        };
+    let response = match tokio::time::timeout(GITHUB_PR_LOOKUP_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            anyhow::bail!(
+                "failed to fetch GitHub pull request page for {repo_slug} issue #{issue} at {url}: {e}"
+            );
+        }
+        Err(_) => {
+            anyhow::bail!(
+                "timed out fetching GitHub pull request page for {repo_slug} issue #{issue} at {url}"
+            );
+        }
+    };
     if !response.status().is_success() {
-        tracing::debug!(
-            issue,
-            repo = %repo_slug,
-            status = %response.status(),
-            "existing PR lookup returned non-success status"
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let rate_limit_remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let is_rate_limited = status.as_u16() == 429
+            || retry_after.is_some()
+            || (status.as_u16() == 403 && rate_limit_remaining.as_deref() == Some("0"));
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        let body = error_body_snippet(&body);
+        let rate_limit_context = if is_rate_limited { " rate limit" } else { "" };
+        let retry_after = retry_after.as_deref().unwrap_or("none");
+        let rate_limit_remaining = rate_limit_remaining.as_deref().unwrap_or("unknown");
+        anyhow::bail!(
+            "GitHub pull request lookup for {repo_slug} issue #{issue} at {url} returned {status};{rate_limit_context} retry-after={retry_after}; x-ratelimit-remaining={rate_limit_remaining}; body={body}"
         );
-        return Ok(None);
     }
+    let next_url = next_link_from_headers(response.headers());
     let items: Vec<GhPrListItem> = response
         .json::<Vec<GitHubPullItem>>()
         .await
         .map(|items| items.into_iter().map(Into::into).collect())
         .map_err(|e| anyhow::anyhow!("invalid GitHub pull request response: {e}"))?;
 
-    Ok(items
-        .into_iter()
-        .find(|item| pr_claims_to_close_issue(item, issue, Some(&repo_slug)))
-        .map(|item| (item.number, item.head_ref_name, item.url)))
+    Ok(GitHubPrPage { items, next_url })
+}
+
+fn error_body_snippet(body: &str) -> String {
+    let mut chars = body.chars();
+    let snippet: String = chars
+        .by_ref()
+        .take(GITHUB_ERROR_BODY_SNIPPET_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        format!("{snippet}...")
+    } else {
+        snippet
+    }
+}
+
+fn next_link_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(LINK)?.to_str().ok()?;
+    parse_next_link(link)
+}
+
+fn parse_next_link(link: &str) -> Option<String> {
+    link.split(',').find_map(|part| {
+        let mut segments = part.split(';').map(str::trim);
+        let url_segment = segments.next()?;
+        if !url_segment.starts_with('<') || !url_segment.ends_with('>') {
+            return None;
+        }
+        if segments.any(link_segment_has_next_rel) {
+            Some(url_segment[1..url_segment.len() - 1].to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn link_segment_has_next_rel(segment: &str) -> bool {
+    let Some((key, value)) = segment.split_once('=') else {
+        return false;
+    };
+    if !key.trim().eq_ignore_ascii_case("rel") {
+        return false;
+    }
+    value
+        .trim()
+        .trim_matches('"')
+        .split_ascii_whitespace()
+        .any(|rel| rel.eq_ignore_ascii_case("next"))
 }
 
 /// Return true iff `item` declares a closing relationship to `issue` — i.e.
@@ -578,6 +726,17 @@ fn trim_git_config_value(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::State,
+        http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn item(title: &str, body: &str) -> GhPrListItem {
         GhPrListItem {
@@ -587,6 +746,269 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
         }
+    }
+
+    #[test]
+    fn parse_next_link_extracts_next_relation() {
+        let link = r#"<https://api.github.com/repos/o/r/pulls?page=2>; rel="next", <https://api.github.com/repos/o/r/pulls?page=4>; rel="last""#;
+        assert_eq!(
+            parse_next_link(link),
+            Some("https://api.github.com/repos/o/r/pulls?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_next_link_returns_none_without_next_relation() {
+        let link = r#"<https://api.github.com/repos/o/r/pulls?page=4>; rel="last""#;
+        assert_eq!(parse_next_link(link), None);
+    }
+
+    #[test]
+    fn parse_next_link_accepts_whitespace_around_rel_equals() {
+        let link = r#"<https://api.github.com/repos/o/r/pulls?page=2>; rel = "next""#;
+        assert_eq!(
+            parse_next_link(link),
+            Some("https://api.github.com/repos/o/r/pulls?page=2".to_string())
+        );
+    }
+
+    struct PaginatedPrState {
+        base_url: String,
+        requests: AtomicUsize,
+    }
+
+    fn page_from_uri(uri: &Uri) -> usize {
+        uri.query()
+            .and_then(|query| {
+                query.split('&').find_map(|part| {
+                    part.strip_prefix("page=")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+            })
+            .unwrap_or(1)
+    }
+
+    async fn paginated_prs_handler(
+        State(state): State<Arc<PaginatedPrState>>,
+        uri: Uri,
+    ) -> impl IntoResponse {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        let page = page_from_uri(&uri);
+
+        let body = if page == 1 {
+            serde_json::json!([
+                {
+                    "number": 101,
+                    "html_url": "https://github.com/owner/repo/pull/101",
+                    "title": "mentions #998",
+                    "body": "related to #998 but does not close it",
+                    "head": {"ref": "docs-998"}
+                }
+            ])
+            .to_string()
+        } else {
+            serde_json::json!([
+                {
+                    "number": 102,
+                    "html_url": "https://github.com/owner/repo/pull/102",
+                    "title": "Fix PR dedup pagination",
+                    "body": "Fixes #998",
+                    "head": {"ref": "fix-998-pagination"}
+                }
+            ])
+            .to_string()
+        };
+
+        let mut headers = HeaderMap::new();
+        if page == 1 {
+            let next_url = format!(
+                "{}/repos/owner/repo/pulls?state=open&per_page=100&page=2",
+                state.base_url
+            );
+            headers.insert(
+                header::LINK,
+                HeaderValue::from_str(&format!("<{next_url}>; rel=\"next\""))
+                    .expect("valid link header"),
+            );
+        }
+        (headers, body)
+    }
+
+    async fn endless_prs_handler(
+        State(state): State<Arc<PaginatedPrState>>,
+        uri: Uri,
+    ) -> impl IntoResponse {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        let page = page_from_uri(&uri);
+        let body = serde_json::json!([
+            {
+                "number": page,
+                "html_url": format!("https://github.com/owner/repo/pull/{page}"),
+                "title": format!("mentions #998 on page {page}"),
+                "body": "related to #998 but does not close it",
+                "head": {"ref": format!("docs-998-page-{page}")}
+            }
+        ])
+        .to_string();
+
+        let next_url = format!(
+            "{}/repos/owner/repo/pulls?state=open&per_page=100&page={}",
+            state.base_url,
+            page + 1
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::LINK,
+            HeaderValue::from_str(&format!("<{next_url}>; rel=\"next\""))
+                .expect("valid link header"),
+        );
+        (headers, body)
+    }
+
+    async fn failing_prs_handler() -> impl IntoResponse {
+        (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+    }
+
+    async fn rate_limited_prs_handler() -> impl IntoResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HeaderName::from_static("x-ratelimit-remaining"),
+            HeaderValue::from_static("0"),
+        );
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        (
+            StatusCode::FORBIDDEN,
+            headers,
+            "API rate limit exceeded for user.",
+        )
+    }
+
+    #[tokio::test]
+    async fn existing_pr_lookup_follows_next_page() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let state = Arc::new(PaginatedPrState {
+            base_url: base_url.clone(),
+            requests: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/repos/owner/repo/pulls", get(paginated_prs_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let found = find_existing_pr_for_issue_in_repo(
+            &reqwest::Client::new(),
+            "owner/repo",
+            998,
+            None,
+            &base_url,
+        )
+        .await?;
+
+        server.abort();
+
+        assert_eq!(
+            found,
+            Some((
+                102,
+                "fix-998-pagination".to_string(),
+                "https://github.com/owner/repo/pull/102".to_string()
+            ))
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_pr_lookup_stops_after_page_limit_without_error() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let state = Arc::new(PaginatedPrState {
+            base_url: base_url.clone(),
+            requests: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/repos/owner/repo/pulls", get(endless_prs_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let found = find_existing_pr_for_issue_in_repo(
+            &reqwest::Client::new(),
+            "owner/repo",
+            998,
+            None,
+            &base_url,
+        )
+        .await?;
+
+        server.abort();
+
+        assert_eq!(found, None);
+        assert_eq!(
+            state.requests.load(Ordering::SeqCst),
+            GITHUB_PR_LOOKUP_MAX_PAGES
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_pr_lookup_errors_when_github_page_fails() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let app = Router::new().route("/repos/owner/repo/pulls", get(failing_prs_handler));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let err = find_existing_pr_for_issue_in_repo(
+            &reqwest::Client::new(),
+            "owner/repo",
+            998,
+            None,
+            &base_url,
+        )
+        .await
+        .expect_err("GitHub lookup failure should not be treated as no PR found");
+
+        server.abort();
+
+        assert!(err.to_string().contains("returned 503"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_pr_lookup_preserves_rate_limit_context() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let app = Router::new().route("/repos/owner/repo/pulls", get(rate_limited_prs_handler));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let err = find_existing_pr_for_issue_in_repo(
+            &reqwest::Client::new(),
+            "owner/repo",
+            998,
+            None,
+            &base_url,
+        )
+        .await
+        .expect_err("GitHub rate limit failure should be visible to retry classification");
+
+        server.abort();
+
+        let err = err.to_string();
+        assert!(err.contains("rate limit"), "unexpected error: {err}");
+        assert!(err.contains("retry-after=60"), "unexpected error: {err}");
+        assert!(
+            err.contains("x-ratelimit-remaining=0"),
+            "unexpected error: {err}"
+        );
+        Ok(())
     }
 
     // --- pr_claims_to_close_issue: positive cases ---
