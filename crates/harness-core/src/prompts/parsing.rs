@@ -235,23 +235,18 @@ pub fn is_waiting(output: &str) -> bool {
 
 /// Check if reviewer output indicates quota exhaustion (e.g., Gemini 24h rate limit).
 ///
-/// Requires ≥ 2 co-occurring quota-signal terms, or a single high-specificity phrase,
-/// to prevent false positives from reviews that incidentally mention "quota" in code.
+/// Matches only explicit Gemini quota-warning signatures to avoid false positives
+/// from normal review comments that discuss quota or rate-limit handling in code.
 pub fn is_quota_exhausted(output: &str) -> bool {
     let lower = output.to_lowercase();
-    // High-specificity phrase: shortcut without requiring two co-occurring indicators.
-    if lower.contains("start processing again") {
-        return true;
-    }
-    let indicators = [
-        "quota",
-        "rate limit",
-        "24 hour",
-        "processing again",
-        "will be processed",
-        "not available",
+    const GEMINI_QUOTA_SIGNATURES: [&str; 3] = [
+        "you have reached your daily quota limit",
+        "i will start processing again in 24 hours once the quota resets",
+        "i will start processing again in 24 hours",
     ];
-    indicators.iter().filter(|&&s| lower.contains(s)).count() >= 2
+    GEMINI_QUOTA_SIGNATURES
+        .iter()
+        .any(|signature| lower.contains(signature))
 }
 
 /// Extract `ISSUES=N` from agent output (any line). Returns `None` if absent.
@@ -381,9 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn test_is_quota_exhausted_two_co_occurring_indicators() {
+    fn test_is_quota_exhausted_daily_limit_phrase() {
         assert!(is_quota_exhausted(
-            "rate limit exceeded, quota exhausted for today"
+            "You have reached your daily quota limit for Gemini Code Assist."
         ));
     }
 
@@ -398,6 +393,15 @@ mod tests {
 The implementation looks clean. I noticed a potential edge case in the error \
 handler: when the input is empty the function returns Ok(()) without logging, \
 which could mask silent failures.\nISSUES=1\nFIXED";
+        assert!(!is_quota_exhausted(review));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_false_for_review_discussing_quota_code() {
+        let review = "\
+Please tighten the is_quota_exhausted matcher. A review comment that mentions \
+rate limits and quota handling in the parser should not graduate the PR.\n\
+ISSUES=1\nFIXED";
         assert!(!is_quota_exhausted(review));
     }
 
