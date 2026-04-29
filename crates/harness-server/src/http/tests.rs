@@ -153,10 +153,12 @@ async fn make_test_state_with(
 async fn make_test_state_with_project_root(
     dir: &std::path::Path,
     project_root: &std::path::Path,
-    config: harness_core::config::HarnessConfig,
+    mut config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
     let db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let database_url = crate::test_helpers::ensure_test_database_url_override()?;
+    config.server.database_url = Some(database_url.clone());
     let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
         (cfg.enabled && crate::intake::feishu::has_verification_token(cfg))
             .then(|| Arc::new(crate::intake::feishu::FeishuIntake::new(cfg.clone())))
@@ -167,10 +169,15 @@ async fn make_test_state_with_project_root(
         thread_manager,
         agent_registry,
     ));
-    let tasks =
-        task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(dir, "tasks"))
-            .await?;
-    let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+    let tasks = task_runner::TaskStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir, "tasks"),
+        Some(&database_url),
+    )
+    .await?;
+    let events = Arc::new(
+        harness_observe::event_store::EventStore::new_with_database_url(dir, Some(&database_url))
+            .await?,
+    );
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
         harness_core::types::ProjectId::new(),
@@ -182,12 +189,14 @@ async fn make_test_state_with_project_root(
         draft_store,
         project_root.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
-        dir, "threads",
-    ))
+    let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir, "threads"),
+        Some(&database_url),
+    )
     .await?;
-    let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
+    let _project_svc_tmp = crate::project_registry::ProjectRegistry::open_with_database_url(
         &harness_core::config::dirs::default_db_path(dir, "projects"),
+        Some(&database_url),
     )
     .await?;
     let project_svc = crate::services::project::DefaultProjectService::new(
@@ -653,6 +662,7 @@ async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn health_degraded_multiple_subsystems() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let mut state = make_test_state(dir.path()).await?;
     Arc::get_mut(&mut state).unwrap().startup_statuses = vec![
@@ -676,6 +686,7 @@ async fn health_degraded_multiple_subsystems() -> anyhow::Result<()> {
 #[tokio::test]
 async fn health_degraded_both_conditions() -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let mut state = make_test_state(dir.path()).await?;
     Arc::get_mut(&mut state).unwrap().degraded_subsystems = vec!["workspace_manager"];
@@ -1065,6 +1076,7 @@ async fn create_task_empty_request_returns_bad_request() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn get_task_returns_not_found_for_missing_id() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
     let app = task_app(state);
