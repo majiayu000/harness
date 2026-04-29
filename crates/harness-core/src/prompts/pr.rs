@@ -73,7 +73,10 @@ pub fn check_resumed_pr_conflicts(pr_num: u64, repo: &str, project_root: &Path) 
             git push --force-with-lease origin \"$BRANCH\"\n\
             ```\n\
             Then print `REBASE_PUSHED` on the last line.\n\
-         7. If `mergeable` is `UNKNOWN`, `DIRTY`, or anything other than `MERGEABLE`/`CONFLICTING`, \
+         7. If `mergeable` is `UNKNOWN`, wait briefly and retry step 1 until GitHub finishes computing \
+            mergeability. If it never becomes `MERGEABLE` or `CONFLICTING` after several retries, \
+            print `MANUAL_RESOLUTION_REQUIRED` on the last line.\n\
+         8. If `mergeable` is `DIRTY` or anything other than `MERGEABLE`/`CONFLICTING`/`UNKNOWN`, \
             print `MANUAL_RESOLUTION_REQUIRED` on the last line."
     )
 }
@@ -375,6 +378,10 @@ mod tests {
         assert!(p.contains("gh pr view 17 --json mergeable,headRefName,baseRefName,url"));
         assert!(p.contains("git worktree add /tmp/harness-rebase-17"));
         assert!(p.contains("git rebase \"origin/$BASE\""));
+        assert!(
+            p.contains("If `mergeable` is `UNKNOWN`, wait briefly and retry step 1"),
+            "UNKNOWN mergeability must be treated as retryable instead of hard failure"
+        );
         assert!(p.contains("CLEAN_PR"));
         assert!(p.contains("REBASE_PUSHED"));
         assert!(p.contains("MANUAL_RESOLUTION_REQUIRED"));
