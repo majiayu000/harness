@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::{server::HarnessServer, task_runner};
+use crate::{project_registry::Project, server::HarnessServer, task_runner};
 
 use super::{engines::EnginesBundle, registry::RegistryBundle, storage::StorageBundle};
 
@@ -51,7 +51,7 @@ pub(crate) async fn build_intake(
                 tracing::info!(threshold_mb, poll_secs, "memory pressure monitor enabled");
                 crate::memory_monitor::start(threshold_mb, poll_secs)
             });
-    let issue_queue_config = runtime_issue_concurrency_config(server);
+    let issue_queue_config = runtime_issue_concurrency_config(server, registry).await;
     let review_queue_config = runtime_review_concurrency_config(server, registry).await;
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new_with_pressure(
         &issue_queue_config,
@@ -254,20 +254,47 @@ pub(crate) async fn build_intake(
     })
 }
 
-fn runtime_issue_concurrency_config(
+async fn runtime_issue_concurrency_config(
     server: &HarnessServer,
+    registry: &RegistryBundle,
+) -> harness_core::config::misc::ConcurrencyConfig {
+    let registry_projects = load_registry_projects(registry).await;
+    build_runtime_issue_concurrency_config(server, &registry_projects)
+}
+
+pub(crate) fn build_runtime_issue_concurrency_config(
+    server: &HarnessServer,
+    registry_projects: &[Project],
 ) -> harness_core::config::misc::ConcurrencyConfig {
     let mut config = server.config.concurrency.clone();
+    config.per_project = effective_issue_project_limits(server, registry_projects);
+    config
+}
+
+pub(crate) fn effective_issue_project_limits(
+    server: &HarnessServer,
+    registry_projects: &[Project],
+) -> std::collections::HashMap<String, usize> {
+    let mut per_project = canonicalized_config_limits(&server.config.concurrency.per_project);
+
+    for project in registry_projects {
+        let Some(limit) = project.max_concurrent.map(|value| value as usize) else {
+            continue;
+        };
+        if !project.active {
+            continue;
+        }
+        per_project.insert(queue_project_key(&project.root), limit);
+    }
 
     for project in &server.startup_projects {
         let Some(limit) = project.max_concurrent.map(|value| value as usize) else {
             continue;
         };
-        let canonical = queue_project_key(&project.root);
-        config.per_project.insert(canonical, limit);
+        per_project.insert(queue_project_key(&project.root), limit);
     }
 
-    config
+    per_project
 }
 
 async fn runtime_review_concurrency_config(
@@ -308,6 +335,36 @@ async fn runtime_review_concurrency_config(
 
 fn queue_project_key(path: &Path) -> String {
     canonicalize_for_queue(path).to_string_lossy().into_owned()
+}
+
+fn canonicalized_config_limits(
+    limits: &std::collections::HashMap<String, usize>,
+) -> std::collections::HashMap<String, usize> {
+    limits
+        .iter()
+        .map(|(project, limit)| {
+            let path = Path::new(project);
+            let key = if path.is_absolute() {
+                queue_project_key(path)
+            } else {
+                project.clone()
+            };
+            (key, *limit)
+        })
+        .collect()
+}
+
+async fn load_registry_projects(registry: &RegistryBundle) -> Vec<Project> {
+    let Some(project_registry) = registry.project_registry.as_ref() else {
+        return Vec::new();
+    };
+    match project_registry.list().await {
+        Ok(projects) => projects,
+        Err(e) => {
+            tracing::warn!("intake: failed to load project registry for issue queue seeding: {e}");
+            Vec::new()
+        }
+    }
 }
 
 fn canonicalize_for_queue(path: &Path) -> PathBuf {
@@ -351,6 +408,23 @@ mod tests {
         (server, storage, engines, registry)
     }
 
+    fn registry_project(
+        id: &str,
+        root: std::path::PathBuf,
+        max_concurrent: Option<u32>,
+        active: bool,
+    ) -> Project {
+        Project {
+            id: id.to_string(),
+            root,
+            name: Some(id.to_string()),
+            default_agent: None,
+            max_concurrent,
+            active,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
     #[tokio::test]
     async fn no_intake_config_produces_empty_intake() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -376,13 +450,34 @@ mod tests {
     }
 
     #[test]
-    fn runtime_issue_concurrency_uses_startup_project_limits() {
+    fn runtime_issue_concurrency_uses_registry_limits() {
         let mut server = HarnessServer::new(
             HarnessConfig::default(),
             ThreadManager::new(),
             AgentRegistry::new("test"),
         );
         server.config.concurrency.max_concurrent_tasks = 6;
+        let cfg = build_runtime_issue_concurrency_config(
+            &server,
+            &[registry_project(
+                "registry-only",
+                std::path::PathBuf::from("/tmp/registry-only"),
+                Some(5),
+                true,
+            )],
+        );
+
+        assert_eq!(cfg.max_concurrent_tasks, 6);
+        assert_eq!(cfg.per_project.get("/tmp/registry-only"), Some(&5));
+    }
+
+    #[test]
+    fn runtime_issue_concurrency_startup_projects_override_registry() {
+        let mut server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        );
         server
             .config
             .concurrency
@@ -405,12 +500,48 @@ mod tests {
             },
         ];
 
-        let cfg = runtime_issue_concurrency_config(&server);
+        let cfg = build_runtime_issue_concurrency_config(
+            &server,
+            &[
+                registry_project("a", std::path::PathBuf::from("/tmp/a"), Some(3), true),
+                registry_project("c", std::path::PathBuf::from("/tmp/c"), Some(9), true),
+            ],
+        );
 
-        assert_eq!(cfg.max_concurrent_tasks, 6);
-        assert_eq!(cfg.per_project.len(), 2);
+        assert_eq!(cfg.per_project.len(), 3);
         assert_eq!(cfg.per_project.get("/tmp/a"), Some(&4));
         assert_eq!(cfg.per_project.get("/tmp/b"), Some(&8));
+        assert_eq!(cfg.per_project.get("/tmp/c"), Some(&9));
+    }
+
+    #[test]
+    fn runtime_issue_concurrency_ignores_inactive_and_unlimited_registry_projects() {
+        let server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        );
+
+        let cfg = build_runtime_issue_concurrency_config(
+            &server,
+            &[
+                registry_project(
+                    "inactive",
+                    std::path::PathBuf::from("/tmp/inactive"),
+                    Some(7),
+                    false,
+                ),
+                registry_project(
+                    "unlimited",
+                    std::path::PathBuf::from("/tmp/unlimited"),
+                    None,
+                    true,
+                ),
+            ],
+        );
+
+        assert!(!cfg.per_project.contains_key("/tmp/inactive"));
+        assert!(!cfg.per_project.contains_key("/tmp/unlimited"));
     }
 
     #[tokio::test]

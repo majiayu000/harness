@@ -44,6 +44,12 @@ static PROJECT_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_projects_name_created_at
               ON projects ((data::jsonb ->> 'name'), created_at DESC)",
     },
+    Migration {
+        version: 3,
+        description: "index project root lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_projects_root_created_at
+              ON projects ((data::jsonb ->> 'root'), created_at DESC)",
+    },
 ];
 
 /// Registry of projects backed by Postgres. Survives server restarts.
@@ -137,6 +143,26 @@ impl ProjectRegistry {
              LIMIT 1",
         )
         .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Find a project by its canonical root path. Returns the newest match.
+    pub async fn get_by_root(&self, root: &std::path::Path) -> anyhow::Result<Option<Project>> {
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let root_str = canonical_root.to_string_lossy();
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data
+             FROM projects
+             WHERE data::jsonb ->> 'root' = $1
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(root_str.as_ref())
         .fetch_optional(&self.pool)
         .await?;
         match row {
@@ -336,6 +362,36 @@ mod tests {
             .expect("should survive reopen");
         assert_eq!(loaded.max_concurrent, Some(2));
         assert_eq!(loaded.default_agent.as_deref(), Some("claude"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_by_root_returns_canonical_match() -> anyhow::Result<()> {
+        let Some(registry) = open_test_registry("projects.db").await? else {
+            return Ok(());
+        };
+
+        let dir = tempfile::tempdir()?;
+        let canonical_root = dir.path().canonicalize()?;
+        registry
+            .register(Project {
+                id: "root-keyed".to_string(),
+                root: canonical_root.clone(),
+                name: Some("root-keyed".to_string()),
+                max_concurrent: Some(2),
+                default_agent: Some("codex".to_string()),
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await?;
+
+        let loaded = registry
+            .get_by_root(dir.path())
+            .await?
+            .expect("project should resolve by canonical root");
+        assert_eq!(loaded.id, "root-keyed");
+        assert_eq!(loaded.root, canonical_root);
+        assert_eq!(loaded.default_agent.as_deref(), Some("codex"));
         Ok(())
     }
 }

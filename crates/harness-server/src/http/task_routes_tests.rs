@@ -83,6 +83,34 @@ async fn resolve_project_from_registry_passes_through_existing_dir() {
 }
 
 #[tokio::test]
+async fn resolve_project_from_registry_existing_dir_uses_registered_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
+        .await
+        .unwrap();
+    let project_root = dir.path().join("registered-root");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let canonical_root = project_root.canonicalize().unwrap();
+    registry
+        .register(crate::project_registry::Project {
+            id: "registered-root".to_string(),
+            root: canonical_root.clone(),
+            name: Some("registered-root".to_string()),
+            max_concurrent: Some(2),
+            default_agent: Some("opus".to_string()),
+            active: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let result = resolve_project_from_registry(Some(&registry), Some(project_root)).await;
+    let (path, agent) = result.unwrap();
+    assert_eq!(path, Some(canonical_root));
+    assert_eq!(agent.as_deref(), Some("opus"));
+}
+
+#[tokio::test]
 async fn resolve_project_from_registry_no_registry_passes_through_nondir() {
     let path = std::path::PathBuf::from("/nonexistent/path");
     let result = resolve_project_from_registry(None, Some(path.clone())).await;
@@ -144,6 +172,38 @@ async fn resolve_project_from_registry_returns_default_agent_from_record() {
     assert_eq!(
         path,
         Some(std::path::PathBuf::from("/home/user/pinned-repo"))
+    );
+    assert_eq!(agent.as_deref(), Some("opus"));
+}
+
+#[tokio::test]
+async fn resolve_project_from_registry_resolves_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = crate::project_registry::ProjectRegistry::open(&dir.path().join("p.db"))
+        .await
+        .unwrap();
+    registry
+        .register(crate::project_registry::Project {
+            id: "named-repo-id".to_string(),
+            root: std::path::PathBuf::from("/home/user/named-repo"),
+            name: Some("named-repo".to_string()),
+            max_concurrent: None,
+            default_agent: Some("opus".to_string()),
+            active: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let result = resolve_project_from_registry(
+        Some(&registry),
+        Some(std::path::PathBuf::from("named-repo")),
+    )
+    .await;
+    let (path, agent) = result.unwrap();
+    assert_eq!(
+        path,
+        Some(std::path::PathBuf::from("/home/user/named-repo"))
     );
     assert_eq!(agent.as_deref(), Some("opus"));
 }
