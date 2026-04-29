@@ -1,12 +1,13 @@
 use super::helpers::{
-    build_task_event, collect_context_items, detect_modified_files, inject_skills_into_prompt,
-    matched_skills_for_prompt, run_agent_streaming_with_options, run_on_error, run_post_execute,
-    run_post_tool_use, run_pre_execute, telemetry_for_timeout, update_status,
-    RunAgentStreamingOptions,
+    build_task_event, collect_context_items, detect_modified_files,
+    inject_project_context_into_prompt, inject_skills_into_prompt, matched_skills_for_prompt,
+    run_agent_streaming_with_options, run_on_error, run_post_execute, run_post_tool_use,
+    run_pre_execute, telemetry_for_timeout, update_status, RunAgentStreamingOptions,
 };
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, TaskFailureKind, TaskId, TaskStatus, TaskStore,
 };
+use anyhow::Context;
 use chrono::Utc;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::interceptor::ToolUseEvent;
@@ -135,6 +136,9 @@ pub(crate) async fn run_implement_phase(
     git: Option<&harness_core::config::project::GitConfig>,
     repo_slug: &str,
     project: &Path,
+    // Canonical project root for project_id derivation. Separate from `project`
+    // because workspace isolation makes `project` a worktree path, not the canonical root.
+    project_root: &Path,
     plan_output: Option<String>,
     resumed_pr_url: Option<String>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
@@ -150,7 +154,13 @@ pub(crate) async fn run_implement_phase(
     update_status(store, task_id, TaskStatus::Implementing, 1).await?;
 
     let first_prompt = if let Some(issue) = req.issue {
-        let base = match super::pr_detection::find_existing_pr_for_issue(project, issue).await {
+        let base = match super::pr_detection::find_existing_pr_for_issue_with_token(
+            project,
+            issue,
+            server_config.server.github_token.as_deref(),
+        )
+        .await
+        {
             Ok(Some((pr_num, branch, pr_url))) => {
                 tracing::info!(
                     "reusing existing PR #{pr_num} on branch `{branch}` for issue #{issue}"
@@ -162,8 +172,11 @@ pub(crate) async fn run_implement_phase(
                 prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
             }
             Err(e) => {
-                tracing::warn!("failed to check for existing PR for issue #{issue}: {e}");
-                prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to check for an existing PR for issue #{issue}; refusing to create a duplicate PR while lookup is unavailable"
+                    )
+                });
             }
         };
         // If the caller also supplied a description alongside the issue number, include it
@@ -250,8 +263,18 @@ pub(crate) async fn run_implement_phase(
     // Since harness uses single-turn `claude -p`, context items are not visible
     // to the agent — we must embed skill content in the prompt string itself.
     // Also records usage for any matched skills via record_use().
-    let matched_skills = matched_skills_for_prompt(skills, &first_prompt).await;
-    let skill_additions = inject_skills_into_prompt(skills, &first_prompt).await;
+    //
+    // Match against the task prompt before appending project instruction files.
+    // Otherwise AGENTS.md / CLAUDE.md trigger phrases can cause unrelated skills
+    // to be injected and logged as used.
+    let skill_match_prompt = first_prompt.clone();
+    let matched_skills = matched_skills_for_prompt(skills, &skill_match_prompt).await;
+    let skill_additions = inject_skills_into_prompt(skills, &skill_match_prompt).await;
+
+    // Inject project instructions directly into the prompt text.
+    // AgentRequest.context is retained for observability, but CLI agents do not
+    // receive it automatically in single-turn mode.
+    let first_prompt = inject_project_context_into_prompt(project, first_prompt);
     let first_prompt = if skill_additions.is_empty() {
         first_prompt
     } else {
@@ -275,7 +298,7 @@ pub(crate) async fn run_implement_phase(
         }
     }
 
-    let context_items = collect_context_items(skills, project, &first_prompt).await;
+    let context_items = collect_context_items(skills, project, &skill_match_prompt).await;
 
     let initial_allowed_tools: Option<Vec<String>> = None;
     let capability_prompt_note: Option<&'static str> = None;
@@ -345,7 +368,7 @@ pub(crate) async fn run_implement_phase(
             project_root: project.to_path_buf(),
             context: context_items.clone(),
             max_budget_usd: req.max_budget_usd,
-            execution_phase: Some(ExecutionPhase::Planning),
+            execution_phase: Some(ExecutionPhase::Execution),
             allowed_tools: initial_allowed_tools.clone(),
             env_vars: cargo_env.clone(),
             ..Default::default()
@@ -628,6 +651,15 @@ pub(crate) async fn run_implement_phase(
             tracing::warn!(stderr = %stderr, "agent stderr during implementation");
         }
 
+        // Append stderr to output so that sentinel parsers (parse_pr_url, etc.) see
+        // the full combined text. For streaming adapters stderr is always empty here;
+        // for non-streaming adapters (execute path) it carries real process output.
+        let output = if !stderr.is_empty() {
+            format!("{output}\n--- stderr ---\n{stderr}")
+        } else {
+            output
+        };
+
         // Fast-fail: if the agent observed a stale worktree managed by another harness
         // session, abort immediately. This prevents the task from pushing commits to the
         // wrong PR (issue #799).
@@ -761,7 +793,7 @@ pub(crate) async fn run_implement_phase(
                 if let (Some(workflows), Some(issue_number)) =
                     (issue_workflow_store.as_ref(), req.issue)
                 {
-                    let project_id = project.to_string_lossy().into_owned();
+                    let project_id = project_root.to_string_lossy().into_owned();
                     if let Err(e) = workflows
                         .record_plan_issue_detected(
                             &project_id,

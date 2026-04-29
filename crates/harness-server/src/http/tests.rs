@@ -9,9 +9,10 @@ use harness_core::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tower::ServiceExt;
 
 struct CapturingAgent {
@@ -23,6 +24,66 @@ impl CapturingAgent {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
         })
+    }
+}
+
+struct BlockingAgent {
+    started: AtomicUsize,
+    started_notify: Notify,
+    release_permits: Semaphore,
+}
+
+impl BlockingAgent {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: AtomicUsize::new(0),
+            started_notify: Notify::new(),
+            release_permits: Semaphore::new(0),
+        })
+    }
+
+    async fn wait_for_started(&self, expected: usize) {
+        while self.started.load(Ordering::SeqCst) < expected {
+            self.started_notify.notified().await;
+        }
+    }
+
+    fn release_runs(&self, count: usize) {
+        self.release_permits.add_permits(count);
+    }
+
+    async fn wait_until_released(&self) {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.started_notify.notify_waiters();
+        let permit = self
+            .release_permits
+            .acquire()
+            .await
+            .expect("blocking agent release semaphore should stay open");
+        permit.forget();
+    }
+}
+
+fn empty_agent_response() -> AgentResponse {
+    AgentResponse {
+        output: String::new(),
+        stderr: String::new(),
+        items: vec![],
+        token_usage: TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+        },
+        model: "mock".into(),
+        exit_code: Some(0),
+    }
+}
+
+fn successful_agent_response() -> AgentResponse {
+    AgentResponse {
+        output: "done".to_string(),
+        ..empty_agent_response()
     }
 }
 
@@ -38,19 +99,7 @@ impl CodeAgent for CapturingAgent {
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         self.prompts.lock().await.push(req.prompt);
-        Ok(AgentResponse {
-            output: String::new(),
-            stderr: String::new(),
-            items: vec![],
-            token_usage: TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                cost_usd: 0.0,
-            },
-            model: "mock".into(),
-            exit_code: Some(0),
-        })
+        Ok(empty_agent_response())
     }
 
     async fn execute_stream(
@@ -58,6 +107,37 @@ impl CodeAgent for CapturingAgent {
         _req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CodeAgent for BlockingAgent {
+    fn name(&self) -> &str {
+        "blocking-agent"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.wait_until_released().await;
+        Ok(successful_agent_response())
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.wait_until_released().await;
+        let _ = tx
+            .send(StreamItem::MessageDelta {
+                text: "done".to_string(),
+            })
+            .await;
+        let _ = tx.send(StreamItem::Done).await;
         Ok(())
     }
 }
@@ -76,6 +156,7 @@ async fn make_test_state_with_project_root(
     config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
+    let db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
     let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
         (cfg.enabled && crate::intake::feishu::has_verification_token(cfg))
             .then(|| Arc::new(crate::intake::feishu::FeishuIntake::new(cfg.clone())))
@@ -114,6 +195,12 @@ async fn make_test_state_with_project_root(
         project_root.to_path_buf(),
     );
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let task_queue = Arc::new(crate::task_queue::TaskQueue::new(
+        &server.config.concurrency,
+    ));
+    let mut review_queue_config = server.config.concurrency.clone();
+    review_queue_config.max_concurrent_tasks = server.config.review.max_concurrent_tasks.max(1);
+    let review_task_queue = Arc::new(crate::task_queue::TaskQueue::new(&review_queue_config));
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
         tasks.clone(),
         server.agent_registry.clone(),
@@ -122,7 +209,8 @@ async fn make_test_state_with_project_root(
         events.clone(),
         vec![],
         None,
-        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        task_queue.clone(),
+        review_task_queue.clone(),
         None,
         None,
         None,
@@ -164,12 +252,12 @@ async fn make_test_state_with_project_root(
             review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
-            task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            task_queue,
+            review_task_queue,
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
+        _db_state_guard: Some(db_state_guard),
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
@@ -186,6 +274,7 @@ async fn make_test_state_with_project_root(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake,
@@ -277,6 +366,19 @@ async fn build_test_state_with_agent(
     Ok((state, capturing))
 }
 
+async fn make_test_state_with_blocking_agent_and_config(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+) -> anyhow::Result<(Arc<AppState>, Arc<BlockingAgent>)> {
+    let blocking = BlockingAgent::new();
+    let mut registry = harness_agents::registry::AgentRegistry::new("test");
+    registry.register("test", blocking.clone());
+
+    let state = make_test_state_with_project_root(dir, project_root, config, registry).await?;
+    Ok((state, blocking))
+}
+
 fn init_fake_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(root.join(".git"))?;
     Ok(())
@@ -286,6 +388,7 @@ fn task_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/tasks", post(task_routes::create_task))
+        .route("/tasks/batch", post(task_routes::create_tasks_batch))
         .route("/tasks/{id}", get(get_task))
         .with_state(state)
 }
@@ -388,18 +491,48 @@ async fn response_json(response: axum::response::Response) -> anyhow::Result<ser
     Ok(serde_json::from_slice(&body)?)
 }
 
+async fn wait_for_task_statuses(
+    state: &Arc<AppState>,
+    task_ids: &[String],
+    expected: task_runner::TaskStatus,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut all_match = true;
+        for task_id in task_ids {
+            let task = state
+                .core
+                .tasks
+                .get_with_db_fallback(&harness_core::types::TaskId(task_id.clone()))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("task {task_id} not found"))?;
+            if task.status != expected {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("tasks did not all reach status {expected:?} before timeout");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_for_task_project_root(
     state: &Arc<AppState>,
     task_id: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
     let task_id = harness_core::types::TaskId(task_id.to_string());
-    for _ in 0..50 {
+    for _ in 0..200 {
         if let Some(task) = state.core.tasks.get_with_db_fallback(&task_id).await? {
             if let Some(project_root) = task.project_root {
                 return Ok(project_root);
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     anyhow::bail!("task {task_id} did not resolve a project root")
@@ -424,6 +557,20 @@ struct HealthResponse {
 struct PersistenceBlock {
     degraded_subsystems: Vec<String>,
     runtime_state_dirty: bool,
+    startup: StartupBlock,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct StartupBlock {
+    stores: Vec<StoreHealth>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct StoreHealth {
+    name: String,
+    critical: bool,
+    ready: bool,
+    error: Option<String>,
 }
 
 async fn call_health(state: Arc<AppState>) -> anyhow::Result<HealthResponse> {
@@ -448,6 +595,7 @@ async fn health_endpoint_returns_ok_and_task_count() -> anyhow::Result<()> {
     assert_eq!(health.tasks, 0);
     assert!(health.persistence.degraded_subsystems.is_empty());
     assert!(!health.persistence.runtime_state_dirty);
+    assert!(health.persistence.startup.stores.is_empty());
     Ok(())
 }
 
@@ -477,9 +625,42 @@ async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_test_state(dir.path()).await?;
+    let state_mut = Arc::get_mut(&mut state).unwrap();
+    state_mut.degraded_subsystems = vec!["review_store"];
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("review_store")
+                .failed("failed to connect to postgres://user:secret@db.internal/harness"),
+        ];
+
+    let health = call_health(state).await?;
+    assert_eq!(health.status, "degraded");
+    assert_eq!(health.persistence.startup.stores.len(), 1);
+    let store = &health.persistence.startup.stores[0];
+    assert_eq!(store.name, "review_store");
+    assert!(!store.critical);
+    assert!(!store.ready);
+    assert_eq!(store.error.as_deref(), Some("database_unavailable"));
+    assert!(
+        !format!("{health:?}").contains("secret"),
+        "health response must not expose raw startup error text"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_degraded_multiple_subsystems() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = make_test_state(dir.path()).await?;
+    Arc::get_mut(&mut state).unwrap().startup_statuses = vec![
+        crate::http::state::StoreStartupResult::optional("q_value_store")
+            .failed("pool timed out while waiting for an open connection"),
+        crate::http::state::StoreStartupResult::optional("runtime_state_store")
+            .failed("runtime state snapshot restore failed"),
+    ];
     Arc::get_mut(&mut state).unwrap().degraded_subsystems =
         vec!["q_value_store", "runtime_state_store"];
     let health = call_health(state).await?;
@@ -488,6 +669,7 @@ async fn health_degraded_multiple_subsystems() -> anyhow::Result<()> {
         health.persistence.degraded_subsystems,
         ["q_value_store", "runtime_state_store"]
     );
+    assert_eq!(health.persistence.startup.stores.len(), 2);
     Ok(())
 }
 
@@ -505,6 +687,24 @@ async fn health_degraded_both_conditions() -> anyhow::Result<()> {
         ["workspace_manager"]
     );
     assert!(health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_reports_critical_store_failure_details() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_test_state(dir.path()).await?;
+    Arc::get_mut(&mut state).unwrap().startup_statuses = vec![
+        crate::http::state::StoreStartupResult::critical("event_store")
+            .failed("failed to open Postgres bootstrap pool"),
+    ];
+    Arc::get_mut(&mut state).unwrap().degraded_subsystems = vec!["event_store"];
+    let health = call_health(state).await?;
+    assert_eq!(health.status, "degraded");
+    assert_eq!(health.persistence.startup.stores.len(), 1);
+    assert_eq!(health.persistence.startup.stores[0].name, "event_store");
+    assert!(health.persistence.startup.stores[0].critical);
+    assert!(!health.persistence.startup.stores[0].ready);
     Ok(())
 }
 
@@ -835,11 +1035,9 @@ async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-    use http_body_util::BodyExt;
-    let resp_body = response.into_body().collect().await?.to_bytes();
-    let resp: serde_json::Value = serde_json::from_slice(&resp_body)?;
+    let resp = response_json(response).await?;
     assert!(resp["task_id"].is_string());
+    assert_eq!(resp["status"], "queued");
     assert_eq!(state.core.tasks.count(), before_count + 1);
     Ok(())
 }
@@ -900,14 +1098,14 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
         .await?;
     assert_eq!(create_resp.status(), StatusCode::ACCEPTED);
 
-    use http_body_util::BodyExt;
-    let create_body = create_resp.into_body().collect().await?.to_bytes();
-    let create_json: serde_json::Value = serde_json::from_slice(&create_body)?;
+    let create_json = response_json(create_resp).await?;
     let task_id = create_json["task_id"]
         .as_str()
         .expect("task_id should be string");
+    assert_eq!(create_json["status"], "queued");
 
-    // GET the task — agent executes instantly (mock), so status should be observable
+    // GET the task — the route accepts immediately, while execution becomes
+    // observable through the task record.
     let get_resp = task_app(state)
         .oneshot(
             Request::builder()
@@ -917,11 +1115,384 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
         .await?;
     assert_eq!(get_resp.status(), StatusCode::OK);
 
+    use http_body_util::BodyExt;
     let get_body = get_resp.into_body().collect().await?.to_bytes();
     let task_json: serde_json::Value = serde_json::from_slice(&get_body)?;
     assert_eq!(task_json["id"], task_id);
     assert!(task_json["scheduler"]["authority_state"].is_string());
     assert!(task_json["scheduler"]["run_generation"].is_number());
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_returns_quickly_when_capacity_saturated() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("queued-task-saturation-")?;
+    let project_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&project_dir)?;
+    init_fake_git_repo(&project_dir)?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.concurrency.max_concurrent_tasks = 1;
+    config.concurrency.max_queue_size = 32;
+    let project = project_dir.display().to_string();
+
+    let (state, blocking_agent) =
+        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
+
+    let first_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "prompt": "hold the only execution slot"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+    let first_json = response_json(first_response).await?;
+    let first_task_id = first_json["task_id"]
+        .as_str()
+        .expect("task_id should be present")
+        .to_string();
+
+    blocking_agent.wait_for_started(1).await;
+
+    let started_at = tokio::time::Instant::now();
+    let saturated_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "prompt": "queued behind the blocking task"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    let elapsed = started_at.elapsed();
+
+    assert_eq!(saturated_response.status(), StatusCode::ACCEPTED);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "saturated POST /tasks should return quickly, took {elapsed:?}"
+    );
+    let queued_json = response_json(saturated_response).await?;
+    assert_eq!(queued_json["status"], "queued");
+
+    let queued_task_id = queued_json["task_id"]
+        .as_str()
+        .expect("task_id should be present")
+        .to_string();
+    wait_for_task_statuses(
+        &state,
+        std::slice::from_ref(&queued_task_id),
+        task_runner::TaskStatus::Pending,
+    )
+    .await?;
+
+    blocking_agent.release_runs(2);
+    wait_for_task_statuses(
+        &state,
+        &[first_task_id, queued_task_id],
+        task_runner::TaskStatus::Done,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_repeated_submits_stay_pending_and_distinct_when_saturated(
+) -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("queued-task-repeated-")?;
+    let project_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&project_dir)?;
+    init_fake_git_repo(&project_dir)?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.concurrency.max_concurrent_tasks = 1;
+    config.concurrency.max_queue_size = 32;
+    let project = project_dir.display().to_string();
+
+    let (state, blocking_agent) =
+        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
+
+    let blocker_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "prompt": "occupy execution"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(blocker_response.status(), StatusCode::ACCEPTED);
+    let blocker_json = response_json(blocker_response).await?;
+    let blocker_task_id = blocker_json["task_id"]
+        .as_str()
+        .expect("task_id should be present")
+        .to_string();
+
+    blocking_agent.wait_for_started(1).await;
+
+    let mut queued_task_ids = Vec::new();
+    for index in 0..10 {
+        let started_at = tokio::time::Instant::now();
+        let response = task_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project": project.clone(),
+                            "prompt": format!("queued task {index}")
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "queued submit {index} should return quickly, took {elapsed:?}"
+        );
+
+        let json = response_json(response).await?;
+        assert_eq!(json["status"], "queued");
+        queued_task_ids.push(
+            json["task_id"]
+                .as_str()
+                .expect("task_id should be present")
+                .to_string(),
+        );
+    }
+
+    let unique_ids: std::collections::HashSet<_> = queued_task_ids.iter().cloned().collect();
+    assert_eq!(unique_ids.len(), queued_task_ids.len());
+
+    wait_for_task_statuses(&state, &queued_task_ids, task_runner::TaskStatus::Pending).await?;
+
+    for task_id in &queued_task_ids {
+        let get_resp = task_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/tasks/{task_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let task_json = response_json(get_resp).await?;
+        assert_eq!(task_json["id"], task_id.as_str());
+        assert_eq!(task_json["status"], "pending");
+    }
+
+    blocking_agent.release_runs(1 + queued_task_ids.len());
+    let mut all_task_ids = vec![blocker_task_id];
+    all_task_ids.extend(queued_task_ids);
+    wait_for_task_statuses(&state, &all_task_ids, task_runner::TaskStatus::Done).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_deduplicates_external_id_while_queued_under_saturation() -> anyhow::Result<()>
+{
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("queued-task-dedup-")?;
+    let project_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&project_dir)?;
+    init_fake_git_repo(&project_dir)?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.concurrency.max_concurrent_tasks = 1;
+    config.concurrency.max_queue_size = 32;
+    let project = project_dir.display().to_string();
+
+    let (state, blocking_agent) =
+        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
+
+    let blocker_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "prompt": "occupy execution"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(blocker_response.status(), StatusCode::ACCEPTED);
+    let blocker_json = response_json(blocker_response).await?;
+    let blocker_task_id = blocker_json["task_id"]
+        .as_str()
+        .expect("task_id should be present")
+        .to_string();
+
+    blocking_agent.wait_for_started(1).await;
+
+    let issue_body = serde_json::json!({
+        "project": project.clone(),
+        "external_id": "issue:42",
+        "prompt": "fix issue 42"
+    })
+    .to_string();
+    let first_issue_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(issue_body.clone()))?,
+        )
+        .await?;
+    assert_eq!(first_issue_response.status(), StatusCode::ACCEPTED);
+    let first_issue_json = response_json(first_issue_response).await?;
+    let first_issue_task_id = first_issue_json["task_id"]
+        .as_str()
+        .expect("task_id should be present")
+        .to_string();
+
+    wait_for_task_statuses(
+        &state,
+        std::slice::from_ref(&first_issue_task_id),
+        task_runner::TaskStatus::Pending,
+    )
+    .await?;
+
+    let duplicate_issue_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(issue_body))?,
+        )
+        .await?;
+    assert_eq!(duplicate_issue_response.status(), StatusCode::ACCEPTED);
+    let duplicate_issue_json = response_json(duplicate_issue_response).await?;
+    assert_eq!(duplicate_issue_json["status"], "queued");
+    assert_eq!(
+        duplicate_issue_json["task_id"].as_str(),
+        Some(first_issue_task_id.as_str())
+    );
+
+    blocking_agent.release_runs(2);
+    wait_for_task_statuses(
+        &state,
+        &[blocker_task_id, first_issue_task_id],
+        task_runner::TaskStatus::Done,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_tasks_batch_remains_queued_under_saturation() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("queued-task-batch-")?;
+    let project_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&project_dir)?;
+    init_fake_git_repo(&project_dir)?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.concurrency.max_concurrent_tasks = 1;
+    config.concurrency.max_queue_size = 32;
+    let project = project_dir.display().to_string();
+
+    let (state, blocking_agent) =
+        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
+
+    let blocker_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "prompt": "occupy execution"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(blocker_response.status(), StatusCode::ACCEPTED);
+    let blocker_json = response_json(blocker_response).await?;
+    let blocker_task_id = blocker_json["task_id"]
+        .as_str()
+        .expect("task_id should be present")
+        .to_string();
+
+    blocking_agent.wait_for_started(1).await;
+
+    let response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "tasks": [
+                            { "description": "batch task 1" },
+                            { "description": "batch task 2" }
+                        ]
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let batch_json = response_json(response).await?;
+    let entries = batch_json
+        .as_array()
+        .expect("batch response should be an array");
+    assert_eq!(entries.len(), 2);
+
+    let queued_task_ids: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            assert_eq!(entry["status"], "queued");
+            entry["task_id"]
+                .as_str()
+                .expect("task_id should be present")
+                .to_string()
+        })
+        .collect();
+    wait_for_task_statuses(&state, &queued_task_ids, task_runner::TaskStatus::Pending).await?;
+
+    blocking_agent.release_runs(1 + queued_task_ids.len());
+    let mut all_task_ids = vec![blocker_task_id];
+    all_task_ids.extend(queued_task_ids);
+    wait_for_task_statuses(&state, &all_task_ids, task_runner::TaskStatus::Done).await?;
     Ok(())
 }
 
@@ -1534,6 +2105,7 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
 
 #[tokio::test]
 async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-repo-a-")?;
     let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-repo-b-")?;
     let secret = "secret";
@@ -1589,6 +2161,7 @@ async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::R
 
 #[tokio::test]
 async fn webhook_routes_prompt_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-a-")?;
     let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-b-")?;
     let secret = "secret";

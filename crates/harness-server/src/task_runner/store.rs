@@ -3,6 +3,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use futures::StreamExt;
 use harness_core::agent::StreamItem;
+use harness_core::db::PgStoreContext;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,7 +60,19 @@ impl TaskStore {
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Arc<Self>> {
         let db = TaskDb::open_with_database_url(db_path, configured_database_url).await?;
+        Self::from_task_db(db, db_path).await
+    }
 
+    pub async fn open_with_context(
+        db_path: &std::path::Path,
+        context: &PgStoreContext,
+        setup_pool: &sqlx::postgres::PgPool,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_with_context(context, setup_pool).await?;
+        Self::from_task_db(db, db_path).await
+    }
+
+    async fn from_task_db(db: TaskDb, db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         // 1. Event replay: runs BEFORE recover_in_progress so event-sourced
         //    data (pr_url, terminal status) wins over checkpoint data.
         let event_log_path = db_path
@@ -107,6 +120,8 @@ impl TaskStore {
         let active_statuses = &[
             "pending",
             "awaiting_deps",
+            "triaging",
+            "planning",
             "implementing",
             "review_generating",
             "review_waiting",
@@ -1086,17 +1101,26 @@ impl TaskStore {
     ///   remove the issue from their `dispatched` map and allow retry)
     /// - OPEN   → leave as Pending
     ///
-    /// `gh` CLI failures are treated as transient network errors; the task is left
+    /// GitHub API failures are treated as transient network errors; the task is left
     /// Pending so it will be retried normally.
     pub async fn validate_recovered_tasks(&self, completion_callback: Option<CompletionCallback>) {
-        self.validate_recovered_tasks_with_gh("gh", completion_callback)
+        self.validate_recovered_tasks_with_github(completion_callback, None)
             .await;
     }
 
-    async fn validate_recovered_tasks_with_gh(
+    pub async fn validate_recovered_tasks_with_token(
         &self,
-        gh_bin: &str,
         completion_callback: Option<CompletionCallback>,
+        github_token: Option<&str>,
+    ) {
+        self.validate_recovered_tasks_with_github(completion_callback, github_token)
+            .await;
+    }
+
+    async fn validate_recovered_tasks_with_github(
+        &self,
+        completion_callback: Option<CompletionCallback>,
+        github_token: Option<&str>,
     ) {
         let candidates = self.collect_recovered_pr_candidates();
 
@@ -1112,7 +1136,7 @@ impl TaskStore {
         // Probe PR states concurrently, but keep persistence and callbacks
         // serialized so terminal-state side effects preserve their current order.
         let mut results = futures::stream::iter(candidates)
-            .map(|candidate| check_recovered_pr_state(gh_bin, candidate))
+            .map(|candidate| check_recovered_pr_state(candidate, github_token))
             .buffer_unordered(RECOVERED_PR_VALIDATION_CONCURRENCY);
 
         while let Some(result) = results.next().await {
@@ -1164,10 +1188,6 @@ impl TaskStore {
     }
 }
 
-fn recovered_pr_view_args(pr_url: &str) -> [&str; 7] {
-    ["pr", "view", pr_url, "--json", "state", "--jq", ".state"]
-}
-
 fn recovered_pr_candidate(task: &TaskState) -> Option<RecoveredPrCandidate> {
     if !matches!(task.status, TaskStatus::Pending) {
         return None;
@@ -1188,24 +1208,34 @@ fn recovered_pr_candidate(task: &TaskState) -> Option<RecoveredPrCandidate> {
 }
 
 async fn check_recovered_pr_state(
-    gh_bin: &str,
     candidate: RecoveredPrCandidate,
+    github_token: Option<&str>,
 ) -> Option<RecoveredPrStatusUpdate> {
     let RecoveredPrCandidate { task_id, pr_url } = candidate;
-
-    // kill_on_drop(true) ensures the child process is killed when the timeout
-    // future is dropped, preventing zombie `gh` processes during startup when
-    // many tasks are recovered concurrently.
-    let mut cmd = tokio::process::Command::new(gh_bin);
-    cmd.args(recovered_pr_view_args(&pr_url)).kill_on_drop(true);
-    let gh_result = tokio::time::timeout(RECOVERED_PR_VIEW_TIMEOUT, cmd.output()).await;
-
-    let output = match gh_result {
+    let Some((owner, repo, pr_number)) = super::spawn::parse_pr_url(&pr_url) else {
+        tracing::warn!(
+            task_id = %task_id.0,
+            pr_url,
+            "could not parse PR URL during startup recovery; leaving pending"
+        );
+        return None;
+    };
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(format!(
+            "https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server");
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
+    }
+    let response = match tokio::time::timeout(RECOVERED_PR_VIEW_TIMEOUT, request.send()).await {
         Err(_elapsed) => {
             tracing::warn!(
                 task_id = %task_id.0,
                 pr_url,
-                "gh pr view timed out after 10s; leaving pending"
+                "GitHub PR lookup timed out after 10s; leaving pending"
             );
             return None;
         }
@@ -1213,29 +1243,46 @@ async fn check_recovered_pr_state(
             tracing::warn!(
                 task_id = %task_id.0,
                 pr_url,
-                "gh CLI error: {e}; leaving pending"
+                "GitHub PR lookup error: {e}; leaving pending"
             );
             return None;
         }
-        Ok(Ok(out)) => out,
+        Ok(Ok(response)) => response,
     };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !response.status().is_success() {
         tracing::warn!(
             task_id = %task_id.0,
             pr_url,
-            "gh pr view failed: {stderr}; leaving pending"
+            status = %response.status(),
+            "GitHub PR lookup failed; leaving pending"
         );
         return None;
     }
 
-    let state = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_uppercase();
-    let new_status = match state.as_str() {
-        "MERGED" => Some(TaskStatus::Done),
-        "CLOSED" => Some(TaskStatus::Failed),
+    let body = match response.json::<serde_json::Value>().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(
+                task_id = %task_id.0,
+                pr_url,
+                "GitHub PR lookup response parse failed: {e}; leaving pending"
+            );
+            return None;
+        }
+    };
+    let state = body
+        .get("state")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let merged = body
+        .get("merged_at")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    let new_status = match (state.as_str(), merged) {
+        ("closed", true) => Some(TaskStatus::Done),
+        ("closed", false) => Some(TaskStatus::Failed),
         _ => None,
     };
 
@@ -1243,7 +1290,11 @@ async fn check_recovered_pr_state(
         Some(RecoveredPrStatusUpdate {
             task_id,
             pr_url,
-            state,
+            state: if merged {
+                "MERGED".to_string()
+            } else {
+                state.to_ascii_uppercase()
+            },
             status,
         })
     } else {
@@ -1474,27 +1525,6 @@ mod tests {
         assert!(state.description.is_none());
     }
 
-    #[test]
-    fn recovered_pr_view_args_use_stored_pr_url() {
-        let expected_url = "https://github.com/acme/repo/pull/42";
-        let args = recovered_pr_view_args(expected_url);
-        assert!(
-            args.contains(&expected_url),
-            "expected gh to receive PR URL, got args: {:?}",
-            args
-        );
-        assert!(
-            args[2] == expected_url,
-            "expected PR URL to be passed positionally, got args: {:?}",
-            args
-        );
-        assert!(
-            !args[2].contains("acme/repo#42"),
-            "gh should not receive repo-qualified refs: {:?}",
-            args
-        );
-    }
-
     #[tokio::test]
     async fn list_siblings_returns_active_tasks_for_same_project() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1577,6 +1607,8 @@ mod tests {
                 false,
                 false,
             ),
+            (TaskStatus::Triaging, false, true, true, false, false, false),
+            (TaskStatus::Planning, false, true, true, false, false, false),
             (
                 TaskStatus::Implementing,
                 false,
@@ -1674,6 +1706,8 @@ mod tests {
         assert_eq!(
             TaskStatus::resumable_statuses(),
             &[
+                "triaging",
+                "planning",
                 "implementing",
                 "review_generating",
                 "review_waiting",

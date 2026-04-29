@@ -38,7 +38,7 @@ fn restricted_tools(profile: CapabilityProfile) -> anyhow::Result<Vec<String>> {
 use pr_detection::{
     build_fix_ci_prompt, parse_harness_mention_command, HarnessMentionCommand, PromptBuilder,
 };
-use pr_detection::{detect_repo_slug, find_existing_pr_for_issue};
+use pr_detection::{detect_repo_slug, find_existing_pr_for_issue_with_token};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -194,11 +194,13 @@ async fn run_non_implementation_task(
         system_input.prompt().to_string(),
         server_config.server.constitution_enabled,
     );
-    let skill_additions = helpers::inject_skills_into_prompt(skills, &prompt).await;
+    let skill_match_prompt = prompt.clone();
+    let skill_additions = helpers::inject_skills_into_prompt(skills, &skill_match_prompt).await;
+    prompt = helpers::inject_project_context_into_prompt(project, prompt);
     if !skill_additions.is_empty() {
         prompt.push_str(&skill_additions);
     }
-    let context_items = helpers::collect_context_items(skills, project, &prompt).await;
+    let context_items = helpers::collect_context_items(skills, project, &skill_match_prompt).await;
     let allowed_tools = Some(restricted_tools(CapabilityProfile::Standard)?);
     if let Some(note) = CapabilityProfile::Standard.prompt_note() {
         prompt = format!("{note}\n\n{prompt}");
@@ -407,6 +409,9 @@ pub(crate) async fn run_task(
     interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
     req: &CreateTaskRequest,
     project: PathBuf,
+    // Canonical project root used for project_id derivation in issue workflow records.
+    // Distinct from `project` when workspace isolation is active (worktree != canonical root).
+    project_root: PathBuf,
     server_config: &harness_core::config::HarnessConfig,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     // Accumulated turn count from previous transient-retry attempts.
@@ -532,11 +537,14 @@ pub(crate) async fn run_task(
         (Some(plan), prompts::TriageComplexity::Medium, 0u32)
     } else if let Some(issue) = req.issue {
         // Only triage fresh issues (no existing PR to continue).
-        let has_existing_pr = find_existing_pr_for_issue(&project, issue)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
+        let has_existing_pr = find_existing_pr_for_issue_with_token(
+            &project,
+            issue,
+            server_config.server.github_token.as_deref(),
+        )
+        .await
+        .with_context(|| format!("failed to check for an existing PR for issue #{issue}"))?
+        .is_some();
         if has_existing_pr {
             // Fresh issue task reusing an existing PR — treat as resumed for conflict gating.
             was_resumed_pr = true;
@@ -549,10 +557,18 @@ pub(crate) async fn run_task(
             );
             (None, prompts::TriageComplexity::Medium, 0u32)
         } else {
-            triage_pipeline::run_triage_plan_pipeline(
-                agent, store, task_id, issue, &events, &cargo_env, &project, req,
+            match triage_pipeline::run_triage_plan_pipeline(
+                agent, store, task_id, issue, &cargo_env, &project, req, &skills, &events,
             )
             .await?
+            {
+                triage_pipeline::TriagePlanPipelineOutcome::Continue {
+                    plan_output,
+                    complexity,
+                    turns,
+                } => (plan_output, complexity, turns),
+                triage_pipeline::TriagePlanPipelineOutcome::Skipped => return Ok(()),
+            }
         }
     } else {
         // Planning gate (task_runner) may have forced TaskPhase::Plan for a
@@ -563,13 +579,12 @@ pub(crate) async fn run_task(
             .map(|s| s.phase == crate::task_runner::TaskPhase::Plan)
             .unwrap_or(false);
         if forced_plan && req.issue.is_none() && req.pr.is_none() {
-            // Set to Implementing BEFORE the plan phase so that a crash during planning
-            // leaves the task in 'implementing' status. The startup recovery code will catch
-            // it and fail-close it (no pr_url → mark failed), rather than leaving it stuck
-            // as a plain 'pending' that is never re-dispatched.
-            update_status(store, task_id, TaskStatus::Implementing, 1).await?;
+            // Set to Planning so operators can see the agent is actively working.
+            // Planning is in resumable_statuses, so a crash here will be caught by
+            // startup recovery: no pr_url/plan checkpoint → mark failed, re-queue manually.
+            update_status(store, task_id, TaskStatus::Planning, 0).await?;
             triage_pipeline::run_plan_for_prompt(
-                agent, store, task_id, &events, &cargo_env, &project, req,
+                agent, store, task_id, &cargo_env, &project, req, &skills, &events,
             )
             .await?
         } else {
@@ -605,7 +620,7 @@ pub(crate) async fn run_task(
     let turn_timeout = crate::task_runner::effective_turn_timeout(req.turn_timeout_secs);
 
     if let (Some(workflows), Some(issue_number)) = (issue_workflow_store.as_ref(), req.issue) {
-        let project_id = project.to_string_lossy().into_owned();
+        let project_id = project_root.to_string_lossy().into_owned();
         if let Err(e) = workflows
             .record_implement_started(&project_id, req.repo.as_deref(), issue_number, &task_id.0)
             .await
@@ -636,6 +651,7 @@ pub(crate) async fn run_task(
             git,
             &repo_slug,
             &project,
+            &project_root,
             current_plan_output.clone(),
             resumed_pr_url.clone(),
             issue_workflow_store.clone(),
@@ -706,6 +722,8 @@ pub(crate) async fn run_task(
                         &cargo_env,
                         &project,
                         req,
+                        &skills,
+                        &events,
                     )
                     .await?;
                     turns_used += 1;
@@ -740,64 +758,15 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    // Conflict resolution gate: intercept CONFLICTING PRs before the review loop.
-    // Only runs on the resume/recovery path — fresh PRs cannot be conflicting yet.
-    let mut rebase_pushed = false;
-    let mut conflict_was_detected = false;
+    // Conflict resolution gate: host-side GitHub/git inspection is disabled by
+    // project policy. On resume paths, ask the agent/reviewer loop to inspect
+    // and resolve any conflicts instead of probing from the server process.
     if was_resumed_pr {
         use conflict_resolver::{assess_pr_conflict, PrConflictSize};
-        let conflict_size = assess_pr_conflict(pr_num, &project).await;
-        match conflict_size {
-            PrConflictSize::Small {
-                file_count,
-                region_count,
-            } => {
-                tracing::info!(
-                    pr = pr_num,
-                    file_count,
-                    region_count,
-                    "conflict: small — attempting auto-rebase"
-                );
-                conflict_was_detected = true;
-                rebase_pushed = triage_pipeline::run_rebase_turn(
-                    agent,
-                    pr_num,
-                    &project,
-                    &repo_slug,
-                    turn_timeout,
-                    &cargo_env,
-                )
-                .await;
-            }
-            PrConflictSize::Large {
-                file_count,
-                region_count,
-            } => {
-                tracing::warn!(
-                    pr = pr_num,
-                    file_count,
-                    region_count,
-                    "conflict: too large for auto-rebase — deferring to review agent"
-                );
-                conflict_was_detected = true;
-            }
-            PrConflictSize::Clean | PrConflictSize::Unknown(_) => {}
-        }
-
-        // Gate B: a detected conflict that was not resolved by a successful rebase
-        // must not silently proceed to review. Mark Failed so the operator can
-        // re-queue after manual resolution rather than getting a false Done.
-        if conflict_was_detected && !rebase_pushed {
-            mutate_and_persist(store, task_id, |s| {
-                s.status = TaskStatus::Failed;
-                s.error = Some(format!(
-                    "pr:{pr_num} is conflicting and rebase was not pushed; manual resolution required"
-                ));
-            })
-            .await?;
-            return Ok(());
-        }
+        let PrConflictSize::Unknown(reason) = assess_pr_conflict(pr_num, &project).await;
+        tracing::debug!(pr = pr_num, reason, "conflict assessment delegated");
     }
+    let rebase_pushed = false;
 
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
@@ -817,6 +786,7 @@ pub(crate) async fn run_task(
                 pr_url.as_deref().unwrap_or(""),
                 project_config.review_type.as_str(),
                 &events,
+                &skills,
                 &cargo_env,
                 effective_max_turns,
                 &mut turns_used,
@@ -898,6 +868,7 @@ pub(crate) async fn run_task(
         task_start,
         repo_slug_for_review,
         jaccard_threshold,
+        server_config.server.github_token.as_deref(),
     )
     .await
 }

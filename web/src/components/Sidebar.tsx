@@ -23,6 +23,10 @@ interface Props {
   onItemClick?: (id: string) => void;
 }
 
+function isExternalHref(href: string | undefined): boolean {
+  return href?.startsWith("http://") === true || href?.startsWith("https://") === true;
+}
+
 export function Sidebar({
   env,
   sections,
@@ -84,6 +88,14 @@ export function Sidebar({
                   >
                     {body}
                   </button>
+                );
+              }
+
+              if (isExternalHref(item.href)) {
+                return (
+                  <a key={item.id} href={item.href} target="_blank" rel="noreferrer" className={itemClass}>
+                    {body}
+                  </a>
                 );
               }
 

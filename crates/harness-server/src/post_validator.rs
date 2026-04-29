@@ -16,10 +16,9 @@ use tokio::time::{timeout, Duration};
 /// turn prompt and retry up to `config.max_retries` times.
 pub struct PostExecutionValidator {
     config: ValidationConfig,
-    /// Path to the `gh` binary used for PR existence verification.
-    /// Defaults to `"gh"` (resolved via PATH). Override in tests to inject a
-    /// fake binary and keep tests hermetic.
+    /// Deprecated test-only field retained for struct literal compatibility.
     gh_bin: String,
+    github_token: Option<String>,
 }
 
 /// Classify a command string into a human-readable error prefix.
@@ -58,6 +57,20 @@ fn classify_command(cmd: &str) -> &'static str {
     "[VALIDATION ERROR]"
 }
 
+fn parse_github_pr_url(pr_url: &str) -> Option<(String, u64)> {
+    let path = pr_url
+        .strip_prefix("https://github.com/")
+        .or_else(|| pr_url.strip_prefix("http://github.com/"))?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if parts.next()? != "pull" {
+        return None;
+    }
+    let pr_number = parts.next()?.parse().ok()?;
+    Some((format!("{owner}/{repo}"), pr_number))
+}
+
 /// Validate that a command string does not contain unquoted shell operators
 /// that could enable command chaining or execution escalation.
 ///
@@ -79,52 +92,48 @@ pub(crate) fn validate_command_safety(cmd_str: &str) -> Result<(), String> {
 
 impl PostExecutionValidator {
     pub fn new(config: ValidationConfig) -> Self {
+        Self::new_with_github_token(config, None)
+    }
+
+    pub fn new_with_github_token(config: ValidationConfig, github_token: Option<String>) -> Self {
         Self {
             config,
             gh_bin: "gh".to_string(),
+            github_token,
         }
     }
 
-    /// Verify that a PR URL exists by calling `gh pr view` with the URL as a
-    /// positional argument (not interpolated into a shell string) to prevent
-    /// command injection from agent-controlled output.
+    /// Verify that a PR URL exists through the GitHub REST API.
     async fn verify_pr_exists(
-        gh_bin: &str,
+        _gh_bin: &str,
         pr_url: &str,
-        project: &Path,
+        _project: &Path,
         timeout_secs: u64,
+        github_token: Option<&str>,
     ) -> Result<(), String> {
-        let child = match Command::new(gh_bin)
-            .args(["pr", "view", pr_url, "--json", "state"])
-            .current_dir(project)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(format!(
-                    "Failed to spawn `{gh_bin}` to verify PR {pr_url}: {e}"
-                ))
-            }
-        };
+        let (repo, pr_number) = parse_github_pr_url(pr_url)
+            .ok_or_else(|| format!("Could not parse GitHub PR URL: {pr_url}"))?;
+        let client = reqwest::Client::new();
+        let mut request = client
+            .get(format!(
+                "https://api.github.com/repos/{repo}/pulls/{pr_number}"
+            ))
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::USER_AGENT, "harness-server");
+        if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+            request = request.bearer_auth(token);
+        }
 
-        let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        let result = timeout(Duration::from_secs(timeout_secs), request.send()).await;
         match result {
-            Ok(Ok(output)) if output.status.success() => Ok(()),
-            Ok(Ok(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let code = output.status.code().unwrap_or(-1);
-                Err(format!(
-                    "`gh pr view {pr_url}` failed (exit {code})\nstdout: {stdout}\nstderr: {stderr}"
-                ))
-            }
-            Ok(Err(e)) => Err(format!("`gh pr view {pr_url}` failed to wait: {e}")),
+            Ok(Ok(response)) if response.status().is_success() => Ok(()),
+            Ok(Ok(response)) => Err(format!(
+                "GitHub PR lookup for {pr_url} failed with status {}",
+                response.status()
+            )),
+            Ok(Err(e)) => Err(format!("GitHub PR lookup for {pr_url} failed: {e}")),
             Err(_) => Err(format!(
-                "`gh pr view {pr_url}` timed out after {timeout_secs}s"
+                "GitHub PR lookup for {pr_url} timed out after {timeout_secs}s"
             )),
         }
     }
@@ -147,11 +156,13 @@ impl PostExecutionValidator {
         pr_url: &str,
         project: &Path,
         timeout_secs: u64,
+        github_token: Option<&str>,
     ) -> Result<(), String> {
         let max_attempts = 3;
         let mut last_err = String::new();
         for attempt in 1..=max_attempts {
-            match Self::verify_pr_exists(gh_bin, pr_url, project, timeout_secs).await {
+            match Self::verify_pr_exists(gh_bin, pr_url, project, timeout_secs, github_token).await
+            {
                 Ok(()) => return Ok(()),
                 Err(e) if !Self::is_transient_error(&e) => return Err(e),
                 Err(e) => {
@@ -282,7 +293,7 @@ impl TurnInterceptor for PostExecutionValidator {
         }
 
         // PR existence verification: if the agent output contains a PR_URL,
-        // verify via `gh pr view` that the PR actually exists on GitHub.
+        // verify via the GitHub REST API that the PR actually exists on GitHub.
         // This prevents silently succeeding when an agent claims to have created
         // a PR that does not exist. Runs only when all other validations pass
         // to avoid noisy failures from incomplete code.
@@ -291,8 +302,8 @@ impl TurnInterceptor for PostExecutionValidator {
                 // Guard: only verify URLs that look like a real GitHub PR
                 // (contain /pull/{number}).  Non-PR URLs are silently skipped.
                 if prompts::extract_pr_number(&pr_url).is_some() {
-                    // Use the full URL so `gh` resolves the exact repo the
-                    // agent targeted, not the repo of the current checkout.
+                    // Use the full URL so the API targets the exact repo the
+                    // agent used, not the repo of the current checkout.
                     // This prevents false passes (same PR number in local repo)
                     // and false failures (PR opened against a fork or different
                     // repo).
@@ -305,6 +316,7 @@ impl TurnInterceptor for PostExecutionValidator {
                         &pr_url,
                         project,
                         self.config.timeout_secs,
+                        self.github_token.as_deref(),
                     )
                     .await
                     {
@@ -749,34 +761,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pr_verification_fails_when_gh_pr_view_fails() {
-        // Hermetic: create a fake `gh` script that always exits 1, inject it
-        // via the gh_bin override so no real network call is made.
-        let bin_dir = tempfile::tempdir().unwrap();
-        let fake_gh = bin_dir.path().join("gh");
-        std::fs::write(&fake_gh, "#!/bin/sh\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
+    async fn pr_verification_fails_for_unparseable_pr_url() {
         let dir = tempfile::tempdir().unwrap();
-        let config = ValidationConfig::default();
-        let validator = PostExecutionValidator {
-            config,
-            gh_bin: fake_gh.to_string_lossy().into_owned(),
-        };
-        let req = make_req(dir.path().to_path_buf());
-        let resp = make_resp("PR_URL=https://github.com/owner/repo/pull/99999");
-        let result = validator.post_execute(&req, &resp).await;
+        let err = PostExecutionValidator::verify_pr_exists(
+            "",
+            "https://example.com/not-a-pr",
+            dir.path(),
+            1,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(
-            result.error.is_some(),
-            "expected PR verification error when gh exits non-zero"
-        );
-        let err = result.error.unwrap();
-        assert!(
-            err.contains("https://github.com/owner/repo/pull/99999"),
+            err.contains("https://example.com/not-a-pr"),
             "expected error mentioning PR URL, got: {err}"
         );
     }

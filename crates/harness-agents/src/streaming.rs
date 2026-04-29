@@ -48,6 +48,11 @@ const AGENT_INTERNAL_PREFIXES: &[&str] = &[
     "reasoning summaries:",
     "session id:",
     "mcp startup:",
+    // Codex CLI telemetry failures are agent-internal and are not actionable
+    // server warnings.
+    "warn codex_analytics::client:",
+    "error codex_analytics::client:",
+    "codex_analytics::client:",
     // Codex reasoning/exec progress lines
     "codex ",
     "exec ",
@@ -685,6 +690,13 @@ mod tests {
         assert!(!looks_like_code_content("warning: unused import"));
         assert!(!looks_like_code_content(
             "agent execution failed: codex exited with status 1"
+        ));
+    }
+
+    #[test]
+    fn codex_analytics_stderr_is_agent_internal() {
+        assert!(is_agent_internal(
+            "WARN codex_analytics::client: events failed with status 403 Forbidden"
         ));
     }
 

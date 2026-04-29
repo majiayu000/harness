@@ -6,6 +6,7 @@ use harness_core::interceptor::{
     InterceptResult, PostExecuteResult, PostToolUseResult, ToolUseEvent, TurnInterceptor,
 };
 use harness_core::types::{Decision, TokenUsage, TurnFailureKind};
+use harness_observe::event_store::EventStore;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
@@ -696,6 +697,168 @@ async fn run_agent_streaming_can_skip_artifact_persistence() {
     );
 }
 
+#[test]
+fn inject_project_context_appends_agents_and_claude_instructions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "Always run cargo check").unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "Use English only").unwrap();
+
+    let result = inject_project_context_into_prompt(dir.path(), "Base task".to_string());
+
+    assert!(result.contains("Base task"));
+    assert!(result.contains("## Project Instructions"));
+    assert!(result.contains("Always run cargo check"));
+    assert!(result.contains("Use English only"));
+}
+
+#[test]
+fn inject_project_context_noops_without_instruction_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = inject_project_context_into_prompt(dir.path(), "Base task".to_string());
+    assert_eq!(result, "Base task");
+}
+
+#[tokio::test]
+async fn project_context_text_does_not_cause_skill_match_when_matching_original_prompt() {
+    let mut store = harness_skills::store::SkillStore::new();
+    store.create(
+        "review".to_string(),
+        "# Review\n<!-- trigger-patterns: code review -->\nReview code carefully.".to_string(),
+    );
+    let skills = RwLock::new(store);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "please do a code review").unwrap();
+
+    let original_prompt = "implement feature X".to_string();
+    let injected_prompt = inject_project_context_into_prompt(dir.path(), original_prompt.clone());
+
+    let matched_original = matched_skills_for_prompt(&skills, &original_prompt).await;
+    let matched_injected = matched_skills_for_prompt(&skills, &injected_prompt).await;
+
+    assert!(
+        matched_original.is_empty(),
+        "task prompt alone should not match the review skill"
+    );
+    assert_eq!(
+        matched_injected.len(),
+        1,
+        "project instruction content would falsely match without preserving the original task prompt"
+    );
+}
+
+fn make_skill_store_with_two_matching() -> harness_skills::store::SkillStore {
+    let mut store = harness_skills::store::SkillStore::new();
+    store.create(
+        "review".to_string(),
+        "# Review\n<!-- trigger-patterns: code review -->\nReview code carefully.".to_string(),
+    );
+    store.create(
+        "build-fix".to_string(),
+        "# BuildFix\n<!-- trigger-patterns: code review -->\nFix build issues.".to_string(),
+    );
+    store
+}
+
+#[tokio::test]
+async fn inject_skills_multiple_matches_all_usage_counts_incremented() {
+    let skills = RwLock::new(make_skill_store_with_two_matching());
+    let events = EventStore::new_noop_for_tests();
+    augment_prompt_with_skills(
+        &skills,
+        &events,
+        &TaskId::new(),
+        "please do a code review".to_string(),
+    )
+    .await;
+    let guard = skills.read().await;
+    for skill in guard.list() {
+        assert_eq!(
+            skill.usage_count, 1,
+            "skill '{}' must have usage_count=1 after matching",
+            skill.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn inject_skills_retired_skill_not_included() {
+    // Drive a skill into Retired state via apply_governance_outcome.
+    // Retired requires: scored_samples >= 30 AND quality_score < 0.30.
+    // Starting from quality_score=0.5, 4 calls with fail=100 yields ~0.293 < 0.30.
+    use harness_skills::store::SkillGovernanceInput;
+    let mut store = harness_skills::store::SkillStore::new();
+    store.create(
+        "retired-review".to_string(),
+        "# RetiredReview\n<!-- trigger-patterns: code review -->\nRetired review content."
+            .to_string(),
+    );
+    let id = store.list()[0].id.clone();
+    for _ in 0..4 {
+        store.apply_governance_outcome(
+            &id,
+            SkillGovernanceInput {
+                success: 0,
+                fail: 100,
+                unknown: 0,
+            },
+        );
+    }
+    let skills = RwLock::new(store);
+    let events = EventStore::new_noop_for_tests();
+    let result = augment_prompt_with_skills(
+        &skills,
+        &events,
+        &TaskId::new(),
+        "please do a code review".to_string(),
+    )
+    .await;
+    assert!(
+        !result.contains("Retired review content."),
+        "retired skill content must not appear in prompt"
+    );
+    let guard = skills.read().await;
+    assert_eq!(
+        guard.list()[0].usage_count,
+        0,
+        "usage must not be recorded for retired skill"
+    );
+}
+
+#[tokio::test]
+async fn inject_skills_quarantine_injection_is_deterministic() {
+    // Drive a skill into Quarantine, then verify same prompt always produces
+    // the same result (canary bucket is deterministic hash, not random).
+    use harness_skills::store::SkillGovernanceInput;
+    let mut store = harness_skills::store::SkillStore::new();
+    store.create(
+        "quarantine-review".to_string(),
+        "# QuarantineReview\n<!-- trigger-patterns: code review -->\nQuarantine content."
+            .to_string(),
+    );
+    let id = store.list()[0].id.clone();
+    // One call with fail=15: quality=0.43 < 0.45, samples=15 >= 10 → Quarantine.
+    store.apply_governance_outcome(
+        &id,
+        SkillGovernanceInput {
+            success: 0,
+            fail: 15,
+            unknown: 0,
+        },
+    );
+    let skills = RwLock::new(store);
+    let events = EventStore::new_noop_for_tests();
+    let prompt = "please do a code review".to_string();
+    let result1 =
+        augment_prompt_with_skills(&skills, &events, &TaskId::new(), prompt.clone()).await;
+    let result2 =
+        augment_prompt_with_skills(&skills, &events, &TaskId::new(), prompt.clone()).await;
+    assert_eq!(
+        result1, result2,
+        "injection result must be deterministic for the same prompt"
+    );
+}
+
 // ── truncate_validation_error ─────────────────────────────────────────────────
 
 #[test]
@@ -709,33 +872,6 @@ fn truncate_long_error_includes_summary() {
     let result = truncate_validation_error(&input, 50);
     assert!(result.starts_with(&"x".repeat(50)));
     assert!(result.contains("(output truncated, 200 chars total)"));
-}
-
-#[test]
-fn parse_porcelain_z_paths_uses_rename_destination() {
-    let raw = b"R  old.txt\0new.txt\0";
-    let paths = parse_porcelain_z_paths(raw);
-    assert_eq!(paths, vec![std::path::PathBuf::from("new.txt")]);
-}
-
-#[test]
-fn parse_porcelain_z_paths_ignores_deletions() {
-    let raw = b"D  gone.txt\0";
-    let paths = parse_porcelain_z_paths(raw);
-    assert!(paths.is_empty());
-}
-
-#[test]
-fn parse_porcelain_z_paths_keeps_modified_and_untracked() {
-    let raw = b" M src/lib.rs\0?? new_file.rs\0";
-    let paths = parse_porcelain_z_paths(raw);
-    assert_eq!(
-        paths,
-        vec![
-            std::path::PathBuf::from("src/lib.rs"),
-            std::path::PathBuf::from("new_file.rs")
-        ]
-    );
 }
 
 // ── process_stream_item: ApprovalRequest ─────────────────────────────────────

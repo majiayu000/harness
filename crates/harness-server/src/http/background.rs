@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
 use crate::task_runner;
-use harness_workflow::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
+use harness_workflow::issue_lifecycle::{workflow_id, IssueLifecycleState, IssueWorkflowInstance};
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     task.external_id
@@ -357,6 +357,8 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
 
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
+        let mut warned_unresolvable: std::collections::HashSet<(String, Option<String>)> =
+            std::collections::HashSet::new();
         loop {
             let state = match weak_state.upgrade() {
                 Some(s) => s,
@@ -401,7 +403,7 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
 
             let mut touched_projects = std::collections::HashSet::new();
             let mut incomplete_projects = std::collections::HashSet::new();
-            for workflow in candidates {
+            for mut workflow in candidates {
                 let Some(pr_number) = workflow.pr_number else {
                     continue;
                 };
@@ -423,9 +425,71 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                     }
                 }
 
+                // Short-circuit if path is healthy (avoids a registry DB query on every tick).
+                let project_path = if tokio::fs::metadata(&workflow.project_id).await.is_ok() {
+                    warned_unresolvable.remove(&project_key);
+                    std::path::PathBuf::from(&workflow.project_id)
+                } else if let Some(registry) = state.core.project_registry.as_deref() {
+                    match registry.resolve_path(&workflow.project_id).await {
+                        Ok(None) | Err(_) => {
+                            if warned_unresolvable.insert(project_key.clone()) {
+                                tracing::warn!(
+                                    project_id = %workflow.project_id,
+                                    "sweeper: project path unresolvable, skipping"
+                                );
+                            }
+                            incomplete_projects.insert(project_key.clone());
+                            let _ = issue_workflows
+                                .release_feedback_claim(
+                                    &workflow.project_id,
+                                    workflow.repo.as_deref(),
+                                    pr_number,
+                                    "sweeper: project path unresolvable",
+                                )
+                                .await;
+                            continue;
+                        }
+                        Ok(Some(resolved))
+                            if resolved.as_path() != std::path::Path::new(&workflow.project_id) =>
+                        {
+                            if let Err(e) = issue_workflows
+                                .repair_project_id(&workflow.id, &resolved.to_string_lossy())
+                                .await
+                            {
+                                tracing::error!(
+                                    workflow_id = %workflow.id,
+                                    error = %e,
+                                    "sweeper: failed to repair project_id"
+                                );
+                                let _ = issue_workflows
+                                    .release_feedback_claim(
+                                        &workflow.project_id,
+                                        workflow.repo.as_deref(),
+                                        pr_number,
+                                        &format!("sweeper: failed to repair project_id: {e}"),
+                                    )
+                                    .await;
+                                continue;
+                            }
+                            let new_project_id = resolved.to_string_lossy().into_owned();
+                            workflow.id = workflow_id(
+                                &new_project_id,
+                                workflow.repo.as_deref(),
+                                workflow.issue_number,
+                            );
+                            workflow.project_id = new_project_id;
+                            warned_unresolvable.remove(&project_key);
+                            resolved
+                        }
+                        Ok(Some(resolved)) => resolved,
+                    }
+                } else {
+                    std::path::PathBuf::from(&workflow.project_id)
+                };
+
                 let req = crate::task_runner::CreateTaskRequest {
                     pr: Some(pr_number),
-                    project: Some(std::path::PathBuf::from(&workflow.project_id)),
+                    project: Some(project_path),
                     repo: workflow.repo.clone(),
                     source: Some("workflow_feedback".to_string()),
                     ..Default::default()
@@ -1218,6 +1282,64 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
 mod tests {
     use super::*;
 
+    const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in
+    // reconciliation.rs, but with an injectable gh_bin so tests run without a live
+    // GitHub connection. Keep the parsing (trim_matches('"'), to_uppercase) in sync
+    // with classify_pr_output in reconciliation.rs to avoid logic drift.
+    /// Fetch the current GitHub state for a PR identified by `pr_url`.
+    ///
+    /// Returns `Some((raw_state, new_status))` only for actionable terminal states
+    /// (MERGED → Done, CLOSED → Cancelled). Any transient failure (I/O error,
+    /// non-zero exit, timeout, unexpected state) returns `None` so the caller
+    /// skips the task silently.
+    async fn fetch_pr_github_state(
+        gh_bin: &str,
+        task_id: &task_runner::TaskId,
+        pr_url: &str,
+    ) -> Option<(String, task_runner::TaskStatus)> {
+        let output = match tokio::time::timeout(
+            RECONCILE_GH_TIMEOUT,
+            tokio::process::Command::new(gh_bin)
+                .args(["pr", "view", pr_url, "--json", "state", "--jq", ".state"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                tracing::warn!(task_id = %task_id, error = %e, "reconciliation: gh command failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(task_id = %task_id, "reconciliation: gh command timed out");
+                return None;
+            }
+        };
+        if !output.status.success() {
+            tracing::debug!(
+                task_id = %task_id,
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "reconciliation: gh pr view returned non-zero"
+            );
+            return None;
+        }
+        let raw = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_matches('"')
+            .to_uppercase();
+        match raw.as_str() {
+            "MERGED" => Some((raw.to_string(), task_runner::TaskStatus::Done)),
+            "CLOSED" => Some((raw.to_string(), task_runner::TaskStatus::Cancelled)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn workflow_recovery_task_ids_only_uses_active_addressing_feedback_rows() {
         let mut addressing = IssueWorkflowInstance::new(
@@ -1262,5 +1384,135 @@ mod tests {
         let mut pending_without_pr = pending_with_pr;
         pending_without_pr.pr_url = None;
         assert!(!task_is_pr_recovery_candidate(&pending_without_pr));
+    }
+
+    #[test]
+    fn warn_dedup_insert_returns_true_first_time_only() {
+        let mut warned: std::collections::HashSet<(String, Option<String>)> =
+            std::collections::HashSet::new();
+        let key = ("/dead/path".to_string(), Some("owner/repo".to_string()));
+        assert!(
+            warned.insert(key.clone()),
+            "first insert should return true (first tick should warn)"
+        );
+        assert!(
+            !warned.insert(key.clone()),
+            "second insert should return false (dedup suppresses warn)"
+        );
+        warned.remove(&key);
+        assert!(
+            warned.insert(key.clone()),
+            "after removal (path recovered), insert returns true again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_merged_transitions_to_done() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'MERGED\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            matches!(result, Some((ref s, task_runner::TaskStatus::Done)) if s == "MERGED"),
+            "expected Some((\"MERGED\", Done)), got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_closed_transitions_to_cancelled() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'CLOSED\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            matches!(result, Some((ref s, task_runner::TaskStatus::Cancelled)) if s == "CLOSED"),
+            "expected Some((\"CLOSED\", Cancelled)), got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_open_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'OPEN\\n'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "expected None for OPEN state, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_gh_failure_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = fetch_pr_github_state(
+            script.to_str().unwrap(),
+            &task_id,
+            "https://github.com/owner/repo/pull/1",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "expected None for non-zero exit, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_gh_timeout_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task_id = task_runner::TaskId::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            fetch_pr_github_state(
+                script.to_str().unwrap(),
+                &task_id,
+                "https://github.com/owner/repo/pull/1",
+            ),
+        )
+        .await;
+        // The inner function must time out after RECONCILE_GH_TIMEOUT (10s) and return None;
+        // the outer 15s guard is a safety net — if it fires, the inner timeout logic is broken.
+        match result {
+            Ok(inner) => assert!(inner.is_none(), "expected None on timeout, got {inner:?}"),
+            Err(_) => panic!("outer test timeout fired before inner function timeout logic"),
+        }
     }
 }

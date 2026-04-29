@@ -24,10 +24,12 @@ impl DispatchedTaskChecker for crate::task_runner::TaskStore {
 pub struct GitHubIssuesPoller {
     repo: String,
     label: String,
+    client: reqwest::Client,
     project_root: Option<PathBuf>,
     dispatched: DashMap<String, TaskId>,
     persist_path: Option<PathBuf>,
     task_checker: Option<Arc<dyn DispatchedTaskChecker>>,
+    github_token: Option<String>,
 }
 
 impl GitHubIssuesPoller {
@@ -35,16 +37,26 @@ impl GitHubIssuesPoller {
         repo_config: &harness_core::config::intake::GitHubRepoConfig,
         data_dir: Option<&Path>,
     ) -> Self {
+        Self::new_with_token(repo_config, data_dir, None)
+    }
+
+    pub fn new_with_token(
+        repo_config: &harness_core::config::intake::GitHubRepoConfig,
+        data_dir: Option<&Path>,
+        github_token: Option<String>,
+    ) -> Self {
         let repo_slug = repo_config.repo.replace('/', "_");
         let persist_path = data_dir.map(|d| d.join(format!("github_dispatched_{repo_slug}.json")));
         let dispatched = Self::load_dispatched(persist_path.as_deref());
         Self {
             repo: repo_config.repo.clone(),
             label: repo_config.label.clone(),
+            client: reqwest::Client::new(),
             project_root: repo_config.project_root.as_ref().map(PathBuf::from),
             dispatched,
             persist_path,
             task_checker: None,
+            github_token,
         }
     }
 
@@ -178,15 +190,19 @@ fn dispatched_contains_issue(dispatched: &DashMap<String, TaskId>, issue_id: &st
     dispatched.contains_key(issue_id) || dispatched.contains_key(&format!("issue:{issue_id}"))
 }
 
-/// Raw GitHub issue fields returned by `gh issue list --json`.
+/// Raw GitHub issue fields returned by the GitHub REST API.
 #[derive(Debug, Deserialize)]
 struct GhIssue {
     number: u64,
     title: String,
     body: Option<String>,
     url: String,
+    html_url: Option<String>,
+    #[serde(default)]
+    pull_request: Option<serde_json::Value>,
+    #[serde(default)]
     labels: Vec<GhLabel>,
-    #[serde(rename = "createdAt")]
+    #[serde(alias = "createdAt")]
     created_at: Option<DateTime<Utc>>,
 }
 
@@ -195,7 +211,7 @@ struct GhLabel {
     name: String,
 }
 
-/// Parsed result from `gh issue list` output.
+/// Parsed result from GitHub issue-list output.
 struct ParsedGhOutput {
     /// New issues not yet dispatched.
     new_issues: Vec<IncomingIssue>,
@@ -203,7 +219,7 @@ struct ParsedGhOutput {
     open_issue_ids: std::collections::HashSet<String>,
 }
 
-/// Parse the JSON output of `gh issue list --json number,title,body,url,labels,createdAt`
+/// Parse the JSON output of the GitHub issue list API
 /// into new issues (filtering out dispatched) and the full set of open issue IDs.
 fn parse_gh_output(
     json: &[u8],
@@ -212,6 +228,10 @@ fn parse_gh_output(
     project_root: Option<&std::path::Path>,
 ) -> anyhow::Result<ParsedGhOutput> {
     let issues: Vec<GhIssue> = serde_json::from_slice(json)?;
+    let issues: Vec<GhIssue> = issues
+        .into_iter()
+        .filter(|issue| issue.pull_request.is_none())
+        .collect();
     let open_issue_ids: std::collections::HashSet<String> =
         issues.iter().map(|i| i.number.to_string()).collect();
     let new_issues = issues
@@ -227,7 +247,7 @@ fn parse_gh_output(
             title: issue.title,
             description: issue.body,
             repo: Some(repo.to_string()),
-            url: Some(issue.url),
+            url: Some(issue.html_url.unwrap_or(issue.url)),
             priority: None,
             labels: issue.labels.into_iter().map(|l| l.name).collect(),
             created_at: issue.created_at,
@@ -247,34 +267,32 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
-        let mut args = vec![
-            "issue",
-            "list",
-            "--repo",
-            &self.repo,
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,url,labels,createdAt",
-            "--limit",
-            "1000",
-        ];
+        let url = format!("https://api.github.com/repos/{}/issues", self.repo);
+        let mut request = self
+            .client
+            .get(url)
+            .query(&[("state", "open"), ("per_page", "100")])
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::USER_AGENT, "harness-server");
         if !self.label.is_empty() {
-            args.push("--label");
-            args.push(&self.label);
+            request = request.query(&[("labels", self.label.as_str())]);
         }
-        let output = tokio::process::Command::new("gh")
-            .args(&args)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh issue list failed: {stderr}");
+        if let Some(token) = crate::github_auth::resolve_github_token(self.github_token.as_deref())
+        {
+            request = request.bearer_auth(token);
         }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "GitHub issue list failed for {} with status {}",
+                self.repo,
+                response.status()
+            );
+        }
+        let body = response.bytes().await?;
 
         let parsed = parse_gh_output(
-            &output.stdout,
+            &body,
             &self.repo,
             &self.dispatched,
             self.project_root.as_deref(),
@@ -416,6 +434,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_gh_output_accepts_api_url_and_html_url() {
+        let json = br#"[
+            {
+                "number": 42,
+                "title": "Fix login bug",
+                "body": null,
+                "url": "https://api.github.com/repos/owner/repo/issues/42",
+                "html_url": "https://github.com/owner/repo/issues/42",
+                "labels": []
+            }
+        ]"#;
+
+        let dispatched = DashMap::new();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
+
+        assert_eq!(parsed.new_issues.len(), 1);
+        assert_eq!(
+            parsed.new_issues[0].url.as_deref(),
+            Some("https://github.com/owner/repo/issues/42")
+        );
+    }
+
+    #[test]
     fn parse_gh_output_filters_dispatched_issues() {
         let json = br#"[
             {"number": 1, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
@@ -430,6 +471,42 @@ mod tests {
         assert_eq!(parsed.new_issues.len(), 1);
         assert_eq!(parsed.new_issues[0].external_id, "3");
         assert_eq!(parsed.open_issue_ids.len(), 3);
+    }
+
+    #[test]
+    fn parse_gh_output_filters_pull_requests_from_issue_endpoint() {
+        let json = br#"[
+            {
+                "number": 10,
+                "title": "Actual issue",
+                "body": null,
+                "url": "https://api.github.com/repos/owner/repo/issues/10",
+                "html_url": "https://github.com/owner/repo/issues/10",
+                "labels": [],
+                "createdAt": null
+            },
+            {
+                "number": 11,
+                "title": "Open pull request",
+                "body": null,
+                "url": "https://api.github.com/repos/owner/repo/issues/11",
+                "html_url": "https://github.com/owner/repo/pull/11",
+                "pull_request": {
+                    "url": "https://api.github.com/repos/owner/repo/pulls/11",
+                    "html_url": "https://github.com/owner/repo/pull/11"
+                },
+                "labels": [],
+                "createdAt": null
+            }
+        ]"#;
+
+        let dispatched = DashMap::new();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
+
+        assert_eq!(parsed.new_issues.len(), 1);
+        assert_eq!(parsed.new_issues[0].external_id, "10");
+        assert!(parsed.open_issue_ids.contains("10"));
+        assert!(!parsed.open_issue_ids.contains("11"));
     }
 
     #[test]
@@ -661,6 +738,27 @@ mod tests {
         assert_eq!(poller.name(), "github");
     }
 
+    #[test]
+    fn github_issues_poller_accepts_configured_token() {
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller =
+            GitHubIssuesPoller::new_with_token(&repo_cfg, None, Some(" configured ".to_string()));
+
+        assert_eq!(
+            crate::github_auth::resolve_github_token_from_sources(
+                poller.github_token.as_deref(),
+                Some("env-github"),
+                Some("env-gh"),
+            )
+            .as_deref(),
+            Some("configured")
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_prunes_missing_dispatched_tasks_but_keeps_skip_markers() {
         let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
@@ -720,5 +818,43 @@ mod tests {
 
         assert_eq!(pruned, 0);
         assert!(poller.dispatched.contains_key("1"));
+    }
+
+    // Surface 3 regression guard: the dispatched JSON file stores only
+    // {issue_id → task_id} pairs.  No workspace path must ever be written.
+    #[test]
+    fn surface3_dispatched_json_has_no_path_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: None,
+        };
+        let poller = GitHubIssuesPoller::new(&repo_cfg, Some(tmp.path()));
+        poller.dispatched.insert(
+            "42".to_string(),
+            harness_core::types::TaskId("task-abc123".to_string()),
+        );
+        poller.dispatched.insert(
+            "99".to_string(),
+            harness_core::types::TaskId("task-xyz456".to_string()),
+        );
+        poller.persist_dispatched();
+
+        let persist_path = tmp.path().join("github_dispatched_owner_repo.json");
+        let json = std::fs::read_to_string(&persist_path)
+            .expect("dispatched file should have been written");
+        assert!(
+            !json.contains("/workspaces/"),
+            "dispatched JSON must not contain workspace paths, got: {json}"
+        );
+        let map: HashMap<String, String> =
+            serde_json::from_str(&json).expect("dispatched JSON must parse");
+        assert_eq!(map.len(), 2, "both entries should be persisted");
+        assert!(
+            map.values()
+                .all(|v| !v.contains('/') || v.starts_with("skip-")),
+            "task IDs must not be filesystem paths"
+        );
     }
 }

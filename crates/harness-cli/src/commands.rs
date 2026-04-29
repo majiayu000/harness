@@ -2,6 +2,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod exec;
+mod reconcile;
 mod serve;
 
 #[derive(Parser)]
@@ -114,6 +115,17 @@ pub enum Command {
 
     /// Display the current version
     Version,
+
+    /// Reconcile harness task state against GitHub PR/issue state
+    Reconcile {
+        /// Report transitions without applying them
+        #[arg(long)]
+        dry_run: bool,
+        /// Deprecated: reconciliation uses each task's stored project root;
+        /// passing this flag returns an error.
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -301,6 +313,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // HARNESS_PROJECT_ROOT, etc. are respected by gc, rule check, and skill
     // commands — not just `serve`.
     config.apply_env_overrides()?;
+    harness_core::db::configure_pg_pool_from_server(&config.server);
 
     match cli.command {
         Command::Serve {
@@ -543,6 +556,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 anyhow::bail!("Version field not found in Cargo.toml");
             }
+        }
+
+        Command::Reconcile { dry_run, project } => {
+            reconcile::run(dry_run, project, &config).await?;
         }
     }
 

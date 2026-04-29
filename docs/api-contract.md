@@ -72,10 +72,14 @@ All three transports share the same method set. The following capabilities are
 | `turn/cancel` | Cancel an in-flight turn |
 | `turn/status` | Query turn status |
 | `turn/steer` | Append an instruction to a running turn |
+| `turn/respond_approval` | Submit a decision for a pending turn approval request |
 | `skill/create` | Register a skill |
 | `skill/list` | Query skills |
 | `skill/get` | Get skill details |
 | `skill/delete` | Remove a skill |
+| `skill/governance/view` | Inspect skill governance configuration |
+| `skill/governance/history` | Inspect skill governance history |
+| `skill/stale` | List stale skills that need review |
 | `rule/load` | Load project rules |
 | `rule/check` | Check files against rules |
 | `exec_plan/init` | Initialise an execution plan |

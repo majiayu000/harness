@@ -322,8 +322,9 @@ async fn run_sequential_subtasks(
 
     // One shared workspace for all sequential steps — step N sees step N-1 outputs.
     let seq_id = harness_core::types::TaskId(format!("{}-seq", task_id.0));
+    // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
     let workspace = match workspace_mgr
-        .create_workspace(&seq_id, source_repo, remote, base_branch, 1)
+        .create_workspace(&seq_id, source_repo, remote, base_branch, 1, None, None)
         .await
     {
         Ok(lease) => lease.workspace_path,
@@ -455,8 +456,9 @@ async fn run_concurrent_subtasks(
 
     for (i, spec) in subtasks.into_iter().enumerate() {
         let sub_id = harness_core::types::TaskId(format!("{}-p{i}", task_id.0));
+        // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
         match workspace_mgr
-            .create_workspace(&sub_id, source_repo, remote, base_branch, 1)
+            .create_workspace(&sub_id, source_repo, remote, base_branch, 1, None, None)
             .await
         {
             Ok(lease) => {

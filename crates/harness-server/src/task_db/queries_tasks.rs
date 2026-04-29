@@ -735,7 +735,8 @@ impl TaskDb {
         let sql = if project.is_some() {
             format!(
                 "SELECT {TASK_ROW_COLUMNS} FROM tasks \
-                 WHERE status IN ('implementing', 'review_generating', 'review_waiting', \
+                 WHERE status IN ('triaging', 'planning', 'implementing', \
+                                  'review_generating', 'review_waiting', \
                                   'planner_generating', 'planner_waiting', 'agent_review', \
                                   'waiting', 'reviewing') \
                  AND external_id IS NOT NULL \
@@ -745,7 +746,8 @@ impl TaskDb {
         } else {
             format!(
                 "SELECT {TASK_ROW_COLUMNS} FROM tasks \
-                 WHERE status IN ('implementing', 'review_generating', 'review_waiting', \
+                 WHERE status IN ('triaging', 'planning', 'implementing', \
+                                  'review_generating', 'review_waiting', \
                                   'planner_generating', 'planner_waiting', 'agent_review', \
                                   'waiting', 'reviewing') \
                  AND external_id IS NOT NULL \
@@ -785,5 +787,24 @@ impl TaskDb {
     #[cfg(test)]
     pub(crate) fn pool_for_test(&self) -> &sqlx::PgPool {
         &self.pool
+    }
+
+    /// Overwrite the `rounds` column with arbitrary raw text.
+    ///
+    /// Used by integration tests to simulate a corrupted DB payload without going
+    /// through the normal serialization path. The name suffix `_for_test` signals
+    /// that production code must never call this.
+    #[doc(hidden)]
+    pub async fn overwrite_rounds_for_test(
+        &self,
+        task_id: &str,
+        raw_rounds: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET rounds = $1 WHERE id = $2")
+            .bind(raw_rounds)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }

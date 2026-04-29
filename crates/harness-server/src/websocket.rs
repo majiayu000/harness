@@ -314,6 +314,7 @@ mod tests {
             vec![],
             None,
             Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
             None,
             None,
             None,
@@ -375,6 +376,7 @@ mod tests {
                 ws_shutdown_tx,
             },
             interceptors: vec![],
+            startup_statuses: vec![],
             degraded_subsystems: vec![],
             intake: crate::http::IntakeServices {
                 feishu_intake: None,

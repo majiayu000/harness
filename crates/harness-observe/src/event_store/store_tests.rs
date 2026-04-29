@@ -1,7 +1,7 @@
 use super::*;
 use harness_core::{
     config::misc::OtelExporter,
-    db::pg_open_pool,
+    db::{pg_open_pool, resolve_database_url},
     types::{
         AutoFixAttempt, EventMetadata, RuleId, TaskId, TurnFailure, TurnFailureKind, TurnTelemetry,
     },
@@ -24,13 +24,13 @@ fn db_semaphore() -> Arc<tokio::sync::Semaphore> {
 }
 
 async fn db_tests_enabled() -> bool {
-    if std::env::var("DATABASE_URL").is_err() {
+    if resolve_database_url(None).is_err() {
         return false;
     }
 
     *DB_AVAILABLE
         .get_or_init(|| async {
-            let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            let Ok(database_url) = resolve_database_url(None) else {
                 return false;
             };
             match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {
@@ -44,9 +44,19 @@ async fn db_tests_enabled() -> bool {
         .await
 }
 
-fn is_pool_timeout(err: &anyhow::Error) -> bool {
-    err.to_string()
-        .contains("pool timed out while waiting for an open connection")
+fn is_db_unavailable(err: &anyhow::Error) -> bool {
+    let msg = format!("{:#}", err);
+    // SQLx pool exhausted locally
+    msg.contains("pool timed out while waiting for an open connection")
+        // Supabase session pooler cap (EMAXCONNSESSION)
+        || msg.contains("EMAXCONNSESSION")
+        // SSL handshake failure (DB unreachable or in maintenance)
+        || msg.contains("SSLRequest")
+        // Postgres admin terminated the connection (maintenance / pool reset)
+        || msg.contains("terminating connection due to administrator command")
+    // Note: "Connection refused" is intentionally excluded — it is too generic
+    // and also matches OTEL endpoint failures, which would mask regressions in
+    // log_with_unreachable_otel_endpoint_still_persists_event.
 }
 
 struct TestStore {
@@ -80,7 +90,7 @@ async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
             inner,
             _permit: permit,
         })),
-        Err(err) if is_pool_timeout(&err) => Ok(None),
+        Err(err) if is_db_unavailable(&err) => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -662,7 +672,7 @@ async fn log_with_unreachable_otel_endpoint_still_persists_event() -> anyhow::Re
         .expect("semaphore never closed");
     let store = match EventStore::with_policies_and_otel(dir.path(), 1800, 90, &config).await {
         Ok(store) => store,
-        Err(err) if is_pool_timeout(&err) => return Ok(()),
+        Err(err) if is_db_unavailable(&err) => return Ok(()),
         Err(err) => return Err(err),
     };
     assert!(store.otel_pipeline_is_none());

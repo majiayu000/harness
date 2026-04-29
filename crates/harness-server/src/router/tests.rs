@@ -7,7 +7,7 @@ use crate::{
 };
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
-use harness_protocol::{methods::Method, methods::RpcRequest, methods::INTERNAL_ERROR};
+use harness_protocol::{methods::Method, methods::RpcRequest, methods::VALIDATION_ERROR};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -57,6 +57,7 @@ async fn make_test_state_with_config_and_registry(
         events.clone(),
         vec![],
         None,
+        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         None,
         None,
@@ -119,6 +120,7 @@ async fn make_test_state_with_config_and_registry(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake: None,
@@ -363,11 +365,14 @@ async fn wait_for_terminal_task(
     state: &AppState,
     task_id: &str,
 ) -> anyhow::Result<crate::task_runner::TaskState> {
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{sleep, Duration, Instant};
 
     let tid = harness_core::types::TaskId(task_id.to_string());
-    for _ in 0..120 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_status = None;
+    loop {
         if let Some(task) = state.core.tasks.get(&tid) {
+            last_status = Some(format!("{:?}", task.status));
             if matches!(
                 task.status,
                 crate::task_runner::TaskStatus::Done | crate::task_runner::TaskStatus::Failed
@@ -375,9 +380,12 @@ async fn wait_for_terminal_task(
                 return Ok(task);
             }
         }
+        if Instant::now() >= deadline {
+            break;
+        }
         sleep(Duration::from_millis(25)).await;
     }
-    anyhow::bail!("task did not reach terminal state in time");
+    anyhow::bail!("task did not reach terminal state in time; last_status={last_status:?}");
 }
 
 async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Result<u32> {
@@ -562,7 +570,7 @@ async fn rule_check_returns_warning_when_no_guards_loaded() -> anyhow::Result<()
         .error
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("expected warning error response"))?;
-    assert_eq!(error.code, INTERNAL_ERROR);
+    assert_eq!(error.code, VALIDATION_ERROR);
     assert!(
         error
             .message
@@ -1388,6 +1396,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         vec![],
         None,
         Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
+        Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
         None,
         None,
         None,
@@ -1449,6 +1458,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake: None,

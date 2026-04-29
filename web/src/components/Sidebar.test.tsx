@@ -52,4 +52,23 @@ describe("<Sidebar>", () => {
     fireEvent.click(screen.getByText("History"));
     expect(onItemClick).toHaveBeenCalledWith("history");
   });
+
+  it("renders absolute hrefs as external links", () => {
+    const sections: SidebarSection[] = [
+      {
+        label: "Reference",
+        items: [{ id: "docs", label: "Docs", href: "https://example.com/docs" }],
+      },
+    ];
+    render(
+      <MemoryRouter>
+        <Sidebar env="local" sections={sections} />
+      </MemoryRouter>,
+    );
+
+    const link = screen.getByRole("link", { name: "Docs" });
+    expect(link).toHaveAttribute("href", "https://example.com/docs");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noreferrer");
+  });
 });

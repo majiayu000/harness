@@ -94,15 +94,17 @@ async fn run_plan_for_prompt_keeps_prompt_only_plan_text_out_of_rounds_and_event
         prompt: Some("secret prompt".to_string()),
         ..Default::default()
     };
+    let skills = RwLock::new(harness_skills::store::SkillStore::new());
 
     let (plan, complexity, turns) = run_plan_for_prompt(
         &PromptPlanningAgent,
         &store,
         &task_id,
-        &events,
         &HashMap::new(),
         dir.path(),
         &req,
+        &skills,
+        &events,
     )
     .await
     .expect("prompt plan should succeed");
@@ -150,15 +152,17 @@ async fn run_plan_for_prompt_redacts_failure_metadata_before_persisting() {
         prompt: Some("secret prompt".to_string()),
         ..Default::default()
     };
+    let skills = RwLock::new(harness_skills::store::SkillStore::new());
 
     let err = run_plan_for_prompt(
         &FailingPromptPlanningAgent,
         &store,
         &task_id,
-        &events,
         &HashMap::new(),
         dir.path(),
         &req,
+        &skills,
+        &events,
     )
     .await
     .expect_err("prompt plan should fail");

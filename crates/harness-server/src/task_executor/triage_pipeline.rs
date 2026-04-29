@@ -1,5 +1,6 @@
 use super::helpers::{
-    build_task_event, run_agent_streaming, run_agent_streaming_with_options, telemetry_for_timeout,
+    augment_prompt_with_skills, build_task_event, run_agent_streaming,
+    run_agent_streaming_with_options, telemetry_for_timeout, update_status,
     RunAgentStreamingOptions,
 };
 use crate::task_runner::{
@@ -12,7 +13,7 @@ use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnFailureKind
 use harness_observe::event_store::EventStore;
 use std::collections::HashMap;
 use std::path::Path;
-use tokio::time::Duration;
+use tokio::sync::RwLock;
 
 async fn record_phase_observability(
     store: &TaskStore,
@@ -103,10 +104,11 @@ pub(crate) async fn run_plan_for_prompt(
     agent: &dyn CodeAgent,
     store: &TaskStore,
     task_id: &TaskId,
-    events: &EventStore,
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
 ) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
     let prompt_text = req.prompt.as_deref().unwrap_or_default();
     tracing::info!(task_id = %task_id, "pipeline: starting plan phase for prompt-only task");
@@ -117,6 +119,7 @@ pub(crate) async fn run_plan_for_prompt(
     .await?;
 
     let plan_prompt = prompts::plan_for_prompt_task(prompt_text);
+    let plan_prompt = augment_prompt_with_skills(skills, events, task_id, plan_prompt).await;
     let prompt_built_at = Utc::now();
     let agent_started_at = Utc::now();
 
@@ -232,29 +235,45 @@ pub(crate) async fn run_plan_for_prompt(
     Ok((Some(plan_text), prompts::TriageComplexity::Medium, 1))
 }
 
+/// Result of the triage and optional plan pipeline.
+pub(crate) enum TriagePlanPipelineOutcome {
+    /// Triage chose to continue into implementation, optionally with a plan.
+    Continue {
+        plan_output: Option<String>,
+        complexity: prompts::TriageComplexity,
+        turns: u32,
+    },
+    /// Triage intentionally skipped the issue. The task has already been marked
+    /// as a successful terminal state and must not continue into implementation.
+    Skipped,
+}
+
 /// Run triage → plan pipeline for a fresh issue-based task.
 ///
-/// Returns `Some(plan_text)` if the triage decided a plan is needed and the plan
-/// phase completed. Returns `None` only when triage says PROCEED (trivial issue,
-/// skip planning). All failures propagate as errors — no silent fallbacks.
+/// Returns `Continue` if the triage decided implementation should proceed.
+/// Returns `Skipped` when triage says SKIP. Agent and parsing failures still
+/// propagate as errors.
 pub(crate) async fn run_triage_plan_pipeline(
     agent: &dyn CodeAgent,
     store: &TaskStore,
     task_id: &TaskId,
     issue: u64,
-    events: &EventStore,
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
-) -> anyhow::Result<(Option<String>, prompts::TriageComplexity, u32)> {
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
+) -> anyhow::Result<TriagePlanPipelineOutcome> {
     // --- Phase 1: Triage ---
     tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
     mutate_and_persist(store, task_id, |state| {
         state.phase = TaskPhase::Triage;
     })
     .await?;
+    update_status(store, task_id, TaskStatus::Triaging, 0).await?;
 
     let triage_prompt = prompts::triage_prompt(issue).to_prompt_string();
+    let triage_prompt = augment_prompt_with_skills(skills, events, task_id, triage_prompt).await;
     let triage_prompt_built_at = Utc::now();
     let triage_started_at = Utc::now();
     let triage_req = AgentRequest {
@@ -404,10 +423,12 @@ pub(crate) async fn run_triage_plan_pipeline(
             mutate_and_persist(store, task_id, |state| {
                 state.status = TaskStatus::Done;
                 state.phase = TaskPhase::Terminal;
-                state.error = Some("Triage: skipped — not worth implementing".to_string());
+                state.error = Some(format!(
+                    "Triage skipped issue #{issue}: not worth implementing"
+                ));
             })
             .await?;
-            anyhow::bail!("triage decided to skip issue #{issue}");
+            return Ok(TriagePlanPipelineOutcome::Skipped);
         }
         prompts::TriageDecision::NeedsClarification => {
             // Treat as ProceedWithPlan — let the planner figure out ambiguities
@@ -416,7 +437,11 @@ pub(crate) async fn run_triage_plan_pipeline(
         }
         prompts::TriageDecision::Proceed => {
             tracing::info!(task_id = %task_id, "triage: PROCEED — skipping plan phase");
-            return Ok((None, complexity, 1));
+            return Ok(TriagePlanPipelineOutcome::Continue {
+                plan_output: None,
+                complexity,
+                turns: 1,
+            });
         }
         prompts::TriageDecision::ProceedWithPlan => {
             // Fall through to plan phase.
@@ -429,8 +454,10 @@ pub(crate) async fn run_triage_plan_pipeline(
         state.phase = TaskPhase::Plan;
     })
     .await?;
+    update_status(store, task_id, TaskStatus::Planning, 0).await?;
 
     let plan_prompt = prompts::plan_prompt(issue, &triage_resp.output).to_prompt_string();
+    let plan_prompt = augment_prompt_with_skills(skills, events, task_id, plan_prompt).await;
     let plan_prompt_built_at = Utc::now();
     let plan_started_at = Utc::now();
     let plan_req = AgentRequest {
@@ -537,7 +564,11 @@ pub(crate) async fn run_triage_plan_pipeline(
     }
 
     tracing::info!(task_id = %task_id, plan_len = plan_text.len(), "plan phase complete");
-    Ok((Some(plan_text), complexity, 2))
+    Ok(TriagePlanPipelineOutcome::Continue {
+        plan_output: Some(plan_text),
+        complexity,
+        turns: 2,
+    })
 }
 
 /// Run a repair-plan step after an implementation attempt emitted `PLAN_ISSUE=...`.
@@ -554,6 +585,8 @@ pub(crate) async fn run_replan_for_issue(
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
 ) -> anyhow::Result<String> {
     tracing::info!(task_id = %task_id, issue, "pipeline: starting replan phase");
     mutate_and_persist(store, task_id, |state| {
@@ -562,6 +595,7 @@ pub(crate) async fn run_replan_for_issue(
     .await?;
 
     let prompt = prompts::replan_prompt(issue, prior_plan, plan_issue).to_prompt_string();
+    let prompt = augment_prompt_with_skills(skills, events, task_id, prompt).await;
     let plan_req = AgentRequest {
         prompt,
         project_root: project.to_path_buf(),
@@ -601,102 +635,115 @@ pub(crate) async fn run_replan_for_issue(
     Ok(plan_text)
 }
 
-/// Fire a single agent turn to rebase a conflicting PR onto `origin/main`.
-///
-/// Returns `true` if the agent reported `REBASE_OK` (i.e. a new commit was
-/// force-pushed), `false` in every other case.  Errors are not propagated —
-/// a rebase failure is not fatal; the review loop will handle the PR.
-pub(crate) async fn run_rebase_turn(
-    agent: &dyn CodeAgent,
-    pr_num: u64,
-    project: &std::path::Path,
-    repo: &str,
-    turn_timeout: Duration,
-    cargo_env: &HashMap<String, String>,
-) -> bool {
-    // Fetch the branch name from GitHub so the prompt has an exact ref.
-    let branch = {
-        let out = tokio::process::Command::new("gh")
-            .current_dir(project)
-            .args([
-                "pr",
-                "view",
-                &pr_num.to_string(),
-                "--json",
-                "headRefName",
-                "--jq",
-                ".headRefName",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await;
-        match out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .trim_matches('"')
-                .to_string(),
-            _ => {
-                tracing::warn!(
-                    pr = pr_num,
-                    "run_rebase_turn: could not fetch branch name; skipping"
-                );
-                return false;
-            }
-        }
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use harness_core::agent::{AgentResponse, StreamItem};
+    use harness_core::types::{Capability, TokenUsage};
 
-    // Reject branch names that contain shell metacharacters.  The branch
-    // name is embedded inside single-quoted shell commands in the agent
-    // prompt; a single-quote in the name would break out of the quoting.
-    if !branch
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '@' | '~' | '+' | ':'))
-    {
-        tracing::warn!(
-            pr = pr_num,
-            branch = %branch,
-            "run_rebase_turn: branch name contains unsafe characters; skipping"
-        );
-        return false;
+    struct StaticStreamAgent {
+        output: String,
     }
 
-    let prompt = harness_core::prompts::rebase_conflicting_pr(pr_num, &branch, repo, project);
-    let req = AgentRequest {
-        prompt,
-        project_root: project.to_path_buf(),
-        env_vars: cargo_env.clone(),
-        execution_phase: Some(harness_core::types::ExecutionPhase::Rebase),
-        ..Default::default()
-    };
-
-    match tokio::time::timeout(turn_timeout, agent.execute(req)).await {
-        Ok(Ok(resp)) => {
-            let last = resp.output.lines().next_back().unwrap_or("").trim();
-            if last.contains("REBASE_OK") {
-                tracing::info!(pr = pr_num, "rebase turn: REBASE_OK");
-                true
-            } else {
-                tracing::warn!(
-                    pr = pr_num,
-                    last_line = last,
-                    "rebase turn: REBASE_FAILED or unexpected output"
-                );
-                false
+    impl StaticStreamAgent {
+        fn new(output: &str) -> Self {
+            Self {
+                output: output.to_string(),
             }
         }
-        Ok(Err(e)) => {
-            tracing::warn!(pr = pr_num, error = %e, "rebase turn: agent error");
-            false
+    }
+
+    #[async_trait]
+    impl CodeAgent for StaticStreamAgent {
+        fn name(&self) -> &str {
+            "static-stream-agent"
         }
-        Err(_) => {
-            tracing::warn!(pr = pr_num, "rebase turn: timed out");
-            false
+
+        fn capabilities(&self) -> Vec<Capability> {
+            Vec::new()
         }
+
+        async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+            Ok(AgentResponse {
+                output: self.output.clone(),
+                stderr: String::new(),
+                items: Vec::new(),
+                token_usage: TokenUsage::default(),
+                model: "test".to_string(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::error::Result<()> {
+            tx.send(StreamItem::MessageDelta {
+                text: self.output.clone(),
+            })
+            .await
+            .map_err(|e| harness_core::error::HarnessError::AgentExecution(e.to_string()))?;
+            tx.send(StreamItem::Done)
+                .await
+                .map_err(|e| harness_core::error::HarnessError::AgentExecution(e.to_string()))?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn triage_skip_returns_successful_terminal_outcome() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
+        let task_id = TaskId::new();
+        let mut state = crate::task_runner::TaskState::new(task_id.clone());
+        state.task_kind = crate::task_runner::TaskKind::Issue;
+        store.insert(&state).await;
+
+        let agent = StaticStreamAgent::new("Not actionable.\nCOMPLEXITY=low\nTRIAGE=SKIP");
+        let req = CreateTaskRequest {
+            issue: Some(123),
+            turn_timeout_secs: 30,
+            ..CreateTaskRequest::default()
+        };
+        let skills = RwLock::new(harness_skills::store::SkillStore::new());
+        let events = EventStore::new_noop_for_tests();
+
+        let outcome = run_triage_plan_pipeline(
+            &agent,
+            &store,
+            &task_id,
+            123,
+            &HashMap::new(),
+            dir.path(),
+            &req,
+            &skills,
+            &events,
+        )
+        .await?;
+
+        assert!(matches!(outcome, TriagePlanPipelineOutcome::Skipped));
+        let final_state = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task must exist"))?;
+        assert_eq!(final_state.status, TaskStatus::Done);
+        assert_eq!(final_state.phase, TaskPhase::Terminal);
+        assert!(final_state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Triage skipped issue #123")));
+        assert_eq!(
+            final_state.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Done
+        );
+        Ok(())
     }
 }
 
 #[cfg(test)]
 #[path = "triage_pipeline_tests.rs"]
-mod tests;
+mod triage_pipeline_tests;

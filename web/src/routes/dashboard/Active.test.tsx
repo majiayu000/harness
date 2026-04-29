@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { render, screen, within, fireEvent } from "@testing-library/react";
+import { render, screen, within, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Active } from "./Active";
 import type { Task } from "@/types";
@@ -28,10 +28,16 @@ vi.mock("@/components/TaskDetailSlideover", () => ({
   },
 }));
 
+vi.mock("@/lib/api", () => ({
+  apiFetch: vi.fn(() => Promise.resolve(undefined)),
+}));
+
 import { useTasks, useDashboard } from "@/lib/queries";
+import { apiFetch } from "@/lib/api";
 
 const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
 const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
+const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 
 function makeTask(id: string, project: string | null, status = "running", task_kind = "issue"): Task {
   return {
@@ -79,6 +85,7 @@ const tasks = [
 
 describe("<Active>", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     mockUseDashboard.mockReturnValue({ data: undefined });
   });
 
@@ -129,12 +136,33 @@ describe("<Active>", () => {
     expect(columnCount("Pending")).toBe("0");
   });
 
+  it("keeps ready-to-merge terminal tasks visible and mergeable", async () => {
+    const ready = {
+      ...makeTask("ready-task", "harness", "done"),
+      pr_url: "https://github.com/owner/repo/pull/123",
+      workflow: { state: "ready_to_merge", pr_number: 123 },
+    };
+    mockUseTasks.mockReturnValue({ data: [ready], isLoading: false, isError: false });
+
+    wrap(<Active projectFilter="harness" />);
+
+    expect(screen.getByText("wf Ready To Merge")).toBeInTheDocument();
+    expect(columnCount("Ready")).toBe("1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith("/tasks/ready-task/merge", { method: "POST" });
+    });
+    expect(screen.queryByTestId("task-slideover")).not.toBeInTheDocument();
+  });
+
   it("groups planner and review lifecycle statuses outside implementing", () => {
     mockUseTasks.mockReturnValue({
       data: [
         makeTask("planner-task", "harness", "planner_waiting", "planner"),
         makeTask("review-task", "harness", "review_generating", "review"),
-        makeTask("impl-task", "harness", "implementing", "issue"),
+        makeTask("impl-task", "harness", "triaging", "issue"),
       ],
       isLoading: false,
       isError: false,
@@ -147,11 +175,19 @@ describe("<Active>", () => {
     expect(screen.getByText("impl-task")).toBeInTheDocument();
   });
 
-  it("clicking a TaskCard opens the slide-over with that task's id", () => {
+  it("clicking a standard task card opens the slide-over with that task's id", () => {
     mockUseTasks.mockReturnValue({ data: [makeTask("t1", "proj")], isLoading: false, isError: false });
     wrap(<Active />);
     fireEvent.click(screen.getByText("t1"));
     expect(screen.getByTestId("task-slideover")).toHaveAttribute("data-task-id", "t1");
+  });
+
+  it("clicking a prompt task card opens the shared slide-over", () => {
+    const promptTask = makeTask("prompt-task", "proj", "planning", "prompt");
+    mockUseTasks.mockReturnValue({ data: [promptTask], isLoading: false, isError: false });
+    wrap(<Active />);
+    fireEvent.click(screen.getByText("prompt-task"));
+    expect(screen.getByTestId("task-slideover")).toHaveAttribute("data-task-id", "prompt-task");
   });
 
   it("calling onClose from the slide-over hides it", () => {

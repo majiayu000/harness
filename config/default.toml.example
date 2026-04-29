@@ -15,6 +15,10 @@
 transport = "http"
 http_addr = "127.0.0.1:9800"
 database_url = "postgres://harness:harness@localhost:5432/harness"
+# Harness opens separate Postgres pools per logical store. The default is
+# intentionally conservative; local Postgres can usually use a higher budget.
+# database_pool_max_connections = 8
+# database_pool_acquire_timeout_secs = 30
 # Absolute path required — the server does not expand `~`.
 # Default on Linux:  ~/.local/share/harness
 # Default on macOS:  ~/Library/Application Support/harness

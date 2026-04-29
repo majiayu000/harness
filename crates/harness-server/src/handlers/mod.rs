@@ -1,6 +1,7 @@
 pub mod classify;
 pub mod cross_review;
 pub mod dashboard;
+pub mod error;
 pub mod exec;
 pub mod gc;
 pub mod health;
@@ -10,6 +11,7 @@ pub mod operator_snapshot;
 pub mod overview;
 pub mod preflight;
 pub mod projects;
+pub mod reconcile;
 pub mod rules;
 pub mod runtime_hosts;
 pub mod runtime_project_cache;

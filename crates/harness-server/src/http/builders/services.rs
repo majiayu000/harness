@@ -35,6 +35,22 @@ pub(crate) async fn build_services(
     intake: &IntakeBundle,
     project_root: &Path,
 ) -> anyhow::Result<ServicesBundle> {
+    let tasks = storage
+        .tasks
+        .as_ref()
+        .expect("build_services requires a ready task store")
+        .clone();
+    let events = engines
+        .events
+        .as_ref()
+        .expect("build_services requires a ready event store")
+        .clone();
+    let project_registry = registry
+        .project_registry
+        .as_ref()
+        .expect("build_services requires a ready project registry")
+        .clone();
+
     // ── Interceptor stack ─────────────────────────────────────────────────────
     let hook_enforcement = server.config.rules.hook_enforcement;
     let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> = vec![
@@ -47,32 +63,36 @@ pub(crate) async fn build_services(
         // )),
         Arc::new(crate::hook_enforcer::HookEnforcer::new(
             engines.rules.clone(),
-            engines.events.clone(),
+            events.clone(),
             hook_enforcement,
         )),
-        Arc::new(crate::post_validator::PostExecutionValidator::new(
-            server.config.validation.clone(),
-        )),
+        Arc::new(
+            crate::post_validator::PostExecutionValidator::new_with_github_token(
+                server.config.validation.clone(),
+                server.config.server.github_token.clone(),
+            ),
+        ),
     ];
 
     // ── Service layer ─────────────────────────────────────────────────────────
     let project_svc = crate::services::project::DefaultProjectService::new(
-        registry.project_registry.clone(),
+        project_registry.clone(),
         project_root.to_path_buf(),
     );
-    let task_svc = crate::services::task::DefaultTaskService::new(storage.tasks.clone());
+    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
-        storage.tasks.clone(),
+        tasks.clone(),
         server.agent_registry.clone(),
         Arc::new(server.config.clone()),
         engines.skills.clone(),
-        engines.events.clone(),
+        events.clone(),
         interceptors.clone(),
         registry.workspace_mgr.clone(),
         intake.task_queue.clone(),
+        intake.review_task_queue.clone(),
         intake.completion_callback.clone(),
         registry.issue_workflow_store.clone(),
-        Some(registry.project_registry.clone()),
+        Some(project_registry.clone()),
         server.config.server.allowed_project_roots.clone(),
     );
 
@@ -131,11 +151,12 @@ pub(crate) async fn build_services(
     // The completion callback is passed so that tasks marked Failed (closed PR)
     // trigger intake cleanup (e.g. removing the issue from the dispatched map).
     {
-        let tasks_for_recovery = storage.tasks.clone();
+        let tasks_for_recovery = tasks.clone();
         let cb_for_recovery = intake.completion_callback.clone();
+        let github_token = server.config.server.github_token.clone();
         tokio::spawn(async move {
             tasks_for_recovery
-                .validate_recovered_tasks(cb_for_recovery)
+                .validate_recovered_tasks_with_token(cb_for_recovery, github_token.as_deref())
                 .await;
         });
     }
@@ -178,10 +199,14 @@ mod tests {
         let engines = crate::http::builders::engines::build_engines(&server, dir, dir)
             .await
             .expect("engines");
-        let registry =
-            crate::http::builders::registry::build_registry(&server, dir, dir, &storage.tasks)
-                .await
-                .expect("registry");
+        let registry = crate::http::builders::registry::build_registry(
+            &server,
+            dir,
+            dir,
+            storage.tasks.as_ref().expect("tasks store"),
+        )
+        .await
+        .expect("registry");
         let intake = crate::http::builders::intake::build_intake(
             &server, &storage, &engines, &registry, dir, dir,
         )

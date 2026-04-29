@@ -1,6 +1,6 @@
 use super::helpers::{
-    build_task_event, run_agent_streaming, run_on_error, run_post_execute, run_pre_execute,
-    telemetry_for_timeout, update_status,
+    augment_prompt_with_skills, build_task_event, run_agent_streaming, run_on_error,
+    run_post_execute, run_pre_execute, telemetry_for_timeout, update_status,
 };
 use crate::task_runner::{mutate_and_persist, RoundResult, TaskId, TaskStatus, TaskStore};
 use chrono::Utc;
@@ -12,6 +12,7 @@ use harness_observe::event_store::EventStore;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::time::Duration;
 
 /// Compute Jaccard word-similarity between two strings.
@@ -64,6 +65,7 @@ pub(crate) async fn run_agent_review(
     pr_url: &str,
     project_type: &str,
     events: &EventStore,
+    skills: &RwLock<harness_skills::store::SkillStore>,
     cargo_env: &HashMap<String, String>,
     effective_max_turns: Option<u32>,
     turns_used: &mut u32,
@@ -78,14 +80,11 @@ pub(crate) async fn run_agent_review(
 
         // Reviewer evaluates the PR diff — read-only except Bash for `gh pr diff`.
         let review_prompt_built_at = Utc::now();
+        let base = prompts::agent_review_prompt(pr_url, agent_round, project_type);
+        let note = prompts::agent_review_capability_note();
+        let augmented_base = augment_prompt_with_skills(skills, events, task_id, base).await;
         let review_req = AgentRequest {
-            prompt: {
-                let base = prompts::agent_review_prompt(pr_url, agent_round, project_type);
-                // Inject capability note — primary enforcement now that --allowedTools
-                // is not passed to the CLI (issue #483).
-                let note = prompts::agent_review_capability_note();
-                format!("{note}\n\n{base}")
-            },
+            prompt: format!("{note}\n\n{augmented_base}"),
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::SimpleReview),

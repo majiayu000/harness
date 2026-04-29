@@ -1,5 +1,11 @@
 # Harness Usage Guide
 
+## Prerequisites
+
+- Rust 1.88+
+- Bun 1.1+ for `cargo build --release` when `web/dist` has not already been built
+- At least one configured agent runtime, such as Codex CLI, Claude CLI, or the direct Anthropic adapter
+
 ## Installation
 
 ```bash
@@ -139,8 +145,11 @@ curl -X POST http://127.0.0.1:9800/tasks \
 Response:
 
 ```json
-{ "status": "running", "task_id": "a1b2c3d4-..." }
+{ "status": "queued", "task_id": "a1b2c3d4-..." }
 ```
+
+The task is accepted immediately and registered as pending work. Use
+`GET /tasks/{task_id}` to observe when execution actually starts.
 
 ### By GitHub Issue
 
@@ -186,7 +195,7 @@ Response:
 
 ```json
 [
-  { "task_id": "...", "status": "running" },
+  { "task_id": "...", "status": "queued" },
   { "task_id": "...", "status": "queued" },
   { "task_id": "...", "status": "queued" },
   { "task_id": "...", "status": "queued" }
@@ -260,7 +269,7 @@ curl http://127.0.0.1:9800/health
 ### List Projects
 
 ```bash
-curl http://127.0.0.1:9800/api/projects
+curl http://127.0.0.1:9800/projects
 ```
 
 ### Register a Project at Runtime
@@ -268,7 +277,7 @@ curl http://127.0.0.1:9800/api/projects
 No server restart needed:
 
 ```bash
-curl -X POST http://127.0.0.1:9800/api/projects \
+curl -X POST http://127.0.0.1:9800/projects \
   -H "Content-Type: application/json" \
   -d '{
     "id": "new-project",
@@ -282,7 +291,7 @@ curl -X POST http://127.0.0.1:9800/api/projects \
 ### Remove a Project
 
 ```bash
-curl -X DELETE http://127.0.0.1:9800/api/projects/new-project
+curl -X DELETE http://127.0.0.1:9800/projects/new-project
 ```
 
 ## Configuration Reference
@@ -293,7 +302,7 @@ curl -X DELETE http://127.0.0.1:9800/api/projects/new-project
 |-------|---------|-------------|
 | `transport` | `"stdio"` | Transport protocol: `stdio`, `http`, or `web_socket` |
 | `http_addr` | `"127.0.0.1:9800"` | HTTP listen address |
-| `data_dir` | `"~/.local/share/harness"` | Data directory for SQLite databases |
+| `data_dir` | `"~/.local/share/harness"` | Data directory for Harness server state and database metadata |
 | `project_root` | `"."` | Default project root (single-project mode) |
 | `github_webhook_secret` | — | HMAC-SHA256 secret for GitHub webhook verification |
 | `notification_broadcast_capacity` | `256` | Internal notification channel capacity |

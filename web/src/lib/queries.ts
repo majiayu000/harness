@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiJson, apiFetch } from "./api";
 import type { DashboardPayload, FullTask, OperatorSnapshotPayload, OverviewPayload, StreamItem, Task } from "@/types";
 
@@ -28,6 +28,8 @@ export function useOperatorSnapshot() {
 export function useTasks() {
   return useQuery<Task[], Error>({
     queryKey: ["tasks"],
+    // Task list/detail/stream routes are exposed at `/tasks`; only aggregate
+    // dashboard endpoints are mounted under `/api/*`.
     queryFn: ({ signal }) => apiJson<Task[]>("/tasks", { signal }),
   });
 }
@@ -106,6 +108,14 @@ export function useTaskStream(
   }, [id]);
 }
 
+export function useCancelTask() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => apiFetch(`/tasks/${id}/cancel`, { method: "POST" }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+  });
+}
+
 export interface WorktreeCard {
   taskId: string;
   pathShort: string;
@@ -116,6 +126,19 @@ export interface WorktreeCard {
   cpuPct: number | null;
   ramPct: number | null;
   diskBytes: number | null;
+}
+
+export async function registerProject(req: {
+  id: string;
+  root: string;
+  default_agent?: string;
+  max_concurrent?: number;
+}): Promise<void> {
+  await apiFetch("/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
 }
 
 export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; error: Error | null } {

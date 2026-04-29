@@ -14,10 +14,10 @@ use crate::circuit_breaker::CircuitBreaker;
 
 /// Post-tool-use hook enforcer.
 ///
-/// When `enabled`, this interceptor fires after each agent turn, detects files
-/// that were modified (via `git status --porcelain`), scans them with all
-/// registered guards, logs a `hook_enforcement` event to the [`EventStore`],
-/// and returns any violations as feedback for the agent's next turn prompt.
+/// When `enabled`, this interceptor fires after each agent turn, scans known
+/// modified files with all registered guards, logs a `hook_enforcement` event
+/// to the [`EventStore`], and returns any violations as feedback for the
+/// agent's next turn prompt.
 ///
 /// ## Infinite-loop protection (circuit breaker)
 ///
@@ -40,8 +40,12 @@ use crate::circuit_breaker::CircuitBreaker;
 /// - `enabled` is `false` (controlled by `rules.hook_enforcement` in config)
 /// - `CI` environment variable is set
 /// - no guards are registered
-/// - no files were modified during the turn
+/// - no affected files are supplied by telemetry
 /// - the circuit breaker is open (consecutive-block limit reached)
+///
+/// Important: host-side git inspection is intentionally disabled by project
+/// policy. Until agent/file-write telemetry supplies `affected_files`, this is
+/// not a complete closed-loop rule-enforcement mechanism.
 pub struct HookEnforcer {
     rules: Arc<RwLock<RuleEngine>>,
     events: Arc<EventStore>,
@@ -59,41 +63,16 @@ impl HookEnforcer {
         }
     }
 
-    /// Detect files added or modified in `project_root` using `git status --porcelain`.
+    /// Detect files added or modified in `project_root`.
     ///
-    /// Deleted files are excluded. Returns an empty list when git is unavailable
-    /// or `project_root` is not a git repository.
+    /// Host-side git inspection is disabled by project policy, so this returns
+    /// an empty list until file changes are supplied by agent telemetry.
     pub async fn detect_modified_files(project_root: &Path) -> Vec<PathBuf> {
-        let output = tokio::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(project_root)
-            .output()
-            .await;
-        match output {
-            Ok(out) => String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| {
-                    // git status --porcelain format: "XY filename" (at least 4 chars)
-                    let line = line.trim();
-                    if line.len() < 4 {
-                        return None;
-                    }
-                    // Skip deleted entries
-                    if line[..2].contains('D') {
-                        return None;
-                    }
-                    Some(PathBuf::from(line[3..].trim()))
-                })
-                .collect(),
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    project_root = %project_root.display(),
-                    "hook_enforcer: git status unavailable"
-                );
-                Vec::new()
-            }
-        }
+        tracing::debug!(
+            project_root = %project_root.display(),
+            "hook_enforcer: host-side git inspection disabled"
+        );
+        Vec::new()
     }
 
     /// Returns the circuit-breaker key for a session.

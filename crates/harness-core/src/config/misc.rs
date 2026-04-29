@@ -1,8 +1,8 @@
 use crate::types::Grade;
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::dirs::dirs_data_dir;
 
@@ -10,11 +10,16 @@ use super::dirs::dirs_data_dir;
 ///
 /// WorkspaceManager provisions an isolated git worktree per task,
 /// preventing merge conflicts when multiple agents edit the same project.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceConfig {
-    /// Root directory for all task worktrees. Default: `~/.local/share/harness/workspaces`.
+    /// Root directory for all task worktrees. Runtime default: `[server.data_dir]/workspaces`.
     #[serde(default = "default_workspace_root")]
     pub root: PathBuf,
+    /// Tracks whether `root` came from config so derived defaults do not rewrite
+    /// an explicit legacy root value.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub root_configured: bool,
     /// Shell script run after worktree creation (cwd = workspace). Fatal on failure.
     #[serde(default)]
     pub after_create_hook: Option<String>,
@@ -29,7 +34,7 @@ pub struct WorkspaceConfig {
     pub auto_cleanup: bool,
 }
 
-fn default_workspace_root() -> PathBuf {
+pub fn default_workspace_root() -> PathBuf {
     dirs_data_dir().join("harness").join("workspaces")
 }
 
@@ -45,10 +50,55 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             root: default_workspace_root(),
+            root_configured: false,
             after_create_hook: None,
             before_remove_hook: None,
             hook_timeout_secs: default_hook_timeout_secs(),
             auto_cleanup: default_auto_cleanup(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WorkspaceConfigToml {
+            #[serde(default)]
+            root: Option<PathBuf>,
+            #[serde(default)]
+            after_create_hook: Option<String>,
+            #[serde(default)]
+            before_remove_hook: Option<String>,
+            #[serde(default = "default_hook_timeout_secs")]
+            hook_timeout_secs: u64,
+            #[serde(default = "default_auto_cleanup")]
+            auto_cleanup: bool,
+        }
+
+        let toml = WorkspaceConfigToml::deserialize(deserializer)?;
+        let root_configured = toml.root.is_some();
+        Ok(Self {
+            root: toml.root.unwrap_or_else(default_workspace_root),
+            root_configured,
+            after_create_hook: toml.after_create_hook,
+            before_remove_hook: toml.before_remove_hook,
+            hook_timeout_secs: toml.hook_timeout_secs,
+            auto_cleanup: toml.auto_cleanup,
+        })
+    }
+}
+
+impl WorkspaceConfig {
+    pub fn root_for_data_dir(data_dir: &Path) -> PathBuf {
+        data_dir.join("workspaces")
+    }
+
+    pub fn use_data_dir_default_root(&mut self, data_dir: &Path) {
+        if !self.root_configured && self.root == default_workspace_root() {
+            self.root = Self::root_for_data_dir(data_dir);
         }
     }
 }
@@ -538,6 +588,46 @@ impl Default for RetrySchedulerConfig {
             stale_threshold_mins: default_retry_stale_threshold_mins(),
             cooldown_mins: default_retry_cooldown_mins(),
             max_retries: default_retry_max_retries(),
+        }
+    }
+}
+
+/// Configuration for the periodic GitHub ↔ Harness reconciliation loop.
+///
+/// The loop enumerates every non-terminal task that has a `pr_url` or an
+/// `external_id` like `issue:N` / `pr:N`, fetches the current GitHub state
+/// via `gh`, and applies the appropriate task-status transition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationConfig {
+    /// Whether the reconciliation loop is enabled. Default: true.
+    #[serde(default = "default_reconciliation_enabled")]
+    pub enabled: bool,
+    /// Seconds between reconciliation ticks. Default: 300 (5 minutes).
+    #[serde(default = "default_reconciliation_interval_secs")]
+    pub interval_secs: u64,
+    /// Maximum `gh` CLI calls per minute across all candidates. Default: 20.
+    #[serde(default = "default_reconciliation_max_gh_calls_per_minute")]
+    pub max_gh_calls_per_minute: u32,
+}
+
+fn default_reconciliation_enabled() -> bool {
+    true
+}
+
+fn default_reconciliation_interval_secs() -> u64 {
+    300
+}
+
+fn default_reconciliation_max_gh_calls_per_minute() -> u32 {
+    20
+}
+
+impl Default for ReconciliationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reconciliation_enabled(),
+            interval_secs: default_reconciliation_interval_secs(),
+            max_gh_calls_per_minute: default_reconciliation_max_gh_calls_per_minute(),
         }
     }
 }

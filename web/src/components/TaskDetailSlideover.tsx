@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useTaskDetail, useTaskStream } from "@/lib/queries";
 import { apiJson } from "@/lib/api";
-import type { FullTask } from "@/types";
+import { isTerminal } from "@/types/task";
+import { ProofOfWorkCard } from "./ProofOfWorkCard";
+import type { FullTask, TaskArtifact, TaskPrompt } from "@/types";
 
 type Tab = "summary" | "output" | "prompts" | "artifacts";
 
@@ -38,16 +40,18 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
 
   const { data: task, isLoading, isError } = useTaskDetail(taskId);
 
+  const isTaskTerminal = task ? isTerminal(task.status) : false;
+
   const { data: artifacts, isError: isArtifactsError } = useQuery({
     queryKey: ["task-artifacts", taskId],
-    queryFn: ({ signal }) => apiJson<unknown[]>(`/tasks/${taskId}/artifacts`, { signal }),
-    enabled: !!taskId && activeTab === "artifacts",
+    queryFn: ({ signal }) => apiJson<TaskArtifact[]>(`/tasks/${taskId}/artifacts`, { signal }),
+    enabled: !!taskId && (activeTab === "artifacts" || isTaskTerminal),
   });
 
   const { data: prompts, isError: isPromptsError } = useQuery({
     queryKey: ["task-prompts", taskId],
-    queryFn: ({ signal }) => apiJson<unknown[]>(`/tasks/${taskId}/prompts`, { signal }),
-    enabled: !!taskId && activeTab === "prompts",
+    queryFn: ({ signal }) => apiJson<TaskPrompt[]>(`/tasks/${taskId}/prompts`, { signal }),
+    enabled: !!taskId && (activeTab === "prompts" || isTaskTerminal),
   });
 
   useEffect(() => {
@@ -122,7 +126,16 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
             </div>
           )}
           {!isLoading && !isError && activeTab === "summary" && task && (
-            <SummaryContent task={task} />
+            <>
+              <SummaryContent task={task} />
+              {isTaskTerminal && (
+                <ProofOfWorkCard
+                  task={task}
+                  prompts={prompts}
+                  artifacts={artifacts}
+                />
+              )}
+            </>
           )}
           {activeTab === "output" && (
             <>
@@ -137,7 +150,7 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
             </>
           )}
           {activeTab === "prompts" && (
-            <RawJsonContent data={prompts} label="prompts" isError={isPromptsError} />
+            <PromptHistoryContent data={prompts} isError={isPromptsError} />
           )}
           {activeTab === "artifacts" && (
             <RawJsonContent data={artifacts} label="artifacts" isError={isArtifactsError} />
@@ -201,5 +214,60 @@ function RawJsonContent({ data, label, isError }: { data: unknown; label: string
     <pre className="font-mono text-[11px] text-ink whitespace-pre-wrap break-words">
       {JSON.stringify(data, null, 2)}
     </pre>
+  );
+}
+
+function PromptHistoryContent({
+  data,
+  isError,
+}: {
+  data: TaskPrompt[] | undefined;
+  isError?: boolean;
+}) {
+  if (isError) {
+    return (
+      <div className="font-mono text-[11px] text-rust" role="alert">
+        Failed to load prompts.
+      </div>
+    );
+  }
+
+  if (data === undefined) {
+    return <div className="font-mono text-[11px] text-ink-3">Loading prompts…</div>;
+  }
+
+  if (data.length === 0) {
+    return <div className="font-mono text-[11px] text-ink-3">No prompts recorded.</div>;
+  }
+
+  const prompts = [...data].sort((a, b) => {
+    if (a.created_at !== b.created_at) return a.created_at < b.created_at ? -1 : 1;
+    if (a.turn !== b.turn) return a.turn - b.turn;
+    return a.phase.localeCompare(b.phase);
+  });
+
+  return (
+    <div className="flex flex-col gap-3">
+      {prompts.map((prompt, index) => (
+        <section
+          key={`${prompt.task_id}-${prompt.turn}-${prompt.phase}-${prompt.created_at}-${index}`}
+          className="border border-line bg-bg-1"
+        >
+          <header className="border-b border-line px-3 py-2 font-mono text-[10px] text-ink-3">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="text-ink">{prompt.phase}</span>
+              <span>turn {prompt.turn}</span>
+              <span>{prompt.created_at}</span>
+            </div>
+          </header>
+          <pre
+            data-testid={`prompt-body-${index}`}
+            className="max-h-72 overflow-auto p-3 font-mono text-[11px] text-ink whitespace-pre-wrap break-words"
+          >
+            {prompt.prompt}
+          </pre>
+        </section>
+      ))}
+    </div>
   );
 }

@@ -11,13 +11,13 @@ use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnFailureKind};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{sleep, Duration, Instant};
 
-/// External state of a PR as observed via `gh`. Used to short-circuit the
+/// External state of a PR as observed via GitHub. Used to short-circuit the
 /// review loop when a PR has been merged or closed outside of this task so the
 /// loop does not keep invoking the reviewer agent against stale work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,64 +28,66 @@ enum PrExternalState {
     Unknown,
 }
 
-/// Query `gh pr view <pr> --json state,mergedAt` with a 10 s timeout and
-/// classify the result. Returns [`PrExternalState::Unknown`] on any transient
+#[derive(Debug, Deserialize)]
+struct GitHubPullState {
+    state: String,
+    merged_at: Option<String>,
+}
+
+/// Query the GitHub REST API with a 10 s timeout and classify the result.
+/// Returns [`PrExternalState::Unknown`] on any transient
 /// failure so callers do not abort a healthy review loop because of a flaky
 /// network call.
-async fn fetch_pr_external_state(pr_num: u64, project: &Path) -> PrExternalState {
-    // kill_on_drop(true) so the gh subprocess is reaped if the timeout
-    // future is dropped — without it, hung gh invocations (network/auth
-    // stalls) accumulate as orphaned children across repeated review
-    // rounds and degrade the server. Mirrors the pattern used by
-    // task_runner/store.rs::validate_recovered_tasks.
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        Command::new("gh")
-            .current_dir(project)
-            .args([
-                "pr",
-                "view",
-                &pr_num.to_string(),
-                "--json",
-                "state,mergedAt",
-                "--jq",
-                ".state + \"|\" + ((.mergedAt // \"\")|tostring)",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-    let output = match result {
-        Ok(Ok(o)) if o.status.success() => o,
-        Ok(Ok(o)) => {
-            tracing::debug!(pr = pr_num, exit = ?o.status.code(), "gh pr state check failed");
+async fn fetch_pr_external_state(
+    pr_num: u64,
+    project: &Path,
+    github_token: Option<&str>,
+) -> PrExternalState {
+    let Some(repo) = super::pr_detection::detect_repo_slug(project).await else {
+        tracing::debug!(
+            pr = pr_num,
+            "PR state check skipped because repository slug is unavailable"
+        );
+        return PrExternalState::Unknown;
+    };
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(format!(
+            "https://api.github.com/repos/{repo}/pulls/{pr_num}"
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server");
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
+    }
+    let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
+        Ok(Ok(response)) if response.status().is_success() => response,
+        Ok(Ok(response)) => {
+            tracing::debug!(pr = pr_num, status = %response.status(), "GitHub PR state check failed");
             return PrExternalState::Unknown;
         }
         Ok(Err(e)) => {
-            tracing::debug!(pr = pr_num, error = %e, "gh pr state check invocation error");
+            tracing::debug!(pr = pr_num, error = %e, "GitHub PR state check invocation error");
             return PrExternalState::Unknown;
         }
         Err(_) => {
-            tracing::debug!(pr = pr_num, "gh pr state check timed out after 10s");
+            tracing::debug!(pr = pr_num, "GitHub PR state check timed out after 10s");
             return PrExternalState::Unknown;
         }
     };
-    let raw = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .trim_matches('"')
-        .to_string();
-    let (state, merged_at) = raw.split_once('|').unwrap_or((raw.as_str(), ""));
-    match (state.trim(), merged_at.trim().is_empty()) {
-        ("OPEN", _) => PrExternalState::Open,
-        ("MERGED", _) => PrExternalState::Merged,
+    let Ok(state) = response.json::<GitHubPullState>().await else {
+        tracing::debug!(pr = pr_num, "GitHub PR state response was not parseable");
+        return PrExternalState::Unknown;
+    };
+    let merged_at_empty = state.merged_at.as_deref().unwrap_or("").trim().is_empty();
+    match (state.state.as_str(), merged_at_empty) {
+        ("open", _) => PrExternalState::Open,
+        ("merged", _) => PrExternalState::Merged,
         // GitHub occasionally reports merged PRs as CLOSED with a non-empty
         // `mergedAt`; treat that as a merge so we do not cancel a completed
         // task by mistake.
-        ("CLOSED", false) => PrExternalState::Merged,
-        ("CLOSED", true) => PrExternalState::Closed,
+        ("closed", false) => PrExternalState::Merged,
+        ("closed", true) => PrExternalState::Closed,
         _ => PrExternalState::Unknown,
     }
 }
@@ -101,6 +103,43 @@ fn issue_count_not_decreasing(counts: &[Option<u32>]) -> bool {
     }
     let tail = &counts[counts.len() - 3..];
     matches!(tail, [Some(a), Some(b), Some(c)] if c >= a && c >= b)
+}
+
+const QUOTA_EXHAUSTED_THRESHOLD: u32 = 3;
+const MAX_QUOTA_HEURISTIC_GRADUATIONS: u32 = 2;
+const QUOTA_HEURISTIC_ATTEMPT_RESULT: &str = "quota_heuristic_attempt";
+const NEEDS_MANUAL_REVIEW_RESULT: &str = "needs_manual_review";
+
+fn update_quota_exhausted_rounds(current: u32, waiting: bool, quota_exhausted: bool) -> u32 {
+    if quota_exhausted {
+        current.saturating_add(1)
+    } else if waiting {
+        current
+    } else {
+        0
+    }
+}
+
+fn quota_exhausted_streak(rounds: &[RoundResult]) -> u32 {
+    let mut streak = 0;
+    for round in rounds.iter().rev() {
+        if round.action != "review" {
+            continue;
+        }
+        if round.result == "quota_exhausted" {
+            streak += 1;
+        } else {
+            break;
+        }
+    }
+    streak
+}
+
+fn quota_heuristic_attempt_count(rounds: &[RoundResult]) -> u32 {
+    rounds
+        .iter()
+        .filter(|round| round.action == "review" && round.result == QUOTA_HEURISTIC_ATTEMPT_RESULT)
+        .count() as u32
 }
 
 /// Execute the external review bot wait loop.
@@ -135,6 +174,7 @@ pub(crate) async fn run_review_loop(
     task_start: Instant,
     repo_slug: String,
     jaccard_threshold: f64,
+    github_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let review_phase_start = Instant::now();
 
@@ -159,8 +199,13 @@ pub(crate) async fn run_review_loop(
     // Tracks the most recent non-waiting review output for Jaccard loop detection.
     let mut prev_review_output: Option<String> = None;
 
-    const QUOTA_EXHAUSTED_THRESHOLD: u32 = 3;
-    let mut quota_exhausted_rounds: u32 = 0;
+    let existing_rounds = store
+        .get_with_db_fallback(task_id)
+        .await?
+        .map(|state| state.rounds)
+        .unwrap_or_default();
+    let mut quota_exhausted_rounds = quota_exhausted_streak(&existing_rounds);
+    let mut quota_heuristic_attempts = quota_heuristic_attempt_count(&existing_rounds);
 
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
@@ -175,7 +220,7 @@ pub(crate) async fn run_review_loop(
         // against stale work — short-circuit to the appropriate terminal
         // status. Unknown/transient failures fall through and continue the
         // normal review flow.
-        match fetch_pr_external_state(pr_num, project).await {
+        match fetch_pr_external_state(pr_num, project, github_token).await {
             PrExternalState::Merged => {
                 tracing::info!(
                     task_id = %task_id,
@@ -454,6 +499,8 @@ pub(crate) async fn run_review_loop(
         let raw_lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
         let quota_exhausted = !raw_lgtm && !waiting && prompts::is_quota_exhausted(&output);
+        quota_exhausted_rounds =
+            update_quota_exhausted_rounds(quota_exhausted_rounds, waiting, quota_exhausted);
         // If post-execute validation failed this round, block LGTM acceptance even
         // if the reviewer approved — the local validator caught an issue that must be
         // fixed before the PR can be marked done.
@@ -553,7 +600,6 @@ pub(crate) async fn run_review_loop(
         // Don't consume a round — sleep and retry. After K consecutive quota rounds,
         // run the test gate as a heuristic graduation check.
         if quota_exhausted {
-            quota_exhausted_rounds += 1;
             tracing::info!(
                 round,
                 quota_exhausted_rounds,
@@ -587,9 +633,55 @@ pub(crate) async fn run_review_loop(
             }
 
             if quota_exhausted_rounds >= QUOTA_EXHAUSTED_THRESHOLD && !lgtm_test_gate_rejected {
+                quota_heuristic_attempts += 1;
+                let attempt_num = quota_heuristic_attempts;
+                mutate_and_persist(store, task_id, |s| {
+                    s.rounds.push(RoundResult::new(
+                        round,
+                        "review",
+                        QUOTA_HEURISTIC_ATTEMPT_RESULT,
+                        Some(format!(
+                            "attempt={attempt_num}/{MAX_QUOTA_HEURISTIC_GRADUATIONS}; quota_rounds={quota_exhausted_rounds}"
+                        )),
+                        None,
+                        None,
+                    ));
+                })
+                .await?;
+
+                if attempt_num > MAX_QUOTA_HEURISTIC_GRADUATIONS {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        attempt_num,
+                        max_attempts = MAX_QUOTA_HEURISTIC_GRADUATIONS,
+                        "quota-heuristic graduation cap exceeded; manual review required"
+                    );
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.turn = round.saturating_add(1);
+                        s.error = Some(format!(
+                            "needs_manual_review: reviewer quota remained exhausted after {} quota-heuristic attempts",
+                            MAX_QUOTA_HEURISTIC_GRADUATIONS
+                        ));
+                        s.rounds.push(RoundResult::new(
+                            round,
+                            "review",
+                            NEEDS_MANUAL_REVIEW_RESULT,
+                            Some(format!(
+                                "quota_heuristic_attempts={attempt_num}; quota_rounds={quota_exhausted_rounds}"
+                            )),
+                            None,
+                            None,
+                        ));
+                    })
+                    .await?;
+                    return Ok(());
+                }
+
                 tracing::info!(
                     task_id = %task_id,
                     quota_exhausted_rounds,
+                    attempt_num,
                     "quota-heuristic graduation: running test gate after {} quota-exhausted rounds",
                     quota_exhausted_rounds
                 );
@@ -742,9 +834,6 @@ pub(crate) async fn run_review_loop(
         // Also treat a test gate rejection as a "fixed" round — the agent needs
         // to push a fix and get a fresh review before LGTM can be accepted.
         prev_fixed = fixed || pending_test_failure.is_some();
-        if fixed {
-            quota_exhausted_rounds = 0;
-        }
         tracing::info!("PR #{pr_num} fixed at round {round}; waiting for bot re-review");
         if round < max_rounds {
             waiting_count += 1;
@@ -806,4 +895,49 @@ pub(crate) async fn run_review_loop(
         "task_completed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review_round(result: &str) -> RoundResult {
+        RoundResult::new(1, "review", result, None, None, None)
+    }
+
+    #[test]
+    fn quota_counter_resets_on_real_review_response() {
+        assert_eq!(update_quota_exhausted_rounds(2, false, false), 0);
+    }
+
+    #[test]
+    fn quota_counter_keeps_waiting_streak_intact() {
+        assert_eq!(update_quota_exhausted_rounds(2, true, false), 2);
+    }
+
+    #[test]
+    fn quota_counter_increments_on_quota_round() {
+        assert_eq!(update_quota_exhausted_rounds(2, false, true), 3);
+    }
+
+    #[test]
+    fn quota_exhausted_streak_uses_trailing_review_rounds() {
+        let rounds = vec![
+            review_round("fixed"),
+            review_round("quota_exhausted"),
+            review_round("quota_exhausted"),
+        ];
+        assert_eq!(quota_exhausted_streak(&rounds), 2);
+    }
+
+    #[test]
+    fn quota_heuristic_attempt_count_uses_persisted_rounds() {
+        let rounds = vec![
+            review_round("quota_exhausted"),
+            review_round(QUOTA_HEURISTIC_ATTEMPT_RESULT),
+            review_round("fixed"),
+            review_round(QUOTA_HEURISTIC_ATTEMPT_RESULT),
+        ];
+        assert_eq!(quota_heuristic_attempt_count(&rounds), 2);
+    }
 }

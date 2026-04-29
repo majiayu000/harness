@@ -5,7 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use harness_core::db::pg_open_pool;
+use harness_core::db::{pg_open_pool, resolve_database_url};
 use tokio::sync::OnceCell;
 
 /// Serialises every test that reads or mutates the process-global `HOME` env
@@ -75,13 +75,13 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
 }
 
 pub async fn db_tests_enabled() -> bool {
-    if std::env::var("DATABASE_URL").is_err() {
+    if resolve_database_url(None).is_err() {
         return false;
     }
 
     *DB_AVAILABLE
         .get_or_init(|| async {
-            let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            let Ok(database_url) = resolve_database_url(None) else {
                 return false;
             };
             match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {
@@ -97,6 +97,10 @@ pub async fn db_tests_enabled() -> bool {
 
 pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
     db_state_lock().lock_owned().await
+}
+
+pub fn test_database_url() -> anyhow::Result<String> {
+    resolve_database_url(None)
 }
 
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
@@ -214,6 +218,7 @@ async fn make_state_inner(
         vec![],
         None,
         task_queue.clone(),
+        task_queue.clone(),
         None,
         None,
         None,
@@ -274,6 +279,7 @@ async fn make_state_inner(
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
         interceptors: vec![],
+        startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
             feishu_intake: None,

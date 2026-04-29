@@ -11,7 +11,7 @@ use self::agents::*;
 use self::intake::*;
 use self::misc::*;
 use self::server::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
 /// A project entry declared in the config file under `[[projects]]`.
@@ -32,7 +32,7 @@ pub struct ProjectEntry {
     pub max_concurrent: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HarnessConfig {
     pub server: ServerConfig,
     pub agents: AgentsConfig,
@@ -53,6 +53,8 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub retry_scheduler: RetrySchedulerConfig,
     #[serde(default)]
+    pub reconciliation: ReconciliationConfig,
+    #[serde(default)]
     pub maintenance_window: MaintenanceWindowConfig,
     /// Projects declared in the config file. Registered on server startup.
     #[serde(default)]
@@ -66,8 +68,23 @@ impl HarnessConfig {
     /// before applying CLI flags so that CLI flags retain the highest
     /// precedence.
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        let workspace_root_is_implicit = !self.workspace.root_configured;
         self.server.apply_env_overrides()?;
+        if workspace_root_is_implicit {
+            self.workspace.root = WorkspaceConfig::root_for_data_dir(&self.server.data_dir);
+        } else {
+            self.apply_derived_defaults();
+        }
         Ok(())
+    }
+
+    /// Apply defaults that depend on other config fields.
+    ///
+    /// Serde field defaults cannot see sibling fields, so cross-field defaults
+    /// are resolved after loading, rebasing, and environment overrides.
+    pub fn apply_derived_defaults(&mut self) {
+        self.workspace
+            .use_data_dir_default_root(&self.server.data_dir);
     }
 
     /// Rebase all relative `PathBuf` fields against `base`.
@@ -105,13 +122,151 @@ impl HarnessConfig {
             rebase(p, base);
         }
         rebase_opt(&mut self.rules.requirements_path, base);
-        rebase(&mut self.workspace.root, base);
+        if self.workspace.root_configured {
+            rebase(&mut self.workspace.root, base);
+        }
+        self.apply_derived_defaults();
+    }
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        let mut config = Self {
+            server: ServerConfig::default(),
+            agents: AgentsConfig::default(),
+            gc: GcConfig::default(),
+            rules: RulesConfig::default(),
+            observe: ObserveConfig::default(),
+            otel: OtelConfig::default(),
+            validation: ValidationConfig::default(),
+            workspace: WorkspaceConfig::default(),
+            concurrency: ConcurrencyConfig::default(),
+            intake: IntakeConfig::default(),
+            review: ReviewConfig::default(),
+            retry_scheduler: RetrySchedulerConfig::default(),
+            reconciliation: ReconciliationConfig::default(),
+            maintenance_window: MaintenanceWindowConfig::default(),
+            projects: Vec::new(),
+        };
+        config.apply_derived_defaults();
+        config
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct HarnessConfigInput {
+            server: ServerConfig,
+            agents: AgentsConfig,
+            gc: GcConfig,
+            rules: RulesConfig,
+            observe: ObserveConfig,
+            otel: OtelConfig,
+            #[serde(default)]
+            validation: ValidationConfig,
+            #[serde(default)]
+            workspace: WorkspaceConfig,
+            #[serde(default)]
+            concurrency: ConcurrencyConfig,
+            #[serde(default)]
+            intake: IntakeConfig,
+            #[serde(default)]
+            review: ReviewConfig,
+            #[serde(default)]
+            retry_scheduler: RetrySchedulerConfig,
+            #[serde(default)]
+            reconciliation: ReconciliationConfig,
+            #[serde(default)]
+            maintenance_window: MaintenanceWindowConfig,
+            #[serde(default)]
+            projects: Vec<ProjectEntry>,
+        }
+
+        let input = HarnessConfigInput::deserialize(deserializer)?;
+        let mut config = Self {
+            server: input.server,
+            agents: input.agents,
+            gc: input.gc,
+            rules: input.rules,
+            observe: input.observe,
+            otel: input.otel,
+            validation: input.validation,
+            workspace: input.workspace,
+            concurrency: input.concurrency,
+            intake: input.intake,
+            review: input.review,
+            retry_scheduler: input.retry_scheduler,
+            reconciliation: input.reconciliation,
+            maintenance_window: input.maintenance_window,
+            projects: input.projects,
+        };
+        config.apply_derived_defaults();
+        Ok(config)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn harness_config_toml(data_dir: &str, workspace_section: &str) -> String {
+        format!(
+            r#"
+            [server]
+            transport = "http"
+            http_addr = "127.0.0.1:9800"
+            data_dir = "{data_dir}"
+            project_root = "/tmp/project"
+
+            [agents]
+            default_agent = "claude"
+            [agents.claude]
+            cli_path = "claude"
+            default_model = "sonnet"
+            [agents.codex]
+            cli_path = "codex"
+            [agents.anthropic_api]
+            base_url = "https://api.anthropic.com"
+            default_model = "claude-sonnet-4-6"
+
+            [gc]
+            max_drafts_per_run = 5
+            budget_per_signal_usd = 0.5
+            total_budget_usd = 5.0
+            [gc.signal_thresholds]
+            repeated_warn_min = 10
+            chronic_block_min = 5
+            hot_file_edits_min = 20
+            slow_op_threshold_ms = 5000
+            slow_op_count_min = 10
+            escalation_ratio = 1.5
+            violation_min = 5
+
+            [rules]
+            discovery_paths = []
+
+            [observe]
+            session_renewal_secs = 1800
+            log_retention_days = 90
+
+            [otel]
+
+            {workspace_section}
+            "#
+        )
+    }
+
+    fn with_env_vars<const N: usize, F>(vars: [(&str, Option<&str>); N], f: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = crate::test_support::process_env_lock();
+        temp_env::with_vars(vars, f);
+    }
 
     #[test]
     fn agent_review_config_defaults() {
@@ -718,6 +873,137 @@ mod tests {
         assert_eq!(config.before_remove_hook.as_deref(), Some("echo cleanup"));
         assert_eq!(config.hook_timeout_secs, 30);
         assert!(!config.auto_cleanup);
+    }
+
+    #[test]
+    fn derived_workspace_root_tracks_custom_data_dir_when_default() {
+        let mut config = HarnessConfig::default();
+        config.server.data_dir = PathBuf::from("/tmp/harness-two");
+        config.apply_derived_defaults();
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/harness-two/workspaces")
+        );
+    }
+
+    #[test]
+    fn harness_config_workspace_root_defaults_to_server_data_dir_when_omitted() {
+        let config: HarnessConfig =
+            toml::from_str(&harness_config_toml("/tmp/harness2", "")).unwrap();
+
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/harness2/workspaces")
+        );
+    }
+
+    #[test]
+    fn derived_workspace_root_preserves_explicit_workspace_root() {
+        let mut config = HarnessConfig::default();
+        config.server.data_dir = PathBuf::from("/tmp/harness-two");
+        config.workspace.root = PathBuf::from("/tmp/shared-harness-workspaces");
+        config.apply_derived_defaults();
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/shared-harness-workspaces")
+        );
+    }
+
+    #[test]
+    fn derived_workspace_root_preserves_explicit_legacy_workspace_root() {
+        let legacy_root = WorkspaceConfig::default().root;
+        let toml_str = format!(
+            r#"
+            root = "{}"
+        "#,
+            legacy_root.display()
+        );
+        let mut config = HarnessConfig {
+            server: ServerConfig {
+                data_dir: PathBuf::from("/tmp/harness-two"),
+                ..ServerConfig::default()
+            },
+            workspace: toml::from_str(&toml_str).unwrap(),
+            ..HarnessConfig::default()
+        };
+        config.apply_derived_defaults();
+        assert_eq!(config.workspace.root, legacy_root);
+    }
+
+    #[test]
+    fn derived_workspace_root_tracks_custom_data_dir_when_toml_root_is_absent() {
+        let toml_str = r#"
+            auto_cleanup = false
+        "#;
+        let mut config = HarnessConfig {
+            server: ServerConfig {
+                data_dir: PathBuf::from("/tmp/harness-two"),
+                ..ServerConfig::default()
+            },
+            workspace: toml::from_str(toml_str).unwrap(),
+            ..HarnessConfig::default()
+        };
+        config.apply_derived_defaults();
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/harness-two/workspaces")
+        );
+        assert!(!config.workspace.auto_cleanup);
+    }
+
+    #[test]
+    fn harness_config_preserves_explicit_workspace_root() {
+        let config: HarnessConfig = toml::from_str(&harness_config_toml(
+            "/tmp/harness2",
+            r#"
+            [workspace]
+            root = "/tmp/custom-workspaces"
+            "#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/custom-workspaces")
+        );
+    }
+
+    #[test]
+    fn env_data_dir_override_updates_implicit_workspace_root() {
+        with_env_vars([("HARNESS_DATA_DIR", Some("/tmp/env-harness2"))], || {
+            let mut config: HarnessConfig =
+                toml::from_str(&harness_config_toml("/tmp/harness2", "")).unwrap();
+
+            config.apply_env_overrides().unwrap();
+
+            assert_eq!(config.server.data_dir, PathBuf::from("/tmp/env-harness2"));
+            assert_eq!(
+                config.workspace.root,
+                PathBuf::from("/tmp/env-harness2/workspaces")
+            );
+        });
+    }
+
+    #[test]
+    fn env_data_dir_override_preserves_explicit_workspace_root() {
+        with_env_vars([("HARNESS_DATA_DIR", Some("/tmp/env-harness2"))], || {
+            let mut config: HarnessConfig = toml::from_str(&harness_config_toml(
+                "/tmp/harness2",
+                r#"
+                [workspace]
+                root = "/tmp/custom-workspaces"
+                "#,
+            ))
+            .unwrap();
+
+            config.apply_env_overrides().unwrap();
+
+            assert_eq!(config.server.data_dir, PathBuf::from("/tmp/env-harness2"));
+            assert_eq!(
+                config.workspace.root,
+                PathBuf::from("/tmp/custom-workspaces")
+            );
+        });
     }
 
     #[test]

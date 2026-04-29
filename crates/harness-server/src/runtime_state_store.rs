@@ -1,10 +1,7 @@
 use crate::runtime_hosts_state::PersistedRuntimeHost;
 use crate::runtime_project_cache_state::PersistedHostProjectCache;
 use chrono::{DateTime, Utc};
-use harness_core::db::{
-    pg_create_schema_if_not_exists, pg_open_pool, pg_open_pool_schematized, resolve_database_url,
-    Migration, PgMigrator,
-};
+use harness_core::db::{Migration, PgStoreContext};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
 use std::path::Path;
@@ -73,23 +70,17 @@ impl RuntimeStateStore {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let database_url = resolve_database_url(configured_database_url)?;
-        use sha2::{Digest, Sha256};
-        let path_utf8 = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
-        let digest = Sha256::digest(path_utf8.as_bytes());
-        let mut schema_bytes = [0u8; 8];
-        schema_bytes.copy_from_slice(&digest[..8]);
-        let schema = format!("h{:016x}", u64::from_le_bytes(schema_bytes));
+        let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let pool = context.open_migrated_pool(RUNTIME_STATE_MIGRATIONS).await?;
+        Ok(Self { pool })
+    }
 
-        let setup = pg_open_pool(&database_url).await?;
-        pg_create_schema_if_not_exists(&setup, &schema).await?;
-        setup.close().await;
-
-        let pool = pg_open_pool_schematized(&database_url, &schema).await?;
-        PgMigrator::new(&pool, RUNTIME_STATE_MIGRATIONS)
-            .run()
+    pub async fn open_with_context(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+    ) -> anyhow::Result<Self> {
+        let pool = context
+            .open_migrated_pool_with_setup_pool(setup_pool, RUNTIME_STATE_MIGRATIONS)
             .await?;
         Ok(Self { pool })
     }
@@ -159,9 +150,10 @@ impl RuntimeStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::db::resolve_database_url;
 
     async fn open_test_store() -> anyhow::Result<Option<RuntimeStateStore>> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;
@@ -201,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_state_store_rejects_newer_schema_snapshot_after_reopen() -> anyhow::Result<()>
     {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -221,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_state_store_survives_reopen() -> anyhow::Result<()> {
-        if std::env::var("DATABASE_URL").is_err() {
+        if resolve_database_url(None).is_err() {
             return Ok(());
         }
         let dir = tempfile::tempdir()?;

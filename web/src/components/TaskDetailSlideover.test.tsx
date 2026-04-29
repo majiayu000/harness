@@ -10,10 +10,16 @@ vi.mock("@/lib/queries", () => ({
   useTaskStream: vi.fn(),
 }));
 
+vi.mock("@/lib/api", () => ({
+  apiJson: vi.fn().mockResolvedValue([]),
+}));
+
 import { useTaskDetail, useTaskStream } from "@/lib/queries";
+import { apiJson } from "@/lib/api";
 
 const mockUseTaskDetail = useTaskDetail as ReturnType<typeof vi.fn>;
 const mockUseTaskStream = useTaskStream as ReturnType<typeof vi.fn>;
+const mockApiJson = apiJson as ReturnType<typeof vi.fn>;
 
 function makeFullTask(overrides: Partial<FullTask> = {}): FullTask {
   return {
@@ -49,6 +55,7 @@ function wrap(ui: React.ReactElement) {
 beforeEach(() => {
   mockUseTaskStream.mockImplementation(() => undefined);
   mockUseTaskDetail.mockReturnValue({ data: undefined, isLoading: false, isError: false });
+  mockApiJson.mockResolvedValue([]);
 });
 
 // ── visibility ────────────────────────────────────────────────────────────────
@@ -136,6 +143,163 @@ describe("TaskDetailSlideover", () => {
   });
 
   // ── tab switching ─────────────────────────────────────────────────────────
+
+  // ── proof-of-work card ────────────────────────────────────────────────────
+
+  it("renders proof-of-work card for terminal task", async () => {
+    const task = makeFullTask({
+      status: "done",
+      pr_url: "https://github.com/owner/repo/pull/42",
+      workflow: { state: "ready_to_merge", pr_number: 42 },
+      updated_at: "2024-01-01T01:00:00Z",
+    });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    mockApiJson.mockImplementation((url: string) => {
+      if (url.includes("/artifacts")) {
+        return Promise.resolve([
+          { task_id: task.id, turn: 1, artifact_type: "patch", content: "diff --git a/x", created_at: "2024-01-01T00:30:00Z" },
+        ]);
+      }
+      if (url.includes("/prompts")) {
+        return Promise.resolve([
+          { task_id: task.id, turn: 1, phase: "implement", prompt: "Write the fix", created_at: "2024-01-01T00:10:00Z" },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    const card = await screen.findByTestId("proof-of-work-card");
+    expect(card).toBeInTheDocument();
+    expect(card).toHaveTextContent("https://github.com/owner/repo/pull/42");
+    expect(card).toHaveTextContent("Rounds: 2");
+    expect(card).toHaveTextContent("Approved");
+    expect(await screen.findByText("patch")).toBeInTheDocument();
+    expect(await screen.findByText(/implement/)).toBeInTheDocument();
+    expect(card).toHaveTextContent("1 prompt recorded");
+    expect(card).not.toHaveTextContent("Write the fix");
+  });
+
+  it("does not render proof-of-work card for non-terminal task", () => {
+    const task = makeFullTask({ status: "implementing" });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    expect(screen.queryByTestId("proof-of-work-card")).not.toBeInTheDocument();
+  });
+
+  it("proof-of-work card degrades gracefully with missing data", async () => {
+    const task = makeFullTask({ status: "done", pr_url: null, workflow: null });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    const card = await screen.findByTestId("proof-of-work-card");
+    expect(card).toHaveTextContent("No PR");
+    expect(card).toHaveTextContent("No reviewer data");
+    await waitFor(() => {
+      expect(card).toHaveTextContent("No prompts recorded");
+      expect(card).toHaveTextContent("No artifacts");
+    });
+  });
+
+  it("fetches and renders prompt history in chronological order for the prompts tab", async () => {
+    const task = makeFullTask({ status: "implementing" });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    mockApiJson.mockImplementation((url: string) => {
+      if (url.includes("/prompts")) {
+        return Promise.resolve([
+          {
+            task_id: task.id,
+            turn: 2,
+            phase: "retry",
+            prompt: "Second prompt body",
+            created_at: "2024-01-01T00:20:00Z",
+          },
+          {
+            task_id: task.id,
+            turn: 1,
+            phase: "plan",
+            prompt: "First prompt body",
+            created_at: "2024-01-01T00:10:00Z",
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("prompts"));
+
+    expect(await screen.findByText("First prompt body")).toBeInTheDocument();
+    expect(screen.getByText("Second prompt body")).toBeInTheDocument();
+
+    const promptBodies = await screen.findAllByTestId(/prompt-body-/);
+    expect(promptBodies[0]).toHaveTextContent("First prompt body");
+    expect(promptBodies[1]).toHaveTextContent("Second prompt body");
+    expect(screen.getByText("plan")).toBeInTheDocument();
+    expect(screen.getByText("retry")).toBeInTheDocument();
+    expect(screen.getByText("2024-01-01T00:10:00Z")).toBeInTheDocument();
+    expect(screen.getByText("2024-01-01T00:20:00Z")).toBeInTheDocument();
+  });
+
+  it("renders long multiline prompts in full without truncation", async () => {
+    const task = makeFullTask({ status: "implementing" });
+    const longPrompt = ["Line 1", "Line 2", "Line 3", "x".repeat(700)].join("\n");
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    mockApiJson.mockImplementation((url: string) => {
+      if (url.includes("/prompts")) {
+        return Promise.resolve([
+          {
+            task_id: task.id,
+            turn: 1,
+            phase: "implement",
+            prompt: longPrompt,
+            created_at: "2024-01-01T00:10:00Z",
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("prompts"));
+
+    const promptBody = await screen.findByTestId("prompt-body-0");
+    expect(promptBody.textContent).toBe(longPrompt);
+    expect(promptBody).toHaveTextContent("Line 1");
+    expect(promptBody).toHaveTextContent("Line 2");
+    expect(promptBody).toHaveTextContent("Line 3");
+    expect(promptBody.textContent?.endsWith("…")).toBe(false);
+  });
+
+  it("renders a clear empty state when no prompts are recorded", async () => {
+    const task = makeFullTask({ status: "implementing" });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    mockApiJson.mockImplementation((url: string) => {
+      if (url.includes("/prompts")) {
+        return Promise.resolve([]);
+      }
+      return Promise.resolve([]);
+    });
+
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("prompts"));
+
+    expect(await screen.findByText("No prompts recorded.")).toBeInTheDocument();
+  });
+
+  it("renders a clear error state when prompts fail to load", async () => {
+    const task = makeFullTask({ status: "implementing" });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    mockApiJson.mockImplementation((url: string) => {
+      if (url.includes("/prompts")) {
+        return Promise.reject(new Error("boom"));
+      }
+      return Promise.resolve([]);
+    });
+
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText("prompts"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Failed to load prompts.");
+  });
 
   it("switches tabs without remounting (Summary → Output → Summary)", () => {
     const task = makeFullTask();

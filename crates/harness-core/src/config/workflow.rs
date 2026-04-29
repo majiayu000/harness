@@ -7,6 +7,11 @@ pub struct IssueWorkflowPolicy {
     pub force_execute_label: String,
     #[serde(default = "default_true")]
     pub auto_replan_on_plan_issue: bool,
+    /// When true, the review loop pauses at `ready_to_merge` and requires a
+    /// human to call `POST /tasks/:id/merge` before the workflow advances to
+    /// `done`.  Defaults to `false` to preserve the legacy auto-merge flow.
+    #[serde(default)]
+    pub require_human_gate_before_merge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +45,7 @@ impl Default for IssueWorkflowPolicy {
         Self {
             force_execute_label: default_force_execute_label(),
             auto_replan_on_plan_issue: default_true(),
+            require_human_gate_before_merge: false,
         }
     }
 }
@@ -129,6 +135,7 @@ mod tests {
         assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 300);
         assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
         assert_eq!(cfg.storage.schema_namespace, "workflow");
+        assert!(!cfg.issue_workflow.require_human_gate_before_merge);
         Ok(())
     }
 
@@ -141,6 +148,7 @@ mod tests {
 issue_workflow:
   force_execute_label: do-not-second-guess
   auto_replan_on_plan_issue: false
+  require_human_gate_before_merge: true
 pr_feedback:
   enabled: false
   sweep_interval_secs: 15
@@ -159,6 +167,7 @@ Body
             "do-not-second-guess"
         );
         assert!(!cfg.issue_workflow.auto_replan_on_plan_issue);
+        assert!(cfg.issue_workflow.require_human_gate_before_merge);
         assert!(!cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 15);
         assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 45);

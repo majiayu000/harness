@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the local dev Postgres container and print the DATABASE_URL.
+# Start the local dev Postgres container and print the HARNESS_DATABASE_URL.
 # Requires Docker with Compose v2 plugin (docker compose, not docker-compose v1).
 # Safe to run multiple times — docker compose up -d is idempotent.
 set -euo pipefail
@@ -34,6 +34,8 @@ docker compose -f "$REPO_ROOT/docker-compose.yml" up -d --wait postgres
 echo ""
 echo "Postgres is ready. Set the following in your shell:"
 echo ""
-echo "  export DATABASE_URL=postgres://harness:harness@localhost:5432/harness"
+echo "  export HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness"
+echo "  export HARNESS_DATABASE_POOL_MAX_CONNECTIONS=8"
+echo "  export HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS=30"
 echo ""
 echo "Migrations run automatically when the server starts — no manual step needed."
