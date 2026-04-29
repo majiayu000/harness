@@ -359,6 +359,8 @@ pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskReques
     state.depends_on = req.depends_on.clone();
     state.priority = req.priority;
     state.issue = req.issue;
+    // Keep queued tasks visible to duplicate detection while they wait for a permit.
+    state.project_root = req.project.clone();
     state.phase = state.task_kind.default_phase();
     state.description = summarize_request_description(req);
     state.request_settings = Some(PersistedRequestSettings::from_req(req));
@@ -1542,6 +1544,7 @@ mod tests {
             source: Some("github".to_string()),
             external_id: Some("20".to_string()),
             repo: Some("acme/harness".to_string()),
+            project: Some(dir.path().to_path_buf()),
             ..Default::default()
         };
 
@@ -1553,6 +1556,7 @@ mod tests {
         assert_eq!(state.source.as_deref(), Some("github"));
         assert_eq!(state.external_id.as_deref(), Some("20"));
         assert_eq!(state.repo.as_deref(), Some("acme/harness"));
+        assert_eq!(state.project_root.as_deref(), Some(dir.path()));
         assert_eq!(state.description.as_deref(), Some("issue #20"));
         Ok(())
     }
