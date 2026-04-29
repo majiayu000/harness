@@ -1,4 +1,5 @@
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::Acquire as _;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -607,25 +608,17 @@ impl<'a> PgMigrator<'a> {
             if stmt.is_empty() {
                 continue;
             }
-            sqlx::query("SAVEPOINT harness_migration_stmt")
-                .execute(&mut *tx)
-                .await?;
-            match sqlx::query(stmt).execute(&mut *tx).await {
+            let mut statement_tx = (&mut tx).begin().await?;
+            match sqlx::query(stmt).execute(&mut *statement_tx).await {
                 Ok(_) => {
-                    sqlx::query("RELEASE SAVEPOINT harness_migration_stmt")
-                        .execute(&mut *tx)
-                        .await?;
+                    statement_tx.commit().await?;
                 }
                 Err(e) if pg_duplicate_column_error(stmt, &e) => {
-                    sqlx::query("ROLLBACK TO SAVEPOINT harness_migration_stmt")
-                        .execute(&mut *tx)
-                        .await?;
-                    sqlx::query("RELEASE SAVEPOINT harness_migration_stmt")
-                        .execute(&mut *tx)
-                        .await?;
+                    statement_tx.rollback().await?;
                     continue;
                 }
                 Err(e) => {
+                    let _ = statement_tx.rollback().await;
                     return Err(anyhow::anyhow!(
                         "migration v{} '{}' failed: {} [sql: {}]",
                         migration.version,
