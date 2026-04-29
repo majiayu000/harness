@@ -98,7 +98,7 @@ describe("<Submit>", () => {
     wrap(<Submit />);
     goToConfig("Issue");
 
-    const nextBtn = screen.getByRole("button", { name: /Next/ });
+    let nextBtn = screen.getByRole("button", { name: /Next/ });
     expect(nextBtn).toBeDisabled();
 
     // invalid input (not a number or URL)
@@ -112,6 +112,37 @@ describe("<Submit>", () => {
     fireEvent.change(screen.getByRole("combobox", { name: /Project/ }), {
       target: { value: "alpha" },
     });
+    expect(nextBtn).not.toBeDisabled();
+  });
+
+  it("rejects non-positive issue and PR identifiers", () => {
+    wrap(<Submit />);
+    goToConfig("Issue");
+
+    let nextBtn = screen.getByRole("button", { name: /Next/ });
+    fireEvent.change(screen.getByRole("combobox", { name: /Project/ }), {
+      target: { value: "alpha" },
+    });
+
+    fireEvent.change(screen.getByPlaceholderText(/123 or/), { target: { value: "0" } });
+    expect(nextBtn).toBeDisabled();
+
+    fireEvent.change(screen.getByPlaceholderText(/123 or/), {
+      target: { value: "https://github.com/owner/repo/issues/0" },
+    });
+    expect(nextBtn).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /Back/ }));
+    goToConfig("Pull Request");
+    nextBtn = screen.getByRole("button", { name: /Next/ });
+    fireEvent.change(screen.getByRole("combobox", { name: /Project/ }), {
+      target: { value: "alpha" },
+    });
+
+    fireEvent.change(screen.getByPlaceholderText(/456 or/), { target: { value: "-1" } });
+    expect(nextBtn).toBeDisabled();
+
+    fireEvent.change(screen.getByPlaceholderText(/456 or/), { target: { value: "7" } });
     expect(nextBtn).not.toBeDisabled();
   });
 
@@ -158,6 +189,25 @@ describe("<Submit>", () => {
     const call = mockApiFetch.mock.calls[0];
     const body = JSON.parse(call[1].body as string);
     expect(body).toMatchObject({ issue: 99, project: "alpha" });
+  });
+
+  it("rejects invalid max turns before submitting", async () => {
+    wrap(<Submit />);
+
+    goToConfig("Issue");
+    fireEvent.change(screen.getByPlaceholderText(/123 or/), { target: { value: "99" } });
+    fireEvent.change(screen.getByRole("combobox", { name: /Project/ }), {
+      target: { value: "alpha" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Next/ }));
+
+    fireEvent.change(screen.getAllByPlaceholderText(/leave blank for default/)[0], {
+      target: { value: "1.5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Submit Task/ }));
+
+    expect(await screen.findByText("Max turns must be a positive integer")).toBeInTheDocument();
+    expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
   it("successful submit transitions to the success screen with the returned taskId", async () => {

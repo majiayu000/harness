@@ -22,21 +22,28 @@ interface Props {
   projectFilter?: string | null;
 }
 
+function parsePositiveInteger(input: string): number | null {
+  const trimmed = input.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 function parseIssueNumber(input: string): number | null {
   const trimmed = input.trim();
-  const direct = parseInt(trimmed, 10);
-  if (!isNaN(direct) && String(direct) === trimmed) return direct;
+  const direct = parsePositiveInteger(trimmed);
+  if (direct !== null) return direct;
   const match = trimmed.match(/\/issues\/(\d+)/);
-  if (match) return parseInt(match[1], 10);
+  if (match) return parsePositiveInteger(match[1]);
   return null;
 }
 
 function parsePrNumber(input: string): number | null {
   const trimmed = input.trim();
-  const direct = parseInt(trimmed, 10);
-  if (!isNaN(direct) && String(direct) === trimmed) return direct;
+  const direct = parsePositiveInteger(trimmed);
+  if (direct !== null) return direct;
   const match = trimmed.match(/\/pull\/(\d+)/);
-  if (match) return parseInt(match[1], 10);
+  if (match) return parsePositiveInteger(match[1]);
   return null;
 }
 
@@ -337,13 +344,23 @@ export function Submit({ projectFilter }: Props) {
     const common: Record<string, unknown> = {};
     if (wizardState.project) common.project = wizardState.project;
     if (wizardState.agent) common.agent = wizardState.agent;
-    if (wizardState.maxTurns) {
-      const n = parseInt(wizardState.maxTurns, 10);
-      if (!isNaN(n)) common.max_turns = n;
+    if (wizardState.maxTurns.trim() !== "") {
+      const n = parsePositiveInteger(wizardState.maxTurns);
+      if (n === null) {
+        setSubmitError("Max turns must be a positive integer");
+        setBusy(false);
+        return;
+      }
+      common.max_turns = n;
     }
-    if (wizardState.turnTimeoutSecs) {
-      const n = parseInt(wizardState.turnTimeoutSecs, 10);
-      if (!isNaN(n)) common.turn_timeout_secs = n;
+    if (wizardState.turnTimeoutSecs.trim() !== "") {
+      const n = parsePositiveInteger(wizardState.turnTimeoutSecs);
+      if (n === null) {
+        setSubmitError("Turn timeout seconds must be a positive integer");
+        setBusy(false);
+        return;
+      }
+      common.turn_timeout_secs = n;
     }
 
     let modePayload: Record<string, unknown>;
