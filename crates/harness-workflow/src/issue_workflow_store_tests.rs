@@ -1,5 +1,7 @@
 use super::IssueWorkflowStore;
-use crate::issue_lifecycle::IssueLifecycleState;
+use crate::issue_lifecycle::{
+    IssueLifecycleState, ReviewFallbackSnapshot, ReviewFallbackTier, ReviewFallbackTrigger,
+};
 use chrono::Utc;
 
 async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
@@ -444,6 +446,59 @@ async fn record_merge_approved_transitions_workflow_to_done() -> anyhow::Result<
         .await?
         .expect("updated workflow");
     assert_eq!(updated.state, IssueLifecycleState::Done);
+    Ok(())
+}
+
+#[tokio::test]
+async fn record_ready_to_merge_with_fallback_persists_snapshot() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/project-ready-fallback";
+    store
+        .record_issue_scheduled(project_id, Some("owner/repo"), 21, "task-1", &[], false)
+        .await?;
+    store
+        .record_pr_detected(
+            project_id,
+            Some("owner/repo"),
+            21,
+            "task-1",
+            121,
+            "https://github.com/owner/repo/pull/121",
+        )
+        .await?;
+    let activated_at = Utc::now();
+    let workflow = store
+        .record_ready_to_merge_with_fallback(
+            project_id,
+            Some("owner/repo"),
+            121,
+            Some("fallback via silence"),
+            ReviewFallbackSnapshot {
+                tier: ReviewFallbackTier::C,
+                trigger: ReviewFallbackTrigger::Silence,
+                active_bot: Some("codex".to_string()),
+                activated_at,
+            },
+        )
+        .await?
+        .expect("workflow");
+
+    assert_eq!(workflow.state, IssueLifecycleState::ReadyToMerge);
+    assert_eq!(
+        workflow.review_fallback,
+        Some(ReviewFallbackSnapshot {
+            tier: ReviewFallbackTier::C,
+            trigger: ReviewFallbackTrigger::Silence,
+            active_bot: Some("codex".to_string()),
+            activated_at,
+        })
+    );
+    assert_eq!(
+        workflow.last_event.and_then(|event| event.detail),
+        Some("fallback via silence".to_string())
+    );
     Ok(())
 }
 

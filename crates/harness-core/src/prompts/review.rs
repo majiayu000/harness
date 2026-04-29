@@ -45,8 +45,9 @@ fn validation_cmd_for_type(project_type: &str) -> &'static str {
 /// - Round 3+: only fix critical/high; skip medium style/design suggestions
 ///
 /// When `prev_fixed` is true (previous round pushed code), the agent must first
-/// verify that Gemini has submitted a **new** review covering the latest commit
-/// before declaring LGTM. If no new review exists yet, agent outputs WAITING.
+/// verify that the active review bot has submitted a **new** review covering
+/// the latest commit before declaring LGTM. If no new review exists yet, the
+/// agent outputs WAITING.
 #[allow(clippy::too_many_arguments)]
 pub fn review_prompt(
     issue: Option<u64>,
@@ -83,7 +84,7 @@ pub fn review_prompt(
     let freshness_check = if prev_fixed {
         // Filter to reviews authored by the configured bot login so that a human
         // reviewer submitting after the latest commit cannot be mistaken for the
-        // bot's re-review.
+        // active bot's re-review.
         let login_filter =
             format!("[.[] | select(.user.login == \"{reviewer_name}\")] | last | .submitted_at");
         format!(

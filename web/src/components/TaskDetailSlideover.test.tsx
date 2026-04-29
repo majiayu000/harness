@@ -90,13 +90,30 @@ describe("TaskDetailSlideover", () => {
   // ── summary tab ───────────────────────────────────────────────────────────
 
   it("renders task summary fields when data resolves", () => {
-    const task = makeFullTask({ status: "implementing", repo: "owner/repo", description: "Fix the bug" });
+    const task = makeFullTask({
+      status: "implementing",
+      repo: "owner/repo",
+      description: "Fix the bug",
+      workflow: {
+        state: "ready_to_merge",
+        pr_number: 42,
+        review_fallback: {
+          tier: "c",
+          trigger: "all_bots_quota",
+          active_bot: "codex",
+          activated_at: "2026-04-30T00:00:00Z",
+        },
+      },
+    });
     mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
     wrap(<TaskDetailSlideover taskId="task-abc-123" onClose={vi.fn()} />);
     // "implementing" appears in both the header badge and the summary field
     expect(screen.getAllByText("implementing").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("owner/repo")).toBeInTheDocument();
     expect(screen.getByText("Fix the bug")).toBeInTheDocument();
+    expect(screen.getByText("C")).toBeInTheDocument();
+    expect(screen.getByText("all bots quota")).toBeInTheDocument();
+    expect(screen.getByText("codex")).toBeInTheDocument();
   });
 
   // ── SSE output tab ────────────────────────────────────────────────────────

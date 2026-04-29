@@ -186,6 +186,15 @@ pub struct AgentReviewConfig {
     /// GitHub login of the review bot (used for freshness checks in review loop).
     #[serde(default = "default_reviewer_name")]
     pub reviewer_name: String,
+    /// Ordered review fallback chain, e.g. ["gemini", "codex"].
+    #[serde(default = "default_review_fallback_chain")]
+    pub fallback_chain: Vec<String>,
+    /// Consecutive rounds with no new bot activity before silence can graduate.
+    #[serde(default = "default_silence_rounds_threshold")]
+    pub silence_rounds_threshold: u32,
+    /// Minimum minutes after the latest commit before silence can graduate.
+    #[serde(default = "default_silence_min_minutes_after_commit")]
+    pub silence_min_minutes_after_commit: u32,
 }
 
 impl Default for AgentReviewConfig {
@@ -197,6 +206,9 @@ impl Default for AgentReviewConfig {
             review_bot_command: default_review_bot_command(),
             review_bot_auto_trigger: default_review_bot_auto_trigger(),
             reviewer_name: default_reviewer_name(),
+            fallback_chain: default_review_fallback_chain(),
+            silence_rounds_threshold: default_silence_rounds_threshold(),
+            silence_min_minutes_after_commit: default_silence_min_minutes_after_commit(),
         }
     }
 }
@@ -215,6 +227,18 @@ fn default_review_bot_auto_trigger() -> bool {
 
 fn default_max_agent_review_rounds() -> u32 {
     3
+}
+
+fn default_review_fallback_chain() -> Vec<String> {
+    vec!["gemini".to_string(), "codex".to_string()]
+}
+
+fn default_silence_rounds_threshold() -> u32 {
+    3
+}
+
+fn default_silence_min_minutes_after_commit() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

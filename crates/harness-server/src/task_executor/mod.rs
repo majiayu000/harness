@@ -1271,6 +1271,8 @@ pub(crate) async fn run_task(
         agent,
         review_config,
         &project_config,
+        issue_workflow_store.as_deref(),
+        &project_root,
         req,
         &events,
         &interceptors,
