@@ -39,23 +39,37 @@ pub(crate) enum ImplementationOutcome {
         pr_url: Option<String>,
         pr_num: Option<u64>,
         created_issue_num: Option<u64>,
-        pushed_commit: bool,
+        pushed_commit: Option<bool>,
     },
 }
 
-pub(crate) fn parse_implementation_outcome(output: &str) -> ImplementationOutcome {
+pub(crate) fn parse_implementation_outcome(output: &str) -> Result<ImplementationOutcome, String> {
     if let Some(desc) = prompts::parse_plan_issue(output) {
-        return ImplementationOutcome::PlanIssue(desc);
+        return Ok(ImplementationOutcome::PlanIssue(desc));
     }
     let pr_url = prompts::parse_pr_url(output);
     let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
     let created_issue_num = prompts::parse_created_issue_number(output);
-    let pushed_commit = prompts::parse_pushed_commit(output);
-    ImplementationOutcome::ParsedPr {
+    let pushed_commit = prompts::parse_pushed_commit(output)?;
+    Ok(ImplementationOutcome::ParsedPr {
         pr_url,
         pr_num,
         created_issue_num,
         pushed_commit,
+    })
+}
+
+fn resolve_pushed_commit_flag(
+    is_direct_pr_check: bool,
+    pushed_commit: Option<bool>,
+) -> Result<bool, String> {
+    match (is_direct_pr_check, pushed_commit) {
+        (_, Some(pushed_commit)) => Ok(pushed_commit),
+        (false, None) => Ok(false),
+        (true, None) => Err(
+            "missing required PUSHED_COMMIT marker in PR-check output; refusing to skip freshness gate"
+                .to_string(),
+        ),
     }
 }
 
@@ -671,7 +685,7 @@ pub(crate) async fn run_implement_phase(
             // If the agent already pushed to a PR before we detected the collision,
             // capture the URL so there is a tracked handle for cleanup.
             let collision_pr_url = match parse_implementation_outcome(&output) {
-                ImplementationOutcome::ParsedPr { pr_url, .. } => pr_url,
+                Ok(ImplementationOutcome::ParsedPr { pr_url, .. }) => pr_url,
                 _ => None,
             };
             tracing::error!(
@@ -794,7 +808,7 @@ pub(crate) async fn run_implement_phase(
 
         let (pr_url, pr_num, created_issue_num, pushed_commit) =
             match parse_implementation_outcome(&output) {
-                ImplementationOutcome::PlanIssue(plan_issue) => {
+                Ok(ImplementationOutcome::PlanIssue(plan_issue)) => {
                     if let (Some(workflows), Some(issue_number)) =
                         (issue_workflow_store.as_ref(), req.issue)
                     {
@@ -875,13 +889,125 @@ pub(crate) async fn run_implement_phase(
                     );
                     return Ok(ImplementOutcome::Done);
                 }
-                ImplementationOutcome::ParsedPr {
+                Ok(ImplementationOutcome::ParsedPr {
                     pr_url,
                     pr_num,
                     created_issue_num,
                     pushed_commit,
-                } => (pr_url, pr_num, created_issue_num, pushed_commit),
+                }) => (pr_url, pr_num, created_issue_num, pushed_commit),
+                Err(parse_err) => {
+                    tracing::error!(
+                        task_id = %task_id,
+                        parse_error = %parse_err,
+                        "implementation returned malformed structured output"
+                    );
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.turn = 2;
+                        s.error = Some(format!(
+                            "implementation returned malformed structured output: {parse_err}"
+                        ));
+                        s.rounds.push(RoundResult::new(
+                            1,
+                            "implement",
+                            "malformed_output",
+                            if output.is_empty() {
+                                None
+                            } else {
+                                Some(output.clone())
+                            },
+                            Some(impl_telemetry.clone()),
+                            None,
+                        ));
+                    })
+                    .await?;
+                    let event = build_task_event(
+                        task_id,
+                        1,
+                        "implement",
+                        "task_implement",
+                        Decision::Block,
+                        Some(format!("malformed structured output: {parse_err}")),
+                        None,
+                        Some(impl_telemetry.clone()),
+                        None,
+                        if output.is_empty() {
+                            None
+                        } else {
+                            Some(output.clone())
+                        },
+                    );
+                    if let Err(error) = events.log(&event).await {
+                        tracing::warn!("failed to log task_implement event: {error}");
+                    }
+                    tracing::info!(
+                        task_id = %task_id,
+                        status = "failed",
+                        turns = 2,
+                        pr_url = tracing::field::Empty,
+                        total_elapsed_secs = task_start.elapsed().as_secs(),
+                        "task_completed"
+                    );
+                    return Ok(ImplementOutcome::Done);
+                }
             };
+
+        let pushed_commit = match resolve_pushed_commit_flag(req.pr.is_some(), pushed_commit) {
+            Ok(pushed_commit) => pushed_commit,
+            Err(parse_err) => {
+                tracing::error!(
+                    task_id = %task_id,
+                    parse_error = %parse_err,
+                    "implementation omitted required PR-check structured output"
+                );
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Failed;
+                    s.turn = 2;
+                    s.error = Some(parse_err.clone());
+                    s.rounds.push(RoundResult::new(
+                        1,
+                        "implement",
+                        "malformed_output",
+                        if output.is_empty() {
+                            None
+                        } else {
+                            Some(output.clone())
+                        },
+                        Some(impl_telemetry.clone()),
+                        None,
+                    ));
+                })
+                .await?;
+                let event = build_task_event(
+                    task_id,
+                    1,
+                    "implement",
+                    "task_implement",
+                    Decision::Block,
+                    Some(parse_err.clone()),
+                    None,
+                    Some(impl_telemetry.clone()),
+                    None,
+                    if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.clone())
+                    },
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log task_implement event: {error}");
+                }
+                tracing::info!(
+                    task_id = %task_id,
+                    status = "failed",
+                    turns = 2,
+                    pr_url = tracing::field::Empty,
+                    total_elapsed_secs = task_start.elapsed().as_secs(),
+                    "task_completed"
+                );
+                return Ok(ImplementOutcome::Done);
+            }
+        };
 
         mutate_and_persist(store, task_id, |s| {
             s.pr_url = pr_url.clone();
@@ -1148,7 +1274,7 @@ mod tests {
     #[test]
     fn parse_implementation_outcome_prefers_plan_issue() {
         let output = "PLAN_ISSUE=Plan missed rollback path\nPR_URL=https://github.com/o/r/pull/123";
-        let parsed = parse_implementation_outcome(output);
+        let parsed = parse_implementation_outcome(output).expect("plan issue should parse");
         assert_eq!(
             parsed,
             ImplementationOutcome::PlanIssue("Plan missed rollback path".to_string())
@@ -1158,14 +1284,14 @@ mod tests {
     #[test]
     fn parse_implementation_outcome_extracts_pr_when_no_plan_issue() {
         let output = "Done.\nPR_URL=https://github.com/majiayu000/harness/pull/42";
-        let parsed = parse_implementation_outcome(output);
+        let parsed = parse_implementation_outcome(output).expect("pr output should parse");
         assert_eq!(
             parsed,
             ImplementationOutcome::ParsedPr {
                 pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
                 pr_num: Some(42),
                 created_issue_num: None,
-                pushed_commit: false,
+                pushed_commit: None,
             }
         );
     }
@@ -1174,15 +1300,38 @@ mod tests {
     fn parse_implementation_outcome_extracts_pushed_commit_flag() {
         let output =
             "PR_URL=https://github.com/majiayu000/harness/pull/42\nPUSHED_COMMIT=true\nFIXED";
-        let parsed = parse_implementation_outcome(output);
+        let parsed = parse_implementation_outcome(output).expect("pushed flag should parse");
         assert_eq!(
             parsed,
             ImplementationOutcome::ParsedPr {
                 pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
                 pr_num: Some(42),
                 created_issue_num: None,
-                pushed_commit: true,
+                pushed_commit: Some(true),
             }
+        );
+    }
+
+    #[test]
+    fn parse_implementation_outcome_rejects_malformed_pushed_commit_flag() {
+        let output =
+            "PR_URL=https://github.com/majiayu000/harness/pull/42\nPUSHED_COMMIT=maybe\nFIXED";
+        assert_eq!(
+            parse_implementation_outcome(output),
+            Err("invalid PUSHED_COMMIT value `maybe`; expected true or false".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_pushed_commit_flag_requires_marker_for_direct_pr_checks() {
+        assert_eq!(resolve_pushed_commit_flag(true, Some(true)), Ok(true));
+        assert_eq!(resolve_pushed_commit_flag(false, None), Ok(false));
+        assert_eq!(
+            resolve_pushed_commit_flag(true, None),
+            Err(
+                "missing required PUSHED_COMMIT marker in PR-check output; refusing to skip freshness gate"
+                    .to_string()
+            )
         );
     }
 

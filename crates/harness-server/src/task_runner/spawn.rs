@@ -1822,7 +1822,7 @@ mod tests {
         );
 
         let agent = PhaseCapturingAgent::new(vec![
-            "PR_URL=https://github.com/owner/repo/pull/7\nWAITING".into(),
+            "PR_URL=https://github.com/owner/repo/pull/7\nPUSHED_COMMIT=false\nWAITING".into(),
             "MANUAL_RESOLUTION_REQUIRED".into(),
         ]);
 
@@ -1896,7 +1896,7 @@ mod tests {
         );
 
         let agent = PhaseCapturingAgent::new(vec![
-            "PR_URL=https://github.com/owner/repo/pull/8\nWAITING".into(),
+            "PR_URL=https://github.com/owner/repo/pull/8\nPUSHED_COMMIT=false\nWAITING".into(),
             "CLEAN_PR".into(),
             "LGTM".into(),
         ]);
@@ -1961,7 +1961,7 @@ mod tests {
         );
 
         let agent = PhaseCapturingAgent::new(vec![
-            "PR_URL=https://github.com/owner/repo/pull/9\nWAITING".into(),
+            "PR_URL=https://github.com/owner/repo/pull/9\nPUSHED_COMMIT=false\nWAITING".into(),
             "REBASE_PUSHED".into(),
             "LGTM".into(),
         ]);

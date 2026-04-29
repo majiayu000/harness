@@ -50,19 +50,20 @@ pub fn check_resumed_pr_conflicts(pr_num: u64, repo: &str, project_root: &Path) 
          - The last non-empty line of your output MUST be exactly one of: \
          `CLEAN_PR`, `REBASE_PUSHED`, or `MANUAL_RESOLUTION_REQUIRED`.\n\n\
          Steps:\n\
-         1. Inspect PR mergeability and head branch:\n\
-            `gh pr view {pr_num} --json mergeable,headRefName,url`\n\
+         1. Inspect PR mergeability, head branch, and base branch:\n\
+            `gh pr view {pr_num} --json mergeable,headRefName,baseRefName,url`\n\
          2. If `mergeable` is `MERGEABLE`, print `CLEAN_PR` on the last line and stop.\n\
          3. If `mergeable` is `CONFLICTING`, repair it in an isolated worktree:\n\
             ```\n\
             BRANCH=$(gh pr view {pr_num} --json headRefName --jq .headRefName)\n\
+            BASE=$(gh pr view {pr_num} --json baseRefName --jq .baseRefName)\n\
             git fetch origin \"$BRANCH\"\n\
-            git fetch origin main\n\
+            git fetch origin \"$BASE\"\n\
             git worktree remove /tmp/harness-rebase-{pr_num} 2>/dev/null || rm -rf /tmp/harness-rebase-{pr_num} 2>/dev/null || true\n\
             git worktree prune\n\
             git worktree add /tmp/harness-rebase-{pr_num} \"$BRANCH\"\n\
             cd /tmp/harness-rebase-{pr_num}\n\
-            git rebase origin/main\n\
+            git rebase \"origin/$BASE\"\n\
             ```\n\
          4. If rebase conflicts appear, resolve each file and continue the rebase. \
             If you cannot finish cleanly, print `MANUAL_RESOLUTION_REQUIRED` on the last line.\n\
@@ -77,7 +78,7 @@ pub fn check_resumed_pr_conflicts(pr_num: u64, repo: &str, project_root: &Path) 
     )
 }
 
-/// Build prompt: rebase a conflicting PR onto the current main branch.
+/// Build prompt: rebase a conflicting PR onto its actual base branch.
 ///
 /// Used when Harness wants the agent to repair a conflicting PR via rebase.
 /// The agent performs the rebase inside an isolated worktree and force-pushes
@@ -114,10 +115,12 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str, project_root
             git worktree prune\n\
             git worktree add /tmp/harness-rebase-{pr_num} '{branch_arg}'\n\
             ```\n\
-         2. Rebase onto origin/main inside the worktree:\n\
+         2. Determine the PR base branch from GitHub and rebase onto it inside the worktree:\n\
             ```\n\
+            BASE=$(gh pr view {pr_num} --json baseRefName --jq .baseRefName)\n\
+            git fetch origin \"$BASE\"\n\
             cd /tmp/harness-rebase-{pr_num}\n\
-            git rebase origin/main\n\
+            git rebase \"origin/$BASE\"\n\
             ```\n\
          3. If rebase conflicts appear, resolve each file, then:\n\
             ```\n\
@@ -212,18 +215,19 @@ pub fn check_existing_pr(
     };
     format!(
         "Check PR #{pr}:{freshness_check}\n\
-         1. Run `gh pr view {pr} --json mergeable,headRefName,statusCheckRollup` — parse the JSON.\n\
+         1. Run `gh pr view {pr} --json mergeable,headRefName,baseRefName,statusCheckRollup` — parse the JSON.\n\
          2. If `mergeable` is `CONFLICTING`, do NOT treat the PR as healthy. \
          Repair it only inside an isolated worktree:\n\
             ```\n\
             BRANCH=$(gh pr view {pr} --json headRefName --jq .headRefName)\n\
+            BASE=$(gh pr view {pr} --json baseRefName --jq .baseRefName)\n\
             git fetch origin \"$BRANCH\"\n\
-            git fetch origin main\n\
+            git fetch origin \"$BASE\"\n\
             git worktree remove /tmp/harness-rebase-{pr} 2>/dev/null || rm -rf /tmp/harness-rebase-{pr} 2>/dev/null || true\n\
             git worktree prune\n\
             git worktree add /tmp/harness-rebase-{pr} \"$BRANCH\"\n\
             cd /tmp/harness-rebase-{pr}\n\
-            git rebase origin/main\n\
+            git rebase \"origin/$BASE\"\n\
             git push --force-with-lease origin \"$BRANCH\"\n\
             ```\n\
             If you cannot complete that repair, explain that manual resolution required and print WAITING on the last line.\n\
@@ -338,12 +342,20 @@ mod tests {
             "must instruct agent to check state field for SUCCESS"
         );
         assert!(
-            p.contains("--json mergeable,headRefName,statusCheckRollup"),
+            p.contains("--json mergeable,headRefName,baseRefName,statusCheckRollup"),
             "must require mergeability inspection before health checks"
         );
         assert!(
             p.contains("git worktree add /tmp/harness-rebase-10"),
             "conflict repair must happen in an isolated worktree"
+        );
+        assert!(
+            p.contains("BASE=$(gh pr view 10 --json baseRefName --jq .baseRefName)"),
+            "conflict repair must derive the base branch from PR metadata"
+        );
+        assert!(
+            p.contains("git rebase \"origin/$BASE\""),
+            "conflict repair must rebase onto the actual base branch"
         );
     }
 
@@ -360,10 +372,24 @@ mod tests {
     #[test]
     fn resumed_pr_conflict_prompt_requires_exact_terminal_tokens() {
         let p = check_resumed_pr_conflicts(17, "owner/repo", std::path::Path::new("."));
-        assert!(p.contains("gh pr view 17 --json mergeable,headRefName,url"));
+        assert!(p.contains("gh pr view 17 --json mergeable,headRefName,baseRefName,url"));
         assert!(p.contains("git worktree add /tmp/harness-rebase-17"));
+        assert!(p.contains("git rebase \"origin/$BASE\""));
         assert!(p.contains("CLEAN_PR"));
         assert!(p.contains("REBASE_PUSHED"));
         assert!(p.contains("MANUAL_RESOLUTION_REQUIRED"));
+    }
+
+    #[test]
+    fn rebase_prompt_uses_pr_base_branch() {
+        let p = rebase_conflicting_pr(
+            42,
+            "feat/my-branch",
+            "owner/repo",
+            std::path::Path::new("."),
+        );
+        assert!(p.contains("gh pr view 42 --json baseRefName --jq .baseRefName"));
+        assert!(p.contains("git fetch origin \"$BASE\""));
+        assert!(p.contains("git rebase \"origin/$BASE\""));
     }
 }

@@ -346,17 +346,38 @@ pub fn parse_plan_issue(output: &str) -> Option<String> {
     None
 }
 
-/// Parse `PUSHED_COMMIT=true|false` from agent output.
+/// Parse an optional `PUSHED_COMMIT=true|false` marker from agent output.
 ///
-/// Used by PR-check flows to propagate whether the agent pushed a commit
-/// during the initial pass, so later review freshness gates can require a
-/// re-review of the latest commit.
-pub fn parse_pushed_commit(output: &str) -> bool {
-    output.lines().rev().any(|line| {
-        line.trim()
-            .strip_prefix("PUSHED_COMMIT=")
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
-    })
+/// Returns:
+/// - `Ok(Some(true|false))` when the marker is present and valid
+/// - `Ok(None)` when the marker is absent
+/// - `Err(...)` when the marker is duplicated or malformed
+///
+/// PR-check flows require this marker so they can fail closed if an agent
+/// pushed new code without surfacing that fact to the freshness gate.
+pub fn parse_pushed_commit(output: &str) -> Result<Option<bool>, String> {
+    let mut parsed: Option<bool> = None;
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("PUSHED_COMMIT=") else {
+            continue;
+        };
+        if parsed.is_some() {
+            return Err("duplicate PUSHED_COMMIT marker".to_string());
+        }
+        let value = value.trim();
+        let bool_value = match value.to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(format!(
+                    "invalid PUSHED_COMMIT value `{value}`; expected true or false"
+                ));
+            }
+        };
+        parsed = Some(bool_value);
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -382,14 +403,31 @@ mod tests {
 
     #[test]
     fn test_parse_pushed_commit() {
-        assert!(parse_pushed_commit(
-            "PR_URL=https://github.com/o/r/pull/1\nPUSHED_COMMIT=true"
-        ));
-        assert!(parse_pushed_commit("PUSHED_COMMIT=TRUE\nFIXED"));
-        assert!(!parse_pushed_commit(
-            "PR_URL=https://github.com/o/r/pull/1\nPUSHED_COMMIT=false\nLGTM"
-        ));
-        assert!(!parse_pushed_commit("LGTM"));
+        assert_eq!(
+            parse_pushed_commit("PR_URL=https://github.com/o/r/pull/1\nPUSHED_COMMIT=true"),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            parse_pushed_commit("PUSHED_COMMIT=TRUE\nFIXED"),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            parse_pushed_commit("PR_URL=https://github.com/o/r/pull/1\nPUSHED_COMMIT=false\nLGTM"),
+            Ok(Some(false))
+        );
+        assert_eq!(parse_pushed_commit("LGTM"), Ok(None));
+    }
+
+    #[test]
+    fn test_parse_pushed_commit_rejects_malformed_or_duplicate_markers() {
+        assert_eq!(
+            parse_pushed_commit("PUSHED_COMMIT=maybe\nFIXED"),
+            Err("invalid PUSHED_COMMIT value `maybe`; expected true or false".to_string())
+        );
+        assert_eq!(
+            parse_pushed_commit("PUSHED_COMMIT=true\nPUSHED_COMMIT=false\nFIXED"),
+            Err("duplicate PUSHED_COMMIT marker".to_string())
+        );
     }
 
     #[test]
