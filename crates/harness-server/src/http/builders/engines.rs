@@ -140,8 +140,8 @@ pub(crate) async fn build_engines(
     };
 
     let retention = server.config.observe.log_retention_days;
-    if retention > 0 && events.is_some() {
-        let purge_events = Arc::clone(events.as_ref().expect("checked is_some above"));
+    if let (true, Some(events)) = (retention > 0, events.as_ref()) {
+        let purge_events = Arc::clone(events);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(24 * 3600)).await;

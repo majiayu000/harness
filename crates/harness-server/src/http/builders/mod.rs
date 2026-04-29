@@ -27,10 +27,10 @@ where
 pub(crate) fn forced_startup_error(name: &'static str) -> Option<String> {
     #[cfg(test)]
     {
-        return FORCED_STARTUP_FAILURES
+        FORCED_STARTUP_FAILURES
             .try_with(|failures| failures.get(name).cloned())
             .ok()
-            .flatten();
+            .flatten()
     }
 
     #[cfg(not(test))]
