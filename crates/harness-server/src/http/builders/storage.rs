@@ -12,6 +12,13 @@ pub(crate) struct StorageBundle {
     pub startup_results: Vec<StoreStartupResult>,
 }
 
+fn failed_storage_startup_results(error: &str) -> Vec<StoreStartupResult> {
+    vec![
+        StoreStartupResult::critical("tasks").failed(error),
+        StoreStartupResult::optional("q_value_store").failed(error),
+    ]
+}
+
 /// Initialize persistent storage: validate `data_dir`, open the task DB and
 /// optionally the Q-value DB.
 ///
@@ -26,14 +33,6 @@ pub(crate) async fn build_storage_with_database_url(
     data_dir: &Path,
     configured_database_url: Option<&str>,
 ) -> anyhow::Result<StorageBundle> {
-    fn startup_failure(name: &'static str, critical: bool, error: &str) -> StoreStartupResult {
-        if critical {
-            StoreStartupResult::critical(name).failed(error)
-        } else {
-            StoreStartupResult::optional(name).failed(error)
-        }
-    }
-
     std::fs::create_dir_all(data_dir)?;
 
     #[cfg(unix)]
@@ -66,10 +65,7 @@ pub(crate) async fn build_storage_with_database_url(
             return Ok(StorageBundle {
                 tasks: None,
                 q_values: None,
-                startup_results: vec![
-                    startup_failure("tasks", true, &error),
-                    startup_failure("q_value_store", false, &error),
-                ],
+                startup_results: failed_storage_startup_results(&error),
             });
         }
     };
@@ -80,10 +76,7 @@ pub(crate) async fn build_storage_with_database_url(
             return Ok(StorageBundle {
                 tasks: None,
                 q_values: None,
-                startup_results: vec![
-                    startup_failure("tasks", true, &error),
-                    startup_failure("q_value_store", false, &error),
-                ],
+                startup_results: failed_storage_startup_results(&error),
             });
         }
     };
@@ -184,6 +177,18 @@ mod tests {
         assert!(bundle.startup_results[0].ready);
         assert!(!bundle.startup_results[1].ready);
         assert!(!bundle.startup_results[1].is_critical());
+    }
+
+    #[test]
+    fn bootstrap_failure_records_all_storage_statuses() {
+        let statuses = failed_storage_startup_results("database unavailable");
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].name, "tasks");
+        assert!(statuses[0].is_critical());
+        assert!(!statuses[0].ready);
+        assert_eq!(statuses[1].name, "q_value_store");
+        assert!(!statuses[1].is_critical());
+        assert!(!statuses[1].ready);
     }
 
     #[cfg(unix)]

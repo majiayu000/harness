@@ -19,6 +19,18 @@ pub(crate) struct RegistryBundle {
     pub startup_results: Vec<StoreStartupResult>,
 }
 
+fn failed_registry_startup_results(error: &str) -> Vec<StoreStartupResult> {
+    vec![
+        StoreStartupResult::critical("thread_db").failed(error),
+        StoreStartupResult::critical("plan_db").failed(error),
+        StoreStartupResult::optional("issue_workflow_store").failed(error),
+        StoreStartupResult::optional("project_workflow_store").failed(error),
+        StoreStartupResult::critical("project_registry").failed(error),
+        StoreStartupResult::optional("workspace_manager").failed(error),
+        StoreStartupResult::optional("runtime_state_store").failed(error),
+    ]
+}
+
 /// Initialize thread DB, plan DB, plan cache, project registry, workspace
 /// manager, and runtime state store.
 ///
@@ -30,14 +42,6 @@ pub(crate) async fn build_registry(
     project_root: &Path,
     tasks: &Arc<crate::task_runner::TaskStore>,
 ) -> anyhow::Result<RegistryBundle> {
-    fn startup_failure(name: &'static str, critical: bool, error: &str) -> StoreStartupResult {
-        if critical {
-            StoreStartupResult::critical(name).failed(error)
-        } else {
-            StoreStartupResult::optional(name).failed(error)
-        }
-    }
-
     let configured_database_url = server.config.server.database_url.as_deref();
     let workflow_config =
         harness_core::config::workflow::load_workflow_config(project_root).unwrap_or_default();
@@ -58,14 +62,7 @@ pub(crate) async fn build_registry(
                 project_registry: None,
                 runtime_state_store: None,
                 workspace_mgr: None,
-                startup_results: vec![
-                    startup_failure("thread_db", true, &error),
-                    startup_failure("plan_db", true, &error),
-                    startup_failure("issue_workflow_store", false, &error),
-                    startup_failure("project_workflow_store", false, &error),
-                    startup_failure("project_registry", true, &error),
-                    startup_failure("runtime_state_store", false, &error),
-                ],
+                startup_results: failed_registry_startup_results(&error),
             });
         }
     };
@@ -82,14 +79,7 @@ pub(crate) async fn build_registry(
                 project_registry: None,
                 runtime_state_store: None,
                 workspace_mgr: None,
-                startup_results: vec![
-                    startup_failure("thread_db", true, &error),
-                    startup_failure("plan_db", true, &error),
-                    startup_failure("issue_workflow_store", false, &error),
-                    startup_failure("project_workflow_store", false, &error),
-                    startup_failure("project_registry", true, &error),
-                    startup_failure("runtime_state_store", false, &error),
-                ],
+                startup_results: failed_registry_startup_results(&error),
             });
         }
     };
@@ -108,10 +98,7 @@ pub(crate) async fn build_registry(
         None => match crate::thread_db::ThreadDb::open_with_context(&thread_context, &setup_pool)
             .await
         {
-            Ok(thread_db) => {
-                startup_results.push(StoreStartupResult::critical("thread_db"));
-                Some(thread_db)
-            }
+            Ok(thread_db) => Some(thread_db),
             Err(error) => {
                 startup_results
                     .push(StoreStartupResult::critical("thread_db").failed(error.to_string()));
@@ -122,11 +109,21 @@ pub(crate) async fn build_registry(
 
     // Load persisted threads into the in-memory ThreadManager cache.
     if let Some(thread_db) = thread_db.as_ref() {
-        for thread in thread_db.list().await? {
-            server
-                .thread_manager
-                .threads_cache()
-                .insert(thread.id.as_str().to_string(), thread);
+        match thread_db.list().await {
+            Ok(threads) => {
+                for thread in threads {
+                    server
+                        .thread_manager
+                        .threads_cache()
+                        .insert(thread.id.as_str().to_string(), thread);
+                }
+                startup_results.push(StoreStartupResult::critical("thread_db"));
+            }
+            Err(error) => {
+                startup_results
+                    .push(StoreStartupResult::critical("thread_db").failed(error.to_string()));
+                tracing::warn!("thread cache: failed to load threads on startup: {error}");
+            }
         }
     }
 
@@ -489,7 +486,11 @@ pub(crate) async fn build_registry(
                     )
                     .await
                     {
-                        Ok(store) => Some(Arc::new(store)),
+                        Ok(store) => {
+                            startup_results
+                                .push(StoreStartupResult::optional("runtime_state_store"));
+                            Some(Arc::new(store))
+                        }
                         Err(e) => {
                             startup_results.push(
                                 StoreStartupResult::optional("runtime_state_store")
@@ -517,14 +518,6 @@ pub(crate) async fn build_registry(
             },
         }
     };
-
-    if runtime_state_store.is_some()
-        && !startup_results
-            .iter()
-            .any(|result| result.name == "runtime_state_store")
-    {
-        startup_results.push(StoreStartupResult::optional("runtime_state_store"));
-    }
 
     setup_pool.close().await;
 
@@ -814,6 +807,18 @@ mod tests {
             assert!(!status.is_critical());
             assert!(!status.ready);
         }
+    }
+
+    #[test]
+    fn bootstrap_failure_records_workspace_manager_status() {
+        let statuses = failed_registry_startup_results("database unavailable");
+        let workspace_status = statuses
+            .iter()
+            .find(|status| status.name == "workspace_manager")
+            .expect("workspace_manager status");
+
+        assert!(!workspace_status.ready);
+        assert!(!workspace_status.is_critical());
     }
 
     #[tokio::test]
