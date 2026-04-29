@@ -282,6 +282,15 @@ struct ReviewLoopDecision {
     wait_for_bot: bool,
 }
 
+fn quota_trigger(bot: ReviewBotKey) -> harness_workflow::issue_lifecycle::ReviewFallbackTrigger {
+    match bot {
+        ReviewBotKey::Gemini => {
+            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::GeminiQuota
+        }
+        ReviewBotKey::Codex => harness_workflow::issue_lifecycle::ReviewFallbackTrigger::CodexQuota,
+    }
+}
+
 fn bot_fallback_chain(
     review_config: &harness_core::config::agents::AgentReviewConfig,
 ) -> Vec<ReviewBotDescriptor> {
@@ -634,12 +643,7 @@ fn decide_review_loop_action(
         });
     }
 
-    let secondary = chain
-        .iter()
-        .skip(1)
-        .find(|bot| bot.key == ReviewBotKey::Codex)
-        .cloned()
-        .unwrap_or_else(|| primary.clone());
+    let secondary = chain.get(1).cloned().unwrap_or_else(|| primary.clone());
     let secondary_key = secondary.key;
     let secondary_signals = signals
         .bots
@@ -658,7 +662,7 @@ fn decide_review_loop_action(
     );
     let fallback_b = Some(ReviewFallbackState {
         tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::B,
-        trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger::GeminiQuota,
+        trigger: quota_trigger(primary.key),
         active_bot: Some(secondary.key),
     });
     match secondary_classification {
@@ -766,6 +770,7 @@ pub(crate) async fn run_review_loop(
 
     let mut silence_rounds = 0u32;
     let mut last_bot_activity_at = None;
+    let mut waiting_on_bot = None;
     let bot_chain = bot_fallback_chain(review_config);
 
     // Review loop.
@@ -944,7 +949,9 @@ pub(crate) async fn run_review_loop(
                     return Ok(());
                 }
                 if decision.wait_for_bot {
-                    if decision.active_bot.key == ReviewBotKey::Codex {
+                    if decision.active_bot.key == ReviewBotKey::Codex
+                        && waiting_on_bot != Some(decision.active_bot.key)
+                    {
                         if let Err(error) = post_review_bot_comment(
                             &repo_slug,
                             pr_num,
@@ -954,6 +961,8 @@ pub(crate) async fn run_review_loop(
                         .await
                         {
                             tracing::warn!(pr = pr_num, "failed to summon Codex reviewer: {error}");
+                        } else {
+                            waiting_on_bot = Some(decision.active_bot.key);
                         }
                     }
                     tracing::info!(
@@ -971,8 +980,10 @@ pub(crate) async fn run_review_loop(
                     sleep(Duration::from_secs(wait_secs)).await;
                     continue;
                 }
+                waiting_on_bot = None;
             }
             Err(error) => {
+                waiting_on_bot = None;
                 tracing::warn!(
                     pr = pr_num,
                     error = %error,
@@ -1484,6 +1495,12 @@ mod tests {
         harness_core::config::agents::AgentReviewConfig::default()
     }
 
+    fn review_config_with_chain(chain: &[&str]) -> harness_core::config::agents::AgentReviewConfig {
+        let mut config = review_config();
+        config.fallback_chain = chain.iter().map(|entry| (*entry).to_string()).collect();
+        config
+    }
+
     fn signals_with(primary: BotSignals, secondary: BotSignals) -> PullRequestSignals {
         let latest_commit_at = Utc::now() - chrono::Duration::minutes(45);
         let mut bots = HashMap::new();
@@ -1665,5 +1682,32 @@ mod tests {
         assert_eq!(decision.active_bot.key, ReviewBotKey::Gemini);
         assert!(decision.fallback.is_none());
         assert!(!decision.wait_for_bot);
+    }
+
+    #[test]
+    fn respects_configured_secondary_order() {
+        let mut codex = bot_signals();
+        codex.reviewed_any_commit = true;
+        codex.latest_comment_at = Some(Utc::now());
+        codex.latest_comment_body =
+            Some("Codex usage limits have been reached for this account.".to_string());
+        let decision = decide_review_loop_action(
+            &bot_fallback_chain(&review_config_with_chain(&["codex", "gemini"])),
+            &signals_with(bot_signals(), codex),
+            0,
+            &review_config_with_chain(&["codex", "gemini"]),
+        )
+        .expect("decision");
+        assert_eq!(decision.active_bot.key, ReviewBotKey::Gemini);
+        let fallback = decision.fallback.expect("fallback");
+        assert_eq!(
+            fallback.tier,
+            harness_workflow::issue_lifecycle::ReviewFallbackTier::B
+        );
+        assert_eq!(
+            fallback.trigger,
+            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::CodexQuota
+        );
+        assert!(decision.wait_for_bot);
     }
 }
