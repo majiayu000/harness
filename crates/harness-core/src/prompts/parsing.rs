@@ -1,5 +1,12 @@
 use super::last_non_empty_line;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrReviewPrepOutcome {
+    RebasePushed,
+    RebaseSkipped,
+    RebaseConflict { paths: Vec<String> },
+}
+
 /// Extract `ISSUE:` prefixed lines from agent review output.
 pub fn extract_review_issues(output: &str) -> Vec<String> {
     output
@@ -106,6 +113,45 @@ pub fn parse_pr_url(output: &str) -> Option<String> {
 
     // Second pass: bare GitHub PR URL anywhere in the output.
     scan_bare_pr_url(&stripped)
+}
+
+/// Parse the strict rebase-preparation sentinel emitted by `pr:N` implement turns.
+///
+/// Accepted lines:
+/// - `REBASE_PUSHED`
+/// - `REBASE_SKIPPED`
+/// - `REBASE_CONFLICT paths=path1,path2`
+///
+/// Returns `None` when the sentinel is missing or malformed so the server can
+/// fail closed instead of assuming a review-prep outcome.
+pub fn parse_pr_review_prep_outcome(output: &str) -> Option<PrReviewPrepOutcome> {
+    let stripped = strip_ansi_codes(output);
+
+    for line in stripped.lines().rev() {
+        let line = line.trim();
+        match line {
+            "REBASE_PUSHED" => return Some(PrReviewPrepOutcome::RebasePushed),
+            "REBASE_SKIPPED" => return Some(PrReviewPrepOutcome::RebaseSkipped),
+            _ => {
+                if let Some(rest) = line.strip_prefix("REBASE_CONFLICT ") {
+                    let paths = rest.strip_prefix("paths=")?;
+                    let paths: Vec<String> = paths
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                        .map(ToString::to_string)
+                        .collect();
+                    return (!paths.is_empty())
+                        .then_some(PrReviewPrepOutcome::RebaseConflict { paths });
+                }
+                if line.starts_with("REBASE_") {
+                    return None;
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Returns `true` only for well-formed GitHub PR URLs.
@@ -742,6 +788,51 @@ PR_URL=https://github.com/owner/repo/pull/269";
         let output = "done\nPR_URL=https://github.com/o/r/pull/5  \n";
         let url = parse_pr_url(output).unwrap();
         assert_eq!(extract_pr_number(&url), Some(5));
+    }
+
+    #[test]
+    fn test_parse_pr_review_prep_outcome_pushed() {
+        assert_eq!(
+            parse_pr_review_prep_outcome(
+                "done\nREBASE_PUSHED\nPR_URL=https://github.com/o/r/pull/5"
+            ),
+            Some(PrReviewPrepOutcome::RebasePushed)
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_review_prep_outcome_skipped() {
+        assert_eq!(
+            parse_pr_review_prep_outcome(
+                "done\nREBASE_SKIPPED\nPR_URL=https://github.com/o/r/pull/5"
+            ),
+            Some(PrReviewPrepOutcome::RebaseSkipped)
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_review_prep_outcome_conflict_with_multiple_paths() {
+        assert_eq!(
+            parse_pr_review_prep_outcome(
+                "REBASE_CONFLICT paths=src/lib.rs, crates/harness-server/src/task_executor/mod.rs"
+            ),
+            Some(PrReviewPrepOutcome::RebaseConflict {
+                paths: vec![
+                    "src/lib.rs".to_string(),
+                    "crates/harness-server/src/task_executor/mod.rs".to_string(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_review_prep_outcome_missing_or_malformed_is_none() {
+        assert_eq!(
+            parse_pr_review_prep_outcome("PR_URL=https://github.com/o/r/pull/5"),
+            None
+        );
+        assert_eq!(parse_pr_review_prep_outcome("REBASE_CONFLICT"), None);
+        assert_eq!(parse_pr_review_prep_outcome("REBASE_CONFLICT paths="), None);
     }
 
     #[test]

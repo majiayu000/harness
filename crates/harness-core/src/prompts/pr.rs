@@ -248,6 +248,54 @@ pub fn check_existing_pr(
     )
 }
 
+/// Build prompt: prepare an existing PR branch for downstream review.
+///
+/// This is the implement-phase prompt for `pr:N` tasks. It resolves the PR head
+/// branch from GitHub, fetches that branch even for fork PRs, rebases only when
+/// the PR is behind `origin/main`, and emits a strict machine-readable outcome
+/// for the server to parse before any review work starts.
+pub fn prepare_pr_for_review(pr: u64, repo: &str) -> String {
+    format!(
+        "Prepare PR #{pr} in `{repo}` for downstream review.\n\n\
+         IMPORTANT: Never run `git checkout` or `git stash` in the main repository working tree.\n\
+         All work must be done in an isolated `/tmp/harness-pr-{pr}` worktree.\n\n\
+         Steps:\n\
+         1. Resolve the PR head branch, head repository, and canonical PR URL from GitHub:\n\
+            - `gh pr view {pr} --repo {repo} --json headRefName,headRepositoryOwner,headRepository,url`\n\
+            - If `headRepository` is null, stop and report that the PR head repository is unavailable.\n\
+         2. Fetch the PR head branch from its actual head repository, capture that commit, then fetch latest main:\n\
+            - `HEAD_REPO_URL=https://github.com/<head-owner>/<head-repo>.git`\n\
+            - `git fetch \"$HEAD_REPO_URL\" \"<head-branch>\"`\n\
+            - `PR_HEAD_SHA=$(git rev-parse FETCH_HEAD)`\n\
+            - `git fetch origin main`\n\
+         3. Recreate the isolated worktree at `/tmp/harness-pr-{pr}` from the captured PR head commit:\n\
+            ```\n\
+            git worktree remove /tmp/harness-pr-{pr} 2>/dev/null || rm -rf /tmp/harness-pr-{pr} 2>/dev/null || true\n\
+            git worktree prune\n\
+            git worktree add /tmp/harness-pr-{pr} --detach \"$PR_HEAD_SHA\"\n\
+            cd /tmp/harness-pr-{pr}\n\
+            git switch -C \"<head-branch>\"\n\
+            ```\n\
+         4. Inside `/tmp/harness-pr-{pr}`, compare the PR branch against `origin/main`:\n\
+            - Compute `git merge-base HEAD origin/main`\n\
+            - Compute `git rev-parse origin/main`\n\
+            - If those SHAs are equal, the branch is already up to date. Do not rebase or push.\n\
+         5. If the branch is behind `origin/main`, run `git rebase origin/main` inside `/tmp/harness-pr-{pr}`.\n\
+         6. If the rebase is clean, push exactly once with lease safety:\n\
+            - `git push --force-with-lease \"$HEAD_REPO_URL\" HEAD:\"<head-branch>\"`\n\
+         7. If the rebase conflicts, do NOT resolve conflicts automatically. Capture the conflicting paths with:\n\
+            - `git diff --name-only --diff-filter=U`\n\
+            - Abort the rebase (`git rebase --abort || true`) and stop.\n\n\
+         Output contract:\n\
+         - Print exactly one sentinel on its own line:\n\
+           - `REBASE_PUSHED` if you rebased cleanly and pushed with `--force-with-lease`\n\
+           - `REBASE_SKIPPED` if the branch was already up to date with `origin/main`\n\
+           - `REBASE_CONFLICT paths=<comma-separated paths>` if the rebase conflicted\n\
+         - Always print `PR_URL=https://github.com/{repo}/pull/{pr}` on its own line.\n\
+         - Do not print `LGTM`, `FIXED`, or `WAITING` in this phase."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +447,28 @@ mod tests {
         assert!(p.contains("gh pr view 42 --json baseRefName --jq .baseRefName"));
         assert!(p.contains("git fetch origin \"$BASE\""));
         assert!(p.contains("git rebase \"origin/$BASE\""));
+    }
+
+    #[test]
+    fn prepare_pr_for_review_uses_isolated_worktree_and_main_comparison() {
+        let p = prepare_pr_for_review(42, "owner/repo");
+        assert!(p.contains("/tmp/harness-pr-42"));
+        assert!(p.contains("git worktree add /tmp/harness-pr-42"));
+        assert!(p.contains("headRepositoryOwner"));
+        assert!(p.contains("headRepository"));
+        assert!(p.contains("PR_HEAD_SHA=$(git rev-parse FETCH_HEAD)"));
+        assert!(p.contains("git worktree add /tmp/harness-pr-42 --detach \"$PR_HEAD_SHA\""));
+        assert!(p.contains("git merge-base HEAD origin/main"));
+        assert!(p.contains("git rev-parse origin/main"));
+    }
+
+    #[test]
+    fn prepare_pr_for_review_requires_force_with_lease_and_sentinels() {
+        let p = prepare_pr_for_review(42, "owner/repo");
+        assert!(p.contains("git push --force-with-lease \"$HEAD_REPO_URL\" HEAD:\"<head-branch>\""));
+        assert!(p.contains("REBASE_PUSHED"));
+        assert!(p.contains("REBASE_SKIPPED"));
+        assert!(p.contains("REBASE_CONFLICT paths=<comma-separated paths>"));
+        assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/42"));
     }
 }

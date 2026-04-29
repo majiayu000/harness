@@ -8,7 +8,7 @@ pub(crate) mod triage_pipeline;
 pub(crate) mod turn_lifecycle;
 
 use crate::task_runner::{
-    mutate_and_persist, CreateTaskRequest, TaskId, TaskKind, TaskStatus, TaskStore,
+    mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskKind, TaskStatus, TaskStore,
 };
 use anyhow::Context;
 use harness_core::agent::{AgentRequest, CodeAgent};
@@ -77,6 +77,99 @@ pub(crate) struct TaskContext {
 
 fn should_run_issue_triage(skip_triage: bool, has_existing_pr: bool) -> bool {
     !skip_triage && !has_existing_pr
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewEntryDecision {
+    Proceed { rebase_pushed: bool },
+    FailConflict { error: String, paths_csv: String },
+}
+
+fn review_entry_decision(
+    pr_num: u64,
+    review_prep: Option<&prompts::PrReviewPrepOutcome>,
+) -> ReviewEntryDecision {
+    match review_prep {
+        Some(prompts::PrReviewPrepOutcome::RebasePushed) => ReviewEntryDecision::Proceed {
+            rebase_pushed: true,
+        },
+        Some(prompts::PrReviewPrepOutcome::RebaseSkipped) | None => ReviewEntryDecision::Proceed {
+            rebase_pushed: false,
+        },
+        Some(prompts::PrReviewPrepOutcome::RebaseConflict { paths }) => {
+            let paths_csv = if paths.is_empty() {
+                "unknown paths".to_string()
+            } else {
+                paths.join(", ")
+            };
+            ReviewEntryDecision::FailConflict {
+                error: format!(
+                    "PR #{pr_num} has rebase conflicts: {paths_csv}; manual resolution required"
+                ),
+                paths_csv,
+            }
+        }
+    }
+}
+
+fn review_prep_from_rounds(rounds: &[RoundResult]) -> Option<prompts::PrReviewPrepOutcome> {
+    rounds
+        .iter()
+        .rev()
+        .find(|round| round.action == "implement")
+        .and_then(|round| match round.result.as_str() {
+            "rebase_pushed" => Some(prompts::PrReviewPrepOutcome::RebasePushed),
+            "rebase_skipped" => Some(prompts::PrReviewPrepOutcome::RebaseSkipped),
+            "rebase_conflict" => round
+                .detail
+                .as_deref()
+                .and_then(prompts::parse_pr_review_prep_outcome)
+                .or_else(|| {
+                    Some(prompts::PrReviewPrepOutcome::RebaseConflict { paths: Vec::new() })
+                }),
+            _ => None,
+        })
+}
+
+fn review_prep_from_checkpoint_phase(last_phase: &str) -> Option<prompts::PrReviewPrepOutcome> {
+    match last_phase {
+        "rebase_pushed" => Some(prompts::PrReviewPrepOutcome::RebasePushed),
+        "rebase_skipped" => Some(prompts::PrReviewPrepOutcome::RebaseSkipped),
+        "rebase_conflict" => Some(prompts::PrReviewPrepOutcome::RebaseConflict { paths: Vec::new() }),
+        _ => None,
+    }
+}
+
+async fn fail_rebase_conflict(
+    store: &TaskStore,
+    task_id: &TaskId,
+    events: &Arc<harness_observe::event_store::EventStore>,
+    pr_num: u64,
+    error: String,
+    paths_csv: String,
+) -> anyhow::Result<()> {
+    mutate_and_persist(store, task_id, |s| {
+        s.status = TaskStatus::Failed;
+        s.error = Some(error.clone());
+    })
+    .await?;
+    store.log_event(crate::event_replay::TaskEvent::Failed {
+        task_id: task_id.0.clone(),
+        ts: crate::event_replay::now_ts(),
+        reason: error,
+    });
+    let mut event = harness_core::types::Event::new(
+        harness_core::types::SessionId::new(),
+        "pr_rebase_conflict",
+        "task_runner",
+        harness_core::types::Decision::Block,
+    );
+    event.reason = Some(paths_csv);
+    event.detail = Some(format!("task_id={} pr={pr_num}", task_id.as_str()));
+    if let Err(err) = events.log(&event).await {
+        tracing::warn!("failed to log pr_rebase_conflict event: {err}");
+    }
+    Ok(())
 }
 
 /// Run the project's test commands as a hard gate before accepting LGTM.
@@ -753,7 +846,8 @@ pub(crate) async fn run_task(
     // Check task store for an existing pr_url first — this survives checkpoint
     // read failures (e.g. transient SQLite contention) and lets us safely
     // resume review even when the checkpoint row is temporarily unreadable.
-    let task_pr_url: Option<String> = store.get(task_id).and_then(|t| t.pr_url);
+    let task_state = store.get(task_id);
+    let task_pr_url: Option<String> = task_state.as_ref().and_then(|t| t.pr_url.clone());
     let checkpoint = match store.load_checkpoint(task_id).await {
         Ok(cp) => cp,
         Err(e) => {
@@ -777,12 +871,20 @@ pub(crate) async fn run_task(
             }
         }
     };
+    let resumed_review_prep = task_state
+        .as_ref()
+        .and_then(|task| review_prep_from_rounds(&task.rounds))
+        .or_else(|| {
+            checkpoint
+                .as_ref()
+                .and_then(|c| review_prep_from_checkpoint_phase(&c.last_phase))
+        });
     let resumed_pr_url: Option<String> =
         task_pr_url.or_else(|| checkpoint.as_ref().and_then(|c| c.pr_url.clone()));
     // Capture before `resumed_pr_url` is moved into run_implement_phase.
     // Also covers fresh pr:N tasks from webhook (req.pr is set but no checkpoint pr_url yet).
     let mut was_resumed_pr = resumed_pr_url.is_some() || req.pr.is_some();
-    let resumed_plan: Option<String> = checkpoint.and_then(|c| c.plan_output);
+    let resumed_plan: Option<String> = checkpoint.as_ref().and_then(|c| c.plan_output.clone());
 
     // --- Pipeline: Triage → Plan → Implement ---
     // For issue-based tasks without an existing PR, run triage first.
@@ -895,7 +997,7 @@ pub(crate) async fn run_task(
 
     let mut current_plan_output = plan_output;
     let mut replan_attempted = false;
-    let (pr_url, pr_num, implementation_pushed_commit, context_items) = loop {
+    let (pr_url, pr_num, implementation_pushed_commit, review_prep, context_items) = loop {
         let outcome = implement_pipeline::run_implement_phase(
             store,
             task_id,
@@ -914,6 +1016,7 @@ pub(crate) async fn run_task(
             &project_root,
             current_plan_output.clone(),
             resumed_pr_url.clone(),
+            resumed_review_prep.clone(),
             issue_workflow_store.clone(),
             turn_timeout,
             effective_max_turns,
@@ -929,9 +1032,16 @@ pub(crate) async fn run_task(
                 pr_url,
                 pr_num,
                 implementation_pushed_commit,
+                review_prep,
                 context_items,
                 ..
-            } => break (pr_url, pr_num, implementation_pushed_commit, context_items),
+            } => break (
+                pr_url,
+                pr_num,
+                implementation_pushed_commit,
+                review_prep,
+                context_items,
+            ),
             implement_pipeline::ImplementOutcome::Replan {
                 issue,
                 plan_issue,
@@ -1019,7 +1129,23 @@ pub(crate) async fn run_task(
         return Ok(());
     }
 
-    let rebase_pushed = if was_resumed_pr {
+    let mut rebase_pushed = match review_entry_decision(pr_num, review_prep.as_ref()) {
+        ReviewEntryDecision::Proceed { rebase_pushed } => rebase_pushed,
+        ReviewEntryDecision::FailConflict { error, paths_csv } => {
+            fail_rebase_conflict(store, task_id, &events, pr_num, error, paths_csv).await?;
+            tracing::info!(
+                task_id = %task_id,
+                status = "failed",
+                turns = turns_used,
+                pr = pr_num,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+            );
+            return Ok(());
+        }
+    };
+
+    if review_prep.is_none() && was_resumed_pr {
         match run_resumed_pr_conflict_gate(
             store,
             task_id,
@@ -1039,13 +1165,15 @@ pub(crate) async fn run_task(
         )
         .await?
         {
-            ConflictGateOutcome::Clean => false,
-            ConflictGateOutcome::RebasePushed => true,
+            ConflictGateOutcome::Clean => {
+                rebase_pushed = false;
+            }
+            ConflictGateOutcome::RebasePushed => {
+                rebase_pushed = true;
+            }
             ConflictGateOutcome::Failed => return Ok(()),
         }
-    } else {
-        false
-    };
+    }
 
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
@@ -1365,6 +1493,130 @@ mod tests {
             !implement_pipeline::task_needs_pr_url(&req),
             "prompt-only task must not require PR_URL (Done is correct)"
         );
+    }
+
+    #[test]
+    fn review_entry_decision_blocks_review_on_rebase_conflict() {
+        assert_eq!(
+            review_entry_decision(
+                42,
+                Some(&prompts::PrReviewPrepOutcome::RebaseConflict {
+                    paths: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                })
+            ),
+            ReviewEntryDecision::FailConflict {
+                error: "PR #42 has rebase conflicts: src/lib.rs, src/main.rs; manual resolution required".to_string(),
+                paths_csv: "src/lib.rs, src/main.rs".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn review_entry_decision_propagates_rebase_pushed_flag() {
+        assert_eq!(
+            review_entry_decision(42, Some(&prompts::PrReviewPrepOutcome::RebasePushed)),
+            ReviewEntryDecision::Proceed {
+                rebase_pushed: true
+            }
+        );
+        assert_eq!(
+            review_entry_decision(42, Some(&prompts::PrReviewPrepOutcome::RebaseSkipped)),
+            ReviewEntryDecision::Proceed {
+                rebase_pushed: false
+            }
+        );
+    }
+
+    #[test]
+    fn review_prep_from_rounds_prefers_latest_implement_round() {
+        let rounds = vec![
+            RoundResult::new(1, "implement", "rebase_skipped", None, None, None),
+            RoundResult::new(2, "review", "needs_fix", None, None, None),
+            RoundResult::new(3, "implement", "rebase_pushed", None, None, None),
+        ];
+        assert_eq!(
+            review_prep_from_rounds(&rounds),
+            Some(prompts::PrReviewPrepOutcome::RebasePushed)
+        );
+    }
+
+    #[test]
+    fn review_prep_from_rounds_recovers_rebase_conflict_detail() {
+        let rounds = vec![RoundResult::new(
+            1,
+            "implement",
+            "rebase_conflict",
+            Some("REBASE_CONFLICT paths=src/lib.rs,src/main.rs".to_string()),
+            None,
+            None,
+        )];
+        assert_eq!(
+            review_prep_from_rounds(&rounds),
+            Some(prompts::PrReviewPrepOutcome::RebaseConflict {
+                paths: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn review_prep_from_checkpoint_phase_recovers_rebase_state() {
+        assert_eq!(
+            review_prep_from_checkpoint_phase("rebase_pushed"),
+            Some(prompts::PrReviewPrepOutcome::RebasePushed)
+        );
+        assert_eq!(
+            review_prep_from_checkpoint_phase("rebase_skipped"),
+            Some(prompts::PrReviewPrepOutcome::RebaseSkipped)
+        );
+        assert_eq!(
+            review_prep_from_checkpoint_phase("rebase_conflict"),
+            Some(prompts::PrReviewPrepOutcome::RebaseConflict { paths: Vec::new() })
+        );
+        assert_eq!(review_prep_from_checkpoint_phase("pr_created"), None);
+    }
+
+    #[tokio::test]
+    async fn fail_rebase_conflict_marks_task_failed_and_logs_event() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+        let task_id = TaskId::new();
+        let state = crate::task_runner::TaskState::new(task_id.clone());
+        store.insert(&state).await;
+
+        fail_rebase_conflict(
+            &store,
+            &task_id,
+            &events,
+            42,
+            "PR #42 has rebase conflicts: src/lib.rs, src/main.rs; manual resolution required"
+                .to_string(),
+            "src/lib.rs, src/main.rs".to_string(),
+        )
+        .await?;
+
+        let final_state = store
+            .get(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task must exist"))?;
+        assert!(matches!(final_state.status, TaskStatus::Failed));
+        assert_eq!(
+            final_state.error.as_deref(),
+            Some(
+                "PR #42 has rebase conflicts: src/lib.rs, src/main.rs; manual resolution required"
+            )
+        );
+
+        let logged = events
+            .query(&harness_core::types::EventFilters {
+                hook: Some("pr_rebase_conflict".to_string()),
+                ..harness_core::types::EventFilters::default()
+            })
+            .await?;
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].reason.as_deref(), Some("src/lib.rs, src/main.rs"));
+        let expected_detail = format!("task_id={} pr=42", task_id.as_str());
+        assert_eq!(logged[0].detail.as_deref(), Some(expected_detail.as_str()));
+        Ok(())
     }
 
     // --- Gate A: pr:N task with non-empty output but no PR_URL gets Failed ---
