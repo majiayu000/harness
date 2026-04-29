@@ -199,6 +199,8 @@ struct GhIssue {
     url: String,
     html_url: Option<String>,
     #[serde(default)]
+    pull_request: Option<serde_json::Value>,
+    #[serde(default)]
     labels: Vec<GhLabel>,
     #[serde(alias = "createdAt")]
     created_at: Option<DateTime<Utc>>,
@@ -226,6 +228,10 @@ fn parse_gh_output(
     project_root: Option<&std::path::Path>,
 ) -> anyhow::Result<ParsedGhOutput> {
     let issues: Vec<GhIssue> = serde_json::from_slice(json)?;
+    let issues: Vec<GhIssue> = issues
+        .into_iter()
+        .filter(|issue| issue.pull_request.is_none())
+        .collect();
     let open_issue_ids: std::collections::HashSet<String> =
         issues.iter().map(|i| i.number.to_string()).collect();
     let new_issues = issues
@@ -465,6 +471,42 @@ mod tests {
         assert_eq!(parsed.new_issues.len(), 1);
         assert_eq!(parsed.new_issues[0].external_id, "3");
         assert_eq!(parsed.open_issue_ids.len(), 3);
+    }
+
+    #[test]
+    fn parse_gh_output_filters_pull_requests_from_issue_endpoint() {
+        let json = br#"[
+            {
+                "number": 10,
+                "title": "Actual issue",
+                "body": null,
+                "url": "https://api.github.com/repos/owner/repo/issues/10",
+                "html_url": "https://github.com/owner/repo/issues/10",
+                "labels": [],
+                "createdAt": null
+            },
+            {
+                "number": 11,
+                "title": "Open pull request",
+                "body": null,
+                "url": "https://api.github.com/repos/owner/repo/issues/11",
+                "html_url": "https://github.com/owner/repo/pull/11",
+                "pull_request": {
+                    "url": "https://api.github.com/repos/owner/repo/pulls/11",
+                    "html_url": "https://github.com/owner/repo/pull/11"
+                },
+                "labels": [],
+                "createdAt": null
+            }
+        ]"#;
+
+        let dispatched = DashMap::new();
+        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
+
+        assert_eq!(parsed.new_issues.len(), 1);
+        assert_eq!(parsed.new_issues[0].external_id, "10");
+        assert!(parsed.open_issue_ids.contains("10"));
+        assert!(!parsed.open_issue_ids.contains("11"));
     }
 
     #[test]
