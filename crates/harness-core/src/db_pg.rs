@@ -1,4 +1,5 @@
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::Acquire as _;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -265,6 +266,42 @@ fn load_database_config_from_path(path: &Path) -> anyhow::Result<LoadedDatabaseC
     })
 }
 
+fn schema_hash_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let absolute = std::env::current_dir()?.join(path);
+    if let Some(parent) = absolute.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            if let Some(file_name) = absolute.file_name() {
+                return Ok(canonical_parent.join(file_name));
+            }
+            return Ok(canonical_parent);
+        }
+    }
+
+    Ok(normalize_path_lexically(&absolute))
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
 /// Derive the legacy per-store Postgres schema name from a store identity path.
 ///
 /// Historical SQLite-backed stores accepted a database file path. The Postgres
@@ -274,9 +311,10 @@ fn load_database_config_from_path(path: &Path) -> anyhow::Result<LoadedDatabaseC
 pub fn pg_schema_for_path(path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
 
-    let path_utf8 = path
+    let hash_path = schema_hash_path(path)?;
+    let path_utf8 = hash_path
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", path))?;
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {:?}", hash_path))?;
     let digest = Sha256::digest(path_utf8.as_bytes());
     let mut schema_bytes = [0u8; 8];
     schema_bytes.copy_from_slice(&digest[..8]);
@@ -570,17 +608,25 @@ impl<'a> PgMigrator<'a> {
             if stmt.is_empty() {
                 continue;
             }
-            if let Err(e) = sqlx::query(stmt).execute(&mut *tx).await {
-                if pg_duplicate_column_error(stmt, &e) {
+            let mut statement_tx = (&mut tx).begin().await?;
+            match sqlx::query(stmt).execute(&mut *statement_tx).await {
+                Ok(_) => {
+                    statement_tx.commit().await?;
+                }
+                Err(e) if pg_duplicate_column_error(stmt, &e) => {
+                    statement_tx.rollback().await?;
                     continue;
                 }
-                return Err(anyhow::anyhow!(
-                    "migration v{} '{}' failed: {} [sql: {}]",
-                    migration.version,
-                    migration.description,
-                    e,
-                    stmt
-                ));
+                Err(e) => {
+                    let _ = statement_tx.rollback().await;
+                    return Err(anyhow::anyhow!(
+                        "migration v{} '{}' failed: {} [sql: {}]",
+                        migration.version,
+                        migration.description,
+                        e,
+                        stmt
+                    ));
+                }
             }
         }
         sqlx::query("INSERT INTO schema_migrations (version, description) VALUES ($1, $2)")
@@ -709,6 +755,32 @@ mod tests {
             .expect("path schema should resolve");
 
         assert_eq!(schema, "h1b76aa87802f7705");
+    }
+
+    #[test]
+    fn pg_schema_for_path_normalizes_relative_aliases() {
+        let _lock = process_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app_dir = dir.path().join("app");
+        std::fs::create_dir(&app_dir).expect("create app dir");
+        let _cwd = CurrentDirGuard::enter(&app_dir);
+
+        let canonical_path = app_dir
+            .canonicalize()
+            .expect("canonical app dir")
+            .join("tasks.db");
+        let canonical_schema =
+            pg_schema_for_path(&canonical_path).expect("canonical path schema should resolve");
+
+        assert_eq!(
+            pg_schema_for_path(Path::new("./tasks.db")).expect("dot path schema should resolve"),
+            canonical_schema
+        );
+        assert_eq!(
+            pg_schema_for_path(Path::new("../app/tasks.db"))
+                .expect("parent alias schema should resolve"),
+            canonical_schema
+        );
     }
 
     #[test]
