@@ -525,11 +525,15 @@ async fn wait_for_task_project_root(
     task_id: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
     let task_id = harness_core::types::TaskId(task_id.to_string());
-    for _ in 0..50 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
         if let Some(task) = state.core.tasks.get_with_db_fallback(&task_id).await? {
             if let Some(project_root) = task.project_root {
                 return Ok(project_root);
             }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -1310,6 +1314,113 @@ async fn create_task_repeated_submits_stay_pending_and_distinct_when_saturated(
     let mut all_task_ids = vec![blocker_task_id];
     all_task_ids.extend(queued_task_ids);
     wait_for_task_statuses(&state, &all_task_ids, task_runner::TaskStatus::Done).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_duplicate_external_id_reuses_queued_task_when_saturated() -> anyhow::Result<()>
+{
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("queued-task-dedup-")?;
+    let project_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&project_dir)?;
+    init_fake_git_repo(&project_dir)?;
+
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.concurrency.max_concurrent_tasks = 1;
+    config.concurrency.max_queue_size = 32;
+    let project = project_dir.display().to_string();
+
+    let (state, blocking_agent) =
+        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
+
+    let blocker_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "prompt": "occupy execution"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(blocker_response.status(), StatusCode::ACCEPTED);
+    let blocker_json = response_json(blocker_response).await?;
+    let blocker_task_id = blocker_json["task_id"]
+        .as_str()
+        .expect("task_id should be present")
+        .to_string();
+
+    blocking_agent.wait_for_started(1).await;
+
+    let first_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "prompt": "queued duplicate candidate",
+                        "external_id": "dedupe-key"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+    let first_json = response_json(first_response).await?;
+    let queued_task_id = first_json["task_id"]
+        .as_str()
+        .expect("task_id should be present")
+        .to_string();
+
+    wait_for_task_statuses(
+        &state,
+        std::slice::from_ref(&queued_task_id),
+        task_runner::TaskStatus::Pending,
+    )
+    .await?;
+    let queued_project_root = wait_for_task_project_root(&state, &queued_task_id).await?;
+    assert_eq!(queued_project_root, project_dir);
+
+    let duplicate_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project.clone(),
+                        "prompt": "same external id should reuse queued task",
+                        "external_id": "dedupe-key"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(duplicate_response.status(), StatusCode::ACCEPTED);
+    let duplicate_json = response_json(duplicate_response).await?;
+    assert_eq!(
+        duplicate_json["task_id"].as_str(),
+        Some(queued_task_id.as_str())
+    );
+
+    blocking_agent.release_runs(2);
+    wait_for_task_statuses(
+        &state,
+        &[blocker_task_id, queued_task_id],
+        task_runner::TaskStatus::Done,
+    )
+    .await?;
+    assert_eq!(blocking_agent.started.load(Ordering::SeqCst), 2);
     Ok(())
 }
 
