@@ -261,6 +261,10 @@ impl CodexAdapter {
 
         Ok(())
     }
+
+    async fn clear_active_turn_id(&self) {
+        self.state.lock().await.active_turn_id = None;
+    }
 }
 
 #[async_trait]
@@ -326,8 +330,8 @@ impl AgentAdapter for CodexAdapter {
                         event,
                         AgentEvent::TurnCompleted { .. } | AgentEvent::Error { .. }
                     );
-                    if matches!(event, AgentEvent::TurnCompleted { .. }) {
-                        self.state.lock().await.active_turn_id = None;
+                    if is_terminal {
+                        self.clear_active_turn_id().await;
                     }
                     if tx.send(event).await.is_err() {
                         break;
@@ -778,5 +782,15 @@ mod tests {
     async fn interrupt_noop_when_no_child() {
         let adapter = CodexAdapter::new(PathBuf::from("codex"));
         adapter.interrupt().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_active_turn_id_drops_stale_turn_state() {
+        let adapter = CodexAdapter::new(PathBuf::from("codex"));
+        adapter.state.lock().await.active_turn_id = Some("turn-1".into());
+
+        adapter.clear_active_turn_id().await;
+
+        assert_eq!(adapter.state.lock().await.active_turn_id, None);
     }
 }

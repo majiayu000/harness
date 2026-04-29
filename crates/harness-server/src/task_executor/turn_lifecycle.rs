@@ -9,7 +9,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-fn bridge_agent_event(event: AgentEvent, output_buf: &mut String) -> Option<StreamItem> {
+fn bridge_agent_event(
+    event: AgentEvent,
+    output_buf: &mut String,
+    emitted_agent_completion: &mut bool,
+) -> Option<StreamItem> {
     match event {
         AgentEvent::ItemStartedPayload { item } => Some(StreamItem::ItemStarted { item }),
         AgentEvent::MessageDelta { text } => {
@@ -26,6 +30,7 @@ fn bridge_agent_event(event: AgentEvent, output_buf: &mut String) -> Option<Stre
             if let harness_core::types::Item::AgentReasoning { content } = &item {
                 output_buf.clear();
                 output_buf.push_str(content);
+                *emitted_agent_completion = true;
             }
             Some(StreamItem::ItemCompleted { item })
         }
@@ -33,6 +38,10 @@ fn bridge_agent_event(event: AgentEvent, output_buf: &mut String) -> Option<Stre
         AgentEvent::Warning { message } => Some(StreamItem::Warning { message }),
         AgentEvent::Error { message } => Some(StreamItem::Error { message }),
         AgentEvent::TurnCompleted { output } => {
+            if *emitted_agent_completion {
+                output_buf.clear();
+                return None;
+            }
             let content = if output.is_empty() {
                 std::mem::take(output_buf)
             } else {
@@ -140,8 +149,10 @@ pub(crate) async fn run_turn_lifecycle(
         let bridge_tx = stream_tx;
         tokio::spawn(async move {
             let mut output_buf = String::new();
+            let mut emitted_agent_completion = false;
             while let Some(event) = event_rx.recv().await {
-                let maybe_item = bridge_agent_event(event, &mut output_buf);
+                let maybe_item =
+                    bridge_agent_event(event, &mut output_buf, &mut emitted_agent_completion);
                 if let Some(item) = maybe_item {
                     if bridge_tx.send(item).await.is_err() {
                         return;
@@ -303,12 +314,15 @@ mod tests {
     #[test]
     fn bridge_preserves_warning_and_token_usage_events() {
         let mut output_buf = String::new();
+        let mut warning_completion = false;
+        let mut usage_completion = false;
 
         let warning = bridge_agent_event(
             AgentEvent::Warning {
                 message: "careful".into(),
             },
             &mut output_buf,
+            &mut warning_completion,
         );
         let usage = bridge_agent_event(
             AgentEvent::TokenUsage {
@@ -320,6 +334,7 @@ mod tests {
                 },
             },
             &mut output_buf,
+            &mut usage_completion,
         );
 
         assert_eq!(
@@ -344,17 +359,20 @@ mod tests {
     #[test]
     fn bridge_uses_buffered_output_when_turn_completed_payload_is_empty() {
         let mut output_buf = String::new();
+        let mut emitted_agent_completion = false;
         let _ = bridge_agent_event(
             AgentEvent::MessageDelta {
                 text: "hello".into(),
             },
             &mut output_buf,
+            &mut emitted_agent_completion,
         );
         let completed = bridge_agent_event(
             AgentEvent::TurnCompleted {
                 output: String::new(),
             },
             &mut output_buf,
+            &mut emitted_agent_completion,
         );
 
         assert_eq!(
@@ -365,6 +383,40 @@ mod tests {
                 }
             })
         );
+        assert!(output_buf.is_empty());
+    }
+
+    #[test]
+    fn bridge_suppresses_duplicate_turn_completed_after_agent_message_completion() {
+        let mut output_buf = String::new();
+        let mut emitted_agent_completion = false;
+        let item_completed = bridge_agent_event(
+            AgentEvent::ItemCompletedPayload {
+                item: Item::AgentReasoning {
+                    content: "done".into(),
+                },
+            },
+            &mut output_buf,
+            &mut emitted_agent_completion,
+        );
+        let turn_completed = bridge_agent_event(
+            AgentEvent::TurnCompleted {
+                output: "done".into(),
+            },
+            &mut output_buf,
+            &mut emitted_agent_completion,
+        );
+
+        assert_eq!(
+            item_completed,
+            Some(StreamItem::ItemCompleted {
+                item: Item::AgentReasoning {
+                    content: "done".into()
+                }
+            })
+        );
+        assert!(emitted_agent_completion);
+        assert_eq!(turn_completed, None);
         assert!(output_buf.is_empty());
     }
 }
