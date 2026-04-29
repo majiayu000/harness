@@ -768,24 +768,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pg_store_context_can_reuse_shared_setup_pool() {
+    #[test]
+    fn pg_store_context_can_reuse_shared_setup_pool() {
+        let _lock = process_env_lock();
         let Ok(database_url) = resolve_database_url(None) else {
             return;
         };
-        let setup_pool = match pg_open_pool(&database_url).await {
-            Ok(pool) => pool,
-            Err(_) => return,
-        };
-        let context =
-            PgStoreContext::from_path(Path::new("/tmp/harness/shared.db"), Some(&database_url))
-                .expect("context should resolve");
-        let pool = context
-            .open_pool_with_setup_pool(&setup_pool)
-            .await
-            .expect("shared setup pool should initialize the store");
-        pool.close().await;
-        setup_pool.close().await;
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let setup_pool = match pg_open_pool(&database_url).await {
+                Ok(pool) => pool,
+                Err(_) => return,
+            };
+            let context =
+                PgStoreContext::from_path(Path::new("/tmp/harness/shared.db"), Some(&database_url))
+                    .expect("context should resolve");
+            let pool = context
+                .open_pool_with_setup_pool(&setup_pool)
+                .await
+                .expect("shared setup pool should initialize the store");
+            pool.close().await;
+            setup_pool.close().await;
+        });
     }
 
     #[test]
