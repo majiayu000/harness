@@ -1,5 +1,6 @@
 use crate::streaming::{
-    filter_agent_stderr, log_captured_stderr, send_stream_item, stream_child_output,
+    captured_stderr_tail, enrich_stream_exit_error, filter_agent_stderr_with_capture,
+    log_captured_stderr, send_stream_item, stream_child_output,
 };
 use async_trait::async_trait;
 use harness_core::config::agents::SandboxMode;
@@ -11,6 +12,7 @@ use harness_sandbox::{wrap_command, SandboxSpec};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 
 pub struct ClaudeCodeAgent {
@@ -305,18 +307,41 @@ impl CodeAgent for ClaudeCodeAgent {
             }
         };
 
+        let stderr_capture = Arc::new(Mutex::new(String::new()));
+        let mut stderr_task = None;
         if let Some(stderr) = child.stderr.take() {
             let agent = self.name().to_string();
-            tokio::spawn(async move {
-                filter_agent_stderr(stderr, &agent).await;
-            });
+            let captured = Arc::clone(&stderr_capture);
+            stderr_task = Some(tokio::spawn(async move {
+                filter_agent_stderr_with_capture(stderr, &agent, Some(captured)).await;
+            }));
         }
 
         let idle_timeout = self
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        stream_child_output(&mut child, &tx, self.name(), idle_timeout).await?;
+        let stream_result = stream_child_output(&mut child, &tx, self.name(), idle_timeout).await;
+        let stream_send_failed = matches!(
+            &stream_result,
+            Err(harness_core::error::HarnessError::AgentExecution(message))
+                if message.contains("stream send failed")
+        );
+        if stream_result.is_err() {
+            #[cfg(unix)]
+            crate::kill_process_group(&child);
+            let _ = child.start_kill();
+        }
+        if stream_send_failed {
+            return Err(stream_result.expect_err("stream send failures return an error"));
+        }
+        if let Some(stderr_task) = stderr_task {
+            let _ = stderr_task.await;
+        }
+        if let Err(error) = stream_result {
+            let stderr = captured_stderr_tail(&stderr_capture);
+            return Err(enrich_stream_exit_error(error, &stderr));
+        }
         send_stream_item(
             &tx,
             StreamItem::TokenUsage {
@@ -676,6 +701,76 @@ printf 'world\n'
             }
             other => panic!("unexpected completed event payload: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_stream_classifies_quota_failure_from_stdout_tail() {
+        let (dir, script) = write_executable_script(
+            r#"
+printf "You've hit your limit · resets 3pm (Asia/Shanghai)\n"
+exit 1
+"#,
+        );
+        let agent = ClaudeCodeAgent::new(
+            script,
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let request = AgentRequest {
+            prompt: "ignored".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let err = agent
+            .execute_stream(request, tx)
+            .await
+            .expect_err("stream execution should fail");
+
+        assert_eq!(
+            err.turn_failure().expect("turn failure").kind,
+            harness_core::types::TurnFailureKind::Quota
+        );
+        assert!(
+            err.to_string()
+                .contains("stdout_tail=[You've hit your limit"),
+            "streamed claude failures must preserve stdout tail, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_waits_for_late_stderr_before_classifying_exit() {
+        let (dir, script) = write_executable_script(
+            r#"
+(sleep 0.2; echo 'quota exhausted: retry later' >&2) >/dev/null &
+exit 1
+"#,
+        );
+        let agent = ClaudeCodeAgent::new(
+            script,
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let request = AgentRequest {
+            prompt: "ignored".to_string(),
+            project_root: dir.path().to_path_buf(),
+            ..AgentRequest::default()
+        };
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let err = agent
+            .execute_stream(request, tx)
+            .await
+            .expect_err("stream execution should fail");
+
+        assert!(
+            matches!(
+                err.turn_failure().expect("turn failure").kind,
+                harness_core::types::TurnFailureKind::Quota
+            ),
+            "expected late stderr to influence streamed exit classification, got: {err}"
+        );
     }
 
     #[tokio::test]

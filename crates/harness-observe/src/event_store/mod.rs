@@ -44,6 +44,11 @@ static EVENT_MIGRATIONS: &[Migration] = &[
             PRIMARY KEY (project, agent_id)
         )",
     },
+    Migration {
+        version: 4,
+        description: "add metadata column to events table",
+        sql: "ALTER TABLE events ADD COLUMN metadata TEXT",
+    },
 ];
 
 /// Event store backed by Postgres.
@@ -339,10 +344,14 @@ impl EventStore {
         let decision = serde_json::to_string(&event.decision)?;
         let decision = decision.trim_matches('"');
         let ts = event.ts.to_rfc3339();
+        let metadata = match &event.metadata {
+            Some(metadata) => Some(serde_json::to_string(metadata)?),
+            None => None,
+        };
         sqlx::query(
             "INSERT INTO events
-                (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(event.id.as_str())
@@ -355,6 +364,7 @@ impl EventStore {
         .bind(&event.detail)
         .bind(event.duration_ms.map(|v| v as i64))
         .bind(&event.content)
+        .bind(metadata)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -376,7 +386,7 @@ impl EventStore {
             "NULL as content"
         };
         let mut sql = format!(
-            "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, {content_col}
+            "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, {content_col}, metadata
              FROM events WHERE 1=1",
         );
         let mut param_count = 0usize;
@@ -454,6 +464,7 @@ impl EventStore {
         let reason: Option<String> = row.try_get("reason")?;
         let detail: Option<String> = row.try_get("detail")?;
         let content: Option<String> = row.try_get("content")?;
+        let metadata_json: Option<String> = row.try_get("metadata")?;
         let duration_ms: Option<i64> = row.try_get("duration_ms")?;
 
         let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
@@ -473,6 +484,10 @@ impl EventStore {
             reason,
             detail,
             content,
+            metadata: metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
             duration_ms: duration_ms.map(|v| v as u64),
         })
     }

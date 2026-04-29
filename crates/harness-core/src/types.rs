@@ -175,6 +175,51 @@ pub struct TokenUsage {
     pub cost_usd: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnTelemetry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_built_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_output_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureKind {
+    Timeout,
+    Quota,
+    Billing,
+    LocalProcess,
+    Upstream,
+    Protocol,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnFailure {
+    pub kind: TurnFailureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_excerpt: Option<String>,
+}
+
 impl Turn {
     pub fn new(thread_id: ThreadId, agent_id: AgentId) -> Self {
         Self {
@@ -336,6 +381,20 @@ pub enum Decision {
     Complete,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EventMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TurnTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TurnFailure>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub id: EventId,
@@ -349,6 +408,8 @@ pub struct Event {
     /// Full content payload for auditing (e.g. raw reviewer output for agent_review events).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub metadata: Option<EventMetadata>,
     pub duration_ms: Option<u64>,
 }
 
@@ -364,6 +425,7 @@ impl Event {
             reason: None,
             detail: None,
             content: None,
+            metadata: None,
             duration_ms: None,
         }
     }
