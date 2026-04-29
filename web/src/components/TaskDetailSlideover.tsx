@@ -241,8 +241,7 @@ function PromptHistoryContent({
   }
 
   const prompts = [...data].sort((a, b) => {
-    const createdAtDiff = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
-    if (createdAtDiff !== 0) return createdAtDiff;
+    if (a.created_at !== b.created_at) return a.created_at < b.created_at ? -1 : 1;
     if (a.turn !== b.turn) return a.turn - b.turn;
     return a.phase.localeCompare(b.phase);
   });
