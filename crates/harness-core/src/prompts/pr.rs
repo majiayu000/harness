@@ -26,7 +26,7 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
          3. Read the original issue requirements: `gh issue view {issue}`\n\
          4. Fix any unresolved review comments and continue the implementation if incomplete.\n\
             All editing must happen inside `/tmp/harness-pr-{pr_number}`.\n\
-         5. Run `cd /tmp/harness-pr-{pr_number} && cargo check && cargo test`\n\
+         5. Run the project's validation commands inside `/tmp/harness-pr-{pr_number}` and fix any failures before pushing.\n\
          6. Commit and push from the worktree to the SAME branch `{branch}` — do NOT create a new PR:\n\
             `cd /tmp/harness-pr-{pr_number} && git push origin {branch}`\n\
          7. Clean up: `git worktree remove /tmp/harness-pr-{pr_number}`\n\n\
@@ -245,6 +245,7 @@ mod tests {
         assert!(p.contains("PR #50"));
         assert!(p.contains("fix/issue-29"));
         assert!(p.contains("do NOT create a new PR"));
+        assert!(p.contains("validation commands"));
         assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/50"));
         assert!(p.contains("repos/owner/repo/pulls/50/comments"));
         // Worktree isolation: must use worktree, must not bare-checkout in main repo
