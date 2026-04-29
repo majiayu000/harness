@@ -13,6 +13,25 @@ use std::sync::Arc;
 use super::{state::AppState, task_routes};
 use crate::{router, task_runner};
 
+fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
+    let error = error?;
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("migration") {
+        Some("migration_failed")
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        Some("timeout")
+    } else if lower.contains("connection")
+        || lower.contains("connect")
+        || lower.contains("database")
+        || lower.contains("postgres")
+        || lower.contains("pool")
+    {
+        Some("database_unavailable")
+    } else {
+        Some("startup_failed")
+    }
+}
+
 pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let count = state.core.tasks.count();
     let dirty = state.is_runtime_state_dirty();
@@ -25,7 +44,7 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
                 "name": status.name,
                 "critical": status.is_critical(),
                 "ready": status.ready,
-                "error": status.error,
+                "error": startup_error_code(status.error.as_deref()),
             })
         })
         .collect();
