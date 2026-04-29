@@ -324,20 +324,26 @@ pub enum TriageComplexity {
 
 /// Parse `COMPLEXITY=<low|medium|high>` from triage agent output.
 ///
-/// The protocol requires `COMPLEXITY=` to appear on the second-to-last line
-/// (just before `TRIAGE=` on the last line). Only the second-to-last non-empty
-/// line is examined to prevent untrusted issue content (e.g. a line containing
-/// `COMPLEXITY=low` in the issue body) from influencing classification.
+/// The protocol requires `COMPLEXITY=` to appear immediately before the final
+/// `TRIAGE_REASON=`/`TRIAGE=` footer. Only the footer block is examined to
+/// prevent untrusted issue content (e.g. a line containing `COMPLEXITY=low`
+/// in the issue body) from influencing classification.
 ///
 /// Returns `TriageComplexity::Medium` if the tag is absent or unrecognised
 /// (backward-compatible fallback).
 pub fn parse_complexity(output: &str) -> TriageComplexity {
     let non_empty: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
-    // second-to-last line (index len-2); need at least 2 non-empty lines
     if non_empty.len() < 2 {
         return TriageComplexity::Medium;
     }
-    let candidate = non_empty[non_empty.len() - 2].trim();
+    let mut index = non_empty.len() - 2;
+    if non_empty[index].trim().starts_with("TRIAGE_REASON=") {
+        if index == 0 {
+            return TriageComplexity::Medium;
+        }
+        index -= 1;
+    }
+    let candidate = non_empty[index].trim();
     if let Some(value) = candidate.strip_prefix("COMPLEXITY=") {
         return match value.trim().to_ascii_lowercase().as_str() {
             "low" => TriageComplexity::Low,
@@ -375,6 +381,26 @@ pub fn parse_triage(output: &str) -> Option<TriageDecision> {
         "SKIP" => Some(TriageDecision::Skip),
         _ => None,
     }
+}
+
+/// Parse an optional `TRIAGE_REASON=<value>` footer from triage agent output.
+///
+/// Only the second-to-last non-empty line is examined so injected issue body
+/// content cannot influence the parsed reason.
+pub fn parse_triage_reason(output: &str) -> Option<String> {
+    let non_empty: Vec<&str> = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if non_empty.len() < 2 {
+        return None;
+    }
+    non_empty[non_empty.len() - 2]
+        .trim()
+        .strip_prefix("TRIAGE_REASON=")
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Check if the agent flagged an issue with the implementation plan.
@@ -934,6 +960,23 @@ PR_URL=https://github.com/owner/repo/pull/269";
     }
 
     #[test]
+    fn test_parse_triage_reason_present() {
+        let output = "Assessment\nCOMPLEXITY=high\nTRIAGE_REASON=actionable_issue_markers\nTRIAGE=PROCEED_WITH_PLAN";
+        assert_eq!(
+            parse_triage_reason(output),
+            Some("actionable_issue_markers".to_string())
+        );
+        assert_eq!(parse_complexity(output), TriageComplexity::High);
+    }
+
+    #[test]
+    fn test_parse_triage_reason_absent_is_safe() {
+        let output = "Assessment\nCOMPLEXITY=medium\nTRIAGE=PROCEED";
+        assert_eq!(parse_triage_reason(output), None);
+        assert_eq!(parse_complexity(output), TriageComplexity::Medium);
+    }
+
+    #[test]
     fn test_parse_plan_issue() {
         assert_eq!(
             parse_plan_issue("Working on it...\nPLAN_ISSUE=The plan missed error handling"),
@@ -984,7 +1027,8 @@ PR_URL=https://github.com/owner/repo/pull/269";
 
     #[test]
     fn test_parse_complexity_with_triage_combo() {
-        let output = "This is a simple typo fix.\nCOMPLEXITY=high\nTRIAGE=PROCEED";
+        let output =
+            "This is a simple typo fix.\nCOMPLEXITY=high\nTRIAGE_REASON=simple_fix\nTRIAGE=PROCEED";
         assert_eq!(parse_complexity(output), TriageComplexity::High);
         assert_eq!(parse_triage(output), Some(TriageDecision::Proceed));
     }

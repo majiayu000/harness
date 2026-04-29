@@ -3,10 +3,23 @@ use async_trait::async_trait;
 use harness_core::agent::{AgentResponse, StreamItem};
 use harness_core::error::HarnessError;
 use harness_core::types::{Capability, EventFilters, TokenUsage};
+use std::sync::Arc;
 
 struct PromptPlanningAgent;
 
 struct FailingPromptPlanningAgent;
+
+struct TriageStaticStreamAgent {
+    output: String,
+}
+
+impl TriageStaticStreamAgent {
+    fn new(output: &str) -> Self {
+        Self {
+            output: output.to_string(),
+        }
+    }
+}
 
 #[async_trait]
 impl CodeAgent for PromptPlanningAgent {
@@ -72,6 +85,44 @@ impl CodeAgent for FailingPromptPlanningAgent {
         Err(HarnessError::AgentExecution(
             "planner exited with exit status: 1: stdout_tail=[secret prompt]".to_string(),
         ))
+    }
+}
+
+#[async_trait]
+impl CodeAgent for TriageStaticStreamAgent {
+    fn name(&self) -> &str {
+        "triage-static-stream-agent"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        Ok(AgentResponse {
+            output: self.output.clone(),
+            stderr: String::new(),
+            items: vec![],
+            token_usage: TokenUsage::default(),
+            model: "mock".to_string(),
+            exit_code: Some(0),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        tx.send(StreamItem::MessageDelta {
+            text: self.output.clone(),
+        })
+        .await
+        .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+        tx.send(StreamItem::Done)
+            .await
+            .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+        Ok(())
     }
 }
 
@@ -247,4 +298,337 @@ fn redact_prompt_plan_error_message_preserves_only_safe_fields() {
     );
     assert!(!message.contains("secret prompt"));
     assert!(!message.contains("still secret"));
+}
+
+fn actionable_issue_body() -> String {
+    r#"
+packages/core/src/infra/sqlite/ops.rs:72
+
+## Recommended Fix
+1. Bind parameters instead of concatenating raw input.
+2. Add a regression test for repeated submissions.
+
+## Acceptance Criteria
+- Reject SQL metacharacters in the failing path.
+- Preserve current successful requests.
+
+```rust
+let statement = conn.prepare_cached(SQL)?;
+```
+"#
+    .to_string()
+}
+
+fn abstract_issue_body() -> String {
+    "We should think about this area again later.\nNo concrete path or implementation detail yet."
+        .to_string()
+}
+
+fn actionable_review_issue_fetcher<'a>(
+    _repo_slug: &'a str,
+    _issue: u64,
+    _github_token: Option<&'a str>,
+) -> IssueFetchFuture<'a> {
+    Box::pin(async {
+        Ok(TypedIssueSnapshot {
+            body: actionable_issue_body(),
+            labels: vec!["review".to_string(), "P1".to_string()],
+        })
+    })
+}
+
+fn actionable_no_label_issue_fetcher<'a>(
+    _repo_slug: &'a str,
+    _issue: u64,
+    _github_token: Option<&'a str>,
+) -> IssueFetchFuture<'a> {
+    Box::pin(async {
+        Ok(TypedIssueSnapshot {
+            body: actionable_issue_body(),
+            labels: vec![],
+        })
+    })
+}
+
+fn abstract_review_issue_fetcher<'a>(
+    _repo_slug: &'a str,
+    _issue: u64,
+    _github_token: Option<&'a str>,
+) -> IssueFetchFuture<'a> {
+    Box::pin(async {
+        Ok(TypedIssueSnapshot {
+            body: abstract_issue_body(),
+            labels: vec!["review".to_string()],
+        })
+    })
+}
+
+fn failing_issue_fetcher<'a>(
+    _repo_slug: &'a str,
+    _issue: u64,
+    _github_token: Option<&'a str>,
+) -> IssueFetchFuture<'a> {
+    Box::pin(async { Err(anyhow::anyhow!("simulated GitHub failure")) })
+}
+
+async fn setup_issue_task_harness() -> anyhow::Result<(
+    tempfile::TempDir,
+    Arc<TaskStore>,
+    EventStore,
+    TaskId,
+    CreateTaskRequest,
+    RwLock<harness_skills::store::SkillStore>,
+)> {
+    let dir = tempfile::tempdir()?;
+    let database_url = crate::test_helpers::test_database_url()?;
+    let store =
+        TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+            .await?;
+    let events = EventStore::new(dir.path()).await?;
+    let task_id = TaskId::new();
+    let mut task = crate::task_runner::TaskState::new(task_id.clone());
+    task.task_kind = crate::task_runner::TaskKind::Issue;
+    store.insert(&task).await;
+    let req = CreateTaskRequest {
+        issue: Some(988),
+        turn_timeout_secs: 30,
+        ..CreateTaskRequest::default()
+    };
+    let skills = RwLock::new(harness_skills::store::SkillStore::new());
+    Ok((dir, store, events, task_id, req, skills))
+}
+
+#[tokio::test]
+async fn actionable_review_issue_skip_is_promoted_to_plan() -> anyhow::Result<()> {
+    let (dir, store, events, task_id, req, skills) = setup_issue_task_harness().await?;
+    let agent = TriageStaticStreamAgent::new(
+        "Looks abstract.\nCOMPLEXITY=low\nTRIAGE_REASON=agent_skip_review_label\nTRIAGE=SKIP",
+    );
+
+    let outcome = run_triage_plan_pipeline_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        "owner/repo",
+        None,
+        None,
+        &HashMap::new(),
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        actionable_review_issue_fetcher,
+    )
+    .await?;
+
+    assert!(matches!(
+        outcome,
+        TriagePlanPipelineOutcome::Continue {
+            plan_output: Some(_),
+            ..
+        }
+    ));
+
+    let events = events
+        .query(&EventFilters {
+            hook: Some("triage_decision".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].detail.as_deref(), Some("result=promote"));
+    assert_eq!(
+        events[0].reason.as_deref(),
+        Some(
+            "actionable_issue_markers:file_line,recommended_section,acceptance_criteria,code_or_steps"
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn actionable_issue_without_labels_skip_is_promoted_to_plan() -> anyhow::Result<()> {
+    let (dir, store, events, task_id, req, skills) = setup_issue_task_harness().await?;
+    let agent = TriageStaticStreamAgent::new(
+        "Skip.\nCOMPLEXITY=medium\nTRIAGE_REASON=agent_skip\nTRIAGE=SKIP",
+    );
+
+    let outcome = run_triage_plan_pipeline_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        "owner/repo",
+        None,
+        None,
+        &HashMap::new(),
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        actionable_no_label_issue_fetcher,
+    )
+    .await?;
+
+    assert!(matches!(
+        outcome,
+        TriagePlanPipelineOutcome::Continue { .. }
+    ));
+    let events = events
+        .query(&EventFilters {
+            hook: Some("triage_decision".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(events[0].detail.as_deref(), Some("result=promote"));
+    assert!(
+        events[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("actionable_issue_markers")),
+        "missing actionable promotion reason: {:?}",
+        events[0].reason
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn abstract_issue_skip_stays_skipped() -> anyhow::Result<()> {
+    let (dir, store, events, task_id, req, skills) = setup_issue_task_harness().await?;
+    let agent = TriageStaticStreamAgent::new("Not actionable.\nCOMPLEXITY=low\nTRIAGE=SKIP");
+
+    let outcome = run_triage_plan_pipeline_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        "owner/repo",
+        None,
+        None,
+        &HashMap::new(),
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        abstract_review_issue_fetcher,
+    )
+    .await?;
+
+    assert!(matches!(outcome, TriagePlanPipelineOutcome::Skipped));
+    let events = events
+        .query(&EventFilters {
+            hook: Some("triage_decision".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(events[0].detail.as_deref(), Some("result=skip"));
+    assert_eq!(
+        events[0].reason.as_deref(),
+        Some("non_actionable_issue_markers:none")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn skip_on_review_label_true_keeps_legacy_skip_reason_for_non_actionable_issue(
+) -> anyhow::Result<()> {
+    let (dir, store, events, task_id, req, skills) = setup_issue_task_harness().await?;
+    let agent = TriageStaticStreamAgent::new("Skip.\nCOMPLEXITY=low\nTRIAGE=SKIP");
+    let triage_config = ProjectTriageConfig {
+        skip_on_review_label: Some(true),
+    };
+
+    let outcome = run_triage_plan_pipeline_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        "owner/repo",
+        None,
+        Some(&triage_config),
+        &HashMap::new(),
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        abstract_review_issue_fetcher,
+    )
+    .await?;
+
+    assert!(matches!(outcome, TriagePlanPipelineOutcome::Skipped));
+    let events = events
+        .query(&EventFilters {
+            hook: Some("triage_decision".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        events[0].reason.as_deref(),
+        Some("review_label_skip_allowed_non_actionable")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn github_fetch_failure_falls_back_to_agent_skip() -> anyhow::Result<()> {
+    let (dir, store, events, task_id, req, skills) = setup_issue_task_harness().await?;
+    let agent = TriageStaticStreamAgent::new(
+        "Skip.\nCOMPLEXITY=low\nTRIAGE_REASON=agent_skip\nTRIAGE=SKIP",
+    );
+
+    let outcome = run_triage_plan_pipeline_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        "owner/repo",
+        None,
+        None,
+        &HashMap::new(),
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        failing_issue_fetcher,
+    )
+    .await?;
+
+    assert!(matches!(outcome, TriagePlanPipelineOutcome::Skipped));
+    let events = events
+        .query(&EventFilters {
+            hook: Some("triage_decision".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(events[0].reason.as_deref(), Some("agent_skip"));
+    Ok(())
+}
+
+#[test]
+fn resolve_triage_decision_promotes_only_actionable_skip() {
+    let actionable = TypedIssueSnapshot {
+        body: actionable_issue_body(),
+        labels: vec!["review".to_string()],
+    };
+    let resolved = resolve_triage_decision(
+        prompts::TriageDecision::Skip,
+        Some("agent_skip_review_label"),
+        Some(&actionable),
+        None,
+    );
+    assert_eq!(resolved.decision, prompts::TriageDecision::ProceedWithPlan);
+
+    let abstract_issue = TypedIssueSnapshot {
+        body: abstract_issue_body(),
+        labels: vec!["review".to_string()],
+    };
+    let resolved = resolve_triage_decision(
+        prompts::TriageDecision::Skip,
+        Some("agent_skip_review_label"),
+        Some(&abstract_issue),
+        None,
+    );
+    assert_eq!(resolved.decision, prompts::TriageDecision::Skip);
+    assert_eq!(resolved.reason, "agent_skip_review_label");
 }

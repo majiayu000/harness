@@ -8,12 +8,340 @@ use crate::task_runner::{
 };
 use chrono::Utc;
 use harness_core::agent::{AgentRequest, CodeAgent};
+use harness_core::config::project::ProjectTriageConfig;
 use harness_core::prompts;
 use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnFailureKind, TurnTelemetry};
 use harness_observe::event_store::EventStore;
+use reqwest::header::{ACCEPT, USER_AGENT};
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::RwLock;
+
+const GITHUB_ISSUE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const UNKNOWN_REPO_SLUG: &str = "{owner}/{repo}";
+
+type IssueFetchFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<TypedIssueSnapshot>> + Send + 'a>>;
+type IssueFetchFn = for<'a> fn(&'a str, u64, Option<&'a str>) -> IssueFetchFuture<'a>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TypedIssueSnapshot {
+    body: String,
+    labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubIssueSnapshotResponse {
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    labels: Vec<GitHubIssueLabel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubIssueLabel {
+    name: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ActionabilitySignals {
+    file_line_reference: bool,
+    recommended_section: bool,
+    acceptance_criteria: bool,
+    code_block_or_step_list: bool,
+}
+
+impl ActionabilitySignals {
+    fn count(self) -> usize {
+        [
+            self.file_line_reference,
+            self.recommended_section,
+            self.acceptance_criteria,
+            self.code_block_or_step_list,
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+    }
+
+    fn is_actionable(self) -> bool {
+        self.file_line_reference
+            && self.code_block_or_step_list
+            && (self.recommended_section || self.acceptance_criteria)
+            && self.count() >= 3
+    }
+
+    fn names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.file_line_reference {
+            names.push("file_line");
+        }
+        if self.recommended_section {
+            names.push("recommended_section");
+        }
+        if self.acceptance_criteria {
+            names.push("acceptance_criteria");
+        }
+        if self.code_block_or_step_list {
+            names.push("code_or_steps");
+        }
+        names
+    }
+
+    fn promotion_reason(self) -> String {
+        format!("actionable_issue_markers:{}", self.names().join(","))
+    }
+
+    fn non_actionable_reason(self) -> String {
+        let names = self.names();
+        if names.is_empty() {
+            "non_actionable_issue_markers:none".to_string()
+        } else {
+            format!("non_actionable_issue_markers:{}", names.join(","))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedTriageDecision {
+    decision: prompts::TriageDecision,
+    reason: String,
+}
+
+fn github_api_base_url() -> String {
+    std::env::var("HARNESS_GITHUB_API_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn issue_has_review_label(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|label| label.trim().eq_ignore_ascii_case("review"))
+}
+
+fn effective_skip_on_review_label(config: Option<&ProjectTriageConfig>) -> bool {
+    config
+        .and_then(|triage| triage.skip_on_review_label)
+        .unwrap_or(false)
+}
+
+fn trim_token(candidate: &str) -> &str {
+    candidate.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '`' | '"' | '\'' | ',' | '.' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    })
+}
+
+fn contains_file_line_reference(body: &str) -> bool {
+    body.split_whitespace().any(|token| {
+        let candidate = trim_token(token);
+        let Some((path, line)) = candidate.rsplit_once(':') else {
+            return false;
+        };
+        !path.is_empty()
+            && !line.is_empty()
+            && line.chars().all(|ch| ch.is_ascii_digit())
+            && (path.contains('/') || path.contains('\\') || path.contains('.'))
+            && path.chars().any(|ch| ch.is_ascii_alphabetic())
+    })
+}
+
+fn has_section(body: &str, marker: &str) -> bool {
+    body.lines()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .any(|line| line.starts_with(marker) || line == marker)
+}
+
+fn is_numbered_step(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return false;
+    }
+    matches!(trimmed.chars().nth(digit_count), Some('.') | Some(')'))
+        && trimmed[digit_count + 1..].starts_with(' ')
+}
+
+fn has_step_list(body: &str) -> bool {
+    body.lines()
+        .filter(|line| is_numbered_step(line))
+        .take(2)
+        .count()
+        >= 2
+}
+
+fn detect_actionability_signals(body: &str) -> ActionabilitySignals {
+    let lower = body.to_ascii_lowercase();
+    ActionabilitySignals {
+        file_line_reference: contains_file_line_reference(body),
+        recommended_section: has_section(&lower, "## recommended fix")
+            || has_section(&lower, "## recommended action")
+            || has_section(&lower, "recommended fix:")
+            || has_section(&lower, "recommended action:"),
+        acceptance_criteria: has_section(&lower, "## acceptance criteria")
+            || has_section(&lower, "acceptance criteria:"),
+        code_block_or_step_list: body.contains("```") || has_step_list(body),
+    }
+}
+
+fn default_triage_reason(decision: &prompts::TriageDecision) -> &'static str {
+    match decision {
+        prompts::TriageDecision::Proceed => "agent_proceed",
+        prompts::TriageDecision::ProceedWithPlan => "agent_proceed_with_plan",
+        prompts::TriageDecision::NeedsClarification => "agent_needs_clarification",
+        prompts::TriageDecision::Skip => "agent_skip",
+    }
+}
+
+fn resolve_triage_decision(
+    agent_decision: prompts::TriageDecision,
+    agent_reason: Option<&str>,
+    issue_snapshot: Option<&TypedIssueSnapshot>,
+    triage_config: Option<&ProjectTriageConfig>,
+) -> ResolvedTriageDecision {
+    let fallback_reason = agent_reason
+        .filter(|reason| !reason.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_triage_reason(&agent_decision).to_string());
+
+    if agent_decision != prompts::TriageDecision::Skip {
+        return ResolvedTriageDecision {
+            decision: agent_decision,
+            reason: fallback_reason,
+        };
+    }
+
+    let Some(issue_snapshot) = issue_snapshot else {
+        return ResolvedTriageDecision {
+            decision: prompts::TriageDecision::Skip,
+            reason: fallback_reason,
+        };
+    };
+
+    let signals = detect_actionability_signals(&issue_snapshot.body);
+    if signals.is_actionable() {
+        return ResolvedTriageDecision {
+            decision: prompts::TriageDecision::ProceedWithPlan,
+            reason: signals.promotion_reason(),
+        };
+    }
+
+    if issue_has_review_label(&issue_snapshot.labels)
+        && effective_skip_on_review_label(triage_config)
+    {
+        return ResolvedTriageDecision {
+            decision: prompts::TriageDecision::Skip,
+            reason: "review_label_skip_allowed_non_actionable".to_string(),
+        };
+    }
+
+    ResolvedTriageDecision {
+        decision: prompts::TriageDecision::Skip,
+        reason: agent_reason
+            .filter(|reason| !reason.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| signals.non_actionable_reason()),
+    }
+}
+
+fn final_triage_event_result(decision: &prompts::TriageDecision) -> &'static str {
+    match decision {
+        prompts::TriageDecision::Skip => "skip",
+        prompts::TriageDecision::Proceed
+        | prompts::TriageDecision::ProceedWithPlan
+        | prompts::TriageDecision::NeedsClarification => "promote",
+    }
+}
+
+fn final_triage_event_decision(decision: &prompts::TriageDecision) -> Decision {
+    match decision {
+        prompts::TriageDecision::Skip => Decision::Block,
+        prompts::TriageDecision::Proceed
+        | prompts::TriageDecision::ProceedWithPlan
+        | prompts::TriageDecision::NeedsClarification => Decision::Complete,
+    }
+}
+
+async fn emit_final_triage_decision_event(
+    events: &EventStore,
+    task_id: &TaskId,
+    turn: u32,
+    decision: &ResolvedTriageDecision,
+) {
+    let event = build_task_event(
+        task_id,
+        turn,
+        "triage",
+        "triage_decision",
+        final_triage_event_decision(&decision.decision),
+        Some(decision.reason.clone()),
+        Some(format!(
+            "result={}",
+            final_triage_event_result(&decision.decision)
+        )),
+        None,
+        None,
+        None,
+    );
+    if let Err(error) = events.log(&event).await {
+        tracing::warn!(task_id = %task_id, "failed to log triage_decision event: {error}");
+    }
+}
+
+async fn fetch_typed_issue_snapshot(
+    repo_slug: &str,
+    issue: u64,
+    github_token: Option<&str>,
+) -> anyhow::Result<TypedIssueSnapshot> {
+    if repo_slug.trim().is_empty() || repo_slug == UNKNOWN_REPO_SLUG {
+        anyhow::bail!("repository slug unavailable for issue triage lookup");
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(GITHUB_ISSUE_LOOKUP_TIMEOUT)
+        .build()?;
+    let url = format!("{}/repos/{repo_slug}/issues/{issue}", github_api_base_url());
+    let mut request = client
+        .get(url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, "harness-server");
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("GitHub issue lookup failed with status {status}: {body}");
+    }
+    let snapshot: GitHubIssueSnapshotResponse = response.json().await?;
+    Ok(TypedIssueSnapshot {
+        body: snapshot.body.unwrap_or_default(),
+        labels: snapshot
+            .labels
+            .into_iter()
+            .map(|label| label.name)
+            .collect(),
+    })
+}
+
+fn fetch_typed_issue_snapshot_boxed<'a>(
+    repo_slug: &'a str,
+    issue: u64,
+    github_token: Option<&'a str>,
+) -> IssueFetchFuture<'a> {
+    Box::pin(fetch_typed_issue_snapshot(repo_slug, issue, github_token))
+}
 
 async fn record_phase_observability(
     store: &TaskStore,
@@ -258,11 +586,48 @@ pub(crate) async fn run_triage_plan_pipeline(
     store: &TaskStore,
     task_id: &TaskId,
     issue: u64,
+    repo_slug: &str,
+    github_token: Option<&str>,
+    triage_config: Option<&ProjectTriageConfig>,
     cargo_env: &HashMap<String, String>,
     project: &Path,
     req: &CreateTaskRequest,
     skills: &RwLock<harness_skills::store::SkillStore>,
     events: &EventStore,
+) -> anyhow::Result<TriagePlanPipelineOutcome> {
+    run_triage_plan_pipeline_with_issue_fetcher(
+        agent,
+        store,
+        task_id,
+        issue,
+        repo_slug,
+        github_token,
+        triage_config,
+        cargo_env,
+        project,
+        req,
+        skills,
+        events,
+        fetch_typed_issue_snapshot_boxed,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_triage_plan_pipeline_with_issue_fetcher(
+    agent: &dyn CodeAgent,
+    store: &TaskStore,
+    task_id: &TaskId,
+    issue: u64,
+    repo_slug: &str,
+    github_token: Option<&str>,
+    triage_config: Option<&ProjectTriageConfig>,
+    cargo_env: &HashMap<String, String>,
+    project: &Path,
+    req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
+    issue_fetcher: IssueFetchFn,
 ) -> anyhow::Result<TriagePlanPipelineOutcome> {
     // --- Phase 1: Triage ---
     tracing::info!(task_id = %task_id, issue, "pipeline: starting triage phase");
@@ -415,16 +780,48 @@ pub(crate) async fn run_triage_plan_pipeline(
             anyhow::bail!("triage output unparseable — agent did not produce TRIAGE=<decision>")
         }
     };
+    let triage_reason = prompts::parse_triage_reason(&triage_resp.output);
     let complexity = prompts::parse_complexity(&triage_resp.output);
-    tracing::info!(task_id = %task_id, ?decision, ?complexity, "triage decision");
+    let fetched_issue = if decision == prompts::TriageDecision::Skip {
+        match issue_fetcher(repo_slug, issue, github_token).await {
+            Ok(issue_snapshot) => Some(issue_snapshot),
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    issue,
+                    repo = repo_slug,
+                    "triage issue fetch failed, falling back to agent decision: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let resolved_decision = resolve_triage_decision(
+        decision.clone(),
+        triage_reason.as_deref(),
+        fetched_issue.as_ref(),
+        triage_config,
+    );
+    emit_final_triage_decision_event(events, task_id, 0, &resolved_decision).await;
+    tracing::info!(
+        task_id = %task_id,
+        raw_decision = ?decision,
+        final_decision = ?resolved_decision.decision,
+        ?complexity,
+        triage_reason = %resolved_decision.reason,
+        "triage decision resolved"
+    );
 
-    match decision {
+    match resolved_decision.decision {
         prompts::TriageDecision::Skip => {
             mutate_and_persist(store, task_id, |state| {
                 state.status = TaskStatus::Done;
                 state.phase = TaskPhase::Terminal;
                 state.error = Some(format!(
-                    "Triage skipped issue #{issue}: not worth implementing"
+                    "Triage skipped issue #{issue}: {}",
+                    resolved_decision.reason
                 ));
             })
             .await?;
@@ -718,6 +1115,9 @@ mod tests {
             &store,
             &task_id,
             123,
+            UNKNOWN_REPO_SLUG,
+            None,
+            None,
             &HashMap::new(),
             dir.path(),
             &req,
