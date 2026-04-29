@@ -233,7 +233,11 @@ pub fn check_existing_pr(
          6. Otherwise fix each comment, commit, push, \
          then run `gh pr comment {pr} --body {body}` to trigger re-review, \
          and print FIXED on the last line\n\n\
-         Always print PR_URL=https://github.com/{repo}/pull/{pr} on a separate line of your output."
+         Output format:\n\
+         - Always print `PR_URL=https://github.com/{repo}/pull/{pr}` on a separate line\n\
+         - Always print `PUSHED_COMMIT=true` if you created or pushed any commit during this check \
+         (including a rebase/force-push to repair conflicts); otherwise print `PUSHED_COMMIT=false`\n\
+         - Then print `LGTM`, `FIXED`, or `WAITING` on the very last line."
     )
 }
 
@@ -322,6 +326,8 @@ mod tests {
         assert!(p.contains("PR #10"));
         assert!(p.contains("LGTM"));
         assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/10"));
+        assert!(p.contains("PUSHED_COMMIT=true"));
+        assert!(p.contains("PUSHED_COMMIT=false"));
         assert!(p.contains("repos/owner/repo/pulls/10/comments"));
         assert!(
             p.contains("statusCheckRollup"),

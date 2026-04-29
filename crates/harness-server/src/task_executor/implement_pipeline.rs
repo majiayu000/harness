@@ -39,6 +39,7 @@ pub(crate) enum ImplementationOutcome {
         pr_url: Option<String>,
         pr_num: Option<u64>,
         created_issue_num: Option<u64>,
+        pushed_commit: bool,
     },
 }
 
@@ -49,10 +50,12 @@ pub(crate) fn parse_implementation_outcome(output: &str) -> ImplementationOutcom
     let pr_url = prompts::parse_pr_url(output);
     let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
     let created_issue_num = prompts::parse_created_issue_number(output);
+    let pushed_commit = prompts::parse_pushed_commit(output);
     ImplementationOutcome::ParsedPr {
         pr_url,
         pr_num,
         created_issue_num,
+        pushed_commit,
     }
 }
 
@@ -106,6 +109,7 @@ pub(crate) enum ImplementOutcome {
     Proceed {
         pr_url: Option<String>,
         pr_num: u64,
+        implementation_pushed_commit: bool,
         context_items: Vec<ContextItem>,
         #[allow(dead_code)]
         turn_timeout: Duration,
@@ -325,7 +329,7 @@ pub(crate) async fn run_implement_phase(
 
     // Duplicate-PR prevention guard: if checkpoint shows PR already created, skip the
     // implement agent entirely to avoid opening a second PR on resume.
-    let (pr_url, pr_num): (Option<String>, u64) = 'implement: {
+    let (pr_url, pr_num, pushed_commit): (Option<String>, u64, bool) = 'implement: {
         if let Some(pr_str) = resumed_pr_url {
             tracing::info!(
                 task_id = %task_id,
@@ -358,7 +362,7 @@ pub(crate) async fn run_implement_phase(
                 ));
             })
             .await?;
-            break 'implement (Some(pr_str), n);
+            break 'implement (Some(pr_str), n, false);
         }
 
         let impl_phase_start = Instant::now();
@@ -788,94 +792,96 @@ pub(crate) async fn run_implement_phase(
             return Ok(ImplementOutcome::Done);
         }
 
-        let (pr_url, pr_num, created_issue_num) = match parse_implementation_outcome(&output) {
-            ImplementationOutcome::PlanIssue(plan_issue) => {
-                if let (Some(workflows), Some(issue_number)) =
-                    (issue_workflow_store.as_ref(), req.issue)
-                {
-                    let project_id = project_root.to_string_lossy().into_owned();
-                    if let Err(e) = workflows
-                        .record_plan_issue_detected(
-                            &project_id,
-                            req.repo.as_deref(),
-                            issue_number,
-                            &task_id.0,
-                            &plan_issue,
-                        )
-                        .await
+        let (pr_url, pr_num, created_issue_num, pushed_commit) =
+            match parse_implementation_outcome(&output) {
+                ImplementationOutcome::PlanIssue(plan_issue) => {
+                    if let (Some(workflows), Some(issue_number)) =
+                        (issue_workflow_store.as_ref(), req.issue)
                     {
-                        tracing::warn!(
-                            issue = issue_number,
-                            task_id = %task_id.0,
-                            "issue workflow PLAN_ISSUE tracking failed: {e}"
-                        );
+                        let project_id = project_root.to_string_lossy().into_owned();
+                        if let Err(e) = workflows
+                            .record_plan_issue_detected(
+                                &project_id,
+                                req.repo.as_deref(),
+                                issue_number,
+                                &task_id.0,
+                                &plan_issue,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                issue = issue_number,
+                                task_id = %task_id.0,
+                                "issue workflow PLAN_ISSUE tracking failed: {e}"
+                            );
+                        }
                     }
-                }
-                if let Some(issue_number) = req.issue {
-                    return Ok(ImplementOutcome::Replan {
-                        issue: issue_number,
-                        plan_issue,
-                        prior_plan: plan_output.clone(),
-                    });
-                }
-                tracing::error!(
-                    task_id = %task_id,
-                    plan_issue = %plan_issue,
-                    "implementation returned PLAN_ISSUE; marking task failed"
-                );
-                mutate_and_persist(store, task_id, |s| {
-                    s.status = TaskStatus::Failed;
-                    s.turn = 2;
-                    s.error = Some(plan_issue.clone());
-                    s.rounds.push(RoundResult::new(
+                    if let Some(issue_number) = req.issue {
+                        return Ok(ImplementOutcome::Replan {
+                            issue: issue_number,
+                            plan_issue,
+                            prior_plan: plan_output.clone(),
+                        });
+                    }
+                    tracing::error!(
+                        task_id = %task_id,
+                        plan_issue = %plan_issue,
+                        "implementation returned PLAN_ISSUE; marking task failed"
+                    );
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.turn = 2;
+                        s.error = Some(plan_issue.clone());
+                        s.rounds.push(RoundResult::new(
+                            1,
+                            "implement",
+                            "plan_issue",
+                            if output.is_empty() {
+                                None
+                            } else {
+                                Some(output.clone())
+                            },
+                            Some(impl_telemetry.clone()),
+                            None,
+                        ));
+                    })
+                    .await?;
+                    let event = build_task_event(
+                        task_id,
                         1,
                         "implement",
-                        "plan_issue",
+                        "task_implement",
+                        Decision::Block,
+                        Some(plan_issue.clone()),
+                        None,
+                        Some(impl_telemetry.clone()),
+                        None,
                         if output.is_empty() {
                             None
                         } else {
                             Some(output.clone())
                         },
-                        Some(impl_telemetry.clone()),
-                        None,
-                    ));
-                })
-                .await?;
-                let event = build_task_event(
-                    task_id,
-                    1,
-                    "implement",
-                    "task_implement",
-                    Decision::Block,
-                    Some(plan_issue.clone()),
-                    None,
-                    Some(impl_telemetry.clone()),
-                    None,
-                    if output.is_empty() {
-                        None
-                    } else {
-                        Some(output.clone())
-                    },
-                );
-                if let Err(error) = events.log(&event).await {
-                    tracing::warn!("failed to log task_implement event: {error}");
+                    );
+                    if let Err(error) = events.log(&event).await {
+                        tracing::warn!("failed to log task_implement event: {error}");
+                    }
+                    tracing::info!(
+                        task_id = %task_id,
+                        status = "failed",
+                        turns = 2,
+                        pr_url = tracing::field::Empty,
+                        total_elapsed_secs = task_start.elapsed().as_secs(),
+                        "task_completed"
+                    );
+                    return Ok(ImplementOutcome::Done);
                 }
-                tracing::info!(
-                    task_id = %task_id,
-                    status = "failed",
-                    turns = 2,
-                    pr_url = tracing::field::Empty,
-                    total_elapsed_secs = task_start.elapsed().as_secs(),
-                    "task_completed"
-                );
-                return Ok(ImplementOutcome::Done);
-            }
-            ImplementationOutcome::ParsedPr {
-                pr_url,
-                pr_num,
-                created_issue_num,
-            } => (pr_url, pr_num, created_issue_num),
-        };
+                ImplementationOutcome::ParsedPr {
+                    pr_url,
+                    pr_num,
+                    created_issue_num,
+                    pushed_commit,
+                } => (pr_url, pr_num, created_issue_num, pushed_commit),
+            };
 
         mutate_and_persist(store, task_id, |s| {
             s.pr_url = pr_url.clone();
@@ -1100,12 +1106,13 @@ pub(crate) async fn run_implement_phase(
             tracing::warn!("failed to log task_implement event: {error}");
         }
 
-        (pr_url, pr_num)
+        (pr_url, pr_num, pushed_commit)
     }; // end 'implement
 
     Ok(ImplementOutcome::Proceed {
         pr_url,
         pr_num,
+        implementation_pushed_commit: pushed_commit,
         context_items,
         turn_timeout,
         initial_allowed_tools,
@@ -1158,6 +1165,23 @@ mod tests {
                 pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
                 pr_num: Some(42),
                 created_issue_num: None,
+                pushed_commit: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_implementation_outcome_extracts_pushed_commit_flag() {
+        let output =
+            "PR_URL=https://github.com/majiayu000/harness/pull/42\nPUSHED_COMMIT=true\nFIXED";
+        let parsed = parse_implementation_outcome(output);
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::ParsedPr {
+                pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
+                pr_num: Some(42),
+                created_issue_num: None,
+                pushed_commit: true,
             }
         );
     }

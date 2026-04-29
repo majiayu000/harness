@@ -346,6 +346,19 @@ pub fn parse_plan_issue(output: &str) -> Option<String> {
     None
 }
 
+/// Parse `PUSHED_COMMIT=true|false` from agent output.
+///
+/// Used by PR-check flows to propagate whether the agent pushed a commit
+/// during the initial pass, so later review freshness gates can require a
+/// re-review of the latest commit.
+pub fn parse_pushed_commit(output: &str) -> bool {
+    output.lines().rev().any(|line| {
+        line.trim()
+            .strip_prefix("PUSHED_COMMIT=")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +378,18 @@ mod tests {
         assert!(is_waiting("WAITING\n"));
         assert!(!is_waiting("LGTM"));
         assert!(!is_waiting("FIXED"));
+    }
+
+    #[test]
+    fn test_parse_pushed_commit() {
+        assert!(parse_pushed_commit(
+            "PR_URL=https://github.com/o/r/pull/1\nPUSHED_COMMIT=true"
+        ));
+        assert!(parse_pushed_commit("PUSHED_COMMIT=TRUE\nFIXED"));
+        assert!(!parse_pushed_commit(
+            "PR_URL=https://github.com/o/r/pull/1\nPUSHED_COMMIT=false\nLGTM"
+        ));
+        assert!(!parse_pushed_commit("LGTM"));
     }
 
     #[test]

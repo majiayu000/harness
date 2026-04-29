@@ -895,7 +895,7 @@ pub(crate) async fn run_task(
 
     let mut current_plan_output = plan_output;
     let mut replan_attempted = false;
-    let (pr_url, pr_num, context_items) = loop {
+    let (pr_url, pr_num, implementation_pushed_commit, context_items) = loop {
         let outcome = implement_pipeline::run_implement_phase(
             store,
             task_id,
@@ -928,9 +928,10 @@ pub(crate) async fn run_task(
             implement_pipeline::ImplementOutcome::Proceed {
                 pr_url,
                 pr_num,
+                implementation_pushed_commit,
                 context_items,
                 ..
-            } => break (pr_url, pr_num, context_items),
+            } => break (pr_url, pr_num, implementation_pushed_commit, context_items),
             implement_pipeline::ImplementOutcome::Replan {
                 issue,
                 plan_issue,
@@ -1079,6 +1080,7 @@ pub(crate) async fn run_task(
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
     }
+    agent_pushed_commit |= implementation_pushed_commit;
 
     // Skip external review bot wait when auto-trigger is disabled — there is
     // no bot to wait for, so the loop would always exhaust all rounds and fail.
