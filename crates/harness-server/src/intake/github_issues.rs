@@ -196,7 +196,6 @@ struct GhIssue {
     number: u64,
     title: String,
     body: Option<String>,
-    #[serde(rename = "html_url")]
     url: String,
     html_url: Option<String>,
     #[serde(default)]
@@ -405,8 +404,7 @@ mod tests {
                 "number": 42,
                 "title": "Fix login bug",
                 "body": "Users cannot log in after password reset.",
-                "url": "https://api.github.com/repos/owner/repo/issues/42",
-                "html_url": "https://github.com/owner/repo/issues/42",
+                "url": "https://github.com/owner/repo/issues/42",
                 "labels": [{"name": "harness"}, {"name": "bug"}],
                 "createdAt": "2026-03-01T10:00:00Z"
             }
@@ -461,9 +459,9 @@ mod tests {
     #[test]
     fn parse_gh_output_filters_dispatched_issues() {
         let json = br#"[
-            {"number": 1, "title": "A", "body": null, "html_url": "u1", "labels": [], "createdAt": null},
-            {"number": 2, "title": "B", "body": null, "html_url": "u2", "labels": [], "createdAt": null},
-            {"number": 3, "title": "C", "body": null, "html_url": "u3", "labels": [], "createdAt": null}
+            {"number": 1, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
+            {"number": 2, "title": "B", "body": null, "url": "u2", "labels": [], "createdAt": null},
+            {"number": 3, "title": "C", "body": null, "url": "u3", "labels": [], "createdAt": null}
         ]"#;
 
         // Issues 1 and 2 already dispatched
@@ -514,9 +512,9 @@ mod tests {
     #[test]
     fn parse_gh_output_filters_canonical_dispatched_issue_keys() {
         let json = br#"[
-            {"number": 1, "title": "A", "body": null, "html_url": "u1", "labels": [], "createdAt": null},
-            {"number": 2, "title": "B", "body": null, "html_url": "u2", "labels": [], "createdAt": null},
-            {"number": 3, "title": "C", "body": null, "html_url": "u3", "labels": [], "createdAt": null}
+            {"number": 1, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
+            {"number": 2, "title": "B", "body": null, "url": "u2", "labels": [], "createdAt": null},
+            {"number": 3, "title": "C", "body": null, "url": "u3", "labels": [], "createdAt": null}
         ]"#;
 
         let dispatched = make_dispatched(&["1"]);
@@ -550,7 +548,7 @@ mod tests {
     #[test]
     fn parse_gh_output_null_body_becomes_none_description() {
         let json = br#"[
-            {"number": 5, "title": "No body", "body": null, "html_url": "u", "labels": [], "createdAt": null}
+            {"number": 5, "title": "No body", "body": null, "url": "u", "labels": [], "createdAt": null}
         ]"#;
         let dispatched = DashMap::new();
         let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
@@ -560,8 +558,8 @@ mod tests {
     #[test]
     fn parse_gh_output_returns_open_issue_ids_for_eviction() {
         let json = br#"[
-            {"number": 10, "title": "A", "body": null, "html_url": "u1", "labels": [], "createdAt": null},
-            {"number": 20, "title": "B", "body": null, "html_url": "u2", "labels": [], "createdAt": null}
+            {"number": 10, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
+            {"number": 20, "title": "B", "body": null, "url": "u2", "labels": [], "createdAt": null}
         ]"#;
 
         // Issue 5 was dispatched but is no longer in the open list (closed).
