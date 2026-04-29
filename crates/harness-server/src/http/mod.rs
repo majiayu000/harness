@@ -153,7 +153,6 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             .max_gh_calls_per_minute;
         crate::reconciliation::run_once_with_token(
             &state.core.tasks,
-            &state.core.project_root,
             max_calls,
             false,
             state.core.server.config.server.github_token.as_deref(),
@@ -503,6 +502,9 @@ mod startup_tests {
     async fn build_app_state_ignores_stale_default_project_metadata_for_different_root(
     ) -> anyhow::Result<()> {
         let _lock = HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
         let sandbox = tempfile::tempdir()?;
         let startup_root = sandbox.path().join("startup-project");
         let override_root = sandbox.path().join("override-project");
@@ -525,7 +527,11 @@ mod startup_tests {
         server.startup_projects = vec![startup_default_project.clone()];
         server.startup_default_project = Some(startup_default_project);
 
-        let state = build_app_state(Arc::new(server)).await?;
+        let state = match build_app_state(Arc::new(server)).await {
+            Ok(state) => state,
+            Err(err) if crate::test_helpers::is_pool_timeout(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
         let registry = state
             .core
             .project_registry

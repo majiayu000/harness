@@ -3,7 +3,8 @@ use crate::task_runner::{mutate_and_persist, TaskId, TaskStatus, TaskStore};
 use harness_core::config::misc::ReconciliationConfig;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -13,6 +14,7 @@ struct Candidate {
     id: TaskId,
     pr_url: Option<String>,
     repo: Option<String>,
+    project_root: Option<PathBuf>,
     /// Numeric issue or PR from `external_id` (e.g. `issue:42` → 42).
     issue_num: Option<u64>,
     /// Numeric PR from `external_id` `pr:N` when no `pr_url` is present.
@@ -114,6 +116,7 @@ fn candidate_from_task(task: &crate::task_runner::TaskState) -> Option<Candidate
         id: task.id.clone(),
         pr_url: task.pr_url.clone(),
         repo: task.repo.clone(),
+        project_root: task.project_root.clone(),
         issue_num,
         pr_num_from_ext,
     })
@@ -245,26 +248,26 @@ pub(crate) async fn fetch_issue_state_with_token(
 /// Core reconciliation logic. Callable from the periodic loop and HTTP handler.
 pub async fn run_once(
     store: &Arc<TaskStore>,
-    project: &Path,
     max_gh_calls_per_minute: u32,
     dry_run: bool,
 ) -> ReconciliationReport {
-    run_once_with_token(store, project, max_gh_calls_per_minute, dry_run, None).await
+    run_once_with_token(store, max_gh_calls_per_minute, dry_run, None).await
 }
 
 pub async fn run_once_with_token(
     store: &Arc<TaskStore>,
-    project: &Path,
     max_gh_calls_per_minute: u32,
     dry_run: bool,
     github_token: Option<&str>,
 ) -> ReconciliationReport {
     let (candidates, skipped_terminal) = collect_candidates(store);
     let mut rate = RateLimiter::new(max_gh_calls_per_minute);
+    let mut repo_slug_cache = HashMap::new();
     let mut transitions = Vec::new();
 
     for candidate in &candidates {
-        let gh_state = resolve_github_state(candidate, project, &mut rate, github_token).await;
+        let gh_state =
+            resolve_github_state(candidate, &mut rate, &mut repo_slug_cache, github_token).await;
 
         let new_status = transition_for_github_state(gh_state);
 
@@ -320,8 +323,8 @@ fn transition_for_github_state(gh_state: GitHubState) -> Option<(TaskStatus, &'s
 /// Determine the current GitHub state for one candidate, consuming rate-limit budget.
 async fn resolve_github_state(
     candidate: &Candidate,
-    project: &Path,
     rate: &mut RateLimiter,
+    repo_slug_cache: &mut HashMap<PathBuf, Option<String>>,
     github_token: Option<&str>,
 ) -> GitHubState {
     // PR URL takes precedence — most candidates in `implementing`/`reviewing`
@@ -330,10 +333,7 @@ async fn resolve_github_state(
         rate.acquire().await;
         return fetch_pr_state_by_url(pr_url, github_token).await;
     }
-    let repo_slug = match candidate.repo.as_deref() {
-        Some(repo) if !repo.trim().is_empty() => Some(repo.to_string()),
-        _ => crate::task_executor::pr_detection::detect_repo_slug(project).await,
-    };
+    let repo_slug = resolve_repo_slug(candidate, repo_slug_cache).await;
     let Some(repo_slug) = repo_slug else {
         tracing::debug!(
             task_id = %candidate.id.0,
@@ -350,6 +350,35 @@ async fn resolve_github_state(
         return fetch_issue_state_with_token(&repo_slug, issue_num, github_token).await;
     }
     GitHubState::Unknown
+}
+
+async fn resolve_repo_slug(
+    candidate: &Candidate,
+    repo_slug_cache: &mut HashMap<PathBuf, Option<String>>,
+) -> Option<String> {
+    match candidate.repo.as_deref() {
+        Some(repo) if !repo.trim().is_empty() => Some(repo.to_string()),
+        _ => match candidate.project_root.as_ref() {
+            Some(project_root) => {
+                if let Some(cached) = cached_repo_slug(repo_slug_cache, project_root) {
+                    return cached.clone();
+                }
+
+                let detected =
+                    crate::task_executor::pr_detection::detect_repo_slug(project_root).await;
+                repo_slug_cache.insert(project_root.clone(), detected.clone());
+                detected
+            }
+            None => None,
+        },
+    }
+}
+
+fn cached_repo_slug(
+    repo_slug_cache: &HashMap<PathBuf, Option<String>>,
+    project_root: &PathBuf,
+) -> Option<Option<String>> {
+    repo_slug_cache.get(project_root).cloned()
 }
 
 /// Apply a status transition to a task, returning `true` on success.
@@ -408,7 +437,6 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
     loop {
         let report = run_once_with_token(
             &state.core.tasks,
-            &state.core.project_root,
             config.max_gh_calls_per_minute,
             false,
             state.core.server.config.server.github_token.as_deref(),
@@ -446,6 +474,9 @@ mod tests {
     use super::*;
     use crate::task_runner::TaskState;
     use harness_core::types::TaskId;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
 
     fn make_task(
         id: &str,
@@ -459,6 +490,93 @@ mod tests {
         task.pr_url = pr_url.map(|s| s.to_string());
         task.external_id = external_id.map(|s| s.to_string());
         task
+    }
+
+    fn async_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScopedEnvVar {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key: key.to_string(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                unsafe { std::env::set_var(&self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(&self.key) };
+            }
+        }
+    }
+
+    async fn github_state_server(routes: Vec<(&'static str, &'static str)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind GitHub mock");
+        let addr = listener.local_addr().expect("GitHub mock address");
+        let routes: HashMap<String, &'static str> = routes
+            .into_iter()
+            .map(|(path, body)| (path.to_string(), body))
+            .collect();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 2048];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let request_line = request.lines().next().unwrap_or_default();
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let (status, response_body) = match routes.get(&path).copied() {
+                        Some(body) => ("200 OK", body),
+                        None => ("404 Not Found", "{}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                        response_body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn write_git_remote_config(path: &std::path::Path, origin: &str) {
+        let dotgit = path.join(".git");
+        std::fs::create_dir_all(&dotgit).expect("create .git");
+        std::fs::write(
+            dotgit.join("config"),
+            format!("[remote \"origin\"]\n\turl = {origin}\n"),
+        )
+        .expect("write git config");
     }
 
     // ── Pure function tests (no DB required) ─────────────────────────────
@@ -511,11 +629,99 @@ mod tests {
     }
 
     #[test]
+    fn candidate_from_task_carries_project_root() {
+        let mut t = make_task("x", TaskStatus::Pending, None, Some("issue:9"));
+        t.project_root = Some(PathBuf::from("/tmp/projects/alpha"));
+        let c = candidate_from_task(&t).unwrap();
+        assert_eq!(c.project_root, Some(PathBuf::from("/tmp/projects/alpha")));
+    }
+
+    #[test]
     fn candidate_from_task_picks_issue_external_id() {
         let t = make_task("x", TaskStatus::Pending, None, Some("issue:9"));
         let c = candidate_from_task(&t).unwrap();
         assert_eq!(c.issue_num, Some(9));
         assert!(c.pr_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_slug_uses_candidate_project_root_when_repo_missing() {
+        let repo_a = tempfile::tempdir().expect("repo a tempdir");
+        let repo_b = tempfile::tempdir().expect("repo b tempdir");
+        write_git_remote_config(repo_a.path(), "https://github.com/example/repo-a.git");
+        write_git_remote_config(repo_b.path(), "https://github.com/example/repo-b.git");
+        assert_eq!(
+            crate::task_executor::pr_detection::detect_repo_slug(repo_a.path()).await,
+            Some("example/repo-a".to_string())
+        );
+
+        let candidate = Candidate {
+            id: TaskId("task-1".to_string()),
+            pr_url: None,
+            repo: None,
+            project_root: Some(repo_b.path().to_path_buf()),
+            issue_num: Some(9),
+            pr_num_from_ext: None,
+        };
+
+        let mut cache = HashMap::new();
+        let repo_slug = resolve_repo_slug(&candidate, &mut cache).await;
+        assert_eq!(repo_slug, Some("example/repo-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_once_uses_each_task_project_root_when_repo_is_missing() {
+        let _env_guard = async_env_lock().lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return;
+        }
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+        let repo_a = tempfile::tempdir().expect("repo a tempdir");
+        let repo_b = tempfile::tempdir().expect("repo b tempdir");
+        write_git_remote_config(repo_a.path(), "https://github.com/example/repo-a.git");
+        write_git_remote_config(repo_b.path(), "https://github.com/example/repo-b.git");
+
+        let api_base = github_state_server(vec![
+            ("/repos/example/repo-a/issues/9", r#"{"state":"open"}"#),
+            ("/repos/example/repo-a/issues/41", r#"{"state":"open"}"#),
+            ("/repos/example/repo-b/issues/9", r#"{"state":"closed"}"#),
+        ])
+        .await;
+        let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+        let dir = tempfile::tempdir().expect("task store tempdir");
+        let store = match TaskStore::open(&dir.path().join("tasks.db")).await {
+            Ok(store) => store,
+            Err(err) if crate::test_helpers::is_pool_timeout(&err) => return,
+            Err(err) => panic!("open task store: {err}"),
+        };
+
+        let mut repo_task = make_task("repo-task", TaskStatus::Pending, None, Some("issue:41"));
+        repo_task.repo = Some("example/repo-a".to_string());
+        repo_task.project_root = Some(repo_a.path().to_path_buf());
+        store.insert(&repo_task).await;
+
+        let mut repo_less_task =
+            make_task("repo-less-task", TaskStatus::Pending, None, Some("issue:9"));
+        repo_less_task.project_root = Some(repo_b.path().to_path_buf());
+        store.insert(&repo_less_task).await;
+
+        let report = run_once(&store, 20, false).await;
+
+        assert_eq!(report.transitions.len(), 1);
+        assert_eq!(report.transitions[0].task_id, repo_less_task.id.0);
+        assert_eq!(
+            report.transitions[0].reason,
+            "reconciled: issue closed before PR"
+        );
+
+        let repo_task_after = store.get(&repo_task.id).expect("repo task remains");
+        assert_eq!(repo_task_after.status, TaskStatus::Pending);
+
+        let repo_less_after = store
+            .get(&repo_less_task.id)
+            .expect("repo-less task remains");
+        assert_eq!(repo_less_after.status, TaskStatus::Cancelled);
     }
 
     #[test]
