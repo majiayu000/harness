@@ -170,6 +170,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
     background::spawn_checkpoint_recovery(&state).await;
 
+    // Re-dispatch leftover pending tasks that crashed before their first checkpoint.
+    background::spawn_orphan_pending_recovery(&state).await;
+
     // Periodically sweep issue workflows with attached PRs and automatically
     // enqueue `pr:N` tasks so PR feedback is handled without manual resubmission.
     background::spawn_issue_workflow_feedback_sweeper(&state);

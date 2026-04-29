@@ -162,6 +162,22 @@ impl TaskDb {
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
     }
 
+    /// Return pending tasks that have no PR URL and no checkpoint row.
+    pub async fn pending_orphan_tasks(&self) -> anyhow::Result<Vec<TaskState>> {
+        let sql = format!(
+            "SELECT {TASK_ROW_COLUMNS} \
+             FROM tasks t \
+             WHERE t.status = 'pending' \
+               AND t.pr_url IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM task_checkpoints c WHERE c.task_id = t.id) \
+             ORDER BY t.created_at DESC"
+        );
+        let rows = sqlx::query_as::<_, TaskRow>(&sql)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(TaskRow::try_into_task_state).collect()
+    }
+
     /// Return the latest `(external_id, status, created_at)` row for each issue task
     /// in a single project/repo namespace.
     pub async fn list_latest_external_statuses_by_project_and_repo(
@@ -805,6 +821,57 @@ impl TaskDb {
             .bind(task_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task_runner::{TaskId, TaskState, TaskStatus};
+
+    #[tokio::test]
+    async fn pending_orphan_tasks_returns_only_true_orphans() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = TaskDb::open(&dir.path().join("tasks.db")).await?;
+
+        let mut orphan_issue = TaskState::new(TaskId::new());
+        orphan_issue.status = TaskStatus::Pending;
+        orphan_issue.external_id = Some("issue:944".to_string());
+        db.insert(&orphan_issue).await?;
+
+        let mut orphan_prompt = TaskState::new(TaskId::new());
+        orphan_prompt.status = TaskStatus::Pending;
+        db.insert(&orphan_prompt).await?;
+
+        let mut with_pr = TaskState::new(TaskId::new());
+        with_pr.status = TaskStatus::Pending;
+        with_pr.pr_url = Some("https://github.com/org/repo/pull/944".to_string());
+        db.insert(&with_pr).await?;
+
+        let mut with_checkpoint = TaskState::new(TaskId::new());
+        with_checkpoint.status = TaskStatus::Pending;
+        db.insert(&with_checkpoint).await?;
+        db.write_checkpoint(&with_checkpoint.id.0, None, Some("plan"), None, "plan")
+            .await?;
+
+        let mut failed = TaskState::new(TaskId::new());
+        failed.status = TaskStatus::Failed;
+        db.insert(&failed).await?;
+
+        let orphan_ids: std::collections::HashSet<_> = db
+            .pending_orphan_tasks()
+            .await?
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+
+        assert_eq!(orphan_ids.len(), 2);
+        assert!(orphan_ids.contains(&orphan_issue.id));
+        assert!(orphan_ids.contains(&orphan_prompt.id));
+        assert!(!orphan_ids.contains(&with_pr.id));
+        assert!(!orphan_ids.contains(&with_checkpoint.id));
+        assert!(!orphan_ids.contains(&failed.id));
         Ok(())
     }
 }
