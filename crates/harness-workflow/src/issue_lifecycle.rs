@@ -8,6 +8,7 @@ use std::path::Path;
 pub use crate::issue_workflow_store::IssueWorkflowStore;
 
 const ISSUE_WORKFLOW_SCHEMA_VERSION: u32 = 1;
+pub const FEEDBACK_CLAIM_TASK_PREFIX: &str = "claim:";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -17,6 +18,7 @@ pub enum IssueLifecycleState {
     Implementing,
     PrOpen,
     AwaitingFeedback,
+    FeedbackClaimed,
     AddressingFeedback,
     ReadyToMerge,
     Blocked,
@@ -162,11 +164,21 @@ impl IssueWorkflowInstance {
                 self.pr_number = event.pr_number;
                 self.pr_url = event.pr_url.clone();
             }
-            IssueLifecycleEventKind::FeedbackTaskScheduled
-            | IssueLifecycleEventKind::FeedbackFound => {
+            IssueLifecycleEventKind::FeedbackFound => {
+                self.state = IssueLifecycleState::FeedbackClaimed;
+                self.active_task_id = None;
+                self.feedback_claimed_at = Some(event.at);
+                if event.pr_number.is_some() {
+                    self.pr_number = event.pr_number;
+                }
+                if event.pr_url.is_some() {
+                    self.pr_url = event.pr_url.clone();
+                }
+            }
+            IssueLifecycleEventKind::FeedbackTaskScheduled => {
                 self.state = IssueLifecycleState::AddressingFeedback;
                 self.active_task_id = event.task_id.clone();
-                self.feedback_claimed_at = Some(Utc::now());
+                self.feedback_claimed_at = None;
                 if event.pr_number.is_some() {
                     self.pr_number = event.pr_number;
                 }
@@ -212,6 +224,10 @@ impl IssueWorkflowInstance {
         self.last_event = Some(event);
         self.updated_at = Utc::now();
     }
+}
+
+pub fn is_feedback_claim_placeholder(task_id: &str) -> bool {
+    task_id.starts_with(FEEDBACK_CLAIM_TASK_PREFIX)
 }
 
 fn repo_key(repo: Option<&str>) -> &str {

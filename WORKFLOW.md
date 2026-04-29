@@ -29,8 +29,9 @@ Current externally configurable rules:
   - Enables or disables automatic background PR feedback sweeping.
 
 - `pr_feedback.claim_stale_after_secs`
-  - Maximum age for a claimed feedback workflow before the sweeper reclaims it
-    after an interrupted enqueue path.
+  - Maximum age for a `feedback_claimed` placeholder before the sweeper reclaims it
+    after an interrupted enqueue path. This does not reclaim live
+    `addressing_feedback` tasks with a real `active_task_id`.
 
 - `storage.schema_namespace`
   - Stable namespace used for workflow persistence in Postgres so multiple instances do not split by local `data_dir` path.

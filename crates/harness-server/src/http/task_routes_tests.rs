@@ -318,6 +318,37 @@ fn workflow_reuse_strategy_reuses_only_active_pr_task_when_active_task_missing()
 }
 
 #[test]
+fn workflow_reuse_strategy_claimed_feedback_falls_back_to_pr() {
+    let mut workflow = IssueWorkflowInstance::new(
+        "/tmp/project".to_string(),
+        Some("owner/repo".to_string()),
+        42,
+    );
+    workflow.state = IssueLifecycleState::FeedbackClaimed;
+    workflow.pr_number = Some(100);
+    match workflow_reuse_strategy(&workflow) {
+        WorkflowReuseStrategy::PrExternalId(ext_id) => assert_eq!(ext_id, "pr:100"),
+        _ => panic!("expected pr-external-id reuse strategy"),
+    }
+}
+
+#[test]
+fn workflow_reuse_strategy_ignores_claim_placeholder_task_ids() {
+    let mut workflow = IssueWorkflowInstance::new(
+        "/tmp/project".to_string(),
+        Some("owner/repo".to_string()),
+        42,
+    );
+    workflow.state = IssueLifecycleState::AddressingFeedback;
+    workflow.active_task_id = Some("claim:workflow-42".to_string());
+    workflow.pr_number = Some(101);
+    match workflow_reuse_strategy(&workflow) {
+        WorkflowReuseStrategy::PrExternalId(ext_id) => assert_eq!(ext_id, "pr:101"),
+        _ => panic!("expected pr-external-id reuse strategy"),
+    }
+}
+
+#[test]
 fn workflow_reuse_strategy_rejects_failed_and_cancelled_workflows() {
     let mut failed = IssueWorkflowInstance::new(
         "/tmp/project".to_string(),

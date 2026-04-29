@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
 use harness_core::{agent::CodeAgent, config::HarnessConfig, interceptor::TurnInterceptor};
 use harness_skills::store::SkillStore;
-use harness_workflow::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
+use harness_workflow::issue_lifecycle::{
+    is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
@@ -160,7 +162,9 @@ pub(crate) fn workflow_reuse_strategy(workflow: &IssueWorkflowInstance) -> Workf
         return WorkflowReuseStrategy::None;
     }
     if let Some(task_id) = workflow.active_task_id.as_ref() {
-        return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
+        if !is_feedback_claim_placeholder(task_id) {
+            return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
+        }
     }
     if let Some(pr_number) = workflow.pr_number {
         return WorkflowReuseStrategy::ActivePrExternalId(format!("pr:{pr_number}"));
