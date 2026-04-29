@@ -16,6 +16,12 @@ pub enum Notification {
     ItemCompleted { turn_id: TurnId, item: Item },
     #[serde(rename = "message/delta", alias = "message_delta")]
     MessageDelta { turn_id: TurnId, text: String },
+    #[serde(rename = "tool/output_delta")]
+    ToolOutputDelta {
+        turn_id: TurnId,
+        item_id: String,
+        text: String,
+    },
     #[serde(rename = "turn/completed")]
     TurnCompleted {
         turn_id: TurnId,
@@ -38,6 +44,8 @@ pub enum Notification {
         request_id: String,
         command: String,
     },
+    #[serde(rename = "warning")]
+    Warning { turn_id: TurnId, message: String },
 }
 
 /// Notification envelope (no id field per JSON-RPC 2.0 spec).

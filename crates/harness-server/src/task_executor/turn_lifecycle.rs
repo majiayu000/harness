@@ -9,6 +9,43 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
+fn bridge_agent_event(event: AgentEvent, output_buf: &mut String) -> Option<StreamItem> {
+    match event {
+        AgentEvent::ItemStartedPayload { item } => Some(StreamItem::ItemStarted { item }),
+        AgentEvent::MessageDelta { text } => {
+            output_buf.push_str(&text);
+            Some(StreamItem::MessageDelta { text })
+        }
+        AgentEvent::ToolOutputDelta { item_id, text } => {
+            Some(StreamItem::ToolOutputDelta { item_id, text })
+        }
+        AgentEvent::ApprovalRequest { id, command } => {
+            Some(StreamItem::ApprovalRequest { id, command })
+        }
+        AgentEvent::ItemCompletedPayload { item } => {
+            if let harness_core::types::Item::AgentReasoning { content } = &item {
+                output_buf.clear();
+                output_buf.push_str(content);
+            }
+            Some(StreamItem::ItemCompleted { item })
+        }
+        AgentEvent::TokenUsage { usage } => Some(StreamItem::TokenUsage { usage }),
+        AgentEvent::Warning { message } => Some(StreamItem::Warning { message }),
+        AgentEvent::Error { message } => Some(StreamItem::Error { message }),
+        AgentEvent::TurnCompleted { output } => {
+            let content = if output.is_empty() {
+                std::mem::take(output_buf)
+            } else {
+                output
+            };
+            Some(StreamItem::ItemCompleted {
+                item: harness_core::types::Item::AgentReasoning { content },
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn run_turn_lifecycle(
     server: Arc<crate::server::HarnessServer>,
     thread_db: Option<crate::thread_db::ThreadDb>,
@@ -104,27 +141,7 @@ pub(crate) async fn run_turn_lifecycle(
         tokio::spawn(async move {
             let mut output_buf = String::new();
             while let Some(event) = event_rx.recv().await {
-                let maybe_item: Option<StreamItem> = match event {
-                    AgentEvent::MessageDelta { ref text } => {
-                        output_buf.push_str(text);
-                        Some(StreamItem::MessageDelta { text: text.clone() })
-                    }
-                    AgentEvent::ApprovalRequest { id, command } => {
-                        Some(StreamItem::ApprovalRequest { id, command })
-                    }
-                    AgentEvent::Error { message } => Some(StreamItem::Error { message }),
-                    AgentEvent::TurnCompleted { output } => {
-                        let content = if output.is_empty() {
-                            std::mem::take(&mut output_buf)
-                        } else {
-                            output
-                        };
-                        Some(StreamItem::ItemCompleted {
-                            item: harness_core::types::Item::AgentReasoning { content },
-                        })
-                    }
-                    _ => None,
-                };
+                let maybe_item = bridge_agent_event(event, &mut output_buf);
                 if let Some(item) = maybe_item {
                     if bridge_tx.send(item).await.is_err() {
                         return;
@@ -274,5 +291,80 @@ pub(crate) async fn run_turn_lifecycle(
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bridge_agent_event;
+    use harness_core::agent::{AgentEvent, StreamItem};
+    use harness_core::types::{Item, TokenUsage};
+
+    #[test]
+    fn bridge_preserves_warning_and_token_usage_events() {
+        let mut output_buf = String::new();
+
+        let warning = bridge_agent_event(
+            AgentEvent::Warning {
+                message: "careful".into(),
+            },
+            &mut output_buf,
+        );
+        let usage = bridge_agent_event(
+            AgentEvent::TokenUsage {
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    total_tokens: 3,
+                    cost_usd: 0.0,
+                },
+            },
+            &mut output_buf,
+        );
+
+        assert_eq!(
+            warning,
+            Some(StreamItem::Warning {
+                message: "careful".into()
+            })
+        );
+        assert_eq!(
+            usage,
+            Some(StreamItem::TokenUsage {
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    total_tokens: 3,
+                    cost_usd: 0.0,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn bridge_uses_buffered_output_when_turn_completed_payload_is_empty() {
+        let mut output_buf = String::new();
+        let _ = bridge_agent_event(
+            AgentEvent::MessageDelta {
+                text: "hello".into(),
+            },
+            &mut output_buf,
+        );
+        let completed = bridge_agent_event(
+            AgentEvent::TurnCompleted {
+                output: String::new(),
+            },
+            &mut output_buf,
+        );
+
+        assert_eq!(
+            completed,
+            Some(StreamItem::ItemCompleted {
+                item: Item::AgentReasoning {
+                    content: "hello".into()
+                }
+            })
+        );
+        assert!(output_buf.is_empty());
     }
 }

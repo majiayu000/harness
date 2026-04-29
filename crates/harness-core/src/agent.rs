@@ -94,13 +94,15 @@ pub struct AgentResponse {
     pub exit_code: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamItem {
     ItemStarted { item: Item },
     MessageDelta { text: String },
+    ToolOutputDelta { item_id: String, text: String },
     ItemCompleted { item: Item },
     TokenUsage { usage: TokenUsage },
+    Warning { message: String },
     Error { message: String },
     ApprovalRequest { id: String, command: String },
     Done,
@@ -134,7 +136,14 @@ pub enum AgentEvent {
     ItemStarted {
         item_type: String,
     },
+    ItemStartedPayload {
+        item: Item,
+    },
     MessageDelta {
+        text: String,
+    },
+    ToolOutputDelta {
+        item_id: String,
         text: String,
     },
     ToolCall {
@@ -146,6 +155,15 @@ pub enum AgentEvent {
         command: String,
     },
     ItemCompleted,
+    ItemCompletedPayload {
+        item: Item,
+    },
+    TokenUsage {
+        usage: TokenUsage,
+    },
+    Warning {
+        message: String,
+    },
     TurnCompleted {
         output: String,
     },
@@ -226,8 +244,20 @@ mod tests {
             AgentEvent::ItemStarted {
                 item_type: "message".into(),
             },
+            AgentEvent::ItemStartedPayload {
+                item: Item::ShellCommand {
+                    command: "pwd".into(),
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            },
             AgentEvent::MessageDelta {
                 text: "hello".into(),
+            },
+            AgentEvent::ToolOutputDelta {
+                item_id: "item-1".into(),
+                text: "output".into(),
             },
             AgentEvent::ToolCall {
                 name: "bash".into(),
@@ -238,6 +268,17 @@ mod tests {
                 command: "rm -rf /tmp/test".into(),
             },
             AgentEvent::ItemCompleted,
+            AgentEvent::ItemCompletedPayload {
+                item: Item::AgentReasoning {
+                    content: "done".into(),
+                },
+            },
+            AgentEvent::TokenUsage {
+                usage: TokenUsage::default(),
+            },
+            AgentEvent::Warning {
+                message: "careful".into(),
+            },
             AgentEvent::TurnCompleted {
                 output: "done".into(),
             },

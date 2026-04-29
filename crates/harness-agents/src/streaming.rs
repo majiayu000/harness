@@ -17,6 +17,18 @@ const MAX_STDERR_LINE_LEN: usize = 1000;
 const MAX_CAPTURED_STDERR_CHARS: usize = 4000;
 const MAX_STREAM_FAILURE_OUTPUT_CHARS: usize = 500;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StderrHandling {
+    ClassifyWarnings,
+    DiagnosticsOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StderrLineDisposition {
+    Debug,
+    Warning,
+}
+
 /// Truncate a string to at most `max_bytes`, snapping to a char boundary.
 fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -221,6 +233,22 @@ fn append_stderr_capture(captured: &Arc<Mutex<String>>, line: &str) {
     }
 }
 
+fn stderr_line_disposition(line: &str, handling: StderrHandling) -> Option<StderrLineDisposition> {
+    let trimmed = truncate_to_char_boundary(line, MAX_STDERR_LINE_LEN);
+    if trimmed.is_empty() {
+        return None;
+    }
+    if handling == StderrHandling::DiagnosticsOnly || is_agent_internal(trimmed) {
+        return Some(StderrLineDisposition::Debug);
+    }
+    let lower = trimmed.to_lowercase();
+    if STDERR_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        Some(StderrLineDisposition::Warning)
+    } else {
+        Some(StderrLineDisposition::Debug)
+    }
+}
+
 pub(crate) fn captured_stderr_tail(captured: &Arc<Mutex<String>>) -> String {
     captured
         .lock()
@@ -242,10 +270,11 @@ pub(crate) fn enrich_stream_exit_error(error: HarnessError, stderr_tail: &str) -
     }
 }
 
-pub(crate) async fn filter_agent_stderr_with_capture(
+async fn drain_agent_stderr_with_capture(
     stderr: tokio::process::ChildStderr,
     agent_name: &str,
     captured: Option<Arc<Mutex<String>>>,
+    handling: StderrHandling,
 ) {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
@@ -258,17 +287,40 @@ pub(crate) async fn filter_agent_stderr_with_capture(
         if let Some(captured) = captured.as_ref() {
             append_stderr_capture(captured, trimmed);
         }
-        if is_agent_internal(trimmed) {
-            tracing::debug!(agent = agent_name, "{trimmed}");
-            continue;
-        }
-        let lower = trimmed.to_lowercase();
-        if STDERR_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
-            tracing::warn!(agent = agent_name, "{trimmed}");
-        } else {
-            tracing::debug!(agent = agent_name, "{trimmed}");
+        match stderr_line_disposition(trimmed, handling) {
+            Some(StderrLineDisposition::Warning) => tracing::warn!(agent = agent_name, "{trimmed}"),
+            Some(StderrLineDisposition::Debug) => tracing::debug!(agent = agent_name, "{trimmed}"),
+            None => {}
         }
     }
+}
+
+pub(crate) async fn filter_agent_stderr_with_capture(
+    stderr: tokio::process::ChildStderr,
+    agent_name: &str,
+    captured: Option<Arc<Mutex<String>>>,
+) {
+    drain_agent_stderr_with_capture(
+        stderr,
+        agent_name,
+        captured,
+        StderrHandling::ClassifyWarnings,
+    )
+    .await;
+}
+
+pub(crate) async fn capture_agent_stderr_diagnostics(
+    stderr: tokio::process::ChildStderr,
+    agent_name: &str,
+    captured: Option<Arc<Mutex<String>>>,
+) {
+    drain_agent_stderr_with_capture(
+        stderr,
+        agent_name,
+        captured,
+        StderrHandling::DiagnosticsOnly,
+    )
+    .await;
 }
 
 /// Read agent stderr line-by-line. Lines matching error keywords are logged
@@ -279,23 +331,23 @@ pub(crate) async fn filter_agent_stderr(stderr: tokio::process::ChildStderr, age
 }
 
 /// Log stderr captured from a non-streaming `output()` call.
-pub(crate) fn log_captured_stderr(stderr: &str, agent_name: &str) {
+fn log_captured_stderr_with_mode(stderr: &str, agent_name: &str, handling: StderrHandling) {
     for line in stderr.lines() {
         let trimmed = truncate_to_char_boundary(line, MAX_STDERR_LINE_LEN);
-        if trimmed.is_empty() {
-            continue;
-        }
-        if is_agent_internal(trimmed) {
-            tracing::debug!(agent = agent_name, "{trimmed}");
-            continue;
-        }
-        let lower = trimmed.to_lowercase();
-        if STDERR_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
-            tracing::warn!(agent = agent_name, "{trimmed}");
-        } else {
-            tracing::debug!(agent = agent_name, "{trimmed}");
+        match stderr_line_disposition(trimmed, handling) {
+            Some(StderrLineDisposition::Warning) => tracing::warn!(agent = agent_name, "{trimmed}"),
+            Some(StderrLineDisposition::Debug) => tracing::debug!(agent = agent_name, "{trimmed}"),
+            None => {}
         }
     }
+}
+
+pub(crate) fn log_captured_stderr(stderr: &str, agent_name: &str) {
+    log_captured_stderr_with_mode(stderr, agent_name, StderrHandling::ClassifyWarnings);
+}
+
+pub(crate) fn log_captured_stderr_diagnostics(stderr: &str, agent_name: &str) {
+    log_captured_stderr_with_mode(stderr, agent_name, StderrHandling::DiagnosticsOnly);
 }
 
 pub(crate) async fn send_stream_item(
@@ -660,6 +712,22 @@ mod tests {
         let long_line = "x".repeat(2000);
         // Should not panic
         log_captured_stderr(&long_line, "agent");
+    }
+
+    #[test]
+    fn diagnostics_only_stderr_does_not_promote_markdown_context_lines() {
+        let disposition = stderr_line_disposition(
+            "110:- Full cargo test --workspace ... -Dwarnings",
+            StderrHandling::DiagnosticsOnly,
+        );
+        assert_eq!(disposition, Some(StderrLineDisposition::Debug));
+    }
+
+    #[test]
+    fn warning_classifier_preserves_real_warning_lines() {
+        let disposition =
+            stderr_line_disposition("warning: unused import", StderrHandling::ClassifyWarnings);
+        assert_eq!(disposition, Some(StderrLineDisposition::Warning));
     }
 
     #[test]
