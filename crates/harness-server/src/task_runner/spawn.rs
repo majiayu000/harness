@@ -1569,6 +1569,7 @@ mod tests {
     /// returns pre-configured responses in order.
     struct PhaseCapturingAgent {
         phases: tokio::sync::Mutex<Vec<Option<ExecutionPhase>>>,
+        prompts: tokio::sync::Mutex<Vec<String>>,
         responses: tokio::sync::Mutex<Vec<String>>,
     }
 
@@ -1576,12 +1577,17 @@ mod tests {
         fn new(responses: Vec<String>) -> Arc<Self> {
             Arc::new(Self {
                 phases: tokio::sync::Mutex::new(Vec::new()),
+                prompts: tokio::sync::Mutex::new(Vec::new()),
                 responses: tokio::sync::Mutex::new(responses),
             })
         }
 
         async fn captured_phases(&self) -> Vec<Option<ExecutionPhase>> {
             self.phases.lock().await.clone()
+        }
+
+        async fn captured_prompts(&self) -> Vec<String> {
+            self.prompts.lock().await.clone()
         }
 
         async fn next_response(&self) -> String {
@@ -1608,6 +1614,20 @@ mod tests {
         }
     }
 
+    async fn wait_for_captured_prompts(
+        agent: &PhaseCapturingAgent,
+        min_count: usize,
+    ) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let prompts = agent.captured_prompts().await;
+            if prompts.len() >= min_count || Instant::now() >= deadline {
+                return prompts;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[async_trait]
     impl harness_core::agent::CodeAgent for PhaseCapturingAgent {
         fn name(&self) -> &str {
@@ -1620,6 +1640,7 @@ mod tests {
 
         async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
             self.phases.lock().await.push(req.execution_phase);
+            self.prompts.lock().await.push(req.prompt.clone());
             let output = self.next_response().await;
             Ok(AgentResponse {
                 output,
@@ -1637,6 +1658,7 @@ mod tests {
             tx: tokio::sync::mpsc::Sender<StreamItem>,
         ) -> harness_core::error::Result<()> {
             self.phases.lock().await.push(req.execution_phase);
+            self.prompts.lock().await.push(req.prompt.clone());
             let output = self.next_response().await;
             if !output.is_empty() {
                 if let Err(e) = tx.send(StreamItem::MessageDelta { text: output }).await {
@@ -1778,6 +1800,212 @@ mod tests {
             phases[1],
             Some(ExecutionPhase::Execution),
             "review loop turn must use Execution phase (agent needs write access to fix bot comments)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumed_pr_manual_conflict_fails_before_review_loop() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
+        let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
+        let events = Arc::new(
+            harness_observe::event_store::EventStore::new_with_database_url(
+                dir.path(),
+                Some(&database_url),
+            )
+            .await?,
+        );
+
+        let agent = PhaseCapturingAgent::new(vec![
+            "PR_URL=https://github.com/owner/repo/pull/7\nWAITING".into(),
+            "MANUAL_RESOLUTION_REQUIRED".into(),
+        ]);
+
+        let req = CreateTaskRequest {
+            pr: Some(7),
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: Some(1),
+            turn_timeout_secs: 30,
+            ..Default::default()
+        };
+
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire("test", 0).await?;
+        let task_id = spawn_task(
+            store.clone(),
+            agent.clone(),
+            None,
+            Default::default(),
+            skills,
+            events,
+            vec![],
+            req,
+            None,
+            permit,
+            None,
+            None,
+        )
+        .await;
+
+        wait_until(Duration::from_secs(15), || {
+            store
+                .get(&task_id)
+                .is_some_and(|state| matches!(state.status, TaskStatus::Failed))
+        })
+        .await?;
+
+        let phases = agent.captured_phases().await;
+        assert_eq!(
+            phases.len(),
+            2,
+            "manual-resolution outcome must stop before the normal review loop"
+        );
+        let state = store.get(&task_id).expect("task should exist");
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("manual resolution required"),
+            "failure must preserve manual-resolution wording for intake safeguards"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumed_pr_clean_conflict_gate_enters_review_loop() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
+        let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
+        let events = Arc::new(
+            harness_observe::event_store::EventStore::new_with_database_url(
+                dir.path(),
+                Some(&database_url),
+            )
+            .await?,
+        );
+
+        let agent = PhaseCapturingAgent::new(vec![
+            "PR_URL=https://github.com/owner/repo/pull/8\nWAITING".into(),
+            "CLEAN_PR".into(),
+            "LGTM".into(),
+        ]);
+
+        let req = CreateTaskRequest {
+            pr: Some(8),
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: Some(1),
+            turn_timeout_secs: 30,
+            ..Default::default()
+        };
+
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire("test", 0).await?;
+        let task_id = spawn_task(
+            store.clone(),
+            agent.clone(),
+            None,
+            Default::default(),
+            skills,
+            events,
+            vec![],
+            req,
+            None,
+            permit,
+            None,
+            None,
+        )
+        .await;
+
+        wait_until(Duration::from_secs(15), || {
+            store
+                .get(&task_id)
+                .is_some_and(|state| matches!(state.status, TaskStatus::Done))
+        })
+        .await?;
+
+        let phases = agent.captured_phases().await;
+        assert!(
+            phases.len() >= 3,
+            "clean resumed PR must enter the review loop after the conflict gate"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumed_pr_rebase_push_requires_fresh_review_prompt() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store =
+            TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+                .await?;
+        let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
+        let events = Arc::new(
+            harness_observe::event_store::EventStore::new_with_database_url(
+                dir.path(),
+                Some(&database_url),
+            )
+            .await?,
+        );
+
+        let agent = PhaseCapturingAgent::new(vec![
+            "PR_URL=https://github.com/owner/repo/pull/9\nWAITING".into(),
+            "REBASE_PUSHED".into(),
+            "LGTM".into(),
+        ]);
+
+        let req = CreateTaskRequest {
+            pr: Some(9),
+            project: Some(dir.path().to_path_buf()),
+            wait_secs: 0,
+            max_rounds: Some(1),
+            turn_timeout_secs: 30,
+            ..Default::default()
+        };
+
+        let queue = crate::task_queue::TaskQueue::unbounded();
+        let permit = queue.acquire("test", 0).await?;
+        let task_id = spawn_task(
+            store.clone(),
+            agent.clone(),
+            None,
+            Default::default(),
+            skills,
+            events,
+            vec![],
+            req,
+            None,
+            permit,
+            None,
+            None,
+        )
+        .await;
+
+        wait_until(Duration::from_secs(15), || {
+            store
+                .get(&task_id)
+                .is_some_and(|state| matches!(state.status, TaskStatus::Done))
+        })
+        .await?;
+
+        let prompts = wait_for_captured_prompts(agent.as_ref(), 3).await;
+        assert!(
+            prompts
+                .get(2)
+                .is_some_and(|prompt| prompt.contains("IMPORTANT — New review verification")),
+            "rebased resumed PRs must require a fresh reviewer pass before accepting LGTM"
         );
         Ok(())
     }

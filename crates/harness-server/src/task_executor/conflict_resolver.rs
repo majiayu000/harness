@@ -1,34 +1,56 @@
-//! PR conflict-size assessment policy.
-//!
-//! Harness no longer queries `gh` or runs local git commands to inspect PRs.
-//! Repository mutation and GitHub state inspection belong in the agent prompt,
-//! so this module only preserves the conflict-size type used by the executor
-//! and reports that automatic host-side assessment is unavailable.
+//! Agent-reported resumed-PR conflict gate outcomes.
 
-use std::path::Path;
+const CLEAN_PR_TOKEN: &str = "CLEAN_PR";
+const REBASE_PUSHED_TOKEN: &str = "REBASE_PUSHED";
+const MANUAL_RESOLUTION_REQUIRED_TOKEN: &str = "MANUAL_RESOLUTION_REQUIRED";
 
-/// Classification of how large a PR's merge conflict is.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PrConflictSize {
-    /// Host-side assessment is unavailable; the agent must inspect GitHub/git state.
-    Unknown(String),
+/// Exact conflict-gate outcomes accepted from the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictCheckOutcome {
+    CleanPr,
+    RebasePushed,
+    ManualResolutionRequired,
 }
 
-/// Return an unknown conflict size so the executor continues without invoking
-/// host-side git/GitHub commands.
-pub(crate) async fn assess_pr_conflict(pr_num: u64, _project: &Path) -> PrConflictSize {
-    PrConflictSize::Unknown(format!(
-        "PR #{pr_num} conflict assessment is delegated to the agent prompt"
-    ))
+/// Parse the final conflict-gate terminal token from the agent output.
+///
+/// The gate is intentionally strict and fail-closed: only the exact last
+/// non-empty line is accepted as a valid outcome.
+pub(crate) fn parse_conflict_check_output(output: &str) -> Result<ConflictCheckOutcome, String> {
+    let Some(last_line) = output.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return Err("missing terminal conflict gate token".to_string());
+    };
+    match last_line.trim() {
+        CLEAN_PR_TOKEN => Ok(ConflictCheckOutcome::CleanPr),
+        REBASE_PUSHED_TOKEN => Ok(ConflictCheckOutcome::RebasePushed),
+        MANUAL_RESOLUTION_REQUIRED_TOKEN => Ok(ConflictCheckOutcome::ManualResolutionRequired),
+        other => Err(format!("unexpected conflict gate terminal token `{other}`")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn conflict_assessment_is_delegated() {
-        let result = assess_pr_conflict(42, std::path::Path::new(".")).await;
-        assert!(matches!(result, PrConflictSize::Unknown(_)));
+    #[test]
+    fn parses_clean_pr_token() {
+        let result = parse_conflict_check_output("inspected mergeability\nCLEAN_PR");
+        assert_eq!(result, Ok(ConflictCheckOutcome::CleanPr));
+    }
+
+    #[test]
+    fn parses_rebase_pushed_token() {
+        let result = parse_conflict_check_output("rebased and pushed\nREBASE_PUSHED");
+        assert_eq!(result, Ok(ConflictCheckOutcome::RebasePushed));
+    }
+
+    #[test]
+    fn rejects_malformed_last_line() {
+        let result =
+            parse_conflict_check_output("MANUAL_RESOLUTION_REQUIRED\nextra trailing output");
+        assert_eq!(
+            result,
+            Err("unexpected conflict gate terminal token `extra trailing output`".to_string())
+        );
     }
 }
