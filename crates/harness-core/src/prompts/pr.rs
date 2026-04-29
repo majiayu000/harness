@@ -458,6 +458,7 @@ mod tests {
         assert!(p.contains("headRepository"));
         assert!(p.contains("PR_HEAD_SHA=$(git rev-parse FETCH_HEAD)"));
         assert!(p.contains("git worktree add /tmp/harness-pr-42 --detach \"$PR_HEAD_SHA\""));
+        assert!(p.contains("HEAD_REPO_URL=https://github.com/<head-owner>/<head-repo>.git"));
         assert!(p.contains("git merge-base HEAD origin/main"));
         assert!(p.contains("git rev-parse origin/main"));
     }

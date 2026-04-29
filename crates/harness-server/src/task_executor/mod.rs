@@ -17,6 +17,7 @@ use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::{config::project::load_project_config, lang_detect, prompts};
 use std::collections::HashMap;
 
+use crate::task_runner::RoundResult;
 use chrono::Utc;
 use helpers::update_status;
 
