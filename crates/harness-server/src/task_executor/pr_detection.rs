@@ -1,6 +1,12 @@
 use harness_core::prompts;
+use reqwest::header::{ACCEPT, LINK, USER_AGENT};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+const GITHUB_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 struct GhPrListItem {
@@ -215,9 +221,8 @@ pub(crate) fn build_pr_approved_prompt(
 /// later task for #791 then tried to "continue" on that PR's branch.
 ///
 /// This function now filters results so only PRs that **explicitly declare a
-/// closing relationship** to the issue are returned. The match is any of:
-/// - a closing keyword in title or body: `closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve #N`
-/// - the `(#N)` suffix pattern that harness uses in its own PR titles
+/// closing relationship** to the issue are returned via a closing keyword in
+/// title or body: `closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve #N`.
 pub(crate) async fn find_existing_pr_for_issue_with_token(
     project: &Path,
     issue: u64,
@@ -232,46 +237,134 @@ pub(crate) async fn find_existing_pr_for_issue_with_token(
         return Ok(None);
     };
 
-    let url = format!("https://api.github.com/repos/{repo_slug}/pulls?state=open&per_page=100");
     let client = reqwest::Client::new();
+    find_existing_pr_for_issue_in_repo(
+        &client,
+        &repo_slug,
+        issue,
+        github_token,
+        GITHUB_API_BASE_URL,
+    )
+    .await
+}
+
+async fn find_existing_pr_for_issue_in_repo(
+    client: &reqwest::Client,
+    repo_slug: &str,
+    issue: u64,
+    github_token: Option<&str>,
+    api_base_url: &str,
+) -> anyhow::Result<Option<(u64, String, String)>> {
+    let mut next_url = Some(github_pulls_url(api_base_url, repo_slug));
+    let mut seen_urls = HashSet::new();
+
+    while let Some(url) = next_url {
+        if !seen_urls.insert(url.clone()) {
+            tracing::debug!(
+                issue,
+                repo = %repo_slug,
+                url = %url,
+                "existing PR lookup stopped because GitHub pagination repeated a URL"
+            );
+            break;
+        }
+
+        let Some(page) = fetch_github_pr_page(client, &url, repo_slug, issue, github_token).await?
+        else {
+            return Ok(None);
+        };
+
+        if let Some(item) = page
+            .items
+            .into_iter()
+            .find(|item| pr_claims_to_close_issue(item, issue, Some(repo_slug)))
+        {
+            return Ok(Some((item.number, item.head_ref_name, item.url)));
+        }
+
+        next_url = page.next_url;
+    }
+
+    Ok(None)
+}
+
+fn github_pulls_url(api_base_url: &str, repo_slug: &str) -> String {
+    format!(
+        "{}/repos/{repo_slug}/pulls?state=open&per_page=100",
+        api_base_url.trim_end_matches('/')
+    )
+}
+
+struct GitHubPrPage {
+    items: Vec<GhPrListItem>,
+    next_url: Option<String>,
+}
+
+async fn fetch_github_pr_page(
+    client: &reqwest::Client,
+    url: &str,
+    repo_slug: &str,
+    issue: u64,
+    github_token: Option<&str>,
+) -> anyhow::Result<Option<GitHubPrPage>> {
     let mut request = client
         .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "harness-server");
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, "harness-server");
     if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
         request = request.bearer_auth(token);
     }
-    let response =
-        match tokio::time::timeout(std::time::Duration::from_secs(10), request.send()).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => {
-                tracing::debug!(issue, repo = %repo_slug, error = %e, "existing PR lookup failed");
-                return Ok(None);
-            }
-            Err(_) => {
-                tracing::debug!(issue, repo = %repo_slug, "existing PR lookup timed out");
-                return Ok(None);
-            }
-        };
+    let response = match tokio::time::timeout(GITHUB_PR_LOOKUP_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            tracing::debug!(issue, repo = %repo_slug, url = %url, error = %e, "existing PR lookup failed");
+            return Ok(None);
+        }
+        Err(_) => {
+            tracing::debug!(issue, repo = %repo_slug, url = %url, "existing PR lookup timed out");
+            return Ok(None);
+        }
+    };
     if !response.status().is_success() {
         tracing::debug!(
             issue,
             repo = %repo_slug,
+            url = %url,
             status = %response.status(),
             "existing PR lookup returned non-success status"
         );
         return Ok(None);
     }
+    let next_url = next_link_from_headers(response.headers());
     let items: Vec<GhPrListItem> = response
         .json::<Vec<GitHubPullItem>>()
         .await
         .map(|items| items.into_iter().map(Into::into).collect())
         .map_err(|e| anyhow::anyhow!("invalid GitHub pull request response: {e}"))?;
 
-    Ok(items
-        .into_iter()
-        .find(|item| pr_claims_to_close_issue(item, issue, Some(&repo_slug)))
-        .map(|item| (item.number, item.head_ref_name, item.url)))
+    Ok(Some(GitHubPrPage { items, next_url }))
+}
+
+fn next_link_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(LINK)?.to_str().ok()?;
+    parse_next_link(link)
+}
+
+fn parse_next_link(link: &str) -> Option<String> {
+    link.split(',').find_map(|part| {
+        let mut segments = part.split(';').map(str::trim);
+        let url_segment = segments.next()?;
+        if !url_segment.starts_with('<') || !url_segment.ends_with('>') {
+            return None;
+        }
+        if segments.any(|segment| {
+            segment.eq_ignore_ascii_case("rel=\"next\"") || segment.eq_ignore_ascii_case("rel=next")
+        }) {
+            Some(url_segment[1..url_segment.len() - 1].to_string())
+        } else {
+            None
+        }
+    })
 }
 
 /// Return true iff `item` declares a closing relationship to `issue` — i.e.
@@ -578,6 +671,17 @@ fn trim_git_config_value(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::State,
+        http::{header, HeaderMap, HeaderValue, Uri},
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn item(title: &str, body: &str) -> GhPrListItem {
         GhPrListItem {
@@ -587,6 +691,114 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
         }
+    }
+
+    #[test]
+    fn parse_next_link_extracts_next_relation() {
+        let link = r#"<https://api.github.com/repos/o/r/pulls?page=2>; rel="next", <https://api.github.com/repos/o/r/pulls?page=4>; rel="last""#;
+        assert_eq!(
+            parse_next_link(link),
+            Some("https://api.github.com/repos/o/r/pulls?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_next_link_returns_none_without_next_relation() {
+        let link = r#"<https://api.github.com/repos/o/r/pulls?page=4>; rel="last""#;
+        assert_eq!(parse_next_link(link), None);
+    }
+
+    struct PaginatedPrState {
+        base_url: String,
+        requests: AtomicUsize,
+    }
+
+    async fn paginated_prs_handler(
+        State(state): State<Arc<PaginatedPrState>>,
+        uri: Uri,
+    ) -> impl IntoResponse {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        let page = if uri.query().is_some_and(|query| query.contains("page=2")) {
+            2
+        } else {
+            1
+        };
+
+        let body = if page == 1 {
+            serde_json::json!([
+                {
+                    "number": 101,
+                    "html_url": "https://github.com/owner/repo/pull/101",
+                    "title": "mentions #998",
+                    "body": "related to #998 but does not close it",
+                    "head": {"ref": "docs-998"}
+                }
+            ])
+            .to_string()
+        } else {
+            serde_json::json!([
+                {
+                    "number": 102,
+                    "html_url": "https://github.com/owner/repo/pull/102",
+                    "title": "Fix PR dedup pagination",
+                    "body": "Fixes #998",
+                    "head": {"ref": "fix-998-pagination"}
+                }
+            ])
+            .to_string()
+        };
+
+        let mut headers = HeaderMap::new();
+        if page == 1 {
+            let next_url = format!(
+                "{}/repos/owner/repo/pulls?state=open&per_page=100&page=2",
+                state.base_url
+            );
+            headers.insert(
+                header::LINK,
+                HeaderValue::from_str(&format!("<{next_url}>; rel=\"next\""))
+                    .expect("valid link header"),
+            );
+        }
+        (headers, body)
+    }
+
+    #[tokio::test]
+    async fn existing_pr_lookup_follows_next_page() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let state = Arc::new(PaginatedPrState {
+            base_url: base_url.clone(),
+            requests: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/repos/owner/repo/pulls", get(paginated_prs_handler))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let found = find_existing_pr_for_issue_in_repo(
+            &reqwest::Client::new(),
+            "owner/repo",
+            998,
+            None,
+            &base_url,
+        )
+        .await?;
+
+        server.abort();
+
+        assert_eq!(
+            found,
+            Some((
+                102,
+                "fix-998-pagination".to_string(),
+                "https://github.com/owner/repo/pull/102".to_string()
+            ))
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+        Ok(())
     }
 
     // --- pr_claims_to_close_issue: positive cases ---
