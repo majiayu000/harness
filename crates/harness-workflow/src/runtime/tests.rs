@@ -1,18 +1,18 @@
 use super::model::{
     ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, RuntimeJob, RuntimeJobStatus,
-    RuntimeKind, ValidationRecord, WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType,
-    WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvidence,
-    WorkflowInstance, WorkflowSubject,
+    RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand, WorkflowCommandRecord,
+    WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowSubject,
 };
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,
     build_plan_issue_decision, build_pr_detected_decision, build_pr_feedback_decision,
-    build_stale_active_workflow_decision, InMemoryWorkflowBus, MergedPrDecisionInput,
-    OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
+    build_stale_active_workflow_decision, CommandDispatchOutcome, InMemoryWorkflowBus,
+    MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
     PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
-    RepoBacklogWorkflowAction, RuntimeJobExecutor, RuntimeWorker, StaleWorkflowDecisionInput,
-    WorkflowRuntimeStore, REPO_BACKLOG_DEFINITION_ID,
+    RepoBacklogWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor, RuntimeWorker,
+    StaleWorkflowDecisionInput, WorkflowRuntimeStore, REPO_BACKLOG_DEFINITION_ID,
 };
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -1022,5 +1022,114 @@ async fn durable_store_lists_workflow_runtime_tree_inputs() -> anyhow::Result<()
     assert_eq!(jobs[0].id, job.id);
     assert_eq!(jobs[0].status, RuntimeJobStatus::Pending);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() -> anyhow::Result<()>
+{
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "replanning");
+    store.upsert_instance(&instance).await?;
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "replanning",
+        "run_replan",
+        "replanning",
+        "Replan before continuing.",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "replan_issue",
+        "issue-123-replan-1",
+    ));
+    let record = WorkflowDecisionRecord::accepted(decision.clone(), None);
+    store.record_decision(&record).await?;
+    let command_id = store
+        .enqueue_command(&instance.id, Some(&record.id), &decision.commands[0])
+        .await?;
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-high", RuntimeKind::CodexJsonrpc),
+    );
+
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+    let runtime_job = match outcome {
+        CommandDispatchOutcome::Enqueued {
+            command_id: dispatched_command_id,
+            runtime_job,
+        } => {
+            assert_eq!(dispatched_command_id, command_id);
+            runtime_job
+        }
+        other => panic!("unexpected dispatch outcome: {other:?}"),
+    };
+    assert_eq!(runtime_job.command_id, command_id);
+    assert_eq!(runtime_job.runtime_kind, RuntimeKind::CodexJsonrpc);
+    assert_eq!(runtime_job.runtime_profile, "codex-high");
+    assert_eq!(runtime_job.status, RuntimeJobStatus::Pending);
+    assert_eq!(
+        runtime_job
+            .input
+            .get("command")
+            .and_then(|command| command.get("activity"))
+            .and_then(|activity| activity.as_str()),
+        Some("replan_issue")
+    );
+    assert_eq!(
+        store.commands_for(&instance.id).await?[0].status,
+        "dispatched"
+    );
+    assert!(dispatcher.dispatch_once().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatcher_skips_non_runtime_commands() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "pr_open");
+    store.upsert_instance(&instance).await?;
+    let command = WorkflowCommand::bind_pr(
+        77,
+        "https://github.com/owner/repo/pull/77",
+        "issue-123-pr-77",
+    );
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-high", RuntimeKind::CodexJsonrpc),
+    );
+
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should be inspected");
+    match outcome {
+        CommandDispatchOutcome::Skipped {
+            command_id: skipped_command_id,
+            reason,
+        } => {
+            assert_eq!(skipped_command_id, command_id);
+            assert_eq!(reason, "command does not require runtime execution");
+        }
+        other => panic!("unexpected dispatch outcome: {other:?}"),
+    }
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert_eq!(store.commands_for(&instance.id).await?[0].status, "skipped");
     Ok(())
 }

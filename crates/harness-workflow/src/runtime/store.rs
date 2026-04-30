@@ -400,6 +400,56 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn pending_commands(&self, limit: i64) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
+             FROM workflow_commands
+             WHERE status = 'pending'
+             ORDER BY created_at ASC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(id, workflow_id, decision_id, status, data, created_at, updated_at)| {
+                    Ok(WorkflowCommandRecord {
+                        id,
+                        workflow_id,
+                        decision_id,
+                        status,
+                        command: serde_json::from_str(&data)?,
+                        created_at,
+                        updated_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub async fn mark_command_status(&self, command_id: &str, status: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE workflow_commands
+             SET status = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2",
+        )
+        .bind(status)
+        .bind(command_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn enqueue_runtime_job(
         &self,
         command_id: &str,

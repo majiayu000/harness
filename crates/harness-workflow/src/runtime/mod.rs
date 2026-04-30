@@ -5,6 +5,7 @@
 //! instances, accepted commands, runtime jobs, and structured activity results.
 
 pub mod bus;
+pub mod dispatcher;
 pub mod model;
 pub mod plan_issue;
 pub mod pr_feedback;
@@ -17,6 +18,7 @@ pub mod worker;
 mod tests;
 
 pub use bus::InMemoryWorkflowBus;
+pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher};
 pub use model::{
     ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, RuntimeEvent, RuntimeJob,
     RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand,

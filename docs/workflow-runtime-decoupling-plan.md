@@ -28,12 +28,13 @@ Implemented now:
 - generic runtime worker boundary for claiming jobs and recording structured activity results
 - workflow-first runtime tree API and dashboard panel for instances, commands, runtime jobs, and
   rejected decisions
+- workflow command outbox dispatcher that converts pending runtime commands into runtime jobs
 
 Still intentionally not moved yet:
 
 - existing task runner ownership of process execution
 - repo backlog polling as the primary controller
-- automatic command outbox to runtime job dispatch
+- server-owned background command dispatcher loop
 - dashboard write actions still use existing task routes
 
 ## Non-Goals
@@ -422,6 +423,31 @@ Tests:
 - workflow tree displays parent and child workflows
 - runtime jobs are visible under workflow activities
 - rejected decisions show operator-readable reasons
+
+### Phase 7: Command Outbox Dispatch
+
+Status: partially implemented.
+
+Convert accepted workflow commands into durable runtime jobs without making the existing task runner
+depend on the new path yet.
+
+Implemented now:
+
+- `RuntimeCommandDispatcher` scans pending command outbox rows
+- commands that require runtime execution enqueue `runtime_jobs`
+- non-runtime commands are marked `skipped` so they do not stay pending forever
+- repeated dispatch is idempotent when a runtime job already exists for the command
+
+Still intentionally not moved yet:
+
+- the server does not spawn the dispatcher in a background loop
+- runtime profile selection is a single default profile, not workflow-specific policy
+- command lease/claiming is not yet a multi-dispatcher concurrency protocol
+
+Tests:
+
+- activity commands enqueue runtime jobs with prompt input context
+- non-runtime commands are skipped without creating jobs
 
 ## Test Strategy
 
