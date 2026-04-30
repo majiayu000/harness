@@ -11,6 +11,7 @@ pub mod pr_feedback;
 pub mod repo_backlog;
 pub mod store;
 pub mod validator;
+pub mod worker;
 
 #[cfg(test)]
 mod tests;
@@ -41,3 +42,4 @@ pub use validator::{
     DecisionValidator, TransitionAllowlist, TransitionRule, ValidationContext,
     WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
 };
+pub use worker::{RuntimeJobExecutor, RuntimeWorker};

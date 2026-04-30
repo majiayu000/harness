@@ -25,12 +25,13 @@ Implemented now:
 - PR detection durable binding through `PrDetected` / `bind_pr`
 - PR feedback decisions for waiting, addressing feedback, and ready-to-merge
 - repo backlog decisions for issue discovery, merged PR reconciliation, and stale workflow recovery
+- generic runtime worker boundary for claiming jobs and recording structured activity results
 
 Still intentionally not moved yet:
 
 - existing task runner ownership of process execution
 - repo backlog polling as the primary controller
-- runtime worker claiming of outbox commands
+- automatic command outbox to runtime job dispatch
 - workflow-first dashboard rendering
 
 ## Non-Goals
@@ -370,7 +371,23 @@ Tests:
 
 ### Phase 5: Runtime Worker Abstraction
 
-Convert existing Codex and Claude execution paths into runtime workers.
+Status: partially implemented.
+
+The current branch adds the generic worker boundary while leaving the existing Codex and Claude task
+execution paths in place.
+
+Implemented now:
+
+- `RuntimeJobExecutor` trait for runtime-specific execution adapters
+- `RuntimeWorker` that claims one pending runtime job, records claim/result events, executes the
+  adapter, and completes the durable job
+- `ActivityResult::cancelled` so cancellation can be represented as a structured runtime result
+
+Still intentionally not moved yet:
+
+- Codex exec/jsonrpc and Claude Code adapters still run through the current task executor
+- command outbox rows are not yet automatically converted into runtime jobs
+- runtime workers are not yet spawned as server-owned background processes
 
 Tests:
 

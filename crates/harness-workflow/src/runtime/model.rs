@@ -649,6 +649,18 @@ impl ActivityResult {
         }
     }
 
+    pub fn cancelled(activity: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            activity: activity.into(),
+            status: ActivityStatus::Cancelled,
+            summary: summary.into(),
+            artifacts: Vec::new(),
+            signals: Vec::new(),
+            validation: Vec::new(),
+            error: None,
+        }
+    }
+
     pub fn with_artifact(mut self, artifact: ActivityArtifact) -> Self {
         self.artifacts.push(artifact);
         self

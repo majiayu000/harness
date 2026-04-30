@@ -1,6 +1,6 @@
 use super::model::{
-    ActivityArtifact, ActivityResult, ActivitySignal, RuntimeJob, RuntimeJobStatus, RuntimeKind,
-    ValidationRecord, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
+    ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, RuntimeJob, RuntimeJobStatus,
+    RuntimeKind, ValidationRecord, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
     WorkflowSubject,
 };
@@ -11,9 +11,10 @@ use super::{
     build_stale_active_workflow_decision, InMemoryWorkflowBus, MergedPrDecisionInput,
     OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
     PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
-    RepoBacklogWorkflowAction, StaleWorkflowDecisionInput, WorkflowRuntimeStore,
-    REPO_BACKLOG_DEFINITION_ID,
+    RepoBacklogWorkflowAction, RuntimeJobExecutor, RuntimeWorker, StaleWorkflowDecisionInput,
+    WorkflowRuntimeStore, REPO_BACKLOG_DEFINITION_ID,
 };
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use harness_core::db::resolve_database_url;
 use serde_json::json;
@@ -335,6 +336,17 @@ fn leased_issue_instance(state: &str) -> WorkflowInstance {
 
 fn validation_context() -> ValidationContext {
     ValidationContext::new("controller-1", Utc::now())
+}
+
+struct StaticRuntimeExecutor {
+    result: ActivityResult,
+}
+
+#[async_trait]
+impl RuntimeJobExecutor for StaticRuntimeExecutor {
+    async fn execute(&self, _job: RuntimeJob) -> ActivityResult {
+        self.result.clone()
+    }
 }
 
 #[test]
@@ -675,6 +687,125 @@ fn in_memory_bus_passes_workflow_commands_to_runtime_jobs() {
         .expect("runtime job should complete");
     assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
     assert_eq!(bus.runtime_events_for(&claimed.id).len(), 2);
+}
+
+#[tokio::test]
+async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = store
+        .enqueue_runtime_job(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "check" }),
+        )
+        .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded("check", "Validation passed."),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+    assert_eq!(completed.id, job.id);
+    assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
+    assert!(completed.lease.is_none());
+    assert!(worker.run_once(&executor).await?.is_none());
+
+    let events = store.runtime_events_for(&completed.id).await?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, "RuntimeJobClaimed");
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(events[1].event_type, "ActivityResultReady");
+    assert_eq!(events[1].sequence, 2);
+    assert_eq!(
+        store
+            .runtime_job_count_by_status(RuntimeJobStatus::Pending)
+            .await?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_records_failed_activity_result() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    store
+        .enqueue_runtime_job(
+            "command-2",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement" }),
+        )
+        .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1");
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::failed(
+            "implement",
+            "Codex execution failed.",
+            "codex stdin not available",
+        ),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should complete failed job");
+    assert_eq!(completed.status, RuntimeJobStatus::Failed);
+    assert_eq!(
+        completed.error.as_deref(),
+        Some("codex stdin not available")
+    );
+    let output: ActivityResult =
+        serde_json::from_value(completed.output.expect("activity result output"))?;
+    assert_eq!(output.status, ActivityStatus::Failed);
+    assert_eq!(output.error.as_deref(), Some("codex stdin not available"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_cancelled_result_releases_lease() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    store
+        .enqueue_runtime_job(
+            "command-3",
+            RuntimeKind::ClaudeCode,
+            "claude-default",
+            json!({ "activity": "review" }),
+        )
+        .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1");
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::cancelled("review", "Runtime job was cancelled."),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should complete cancelled job");
+    assert_eq!(completed.status, RuntimeJobStatus::Cancelled);
+    assert!(completed.lease.is_none());
+    let output: ActivityResult =
+        serde_json::from_value(completed.output.expect("activity result output"))?;
+    assert_eq!(output.status, ActivityStatus::Cancelled);
+    Ok(())
 }
 
 #[tokio::test]
