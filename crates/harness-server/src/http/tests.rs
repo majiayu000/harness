@@ -1974,6 +1974,166 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
 }
 
 #[tokio::test]
+async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = crate::test_helpers::tempdir_in_home("harness-test-task-workflows-")?;
+    let mut state = make_test_state(dir.path()).await?;
+    let workflow_store = Arc::new(
+        harness_workflow::issue_lifecycle::IssueWorkflowStore::open(
+            &harness_core::config::dirs::default_db_path(dir.path(), "issue_workflows"),
+        )
+        .await?,
+    );
+    let project_id = dir.path().display().to_string();
+
+    workflow_store
+        .record_issue_scheduled(
+            project_id.as_str(),
+            Some("owner/repo"),
+            42,
+            "task-issue",
+            &[],
+            false,
+        )
+        .await?;
+    workflow_store
+        .record_issue_scheduled(
+            project_id.as_str(),
+            Some("owner/repo"),
+            77,
+            "task-pr",
+            &[],
+            false,
+        )
+        .await?;
+    workflow_store
+        .record_pr_detected(
+            project_id.as_str(),
+            Some("owner/repo"),
+            77,
+            "task-pr",
+            101,
+            "https://github.com/owner/repo/pull/101",
+        )
+        .await?;
+    workflow_store
+        .record_issue_scheduled(
+            "/tmp/other-project",
+            Some("owner/repo"),
+            42,
+            "other-task",
+            &[],
+            false,
+        )
+        .await?;
+
+    Arc::get_mut(&mut state)
+        .expect("state should be uniquely owned")
+        .core
+        .issue_workflow_store = Some(workflow_store);
+
+    let issue_task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Issue,
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("github".to_string()),
+        external_id: Some("issue:42".to_string()),
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: Some(42),
+        repo: Some("owner/repo".to_string()),
+        description: Some("issue task".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Implement,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    let pr_task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Issue,
+        status: task_runner::TaskStatus::Pending,
+        turn: 0,
+        pr_url: Some("https://github.com/owner/repo/pull/101".to_string()),
+        rounds: vec![],
+        error: None,
+        source: Some("github".to_string()),
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: Some(77),
+        repo: Some("owner/repo".to_string()),
+        description: Some("pr task".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Implement,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    let issue_task_id = issue_task.id.0.clone();
+    let pr_task_id = pr_task.id.0.clone();
+    state.core.tasks.insert(&issue_task).await;
+    state.core.tasks.insert(&pr_task).await;
+
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let tasks: serde_json::Value = serde_json::from_slice(&body)?;
+    let tasks = tasks.as_array().expect("tasks array");
+
+    let issue_json = tasks
+        .iter()
+        .find(|task| task["id"] == issue_task_id)
+        .expect("issue task should be listed");
+    assert_eq!(issue_json["workflow"]["project_id"], project_id);
+    assert_eq!(issue_json["workflow"]["issue_number"], 42);
+    assert_eq!(issue_json["workflow"]["pr_number"], serde_json::Value::Null);
+
+    let pr_json = tasks
+        .iter()
+        .find(|task| task["id"] == pr_task_id)
+        .expect("pr task should be listed");
+    assert_eq!(pr_json["workflow"]["project_id"], project_id);
+    assert_eq!(pr_json["workflow"]["issue_number"], 77);
+    assert_eq!(pr_json["workflow"]["pr_number"], 101);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn feishu_webhook_returns_service_unavailable_when_token_missing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state_with_feishu(dir.path(), None).await?;
