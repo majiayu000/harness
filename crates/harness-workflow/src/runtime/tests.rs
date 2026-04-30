@@ -2,17 +2,18 @@ use super::model::{
     ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, RuntimeJob, RuntimeJobStatus,
     RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand, WorkflowCommandRecord,
     WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition,
-    WorkflowEvidence, WorkflowInstance, WorkflowSubject,
+    WorkflowEvent, WorkflowEvidence, WorkflowInstance, WorkflowSubject,
 };
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,
     build_plan_issue_decision, build_pr_detected_decision, build_pr_feedback_decision,
-    build_stale_active_workflow_decision, CommandDispatchOutcome, InMemoryWorkflowBus,
-    MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
-    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
-    RepoBacklogWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor, RuntimeWorker,
-    StaleWorkflowDecisionInput, WorkflowRuntimeStore, REPO_BACKLOG_DEFINITION_ID,
+    build_stale_active_workflow_decision, reduce_runtime_job_completed, CommandDispatchOutcome,
+    InMemoryWorkflowBus, MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput,
+    PlanIssueWorkflowAction, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
+    PrFeedbackWorkflowAction, RepoBacklogWorkflowAction, RuntimeCommandDispatcher,
+    RuntimeJobExecutor, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowRuntimeStore,
+    REPO_BACKLOG_DEFINITION_ID,
 };
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -233,6 +234,58 @@ fn pr_feedback_decision_marks_ready_to_merge() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("ready-to-merge decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_resumes_after_replan() {
+    let instance = issue_instance("replanning");
+    let result = ActivityResult::succeeded("replan_issue", "Replan completed.");
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("replan completion should produce a decision");
+
+    assert_eq!(decision.decision, "resume_implementation_after_replan");
+    assert_eq!(decision.next_state, "implementing");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("runtime completion decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_returns_none_for_unmapped_success() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.");
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    assert!(reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .is_none());
 }
 
 #[test]
@@ -756,21 +809,21 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let workflow = issue_instance("implementing");
+    let workflow = issue_instance("replanning");
     store.upsert_instance(&workflow).await?;
-    let command = WorkflowCommand::enqueue_activity("implement_issue", "impl-1");
+    let command = WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store
         .enqueue_runtime_job(
             &command_id,
             RuntimeKind::CodexJsonrpc,
             "codex-default",
-            json!({ "activity": "implement_issue" }),
+            json!({ "activity": "replan_issue" }),
         )
         .await?;
     let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
     let executor = StaticRuntimeExecutor {
-        result: ActivityResult::succeeded("implement_issue", "Implementation completed."),
+        result: ActivityResult::succeeded("replan_issue", "Replan completed."),
     };
 
     let completed = worker
@@ -794,8 +847,17 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
     assert_eq!(event.event["runtime_job_status"], "succeeded");
     assert_eq!(
         event.event["activity_result"]["summary"],
-        "Implementation completed."
+        "Replan completed."
     );
+    let reloaded = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(reloaded.state, "implementing");
+    let decisions = store.decisions_for(&workflow.id).await?;
+    assert!(decisions
+        .iter()
+        .any(|record| record.decision.decision == "resume_implementation_after_replan"));
     Ok(())
 }
 

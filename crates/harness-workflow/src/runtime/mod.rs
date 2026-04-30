@@ -9,6 +9,7 @@ pub mod dispatcher;
 pub mod model;
 pub mod plan_issue;
 pub mod pr_feedback;
+pub mod reducer;
 pub mod repo_backlog;
 pub mod store;
 pub mod validator;
@@ -33,6 +34,9 @@ pub use plan_issue::{
 pub use pr_feedback::{
     build_pr_detected_decision, build_pr_feedback_decision, PrDetectedDecisionInput,
     PrFeedbackDecisionInput, PrFeedbackDecisionOutput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
+};
+pub use reducer::{
+    reduce_runtime_job_completed, GITHUB_ISSUE_PR_DEFINITION_ID, RUNTIME_JOB_COMPLETED_EVENT,
 };
 pub use repo_backlog::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,

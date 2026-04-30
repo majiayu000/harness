@@ -32,6 +32,7 @@ Implemented now:
 - opt-in server background loop for workflow command dispatch
 - opt-in server background runtime worker that executes runtime jobs through registered agents
 - runtime job completion writes back command status and workflow completion events
+- runtime completion reducer advances known workflow states from activity output
 
 Still intentionally not moved yet:
 
@@ -496,8 +497,7 @@ Implemented now:
 Still intentionally not moved yet:
 
 - workflow-specific runtime profiles do not yet select model, effort, sandbox, or turn budget
-- workflow completion events do not yet feed a reducer that advances workflow state from activity
-  output
+- workflow completion reducer coverage is intentionally limited to known activity/state pairs
 - runtime workers are process-local; distributed worker leasing beyond the job claim is not added yet
 
 Tests:
@@ -520,7 +520,7 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- no reducer consumes `RuntimeJobCompleted` to advance state automatically
+- reducer coverage is limited to known activity/state pairs
 - activity result schemas are not yet workflow-specific
 - retry policy for failed activity results is not yet modeled in workflow state
 
@@ -528,6 +528,34 @@ Tests:
 
 - runtime worker completion updates command status and appends a workflow event
 - existing runtime worker tests still cover direct jobs without command rows
+
+### Phase 11: Runtime Completion Reducer
+
+Status: partially implemented.
+
+Consume `RuntimeJobCompleted` events and advance workflow state for known activity results.
+
+Implemented now:
+
+- `replan_issue` completion moves GitHub issue workflows from `replanning` to `implementing`
+- `address_pr_feedback` completion moves GitHub issue workflows from `addressing_feedback` to
+  `awaiting_feedback`
+- failed, blocked, and cancelled activity results transition workflows to `failed`, `blocked`, or
+  `cancelled` through validated workflow decisions
+- unknown successful activity/state pairs are preserved as completion events without unsafe state
+  changes
+
+Still intentionally not moved yet:
+
+- implementation completion does not infer PR state from free-form agent text
+- activity result schemas are not yet workflow-specific enough to drive every state transition
+- failed activity retry policy is not yet modeled
+
+Tests:
+
+- reducer resumes implementation after replan completion
+- reducer ignores unmapped successful activity completions
+- runtime worker applies the reducer, records decisions, and updates workflow state
 
 ## Test Strategy
 

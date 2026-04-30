@@ -1,5 +1,7 @@
 use super::model::{ActivityResult, ActivityStatus, RuntimeJob};
+use super::reducer::reduce_runtime_job_completed;
 use super::store::WorkflowRuntimeStore;
+use super::validator::{DecisionValidator, ValidationContext};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -77,7 +79,8 @@ impl<'a> RuntimeWorker<'a> {
         self.store
             .mark_command_status(&command.id, command_status_for_activity(result.status))
             .await?;
-        self.store
+        let event = self
+            .store
             .append_event(
                 &command.workflow_id,
                 "RuntimeJobCompleted",
@@ -90,14 +93,66 @@ impl<'a> RuntimeWorker<'a> {
                 }),
             )
             .await?;
+        self.apply_runtime_completion_reducer(&command.workflow_id, &event)
+            .await?;
         Ok(())
+    }
+
+    async fn apply_runtime_completion_reducer(
+        &self,
+        workflow_id: &str,
+        event: &super::model::WorkflowEvent,
+    ) -> anyhow::Result<()> {
+        let Some(mut instance) = self.store.get_instance(workflow_id).await? else {
+            return Ok(());
+        };
+        let Some(decision) = reduce_runtime_job_completed(&instance, event)? else {
+            return Ok(());
+        };
+
+        let validator = match instance.definition_id.as_str() {
+            super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
+            super::repo_backlog::REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
+            _ => return Ok(()),
+        };
+        let validation = validator.validate(
+            &instance,
+            &decision,
+            &ValidationContext::new(&self.owner, Utc::now()),
+        );
+        let record = match validation {
+            Ok(()) => super::model::WorkflowDecisionRecord::accepted(
+                decision.clone(),
+                Some(event.id.clone()),
+            ),
+            Err(error) => {
+                let record = super::model::WorkflowDecisionRecord::rejected(
+                    decision,
+                    Some(event.id.clone()),
+                    &error.to_string(),
+                );
+                self.store.record_decision(&record).await?;
+                return Ok(());
+            }
+        };
+
+        self.store.record_decision(&record).await?;
+        for command in &decision.commands {
+            self.store
+                .enqueue_command(&instance.id, Some(&record.id), command)
+                .await?;
+        }
+        instance.state = decision.next_state.clone();
+        instance.version = instance.version.saturating_add(1);
+        self.store.upsert_instance(&instance).await
     }
 }
 
 fn command_status_for_activity(status: ActivityStatus) -> &'static str {
     match status {
         ActivityStatus::Succeeded => "completed",
-        ActivityStatus::Failed | ActivityStatus::Blocked => "failed",
+        ActivityStatus::Failed => "failed",
+        ActivityStatus::Blocked => "blocked",
         ActivityStatus::Cancelled => "cancelled",
     }
 }
