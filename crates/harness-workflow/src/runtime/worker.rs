@@ -1,7 +1,10 @@
-use super::model::{ActivityResult, ActivityStatus, RuntimeJob};
+use super::model::{
+    ActivityResult, ActivityStatus, RuntimeJob, RuntimeProfile, WorkflowCommandRecord,
+};
 use super::reducer::reduce_runtime_job_completed;
 use super::store::WorkflowRuntimeStore;
 use super::validator::{DecisionValidator, ValidationContext};
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -55,7 +58,10 @@ impl<'a> RuntimeWorker<'a> {
             )
             .await?;
 
-        let result = executor.execute(job.clone()).await;
+        let result = match self.max_turns_budget_result(&job).await? {
+            Some(result) => result,
+            None => executor.execute(job.clone()).await,
+        };
         self.store
             .record_runtime_event(
                 &job.id,
@@ -146,6 +152,34 @@ impl<'a> RuntimeWorker<'a> {
         instance.version = instance.version.saturating_add(1);
         self.store.upsert_instance(&instance).await
     }
+
+    async fn max_turns_budget_result(
+        &self,
+        job: &RuntimeJob,
+    ) -> anyhow::Result<Option<ActivityResult>> {
+        let Some(profile) = runtime_profile_for_job(job)? else {
+            return Ok(None);
+        };
+        let Some(max_turns) = profile.max_turns else {
+            return Ok(None);
+        };
+        let Some(command) = self.store.get_command(&job.command_id).await? else {
+            return Ok(None);
+        };
+        let turns_started = self
+            .store
+            .runtime_turns_started_for_workflow(&command.workflow_id, Some(&job.id))
+            .await?;
+        if turns_started < i64::from(max_turns) {
+            return Ok(None);
+        }
+        Ok(Some(runtime_budget_blocked_result(
+            &command,
+            &profile,
+            turns_started,
+            max_turns,
+        )))
+    }
 }
 
 fn command_status_for_activity(status: ActivityStatus) -> &'static str {
@@ -155,4 +189,46 @@ fn command_status_for_activity(status: ActivityStatus) -> &'static str {
         ActivityStatus::Blocked => "blocked",
         ActivityStatus::Cancelled => "cancelled",
     }
+}
+
+fn runtime_profile_for_job(job: &RuntimeJob) -> anyhow::Result<Option<RuntimeProfile>> {
+    let Some(value) = job.input.get("runtime_profile") else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .with_context(|| format!("runtime job {} has invalid runtime_profile input", job.id))
+        .map(Some)
+}
+
+fn runtime_budget_blocked_result(
+    command: &WorkflowCommandRecord,
+    profile: &RuntimeProfile,
+    turns_started: i64,
+    max_turns: u32,
+) -> ActivityResult {
+    let activity = command
+        .command
+        .activity_name()
+        .map(str::to_string)
+        .unwrap_or_else(|| command_type_name(command));
+    let error = format!(
+        "Runtime profile `{}` exhausted max_turns: used {} of {} allowed runtime turns",
+        profile.name, turns_started, max_turns
+    );
+    ActivityResult {
+        activity,
+        status: ActivityStatus::Blocked,
+        summary: "Runtime turn budget exhausted before execution.".to_string(),
+        artifacts: Vec::new(),
+        signals: Vec::new(),
+        validation: Vec::new(),
+        error: Some(error),
+    }
+}
+
+fn command_type_name(command: &WorkflowCommandRecord) -> String {
+    serde_json::to_value(command.command.command_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "runtime_job".to_string())
 }

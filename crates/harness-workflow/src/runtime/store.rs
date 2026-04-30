@@ -660,6 +660,26 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn runtime_turns_started_for_workflow(
+        &self,
+        workflow_id: &str,
+        exclude_runtime_job_id: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)
+             FROM runtime_jobs r
+             JOIN workflow_commands c ON c.id = r.command_id
+             WHERE c.workflow_id = $1
+               AND r.status <> 'pending'
+               AND ($2::text IS NULL OR r.id <> $2)",
+        )
+        .bind(workflow_id)
+        .bind(exclude_runtime_job_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     pub async fn runtime_job_count_by_status(
         &self,
         status: RuntimeJobStatus,

@@ -38,6 +38,7 @@ Implemented now:
 - server runtime workers pass runtime profile model overrides into agent turns
 - server turn lifecycle enforces runtime profile `timeout_secs` as an execution deadline
 - server runtime workers pass profile reasoning effort and sandbox overrides into agent requests
+- workflow runtime workers enforce profile `max_turns` as a workflow-instance runtime turn budget
 
 Still intentionally not moved yet:
 
@@ -501,8 +502,7 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- runtime workers apply model overrides from runtime profiles, but reasoning effort, sandbox, max
-  turns, and timeout enforcement still remain metadata for later runtime policy work
+- approval policy still remains metadata until a workflow policy contract defines its semantics
 - workflow completion reducer coverage is intentionally limited to known activity/state pairs
 - runtime workers are process-local; distributed worker leasing beyond the job claim is not added yet
 
@@ -612,7 +612,7 @@ Implemented now:
 Still intentionally not moved yet:
 
 - approval policy still comes from registered agent/server configuration
-- `max_turns` and timeout are not a workflow reducer budget yet
+- timeout is not a workflow reducer retry budget yet
 
 Tests:
 
@@ -638,8 +638,7 @@ Implemented now:
 Still intentionally not moved yet:
 
 - timeout policy is per runtime job, not a workflow-level retry or reducer budget
-- `max_turns` is not enforced by the workflow runtime yet
-- reasoning effort, sandbox, and approval policy still require request/runtime contract work
+- approval policy still requires request/runtime contract work
 
 Tests:
 
@@ -666,7 +665,6 @@ Still intentionally not moved yet:
 
 - `approval_policy` is not applied to runtime profiles because approval semantics need an explicit
   workflow policy contract
-- `max_turns` is still not enforced by the workflow runtime
 - Claude adapter sandbox wrapping is still unchanged because that path does not currently own a
   sandbox wrapper configuration
 
@@ -676,6 +674,37 @@ Tests:
 - Codex app-server thread and turn payloads include runtime profile overrides
 - Claude CodeAgent base arguments honor request reasoning effort without overriding execution phase
 - server runtime worker passes profile reasoning effort and sandbox overrides to the agent request
+
+### Phase 16: Runtime Profile Turn Budget
+
+Status: partially implemented.
+
+Apply `max_turns` as a workflow-runtime budget without changing agent CLI behavior. In the current
+runtime contract each `RuntimeJob` maps to one agent turn, so the budget is enforced before a
+claimed runtime job starts execution.
+
+Implemented now:
+
+- workflow runtime store can count started runtime turns for a workflow instance
+- runtime worker checks the selected profile `max_turns` after claiming a job and before invoking
+  the runtime executor
+- exhausted budgets complete the job with a structured blocked `ActivityResult`
+- blocked budget results mark the workflow command as `blocked` and flow through the existing
+  runtime completion reducer
+- currently running jobs from the same workflow count toward the budget, while the claimed current
+  job is excluded so `max_turns: 1` allows the first turn and blocks the second
+
+Still intentionally not moved yet:
+
+- `max_turns` is not a multi-turn conversation budget inside a single runtime job because runtime
+  jobs currently execute one lifecycle turn
+- timeout policy is still per runtime job, not a workflow-level retry or reducer budget
+- `approval_policy` still needs an explicit workflow policy contract before it is applied
+
+Tests:
+
+- runtime worker executes the first job under `max_turns: 1`
+- runtime worker blocks the second job for the same workflow without invoking the executor
 
 ## Test Strategy
 
