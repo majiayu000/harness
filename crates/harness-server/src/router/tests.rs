@@ -62,6 +62,7 @@ async fn make_test_state_with_config_and_registry(
         None,
         None,
         None,
+        None,
         vec![],
     );
     Ok(AppState {
@@ -77,6 +78,7 @@ async fn make_test_state_with_config_and_registry(
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
             project_workflow_store: None,
+            workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -1400,6 +1402,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         None,
         None,
         None,
+        None,
         vec![],
     );
     Ok(AppState {
@@ -1415,6 +1418,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
             project_workflow_store: None,
+            workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,

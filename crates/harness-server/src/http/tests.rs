@@ -225,6 +225,7 @@ async fn make_test_state_with_project_root(
         None,
         None,
         None,
+        None,
         vec![],
     );
     Ok(Arc::new(AppState {
@@ -240,6 +241,7 @@ async fn make_test_state_with_project_root(
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
             project_workflow_store: None,
+            workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -328,6 +330,7 @@ async fn make_test_state_with_issue_workflows(
             plan_cache: state.core.plan_cache.clone(),
             issue_workflow_store: Some(Arc::new(workflow_store)),
             project_workflow_store: None,
+            workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,

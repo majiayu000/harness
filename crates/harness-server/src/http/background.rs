@@ -402,6 +402,14 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                         permit,
                         state.intake.completion_callback.clone(),
                         state.core.issue_workflow_store.clone(),
+                        state.core.workflow_runtime_store.clone(),
+                        state
+                            .core
+                            .server
+                            .config
+                            .server
+                            .allowed_project_roots
+                            .clone(),
                         None,
                     )
                     .await;
@@ -884,6 +892,14 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
                     permit,
                     state.intake.completion_callback.clone(),
                     state.core.issue_workflow_store.clone(),
+                    state.core.workflow_runtime_store.clone(),
+                    state
+                        .core
+                        .server
+                        .config
+                        .server
+                        .allowed_project_roots
+                        .clone(),
                     None,
                 )
                 .await;
@@ -1122,6 +1138,14 @@ pub(super) fn spawn_system_task_recovery(state: &Arc<AppState>) {
                     permit,
                     state.intake.completion_callback.clone(),
                     state.core.issue_workflow_store.clone(),
+                    state.core.workflow_runtime_store.clone(),
+                    state
+                        .core
+                        .server
+                        .config
+                        .server
+                        .allowed_project_roots
+                        .clone(),
                     None,
                 )
                 .await;
@@ -1357,6 +1381,14 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     permit,
                     state.intake.completion_callback.clone(),
                     state.core.issue_workflow_store.clone(),
+                    state.core.workflow_runtime_store.clone(),
+                    state
+                        .core
+                        .server
+                        .config
+                        .server
+                        .allowed_project_roots
+                        .clone(),
                     None,
                 )
                 .await;
@@ -1582,6 +1614,14 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
                 permit,
                 state.intake.completion_callback.clone(),
                 state.core.issue_workflow_store.clone(),
+                state.core.workflow_runtime_store.clone(),
+                state
+                    .core
+                    .server
+                    .config
+                    .server
+                    .allowed_project_roots
+                    .clone(),
                 None,
             )
             .await;

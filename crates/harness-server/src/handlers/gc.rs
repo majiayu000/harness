@@ -331,6 +331,14 @@ pub async fn gc_adopt(
                                 permit,
                                 None,
                                 state.core.issue_workflow_store.clone(),
+                                state.core.workflow_runtime_store.clone(),
+                                state
+                                    .core
+                                    .server
+                                    .config
+                                    .server
+                                    .allowed_project_roots
+                                    .clone(),
                             )
                             .await;
                             Ok(Some(tid.0))

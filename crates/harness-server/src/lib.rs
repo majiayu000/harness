@@ -53,6 +53,7 @@ pub mod skill_governor;
 pub mod stdio;
 pub mod task_db;
 pub mod task_executor;
+pub(crate) mod workflow_runtime_plan_issue;
 pub use harness_workflow::task_queue;
 pub mod task_runner;
 pub mod thread_db;

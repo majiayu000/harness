@@ -13,6 +13,7 @@ pub(crate) struct RegistryBundle {
     pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     pub project_workflow_store:
         Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
+    pub workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
     pub project_registry: Option<Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
@@ -25,6 +26,7 @@ fn failed_registry_startup_results(error: &str) -> Vec<StoreStartupResult> {
         StoreStartupResult::critical("plan_db").failed(error),
         StoreStartupResult::optional("issue_workflow_store").failed(error),
         StoreStartupResult::optional("project_workflow_store").failed(error),
+        StoreStartupResult::optional("workflow_runtime_store").failed(error),
         StoreStartupResult::critical("project_registry").failed(error),
         StoreStartupResult::optional("workspace_manager").failed(error),
         StoreStartupResult::optional("runtime_state_store").failed(error),
@@ -41,6 +43,7 @@ fn failed_registry_bundle(
         plan_cache,
         issue_workflow_store: None,
         project_workflow_store: None,
+        workflow_runtime_store: None,
         project_registry: None,
         runtime_state_store: None,
         workspace_mgr: None,
@@ -319,6 +322,58 @@ pub(crate) async fn build_registry(
     };
 
     // ── Project registry ──────────────────────────────────────────────────────
+    let workflow_runtime_store = {
+        let schema = format!("{workflow_ns}_runtime");
+        match super::forced_startup_error("workflow_runtime_store") {
+            Some(error) => {
+                startup_results
+                    .push(StoreStartupResult::optional("workflow_runtime_store").failed(error));
+                None
+            }
+            None => {
+                match harness_core::db::PgStoreContext::new(database_url.clone(), schema.clone()) {
+                    Ok(context) => {
+                        match harness_workflow::runtime::WorkflowRuntimeStore::open_with_context(
+                            &context,
+                            &setup_pool,
+                        )
+                        .await
+                        {
+                            Ok(store) => {
+                                startup_results
+                                    .push(StoreStartupResult::optional("workflow_runtime_store"));
+                                Some(Arc::new(store))
+                            }
+                            Err(e) => {
+                                startup_results.push(
+                                    StoreStartupResult::optional("workflow_runtime_store")
+                                        .failed(e.to_string()),
+                                );
+                                tracing::warn!(
+                                    schema = %schema,
+                                    "workflow runtime store init failed, generic workflow decisions will not persist: {e}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        startup_results.push(
+                            StoreStartupResult::optional("workflow_runtime_store")
+                                .failed(error.to_string()),
+                        );
+                        tracing::warn!(
+                            schema = %schema,
+                            "workflow runtime store context init failed, generic workflow decisions will not persist: {error}"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    };
+
+    // ── Project registry ──────────────────────────────────────────────────────
     let projects_db_path = harness_core::config::dirs::default_db_path(data_dir, "projects");
     let project_context = harness_core::db::PgStoreContext::new(
         database_url.clone(),
@@ -524,6 +579,7 @@ pub(crate) async fn build_registry(
         plan_cache,
         issue_workflow_store,
         project_workflow_store,
+        workflow_runtime_store,
         project_registry,
         runtime_state_store,
         workspace_mgr,

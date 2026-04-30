@@ -67,6 +67,7 @@ pub struct CoreServices {
     pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     pub project_workflow_store:
         Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
+    pub workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     /// Q-value store for MemRL rule utility tracking. None when unavailable.

@@ -769,6 +769,7 @@ pub(crate) async fn run_task(
     project_root: PathBuf,
     server_config: &harness_core::config::HarnessConfig,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
     // Accumulated turn count from previous transient-retry attempts.
     // Ensures the max_turns budget is global across the full task lifecycle,
     // not reset on each retry (fix for budget-reset-on-retry bug).
@@ -1062,68 +1063,79 @@ pub(crate) async fn run_task(
                 plan_issue,
                 prior_plan,
             } => {
-                if replan_attempted {
-                    mutate_and_persist(store, task_id, |s| {
-                        s.status = TaskStatus::Failed;
-                        s.error = Some(format!("PLAN_ISSUE persisted after replan: {plan_issue}"));
-                    })
-                    .await?;
-                    return Ok(());
-                }
-
                 let workflow_cfg = harness_core::config::workflow::load_workflow_config(&project)
                     .unwrap_or_default();
-
-                if req.force_execute {
-                    let forced_plan = match prior_plan.or(current_plan_output.clone()) {
-                        Some(plan) => format!(
-                            "{plan}\n\nExecution override: this issue is force_execute.\n\
-                             Previous plan concern:\n{}",
-                            prompts::wrap_external_data(&plan_issue)
-                        ),
-                        None => format!(
-                            "Execution override: this issue is force_execute.\n\
-                             Previous plan concern:\n{}",
-                            prompts::wrap_external_data(&plan_issue)
-                        ),
-                    };
-                    current_plan_output = Some(forced_plan);
-                } else if workflow_cfg.issue_workflow.auto_replan_on_plan_issue {
-                    if let Some(max) = effective_max_turns {
-                        if turns_used >= max {
-                            return Err(anyhow::anyhow!(
-                                "Turn budget exhausted before replan: used {} of {} allowed turns",
-                                turns_used,
-                                max
-                            ));
-                        }
-                    }
-                    let new_plan = triage_pipeline::run_replan_for_issue(
-                        agent,
-                        store,
+                let turn_budget_exhausted =
+                    effective_max_turns.is_some_and(|max| turns_used >= max);
+                let workflow_action = crate::workflow_runtime_plan_issue::decide_plan_issue(
+                    workflow_runtime_store.clone(),
+                    crate::workflow_runtime_plan_issue::PlanIssueRuntimeContext {
+                        project_root: &project_root,
+                        repo: req.repo.as_deref(),
+                        issue_number: issue,
                         task_id,
-                        issue,
-                        prior_plan.as_deref().or(current_plan_output.as_deref()),
-                        &plan_issue,
-                        &cargo_env,
-                        &project,
-                        req,
-                        &skills,
-                        &events,
-                    )
-                    .await?;
-                    turns_used += 1;
-                    *turns_used_acc = turns_used;
-                    current_plan_output = Some(new_plan);
-                } else {
-                    mutate_and_persist(store, task_id, |s| {
-                        s.status = TaskStatus::Failed;
-                        s.error = Some(format!(
-                            "PLAN_ISSUE encountered and auto_replan_on_plan_issue=false: {plan_issue}"
-                        ));
-                    })
-                    .await?;
-                    return Ok(());
+                        plan_issue: &plan_issue,
+                        force_execute: req.force_execute,
+                        auto_replan_on_plan_issue: workflow_cfg
+                            .issue_workflow
+                            .auto_replan_on_plan_issue,
+                        replan_already_attempted: replan_attempted,
+                        turn_budget_exhausted,
+                    },
+                )
+                .await;
+
+                match workflow_action {
+                    crate::workflow_runtime_plan_issue::PlanIssueRuntimeAction::Block { error } => {
+                        mutate_and_persist(store, task_id, |s| {
+                            s.status = TaskStatus::Failed;
+                            s.error = Some(error.clone());
+                        })
+                        .await?;
+                        return Ok(());
+                    }
+                    crate::workflow_runtime_plan_issue::PlanIssueRuntimeAction::ForceContinue => {
+                        let forced_plan = match prior_plan.clone().or(current_plan_output.clone()) {
+                            Some(plan) => format!(
+                                "{plan}\n\nExecution override: this issue is force_execute.\n\
+                                 Previous plan concern:\n{}",
+                                prompts::wrap_external_data(&plan_issue)
+                            ),
+                            None => format!(
+                                "Execution override: this issue is force_execute.\n\
+                                 Previous plan concern:\n{}",
+                                prompts::wrap_external_data(&plan_issue)
+                            ),
+                        };
+                        current_plan_output = Some(forced_plan);
+                    }
+                    crate::workflow_runtime_plan_issue::PlanIssueRuntimeAction::RunReplan => {
+                        let new_plan = triage_pipeline::run_replan_for_issue(
+                            agent,
+                            store,
+                            task_id,
+                            issue,
+                            prior_plan.as_deref().or(current_plan_output.as_deref()),
+                            &plan_issue,
+                            &cargo_env,
+                            &project,
+                            req,
+                            &skills,
+                            &events,
+                        )
+                        .await?;
+                        turns_used += 1;
+                        *turns_used_acc = turns_used;
+                        crate::workflow_runtime_plan_issue::record_replan_completed(
+                            workflow_runtime_store.clone(),
+                            &project_root,
+                            req.repo.as_deref(),
+                            issue,
+                            task_id,
+                        )
+                        .await;
+                        current_plan_output = Some(new_plan);
+                    }
                 }
                 replan_attempted = true;
             }

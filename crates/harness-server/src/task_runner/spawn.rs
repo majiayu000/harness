@@ -1,6 +1,6 @@
 use harness_core::agent::CodeAgent;
 use harness_core::types::{Decision, Event, SessionId};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -171,6 +171,28 @@ async fn resolve_project_root_with(
     }
 }
 
+fn validate_spawn_project_root(
+    raw_project: &Path,
+    home_dir: &Path,
+    allowed_project_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    if allowed_project_roots.is_empty() {
+        return crate::handlers::validate_project_root(raw_project, home_dir);
+    }
+
+    let canonical = raw_project
+        .canonicalize()
+        .map_err(|e| format!("invalid project root '{}': {e}", raw_project.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "project root is not a directory: {}",
+            canonical.display()
+        ));
+    }
+    crate::project_registry::check_allowed_roots(&canonical, allowed_project_roots)?;
+    Ok(canonical)
+}
+
 /// Resolve and canonicalize the project root so the caller can obtain a stable
 /// semaphore key before acquiring the concurrency permit.
 ///
@@ -327,6 +349,8 @@ pub async fn spawn_task(
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
+    allowed_project_roots: Vec<PathBuf>,
 ) -> TaskId {
     spawn_task_with_worktree_detector(
         store,
@@ -342,6 +366,8 @@ pub async fn spawn_task(
         permit,
         completion_callback,
         issue_workflow_store,
+        workflow_runtime_store,
+        allowed_project_roots,
         None,
         None,
     )
@@ -391,6 +417,8 @@ pub async fn spawn_preregistered_task(
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
+    allowed_project_roots: Vec<PathBuf>,
     group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
     spawn_task_with_worktree_detector(
@@ -407,6 +435,8 @@ pub async fn spawn_preregistered_task(
         permit,
         completion_callback,
         issue_workflow_store,
+        workflow_runtime_store,
+        allowed_project_roots,
         Some(task_id),
         group_permit,
     )
@@ -427,6 +457,8 @@ pub(super) async fn spawn_task_with_worktree_detector<F>(
     permit: crate::task_queue::TaskPermit,
     completion_callback: Option<CompletionCallback>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
+    allowed_project_roots: Vec<PathBuf>,
     preregistered_id: Option<TaskId>,
     group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> TaskId
@@ -478,8 +510,9 @@ where
         let home_dir = captured_home_dir
             .clone()
             .unwrap_or_else(|| raw_project.clone());
-        let project_root = crate::handlers::validate_project_root(&raw_project, &home_dir)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let project_root =
+            validate_spawn_project_root(&raw_project, &home_dir, &allowed_project_roots)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         if req.repo.is_none() {
             req.repo = crate::task_executor::pr_detection::detect_repo_slug(&project_root).await;
@@ -807,6 +840,7 @@ where
                 canonical_project_root.clone(),
                 server_config.as_ref(),
                 issue_workflow_store.clone(),
+                workflow_runtime_store.clone(),
                 &mut total_turns_used,
             )
             .await;
@@ -1298,6 +1332,8 @@ mod tests {
             permit,
             None,
             None,
+            None,
+            vec![],
         )
         .await;
 
@@ -1389,6 +1425,8 @@ mod tests {
             permit,
             None,
             None,
+            None,
+            vec![],
         )
         .await;
 
@@ -1486,6 +1524,8 @@ mod tests {
             permit,
             None,
             None,
+            None,
+            vec![],
             None,
             None,
         )
@@ -1717,6 +1757,8 @@ mod tests {
             permit,
             None,
             None,
+            None,
+            vec![],
         )
         .await;
 
@@ -1782,6 +1824,8 @@ mod tests {
             permit,
             None,
             None,
+            None,
+            vec![],
         )
         .await;
 
@@ -1849,6 +1893,8 @@ mod tests {
             permit,
             None,
             None,
+            None,
+            vec![],
         )
         .await;
 
@@ -1923,6 +1969,8 @@ mod tests {
             permit,
             None,
             None,
+            None,
+            vec![],
         )
         .await;
 
@@ -1987,6 +2035,8 @@ mod tests {
             permit,
             None,
             None,
+            None,
+            vec![],
         )
         .await;
 
