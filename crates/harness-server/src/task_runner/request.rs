@@ -121,6 +121,12 @@ impl SystemTaskInput {
 /// guardrails instead of silently falling back to server-wide defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PersistedRequestSettings {
+    /// Structured issue identifier for restart recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
+    /// Structured PR identifier for restart recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,6 +171,8 @@ pub struct PersistedRequestSettings {
 impl PersistedRequestSettings {
     pub(crate) fn from_req(req: &CreateTaskRequest) -> Self {
         Self {
+            issue: req.issue,
+            pr: req.pr,
             agent: req.agent.clone(),
             max_rounds: req.max_rounds,
             max_turns: req.max_turns,
@@ -197,6 +205,12 @@ impl PersistedRequestSettings {
     }
 
     pub(crate) fn apply_to_req(&self, req: &mut CreateTaskRequest) {
+        if req.issue.is_none() {
+            req.issue = self.issue;
+        }
+        if req.pr.is_none() {
+            req.pr = self.pr;
+        }
         req.agent = self.agent.clone();
         req.max_rounds = self.max_rounds;
         req.max_turns = self.max_turns;
@@ -419,6 +433,7 @@ mod tests {
 
         let mut restored = CreateTaskRequest::default();
         settings.apply_to_req(&mut restored);
+        assert_eq!(restored.issue, Some(42));
         assert!(restored.skip_triage);
         assert!(restored.force_execute);
     }

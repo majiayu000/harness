@@ -21,11 +21,29 @@ fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
         })
         .unwrap_or((None, None));
 
+    let (issue_from_settings, pr_from_settings) = task
+        .request_settings
+        .as_ref()
+        .map(|settings| (settings.issue, settings.pr))
+        .unwrap_or((None, None));
+
     let issue = issue_from_external_id
         .or(task.issue)
-        .or_else(|| parse_description_number(task.description.as_deref(), "issue #"));
-    let pr = pr_from_external_id
-        .or_else(|| parse_description_number(task.description.as_deref(), "PR #"));
+        .or(issue_from_settings)
+        .or_else(|| {
+            if matches!(task.task_kind, task_runner::TaskKind::Issue) {
+                parse_description_number(task.description.as_deref(), "issue #")
+            } else {
+                None
+            }
+        });
+    let pr = pr_from_external_id.or(pr_from_settings).or_else(|| {
+        if matches!(task.task_kind, task_runner::TaskKind::Pr) {
+            parse_description_number(task.description.as_deref(), "PR #")
+        } else {
+            None
+        }
+    });
 
     (issue, pr)
 }
@@ -76,6 +94,25 @@ fn task_has_restart_safe_prompt(task: &task_runner::TaskState) -> bool {
         }
     }
     req.prompt.is_some()
+}
+
+fn task_allows_prompt_orphan_recovery(task: &task_runner::TaskState) -> bool {
+    matches!(
+        task.task_kind,
+        task_runner::TaskKind::Prompt
+            | task_runner::TaskKind::Review
+            | task_runner::TaskKind::Planner
+    ) && task_has_restart_safe_prompt(task)
+}
+
+fn orphan_recovery_failure_reason(task: &task_runner::TaskState) -> &'static str {
+    match task.task_kind {
+        task_runner::TaskKind::Issue => "orphaned issue task: issue number not persisted",
+        task_runner::TaskKind::Pr => "orphaned PR task: PR number not persisted",
+        task_runner::TaskKind::Prompt => "orphaned prompt-only task: prompt not persisted",
+        task_runner::TaskKind::Review => "orphaned review task: prompt not persisted",
+        task_runner::TaskKind::Planner => "orphaned planner task: prompt not persisted",
+    }
 }
 
 pub(super) fn recovery_queue_domain(task_kind: task_runner::TaskKind) -> task_routes::QueueDomain {
@@ -1351,7 +1388,7 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
     let mut failed = Vec::new();
     for task in orphan_tasks {
         let (issue, pr) = parse_issue_pr(&task);
-        if issue.is_some() || pr.is_some() || task_has_restart_safe_prompt(&task) {
+        if issue.is_some() || pr.is_some() || task_allows_prompt_orphan_recovery(&task) {
             recoverable.push((task, issue, pr));
         } else {
             failed.push(task);
@@ -1371,7 +1408,7 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
             else {
                 return;
             };
-            let reason = "orphaned prompt-only task: prompt not persisted".to_string();
+            let reason = orphan_recovery_failure_reason(&task).to_string();
             tracing::warn!(task_id = ?task.id, "{reason}");
             let task_id = task.id.clone();
             if let Err(pe) =
@@ -1656,6 +1693,58 @@ mod tests {
 
         let ids = workflow_recovery_task_ids(&[claimed]);
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn parse_issue_pr_uses_persisted_request_identifiers() {
+        let issue_settings =
+            task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+                issue: Some(944),
+                prompt: Some("extra context".to_string()),
+                external_id: Some("custom-issue-944".to_string()),
+                ..task_runner::CreateTaskRequest::default()
+            });
+        let mut issue_task = task_runner::TaskState::new(task_runner::TaskId::new());
+        issue_task.task_kind = task_runner::TaskKind::Issue;
+        issue_task.external_id = Some("custom-issue-944".to_string());
+        issue_task.request_settings = Some(issue_settings);
+        assert_eq!(parse_issue_pr(&issue_task), (Some(944), None));
+
+        let pr_settings =
+            task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+                pr: Some(1040),
+                external_id: Some("custom-pr-1040".to_string()),
+                ..task_runner::CreateTaskRequest::default()
+            });
+        let mut pr_task = task_runner::TaskState::new(task_runner::TaskId::new());
+        pr_task.task_kind = task_runner::TaskKind::Pr;
+        pr_task.external_id = Some("custom-pr-1040".to_string());
+        pr_task.request_settings = Some(pr_settings);
+        assert_eq!(parse_issue_pr(&pr_task), (None, Some(1040)));
+    }
+
+    #[test]
+    fn prompt_orphan_recovery_requires_prompt_task_kind() {
+        let settings =
+            task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+                issue: Some(944),
+                prompt: Some("extra context".to_string()),
+                ..task_runner::CreateTaskRequest::default()
+            });
+        let mut issue_task = task_runner::TaskState::new(task_runner::TaskId::new());
+        issue_task.task_kind = task_runner::TaskKind::Issue;
+        issue_task.request_settings = Some(settings);
+        assert!(!task_allows_prompt_orphan_recovery(&issue_task));
+
+        let prompt_settings =
+            task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+                prompt: Some("restart-safe prompt".to_string()),
+                ..task_runner::CreateTaskRequest::default()
+            });
+        let mut prompt_task = task_runner::TaskState::new(task_runner::TaskId::new());
+        prompt_task.task_kind = task_runner::TaskKind::Prompt;
+        prompt_task.request_settings = Some(prompt_settings);
+        assert!(task_allows_prompt_orphan_recovery(&prompt_task));
     }
 
     #[test]

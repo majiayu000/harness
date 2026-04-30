@@ -2829,6 +2829,11 @@ async fn wait_for_task_to_leave_pending(
 async fn orphan_issue_task_is_redispatched_using_existing_task_row() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, agent) = make_test_state_with_agent(dir.path(), Some("secret")).await?;
+    let settings =
+        task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+            issue: Some(944),
+            ..task_runner::CreateTaskRequest::default()
+        });
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -2848,16 +2853,16 @@ async fn orphan_issue_task_is_redispatched_using_existing_task_row() -> anyhow::
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
-        issue: Some(944),
+        issue: None,
         repo: Some("majiayu000/harness".to_string()),
-        description: Some("issue #944".to_string()),
+        description: None,
         created_at: None,
         updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
-        request_settings: None,
+        request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
@@ -2877,6 +2882,11 @@ async fn orphan_issue_task_is_redispatched_using_existing_task_row() -> anyhow::
 async fn orphan_pr_task_is_redispatched_using_existing_task_row() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, agent) = make_test_state_with_agent(dir.path(), Some("secret")).await?;
+    let settings =
+        task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+            pr: Some(944),
+            ..task_runner::CreateTaskRequest::default()
+        });
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -2898,14 +2908,14 @@ async fn orphan_pr_task_is_redispatched_using_existing_task_row() -> anyhow::Res
         run_generation: 0,
         issue: None,
         repo: Some("majiayu000/harness".to_string()),
-        description: Some("PR #944".to_string()),
+        description: None,
         created_at: None,
         updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
-        request_settings: None,
+        request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
@@ -2926,6 +2936,11 @@ async fn orphan_issue_task_is_redispatched_when_external_id_is_noncanonical() ->
 {
     let dir = tempfile::tempdir()?;
     let (state, agent) = make_test_state_with_agent(dir.path(), Some("secret")).await?;
+    let settings =
+        task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+            issue: Some(944),
+            ..task_runner::CreateTaskRequest::default()
+        });
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -2945,16 +2960,16 @@ async fn orphan_issue_task_is_redispatched_when_external_id_is_noncanonical() ->
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
-        issue: Some(944),
+        issue: None,
         repo: Some("majiayu000/harness".to_string()),
-        description: Some("issue #944".to_string()),
+        description: None,
         created_at: None,
         updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
-        request_settings: None,
+        request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
@@ -2974,6 +2989,11 @@ async fn orphan_issue_task_is_redispatched_when_external_id_is_noncanonical() ->
 async fn orphan_pr_task_is_redispatched_when_external_id_is_noncanonical() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, agent) = make_test_state_with_agent(dir.path(), Some("secret")).await?;
+    let settings =
+        task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+            pr: Some(944),
+            ..task_runner::CreateTaskRequest::default()
+        });
 
     let task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -2995,14 +3015,14 @@ async fn orphan_pr_task_is_redispatched_when_external_id_is_noncanonical() -> an
         run_generation: 0,
         issue: None,
         repo: Some("majiayu000/harness".to_string()),
-        description: Some("PR #944".to_string()),
+        description: None,
         created_at: None,
         updated_at: None,
         priority: 0,
         phase: task_runner::TaskPhase::default(),
         triage_output: None,
         plan_output: None,
-        request_settings: None,
+        request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
     };
     let task_id = task.id.clone();
@@ -3015,6 +3035,65 @@ async fn orphan_pr_task_is_redispatched_when_external_id_is_noncanonical() -> an
     assert_ne!(final_state.status, task_runner::TaskStatus::Pending);
     assert_eq!(state.core.tasks.list_all_with_terminal().await?.len(), 1);
     assert!(agent.prompts.lock().await.len() <= 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphan_issue_task_with_prompt_context_fails_when_identifier_is_missing(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, agent) = make_test_state_with_agent(dir.path(), Some("secret")).await?;
+
+    let mut settings =
+        task_runner::PersistedRequestSettings::from_req(&task_runner::CreateTaskRequest {
+            issue: Some(944),
+            prompt: Some("extra issue context".to_string()),
+            ..task_runner::CreateTaskRequest::default()
+        });
+    settings.issue = None;
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Issue,
+        status: task_runner::TaskStatus::Pending,
+        failure_kind: None,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: Some("github".to_string()),
+        external_id: Some("legacy-issue-without-number".to_string()),
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        issue: None,
+        repo: Some("majiayu000/harness".to_string()),
+        description: None,
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: Some(settings),
+        scheduler: task_runner::TaskSchedulerState::queued(),
+    };
+    let task_id = task.id.clone();
+    state.core.tasks.insert(&task).await;
+
+    super::background::spawn_orphan_pending_recovery(&state).await;
+
+    let final_state =
+        wait_for_task_status(&state, &task_id, task_runner::TaskStatus::Failed).await?;
+    assert_eq!(
+        final_state.error.as_deref(),
+        Some("orphaned issue task: issue number not persisted")
+    );
+    assert!(agent.prompts.lock().await.is_empty());
     Ok(())
 }
 
