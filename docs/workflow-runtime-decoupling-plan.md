@@ -37,6 +37,7 @@ Implemented now:
 - runtime profiles carry model and execution metadata into runtime jobs
 - server runtime workers pass runtime profile model overrides into agent turns
 - server turn lifecycle enforces runtime profile `timeout_secs` as an execution deadline
+- server runtime workers pass profile reasoning effort and sandbox overrides into agent requests
 
 Still intentionally not moved yet:
 
@@ -610,8 +611,7 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- Codex reasoning effort is not per-request yet because `AgentRequest` has no field for it
-- sandbox and approval policy still come from registered agent/server configuration
+- approval policy still comes from registered agent/server configuration
 - `max_turns` and timeout are not a workflow reducer budget yet
 
 Tests:
@@ -644,6 +644,38 @@ Still intentionally not moved yet:
 Tests:
 
 - runtime worker fails a blocked registered agent when profile `timeout_secs` expires
+
+### Phase 15: Runtime Profile Execution Metadata
+
+Status: partially implemented.
+
+Apply runtime profile metadata that already has a concrete execution-layer contract without moving
+workflow policy into Rust code.
+
+Implemented now:
+
+- `AgentRequest` and adapter `TurnRequest` carry optional `reasoning_effort` and `sandbox_mode`
+- runtime worker parses profile `sandbox` values and passes request metadata into turn lifecycle
+- Codex exec uses request `reasoning_effort` for `model_reasoning_effort` and request sandbox for
+  both CLI `-s` and the OS sandbox wrapper
+- Codex app-server requests include profile `effort` and `sandbox` metadata
+- Claude CodeAgent uses request `reasoning_effort` when no execution phase already defines effort
+- Claude CodeAgent applies request sandbox to the OS sandbox wrapper
+
+Still intentionally not moved yet:
+
+- `approval_policy` is not applied to runtime profiles because approval semantics need an explicit
+  workflow policy contract
+- `max_turns` is still not enforced by the workflow runtime
+- Claude adapter sandbox wrapping is still unchanged because that path does not currently own a
+  sandbox wrapper configuration
+
+Tests:
+
+- Codex exec base arguments honor request reasoning effort and sandbox overrides
+- Codex app-server thread and turn payloads include runtime profile overrides
+- Claude CodeAgent base arguments honor request reasoning effort without overriding execution phase
+- server runtime worker passes profile reasoning effort and sandbox overrides to the agent request
 
 ## Test Strategy
 

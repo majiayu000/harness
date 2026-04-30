@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
 use chrono::Utc;
+use harness_core::config::agents::SandboxMode;
 use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
     types::Capability, types::Item, types::TokenUsage, types::TurnFailure, types::TurnFailureKind,
@@ -31,6 +32,8 @@ impl CapturingAgent {
 struct RuntimeStreamAgent {
     prompts: Mutex<Vec<String>>,
     models: Mutex<Vec<Option<String>>>,
+    reasoning_efforts: Mutex<Vec<Option<String>>>,
+    sandbox_modes: Mutex<Vec<Option<SandboxMode>>>,
 }
 
 impl RuntimeStreamAgent {
@@ -38,6 +41,8 @@ impl RuntimeStreamAgent {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
             models: Mutex::new(Vec::new()),
+            reasoning_efforts: Mutex::new(Vec::new()),
+            sandbox_modes: Mutex::new(Vec::new()),
         })
     }
 }
@@ -138,6 +143,11 @@ impl CodeAgent for RuntimeStreamAgent {
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         self.models.lock().await.push(req.model.clone());
+        self.reasoning_efforts
+            .lock()
+            .await
+            .push(req.reasoning_effort.clone());
+        self.sandbox_modes.lock().await.push(req.sandbox_mode);
         self.prompts.lock().await.push(req.prompt);
         Ok(successful_agent_response())
     }
@@ -148,6 +158,11 @@ impl CodeAgent for RuntimeStreamAgent {
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
         self.models.lock().await.push(req.model.clone());
+        self.reasoning_efforts
+            .lock()
+            .await
+            .push(req.reasoning_effort.clone());
+        self.sandbox_modes.lock().await.push(req.sandbox_mode);
         self.prompts.lock().await.push(req.prompt);
         let _ = tx
             .send(StreamItem::ItemCompleted {
@@ -1051,6 +1066,8 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
     );
     runtime_profile.model = Some("gpt-runtime".to_string());
+    runtime_profile.reasoning_effort = Some("medium".to_string());
+    runtime_profile.sandbox = Some("read-only".to_string());
     runtime_profile.timeout_secs = Some(300);
     let runtime_job = store
         .enqueue_runtime_job(
@@ -1106,6 +1123,12 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     drop(prompts);
     let models = agent.models.lock().await;
     assert_eq!(models.as_slice(), &[Some("gpt-runtime".to_string())]);
+    drop(models);
+    let reasoning_efforts = agent.reasoning_efforts.lock().await;
+    assert_eq!(reasoning_efforts.as_slice(), &[Some("medium".to_string())]);
+    drop(reasoning_efforts);
+    let sandbox_modes = agent.sandbox_modes.lock().await;
+    assert_eq!(sandbox_modes.as_slice(), &[Some(SandboxMode::ReadOnly)]);
     Ok(())
 }
 

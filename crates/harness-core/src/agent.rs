@@ -1,4 +1,5 @@
 use crate::capability::CapabilityToken;
+use crate::config::agents::SandboxMode;
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,10 @@ pub struct AgentRequest {
     /// (`allowed_tools = []`) from being silently promoted to full permissions.
     pub allowed_tools: Option<Vec<String>>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub sandbox_mode: Option<SandboxMode>,
     pub max_budget_usd: Option<f64>,
     pub context: Vec<ContextItem>,
     /// Execution phase for per-phase model selection via ReasoningBudget.
@@ -75,6 +80,8 @@ impl Default for AgentRequest {
             project_root: PathBuf::from("."),
             allowed_tools: None,
             model: None,
+            reasoning_effort: None,
+            sandbox_mode: None,
             max_budget_usd: None,
             context: Vec::new(),
             execution_phase: None,
@@ -186,6 +193,8 @@ pub struct TurnRequest {
     pub prompt: String,
     pub project_root: PathBuf,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub sandbox_mode: Option<SandboxMode>,
     pub allowed_tools: Vec<String>,
     pub context: Vec<ContextItem>,
     pub timeout_secs: Option<u64>,

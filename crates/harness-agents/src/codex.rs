@@ -67,8 +67,20 @@ impl CodexAgent {
         cloud_setup::run_setup_phase(&self.cloud, project_root).await
     }
 
+    fn effective_reasoning_effort<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
+        req.reasoning_effort
+            .as_deref()
+            .unwrap_or(&self.reasoning_effort)
+    }
+
+    fn effective_sandbox_mode(&self, req: &AgentRequest) -> SandboxMode {
+        req.sandbox_mode.unwrap_or(self.sandbox_mode)
+    }
+
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let reasoning_effort = self.effective_reasoning_effort(req);
+        let sandbox_mode = self.effective_sandbox_mode(req);
         let mut args = vec![
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
@@ -78,12 +90,9 @@ impl CodexAgent {
             OsString::from("-m"),
             OsString::from(model),
             OsString::from("-c"),
-            OsString::from(format!(
-                "model_reasoning_effort=\"{}\"",
-                self.reasoning_effort
-            )),
+            OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
             OsString::from("-s"),
-            OsString::from(codex_sandbox_mode(self.sandbox_mode)),
+            OsString::from(codex_sandbox_mode(sandbox_mode)),
         ];
 
         if self.cloud.enabled {
@@ -489,11 +498,12 @@ impl CodeAgent for CodexAgent {
         self.run_setup_phase(&req.project_root).await?;
 
         let base_args = self.base_args(&req);
+        let sandbox_mode = self.effective_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
         };
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
@@ -607,11 +617,12 @@ impl CodeAgent for CodexAgent {
         self.run_setup_phase(&req.project_root).await?;
 
         let base_args = self.base_args(&req);
+        let sandbox_mode = self.effective_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
         };
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
@@ -1533,6 +1544,29 @@ sleep 30
             codex_sandbox_mode(SandboxMode::DangerFullAccess),
             "danger-full-access"
         );
+    }
+
+    #[test]
+    fn base_args_uses_request_reasoning_effort_and_sandbox_override() {
+        let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::DangerFullAccess);
+        let request = AgentRequest {
+            prompt: "ping".to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            reasoning_effort: Some("medium".to_string()),
+            sandbox_mode: Some(SandboxMode::ReadOnly),
+            ..Default::default()
+        };
+
+        let args: Vec<String> = agent
+            .base_args(&request)
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["-c", "model_reasoning_effort=\"medium\""]));
+        assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
     }
 
     #[test]

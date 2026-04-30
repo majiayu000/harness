@@ -2,6 +2,7 @@ use super::helpers::{
     emit_runtime_notification, mark_turn_failed, persist_runtime_thread, process_stream_item,
 };
 use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
+use harness_core::config::agents::SandboxMode;
 use harness_core::error::HarnessError;
 use harness_core::types::TurnId;
 use harness_protocol::notifications::{Notification, RpcNotification};
@@ -82,6 +83,8 @@ pub(crate) async fn run_turn_lifecycle(
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TurnLifecycleOptions {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub sandbox_mode: Option<SandboxMode>,
     pub timeout_secs: Option<u64>,
 }
 
@@ -196,6 +199,8 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             prompt,
             project_root,
             model: options.model.clone(),
+            reasoning_effort: options.reasoning_effort.clone(),
+            sandbox_mode: options.sandbox_mode,
             allowed_tools: vec![],
             context: vec![],
             timeout_secs: options.timeout_secs,
@@ -207,6 +212,8 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             prompt,
             project_root,
             model: options.model.clone(),
+            reasoning_effort: options.reasoning_effort.clone(),
+            sandbox_mode: options.sandbox_mode,
             ..Default::default()
         };
         Box::pin(agent.execute_stream(req, stream_tx))

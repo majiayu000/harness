@@ -3,6 +3,7 @@ use crate::task_executor::turn_lifecycle::TurnLifecycleOptions;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Duration;
+use harness_core::config::agents::SandboxMode;
 use harness_core::types::{AgentId, Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityResult, ActivitySignal, RuntimeJob, RuntimeJobExecutor,
@@ -92,6 +93,7 @@ impl ServerRuntimeJobExecutor {
         }
 
         let runtime_profile = runtime_profile_for_job(&job)?;
+        let sandbox_mode = runtime_profile_sandbox_mode(&runtime_profile)?;
         let prompt =
             build_runtime_job_prompt(&job, workflow.as_ref(), &project_root, &runtime_profile);
         let thread_id = self
@@ -118,6 +120,8 @@ impl ServerRuntimeJobExecutor {
             agent_name.to_string(),
             TurnLifecycleOptions {
                 model: runtime_profile.model.clone(),
+                reasoning_effort: runtime_profile.reasoning_effort.clone(),
+                sandbox_mode,
                 timeout_secs: runtime_profile.timeout_secs,
             },
         )
@@ -253,6 +257,19 @@ fn runtime_profile_for_job(job: &RuntimeJob) -> anyhow::Result<RuntimeProfile> {
     };
     serde_json::from_value(value.clone())
         .with_context(|| format!("runtime job {} has invalid runtime_profile input", job.id))
+}
+
+fn runtime_profile_sandbox_mode(profile: &RuntimeProfile) -> anyhow::Result<Option<SandboxMode>> {
+    let Some(raw) = profile.sandbox.as_deref() else {
+        return Ok(None);
+    };
+    let mode = match raw {
+        "read-only" => SandboxMode::ReadOnly,
+        "workspace-write" => SandboxMode::WorkspaceWrite,
+        "danger-full-access" => SandboxMode::DangerFullAccess,
+        other => anyhow::bail!("runtime profile sandbox `{other}` is not supported"),
+    };
+    Ok(Some(mode))
 }
 
 fn activity_result_from_turn(

@@ -221,6 +221,11 @@ impl TaskStore {
         self.cache.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pool_for_test(&self) -> &sqlx::PgPool {
+        self.db.pool_for_test()
+    }
+
     /// Check whether an active (non-terminal) task already exists for the same
     /// project + external_id. Cache-first, DB fallback.
     pub async fn find_active_duplicate(

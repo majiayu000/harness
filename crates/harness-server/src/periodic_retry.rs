@@ -706,6 +706,10 @@ mod tests {
         task.workspace_owner = Some("old-session".to_string());
         task.run_generation = 1;
         state.core.tasks.insert(&task).await;
+        sqlx::query("UPDATE tasks SET updated_at = NOW() - INTERVAL '120 minutes' WHERE id = $1")
+            .bind(&task_id.0)
+            .execute(state.core.tasks.pool_for_test())
+            .await?;
 
         let config = RetrySchedulerConfig {
             enabled: true,
