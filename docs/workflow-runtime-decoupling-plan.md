@@ -33,6 +33,7 @@ Implemented now:
 - opt-in server background runtime worker that executes runtime jobs through registered agents
 - runtime job completion writes back command status and workflow completion events
 - runtime completion reducer advances known workflow states from activity output
+- runtime command dispatch can select runtime profiles per workflow definition
 
 Still intentionally not moved yet:
 
@@ -496,7 +497,8 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- workflow-specific runtime profiles do not yet select model, effort, sandbox, or turn budget
+- runtime profile selection is workflow-specific, but model, effort, sandbox, and turn budget still
+  remain runtime execution metadata rather than enforced worker policy
 - workflow completion reducer coverage is intentionally limited to known activity/state pairs
 - runtime workers are process-local; distributed worker leasing beyond the job claim is not added yet
 
@@ -556,6 +558,36 @@ Tests:
 - reducer resumes implementation after replan completion
 - reducer ignores unmapped successful activity completions
 - runtime worker applies the reducer, records decisions, and updates workflow state
+
+### Phase 12: Workflow Runtime Profile Selection
+
+Status: partially implemented.
+
+Route runtime command dispatch through a workflow-aware profile selector instead of a single global
+runtime profile.
+
+Implemented now:
+
+- `WORKFLOW.md` front matter can define `runtime_dispatch.workflow_profiles` overrides keyed by
+  workflow definition id
+- command dispatch loads the command's workflow instance and selects the matching runtime profile
+  when available
+- unmatched workflows and missing workflow rows fall back to the configured default runtime profile
+- server background dispatch builds the same profile selector from project workflow config
+
+Still intentionally not moved yet:
+
+- activity-specific profile selection is not modeled
+- runtime workers do not yet enforce profile fields such as model, effort, sandbox, max turns, or
+  timeout
+- profile definitions are still lightweight config entries, not durable workflow definition
+  artifacts
+
+Tests:
+
+- workflow config parses per-workflow runtime profile overrides
+- dispatcher uses workflow definition overrides and falls back to the default profile
+- server dispatch config conversion preserves default and override behavior
 
 ## Test Strategy
 

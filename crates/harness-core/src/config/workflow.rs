@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,16 @@ pub struct RuntimeDispatchPolicy {
     pub runtime_kind: String,
     #[serde(default = "default_runtime_dispatch_profile")]
     pub runtime_profile: String,
+    #[serde(default)]
+    pub workflow_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeDispatchProfileOverride {
+    #[serde(default)]
+    pub runtime_kind: Option<String>,
+    #[serde(default)]
+    pub runtime_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +109,7 @@ impl Default for RuntimeDispatchPolicy {
             batch_limit: default_runtime_dispatch_batch_limit(),
             runtime_kind: default_runtime_dispatch_kind(),
             runtime_profile: default_runtime_dispatch_profile(),
+            workflow_profiles: BTreeMap::new(),
         }
     }
 }
@@ -219,6 +231,7 @@ mod tests {
         assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
         assert_eq!(cfg.runtime_dispatch.runtime_kind, "codex_jsonrpc");
         assert_eq!(cfg.runtime_dispatch.runtime_profile, "codex-default");
+        assert!(cfg.runtime_dispatch.workflow_profiles.is_empty());
         assert!(!cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 5);
         assert_eq!(cfg.runtime_worker.concurrency, 1);
@@ -249,6 +262,12 @@ runtime_dispatch:
   batch_limit: 7
   runtime_kind: claude_code
   runtime_profile: claude-default
+  workflow_profiles:
+    github_issue_pr:
+      runtime_kind: codex_jsonrpc
+      runtime_profile: codex-high
+    repo_backlog:
+      runtime_profile: codex-backlog
 runtime_worker:
   enabled: true
   interval_secs: 3
@@ -277,6 +296,23 @@ Body
         assert_eq!(cfg.runtime_dispatch.batch_limit, 7);
         assert_eq!(cfg.runtime_dispatch.runtime_kind, "claude_code");
         assert_eq!(cfg.runtime_dispatch.runtime_profile, "claude-default");
+        let issue_profile = cfg
+            .runtime_dispatch
+            .workflow_profiles
+            .get("github_issue_pr")
+            .expect("issue workflow override should parse");
+        assert_eq!(issue_profile.runtime_kind.as_deref(), Some("codex_jsonrpc"));
+        assert_eq!(issue_profile.runtime_profile.as_deref(), Some("codex-high"));
+        let backlog_profile = cfg
+            .runtime_dispatch
+            .workflow_profiles
+            .get("repo_backlog")
+            .expect("repo backlog override should parse");
+        assert_eq!(backlog_profile.runtime_kind, None);
+        assert_eq!(
+            backlog_profile.runtime_profile.as_deref(),
+            Some("codex-backlog")
+        );
         assert!(cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 3);
         assert_eq!(cfg.runtime_worker.concurrency, 2);

@@ -1,6 +1,7 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
 use super::store::WorkflowRuntimeStore;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 const COMMAND_STATUS_DISPATCHED: &str = "dispatched";
 const COMMAND_STATUS_SKIPPED: &str = "skipped";
@@ -21,17 +22,60 @@ pub enum CommandDispatchOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeProfileSelector {
+    default_profile: RuntimeProfile,
+    workflow_profiles: BTreeMap<String, RuntimeProfile>,
+}
+
+impl RuntimeProfileSelector {
+    pub fn new(default_profile: RuntimeProfile) -> Self {
+        Self {
+            default_profile,
+            workflow_profiles: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_workflow_profile(
+        mut self,
+        definition_id: impl Into<String>,
+        profile: RuntimeProfile,
+    ) -> Self {
+        self.workflow_profiles.insert(definition_id.into(), profile);
+        self
+    }
+
+    pub fn select(&self, definition_id: Option<&str>) -> &RuntimeProfile {
+        definition_id
+            .and_then(|id| self.workflow_profiles.get(id))
+            .unwrap_or(&self.default_profile)
+    }
+}
+
+impl From<RuntimeProfile> for RuntimeProfileSelector {
+    fn from(default_profile: RuntimeProfile) -> Self {
+        Self::new(default_profile)
+    }
+}
+
 pub struct RuntimeCommandDispatcher<'a> {
     store: &'a WorkflowRuntimeStore,
-    runtime_profile: RuntimeProfile,
+    profile_selector: RuntimeProfileSelector,
     batch_limit: i64,
 }
 
 impl<'a> RuntimeCommandDispatcher<'a> {
     pub fn new(store: &'a WorkflowRuntimeStore, runtime_profile: RuntimeProfile) -> Self {
+        Self::with_profile_selector(store, RuntimeProfileSelector::new(runtime_profile))
+    }
+
+    pub fn with_profile_selector(
+        store: &'a WorkflowRuntimeStore,
+        profile_selector: RuntimeProfileSelector,
+    ) -> Self {
         Self {
             store,
-            runtime_profile,
+            profile_selector,
             batch_limit: 25,
         }
     }
@@ -87,19 +131,20 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             });
         }
 
+        let runtime_profile = self.profile_for_command(&command).await?;
         let runtime_job = self
             .store
             .enqueue_runtime_job(
                 &command.id,
-                self.runtime_profile.kind,
-                &self.runtime_profile.name,
+                runtime_profile.kind,
+                &runtime_profile.name,
                 json!({
                     "workflow_id": command.workflow_id.clone(),
                     "command_id": command.id.clone(),
                     "command_type": command.command.command_type,
                     "dedupe_key": command.command.dedupe_key.clone(),
                     "command": command.command.command.clone(),
-                    "runtime_profile": self.runtime_profile.clone(),
+                    "runtime_profile": runtime_profile.clone(),
                 }),
             )
             .await?;
@@ -110,5 +155,20 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             command_id: command.id,
             runtime_job,
         })
+    }
+
+    async fn profile_for_command(
+        &self,
+        command: &WorkflowCommandRecord,
+    ) -> anyhow::Result<RuntimeProfile> {
+        let instance = self.store.get_instance(&command.workflow_id).await?;
+        Ok(self
+            .profile_selector
+            .select(
+                instance
+                    .as_ref()
+                    .map(|workflow| workflow.definition_id.as_str()),
+            )
+            .clone())
     }
 }

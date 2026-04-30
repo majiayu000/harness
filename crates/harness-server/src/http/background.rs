@@ -7,6 +7,7 @@ use harness_workflow::issue_lifecycle::{
 };
 use harness_workflow::runtime::{
     CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
+    RuntimeProfileSelector,
 };
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
@@ -474,13 +475,13 @@ impl RuntimeCommandDispatchTick {
 
 pub(super) async fn run_runtime_command_dispatch_tick(
     state: &Arc<AppState>,
-    runtime_profile: RuntimeProfile,
+    runtime_profiles: impl Into<RuntimeProfileSelector>,
     batch_limit: i64,
 ) -> anyhow::Result<RuntimeCommandDispatchTick> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(RuntimeCommandDispatchTick::default());
     };
-    let outcomes = RuntimeCommandDispatcher::new(store, runtime_profile)
+    let outcomes = RuntimeCommandDispatcher::with_profile_selector(store, runtime_profiles.into())
         .with_batch_limit(batch_limit)
         .dispatch_pending()
         .await?;
@@ -511,6 +512,29 @@ fn runtime_dispatch_profile(
     RuntimeProfile::new(policy.runtime_profile.clone(), kind)
 }
 
+fn runtime_dispatch_profile_selector(
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> RuntimeProfileSelector {
+    let default_profile = runtime_dispatch_profile(policy);
+    let mut selector = RuntimeProfileSelector::new(default_profile.clone());
+    for (definition_id, override_policy) in &policy.workflow_profiles {
+        let kind = override_policy
+            .runtime_kind
+            .as_deref()
+            .and_then(runtime_kind_from_config)
+            .unwrap_or(default_profile.kind);
+        let profile_name = override_policy
+            .runtime_profile
+            .clone()
+            .unwrap_or_else(|| default_profile.name.clone());
+        selector = selector.with_workflow_profile(
+            definition_id.clone(),
+            RuntimeProfile::new(profile_name, kind),
+        );
+    }
+    selector
+}
+
 pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
     if state.core.workflow_runtime_store.is_none() {
         tracing::debug!("workflow runtime command dispatcher disabled: store unavailable");
@@ -535,10 +559,10 @@ pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
             let policy = workflow_cfg.runtime_dispatch;
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
             if policy.enabled {
-                let profile = runtime_dispatch_profile(&policy);
+                let profile_selector = runtime_dispatch_profile_selector(&policy);
                 match run_runtime_command_dispatch_tick(
                     &state,
-                    profile,
+                    profile_selector,
                     i64::from(policy.batch_limit.max(1)),
                 )
                 .await
@@ -1859,6 +1883,40 @@ mod tests {
     use super::*;
 
     const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn runtime_dispatch_profile_selector_applies_workflow_overrides() {
+        let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: "claude_code".to_string(),
+            runtime_profile: "claude-default".to_string(),
+            ..Default::default()
+        };
+        policy.workflow_profiles.insert(
+            "github_issue_pr".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: Some("codex_exec".to_string()),
+                runtime_profile: Some("codex-high".to_string()),
+            },
+        );
+        policy.workflow_profiles.insert(
+            "repo_backlog".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: None,
+                runtime_profile: Some("codex-backlog".to_string()),
+            },
+        );
+
+        let selector = runtime_dispatch_profile_selector(&policy);
+        let issue_profile = selector.select(Some("github_issue_pr"));
+        assert_eq!(issue_profile.kind, RuntimeKind::CodexExec);
+        assert_eq!(issue_profile.name, "codex-high");
+        let backlog_profile = selector.select(Some("repo_backlog"));
+        assert_eq!(backlog_profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(backlog_profile.name, "codex-backlog");
+        let default_profile = selector.select(Some("quality_gate"));
+        assert_eq!(default_profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(default_profile.name, "claude-default");
+    }
 
     // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in
     // reconciliation.rs, but with an injectable gh_bin so tests run without a live
