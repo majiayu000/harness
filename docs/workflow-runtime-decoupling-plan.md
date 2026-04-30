@@ -22,11 +22,12 @@ Implemented now:
 - optional server startup wiring for `{workflow_namespace}_runtime`
 - `PLAN_ISSUE` durable event/decision/command recording
 - `ReplanCompleted` event recording after a successful replan
+- PR detection durable binding through `PrDetected` / `bind_pr`
+- PR feedback decisions for waiting, addressing feedback, and ready-to-merge
 
 Still intentionally not moved yet:
 
 - existing task runner ownership of process execution
-- PR feedback interpretation
 - repo backlog polling
 - runtime worker claiming of outbox commands
 - workflow-first dashboard rendering
@@ -314,7 +315,23 @@ Tests:
 
 ### Phase 3: PR Feedback Workflow
 
-Move PR feedback interpretation into `pr_feedback`.
+Status: partially implemented.
+
+The current branch records PR feedback decisions into the workflow runtime while keeping the
+existing review loop as the execution path.
+
+Implemented now:
+
+- `PrDetected` events bind issue workflows to PRs through a validated `bind_pr` decision
+- review waits record `NoFeedbackFound` / `wait_for_pr_feedback`
+- actionable review or validation failures record `FeedbackFound` / `address_pr_feedback`
+- approved reviews and graduated low-risk exits record `PrReadyToMerge` / `mark_ready_to_merge`
+
+Still intentionally not moved yet:
+
+- GitHub signal interpretation still runs in the existing review loop
+- feedback fix execution still runs through task runner turns
+- `pr_feedback` is not yet a separate child workflow with its own runtime job
 
 Tests:
 

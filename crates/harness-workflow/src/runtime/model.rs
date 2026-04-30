@@ -223,6 +223,29 @@ impl WorkflowCommand {
         )
     }
 
+    pub fn bind_pr(
+        pr_number: u64,
+        pr_url: impl Into<String>,
+        dedupe_key: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            WorkflowCommandType::BindPr,
+            dedupe_key,
+            json!({
+                "pr_number": pr_number,
+                "pr_url": pr_url.into()
+            }),
+        )
+    }
+
+    pub fn wait(reason: impl Into<String>, dedupe_key: impl Into<String>) -> Self {
+        Self::new(
+            WorkflowCommandType::Wait,
+            dedupe_key,
+            json!({ "reason": reason.into() }),
+        )
+    }
+
     pub fn mark_blocked(reason: impl Into<String>, dedupe_key: impl Into<String>) -> Self {
         Self::new(
             WorkflowCommandType::MarkBlocked,

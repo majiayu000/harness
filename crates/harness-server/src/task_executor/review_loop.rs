@@ -11,6 +11,7 @@ use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnFailureKind};
+use harness_workflow::runtime::PrFeedbackOutcome;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -715,6 +716,32 @@ fn update_silence_rounds(
     }
 }
 
+async fn record_runtime_pr_feedback(
+    workflow_runtime_store: Option<&harness_workflow::runtime::WorkflowRuntimeStore>,
+    project_root: &Path,
+    req: &CreateTaskRequest,
+    task_id: &TaskId,
+    pr_num: u64,
+    pr_url: Option<&str>,
+    outcome: PrFeedbackOutcome,
+    summary: &str,
+) {
+    crate::workflow_runtime_pr_feedback::record_pr_feedback(
+        workflow_runtime_store,
+        crate::workflow_runtime_pr_feedback::PrFeedbackRuntimeContext {
+            project_root,
+            repo: req.repo.as_deref(),
+            issue_number: req.issue,
+            task_id,
+            pr_number: pr_num,
+            pr_url,
+            outcome,
+            summary,
+        },
+    )
+    .await;
+}
+
 /// Execute the external review bot wait loop.
 ///
 /// Polls the PR for review bot feedback, handles LGTM/FIXED/WAITING responses,
@@ -728,6 +755,7 @@ pub(crate) async fn run_review_loop(
     review_config: &harness_core::config::agents::AgentReviewConfig,
     project_config: &harness_core::config::project::ProjectConfig,
     issue_workflow_store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
+    workflow_runtime_store: Option<&harness_workflow::runtime::WorkflowRuntimeStore>,
     project_root: &Path,
     req: &CreateTaskRequest,
     events: &Arc<harness_observe::event_store::EventStore>,
@@ -948,6 +976,17 @@ pub(crate) async fn run_review_loop(
                             )
                             .await;
                     }
+                    record_runtime_pr_feedback(
+                        workflow_runtime_store,
+                        project_root,
+                        req,
+                        task_id,
+                        pr_num,
+                        pr_url.as_deref(),
+                        PrFeedbackOutcome::ReadyToMerge,
+                        &detail,
+                    )
+                    .await;
                     store.log_event(crate::event_replay::TaskEvent::Completed {
                         task_id: task_id.0.clone(),
                         ts: crate::event_replay::now_ts(),
@@ -977,6 +1016,17 @@ pub(crate) async fn run_review_loop(
                         silence_rounds,
                         "waiting for review bot activity"
                     );
+                    record_runtime_pr_feedback(
+                        workflow_runtime_store,
+                        project_root,
+                        req,
+                        task_id,
+                        pr_num,
+                        pr_url.as_deref(),
+                        PrFeedbackOutcome::NoActionableFeedback,
+                        "Review bot has not produced actionable feedback yet.",
+                    )
+                    .await;
                     waiting_count = waiting_count.saturating_add(1);
                     if waiting_count >= MAX_CONSECUTIVE_WAITS {
                         round += 1;
@@ -1306,6 +1356,17 @@ pub(crate) async fn run_review_loop(
                     waiting_count,
                     "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
                 );
+                record_runtime_pr_feedback(
+                    workflow_runtime_store,
+                    project_root,
+                    req,
+                    task_id,
+                    pr_num,
+                    pr_url.as_deref(),
+                    PrFeedbackOutcome::NoActionableFeedback,
+                    "Review output asked the workflow to keep waiting for fresh feedback.",
+                )
+                .await;
                 waiting_count += 1;
                 update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
                 sleep(Duration::from_secs(wait_secs)).await;
@@ -1369,6 +1430,17 @@ pub(crate) async fn run_review_loop(
             {
                 Ok(()) => {
                     tracing::info!("PR #{pr_num} approved at round {round}");
+                    record_runtime_pr_feedback(
+                        workflow_runtime_store,
+                        project_root,
+                        req,
+                        task_id,
+                        pr_num,
+                        pr_url.as_deref(),
+                        PrFeedbackOutcome::ReadyToMerge,
+                        "Reviewer approved and validation passed.",
+                    )
+                    .await;
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Done;
                         s.turn = round.saturating_add(1);
@@ -1403,6 +1475,17 @@ pub(crate) async fn run_review_loop(
                     );
                     lgtm_test_gate_rejected = true;
                     pending_test_failure = Some(output);
+                    record_runtime_pr_feedback(
+                        workflow_runtime_store,
+                        project_root,
+                        req,
+                        task_id,
+                        pr_num,
+                        pr_url.as_deref(),
+                        PrFeedbackOutcome::BlockingFeedback,
+                        "Reviewer approved, but local validation failed and must be addressed.",
+                    )
+                    .await;
                 }
             }
         }
@@ -1412,6 +1495,19 @@ pub(crate) async fn run_review_loop(
         // Also treat a test gate rejection as a "fixed" round — the agent needs
         // to push a fix and get a fresh review before LGTM can be accepted.
         prev_fixed = fixed || pending_test_failure.is_some();
+        if !lgtm {
+            record_runtime_pr_feedback(
+                workflow_runtime_store,
+                project_root,
+                req,
+                task_id,
+                pr_num,
+                pr_url.as_deref(),
+                PrFeedbackOutcome::BlockingFeedback,
+                "Review round produced actionable feedback that requires another pass.",
+            )
+            .await;
+        }
         tracing::info!("PR #{pr_num} fixed at round {round}; waiting for bot re-review");
         if round < max_rounds {
             waiting_count += 1;
@@ -1436,6 +1532,17 @@ pub(crate) async fn run_review_loop(
             remaining_issues = last_issue_count.unwrap_or(0),
             "review loop exhausted but few issues remain — marking done with warning"
         );
+        record_runtime_pr_feedback(
+            workflow_runtime_store,
+            project_root,
+            req,
+            task_id,
+            pr_num,
+            pr_url.as_deref(),
+            PrFeedbackOutcome::ReadyToMerge,
+            "Review loop graduated with few remaining issues.",
+        )
+        .await;
         mutate_and_persist(store, task_id, |s| {
             s.status = TaskStatus::Done;
             s.turn = max_rounds.saturating_add(1);

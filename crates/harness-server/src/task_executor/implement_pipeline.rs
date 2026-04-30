@@ -169,6 +169,7 @@ pub(crate) async fn run_implement_phase(
     resumed_pr_url: Option<String>,
     resumed_review_prep: Option<prompts::PrReviewPrepOutcome>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
     turn_timeout: Duration,
     effective_max_turns: Option<u32>,
     turns_used: &mut u32,
@@ -1167,6 +1168,22 @@ pub(crate) async fn run_implement_phase(
                         "issue workflow PR binding failed: {e}"
                     );
                 }
+            }
+            if let (Some(workflow_runtime), Some(issue_number), Some(pr_number)) =
+                (workflow_runtime_store.as_ref(), req.issue, pr_num)
+            {
+                crate::workflow_runtime_pr_feedback::record_pr_detected(
+                    Some(workflow_runtime.as_ref()),
+                    crate::workflow_runtime_pr_feedback::PrDetectedRuntimeContext {
+                        project_root,
+                        repo: req.repo.as_deref(),
+                        issue_number,
+                        task_id,
+                        pr_number,
+                        pr_url: pr_url_str,
+                    },
+                )
+                .await;
             }
             store.log_event(crate::event_replay::TaskEvent::PrDetected {
                 task_id: task_id.0.clone(),

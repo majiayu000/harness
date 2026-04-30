@@ -111,8 +111,24 @@ impl TransitionAllowlist {
                 "pr_open",
                 [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
             )
+            .allow("pr_open", "pr_open", [BindPr, Wait])
             .allow(
                 "pr_open",
+                "awaiting_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "pr_open",
+                "addressing_feedback",
+                [EnqueueActivity, StartChildWorkflow, MarkBlocked, Wait],
+            )
+            .allow(
+                "pr_open",
+                "ready_to_merge",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "awaiting_feedback",
                 "awaiting_feedback",
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
@@ -123,7 +139,17 @@ impl TransitionAllowlist {
             )
             .allow(
                 "addressing_feedback",
+                "addressing_feedback",
+                [EnqueueActivity, StartChildWorkflow, MarkBlocked, Wait],
+            )
+            .allow(
+                "addressing_feedback",
                 "awaiting_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "addressing_feedback",
+                "ready_to_merge",
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
             .allow(
@@ -131,6 +157,7 @@ impl TransitionAllowlist {
                 "ready_to_merge",
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
+            .allow("ready_to_merge", "ready_to_merge", [Wait])
             .allow("ready_to_merge", "done", [MarkDone])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])

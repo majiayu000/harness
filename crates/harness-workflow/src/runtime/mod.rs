@@ -7,6 +7,7 @@
 pub mod bus;
 pub mod model;
 pub mod plan_issue;
+pub mod pr_feedback;
 pub mod store;
 pub mod validator;
 
@@ -23,6 +24,10 @@ pub use model::{
 pub use plan_issue::{
     build_plan_issue_decision, PlanIssueDecisionInput, PlanIssueDecisionOutput,
     PlanIssueWorkflowAction,
+};
+pub use pr_feedback::{
+    build_pr_detected_decision, build_pr_feedback_decision, PrDetectedDecisionInput,
+    PrFeedbackDecisionInput, PrFeedbackDecisionOutput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
 };
 pub use store::WorkflowRuntimeStore;
 pub use validator::{

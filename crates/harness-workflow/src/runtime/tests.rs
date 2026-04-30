@@ -6,8 +6,9 @@ use super::model::{
 };
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
-    build_plan_issue_decision, InMemoryWorkflowBus, PlanIssueDecisionInput,
-    PlanIssueWorkflowAction, WorkflowRuntimeStore,
+    build_plan_issue_decision, build_pr_detected_decision, build_pr_feedback_decision,
+    InMemoryWorkflowBus, PlanIssueDecisionInput, PlanIssueWorkflowAction, PrDetectedDecisionInput,
+    PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction, WorkflowRuntimeStore,
 };
 use chrono::{Duration, Utc};
 use harness_core::db::resolve_database_url;
@@ -101,6 +102,109 @@ fn plan_issue_decision_blocks_repeated_replan() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("block decision should validate");
+}
+
+#[test]
+fn pr_detected_decision_binds_pr_from_implementation() {
+    let instance = issue_instance("implementing");
+    let output = build_pr_detected_decision(
+        &instance,
+        PrDetectedDecisionInput {
+            task_id: "task-1",
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::BindPr);
+    assert_eq!(output.decision.decision, "bind_pr");
+    assert_eq!(output.decision.next_state, "pr_open");
+    assert_eq!(output.decision.commands.len(), 1);
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("PR binding decision should validate");
+}
+
+#[test]
+fn pr_feedback_decision_addresses_blocking_feedback() {
+    let instance = issue_instance("awaiting_feedback");
+    let output = build_pr_feedback_decision(
+        &instance,
+        PrFeedbackDecisionInput {
+            task_id: "task-1",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            outcome: PrFeedbackOutcome::BlockingFeedback,
+            summary: "Reviewer found blocking feedback.",
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::AddressFeedback);
+    assert_eq!(output.decision.decision, "address_pr_feedback");
+    assert_eq!(output.decision.next_state, "addressing_feedback");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("blocking feedback decision should validate");
+}
+
+#[test]
+fn pr_feedback_decision_waits_when_no_actionable_feedback_exists() {
+    let instance = issue_instance("pr_open");
+    let output = build_pr_feedback_decision(
+        &instance,
+        PrFeedbackDecisionInput {
+            task_id: "task-1",
+            pr_number: 77,
+            pr_url: None,
+            outcome: PrFeedbackOutcome::NoActionableFeedback,
+            summary: "Review bot has not produced actionable feedback yet.",
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::AwaitFeedback);
+    assert_eq!(output.decision.decision, "wait_for_pr_feedback");
+    assert_eq!(output.decision.next_state, "awaiting_feedback");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("wait decision should validate");
+}
+
+#[test]
+fn pr_feedback_decision_marks_ready_to_merge() {
+    let instance = issue_instance("addressing_feedback");
+    let output = build_pr_feedback_decision(
+        &instance,
+        PrFeedbackDecisionInput {
+            task_id: "task-1",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            outcome: PrFeedbackOutcome::ReadyToMerge,
+            summary: "Reviewer approved and validation passed.",
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::ReadyToMerge);
+    assert_eq!(output.decision.decision, "mark_ready_to_merge");
+    assert_eq!(output.decision.next_state, "ready_to_merge");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("ready-to-merge decision should validate");
 }
 
 fn leased_issue_instance(state: &str) -> WorkflowInstance {
