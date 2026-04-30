@@ -1319,7 +1319,7 @@ async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() 
 }
 
 #[tokio::test]
-async fn runtime_command_dispatcher_selects_profile_by_workflow_definition() -> anyhow::Result<()> {
+async fn runtime_command_dispatcher_prefers_activity_profile() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -1331,12 +1331,17 @@ async fn runtime_command_dispatcher_selects_profile_by_workflow_definition() -> 
     store.upsert_instance(&issue).await?;
     store.upsert_instance(&backlog).await?;
 
-    let issue_command =
+    let issue_replan_command =
         WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-profile");
+    let issue_implement_command =
+        WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-profile");
     let backlog_command =
         WorkflowCommand::enqueue_activity("scan_repo", "repo-backlog-scan-profile");
-    let issue_command_id = store
-        .enqueue_command(&issue.id, None, &issue_command)
+    let issue_replan_command_id = store
+        .enqueue_command(&issue.id, None, &issue_replan_command)
+        .await?;
+    let issue_implement_command_id = store
+        .enqueue_command(&issue.id, None, &issue_implement_command)
         .await?;
     let backlog_command_id = store
         .enqueue_command(&backlog.id, None, &backlog_command)
@@ -1347,23 +1352,51 @@ async fn runtime_command_dispatcher_selects_profile_by_workflow_definition() -> 
     let mut issue_profile = RuntimeProfile::new("codex-issue-high", RuntimeKind::CodexExec);
     issue_profile.model = Some("gpt-issue".to_string());
     issue_profile.timeout_secs = Some(1200);
+    let mut replan_profile = RuntimeProfile::new("codex-replan", RuntimeKind::CodexJsonrpc);
+    replan_profile.model = Some("gpt-replan".to_string());
+    replan_profile.timeout_secs = Some(300);
     let profile_selector = RuntimeProfileSelector::new(default_profile)
-        .with_workflow_profile("github_issue_pr", issue_profile);
+        .with_workflow_profile("github_issue_pr", issue_profile)
+        .with_activity_profile("replan_issue", replan_profile);
     let dispatcher = RuntimeCommandDispatcher::with_profile_selector(&store, profile_selector);
 
     let outcomes = dispatcher.dispatch_pending().await?;
-    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes.len(), 3);
 
-    let issue_jobs = store.runtime_jobs_for_command(&issue_command_id).await?;
-    assert_eq!(issue_jobs.len(), 1);
-    assert_eq!(issue_jobs[0].runtime_kind, RuntimeKind::CodexExec);
-    assert_eq!(issue_jobs[0].runtime_profile, "codex-issue-high");
+    let replan_jobs = store
+        .runtime_jobs_for_command(&issue_replan_command_id)
+        .await?;
+    assert_eq!(replan_jobs.len(), 1);
+    assert_eq!(replan_jobs[0].runtime_kind, RuntimeKind::CodexJsonrpc);
+    assert_eq!(replan_jobs[0].runtime_profile, "codex-replan");
     assert_eq!(
-        issue_jobs[0].input["runtime_profile"]["name"],
+        replan_jobs[0].input["runtime_profile"]["name"],
+        "codex-replan"
+    );
+    assert_eq!(
+        replan_jobs[0].input["runtime_profile"]["model"],
+        "gpt-replan"
+    );
+    assert_eq!(replan_jobs[0].input["runtime_profile"]["timeout_secs"], 300);
+
+    let implement_jobs = store
+        .runtime_jobs_for_command(&issue_implement_command_id)
+        .await?;
+    assert_eq!(implement_jobs.len(), 1);
+    assert_eq!(implement_jobs[0].runtime_kind, RuntimeKind::CodexExec);
+    assert_eq!(implement_jobs[0].runtime_profile, "codex-issue-high");
+    assert_eq!(
+        implement_jobs[0].input["runtime_profile"]["name"],
         "codex-issue-high"
     );
-    assert_eq!(issue_jobs[0].input["runtime_profile"]["model"], "gpt-issue");
-    assert_eq!(issue_jobs[0].input["runtime_profile"]["timeout_secs"], 1200);
+    assert_eq!(
+        implement_jobs[0].input["runtime_profile"]["model"],
+        "gpt-issue"
+    );
+    assert_eq!(
+        implement_jobs[0].input["runtime_profile"]["timeout_secs"],
+        1200
+    );
 
     let backlog_jobs = store.runtime_jobs_for_command(&backlog_command_id).await?;
     assert_eq!(backlog_jobs.len(), 1);

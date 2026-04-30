@@ -26,6 +26,7 @@ pub enum CommandDispatchOutcome {
 pub struct RuntimeProfileSelector {
     default_profile: RuntimeProfile,
     workflow_profiles: BTreeMap<String, RuntimeProfile>,
+    activity_profiles: BTreeMap<String, RuntimeProfile>,
 }
 
 impl RuntimeProfileSelector {
@@ -33,6 +34,7 @@ impl RuntimeProfileSelector {
         Self {
             default_profile,
             workflow_profiles: BTreeMap::new(),
+            activity_profiles: BTreeMap::new(),
         }
     }
 
@@ -45,7 +47,23 @@ impl RuntimeProfileSelector {
         self
     }
 
-    pub fn select(&self, definition_id: Option<&str>) -> &RuntimeProfile {
+    pub fn with_activity_profile(
+        mut self,
+        activity: impl Into<String>,
+        profile: RuntimeProfile,
+    ) -> Self {
+        self.activity_profiles.insert(activity.into(), profile);
+        self
+    }
+
+    pub fn select(&self, definition_id: Option<&str>, activity: Option<&str>) -> &RuntimeProfile {
+        activity
+            .and_then(|name| self.activity_profiles.get(name))
+            .or_else(|| definition_id.and_then(|id| self.workflow_profiles.get(id)))
+            .unwrap_or(&self.default_profile)
+    }
+
+    pub fn select_for_workflow(&self, definition_id: Option<&str>) -> &RuntimeProfile {
         definition_id
             .and_then(|id| self.workflow_profiles.get(id))
             .unwrap_or(&self.default_profile)
@@ -168,6 +186,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                 instance
                     .as_ref()
                     .map(|workflow| workflow.definition_id.as_str()),
+                command.command.activity_name(),
             )
             .clone())
     }

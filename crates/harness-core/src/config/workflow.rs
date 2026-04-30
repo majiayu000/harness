@@ -51,6 +51,8 @@ pub struct RuntimeDispatchPolicy {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub workflow_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
+    #[serde(default)]
+    pub activity_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -140,6 +142,7 @@ impl Default for RuntimeDispatchPolicy {
             max_turns: None,
             timeout_secs: None,
             workflow_profiles: BTreeMap::new(),
+            activity_profiles: BTreeMap::new(),
         }
     }
 }
@@ -268,6 +271,7 @@ mod tests {
         assert_eq!(cfg.runtime_dispatch.max_turns, None);
         assert_eq!(cfg.runtime_dispatch.timeout_secs, None);
         assert!(cfg.runtime_dispatch.workflow_profiles.is_empty());
+        assert!(cfg.runtime_dispatch.activity_profiles.is_empty());
         assert!(!cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 5);
         assert_eq!(cfg.runtime_worker.concurrency, 1);
@@ -314,6 +318,11 @@ runtime_dispatch:
     repo_backlog:
       runtime_profile: codex-backlog
       timeout_secs: 120
+  activity_profiles:
+    replan_issue:
+      runtime_profile: codex-replan
+      model: gpt-5.4-mini
+      timeout_secs: 180
 runtime_worker:
   enabled: true
   interval_secs: 3
@@ -381,6 +390,17 @@ Body
             Some("codex-backlog")
         );
         assert_eq!(backlog_profile.timeout_secs, Some(120));
+        let replan_profile = cfg
+            .runtime_dispatch
+            .activity_profiles
+            .get("replan_issue")
+            .expect("activity profile override should parse");
+        assert_eq!(
+            replan_profile.runtime_profile.as_deref(),
+            Some("codex-replan")
+        );
+        assert_eq!(replan_profile.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(replan_profile.timeout_secs, Some(180));
         assert!(cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 3);
         assert_eq!(cfg.runtime_worker.concurrency, 2);
