@@ -17,6 +17,7 @@ pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
 static DATABASE_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
 static DB_STATE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+static TEST_DATABASE_URL: OnceLock<String> = OnceLock::new();
 
 fn db_state_lock() -> Arc<tokio::sync::Mutex<()>> {
     DB_STATE_LOCK
@@ -36,6 +37,11 @@ impl HomeGuard {
     /// The caller must hold `HOME_LOCK` for the lifetime of this guard.
     pub unsafe fn set(path: &std::path::Path) -> Self {
         let original = std::env::var("HOME").ok();
+        if TEST_DATABASE_URL.get().is_none() {
+            if let Ok(database_url) = resolve_database_url(None) {
+                let _ = TEST_DATABASE_URL.set(database_url);
+            }
+        }
         std::env::set_var("HOME", path);
         HomeGuard { original }
     }
@@ -100,7 +106,13 @@ pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
 }
 
 pub fn test_database_url() -> anyhow::Result<String> {
-    resolve_database_url(None)
+    if let Some(database_url) = TEST_DATABASE_URL.get() {
+        return Ok(database_url.clone());
+    }
+
+    let database_url = resolve_database_url(None)?;
+    let _ = TEST_DATABASE_URL.set(database_url.clone());
+    Ok(database_url)
 }
 
 pub fn ensure_test_database_url_override() -> anyhow::Result<String> {

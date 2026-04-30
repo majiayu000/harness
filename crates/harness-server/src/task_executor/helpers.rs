@@ -295,6 +295,17 @@ pub(crate) async fn process_stream_item(
                 },
             );
         }
+        StreamItem::ToolOutputDelta { item_id, text } => {
+            emit_runtime_notification(
+                notify_tx,
+                notification_tx,
+                Notification::ToolOutputDelta {
+                    turn_id: turn_id.clone(),
+                    item_id,
+                    text,
+                },
+            );
+        }
         StreamItem::ApprovalRequest { id, command } => {
             if let Err(err) = server.thread_manager.add_item(
                 thread_id,
@@ -316,6 +327,16 @@ pub(crate) async fn process_stream_item(
                     turn_id: turn_id.clone(),
                     request_id: id,
                     command,
+                },
+            );
+        }
+        StreamItem::Warning { message } => {
+            emit_runtime_notification(
+                notify_tx,
+                notification_tx,
+                Notification::Warning {
+                    turn_id: turn_id.clone(),
+                    message,
                 },
             );
         }

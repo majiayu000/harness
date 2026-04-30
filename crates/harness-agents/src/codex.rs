@@ -1,18 +1,22 @@
 use crate::cloud_setup;
 use crate::streaming::{
-    captured_stderr_tail, enrich_stream_exit_error, filter_agent_stderr_with_capture,
-    log_captured_stderr, send_stream_item, stream_child_output,
+    capture_agent_stderr_diagnostics, captured_stderr_tail, enrich_stream_exit_error,
+    log_captured_stderr_diagnostics, send_stream_item,
 };
 use async_trait::async_trait;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::agents::SandboxMode;
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig};
-use harness_core::types::{Capability, TokenUsage};
+use harness_core::types::{Capability, Item, TokenUsage};
 use harness_sandbox::{wrap_command, SandboxSpec};
+use serde_json::Value;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 pub struct CodexAgent {
@@ -68,6 +72,9 @@ impl CodexAgent {
         let mut args = vec![
             OsString::from("exec"),
             OsString::from("--skip-git-repo-check"),
+            OsString::from("--json"),
+            OsString::from("--color"),
+            OsString::from("never"),
             OsString::from("-m"),
             OsString::from(model),
             OsString::from("-c"),
@@ -88,6 +95,264 @@ impl CodexAgent {
         args.push(OsString::from(req.prompt.clone()));
         args
     }
+}
+
+#[derive(Debug)]
+enum ParsedCodexExecEvent {
+    MessageDelta { item_id: String, text: String },
+    ToolOutputDelta { item_id: String, text: String },
+    ItemStarted { item: Item },
+    ItemCompleted { item_id: String, item: Item },
+    TokenUsage { usage: TokenUsage },
+    Warning { message: String },
+    Error { message: String },
+    Ignore,
+}
+
+#[derive(Debug, Default)]
+struct ParsedCodexExecOutput {
+    output: String,
+    items: Vec<Item>,
+    token_usage: TokenUsage,
+    warnings: Vec<String>,
+    structured_error: Option<String>,
+}
+
+fn json_str_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|field| field.as_str()))
+}
+
+pub(crate) fn parse_codex_item(item: &Value) -> Option<Item> {
+    match json_str_field(item, &["type"])? {
+        "agent_message" | "agentMessage" => Some(Item::AgentReasoning {
+            content: json_str_field(item, &["text"])?.to_string(),
+        }),
+        "command_execution" | "commandExecution" => Some(Item::ShellCommand {
+            command: json_str_field(item, &["command"])?.to_string(),
+            exit_code: item
+                .get("exit_code")
+                .or_else(|| item.get("exitCode"))
+                .and_then(|field| field.as_i64())
+                .and_then(|code| i32::try_from(code).ok()),
+            stdout: json_str_field(item, &["aggregated_output", "aggregatedOutput"])
+                .unwrap_or_default()
+                .to_string(),
+            stderr: String::new(),
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_codex_token_usage(usage: &Value) -> Option<TokenUsage> {
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("inputTokens"))
+        .and_then(|field| field.as_u64())?;
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("outputTokens"))
+        .and_then(|field| field.as_u64())?;
+    let total_tokens = usage
+        .get("total_tokens")
+        .or_else(|| usage.get("totalTokens"))
+        .and_then(|field| field.as_u64())
+        .unwrap_or(input_tokens.saturating_add(output_tokens));
+
+    Some(TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cost_usd: 0.0,
+    })
+}
+
+fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecEvent> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let event_type = json_str_field(&value, &["type"])?;
+
+    match event_type {
+        "thread.started" | "turn.started" => Some(ParsedCodexExecEvent::Ignore),
+        "warning" => Some(ParsedCodexExecEvent::Warning {
+            message: json_str_field(&value, &["message"])
+                .or_else(|| value.get("warning").and_then(Value::as_str))
+                .unwrap_or("unknown warning")
+                .to_string(),
+        }),
+        "error" => Some(ParsedCodexExecEvent::Error {
+            message: json_str_field(&value, &["message"])
+                .or_else(|| {
+                    value
+                        .get("error")
+                        .and_then(|error| json_str_field(error, &["message"]))
+                })
+                .unwrap_or("unknown error")
+                .to_string(),
+        }),
+        "turn.completed" => value
+            .get("usage")
+            .and_then(parse_codex_token_usage)
+            .map(|usage| ParsedCodexExecEvent::TokenUsage { usage })
+            .or(Some(ParsedCodexExecEvent::Ignore)),
+        "item.started" | "item.completed" => {
+            let item_value = value.get("item")?;
+            let item_id = json_str_field(item_value, &["id"])?.to_string();
+            let item = parse_codex_item(item_value)?;
+            if event_type == "item.started" {
+                let _ = item_id;
+                Some(ParsedCodexExecEvent::ItemStarted { item })
+            } else {
+                Some(ParsedCodexExecEvent::ItemCompleted { item_id, item })
+            }
+        }
+        "item.delta" | "item/agentMessage/delta" | "item.agent_message.delta" => {
+            Some(ParsedCodexExecEvent::MessageDelta {
+                item_id: json_str_field(&value, &["item_id", "itemId"])?.to_string(),
+                text: json_str_field(&value, &["delta", "text"])?.to_string(),
+            })
+        }
+        "item/commandExecution/outputDelta"
+        | "item.command_execution.output_delta"
+        | "item.command_output_delta" => Some(ParsedCodexExecEvent::ToolOutputDelta {
+            item_id: json_str_field(&value, &["item_id", "itemId"])?.to_string(),
+            text: json_str_field(&value, &["delta", "text"])?.to_string(),
+        }),
+        _ => Some(ParsedCodexExecEvent::Ignore),
+    }
+}
+
+fn apply_codex_exec_event(
+    parsed: &mut ParsedCodexExecOutput,
+    seen_message_deltas: &mut HashSet<String>,
+    event: ParsedCodexExecEvent,
+    emitted_items: &mut Vec<StreamItem>,
+) {
+    match event {
+        ParsedCodexExecEvent::MessageDelta { item_id, text } => {
+            seen_message_deltas.insert(item_id);
+            parsed.output.push_str(&text);
+            emitted_items.push(StreamItem::MessageDelta { text });
+        }
+        ParsedCodexExecEvent::ToolOutputDelta { item_id, text } => {
+            emitted_items.push(StreamItem::ToolOutputDelta { item_id, text });
+        }
+        ParsedCodexExecEvent::ItemStarted { item } => {
+            emitted_items.push(StreamItem::ItemStarted { item });
+        }
+        ParsedCodexExecEvent::ItemCompleted { item_id, item } => {
+            if let Item::AgentReasoning { content } = &item {
+                if !seen_message_deltas.contains(&item_id) {
+                    parsed.output.push_str(content);
+                    emitted_items.push(StreamItem::MessageDelta {
+                        text: content.clone(),
+                    });
+                }
+            } else {
+                parsed.items.push(item.clone());
+            }
+            emitted_items.push(StreamItem::ItemCompleted { item });
+        }
+        ParsedCodexExecEvent::TokenUsage { usage } => {
+            parsed.token_usage = usage.clone();
+            emitted_items.push(StreamItem::TokenUsage { usage });
+        }
+        ParsedCodexExecEvent::Warning { message } => {
+            parsed.warnings.push(message.clone());
+            emitted_items.push(StreamItem::Warning { message });
+        }
+        ParsedCodexExecEvent::Error { message } => {
+            parsed.structured_error = Some(message.clone());
+            emitted_items.push(StreamItem::Error { message });
+        }
+        ParsedCodexExecEvent::Ignore => {}
+    }
+}
+
+fn parse_codex_exec_output(stdout: &str) -> harness_core::error::Result<ParsedCodexExecOutput> {
+    let mut parsed = ParsedCodexExecOutput::default();
+    let mut seen_message_deltas = HashSet::new();
+
+    for line in stdout.lines() {
+        let event = parse_codex_exec_event_line(line).ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to parse codex json line: {line}"
+            ))
+        })?;
+        let mut ignored = Vec::new();
+        apply_codex_exec_event(&mut parsed, &mut seen_message_deltas, event, &mut ignored);
+    }
+
+    Ok(parsed)
+}
+
+async fn stream_codex_exec_output(
+    child: &mut tokio::process::Child,
+    tx: &tokio::sync::mpsc::Sender<StreamItem>,
+    idle_timeout: Option<Duration>,
+) -> harness_core::error::Result<ParsedCodexExecOutput> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        harness_core::error::HarnessError::AgentExecution("codex stdout unavailable".into())
+    })?;
+    let mut lines = BufReader::new(stdout).lines();
+    let mut parsed = ParsedCodexExecOutput::default();
+    let mut seen_message_deltas = HashSet::new();
+
+    loop {
+        let maybe_line = if let Some(duration) = idle_timeout {
+            tokio::time::timeout(duration, lines.next_line())
+                .await
+                .map_err(|_| {
+                    #[cfg(unix)]
+                    crate::kill_process_group(child);
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "codex stream idle timeout after {}s: zombie connection terminated",
+                        duration.as_secs()
+                    ))
+                })?
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "failed reading codex stdout: {error}"
+                    ))
+                })?
+        } else {
+            lines.next_line().await.map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed reading codex stdout: {error}"
+                ))
+            })?
+        };
+        let Some(line) = maybe_line else {
+            break;
+        };
+        let event = parse_codex_exec_event_line(&line).ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to parse codex json line: {line}"
+            ))
+        })?;
+        let mut emitted_items = Vec::new();
+        apply_codex_exec_event(
+            &mut parsed,
+            &mut seen_message_deltas,
+            event,
+            &mut emitted_items,
+        );
+        for item in emitted_items {
+            let item_label = match &item {
+                StreamItem::ItemStarted { .. } => "item_started",
+                StreamItem::MessageDelta { .. } => "message_delta",
+                StreamItem::ToolOutputDelta { .. } => "tool_output_delta",
+                StreamItem::ItemCompleted { .. } => "item_completed",
+                StreamItem::TokenUsage { .. } => "token_usage",
+                StreamItem::Warning { .. } => "warning",
+                StreamItem::Error { .. } => "error",
+                StreamItem::ApprovalRequest { .. } => "approval_request",
+                StreamItem::Done => "done",
+            };
+            send_stream_item(tx, item, "codex", item_label).await?;
+        }
+    }
+
+    Ok(parsed)
 }
 
 #[derive(Debug)]
@@ -286,7 +551,7 @@ impl CodeAgent for CodexAgent {
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        log_captured_stderr(&stderr, self.name());
+        log_captured_stderr_diagnostics(&stderr, self.name());
 
         if !output.status.success() {
             if harness_core::error::is_billing_failure_message(&stderr) {
@@ -307,11 +572,19 @@ impl CodeAgent for CodexAgent {
             )));
         }
 
+        let parsed = parse_codex_exec_output(&stdout)?;
+        if let Some(message) = parsed.structured_error {
+            return Err(harness_core::error::HarnessError::AgentExecution(message));
+        }
+        for warning in &parsed.warnings {
+            tracing::warn!(agent = self.name(), "{warning}");
+        }
+
         Ok(AgentResponse {
-            output: stdout,
+            output: parsed.output,
             stderr,
-            items: Vec::new(),
-            token_usage: TokenUsage::default(),
+            items: parsed.items,
+            token_usage: parsed.token_usage,
             model: "codex".to_string(),
             exit_code: output.status.code(),
         })
@@ -395,7 +668,7 @@ impl CodeAgent for CodexAgent {
             let agent = self.name().to_string();
             let captured = Arc::clone(&stderr_capture);
             stderr_task = Some(tokio::spawn(async move {
-                filter_agent_stderr_with_capture(stderr, &agent, Some(captured)).await;
+                capture_agent_stderr_diagnostics(stderr, &agent, Some(captured)).await;
             }));
         }
 
@@ -403,7 +676,7 @@ impl CodeAgent for CodexAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        let stream_result = stream_child_output(&mut child, &tx, self.name(), idle_timeout).await;
+        let stream_result = stream_codex_exec_output(&mut child, &tx, idle_timeout).await;
         let stream_send_failed = matches!(
             &stream_result,
             Err(harness_core::error::HarnessError::AgentExecution(message))
@@ -420,7 +693,31 @@ impl CodeAgent for CodexAgent {
         if let Some(stderr_task) = stderr_task {
             let _ = stderr_task.await;
         }
-        if let Err(error) = stream_result {
+        let parsed = match stream_result {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let stderr = captured_stderr_tail(&stderr_capture);
+                if !stderr.is_empty() {
+                    if harness_core::error::is_billing_failure_message(&stderr) {
+                        return Err(harness_core::error::HarnessError::BillingFailed(format!(
+                            "codex billing failure (streamed exit): {stderr}"
+                        )));
+                    }
+                    if harness_core::error::is_quota_failure_message(&stderr) {
+                        return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
+                            "codex quota exhausted (streamed exit): {stderr}"
+                        )));
+                    }
+                }
+                return Err(enrich_stream_exit_error(error, &stderr));
+            }
+        };
+        let status = child.wait().await.map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed waiting for codex process: {error}"
+            ))
+        })?;
+        if !status.success() {
             let stderr = captured_stderr_tail(&stderr_capture);
             if !stderr.is_empty() {
                 if harness_core::error::is_billing_failure_message(&stderr) {
@@ -434,7 +731,15 @@ impl CodeAgent for CodexAgent {
                     )));
                 }
             }
-            return Err(enrich_stream_exit_error(error, &stderr));
+            return Err(enrich_stream_exit_error(
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "codex exited with {status}"
+                )),
+                &stderr,
+            ));
+        }
+        if let Some(message) = parsed.structured_error {
+            return Err(harness_core::error::HarnessError::AgentExecution(message));
         }
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
@@ -519,6 +824,132 @@ mod tests {
             fs::set_permissions(&path, perms).expect("set executable permissions");
         }
         (dir, path)
+    }
+
+    #[test]
+    fn base_args_enable_structured_json_stdout() {
+        let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+        let request = AgentRequest {
+            prompt: "ping".to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            ..Default::default()
+        };
+
+        let args: Vec<String> = agent
+            .base_args(&request)
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.iter().any(|arg| arg == "--json"));
+        assert!(args.windows(2).any(|window| window == ["--color", "never"]));
+    }
+
+    #[test]
+    fn parse_exec_agent_message_completion() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hi"}}"#;
+        let event = parse_codex_exec_event_line(line).expect("event should parse");
+        match event {
+            ParsedCodexExecEvent::ItemCompleted { item_id, item } => {
+                assert_eq!(item_id, "item_0");
+                assert_eq!(
+                    item,
+                    Item::AgentReasoning {
+                        content: "hi".into()
+                    }
+                );
+            }
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_exec_command_item_started() {
+        let line = r#"{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"pwd","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#;
+        let event = parse_codex_exec_event_line(line).expect("event should parse");
+        match event {
+            ParsedCodexExecEvent::ItemStarted { item } => {
+                assert_eq!(
+                    item,
+                    Item::ShellCommand {
+                        command: "pwd".into(),
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }
+                );
+            }
+            other => panic!("expected item start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_exec_command_output_delta() {
+        let line = r#"{"type":"item.command_execution.output_delta","item_id":"item_0","delta":"cargo check\n"}"#;
+        let event = parse_codex_exec_event_line(line).expect("event should parse");
+        match event {
+            ParsedCodexExecEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "item_0");
+                assert_eq!(text, "cargo check\n");
+            }
+            other => panic!("expected tool output delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_exec_warning_and_error() {
+        let warning = parse_codex_exec_event_line(r#"{"type":"warning","message":"careful"}"#)
+            .expect("warning should parse");
+        let error = parse_codex_exec_event_line(
+            r#"{"type":"error","error":{"message":"something failed"}}"#,
+        )
+        .expect("error should parse");
+
+        assert!(matches!(
+            warning,
+            ParsedCodexExecEvent::Warning { ref message } if message == "careful"
+        ));
+        assert!(matches!(
+            error,
+            ParsedCodexExecEvent::Error { ref message } if message == "something failed"
+        ));
+    }
+
+    #[test]
+    fn parse_exec_turn_completed_usage() {
+        let line = r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":3,"reasoning_output_tokens":2}}"#;
+        let event = parse_codex_exec_event_line(line).expect("event should parse");
+        match event {
+            ParsedCodexExecEvent::TokenUsage { usage } => {
+                assert_eq!(
+                    usage,
+                    TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                        total_tokens: 13,
+                        cost_usd: 0.0,
+                    }
+                );
+            }
+            other => panic!("expected token usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_exec_output_deduplicates_completed_agent_message_after_delta() {
+        let stdout = concat!(
+            r#"{"type":"item.delta","item_id":"item_0","delta":"he"}"#,
+            "\n",
+            r#"{"type":"item.delta","item_id":"item_0","delta":"llo"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}"#,
+        );
+
+        let parsed = parse_codex_exec_output(stdout).expect("stdout should parse");
+        assert_eq!(parsed.output, "hello");
+        assert_eq!(parsed.token_usage.total_tokens, 3);
     }
 
     enum StreamObservation {
@@ -624,9 +1055,11 @@ mod tests {
     async fn execute_stream_emits_delta_before_completion_and_done() {
         let (dir, script) = write_executable_script(
             r#"
-printf 'hello\n'
+printf '%s\n' '{"type":"item.delta","item_id":"item_0","delta":"hello "}'
 sleep 0.2
-printf 'world\n'
+printf '%s\n' '{"type":"item.delta","item_id":"item_0","delta":"world"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello world"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}'
 "#,
         );
         let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
@@ -751,9 +1184,9 @@ exit 1
     async fn execute_stream_cancel_path_converges_when_receiver_dropped_mid_stream() {
         let (dir, script) = write_executable_script(
             r#"
-printf 'first\n'
+printf '%s\n' '{"type":"item.delta","item_id":"item_0","delta":"first"}'
 sleep 0.1
-printf 'second\n'
+printf '%s\n' '{"type":"item.delta","item_id":"item_0","delta":"second"}'
 sleep 30
 "#,
         );

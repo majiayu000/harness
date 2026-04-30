@@ -297,9 +297,11 @@ async fn make_test_state_with_project_root(
 }
 
 async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.database_url = Some(crate::test_helpers::test_database_url()?);
     make_test_state_with(
         dir,
-        harness_core::config::HarnessConfig::default(),
+        config,
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await
@@ -597,6 +599,7 @@ async fn call_health(state: Arc<AppState>) -> anyhow::Result<HealthResponse> {
 
 #[tokio::test]
 async fn health_endpoint_returns_ok_and_task_count() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
     let health = call_health(state).await?;
@@ -610,6 +613,7 @@ async fn health_endpoint_returns_ok_and_task_count() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn health_degraded_when_subsystem_missing() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let mut state = make_test_state(dir.path()).await?;
     Arc::get_mut(&mut state).unwrap().degraded_subsystems = vec!["q_value_store"];
@@ -635,6 +639,7 @@ async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let mut state = make_test_state(dir.path()).await?;
     let state_mut = Arc::get_mut(&mut state).unwrap();
@@ -703,6 +708,7 @@ async fn health_degraded_both_conditions() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn health_reports_critical_store_failure_details() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let mut state = make_test_state(dir.path()).await?;
     Arc::get_mut(&mut state).unwrap().startup_statuses = vec![
@@ -1557,6 +1563,7 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn get_task_includes_round_telemetry_and_failure() -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
 

@@ -953,3 +953,112 @@ async fn process_stream_item_approval_request_appends_item_and_emits_notificatio
         other => panic!("expected ApprovalRequest notification, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn process_stream_item_warning_emits_notification() {
+    use crate::server::HarnessServer;
+    use crate::thread_manager::ThreadManager;
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::agent::StreamItem;
+    use harness_core::config::HarnessConfig;
+    use harness_core::types::AgentId;
+    use harness_protocol::notifications::RpcNotification;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    let server = Arc::new(HarnessServer::new(
+        HarnessConfig::default(),
+        ThreadManager::new(),
+        AgentRegistry::new(""),
+    ));
+    let thread_id = server.thread_manager.start_thread(PathBuf::from("/tmp"));
+    let turn_id = server
+        .thread_manager
+        .start_turn(&thread_id, "task".to_string(), AgentId::new())
+        .unwrap();
+    let (notification_tx, mut notification_rx) = broadcast::channel::<RpcNotification>(16);
+
+    process_stream_item(
+        &server,
+        &None,
+        &None,
+        &notification_tx,
+        &thread_id,
+        &turn_id,
+        StreamItem::Warning {
+            message: "careful".to_string(),
+        },
+    )
+    .await;
+
+    let notif = notification_rx
+        .try_recv()
+        .expect("warning notification must be emitted");
+    match notif.notification {
+        harness_protocol::notifications::Notification::Warning {
+            turn_id: notif_turn_id,
+            message,
+        } => {
+            assert_eq!(notif_turn_id, turn_id);
+            assert_eq!(message, "careful");
+        }
+        other => panic!("expected Warning notification, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn process_stream_item_tool_output_delta_emits_notification() {
+    use crate::server::HarnessServer;
+    use crate::thread_manager::ThreadManager;
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::agent::StreamItem;
+    use harness_core::config::HarnessConfig;
+    use harness_core::types::AgentId;
+    use harness_protocol::notifications::RpcNotification;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    let server = Arc::new(HarnessServer::new(
+        HarnessConfig::default(),
+        ThreadManager::new(),
+        AgentRegistry::new(""),
+    ));
+    let thread_id = server.thread_manager.start_thread(PathBuf::from("/tmp"));
+    let turn_id = server
+        .thread_manager
+        .start_turn(&thread_id, "task".to_string(), AgentId::new())
+        .unwrap();
+    let (notification_tx, mut notification_rx) = broadcast::channel::<RpcNotification>(16);
+
+    process_stream_item(
+        &server,
+        &None,
+        &None,
+        &notification_tx,
+        &thread_id,
+        &turn_id,
+        StreamItem::ToolOutputDelta {
+            item_id: "item-1".to_string(),
+            text: "cargo check\n".to_string(),
+        },
+    )
+    .await;
+
+    let notif = notification_rx
+        .try_recv()
+        .expect("tool output notification must be emitted");
+    match notif.notification {
+        harness_protocol::notifications::Notification::ToolOutputDelta {
+            turn_id: notif_turn_id,
+            item_id,
+            text,
+        } => {
+            assert_eq!(notif_turn_id, turn_id);
+            assert_eq!(item_id, "item-1");
+            assert_eq!(text, "cargo check\n");
+        }
+        other => panic!("expected ToolOutputDelta notification, got {other:?}"),
+    }
+}
