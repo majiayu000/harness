@@ -207,11 +207,7 @@ fn runtime_budget_blocked_result(
     turns_started: i64,
     max_turns: u32,
 ) -> ActivityResult {
-    let activity = command
-        .command
-        .activity_name()
-        .map(str::to_string)
-        .unwrap_or_else(|| command_type_name(command));
+    let activity = command.command.runtime_activity_key().to_string();
     let error = format!(
         "Runtime profile `{}` exhausted max_turns: used {} of {} allowed runtime turns",
         profile.name, turns_started, max_turns
@@ -225,11 +221,4 @@ fn runtime_budget_blocked_result(
         validation: Vec::new(),
         error: Some(error),
     }
-}
-
-fn command_type_name(command: &WorkflowCommandRecord) -> String {
-    serde_json::to_value(command.command.command_type)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| "runtime_job".to_string())
 }

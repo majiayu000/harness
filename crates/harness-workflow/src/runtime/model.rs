@@ -179,6 +179,23 @@ pub enum WorkflowCommandType {
     RequestOperatorAttention,
 }
 
+impl WorkflowCommandType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EnqueueActivity => "enqueue_activity",
+            Self::StartChildWorkflow => "start_child_workflow",
+            Self::BindPr => "bind_pr",
+            Self::RecordPlanConcern => "record_plan_concern",
+            Self::Wait => "wait",
+            Self::MarkBlocked => "mark_blocked",
+            Self::MarkDone => "mark_done",
+            Self::MarkFailed => "mark_failed",
+            Self::MarkCancelled => "mark_cancelled",
+            Self::RequestOperatorAttention => "request_operator_attention",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowCommand {
     pub command_type: WorkflowCommandType,
@@ -273,6 +290,11 @@ impl WorkflowCommand {
         self.command
             .get("activity")
             .and_then(|value| value.as_str())
+    }
+
+    pub fn runtime_activity_key(&self) -> &str {
+        self.activity_name()
+            .unwrap_or_else(|| self.command_type.as_str())
     }
 }
 

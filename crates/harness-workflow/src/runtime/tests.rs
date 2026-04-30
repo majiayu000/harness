@@ -1602,6 +1602,13 @@ async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() 
     assert_eq!(
         runtime_job
             .input
+            .get("activity")
+            .and_then(|activity| activity.as_str()),
+        Some("replan_issue")
+    );
+    assert_eq!(
+        runtime_job
+            .input
             .get("command")
             .and_then(|command| command.get("activity"))
             .and_then(|activity| activity.as_str()),
@@ -1733,6 +1740,56 @@ async fn runtime_command_dispatcher_prefers_workflow_activity_profile() -> anyho
         backlog_scan_jobs[0].input["runtime_profile"]["model"],
         "gpt-default"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatcher_uses_command_type_activity_key_for_child_workflow(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let backlog = repo_backlog_instance("dispatching").with_id("repo-backlog");
+    store.upsert_instance(&backlog).await?;
+
+    let child_command = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:123",
+        "repo-backlog:owner/repo:issue:123:start",
+    );
+    let child_command_id = store
+        .enqueue_command(&backlog.id, None, &child_command)
+        .await?;
+
+    let default_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    let mut child_profile = RuntimeProfile::new("codex-child", RuntimeKind::CodexExec);
+    child_profile.model = Some("gpt-child".to_string());
+    let profile_selector = RuntimeProfileSelector::new(default_profile)
+        .with_activity_profile("start_child_workflow", child_profile);
+    let dispatcher = RuntimeCommandDispatcher::with_profile_selector(&store, profile_selector);
+
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("child workflow command should dispatch");
+    let runtime_job = match outcome {
+        CommandDispatchOutcome::Enqueued {
+            command_id,
+            runtime_job,
+        } => {
+            assert_eq!(command_id, child_command_id);
+            runtime_job
+        }
+        other => panic!("unexpected dispatch outcome: {other:?}"),
+    };
+
+    assert_eq!(runtime_job.runtime_kind, RuntimeKind::CodexExec);
+    assert_eq!(runtime_job.runtime_profile, "codex-child");
+    assert_eq!(runtime_job.input["activity"], "start_child_workflow");
+    assert_eq!(runtime_job.input["runtime_profile"]["model"], "gpt-child");
     Ok(())
 }
 

@@ -350,11 +350,66 @@ fn activity_result_from_turn(
 
 fn activity_name(job: &RuntimeJob) -> String {
     job.input
-        .get("command")
-        .and_then(|command| command.get("activity"))
+        .get("activity")
         .and_then(Value::as_str)
+        .filter(|activity| !activity.trim().is_empty())
+        .or_else(|| {
+            job.input
+                .get("command")
+                .and_then(|command| command.get("activity"))
+                .and_then(Value::as_str)
+                .filter(|activity| !activity.trim().is_empty())
+        })
+        .or_else(|| {
+            job.input
+                .get("command_type")
+                .and_then(Value::as_str)
+                .filter(|command_type| !command_type.trim().is_empty())
+        })
         .unwrap_or("workflow_activity")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_name_uses_top_level_runtime_activity_key() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "start_child_workflow",
+                "command_type": "start_child_workflow",
+                "command": {
+                    "definition_id": "github_issue_pr",
+                    "subject_key": "issue:123"
+                }
+            }),
+        );
+
+        assert_eq!(activity_name(&job), "start_child_workflow");
+    }
+
+    #[test]
+    fn activity_name_falls_back_to_command_type() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "command_type": "start_child_workflow",
+                "command": {
+                    "definition_id": "github_issue_pr",
+                    "subject_key": "issue:123"
+                }
+            }),
+        );
+
+        assert_eq!(activity_name(&job), "start_child_workflow");
+    }
 }
 
 fn last_agent_summary(items: &[Item]) -> Option<String> {
@@ -400,7 +455,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+mod profile_tests {
     use super::*;
 
     #[test]

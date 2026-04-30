@@ -171,6 +171,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             });
         }
 
+        let activity = command.command.runtime_activity_key().to_string();
         let runtime_profile = self.profile_for_command(&command).await?;
         let runtime_job = self
             .store
@@ -183,6 +184,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                     "command_id": command.id.clone(),
                     "command_type": command.command.command_type,
                     "dedupe_key": command.command.dedupe_key.clone(),
+                    "activity": activity,
                     "command": command.command.command.clone(),
                     "runtime_profile": runtime_profile.clone(),
                 }),
@@ -208,7 +210,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                 instance
                     .as_ref()
                     .map(|workflow| workflow.definition_id.as_str()),
-                command.command.activity_name(),
+                Some(command.command.runtime_activity_key()),
             )
             .clone())
     }

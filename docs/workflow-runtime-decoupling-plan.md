@@ -601,6 +601,10 @@ Implemented now:
   and then by activity name
 - command dispatch loads the command's workflow instance and activity name, then selects the most
   specific matching runtime profile when available
+- commands without an explicit activity use their command type as the runtime activity key, so
+  child workflow dispatch can be targeted as `start_child_workflow`
+- runtime job input persists the resolved runtime activity key for external workers and server
+  worker prompts
 - selection precedence is workflow/activity pair, global activity, workflow, then configured default
   runtime profile
 - server background dispatch builds the same profile selector from project workflow config
@@ -615,6 +619,8 @@ Tests:
 - workflow config parses per-workflow, per-activity, and workflow/activity runtime profile overrides
 - dispatcher uses workflow/activity overrides first, then activity overrides, then workflow
   definition overrides, then the default profile
+- dispatcher selects activity overrides for child workflow dispatch through the
+  `start_child_workflow` activity key
 - server dispatch config conversion preserves default, workflow override, activity override, and
   workflow/activity override behavior
 
