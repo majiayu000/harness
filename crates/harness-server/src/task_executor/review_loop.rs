@@ -324,6 +324,13 @@ fn bot_approval_signal(bot: ReviewBotKey, body: &str) -> bool {
     }
 }
 
+fn review_bot_key_for_author(chain: &[ReviewBotDescriptor], author: &str) -> Option<ReviewBotKey> {
+    chain
+        .iter()
+        .find(|descriptor| descriptor.reviewer_name.eq_ignore_ascii_case(author))
+        .map(|descriptor| descriptor.key)
+}
+
 fn blocking_review_thread(thread: &ReviewThreadNode) -> bool {
     if thread.is_resolved || thread.is_outdated {
         return false;
@@ -341,6 +348,18 @@ fn latest_comment_body_after_commit(
     match (bot.latest_comment_at, bot.latest_comment_body.as_deref()) {
         (Some(at), Some(body)) if at >= latest_commit_at => Some(body),
         _ => None,
+    }
+}
+
+fn record_bot_comment_signal(bot: &mut BotSignals, body: String, created_at: DateTime<Utc>) {
+    bot.reviewed_any_commit = true;
+    let replace = bot
+        .latest_comment_at
+        .map(|current| created_at >= current)
+        .unwrap_or(true);
+    if replace {
+        bot.latest_comment_at = Some(created_at);
+        bot.latest_comment_body = Some(body);
     }
 }
 
@@ -402,6 +421,7 @@ async fn fetch_pull_request_signals(
     repo_slug: &str,
     pr_num: u64,
     github_token: Option<&str>,
+    chain: &[ReviewBotDescriptor],
 ) -> anyhow::Result<PullRequestSignals> {
     let Some((owner, repo)) = repo_slug.split_once('/') else {
         anyhow::bail!("invalid repo slug for review loop: {repo_slug}");
@@ -505,11 +525,7 @@ async fn fetch_pull_request_signals(
         let Some(author) = review.author.as_ref().map(|author| author.login.as_str()) else {
             continue;
         };
-        let key = if author == CODEX_REVIEWER_NAME {
-            ReviewBotKey::Codex
-        } else if author.ends_with("[bot]") {
-            ReviewBotKey::Gemini
-        } else {
+        let Some(key) = review_bot_key_for_author(chain, author) else {
             continue;
         };
         let entry = bots.entry(key).or_default();
@@ -531,21 +547,11 @@ async fn fetch_pull_request_signals(
         let Some(author) = comment.author.as_ref().map(|author| author.login.as_str()) else {
             continue;
         };
-        let key = match author {
-            CODEX_REVIEWER_NAME => Some(ReviewBotKey::Codex),
-            _ if author.ends_with("[bot]") => Some(ReviewBotKey::Gemini),
-            _ => None,
+        let Some(key) = review_bot_key_for_author(chain, author) else {
+            continue;
         };
-        let Some(key) = key else { continue };
         let entry = bots.entry(key).or_default();
-        let replace = entry
-            .latest_comment_at
-            .map(|current| comment.created_at >= current)
-            .unwrap_or(true);
-        if replace {
-            entry.latest_comment_at = Some(comment.created_at);
-            entry.latest_comment_body = Some(comment.body);
-        }
+        record_bot_comment_signal(entry, comment.body, comment.created_at);
     }
 
     let blocking_feedback = pr.review_threads.nodes.iter().any(blocking_review_thread);
@@ -555,7 +561,7 @@ async fn fetch_pull_request_signals(
             let Some(author) = comment.author.as_ref().map(|author| author.login.as_str()) else {
                 continue;
             };
-            if !author.ends_with("[bot]") {
+            if review_bot_key_for_author(chain, author).is_none() {
                 continue;
             }
             let published_at = comment.published_at.unwrap_or(latest_commit_at);
@@ -850,7 +856,7 @@ pub(crate) async fn run_review_loop(
             fallback: None,
             wait_for_bot: false,
         };
-        match fetch_pull_request_signals(&repo_slug, pr_num, github_token).await {
+        match fetch_pull_request_signals(&repo_slug, pr_num, github_token, &bot_chain).await {
             Ok(signals) => {
                 (silence_rounds, last_bot_activity_at) = update_silence_rounds(
                     silence_rounds,
@@ -1499,6 +1505,65 @@ mod tests {
         let mut config = review_config();
         config.fallback_chain = chain.iter().map(|entry| (*entry).to_string()).collect();
         config
+    }
+
+    #[test]
+    fn review_bot_author_matching_uses_configured_reviewer_name() {
+        let mut config = review_config_with_chain(&["gemini", "codex"]);
+        config.reviewer_name = "custom-reviewer".to_string();
+        let chain = bot_fallback_chain(&config);
+
+        assert_eq!(
+            review_bot_key_for_author(&chain, "custom-reviewer"),
+            Some(ReviewBotKey::Gemini)
+        );
+        assert_eq!(
+            review_bot_key_for_author(&chain, CODEX_REVIEWER_NAME),
+            Some(ReviewBotKey::Codex)
+        );
+        assert_eq!(
+            review_bot_key_for_author(&chain, "unconfigured-reviewer[bot]"),
+            None
+        );
+    }
+
+    #[test]
+    fn comment_signal_marks_prior_bot_participation() {
+        let mut bot = bot_signals();
+        let comment_at = Utc::now() - chrono::Duration::minutes(60);
+
+        record_bot_comment_signal(&mut bot, "previous review comment".to_string(), comment_at);
+
+        assert!(bot.reviewed_any_commit);
+        assert_eq!(bot.latest_comment_at, Some(comment_at));
+        assert_eq!(
+            bot.latest_comment_body.as_deref(),
+            Some("previous review comment")
+        );
+    }
+
+    #[test]
+    fn stale_comment_participation_can_satisfy_silence_fallback() {
+        let mut bot = bot_signals();
+        let latest_commit_at = Utc::now() - chrono::Duration::minutes(45);
+        record_bot_comment_signal(
+            &mut bot,
+            "previous review comment".to_string(),
+            Utc::now() - chrono::Duration::minutes(60),
+        );
+
+        let classification = classify_bot(
+            &descriptor(ReviewBotKey::Codex),
+            &bot,
+            latest_commit_at,
+            true,
+            false,
+            3,
+            3,
+            30,
+        );
+
+        assert_eq!(classification, BotClassification::Silent);
     }
 
     fn signals_with(primary: BotSignals, secondary: BotSignals) -> PullRequestSignals {
