@@ -91,6 +91,26 @@ pub struct RuntimeWorkerPolicy {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeRetryPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_failed_activity_retries: Option<u64>,
+    #[serde(default)]
+    pub activity_retries: BTreeMap<String, RuntimeActivityRetryPolicy>,
+}
+
+impl RuntimeRetryPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.max_failed_activity_retries.is_none() && self.activity_retries.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeActivityRetryPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_failed_activity_retries: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowConfig {
     #[serde(default)]
     pub issue_workflow: IssueWorkflowPolicy,
@@ -100,6 +120,8 @@ pub struct WorkflowConfig {
     pub runtime_dispatch: RuntimeDispatchPolicy,
     #[serde(default)]
     pub runtime_worker: RuntimeWorkerPolicy,
+    #[serde(default)]
+    pub runtime_retry_policy: RuntimeRetryPolicy,
     #[serde(default)]
     pub storage: WorkflowStoragePolicy,
 }
@@ -281,6 +303,7 @@ mod tests {
         assert_eq!(cfg.runtime_worker.interval_secs, 5);
         assert_eq!(cfg.runtime_worker.concurrency, 1);
         assert_eq!(cfg.runtime_worker.lease_ttl_secs, 900);
+        assert!(cfg.runtime_retry_policy.is_empty());
         assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
         assert_eq!(cfg.storage.schema_namespace, "workflow");
         assert!(!cfg.issue_workflow.require_human_gate_before_merge);
@@ -339,6 +362,11 @@ runtime_worker:
   interval_secs: 3
   concurrency: 2
   lease_ttl_secs: 120
+runtime_retry_policy:
+  max_failed_activity_retries: 1
+  activity_retries:
+    implement_issue:
+      max_failed_activity_retries: 2
 storage:
   schema_namespace: orchestration
 ---
@@ -428,6 +456,17 @@ Body
         assert_eq!(cfg.runtime_worker.interval_secs, 3);
         assert_eq!(cfg.runtime_worker.concurrency, 2);
         assert_eq!(cfg.runtime_worker.lease_ttl_secs, 120);
+        assert_eq!(
+            cfg.runtime_retry_policy.max_failed_activity_retries,
+            Some(1)
+        );
+        assert_eq!(
+            cfg.runtime_retry_policy
+                .activity_retries
+                .get("implement_issue")
+                .and_then(|policy| policy.max_failed_activity_retries),
+            Some(2)
+        );
         assert_eq!(cfg.storage.schema_namespace, "orchestration");
         Ok(())
     }

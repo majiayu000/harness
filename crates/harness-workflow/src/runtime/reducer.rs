@@ -114,13 +114,13 @@ fn retry_failed_activity_decision(
     if !supports_same_state_activity_retry(&instance.definition_id, &instance.state) {
         return None;
     }
-    let retry_limit = failed_activity_retry_limit(instance)?;
     let retry_attempt = failed_activity_retry_attempt(event);
+    let activity = retry_activity_name(event, result)?;
+    let retry_limit = failed_activity_retry_limit(instance, &activity)?;
     if retry_attempt >= retry_limit {
         return None;
     }
     let next_attempt = retry_attempt + 1;
-    let activity = retry_activity_name(event, result)?;
     let reason = runtime_failure_reason(result, "Runtime activity failed.");
     Some(
         WorkflowDecision::new(
@@ -184,11 +184,18 @@ fn runtime_failure_reason(result: &ActivityResult, fallback: &str) -> String {
         .to_string()
 }
 
-fn failed_activity_retry_limit(instance: &WorkflowInstance) -> Option<u64> {
-    instance
-        .data
-        .get("runtime_retry_policy")
-        .and_then(|policy| policy.get("max_failed_activity_retries"))
+fn failed_activity_retry_limit(instance: &WorkflowInstance, activity: &str) -> Option<u64> {
+    let policy = instance.data.get("runtime_retry_policy")?;
+    if let Some(limit) = policy
+        .get("activity_retries")
+        .and_then(|activities| activities.get(activity))
+        .and_then(|activity_policy| activity_policy.get("max_failed_activity_retries"))
+        .and_then(|value| value.as_u64())
+    {
+        return (limit > 0).then_some(limit);
+    }
+    policy
+        .get("max_failed_activity_retries")
         .and_then(|value| value.as_u64())
         .filter(|limit| *limit > 0)
 }

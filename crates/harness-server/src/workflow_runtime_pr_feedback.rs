@@ -82,14 +82,17 @@ async fn persist_pr_detected(
         "implementing",
     )
     .await?;
-    instance.data = json!({
+    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        ctx.project_root,
+        json!({
         "project_id": project_id,
         "repo": ctx.repo,
         "issue_number": ctx.issue_number,
         "task_id": ctx.task_id.as_str(),
         "pr_number": ctx.pr_number,
         "pr_url": ctx.pr_url,
-    });
+        }),
+    );
     store.upsert_instance(&instance).await?;
     let event = store
         .append_event(
@@ -134,7 +137,9 @@ async fn persist_pr_feedback(
         "pr_open",
     )
     .await?;
-    instance.data = json!({
+    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        ctx.project_root,
+        json!({
         "project_id": project_id,
         "repo": ctx.repo,
         "issue_number": issue_number,
@@ -142,7 +147,8 @@ async fn persist_pr_feedback(
         "pr_number": ctx.pr_number,
         "pr_url": ctx.pr_url,
         "feedback_summary": ctx.summary,
-    });
+        }),
+    );
     store.upsert_instance(&instance).await?;
     let event = store
         .append_event(
@@ -244,11 +250,14 @@ fn issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id)
-    .with_data(json!({
-        "project_id": project_id,
-        "repo": repo,
-        "issue_number": issue_number,
-    }))
+    .with_data(crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        Path::new(&project_id),
+        json!({
+            "project_id": project_id,
+            "repo": repo,
+            "issue_number": issue_number,
+        }),
+    ))
 }
 
 fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_json::Value {

@@ -397,6 +397,63 @@ fn runtime_completion_reducer_fails_after_retry_policy_exhausted() {
 }
 
 #[test]
+fn runtime_completion_reducer_uses_activity_retry_override() {
+    let instance = issue_instance("implementing").with_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 1,
+            "activity_retries": {
+                "implement_issue": {
+                    "max_failed_activity_retries": 2
+                }
+            }
+        }
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "implement-retry-1",
+        json!({
+            "activity": "implement_issue",
+            "retry_attempt": 1
+        }),
+    );
+    let result = ActivityResult::failed(
+        "implement_issue",
+        "Implementation failed again.",
+        "codex stdin not available",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        2,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-2",
+        "command": command,
+        "runtime_job_id": "job-2",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("activity override should allow a second retry");
+
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(decision.commands[0].command["retry_attempt"], 2);
+    assert_eq!(
+        decision.commands[0].command["max_failed_activity_retries"],
+        2
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("retry override decision should validate");
+}
+
+#[test]
 fn repo_backlog_open_issue_without_workflow_starts_child_workflow() {
     let instance = repo_backlog_instance("idle");
     let output = build_open_issue_without_workflow_decision(

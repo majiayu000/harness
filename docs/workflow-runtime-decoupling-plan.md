@@ -35,6 +35,8 @@ Implemented now:
 - runtime completion reducer advances known workflow states from activity output
 - runtime completion reducer can retry failed activities when the workflow instance declares a
   bounded retry policy
+- `WORKFLOW.md` can define a global failed activity retry budget and activity-specific retry
+  overrides that are copied into workflow runtime instance data
 - runtime command dispatch can select runtime profiles per workflow/activity pair, then activity,
   then workflow
 - runtime profiles carry model and execution metadata into runtime jobs
@@ -528,6 +530,8 @@ Implemented now:
 - runtime workers append `RuntimeJobCompleted` events to the parent workflow when the command row
   is known, including the original workflow command payload for retry/reducer policy
 - direct runtime jobs without a workflow command row still complete normally
+- workflow runtime instance data carries configured `runtime_retry_policy` values from
+  `WORKFLOW.md` when policy is present
 
 Still intentionally not moved yet:
 
@@ -555,6 +559,8 @@ Implemented now:
   `cancelled` through validated workflow decisions
 - failed activity results retry the same activity before failing when
   `runtime_retry_policy.max_failed_activity_retries` is present on the workflow instance data
+- activity-specific retry budgets under `runtime_retry_policy.activity_retries` override the global
+  failed activity retry budget
 - unknown successful activity/state pairs are preserved as completion events without unsafe state
   changes
 
@@ -562,14 +568,14 @@ Still intentionally not moved yet:
 
 - implementation completion does not infer PR state from free-form agent text
 - activity result schemas are not yet workflow-specific enough to drive every state transition
-- retry policy supports bounded immediate retries only; backoff, cooldown, and per-activity
-  overrides are not yet modeled
+- retry policy supports bounded immediate retries only; backoff and cooldown are not yet modeled
 
 Tests:
 
 - reducer resumes implementation after replan completion
 - reducer ignores unmapped successful activity completions
 - reducer retries a failed activity until the configured retry budget is exhausted
+- reducer honors activity-specific retry budget overrides
 - runtime worker applies the reducer, records decisions, and updates workflow state
 
 ### Phase 12: Workflow Runtime Profile Selection

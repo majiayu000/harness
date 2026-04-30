@@ -17,6 +17,8 @@ runtime_worker:
   interval_secs: 5
   concurrency: 1
   lease_ttl_secs: 900
+runtime_retry_policy:
+  activity_retries: {}
 storage:
   schema_namespace: workflow
 ---
@@ -74,6 +76,14 @@ Current externally configurable rules:
 
 - `runtime_worker.lease_ttl_secs`
   - Lease duration recorded on claimed runtime jobs.
+
+- `runtime_retry_policy.max_failed_activity_retries`
+  - Optional global retry budget for failed workflow runtime activities. When
+    unset or zero, failed runtime activities fail the workflow immediately.
+
+- `runtime_retry_policy.activity_retries.<activity>.max_failed_activity_retries`
+  - Optional activity-specific retry budget that overrides the global runtime
+    activity retry budget for that activity.
 
 - `storage.schema_namespace`
   - Stable namespace used for workflow persistence in Postgres so multiple instances do not split by local `data_dir` path.

@@ -93,13 +93,16 @@ async fn persist_plan_issue_decision(
             "implementing",
         ),
     };
-    instance.data = json!({
+    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        ctx.project_root,
+        json!({
         "project_id": project_id,
         "repo": ctx.repo,
         "issue_number": ctx.issue_number,
         "task_id": ctx.task_id.as_str(),
         "plan_concern": ctx.plan_issue,
-    });
+        }),
+    );
     store.upsert_instance(&instance).await?;
     let event = store
         .append_event(
@@ -151,14 +154,17 @@ async fn persist_plan_issue_decision(
     }
     instance.state = output.decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
-    instance.data = json!({
+    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        ctx.project_root,
+        json!({
         "project_id": ctx.project_root.to_string_lossy(),
         "repo": ctx.repo,
         "issue_number": ctx.issue_number,
         "task_id": ctx.task_id.as_str(),
         "plan_concern": ctx.plan_issue,
         "last_decision": output.decision.decision,
-    });
+        }),
+    );
     store.upsert_instance(&instance).await?;
 
     Ok(match output.action {
@@ -204,13 +210,16 @@ async fn persist_replan_completed(
         .await?;
     instance.state = "implementing".to_string();
     instance.version = instance.version.saturating_add(1);
-    instance.data = json!({
+    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        project_root,
+        json!({
         "project_id": project_id,
         "repo": repo,
         "issue_number": issue_number,
         "task_id": task_id.as_str(),
         "last_event": "ReplanCompleted",
-    });
+        }),
+    );
     store.upsert_instance(&instance).await
 }
 
@@ -253,11 +262,14 @@ fn issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id)
-    .with_data(json!({
-        "project_id": project_id,
-        "repo": repo,
-        "issue_number": issue_number,
-    }))
+    .with_data(crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        Path::new(&project_id),
+        json!({
+            "project_id": project_id,
+            "repo": repo,
+            "issue_number": issue_number,
+        }),
+    ))
 }
 
 #[cfg(test)]
@@ -280,6 +292,19 @@ mod tests {
             };
         let project_root = dir.path().join("project");
         std::fs::create_dir(&project_root)?;
+        std::fs::write(
+            project_root.join("WORKFLOW.md"),
+            r#"---
+runtime_retry_policy:
+  max_failed_activity_retries: 1
+  activity_retries:
+    replan_issue:
+      max_failed_activity_retries: 2
+---
+
+Workflow policy
+"#,
+        )?;
         let task_id = TaskId::from_str("task-1");
 
         let action = decide_plan_issue(
@@ -309,6 +334,15 @@ mod tests {
             .await?
             .expect("workflow instance should be persisted");
         assert_eq!(instance.state, "replanning");
+        assert_eq!(
+            instance.data["runtime_retry_policy"]["max_failed_activity_retries"],
+            1
+        );
+        assert_eq!(
+            instance.data["runtime_retry_policy"]["activity_retries"]["replan_issue"]
+                ["max_failed_activity_retries"],
+            2
+        );
         let events = store.events_for(&workflow_id).await?;
         assert!(events
             .iter()

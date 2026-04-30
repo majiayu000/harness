@@ -244,10 +244,13 @@ async fn load_or_repo_backlog_instance(
             WorkflowSubject::new("repo", repo.unwrap_or("<none>")),
         )
         .with_id(workflow_id)
-        .with_data(json!({
-            "project_id": project_id,
-            "repo": repo,
-        })),
+        .with_data(crate::workflow_runtime_policy::merge_runtime_retry_policy(
+            project_root,
+            json!({
+                "project_id": project_id,
+                "repo": repo,
+            }),
+        )),
     })
 }
 
@@ -309,7 +312,7 @@ fn merge_repo_data(
             }
         }
     }
-    data
+    crate::workflow_runtime_policy::merge_runtime_retry_policy(project_root, data)
 }
 
 fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_json::Value {

@@ -54,6 +54,7 @@ pub mod stdio;
 pub mod task_db;
 pub mod task_executor;
 pub(crate) mod workflow_runtime_plan_issue;
+pub(crate) mod workflow_runtime_policy;
 pub(crate) mod workflow_runtime_pr_feedback;
 pub(crate) mod workflow_runtime_repo_backlog;
 pub(crate) mod workflow_runtime_worker;
