@@ -7,7 +7,8 @@ use harness_core::config::agents::SandboxMode;
 use harness_core::types::{AgentId, Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityResult, ActivitySignal, RuntimeJob, RuntimeJobExecutor,
-    RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker, WorkflowInstance,
+    RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker, WorkflowDefinition,
+    WorkflowInstance, WorkflowSubject,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -79,6 +80,11 @@ impl ServerRuntimeJobExecutor {
 
     async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
         let workflow = self.workflow_for_job(&job).await?;
+        if is_start_child_workflow_job(&job) {
+            return self
+                .execute_start_child_workflow(&job, workflow.as_ref())
+                .await;
+        }
         let project_root = self.project_root_for_job(&job, workflow.as_ref())?;
         let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
         if self
@@ -155,6 +161,96 @@ impl ServerRuntimeJobExecutor {
             return Ok(None);
         };
         store.get_instance(workflow_id).await
+    }
+
+    async fn execute_start_child_workflow(
+        &self,
+        job: &RuntimeJob,
+        parent: Option<&WorkflowInstance>,
+    ) -> anyhow::Result<ActivityResult> {
+        let Some(store) = self.state.core.workflow_runtime_store.as_ref() else {
+            anyhow::bail!("workflow runtime store is unavailable");
+        };
+        let command = job
+            .input
+            .get("command")
+            .ok_or_else(|| anyhow::anyhow!("start_child_workflow command payload is missing"))?;
+        let definition_id = required_string(command, "definition_id")?;
+        let subject_key = required_string(command, "subject_key")?;
+        if definition_id != "github_issue_pr" {
+            anyhow::bail!("start_child_workflow definition `{definition_id}` is not supported yet");
+        }
+        let issue_number = parse_issue_subject_key(subject_key)?;
+        let project_id = parent
+            .and_then(|workflow| workflow.data.get("project_id"))
+            .and_then(Value::as_str)
+            .or_else(|| job.input.get("project_id").and_then(Value::as_str))
+            .ok_or_else(|| anyhow::anyhow!("start_child_workflow project_id is missing"))?;
+        let repo = parent
+            .and_then(|workflow| workflow.data.get("repo"))
+            .and_then(Value::as_str)
+            .or_else(|| command.get("repo").and_then(Value::as_str));
+        let child_id =
+            harness_workflow::issue_lifecycle::workflow_id(project_id, repo, issue_number);
+        store
+            .upsert_definition(&WorkflowDefinition::new(
+                "github_issue_pr",
+                1,
+                "GitHub issue PR workflow",
+            ))
+            .await?;
+        let mut child = match store.get_instance(&child_id).await? {
+            Some(instance) => instance,
+            None => WorkflowInstance::new(
+                "github_issue_pr",
+                1,
+                "discovered",
+                WorkflowSubject::new("issue", subject_key),
+            )
+            .with_id(child_id.clone()),
+        };
+        if child.parent_workflow_id.is_none() {
+            if let Some(parent) = parent {
+                child.parent_workflow_id = Some(parent.id.clone());
+            }
+        }
+        child.data = merge_child_issue_data(
+            child.data,
+            project_id,
+            repo,
+            issue_number,
+            job.id.as_str(),
+            job.command_id.as_str(),
+        );
+        store.upsert_instance(&child).await?;
+        store
+            .append_event(
+                &child.id,
+                "ChildWorkflowStarted",
+                "workflow_runtime_worker",
+                json!({
+                    "parent_workflow_id": parent.map(|workflow| workflow.id.as_str()),
+                    "runtime_job_id": job.id.as_str(),
+                    "command_id": job.command_id.as_str(),
+                    "definition_id": definition_id,
+                    "subject_key": subject_key,
+                }),
+            )
+            .await?;
+
+        Ok(ActivityResult::succeeded(
+            activity_name(job),
+            format!("Child workflow `{}` started.", child.id),
+        )
+        .with_artifact(ActivityArtifact::new(
+            "child_workflow",
+            json!({
+                "workflow_id": child.id,
+                "definition_id": child.definition_id,
+                "state": child.state,
+                "subject_key": child.subject.subject_key,
+            }),
+        )))
     }
 
     fn project_root_for_job(
@@ -348,6 +444,10 @@ fn activity_result_from_turn(
         ))
 }
 
+fn is_start_child_workflow_job(job: &RuntimeJob) -> bool {
+    job.input.get("command_type").and_then(Value::as_str) == Some("start_child_workflow")
+}
+
 fn activity_name(job: &RuntimeJob) -> String {
     job.input
         .get("activity")
@@ -368,6 +468,46 @@ fn activity_name(job: &RuntimeJob) -> String {
         })
         .unwrap_or("workflow_activity")
         .to_string()
+}
+
+fn required_string<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("start_child_workflow `{field}` is missing"))
+}
+
+fn parse_issue_subject_key(subject_key: &str) -> anyhow::Result<u64> {
+    subject_key
+        .strip_prefix("issue:")
+        .unwrap_or(subject_key)
+        .parse::<u64>()
+        .with_context(|| format!("start_child_workflow subject_key `{subject_key}` is invalid"))
+}
+
+fn merge_child_issue_data(
+    mut data: Value,
+    project_id: &str,
+    repo: Option<&str>,
+    issue_number: u64,
+    runtime_job_id: &str,
+    command_id: &str,
+) -> Value {
+    if !data.is_object() {
+        data = json!({});
+    }
+    if let Some(object) = data.as_object_mut() {
+        object.insert("project_id".to_string(), json!(project_id));
+        object.insert("repo".to_string(), json!(repo));
+        object.insert("issue_number".to_string(), json!(issue_number));
+        object.insert(
+            "started_by_runtime_job_id".to_string(),
+            json!(runtime_job_id),
+        );
+        object.insert("started_by_command_id".to_string(), json!(command_id));
+    }
+    crate::workflow_runtime_policy::merge_runtime_retry_policy(Path::new(project_id), data)
 }
 
 #[cfg(test)]

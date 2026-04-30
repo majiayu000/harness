@@ -507,6 +507,8 @@ Implemented now:
 - runtime jobs create normal Harness threads and turns, so agent output remains visible in the
   existing conversation/runtime log path
 - completed turns are written back as structured `ActivityResult` payloads
+- `start_child_workflow` is handled as a server-owned lifecycle command, creating or reusing the
+  child workflow without asking an agent to mutate workflow tables
 - `remote_host` jobs remain reserved for external runtime hosts and are not executed locally
 
 Still intentionally not moved yet:
@@ -519,6 +521,8 @@ Tests:
 
 - workflow config parses worker policy fields
 - server worker tick claims a job, runs a registered agent, and records a succeeded runtime job
+- server worker starts child workflows directly and feeds the completion back through the runtime
+  reducer
 
 ### Phase 10: Runtime Completion Feedback
 
