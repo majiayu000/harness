@@ -268,6 +268,7 @@ describe("<Active>", () => {
                         runtime_profile: "codex-high",
                         status: "pending",
                         input: {},
+                        not_before: "2026-04-30T00:05:00Z",
                         created_at: "2026-04-30T00:00:00Z",
                         updated_at: "2026-04-30T00:00:00Z",
                       },
@@ -292,7 +293,9 @@ describe("<Active>", () => {
     expect(screen.getByText("repo_backlog - owner/repo")).toBeInTheDocument();
     expect(screen.getByText("github_issue_pr - issue:123")).toBeInTheDocument();
     expect(screen.getByText("activity: replan_issue")).toBeInTheDocument();
-    expect(screen.getByText("1 jobs - pending")).toBeInTheDocument();
+    expect(
+      screen.getByText("1 jobs - pending - not before 2026-04-30T00:05:00Z"),
+    ).toBeInTheDocument();
     expect(screen.getByText("rejected: replan limit exhausted")).toBeInTheDocument();
   });
 

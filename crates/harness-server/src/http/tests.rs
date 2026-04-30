@@ -945,12 +945,14 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     let command_id = store
         .enqueue_command(&child.id, Some(&rejected.id), &command)
         .await?;
+    let not_before = chrono::Utc::now() + chrono::Duration::minutes(5);
     store
-        .enqueue_runtime_job(
+        .enqueue_runtime_job_with_not_before(
             &command_id,
             harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
             "codex-high",
             serde_json::json!({ "workflow_id": child.id }),
+            Some(not_before),
         )
         .await?;
 
@@ -978,6 +980,10 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     assert_eq!(
         child_node["commands"][0]["runtime_jobs"][0]["runtime_profile"],
         "codex-high"
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["not_before"],
+        serde_json::json!(not_before)
     );
     Ok(())
 }

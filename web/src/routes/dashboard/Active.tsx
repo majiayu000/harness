@@ -106,6 +106,13 @@ function commandLabel(command: WorkflowRuntimeCommandNode): string {
   return command.command.command_type.replaceAll("_", " ");
 }
 
+function runtimeJobLabel(command: WorkflowRuntimeCommandNode): string {
+  const job = command.runtime_jobs[0];
+  if (!job) return `${command.runtime_jobs.length} jobs`;
+  const notBefore = job.not_before ? ` - not before ${job.not_before}` : "";
+  return `${command.runtime_jobs.length} jobs - ${job.status}${notBefore}`;
+}
+
 function rejectedDecisions(decisions: WorkflowRuntimeDecisionRecord[]) {
   return decisions.filter((decision) => !decision.accepted);
 }
@@ -162,9 +169,8 @@ function WorkflowRuntimeNode({ node, depth = 0 }: { node: WorkflowRuntimeTreeNod
               <span className="truncate" title={command.command.dedupe_key}>
                 activity: {commandLabel(command)}
               </span>
-              <span>
-                {command.runtime_jobs.length} jobs
-                {command.runtime_jobs[0] ? ` - ${command.runtime_jobs[0].status}` : ""}
+              <span className="truncate text-right" title={runtimeJobLabel(command)}>
+                {runtimeJobLabel(command)}
               </span>
             </div>
           ))}

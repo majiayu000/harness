@@ -75,6 +75,7 @@ export interface WorkflowRuntimeJob {
   input: Record<string, unknown>;
   output?: Record<string, unknown> | null;
   error?: string | null;
+  not_before?: string | null;
   created_at: string;
   updated_at: string;
 }
