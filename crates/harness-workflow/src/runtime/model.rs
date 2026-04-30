@@ -495,6 +495,8 @@ pub struct RuntimeJob {
     pub output: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -517,9 +519,15 @@ impl RuntimeJob {
             input,
             output: None,
             error: None,
+            not_before: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    pub fn with_not_before(mut self, not_before: DateTime<Utc>) -> Self {
+        self.not_before = Some(not_before);
+        self
     }
 
     pub fn claim(&mut self, owner: impl Into<String>, expires_at: DateTime<Utc>) {

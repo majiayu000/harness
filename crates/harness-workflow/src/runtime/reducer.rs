@@ -3,6 +3,7 @@ use super::model::{
     WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 
 pub const RUNTIME_JOB_COMPLETED_EVENT: &str = "RuntimeJobCompleted";
@@ -141,6 +142,7 @@ fn retry_failed_activity_decision(
     }
     let next_attempt = retry_attempt + 1;
     let reason = runtime_failure_reason(result, "Runtime activity failed.");
+    let retry_schedule = failed_activity_retry_schedule(instance, &activity, next_attempt);
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -157,6 +159,7 @@ fn retry_failed_activity_decision(
             next_attempt,
             retry_limit,
             &reason,
+            retry_schedule,
         ))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
@@ -196,19 +199,52 @@ fn runtime_failure_reason(result: &ActivityResult, fallback: &str) -> String {
 }
 
 fn failed_activity_retry_limit(instance: &WorkflowInstance, activity: &str) -> Option<u64> {
-    let policy = instance.data.get("runtime_retry_policy")?;
-    if let Some(limit) = policy
-        .get("activity_retries")
-        .and_then(|activities| activities.get(activity))
-        .and_then(|activity_policy| activity_policy.get("max_failed_activity_retries"))
-        .and_then(|value| value.as_u64())
-    {
+    if let Some(limit) = retry_policy_u64(instance, activity, "max_failed_activity_retries") {
         return (limit > 0).then_some(limit);
     }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetrySchedule {
+    delay_secs: u64,
+    not_before: DateTime<Utc>,
+}
+
+fn failed_activity_retry_schedule(
+    instance: &WorkflowInstance,
+    activity: &str,
+    next_attempt: u64,
+) -> Option<RetrySchedule> {
+    let base_delay = retry_policy_u64(instance, activity, "retry_delay_secs")?;
+    if base_delay == 0 {
+        return None;
+    }
+    let multiplier = 1_u64
+        .checked_shl(next_attempt.saturating_sub(1).min(63) as u32)
+        .unwrap_or(u64::MAX);
+    let mut delay_secs = base_delay.saturating_mul(multiplier);
+    if let Some(max_delay) = retry_policy_u64(instance, activity, "max_retry_delay_secs")
+        .filter(|max_delay| *max_delay > 0)
+    {
+        delay_secs = delay_secs.min(max_delay);
+    }
+    const MAX_SAFE_RETRY_DELAY_SECS: u64 = 30 * 24 * 60 * 60;
+    delay_secs = delay_secs.min(MAX_SAFE_RETRY_DELAY_SECS);
+    Some(RetrySchedule {
+        delay_secs,
+        not_before: Utc::now() + Duration::seconds(delay_secs as i64),
+    })
+}
+
+fn retry_policy_u64(instance: &WorkflowInstance, activity: &str, field: &str) -> Option<u64> {
+    let policy = instance.data.get("runtime_retry_policy")?;
     policy
-        .get("max_failed_activity_retries")
-        .and_then(|value| value.as_u64())
-        .filter(|limit| *limit > 0)
+        .get("activity_retries")
+        .and_then(|activities| activities.get(activity))
+        .and_then(|activity_policy| activity_policy.get(field))
+        .and_then(Value::as_u64)
+        .or_else(|| policy.get(field).and_then(Value::as_u64))
 }
 
 fn failed_activity_retry_attempt(event: &WorkflowEvent) -> u64 {
@@ -240,6 +276,7 @@ fn retry_command(
     next_attempt: u64,
     retry_limit: u64,
     reason: &str,
+    retry_schedule: Option<RetrySchedule>,
 ) -> WorkflowCommand {
     let previous = event_workflow_command(event);
     let command_type = previous
@@ -268,6 +305,13 @@ fn retry_command(
             optional_json_string(event_field_string(event, "runtime_job_id")),
         );
         object.insert("previous_error".to_string(), json!(reason));
+        if let Some(schedule) = retry_schedule {
+            object.insert("retry_delay_secs".to_string(), json!(schedule.delay_secs));
+            object.insert(
+                "retry_not_before".to_string(),
+                json!(schedule.not_before.to_rfc3339()),
+            );
+        }
     } else {
         command_payload = json!({
             "activity": activity,
@@ -277,6 +321,15 @@ fn retry_command(
             "previous_runtime_job_id": event_field_string(event, "runtime_job_id"),
             "previous_error": reason,
         });
+        if let Some(schedule) = retry_schedule {
+            if let Some(object) = command_payload.as_object_mut() {
+                object.insert("retry_delay_secs".to_string(), json!(schedule.delay_secs));
+                object.insert(
+                    "retry_not_before".to_string(),
+                    json!(schedule.not_before.to_rfc3339()),
+                );
+            }
+        }
     }
     WorkflowCommand::new(
         command_type,

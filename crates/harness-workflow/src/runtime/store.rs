@@ -3,6 +3,7 @@ use super::model::{
     WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent,
     WorkflowInstance,
 };
+use chrono::{DateTime, Utc};
 use harness_core::db::{Migration, PgStoreContext};
 use serde::Serialize;
 use serde_json::Value;
@@ -493,7 +494,26 @@ impl WorkflowRuntimeStore {
         runtime_profile: &str,
         input: Value,
     ) -> anyhow::Result<RuntimeJob> {
-        let job = RuntimeJob::pending(command_id, runtime_kind, runtime_profile, input);
+        self.enqueue_runtime_job_with_not_before(
+            command_id,
+            runtime_kind,
+            runtime_profile,
+            input,
+            None,
+        )
+        .await
+    }
+
+    pub async fn enqueue_runtime_job_with_not_before(
+        &self,
+        command_id: &str,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: Value,
+        not_before: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<RuntimeJob> {
+        let mut job = RuntimeJob::pending(command_id, runtime_kind, runtime_profile, input);
+        job.not_before = not_before;
         let data = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         let runtime_kind = enum_str(&job.runtime_kind)?;
@@ -522,6 +542,11 @@ impl WorkflowRuntimeStore {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT id, data::text FROM runtime_jobs
              WHERE status = 'pending'
+               AND CASE
+                   WHEN data ? 'not_before'
+                   THEN (data->>'not_before')::timestamptz <= CURRENT_TIMESTAMP
+                   ELSE TRUE
+               END
              ORDER BY created_at ASC
              LIMIT 1
              FOR UPDATE SKIP LOCKED",

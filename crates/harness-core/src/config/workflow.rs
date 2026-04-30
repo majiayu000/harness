@@ -94,13 +94,20 @@ pub struct RuntimeWorkerPolicy {
 pub struct RuntimeRetryPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_failed_activity_retries: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retry_delay_secs: Option<u64>,
     #[serde(default)]
     pub activity_retries: BTreeMap<String, RuntimeActivityRetryPolicy>,
 }
 
 impl RuntimeRetryPolicy {
     pub fn is_empty(&self) -> bool {
-        self.max_failed_activity_retries.is_none() && self.activity_retries.is_empty()
+        self.max_failed_activity_retries.is_none()
+            && self.retry_delay_secs.is_none()
+            && self.max_retry_delay_secs.is_none()
+            && self.activity_retries.is_empty()
     }
 }
 
@@ -108,6 +115,10 @@ impl RuntimeRetryPolicy {
 pub struct RuntimeActivityRetryPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_failed_activity_retries: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retry_delay_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -364,9 +375,13 @@ runtime_worker:
   lease_ttl_secs: 120
 runtime_retry_policy:
   max_failed_activity_retries: 1
+  retry_delay_secs: 30
+  max_retry_delay_secs: 120
   activity_retries:
     implement_issue:
       max_failed_activity_retries: 2
+      retry_delay_secs: 10
+      max_retry_delay_secs: 60
 storage:
   schema_namespace: orchestration
 ---
@@ -460,12 +475,28 @@ Body
             cfg.runtime_retry_policy.max_failed_activity_retries,
             Some(1)
         );
+        assert_eq!(cfg.runtime_retry_policy.retry_delay_secs, Some(30));
+        assert_eq!(cfg.runtime_retry_policy.max_retry_delay_secs, Some(120));
         assert_eq!(
             cfg.runtime_retry_policy
                 .activity_retries
                 .get("implement_issue")
                 .and_then(|policy| policy.max_failed_activity_retries),
             Some(2)
+        );
+        assert_eq!(
+            cfg.runtime_retry_policy
+                .activity_retries
+                .get("implement_issue")
+                .and_then(|policy| policy.retry_delay_secs),
+            Some(10)
+        );
+        assert_eq!(
+            cfg.runtime_retry_policy
+                .activity_retries
+                .get("implement_issue")
+                .and_then(|policy| policy.max_retry_delay_secs),
+            Some(60)
         );
         assert_eq!(cfg.storage.schema_namespace, "orchestration");
         Ok(())

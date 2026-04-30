@@ -16,7 +16,7 @@ use super::{
     WorkflowRuntimeStore, REPO_BACKLOG_DEFINITION_ID,
 };
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use harness_core::db::resolve_database_url;
 use serde_json::json;
 use std::sync::{
@@ -451,6 +451,71 @@ fn runtime_completion_reducer_uses_activity_retry_override() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("retry override decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_adds_retry_cooldown_metadata() {
+    let instance = issue_instance("implementing").with_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 3,
+            "retry_delay_secs": 30,
+            "max_retry_delay_secs": 60,
+            "activity_retries": {
+                "implement_issue": {
+                    "retry_delay_secs": 20,
+                    "max_retry_delay_secs": 35
+                }
+            }
+        }
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "implement-retry-1",
+        json!({
+            "activity": "implement_issue",
+            "retry_attempt": 1
+        }),
+    );
+    let result = ActivityResult::failed(
+        "implement_issue",
+        "Implementation failed again.",
+        "codex stdin not available",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        2,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-2",
+        "command": command,
+        "runtime_job_id": "job-2",
+        "activity_result": result,
+    }));
+    let before = Utc::now();
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("cooldown policy should still produce a retry decision");
+
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(decision.commands[0].command["retry_attempt"], 2);
+    assert_eq!(decision.commands[0].command["retry_delay_secs"], 35);
+    let not_before = decision.commands[0].command["retry_not_before"]
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .expect("retry_not_before should be an RFC3339 timestamp");
+    assert!(not_before >= before + Duration::seconds(34));
+    assert!(not_before <= Utc::now() + Duration::seconds(36));
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("retry cooldown decision should validate");
 }
 
 #[test]
@@ -1112,6 +1177,48 @@ async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn runtime_worker_skips_runtime_jobs_before_not_before() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let not_before = Utc::now() + Duration::minutes(5);
+    let job = store
+        .enqueue_runtime_job_with_not_before(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "check" }),
+            Some(not_before),
+        )
+        .await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = CountingRuntimeExecutor {
+        result: ActivityResult::succeeded("check", "Validation passed."),
+        calls: calls.clone(),
+    };
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+
+    assert!(worker.run_once(&executor).await?.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let persisted = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("runtime job should still exist");
+    assert_eq!(persisted.status, RuntimeJobStatus::Pending);
+    assert_eq!(persisted.not_before, Some(not_before));
+    assert_eq!(
+        store
+            .runtime_job_count_by_status(RuntimeJobStatus::Pending)
+            .await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_worker_records_completion_event_and_command_status() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -1740,6 +1847,54 @@ async fn runtime_command_dispatcher_prefers_workflow_activity_profile() -> anyho
         backlog_scan_jobs[0].input["runtime_profile"]["model"],
         "gpt-default"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatcher_preserves_retry_not_before() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "implementing");
+    store.upsert_instance(&instance).await?;
+    let not_before = Utc::now() + Duration::seconds(60);
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "issue-123-implement-retry",
+        json!({
+            "activity": "implement_issue",
+            "retry_attempt": 1,
+            "retry_not_before": not_before.to_rfc3339(),
+        }),
+    );
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc),
+    );
+
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("retry command should dispatch");
+    let runtime_job = match outcome {
+        CommandDispatchOutcome::Enqueued {
+            command_id: dispatched_command_id,
+            runtime_job,
+        } => {
+            assert_eq!(dispatched_command_id, command_id);
+            runtime_job
+        }
+        other => panic!("unexpected dispatch outcome: {other:?}"),
+    };
+
+    assert_eq!(runtime_job.not_before, Some(not_before));
+    let persisted = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].not_before, Some(not_before));
     Ok(())
 }
 

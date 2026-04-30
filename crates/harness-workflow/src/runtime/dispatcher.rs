@@ -1,5 +1,7 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
 use super::store::WorkflowRuntimeStore;
+use anyhow::Context;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -173,9 +175,10 @@ impl<'a> RuntimeCommandDispatcher<'a> {
 
         let activity = command.command.runtime_activity_key().to_string();
         let runtime_profile = self.profile_for_command(&command).await?;
+        let not_before = retry_not_before_for_command(&command)?;
         let runtime_job = self
             .store
-            .enqueue_runtime_job(
+            .enqueue_runtime_job_with_not_before(
                 &command.id,
                 runtime_profile.kind,
                 &runtime_profile.name,
@@ -188,6 +191,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                     "command": command.command.command.clone(),
                     "runtime_profile": runtime_profile.clone(),
                 }),
+                not_before,
             )
             .await?;
         self.store
@@ -214,4 +218,26 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             )
             .clone())
     }
+}
+
+fn retry_not_before_for_command(
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let Some(raw) = command
+        .command
+        .command
+        .get("retry_not_before")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| Some(value.with_timezone(&Utc)))
+        .with_context(|| {
+            format!(
+                "workflow command {} has invalid retry_not_before",
+                command.id
+            )
+        })
 }

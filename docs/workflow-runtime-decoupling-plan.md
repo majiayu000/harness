@@ -43,6 +43,8 @@ Implemented now:
   then workflow
 - repo backlog lifecycle activities are handled as server-owned runtime worker operations for child
   workflow creation, merged-PR completion, and stale workflow recovery
+- failed runtime activity retries can declare cooldown metadata and runtime jobs are not claimed
+  before their `not_before` timestamp
 - runtime profiles carry model and execution metadata into runtime jobs
 - server runtime workers pass runtime profile model overrides into agent turns
 - server turn lifecycle enforces runtime profile `timeout_secs` as an execution deadline
@@ -542,17 +544,21 @@ Implemented now:
 - direct runtime jobs without a workflow command row still complete normally
 - workflow runtime instance data carries configured `runtime_retry_policy` values from
   `WORKFLOW.md` when policy is present
+- runtime jobs can carry `not_before` cooldown timestamps and the worker claim query leaves future
+  retry jobs pending until the cooldown expires
 
 Still intentionally not moved yet:
 
 - reducer coverage is limited to known activity/state pairs
 - activity result schemas are not yet workflow-specific
-- retry backoff and retry cooldown windows are not yet modeled
+- retry cooldown scheduling is best-effort local timing; distributed scheduling visibility is not
+  yet exposed in the dashboard
 
 Tests:
 
 - runtime worker completion updates command status and appends a workflow event
 - existing runtime worker tests still cover direct jobs without command rows
+- runtime worker skips pending runtime jobs whose `not_before` timestamp is still in the future
 
 ### Phase 11: Runtime Completion Reducer
 
@@ -573,6 +579,8 @@ Implemented now:
   `runtime_retry_policy.max_failed_activity_retries` is present on the workflow instance data
 - activity-specific retry budgets under `runtime_retry_policy.activity_retries` override the global
   failed activity retry budget
+- retry policy supports `retry_delay_secs` and `max_retry_delay_secs`, including per-activity
+  overrides, and writes `retry_not_before` metadata into retry commands
 - failed command retries preserve the original workflow command type and payload before adding
   retry metadata
 - unknown successful activity/state pairs are preserved as completion events without unsafe state
@@ -591,6 +599,7 @@ Tests:
 - reducer ignores unmapped successful activity completions
 - reducer retries a failed activity until the configured retry budget is exhausted
 - reducer honors activity-specific retry budget overrides
+- reducer adds cooldown metadata to retry commands when retry delay policy is configured
 - reducer preserves `StartChildWorkflow` command type when retrying failed child workflow dispatch
 - runtime worker applies the reducer, records decisions, and updates workflow state
 
