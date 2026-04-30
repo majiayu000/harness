@@ -3,7 +3,7 @@ use super::model::{
     WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub const RUNTIME_JOB_COMPLETED_EVENT: &str = "RuntimeJobCompleted";
 pub const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
@@ -151,20 +151,12 @@ fn retry_failed_activity_decision(
                 "Runtime activity `{activity}` failed; retrying attempt {next_attempt} of {retry_limit}. Last error: {reason}"
             ),
         )
-        .with_command(WorkflowCommand::new(
-            WorkflowCommandType::EnqueueActivity,
-            format!(
-                "runtime-completion:{}:retry:{}:{}",
-                event.id, activity, next_attempt
-            ),
-            json!({
-                "activity": activity,
-                "retry_attempt": next_attempt,
-                "max_failed_activity_retries": retry_limit,
-                "previous_command_id": event_field_string(event, "command_id"),
-                "previous_runtime_job_id": event_field_string(event, "runtime_job_id"),
-                "previous_error": reason,
-            }),
+        .with_command(retry_command(
+            event,
+            &activity,
+            next_attempt,
+            retry_limit,
+            &reason,
         ))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
@@ -237,8 +229,63 @@ fn retry_activity_name(event: &WorkflowEvent, result: &ActivityResult) -> Option
         .and_then(|command| command.get("activity"))
         .and_then(|value| value.as_str())
         .filter(|activity| !activity.trim().is_empty())
+        .or_else(|| event_command_type(event))
         .or_else(|| (!result.activity.trim().is_empty()).then_some(result.activity.as_str()))
         .map(str::to_string)
+}
+
+fn retry_command(
+    event: &WorkflowEvent,
+    activity: &str,
+    next_attempt: u64,
+    retry_limit: u64,
+    reason: &str,
+) -> WorkflowCommand {
+    let previous = event_workflow_command(event);
+    let command_type = previous
+        .as_ref()
+        .map(|command| command.command_type)
+        .unwrap_or(WorkflowCommandType::EnqueueActivity);
+    let mut command_payload = previous
+        .map(|command| command.command)
+        .unwrap_or_else(|| json!({ "activity": activity }));
+    if let Some(object) = command_payload.as_object_mut() {
+        if command_type == WorkflowCommandType::EnqueueActivity && !object.contains_key("activity")
+        {
+            object.insert("activity".to_string(), json!(activity));
+        }
+        object.insert("retry_attempt".to_string(), json!(next_attempt));
+        object.insert(
+            "max_failed_activity_retries".to_string(),
+            json!(retry_limit),
+        );
+        object.insert(
+            "previous_command_id".to_string(),
+            optional_json_string(event_field_string(event, "command_id")),
+        );
+        object.insert(
+            "previous_runtime_job_id".to_string(),
+            optional_json_string(event_field_string(event, "runtime_job_id")),
+        );
+        object.insert("previous_error".to_string(), json!(reason));
+    } else {
+        command_payload = json!({
+            "activity": activity,
+            "retry_attempt": next_attempt,
+            "max_failed_activity_retries": retry_limit,
+            "previous_command_id": event_field_string(event, "command_id"),
+            "previous_runtime_job_id": event_field_string(event, "runtime_job_id"),
+            "previous_error": reason,
+        });
+    }
+    WorkflowCommand::new(
+        command_type,
+        format!(
+            "runtime-completion:{}:retry:{}:{}",
+            event.id, activity, next_attempt
+        ),
+        command_payload,
+    )
 }
 
 fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool {
@@ -265,6 +312,18 @@ fn event_command_type(event: &WorkflowEvent) -> Option<&str> {
         .get("command")
         .and_then(|command| command.get("command_type"))
         .and_then(|value| value.as_str())
+}
+
+fn event_workflow_command(event: &WorkflowEvent) -> Option<WorkflowCommand> {
+    event
+        .event
+        .get("command")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn optional_json_string(value: Option<String>) -> Value {
+    value.map(Value::String).unwrap_or(Value::Null)
 }
 
 fn runtime_completion_evidence(event: &WorkflowEvent, result: &ActivityResult) -> WorkflowEvidence {

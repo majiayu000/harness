@@ -454,6 +454,60 @@ fn runtime_completion_reducer_uses_activity_retry_override() {
 }
 
 #[test]
+fn runtime_completion_reducer_preserves_start_child_workflow_retry_type() {
+    let instance = repo_backlog_instance("dispatching").with_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 1
+        }
+    }));
+    let command = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:123",
+        "repo-backlog:owner/repo:issue:123:start",
+    );
+    let result = ActivityResult::failed(
+        "workflow_activity",
+        "Child workflow dispatch failed.",
+        "runtime host unavailable",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("start child workflow failure should retry");
+
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(
+        decision.commands[0].command["definition_id"],
+        "github_issue_pr"
+    );
+    assert_eq!(decision.commands[0].command["subject_key"], "issue:123");
+    assert_eq!(decision.commands[0].command["retry_attempt"], 1);
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("start child workflow retry should validate");
+}
+
+#[test]
 fn repo_backlog_open_issue_without_workflow_starts_child_workflow() {
     let instance = repo_backlog_instance("idle");
     let output = build_open_issue_without_workflow_decision(

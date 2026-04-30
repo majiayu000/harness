@@ -565,6 +565,8 @@ Implemented now:
   `runtime_retry_policy.max_failed_activity_retries` is present on the workflow instance data
 - activity-specific retry budgets under `runtime_retry_policy.activity_retries` override the global
   failed activity retry budget
+- failed command retries preserve the original workflow command type and payload before adding
+  retry metadata
 - unknown successful activity/state pairs are preserved as completion events without unsafe state
   changes
 
@@ -581,6 +583,7 @@ Tests:
 - reducer ignores unmapped successful activity completions
 - reducer retries a failed activity until the configured retry budget is exhausted
 - reducer honors activity-specific retry budget overrides
+- reducer preserves `StartChildWorkflow` command type when retrying failed child workflow dispatch
 - runtime worker applies the reducer, records decisions, and updates workflow state
 
 ### Phase 12: Workflow Runtime Profile Selection
