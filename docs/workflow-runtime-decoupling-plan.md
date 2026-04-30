@@ -26,13 +26,15 @@ Implemented now:
 - PR feedback decisions for waiting, addressing feedback, and ready-to-merge
 - repo backlog decisions for issue discovery, merged PR reconciliation, and stale workflow recovery
 - generic runtime worker boundary for claiming jobs and recording structured activity results
+- workflow-first runtime tree API and dashboard panel for instances, commands, runtime jobs, and
+  rejected decisions
 
 Still intentionally not moved yet:
 
 - existing task runner ownership of process execution
 - repo backlog polling as the primary controller
 - automatic command outbox to runtime job dispatch
-- workflow-first dashboard rendering
+- dashboard write actions still use existing task routes
 
 ## Non-Goals
 
@@ -398,7 +400,22 @@ Tests:
 
 ### Phase 6: Workflow-First UI
 
+Status: partially implemented.
+
 Keep task drill-down, but make workflow tree the primary dashboard surface.
+
+Implemented now:
+
+- `GET /api/workflows/runtime/tree` returns workflow instances as a parent/child tree
+- each node includes events, decisions, command outbox rows, and runtime jobs
+- the dashboard active view shows a compact workflow runtime panel above the task kanban
+- rejected decisions display operator-readable reasons
+
+Still intentionally not moved yet:
+
+- task cards and merge actions still use existing task endpoints
+- workflow runtime tree is read-only
+- command outbox rows are not yet the primary dispatch source for runtime jobs
 
 Tests:
 

@@ -1,6 +1,7 @@
 use super::model::{
     ActivityResult, RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, WorkflowCommand,
-    WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowInstance,
+    WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent,
+    WorkflowInstance,
 };
 use harness_core::db::{Migration, PgStoreContext};
 use serde::Serialize;
@@ -215,6 +216,27 @@ impl WorkflowRuntimeStore {
             .map_err(Into::into)
     }
 
+    pub async fn list_instances(
+        &self,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE ($1::text IS NULL OR data->'data'->>'project_id' = $1)
+             ORDER BY updated_at DESC
+             LIMIT $2",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     pub async fn append_event(
         &self,
         workflow_id: &str,
@@ -284,6 +306,23 @@ impl WorkflowRuntimeStore {
         Ok(())
     }
 
+    pub async fn decisions_for(
+        &self,
+        workflow_id: &str,
+    ) -> anyhow::Result<Vec<WorkflowDecisionRecord>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_decisions
+             WHERE workflow_id = $1
+             ORDER BY created_at ASC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     pub async fn enqueue_command(
         &self,
         workflow_id: &str,
@@ -321,6 +360,44 @@ impl WorkflowRuntimeStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    pub async fn commands_for(
+        &self,
+        workflow_id: &str,
+    ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
+        let rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
+                 FROM workflow_commands
+                 WHERE workflow_id = $1
+                 ORDER BY created_at ASC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(id, workflow_id, decision_id, status, data, created_at, updated_at)| {
+                    Ok(WorkflowCommandRecord {
+                        id,
+                        workflow_id,
+                        decision_id,
+                        status,
+                        command: serde_json::from_str(&data)?,
+                        created_at,
+                        updated_at,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub async fn enqueue_runtime_job(
@@ -478,6 +555,23 @@ impl WorkflowRuntimeStore {
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub async fn runtime_jobs_for_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Vec<RuntimeJob>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM runtime_jobs
+             WHERE command_id = $1
+             ORDER BY created_at ASC",
+        )
+        .bind(command_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
     }
 
     pub async fn runtime_job_count_by_status(

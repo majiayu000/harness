@@ -381,6 +381,78 @@ async fn make_test_state_with_issue_workflows(
     }))
 }
 
+async fn make_test_state_with_workflow_runtime(
+    dir: &std::path::Path,
+) -> anyhow::Result<Arc<AppState>> {
+    let state = make_test_state(dir).await?;
+    let workflow_runtime_store =
+        harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir, "workflow_runtime"),
+            Some(&crate::test_helpers::test_database_url()?),
+        )
+        .await?;
+    Ok(Arc::new(AppState {
+        core: crate::http::CoreServices {
+            server: state.core.server.clone(),
+            project_root: state.core.project_root.clone(),
+            home_dir: state.core.home_dir.clone(),
+            tasks: state.core.tasks.clone(),
+            thread_db: None,
+            plan_db: None,
+            plan_cache: state.core.plan_cache.clone(),
+            issue_workflow_store: None,
+            project_workflow_store: None,
+            workflow_runtime_store: Some(Arc::new(workflow_runtime_store)),
+            project_registry: None,
+            runtime_state_store: None,
+            q_values: None,
+            maintenance_active: state.core.maintenance_active.clone(),
+        },
+        engines: crate::http::EngineServices {
+            skills: state.engines.skills.clone(),
+            rules: state.engines.rules.clone(),
+            gc_agent: state.engines.gc_agent.clone(),
+        },
+        observability: crate::http::ObservabilityServices {
+            events: state.observability.events.clone(),
+            signal_rate_limiter: state.observability.signal_rate_limiter.clone(),
+            password_reset_rate_limiter: state.observability.password_reset_rate_limiter.clone(),
+            review_store: None,
+        },
+        concurrency: crate::http::ConcurrencyServices {
+            task_queue: state.concurrency.task_queue.clone(),
+            review_task_queue: state.concurrency.review_task_queue.clone(),
+            workspace_mgr: None,
+        },
+        #[cfg(test)]
+        _db_state_guard: None,
+        runtime_hosts: state.runtime_hosts.clone(),
+        runtime_project_cache: state.runtime_project_cache.clone(),
+        runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+        runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        notifications: crate::http::NotificationServices {
+            notification_tx: tokio::sync::broadcast::channel(32).0,
+            notification_lagged_total: Arc::new(AtomicU64::new(0)),
+            notification_lag_log_every: 1,
+            notify_tx: None,
+            initializing: Arc::new(AtomicBool::new(true)),
+            initialized: Arc::new(AtomicBool::new(true)),
+            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        },
+        interceptors: vec![],
+        startup_statuses: vec![],
+        degraded_subsystems: vec![],
+        intake: crate::http::IntakeServices {
+            feishu_intake: None,
+            github_pollers: vec![],
+            completion_callback: None,
+        },
+        project_svc: state.project_svc.clone(),
+        task_svc: state.task_svc.clone(),
+        execution_svc: state.execution_svc.clone(),
+    }))
+}
+
 #[tokio::test]
 async fn persist_runtime_state_is_serialized() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -489,6 +561,15 @@ fn token_usage_app(state: Arc<AppState>) -> Router {
         .route(
             "/api/token-usage",
             get(crate::handlers::token_usage::token_usage),
+        )
+        .with_state(state)
+}
+
+fn workflow_runtime_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/api/workflows/runtime/tree",
+            get(get_workflow_runtime_tree),
         )
         .with_state(state)
 }
@@ -704,6 +785,110 @@ async fn health_degraded_when_subsystem_missing() -> anyhow::Result<()> {
     assert_eq!(health.status, "degraded");
     assert_eq!(health.persistence.degraded_subsystems, ["q_value_store"]);
     assert!(!health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        1,
+        "dispatching",
+        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+    )
+    .with_id("repo-backlog")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+    }));
+    let child = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "replanning",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:123"),
+    )
+    .with_id("issue-123")
+    .with_parent(parent.id.clone())
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 123,
+    }));
+    store.upsert_instance(&parent).await?;
+    store.upsert_instance(&child).await?;
+    let event = store
+        .append_event(
+            &child.id,
+            "PlanIssueRaised",
+            "workflow-runtime-test",
+            serde_json::json!({ "issue_number": 123 }),
+        )
+        .await?;
+    let decision = harness_workflow::runtime::WorkflowDecision::new(
+        child.id.clone(),
+        "replanning",
+        "run_replan",
+        "replanning",
+        "Replan requested after the budget was exhausted.",
+    );
+    let rejected = harness_workflow::runtime::WorkflowDecisionRecord::rejected(
+        decision,
+        Some(event.id),
+        "replan limit exhausted",
+    );
+    store.record_decision(&rejected).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "replan_issue",
+        "issue-123-replan-2",
+    );
+    let command_id = store
+        .enqueue_command(&child.id, Some(&rejected.id), &command)
+        .await?;
+    store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            serde_json::json!({ "workflow_id": child.id }),
+        )
+        .await?;
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["total_workflows"], 2);
+    assert_eq!(body["workflows"][0]["workflow"]["id"], "repo-backlog");
+    let child_node = &body["workflows"][0]["children"][0];
+    assert_eq!(child_node["workflow"]["id"], "issue-123");
+    assert_eq!(
+        child_node["decisions"][0]["rejection_reason"],
+        "replan limit exhausted"
+    );
+    assert_eq!(
+        child_node["commands"][0]["command"]["command"]["activity"],
+        "replan_issue"
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["runtime_profile"],
+        "codex-high"
+    );
     Ok(())
 }
 

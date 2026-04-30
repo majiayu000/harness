@@ -8,6 +8,7 @@ import type { Task } from "@/types";
 vi.mock("@/lib/queries", () => ({
   useTasks: vi.fn(),
   useDashboard: vi.fn(),
+  useWorkflowRuntimeTree: vi.fn(),
 }));
 
 vi.mock("@/components/TaskDetailSlideover", () => ({
@@ -32,11 +33,12 @@ vi.mock("@/lib/api", () => ({
   apiFetch: vi.fn(() => Promise.resolve(undefined)),
 }));
 
-import { useTasks, useDashboard } from "@/lib/queries";
+import { useTasks, useDashboard, useWorkflowRuntimeTree } from "@/lib/queries";
 import { apiFetch } from "@/lib/api";
 
 const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
 const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
+const mockUseWorkflowRuntimeTree = useWorkflowRuntimeTree as ReturnType<typeof vi.fn>;
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 
 function makeTask(id: string, project: string | null, status = "running", task_kind = "issue"): Task {
@@ -87,6 +89,11 @@ describe("<Active>", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockUseDashboard.mockReturnValue({ data: undefined });
+    mockUseWorkflowRuntimeTree.mockReturnValue({
+      data: { workflows: [], total_workflows: 0 },
+      isLoading: false,
+      isError: false,
+    });
   });
 
   it("filters to matching project when projectFilter is set", () => {
@@ -179,6 +186,114 @@ describe("<Active>", () => {
     expect(screen.getByText("planner-task")).toBeInTheDocument();
     expect(screen.getByText("review-task")).toBeInTheDocument();
     expect(screen.getByText("impl-task")).toBeInTheDocument();
+  });
+
+  it("renders workflow runtime tree with jobs and rejected decisions", () => {
+    mockUseTasks.mockReturnValue({ data: [], isLoading: false, isError: false });
+    mockUseWorkflowRuntimeTree.mockReturnValue({
+      data: {
+        total_workflows: 2,
+        workflows: [
+          {
+            workflow: {
+              id: "repo-backlog",
+              definition_id: "repo_backlog",
+              definition_version: 1,
+              state: "dispatching",
+              subject: { subject_type: "repo", subject_key: "owner/repo" },
+              data: {},
+              version: 1,
+              created_at: "2026-04-30T00:00:00Z",
+              updated_at: "2026-04-30T00:00:00Z",
+            },
+            events: [],
+            decisions: [],
+            commands: [],
+            children: [
+              {
+                workflow: {
+                  id: "issue-123",
+                  definition_id: "github_issue_pr",
+                  definition_version: 1,
+                  state: "replanning",
+                  subject: { subject_type: "issue", subject_key: "issue:123" },
+                  parent_workflow_id: "repo-backlog",
+                  data: {},
+                  version: 2,
+                  created_at: "2026-04-30T00:00:00Z",
+                  updated_at: "2026-04-30T00:00:00Z",
+                },
+                events: [
+                  {
+                    id: "event-1",
+                    workflow_id: "issue-123",
+                    sequence: 1,
+                    event_type: "PlanIssueRaised",
+                    event: {},
+                    source: "test",
+                    created_at: "2026-04-30T00:00:00Z",
+                  },
+                ],
+                decisions: [
+                  {
+                    id: "decision-1",
+                    workflow_id: "issue-123",
+                    accepted: false,
+                    rejection_reason: "replan limit exhausted",
+                    decision: {
+                      decision: "run_replan",
+                      observed_state: "replanning",
+                      next_state: "replanning",
+                      reason: "Replan requested after the budget was exhausted.",
+                    },
+                    created_at: "2026-04-30T00:00:00Z",
+                  },
+                ],
+                commands: [
+                  {
+                    id: "command-1",
+                    workflow_id: "issue-123",
+                    decision_id: "decision-1",
+                    status: "pending",
+                    command: {
+                      command_type: "enqueue_activity",
+                      dedupe_key: "issue-123-replan-2",
+                      command: { activity: "replan_issue" },
+                    },
+                    runtime_jobs: [
+                      {
+                        id: "job-1",
+                        command_id: "command-1",
+                        runtime_kind: "codex_jsonrpc",
+                        runtime_profile: "codex-high",
+                        status: "pending",
+                        input: {},
+                        created_at: "2026-04-30T00:00:00Z",
+                        updated_at: "2026-04-30T00:00:00Z",
+                      },
+                    ],
+                    created_at: "2026-04-30T00:00:00Z",
+                    updated_at: "2026-04-30T00:00:00Z",
+                  },
+                ],
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    });
+
+    wrap(<Active projectFilter="harness" />);
+
+    expect(screen.getByText("Workflow Runtime")).toBeInTheDocument();
+    expect(screen.getByText("repo_backlog - owner/repo")).toBeInTheDocument();
+    expect(screen.getByText("github_issue_pr - issue:123")).toBeInTheDocument();
+    expect(screen.getByText("activity: replan_issue")).toBeInTheDocument();
+    expect(screen.getByText("1 jobs - pending")).toBeInTheDocument();
+    expect(screen.getByText("rejected: replan limit exhausted")).toBeInTheDocument();
   });
 
   it("clicking a standard task card opens the slide-over with that task's id", () => {

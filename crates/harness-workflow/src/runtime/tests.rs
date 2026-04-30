@@ -1,8 +1,8 @@
 use super::model::{
     ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, RuntimeJob, RuntimeJobStatus,
-    RuntimeKind, ValidationRecord, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
-    WorkflowSubject,
+    RuntimeKind, ValidationRecord, WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType,
+    WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvidence,
+    WorkflowInstance, WorkflowSubject,
 };
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
@@ -35,6 +35,20 @@ fn repo_backlog_instance(state: &str) -> WorkflowInstance {
         state,
         WorkflowSubject::new("repo", "owner/repo"),
     )
+}
+
+fn project_issue_instance(project_id: &str, issue_number: u64, state: &str) -> WorkflowInstance {
+    WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        state,
+        WorkflowSubject::new("issue", format!("issue:{issue_number}")),
+    )
+    .with_id(format!("{project_id}::issue:{issue_number}"))
+    .with_data(json!({
+        "project_id": project_id,
+        "issue_number": issue_number,
+    }))
 }
 
 #[test]
@@ -922,6 +936,91 @@ async fn durable_store_persists_workflow_runtime_bus_contract() -> anyhow::Resul
             .status,
         RuntimeJobStatus::Succeeded
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_store_lists_workflow_runtime_tree_inputs() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+
+    let parent = repo_backlog_instance("dispatching").with_data(json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+    }));
+    let child =
+        project_issue_instance("/project-a", 123, "replanning").with_parent(parent.id.clone());
+    let other_project = project_issue_instance("/project-b", 456, "implementing");
+    store.upsert_instance(&parent).await?;
+    store.upsert_instance(&child).await?;
+    store.upsert_instance(&other_project).await?;
+    let event = store
+        .append_event(
+            &child.id,
+            "PlanIssueRaised",
+            "workflow-runtime-test",
+            json!({ "issue_number": 123 }),
+        )
+        .await?;
+    let rejected_decision = WorkflowDecision::new(
+        child.id.clone(),
+        "replanning",
+        "run_replan",
+        "replanning",
+        "Replan requested after the budget was exhausted.",
+    );
+    let rejected = WorkflowDecisionRecord::rejected(
+        rejected_decision,
+        Some(event.id),
+        "replan limit exhausted",
+    );
+    store.record_decision(&rejected).await?;
+
+    let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-2");
+    let command_id = store
+        .enqueue_command(&child.id, Some(&rejected.id), &command)
+        .await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            json!({ "workflow_id": child.id }),
+        )
+        .await?;
+
+    let listed = store.list_instances(Some("/project-a"), 25).await?;
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|instance| {
+        instance
+            .data
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            == Some("/project-a")
+    }));
+
+    let decisions = store.decisions_for(&child.id).await?;
+    assert_eq!(decisions.len(), 1);
+    assert!(!decisions[0].accepted);
+    assert_eq!(
+        decisions[0].rejection_reason.as_deref(),
+        Some("replan limit exhausted")
+    );
+
+    let commands: Vec<WorkflowCommandRecord> = store.commands_for(&child.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].id, command_id);
+    assert_eq!(commands[0].command.activity_name(), Some("replan_issue"));
+
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, job.id);
+    assert_eq!(jobs[0].status, RuntimeJobStatus::Pending);
 
     Ok(())
 }
