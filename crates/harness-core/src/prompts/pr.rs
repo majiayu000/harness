@@ -34,11 +34,58 @@ pub fn continue_existing_pr(issue: u64, pr_number: u64, branch: &str, repo: &str
     )
 }
 
-/// Build prompt: rebase a conflicting PR onto the current main branch.
+/// Build prompt: resumed-PR conflict gate before the normal review loop.
 ///
-/// Used when [`conflict_resolver::assess_pr_conflict`] classifies the PR as
-/// `Small` (≤3 files, <5 conflict regions). The agent performs the rebase
-/// inside an isolated worktree and force-pushes the result.
+/// The agent must inspect the PR's mergeability via `gh`, perform any repair in
+/// an isolated worktree, and finish by printing exactly one terminal token.
+pub fn check_resumed_pr_conflicts(pr_num: u64, repo: &str, project_root: &Path) -> String {
+    let validation_step = rebase_validation_step(pr_num, project_root)
+        .replace("REBASE_FAILED", "MANUAL_RESOLUTION_REQUIRED");
+    format!(
+        "Inspect PR #{pr_num} in `{repo}` before any review work.\n\n\
+         IMPORTANT:\n\
+         - You MUST inspect mergeability with GitHub CLI before deciding anything.\n\
+         - Never run `git checkout` or `git stash` in the main repository working tree.\n\
+         - Any repair or rebase MUST happen inside an isolated worktree.\n\
+         - The last non-empty line of your output MUST be exactly one of: \
+         `CLEAN_PR`, `REBASE_PUSHED`, or `MANUAL_RESOLUTION_REQUIRED`.\n\n\
+         Steps:\n\
+         1. Inspect PR mergeability, head branch, and base branch:\n\
+            `gh pr view {pr_num} --json mergeable,headRefName,baseRefName,url`\n\
+         2. If `mergeable` is `MERGEABLE`, print `CLEAN_PR` on the last line and stop.\n\
+         3. If `mergeable` is `CONFLICTING`, repair it in an isolated worktree:\n\
+            ```\n\
+            BRANCH=$(gh pr view {pr_num} --json headRefName --jq .headRefName)\n\
+            BASE=$(gh pr view {pr_num} --json baseRefName --jq .baseRefName)\n\
+            git fetch origin \"$BRANCH\"\n\
+            git fetch origin \"$BASE\"\n\
+            git worktree remove /tmp/harness-rebase-{pr_num} 2>/dev/null || rm -rf /tmp/harness-rebase-{pr_num} 2>/dev/null || true\n\
+            git worktree prune\n\
+            git worktree add /tmp/harness-rebase-{pr_num} \"$BRANCH\"\n\
+            cd /tmp/harness-rebase-{pr_num}\n\
+            git rebase \"origin/$BASE\"\n\
+            ```\n\
+         4. If rebase conflicts appear, resolve each file and continue the rebase. \
+            If you cannot finish cleanly, print `MANUAL_RESOLUTION_REQUIRED` on the last line.\n\
+         {validation_step}\
+         6. If the rebase succeeds, push the repaired branch:\n\
+            ```\n\
+            git push --force-with-lease origin \"$BRANCH\"\n\
+            ```\n\
+            Then print `REBASE_PUSHED` on the last line.\n\
+         7. If `mergeable` is `UNKNOWN`, wait briefly and retry step 1 until GitHub finishes computing \
+            mergeability. If it never becomes `MERGEABLE` or `CONFLICTING` after several retries, \
+            print `MANUAL_RESOLUTION_REQUIRED` on the last line.\n\
+         8. If `mergeable` is `DIRTY` or anything other than `MERGEABLE`/`CONFLICTING`/`UNKNOWN`, \
+            print `MANUAL_RESOLUTION_REQUIRED` on the last line."
+    )
+}
+
+/// Build prompt: rebase a conflicting PR onto its actual base branch.
+///
+/// Used when Harness wants the agent to repair a conflicting PR via rebase.
+/// The agent performs the rebase inside an isolated worktree and force-pushes
+/// the result.
 ///
 /// `project_root` is used to detect the project language so the validation
 /// step uses the correct build/test toolchain instead of hardcoding `cargo`.
@@ -71,10 +118,12 @@ pub fn rebase_conflicting_pr(pr_num: u64, branch: &str, repo: &str, project_root
             git worktree prune\n\
             git worktree add /tmp/harness-rebase-{pr_num} '{branch_arg}'\n\
             ```\n\
-         2. Rebase onto origin/main inside the worktree:\n\
+         2. Determine the PR base branch from GitHub and rebase onto it inside the worktree:\n\
             ```\n\
+            BASE=$(gh pr view {pr_num} --json baseRefName --jq .baseRefName)\n\
+            git fetch origin \"$BASE\"\n\
             cd /tmp/harness-rebase-{pr_num}\n\
-            git rebase origin/main\n\
+            git rebase \"origin/$BASE\"\n\
             ```\n\
          3. If rebase conflicts appear, resolve each file, then:\n\
             ```\n\
@@ -169,14 +218,33 @@ pub fn check_existing_pr(
     };
     format!(
         "Check PR #{pr}:{freshness_check}\n\
-         1. Run `gh pr view {pr} --json statusCheckRollup` — parse the JSON. \
-         CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
-         2. `gh api repos/{repo}/pulls/{pr}/comments` — read inline review comments\n\
-         3. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
-         4. Otherwise fix each comment, commit, push, \
+         1. Run `gh pr view {pr} --json mergeable,headRefName,baseRefName,statusCheckRollup` — parse the JSON.\n\
+         2. If `mergeable` is `CONFLICTING`, do NOT treat the PR as healthy. \
+         Repair it only inside an isolated worktree:\n\
+            ```\n\
+            BRANCH=$(gh pr view {pr} --json headRefName --jq .headRefName)\n\
+            BASE=$(gh pr view {pr} --json baseRefName --jq .baseRefName)\n\
+            git fetch origin \"$BRANCH\"\n\
+            git fetch origin \"$BASE\"\n\
+            git worktree remove /tmp/harness-rebase-{pr} 2>/dev/null || rm -rf /tmp/harness-rebase-{pr} 2>/dev/null || true\n\
+            git worktree prune\n\
+            git worktree add /tmp/harness-rebase-{pr} \"$BRANCH\"\n\
+            cd /tmp/harness-rebase-{pr}\n\
+            git rebase \"origin/$BASE\"\n\
+            git push --force-with-lease origin \"$BRANCH\"\n\
+            ```\n\
+            If you cannot complete that repair, explain that manual resolution required and print WAITING on the last line.\n\
+         3. CI passes only if the `state` field in the `statusCheckRollup` object is `SUCCESS`\n\
+         4. `gh api repos/{repo}/pulls/{pr}/comments` — read inline review comments\n\
+         5. If CI passes and there are no unresolved review comments, print LGTM on the last line\n\
+         6. Otherwise fix each comment, commit, push, \
          then run `gh pr comment {pr} --body {body}` to trigger re-review, \
          and print FIXED on the last line\n\n\
-         Always print PR_URL=https://github.com/{repo}/pull/{pr} on a separate line of your output."
+         Output format:\n\
+         - Always print `PR_URL=https://github.com/{repo}/pull/{pr}` on a separate line\n\
+         - Always print `PUSHED_COMMIT=true` if you created or pushed any commit during this check \
+         (including a rebase/force-push to repair conflicts); otherwise print `PUSHED_COMMIT=false`\n\
+         - Then print `LGTM`, `FIXED`, or `WAITING` on the very last line."
     )
 }
 
@@ -266,6 +334,8 @@ mod tests {
         assert!(p.contains("PR #10"));
         assert!(p.contains("LGTM"));
         assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/10"));
+        assert!(p.contains("PUSHED_COMMIT=true"));
+        assert!(p.contains("PUSHED_COMMIT=false"));
         assert!(p.contains("repos/owner/repo/pulls/10/comments"));
         assert!(
             p.contains("statusCheckRollup"),
@@ -274,6 +344,22 @@ mod tests {
         assert!(
             p.contains("state") && p.contains("SUCCESS"),
             "must instruct agent to check state field for SUCCESS"
+        );
+        assert!(
+            p.contains("--json mergeable,headRefName,baseRefName,statusCheckRollup"),
+            "must require mergeability inspection before health checks"
+        );
+        assert!(
+            p.contains("git worktree add /tmp/harness-rebase-10"),
+            "conflict repair must happen in an isolated worktree"
+        );
+        assert!(
+            p.contains("BASE=$(gh pr view 10 --json baseRefName --jq .baseRefName)"),
+            "conflict repair must derive the base branch from PR metadata"
+        );
+        assert!(
+            p.contains("git rebase \"origin/$BASE\""),
+            "conflict repair must rebase onto the actual base branch"
         );
     }
 
@@ -285,5 +371,33 @@ mod tests {
             p.contains(r"'it'\''s a test'"),
             "single quote must be escaped"
         );
+    }
+
+    #[test]
+    fn resumed_pr_conflict_prompt_requires_exact_terminal_tokens() {
+        let p = check_resumed_pr_conflicts(17, "owner/repo", std::path::Path::new("."));
+        assert!(p.contains("gh pr view 17 --json mergeable,headRefName,baseRefName,url"));
+        assert!(p.contains("git worktree add /tmp/harness-rebase-17"));
+        assert!(p.contains("git rebase \"origin/$BASE\""));
+        assert!(
+            p.contains("If `mergeable` is `UNKNOWN`, wait briefly and retry step 1"),
+            "UNKNOWN mergeability must be treated as retryable instead of hard failure"
+        );
+        assert!(p.contains("CLEAN_PR"));
+        assert!(p.contains("REBASE_PUSHED"));
+        assert!(p.contains("MANUAL_RESOLUTION_REQUIRED"));
+    }
+
+    #[test]
+    fn rebase_prompt_uses_pr_base_branch() {
+        let p = rebase_conflicting_pr(
+            42,
+            "feat/my-branch",
+            "owner/repo",
+            std::path::Path::new("."),
+        );
+        assert!(p.contains("gh pr view 42 --json baseRefName --jq .baseRefName"));
+        assert!(p.contains("git fetch origin \"$BASE\""));
+        assert!(p.contains("git rebase \"origin/$BASE\""));
     }
 }
