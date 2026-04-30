@@ -95,6 +95,11 @@ impl CodexAgent {
             OsString::from(codex_sandbox_mode(sandbox_mode)),
         ];
 
+        if let Some(approval_policy) = req.approval_policy.as_deref() {
+            args.push(OsString::from("-a"));
+            args.push(OsString::from(approval_policy));
+        }
+
         if self.cloud.enabled {
             args.push(OsString::from("--ephemeral"));
         }
@@ -1547,13 +1552,14 @@ sleep 30
     }
 
     #[test]
-    fn base_args_uses_request_reasoning_effort_and_sandbox_override() {
+    fn base_args_uses_request_reasoning_effort_sandbox_and_approval_override() {
         let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::DangerFullAccess);
         let request = AgentRequest {
             prompt: "ping".to_string(),
             project_root: PathBuf::from("/tmp/project"),
             reasoning_effort: Some("medium".to_string()),
             sandbox_mode: Some(SandboxMode::ReadOnly),
+            approval_policy: Some("on-request".to_string()),
             ..Default::default()
         };
 
@@ -1567,6 +1573,8 @@ sleep 30
             .windows(2)
             .any(|window| window == ["-c", "model_reasoning_effort=\"medium\""]));
         assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
+        assert!(args.windows(2).any(|window| window == ["-a", "on-request"]));
+        assert_eq!(args.last().map(String::as_str), Some("ping"));
     }
 
     #[test]

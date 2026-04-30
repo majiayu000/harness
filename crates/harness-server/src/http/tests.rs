@@ -34,6 +34,7 @@ struct RuntimeStreamAgent {
     models: Mutex<Vec<Option<String>>>,
     reasoning_efforts: Mutex<Vec<Option<String>>>,
     sandbox_modes: Mutex<Vec<Option<SandboxMode>>>,
+    approval_policies: Mutex<Vec<Option<String>>>,
 }
 
 impl RuntimeStreamAgent {
@@ -43,6 +44,7 @@ impl RuntimeStreamAgent {
             models: Mutex::new(Vec::new()),
             reasoning_efforts: Mutex::new(Vec::new()),
             sandbox_modes: Mutex::new(Vec::new()),
+            approval_policies: Mutex::new(Vec::new()),
         })
     }
 }
@@ -148,6 +150,10 @@ impl CodeAgent for RuntimeStreamAgent {
             .await
             .push(req.reasoning_effort.clone());
         self.sandbox_modes.lock().await.push(req.sandbox_mode);
+        self.approval_policies
+            .lock()
+            .await
+            .push(req.approval_policy.clone());
         self.prompts.lock().await.push(req.prompt);
         Ok(successful_agent_response())
     }
@@ -163,6 +169,10 @@ impl CodeAgent for RuntimeStreamAgent {
             .await
             .push(req.reasoning_effort.clone());
         self.sandbox_modes.lock().await.push(req.sandbox_mode);
+        self.approval_policies
+            .lock()
+            .await
+            .push(req.approval_policy.clone());
         self.prompts.lock().await.push(req.prompt);
         let _ = tx
             .send(StreamItem::ItemCompleted {
@@ -1068,6 +1078,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     runtime_profile.model = Some("gpt-runtime".to_string());
     runtime_profile.reasoning_effort = Some("medium".to_string());
     runtime_profile.sandbox = Some("read-only".to_string());
+    runtime_profile.approval_policy = Some("on-request".to_string());
     runtime_profile.timeout_secs = Some(300);
     let runtime_job = store
         .enqueue_runtime_job(
@@ -1129,6 +1140,12 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     drop(reasoning_efforts);
     let sandbox_modes = agent.sandbox_modes.lock().await;
     assert_eq!(sandbox_modes.as_slice(), &[Some(SandboxMode::ReadOnly)]);
+    drop(sandbox_modes);
+    let approval_policies = agent.approval_policies.lock().await;
+    assert_eq!(
+        approval_policies.as_slice(),
+        &[Some("on-request".to_string())]
+    );
     Ok(())
 }
 

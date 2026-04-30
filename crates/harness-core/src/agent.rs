@@ -38,6 +38,8 @@ pub struct AgentRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub sandbox_mode: Option<SandboxMode>,
+    #[serde(default)]
+    pub approval_policy: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub context: Vec<ContextItem>,
     /// Execution phase for per-phase model selection via ReasoningBudget.
@@ -82,6 +84,7 @@ impl Default for AgentRequest {
             model: None,
             reasoning_effort: None,
             sandbox_mode: None,
+            approval_policy: None,
             max_budget_usd: None,
             context: Vec::new(),
             execution_phase: None,
@@ -195,6 +198,7 @@ pub struct TurnRequest {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub sandbox_mode: Option<SandboxMode>,
+    pub approval_policy: Option<String>,
     pub allowed_tools: Vec<String>,
     pub context: Vec<ContextItem>,
     pub timeout_secs: Option<u64>,

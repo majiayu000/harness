@@ -422,11 +422,23 @@ fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
     mode.map(|value| value.to_string())
 }
 
+fn sandbox_policy_value(mode: Option<SandboxMode>, project_root: &PathBuf) -> Option<Value> {
+    mode.map(|value| match value {
+        SandboxMode::ReadOnly => json!({ "type": "readOnly" }),
+        SandboxMode::WorkspaceWrite => json!({
+            "type": "workspaceWrite",
+            "writableRoots": [project_root],
+        }),
+        SandboxMode::DangerFullAccess => json!({ "type": "dangerFullAccess" }),
+    })
+}
+
 fn thread_start_params(req: &TurnRequest) -> Value {
     json!({
         "cwd": req.project_root,
         "model": req.model,
         "sandbox": sandbox_mode_value(req.sandbox_mode),
+        "approvalPolicy": req.approval_policy,
         "ephemeral": true,
     })
 }
@@ -437,7 +449,8 @@ fn turn_start_params(req: &TurnRequest, thread_id: &str) -> Value {
         "cwd": req.project_root,
         "model": req.model,
         "effort": req.reasoning_effort,
-        "sandbox": sandbox_mode_value(req.sandbox_mode),
+        "sandboxPolicy": sandbox_policy_value(req.sandbox_mode, &req.project_root),
+        "approvalPolicy": req.approval_policy,
         "input": [
             {
                 "type": "text",
@@ -847,6 +860,7 @@ mod tests {
             model: Some("gpt-runtime".to_string()),
             reasoning_effort: Some("medium".to_string()),
             sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+            approval_policy: Some("on-request".to_string()),
             allowed_tools: vec![],
             context: vec![],
             timeout_secs: Some(60),
@@ -859,6 +873,7 @@ mod tests {
                 "cwd": "/tmp/project",
                 "model": "gpt-runtime",
                 "sandbox": "workspace-write",
+                "approvalPolicy": "on-request",
                 "ephemeral": true,
             })
         );
@@ -869,7 +884,11 @@ mod tests {
                 "cwd": "/tmp/project",
                 "model": "gpt-runtime",
                 "effort": "medium",
-                "sandbox": "workspace-write",
+                "sandboxPolicy": {
+                    "type": "workspaceWrite",
+                    "writableRoots": ["/tmp/project"],
+                },
+                "approvalPolicy": "on-request",
                 "input": [
                     {
                         "type": "text",

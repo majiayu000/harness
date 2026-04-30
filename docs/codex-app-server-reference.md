@@ -52,7 +52,7 @@ The stdio reader and message processor serve as the **translation layer**: they 
 
 | Method | Purpose |
 |--------|---------|
-| `thread/start` | Create new thread (params: model, cwd, sandbox, personality) |
+| `thread/start` | Create new thread (params: model, cwd, sandbox, approvalPolicy, personality) |
 | `thread/resume` | Reopen existing thread by ID |
 | `thread/fork` | Branch history into new thread |
 | `thread/list` | Page through threads (filter, sort, pagination) |
@@ -65,7 +65,7 @@ The stdio reader and message processor serve as the **translation layer**: they 
 
 | Method | Purpose |
 |--------|---------|
-| `turn/start` | Begin generation (params: threadId, input[], model, effort, sandbox overrides) |
+| `turn/start` | Begin generation (params: threadId, input[], model, effort, sandboxPolicy, approvalPolicy) |
 | `turn/steer` | Append input to in-flight turn |
 | `turn/interrupt` | Cancel in-flight turn |
 
@@ -150,7 +150,7 @@ Key flags:
 - `--skip-git-repo-check` — run outside git repo
 - `-o PATH` — write final message to file
 - `--output-schema PATH` — enforce structured JSON output
-- `-a <policy>` — approval policy (untrusted/on-request/never)
+- `-a <policy>` — approval policy (untrusted/on-failure/on-request/never)
 - `-s <sandbox>` — sandbox policy (read-only/workspace-write/danger-full-access)
 - `-C <dir>` — working directory
 

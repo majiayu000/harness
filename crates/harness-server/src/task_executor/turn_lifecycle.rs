@@ -85,6 +85,7 @@ pub(crate) struct TurnLifecycleOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub sandbox_mode: Option<SandboxMode>,
+    pub approval_policy: Option<String>,
     pub timeout_secs: Option<u64>,
 }
 
@@ -201,6 +202,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
             sandbox_mode: options.sandbox_mode,
+            approval_policy: options.approval_policy.clone(),
             allowed_tools: vec![],
             context: vec![],
             timeout_secs: options.timeout_secs,
@@ -214,6 +216,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
             sandbox_mode: options.sandbox_mode,
+            approval_policy: options.approval_policy.clone(),
             ..Default::default()
         };
         Box::pin(agent.execute_stream(req, stream_tx))

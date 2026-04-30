@@ -94,6 +94,7 @@ impl ServerRuntimeJobExecutor {
 
         let runtime_profile = runtime_profile_for_job(&job)?;
         let sandbox_mode = runtime_profile_sandbox_mode(&runtime_profile)?;
+        let approval_policy = runtime_profile_approval_policy(&runtime_profile, job.runtime_kind)?;
         let prompt =
             build_runtime_job_prompt(&job, workflow.as_ref(), &project_root, &runtime_profile);
         let thread_id = self
@@ -122,6 +123,7 @@ impl ServerRuntimeJobExecutor {
                 model: runtime_profile.model.clone(),
                 reasoning_effort: runtime_profile.reasoning_effort.clone(),
                 sandbox_mode,
+                approval_policy,
                 timeout_secs: runtime_profile.timeout_secs,
             },
         )
@@ -272,6 +274,36 @@ fn runtime_profile_sandbox_mode(profile: &RuntimeProfile) -> anyhow::Result<Opti
     Ok(Some(mode))
 }
 
+fn runtime_profile_approval_policy(
+    profile: &RuntimeProfile,
+    runtime_kind: RuntimeKind,
+) -> anyhow::Result<Option<String>> {
+    let Some(raw) = profile.approval_policy.as_deref() else {
+        return Ok(None);
+    };
+    match raw {
+        "untrusted" | "on-failure" | "on-request" | "never" => {}
+        other => anyhow::bail!("runtime profile approval_policy `{other}` is not supported"),
+    }
+    match runtime_kind {
+        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => Ok(Some(raw.to_string())),
+        other => anyhow::bail!(
+            "runtime profile approval_policy `{raw}` is only supported for Codex runtime kinds, not {}",
+            runtime_kind_label(other)
+        ),
+    }
+}
+
+fn runtime_kind_label(kind: RuntimeKind) -> &'static str {
+    match kind {
+        RuntimeKind::CodexExec => "codex_exec",
+        RuntimeKind::CodexJsonrpc => "codex_jsonrpc",
+        RuntimeKind::ClaudeCode => "claude_code",
+        RuntimeKind::AnthropicApi => "anthropic_api",
+        RuntimeKind::RemoteHost => "remote_host",
+    }
+}
+
 fn activity_result_from_turn(
     job: &RuntimeJob,
     status: &TurnStatus,
@@ -365,4 +397,49 @@ where
         })
         .to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_profile_approval_policy_accepts_codex_values() {
+        for value in ["untrusted", "on-failure", "on-request", "never"] {
+            let mut profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexExec);
+            profile.approval_policy = Some(value.to_string());
+
+            assert_eq!(
+                runtime_profile_approval_policy(&profile, RuntimeKind::CodexExec)
+                    .expect("codex approval policy should be accepted"),
+                Some(value.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_profile_approval_policy_rejects_unknown_values() {
+        let mut profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexExec);
+        profile.approval_policy = Some("always".to_string());
+
+        let error = runtime_profile_approval_policy(&profile, RuntimeKind::CodexExec)
+            .expect_err("unknown approval policy should fail");
+
+        assert!(error
+            .to_string()
+            .contains("runtime profile approval_policy `always` is not supported"));
+    }
+
+    #[test]
+    fn runtime_profile_approval_policy_rejects_non_codex_runtimes() {
+        let mut profile = RuntimeProfile::new("claude-default", RuntimeKind::ClaudeCode);
+        profile.approval_policy = Some("on-request".to_string());
+
+        let error = runtime_profile_approval_policy(&profile, RuntimeKind::ClaudeCode)
+            .expect_err("Claude approval policy should fail until it has a contract");
+
+        assert!(error
+            .to_string()
+            .contains("only supported for Codex runtime kinds"));
+    }
 }

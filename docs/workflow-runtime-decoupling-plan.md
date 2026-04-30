@@ -39,6 +39,8 @@ Implemented now:
 - server turn lifecycle enforces runtime profile `timeout_secs` as an execution deadline
 - server runtime workers pass profile reasoning effort and sandbox overrides into agent requests
 - workflow runtime workers enforce profile `max_turns` as a workflow-instance runtime turn budget
+- server runtime workers pass Codex runtime profile `approval_policy` into Codex exec and
+  app-server requests
 
 Still intentionally not moved yet:
 
@@ -502,7 +504,7 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- approval policy still remains metadata until a workflow policy contract defines its semantics
+- non-Codex approval policy remains metadata until those runtimes define compatible contracts
 - workflow completion reducer coverage is intentionally limited to known activity/state pairs
 - runtime workers are process-local; distributed worker leasing beyond the job claim is not added yet
 
@@ -611,7 +613,7 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- approval policy still comes from registered agent/server configuration
+- non-Codex approval policy still comes from registered agent/server configuration
 - timeout is not a workflow reducer retry budget yet
 
 Tests:
@@ -638,7 +640,7 @@ Implemented now:
 Still intentionally not moved yet:
 
 - timeout policy is per runtime job, not a workflow-level retry or reducer budget
-- approval policy still requires request/runtime contract work
+- non-Codex approval policy still requires request/runtime contract work
 
 Tests:
 
@@ -657,14 +659,15 @@ Implemented now:
 - runtime worker parses profile `sandbox` values and passes request metadata into turn lifecycle
 - Codex exec uses request `reasoning_effort` for `model_reasoning_effort` and request sandbox for
   both CLI `-s` and the OS sandbox wrapper
-- Codex app-server requests include profile `effort` and `sandbox` metadata
+- Codex app-server requests include profile `effort`, thread `sandbox`, and turn
+  `sandboxPolicy` metadata
 - Claude CodeAgent uses request `reasoning_effort` when no execution phase already defines effort
 - Claude CodeAgent applies request sandbox to the OS sandbox wrapper
 
 Still intentionally not moved yet:
 
-- `approval_policy` is not applied to runtime profiles because approval semantics need an explicit
-  workflow policy contract
+- `approval_policy` is not applied to non-Codex runtime profiles because those adapters do not yet
+  expose a matching approval contract
 - Claude adapter sandbox wrapping is still unchanged because that path does not currently own a
   sandbox wrapper configuration
 
@@ -699,12 +702,45 @@ Still intentionally not moved yet:
 - `max_turns` is not a multi-turn conversation budget inside a single runtime job because runtime
   jobs currently execute one lifecycle turn
 - timeout policy is still per runtime job, not a workflow-level retry or reducer budget
-- `approval_policy` still needs an explicit workflow policy contract before it is applied
+- `approval_policy` is only applied to Codex runtime profiles
 
 Tests:
 
 - runtime worker executes the first job under `max_turns: 1`
 - runtime worker blocks the second job for the same workflow without invoking the executor
+
+### Phase 17: Runtime Profile Approval Policy
+
+Status: partially implemented.
+
+Apply `approval_policy` only where the execution layer has a concrete native contract. This keeps
+workflow policy declarative while avoiding silent no-ops on adapters that do not yet expose approval
+mode selection.
+
+Implemented now:
+
+- runtime worker validates profile `approval_policy` values against Codex native modes:
+  `untrusted`, `on-failure`, `on-request`, and `never`
+- runtime worker rejects `approval_policy` on non-Codex runtime kinds until those adapters define
+  compatible semantics
+- `AgentRequest` and adapter `TurnRequest` carry optional `approval_policy`
+- Codex exec passes request approval policy via CLI `-a`
+- Codex app-server passes request approval policy via `approvalPolicy` on both `thread/start` and
+  `turn/start`
+- Codex app-server turn sandbox metadata now uses the current `sandboxPolicy` object shape while
+  thread startup keeps the native `sandbox` mode string
+
+Still intentionally not moved yet:
+
+- Claude approval behavior remains controlled by its existing permission/tooling path
+- remote host runtimes must define their own runtime-host approval contract before using this field
+
+Tests:
+
+- Codex exec base arguments honor request approval overrides and keep the prompt as the final token
+- Codex app-server thread and turn payloads include `approvalPolicy`
+- runtime worker passes profile approval policy into the agent request
+- runtime worker rejects unknown approval policies and non-Codex approval policy usage
 
 ## Test Strategy
 
