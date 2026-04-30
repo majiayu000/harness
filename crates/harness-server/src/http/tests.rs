@@ -1130,12 +1130,32 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(output.summary, "runtime done");
     let events = store.runtime_events_for(&runtime_job.id).await?;
     assert_eq!(events[0].event_type, "RuntimeJobClaimed");
-    assert_eq!(events[1].event_type, "ActivityResultReady");
+    assert_eq!(events[1].event_type, "RuntimePromptPrepared");
+    assert_eq!(
+        events[1].event["prompt_packet"]["schema"],
+        "harness.runtime.prompt_packet.v1"
+    );
+    assert_eq!(
+        events[1].event["prompt_packet"]["required_structured_output"]["validation_commands"],
+        "Validation commands run and their results."
+    );
+    let prompt_packet_digest = events[1].event["prompt_packet_digest"]
+        .as_str()
+        .expect("prompt packet digest should be recorded");
+    assert_eq!(prompt_packet_digest.len(), 64);
+    assert_eq!(events[2].event_type, "ActivityResultReady");
+    let prompt_artifact = output
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "runtime_prompt_packet")
+        .expect("runtime output should reference the prompt packet");
+    assert_eq!(prompt_artifact.artifact["digest"], prompt_packet_digest);
     let prompts = agent.prompts.lock().await;
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains("You are executing a Harness workflow runtime job."));
     assert!(prompts[0].contains("Activity: implement_issue"));
-    assert!(prompts[0].contains("Runtime profile metadata:"));
+    assert!(prompts[0].contains("Prompt packet:"));
+    assert!(prompts[0].contains("required_structured_output"));
     assert!(prompts[0].contains("gpt-runtime"));
     drop(prompts);
     let models = agent.models.lock().await;

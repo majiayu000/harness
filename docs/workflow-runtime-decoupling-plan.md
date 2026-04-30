@@ -52,6 +52,8 @@ Implemented now:
 - workflow runtime workers enforce profile `max_turns` as a workflow-instance runtime turn budget
 - server runtime workers pass Codex runtime profile `approval_policy` into Codex exec and
   app-server requests
+- server runtime workers build a structured prompt packet for agent jobs and record
+  `RuntimePromptPrepared` with a SHA-256 packet digest before the agent turn starts
 
 Still intentionally not moved yet:
 
@@ -274,6 +276,14 @@ Every runtime job receives a complete prompt packet:
 - required structured output schema
 
 The runtime should persist a prompt digest or redacted prompt packet for audit and recovery.
+
+Implemented now:
+
+- server-owned runtime jobs build `harness.runtime.prompt_packet.v1`
+- the generated prompt is derived from that packet instead of separate ad hoc prompt sections
+- runtime events persist `RuntimePromptPrepared` with `prompt_packet_digest` and the redacted packet
+- agent-backed activity results include a `runtime_prompt_packet` artifact that references the
+  digest used for the turn
 
 ## Migration Plan
 

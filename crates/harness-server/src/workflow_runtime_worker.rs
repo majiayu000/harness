@@ -11,6 +11,7 @@ use harness_workflow::runtime::{
     WorkflowInstance, WorkflowSubject,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -102,8 +103,12 @@ impl ServerRuntimeJobExecutor {
         let runtime_profile = runtime_profile_for_job(&job)?;
         let sandbox_mode = runtime_profile_sandbox_mode(&runtime_profile)?;
         let approval_policy = runtime_profile_approval_policy(&runtime_profile, job.runtime_kind)?;
-        let prompt =
-            build_runtime_job_prompt(&job, workflow.as_ref(), &project_root, &runtime_profile);
+        let prompt_packet =
+            build_runtime_prompt_packet(&job, workflow.as_ref(), &project_root, &runtime_profile);
+        let prompt_packet_digest = prompt_packet_digest(&prompt_packet);
+        self.record_prompt_packet_prepared(&job, &prompt_packet, &prompt_packet_digest)
+            .await?;
+        let prompt = build_runtime_job_prompt(&prompt_packet);
         let thread_id = self
             .state
             .core
@@ -151,6 +156,7 @@ impl ServerRuntimeJobExecutor {
             &turn_id,
             agent_name,
             &project_root,
+            &prompt_packet_digest,
         ))
     }
 
@@ -181,6 +187,28 @@ impl ServerRuntimeJobExecutor {
             )),
             _ => Ok(None),
         }
+    }
+
+    async fn record_prompt_packet_prepared(
+        &self,
+        job: &RuntimeJob,
+        prompt_packet: &Value,
+        prompt_packet_digest: &str,
+    ) -> anyhow::Result<()> {
+        let Some(store) = self.state.core.workflow_runtime_store.as_ref() else {
+            return Ok(());
+        };
+        store
+            .record_runtime_event(
+                &job.id,
+                "RuntimePromptPrepared",
+                json!({
+                    "prompt_packet_digest": prompt_packet_digest,
+                    "prompt_packet": prompt_packet,
+                }),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn execute_start_child_workflow(
@@ -474,17 +502,79 @@ fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&'static str
     }
 }
 
-fn build_runtime_job_prompt(
+fn build_runtime_prompt_packet(
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
     project_root: &Path,
     runtime_profile: &RuntimeProfile,
-) -> String {
-    let workflow_json = workflow
-        .map(pretty_json)
-        .unwrap_or_else(|| "null".to_string());
-    let command_json = pretty_json(&job.input);
-    let profile_json = pretty_json(runtime_profile);
+) -> Value {
+    json!({
+        "schema": "harness.runtime.prompt_packet.v1",
+        "runtime_job": {
+            "id": job.id,
+            "command_id": job.command_id,
+            "runtime_kind": job.runtime_kind,
+            "runtime_profile": job.runtime_profile,
+            "activity": activity_name(job),
+        },
+        "runtime_profile": runtime_profile,
+        "project": {
+            "root": project_root.display().to_string(),
+            "repo": workflow
+                .and_then(|workflow| workflow.data.get("repo"))
+                .and_then(Value::as_str)
+                .or_else(|| job.input.get("repo").and_then(Value::as_str)),
+        },
+        "workflow": workflow.map(|workflow| {
+            json!({
+                "id": workflow.id,
+                "definition_id": workflow.definition_id,
+                "definition_version": workflow.definition_version,
+                "state": workflow.state,
+                "version": workflow.version,
+                "subject": workflow.subject,
+                "parent_workflow_id": workflow.parent_workflow_id,
+                "data": workflow.data,
+            })
+        }),
+        "command_input": job.input,
+        "runtime_contract": {
+            "orchestration_source": "workflow_database",
+            "agent_must_not_edit_workflow_tables": true,
+            "agent_executes_repository_and_github_work": true,
+            "follow_project_instructions": true,
+        },
+        "required_structured_output": {
+            "summary": "Concise final activity summary.",
+            "changed_files": "Files changed by this runtime activity, if any.",
+            "validation_commands": "Validation commands run and their results.",
+            "remaining_blockers": "Any blockers that still require follow-up.",
+        },
+    })
+}
+
+fn build_runtime_job_prompt(prompt_packet: &Value) -> String {
+    let prompt_packet_json = pretty_json(prompt_packet);
+    let activity = prompt_packet
+        .get("runtime_job")
+        .and_then(|runtime_job| runtime_job.get("activity"))
+        .and_then(Value::as_str)
+        .unwrap_or("workflow_activity");
+    let project_root = prompt_packet
+        .get("project")
+        .and_then(|project| project.get("root"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let runtime_profile = prompt_packet
+        .get("runtime_job")
+        .and_then(|runtime_job| runtime_job.get("runtime_profile"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let job_id = prompt_packet
+        .get("runtime_job")
+        .and_then(|runtime_job| runtime_job.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     format!(
         "You are executing a Harness workflow runtime job.\n\n\
          Runtime contract:\n\
@@ -496,13 +586,23 @@ fn build_runtime_job_prompt(
          Runtime job id: {job_id}\n\
          Runtime profile: {runtime_profile}\n\
          Activity: {activity}\n\n\
-         Runtime profile metadata:\n{profile_json}\n\n\
-         Workflow instance:\n{workflow_json}\n\n\
-         Runtime command input:\n{command_json}\n",
-        project_root = project_root.display(),
-        job_id = job.id.as_str(),
-        runtime_profile = job.runtime_profile.as_str(),
-        activity = activity_name(job),
+         Prompt packet:\n{prompt_packet_json}\n",
+    )
+}
+
+fn prompt_packet_digest(prompt_packet: &Value) -> String {
+    let bytes = serde_json::to_vec(prompt_packet).unwrap_or_else(|_| Vec::new());
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn workflow_prompt_artifact(prompt_packet_digest: &str) -> ActivityArtifact {
+    ActivityArtifact::new(
+        "runtime_prompt_packet",
+        json!({
+            "digest": prompt_packet_digest,
+            "schema": "harness.runtime.prompt_packet.v1",
+        }),
     )
 }
 
@@ -568,6 +668,7 @@ fn activity_result_from_turn(
     turn_id: &TurnId,
     agent_name: &str,
     project_root: &Path,
+    prompt_packet_digest: &str,
 ) -> ActivityResult {
     let activity = activity_name(job);
     let summary = last_agent_summary(items).unwrap_or_else(|| match status {
@@ -586,6 +687,7 @@ fn activity_result_from_turn(
         ),
     };
     result
+        .with_artifact(workflow_prompt_artifact(prompt_packet_digest))
         .with_artifact(ActivityArtifact::new(
             "runtime_turn",
             json!({
