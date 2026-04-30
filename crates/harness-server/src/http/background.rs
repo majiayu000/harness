@@ -83,6 +83,31 @@ fn build_recovered_request(
     req
 }
 
+async fn record_runtime_recovery_requested(
+    state: &Arc<AppState>,
+    project_root: &std::path::Path,
+    task: &task_runner::TaskState,
+    issue_number: Option<u64>,
+    recovery_kind: &'static str,
+) {
+    let Some(issue_number) = issue_number else {
+        return;
+    };
+    let reason = format!("startup {recovery_kind} recovery requested redispatch");
+    crate::workflow_runtime_repo_backlog::record_stale_active_workflow(
+        state.core.workflow_runtime_store.as_deref(),
+        crate::workflow_runtime_repo_backlog::StaleWorkflowRuntimeContext {
+            project_root,
+            repo: task.repo.as_deref(),
+            issue_number,
+            active_task_id: Some(task.id.as_str()),
+            observed_state: task.status.as_ref(),
+            reason: &reason,
+        },
+    )
+    .await;
+}
+
 fn task_has_restart_safe_prompt(task: &task_runner::TaskState) -> bool {
     let mut req = task_runner::CreateTaskRequest::default();
     if let Some(ref settings) = task.request_settings {
@@ -1286,6 +1311,14 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     }
                 };
                 let project_id = canonical.to_string_lossy().into_owned();
+                record_runtime_recovery_requested(
+                    &state,
+                    &canonical,
+                    &task,
+                    issue_num,
+                    "checkpoint",
+                )
+                .await;
 
                 let permit = match state
                     .concurrency
@@ -1529,6 +1562,7 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
                 }
             };
             let project_id = canonical.to_string_lossy().into_owned();
+            record_runtime_recovery_requested(&state, &canonical, &task, issue, "orphan").await;
 
             let queue = match recovery_queue_domain(task.task_kind) {
                 task_routes::QueueDomain::Primary => state.concurrency.task_queue.clone(),

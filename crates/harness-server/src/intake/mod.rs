@@ -474,6 +474,55 @@ fn ready_issues(
         .collect()
 }
 
+async fn record_runtime_open_issue_if_missing(
+    state: &Arc<AppState>,
+    project_root: &std::path::Path,
+    project_id: &str,
+    repo: &str,
+    issue: &IncomingIssue,
+) {
+    let Some(runtime_store) = state.core.workflow_runtime_store.as_deref() else {
+        return;
+    };
+    let Some(issue_number) = issue.external_id.parse::<u64>().ok() else {
+        return;
+    };
+
+    let exists = if let Some(workflows) = state.core.issue_workflow_store.as_ref() {
+        match workflows
+            .get_by_issue(project_id, Some(repo), issue_number)
+            .await
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    repo,
+                    issue = issue_number,
+                    "intake: failed to check issue workflow before repo backlog runtime write: {error}"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if exists {
+        return;
+    }
+
+    crate::workflow_runtime_repo_backlog::record_open_issue_without_workflow(
+        Some(runtime_store),
+        crate::workflow_runtime_repo_backlog::OpenIssueRuntimeContext {
+            project_root,
+            repo: Some(repo),
+            issue_number,
+            issue_url: issue.url.as_deref(),
+        },
+    )
+    .await;
+}
+
 /// Run sprint planner + DAG-based slot-filling execution for a single repo.
 async fn run_repo_sprint(
     state: &Arc<AppState>,
@@ -742,6 +791,9 @@ async fn run_repo_sprint(
                 completed.insert(issue_num);
                 continue;
             };
+
+            record_runtime_open_issue_if_missing(state, &project_root, &project_id, repo, issue)
+                .await;
 
             let placeholder_id = harness_core::types::TaskId(format!("pending-{ext_id}"));
             if let Err(e) = source.mark_dispatched(&ext_id, &placeholder_id).await {

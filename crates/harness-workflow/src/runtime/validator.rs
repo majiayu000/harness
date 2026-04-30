@@ -163,6 +163,45 @@ impl TransitionAllowlist {
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
     }
+
+    pub fn repo_backlog_defaults() -> Self {
+        use WorkflowCommandType::{
+            EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
+            RequestOperatorAttention, StartChildWorkflow, Wait,
+        };
+
+        Self::default()
+            .allow(
+                "idle",
+                "dispatching",
+                [StartChildWorkflow, EnqueueActivity, Wait],
+            )
+            .allow("idle", "reconciling", [EnqueueActivity, Wait])
+            .allow(
+                "scanning",
+                "dispatching",
+                [StartChildWorkflow, EnqueueActivity, Wait],
+            )
+            .allow("scanning", "reconciling", [EnqueueActivity, Wait])
+            .allow(
+                "dispatching",
+                "dispatching",
+                [StartChildWorkflow, EnqueueActivity, Wait],
+            )
+            .allow("dispatching", "reconciling", [EnqueueActivity, Wait])
+            .allow("reconciling", "reconciling", [EnqueueActivity, Wait])
+            .allow(
+                "reconciling",
+                "dispatching",
+                [StartChildWorkflow, EnqueueActivity, Wait],
+            )
+            .allow("dispatching", "idle", [Wait])
+            .allow("reconciling", "idle", [Wait])
+            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
+            .allow_from_any("done", [MarkDone])
+            .allow_from_any("failed", [MarkFailed])
+            .allow_from_any("cancelled", [MarkCancelled])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +306,10 @@ impl DecisionValidator {
 
     pub fn github_issue_pr() -> Self {
         Self::new(TransitionAllowlist::github_issue_pr_defaults())
+    }
+
+    pub fn repo_backlog() -> Self {
+        Self::new(TransitionAllowlist::repo_backlog_defaults())
     }
 
     pub fn validate(

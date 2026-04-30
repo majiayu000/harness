@@ -8,6 +8,7 @@ pub mod bus;
 pub mod model;
 pub mod plan_issue;
 pub mod pr_feedback;
+pub mod repo_backlog;
 pub mod store;
 pub mod validator;
 
@@ -28,6 +29,12 @@ pub use plan_issue::{
 pub use pr_feedback::{
     build_pr_detected_decision, build_pr_feedback_decision, PrDetectedDecisionInput,
     PrFeedbackDecisionInput, PrFeedbackDecisionOutput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
+};
+pub use repo_backlog::{
+    build_merged_pr_decision, build_open_issue_without_workflow_decision,
+    build_stale_active_workflow_decision, repo_backlog_workflow_id, MergedPrDecisionInput,
+    OpenIssueDecisionInput, RepoBacklogDecisionOutput, RepoBacklogWorkflowAction,
+    StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID,
 };
 pub use store::WorkflowRuntimeStore;
 pub use validator::{

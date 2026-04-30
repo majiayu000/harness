@@ -24,11 +24,12 @@ Implemented now:
 - `ReplanCompleted` event recording after a successful replan
 - PR detection durable binding through `PrDetected` / `bind_pr`
 - PR feedback decisions for waiting, addressing feedback, and ready-to-merge
+- repo backlog decisions for issue discovery, merged PR reconciliation, and stale workflow recovery
 
 Still intentionally not moved yet:
 
 - existing task runner ownership of process execution
-- repo backlog polling
+- repo backlog polling as the primary controller
 - runtime worker claiming of outbox commands
 - workflow-first dashboard rendering
 
@@ -341,7 +342,25 @@ Tests:
 
 ### Phase 4: Repo Backlog Workflow
 
-Move GitHub polling and reconciliation into `repo_backlog`.
+Status: partially implemented.
+
+The current branch records repo backlog decisions into the workflow runtime while keeping the
+existing intake poller, sprint planner, and reconciliation loop as the execution path.
+
+Implemented now:
+
+- open GitHub issues without an existing issue workflow record `IssueDiscovered` and emit a
+  validated `start_issue_workflow` child workflow command
+- externally merged PRs record `PrMerged`, emit `mark_bound_issue_done`, and update the bound
+  issue workflow to `done`
+- startup recovery of stale active issue workflows records `RecoveryRequested` and emits
+  `recover_issue_workflow`
+
+Still intentionally not moved yet:
+
+- GitHub polling still runs through the existing intake source implementations
+- sprint planning still uses the current task queue path
+- command outbox rows are not yet claimed by runtime workers
 
 Tests:
 

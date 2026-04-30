@@ -6,9 +6,13 @@ use super::model::{
 };
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
+    build_merged_pr_decision, build_open_issue_without_workflow_decision,
     build_plan_issue_decision, build_pr_detected_decision, build_pr_feedback_decision,
-    InMemoryWorkflowBus, PlanIssueDecisionInput, PlanIssueWorkflowAction, PrDetectedDecisionInput,
-    PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction, WorkflowRuntimeStore,
+    build_stale_active_workflow_decision, InMemoryWorkflowBus, MergedPrDecisionInput,
+    OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
+    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
+    RepoBacklogWorkflowAction, StaleWorkflowDecisionInput, WorkflowRuntimeStore,
+    REPO_BACKLOG_DEFINITION_ID,
 };
 use chrono::{Duration, Utc};
 use harness_core::db::resolve_database_url;
@@ -20,6 +24,15 @@ fn issue_instance(state: &str) -> WorkflowInstance {
         1,
         state,
         WorkflowSubject::new("issue", "123"),
+    )
+}
+
+fn repo_backlog_instance(state: &str) -> WorkflowInstance {
+    WorkflowInstance::new(
+        REPO_BACKLOG_DEFINITION_ID,
+        1,
+        state,
+        WorkflowSubject::new("repo", "owner/repo"),
     )
 }
 
@@ -205,6 +218,115 @@ fn pr_feedback_decision_marks_ready_to_merge() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("ready-to-merge decision should validate");
+}
+
+#[test]
+fn repo_backlog_open_issue_without_workflow_starts_child_workflow() {
+    let instance = repo_backlog_instance("idle");
+    let output = build_open_issue_without_workflow_decision(
+        &instance,
+        OpenIssueDecisionInput {
+            repo: Some("owner/repo"),
+            issue_number: 42,
+            issue_url: Some("https://github.com/owner/repo/issues/42"),
+        },
+    );
+
+    assert_eq!(output.action, RepoBacklogWorkflowAction::StartIssueWorkflow);
+    assert_eq!(output.decision.decision, "start_issue_workflow");
+    assert_eq!(output.decision.next_state, "dispatching");
+    assert_eq!(
+        output.decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("repo backlog start decision should validate");
+}
+
+#[test]
+fn repo_backlog_merged_pr_marks_bound_issue_done() {
+    let instance = repo_backlog_instance("idle");
+    let output = build_merged_pr_decision(
+        &instance,
+        MergedPrDecisionInput {
+            repo: Some("owner/repo"),
+            issue_number: Some(42),
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+        },
+    );
+
+    assert_eq!(output.action, RepoBacklogWorkflowAction::MarkBoundIssueDone);
+    assert_eq!(output.decision.decision, "mark_bound_issue_done");
+    assert_eq!(output.decision.next_state, "reconciling");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("mark_bound_issue_done")
+    );
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("repo backlog merged PR decision should validate");
+}
+
+#[test]
+fn repo_backlog_merged_pr_can_reconcile_after_dispatch() {
+    let instance = repo_backlog_instance("dispatching");
+    let output = build_merged_pr_decision(
+        &instance,
+        MergedPrDecisionInput {
+            repo: Some("owner/repo"),
+            issue_number: Some(42),
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+        },
+    );
+
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("repo backlog can reconcile after dispatching work");
+}
+
+#[test]
+fn repo_backlog_stale_workflow_requests_recovery() {
+    let instance = repo_backlog_instance("idle");
+    let output = build_stale_active_workflow_decision(
+        &instance,
+        StaleWorkflowDecisionInput {
+            repo: Some("owner/repo"),
+            issue_number: 42,
+            active_task_id: Some("task-1"),
+            observed_state: "implementing",
+            reason: "active task disappeared during startup reconciliation",
+        },
+    );
+
+    assert_eq!(output.action, RepoBacklogWorkflowAction::RequestRecovery);
+    assert_eq!(output.decision.decision, "request_workflow_recovery");
+    assert_eq!(output.decision.next_state, "reconciling");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("recover_issue_workflow")
+    );
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("repo backlog recovery decision should validate");
 }
 
 fn leased_issue_instance(state: &str) -> WorkflowInstance {
