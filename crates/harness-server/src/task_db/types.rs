@@ -43,7 +43,8 @@ pub struct TaskCheckpoint {
     pub plan_output: Option<String>,
     /// Non-null once a PR has been created (most critical for duplicate-PR prevention).
     pub pr_url: Option<String>,
-    /// Last completed phase: `triage_done` | `plan_done` | `pr_created`.
+    /// Last completed phase: `triage_done` | `plan_done` | `pr_created` |
+    /// `rebase_pushed` | `rebase_skipped`.
     pub last_phase: String,
     pub updated_at: String,
 }

@@ -40,6 +40,7 @@ pub(crate) enum ImplementationOutcome {
         pr_num: Option<u64>,
         created_issue_num: Option<u64>,
         pushed_commit: Option<bool>,
+        review_prep: Option<prompts::PrReviewPrepOutcome>,
     },
 }
 
@@ -51,22 +52,28 @@ pub(crate) fn parse_implementation_outcome(output: &str) -> Result<Implementatio
     let pr_num = pr_url.as_deref().and_then(prompts::extract_pr_number);
     let created_issue_num = prompts::parse_created_issue_number(output);
     let pushed_commit = prompts::parse_pushed_commit(output)?;
+    let review_prep = prompts::parse_pr_review_prep_outcome(output);
     Ok(ImplementationOutcome::ParsedPr {
         pr_url,
         pr_num,
         created_issue_num,
         pushed_commit,
+        review_prep,
     })
 }
 
 fn resolve_pushed_commit_flag(
     is_direct_pr_check: bool,
     pushed_commit: Option<bool>,
+    review_prep: Option<&prompts::PrReviewPrepOutcome>,
 ) -> Result<bool, String> {
-    match (is_direct_pr_check, pushed_commit) {
-        (_, Some(pushed_commit)) => Ok(pushed_commit),
-        (false, None) => Ok(false),
-        (true, None) => Err(
+    match (pushed_commit, review_prep) {
+        (Some(pushed_commit), _) => Ok(pushed_commit),
+        (None, Some(prompts::PrReviewPrepOutcome::RebasePushed)) => Ok(true),
+        (None, Some(prompts::PrReviewPrepOutcome::RebaseSkipped))
+        | (None, Some(prompts::PrReviewPrepOutcome::RebaseConflict { .. })) => Ok(false),
+        (None, None) if !is_direct_pr_check => Ok(false),
+        (None, None) => Err(
             "missing required PUSHED_COMMIT marker in PR-check output; refusing to skip freshness gate"
                 .to_string(),
         ),
@@ -124,6 +131,7 @@ pub(crate) enum ImplementOutcome {
         pr_url: Option<String>,
         pr_num: u64,
         implementation_pushed_commit: bool,
+        review_prep: Option<prompts::PrReviewPrepOutcome>,
         context_items: Vec<ContextItem>,
         #[allow(dead_code)]
         turn_timeout: Duration,
@@ -146,7 +154,7 @@ pub(crate) async fn run_implement_phase(
     req: &CreateTaskRequest,
     server_config: &harness_core::config::HarnessConfig,
     project_config: &harness_core::config::project::ProjectConfig,
-    review_config: &harness_core::config::agents::AgentReviewConfig,
+    _review_config: &harness_core::config::agents::AgentReviewConfig,
     interceptors: &Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
     events: &Arc<harness_observe::event_store::EventStore>,
     skills: &Arc<tokio::sync::RwLock<harness_skills::store::SkillStore>>,
@@ -159,6 +167,7 @@ pub(crate) async fn run_implement_phase(
     project_root: &Path,
     plan_output: Option<String>,
     resumed_pr_url: Option<String>,
+    resumed_review_prep: Option<prompts::PrReviewPrepOutcome>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     turn_timeout: Duration,
     effective_max_turns: Option<u32>,
@@ -209,13 +218,7 @@ pub(crate) async fn run_implement_phase(
             base
         }
     } else if let Some(pr) = req.pr {
-        prompts::check_existing_pr(
-            pr,
-            &review_config.review_bot_command,
-            repo_slug,
-            &review_config.reviewer_name,
-            false,
-        )
+        prompts::prepare_pr_for_review(pr, repo_slug)
     } else {
         prompts::implement_from_prompt(req.prompt.as_deref().unwrap_or_default(), git)
     };
@@ -343,7 +346,12 @@ pub(crate) async fn run_implement_phase(
 
     // Duplicate-PR prevention guard: if checkpoint shows PR already created, skip the
     // implement agent entirely to avoid opening a second PR on resume.
-    let (pr_url, pr_num, pushed_commit): (Option<String>, u64, bool) = 'implement: {
+    let (pr_url, pr_num, pushed_commit, review_prep): (
+        Option<String>,
+        u64,
+        bool,
+        Option<prompts::PrReviewPrepOutcome>,
+    ) = 'implement: {
         if let Some(pr_str) = resumed_pr_url {
             tracing::info!(
                 task_id = %task_id,
@@ -376,7 +384,7 @@ pub(crate) async fn run_implement_phase(
                 ));
             })
             .await?;
-            break 'implement (Some(pr_str), n, false);
+            break 'implement (Some(pr_str), n, false, resumed_review_prep);
         }
 
         let impl_phase_start = Instant::now();
@@ -806,7 +814,7 @@ pub(crate) async fn run_implement_phase(
             return Ok(ImplementOutcome::Done);
         }
 
-        let (pr_url, pr_num, created_issue_num, pushed_commit) =
+        let (pr_url, pr_num, created_issue_num, pushed_commit, review_prep) =
             match parse_implementation_outcome(&output) {
                 Ok(ImplementationOutcome::PlanIssue(plan_issue)) => {
                     if let (Some(workflows), Some(issue_number)) =
@@ -894,7 +902,14 @@ pub(crate) async fn run_implement_phase(
                     pr_num,
                     created_issue_num,
                     pushed_commit,
-                }) => (pr_url, pr_num, created_issue_num, pushed_commit),
+                    review_prep,
+                }) => (
+                    pr_url,
+                    pr_num,
+                    created_issue_num,
+                    pushed_commit,
+                    review_prep,
+                ),
                 Err(parse_err) => {
                     tracing::error!(
                         task_id = %task_id,
@@ -952,22 +967,18 @@ pub(crate) async fn run_implement_phase(
                 }
             };
 
-        let pushed_commit = match resolve_pushed_commit_flag(req.pr.is_some(), pushed_commit) {
-            Ok(pushed_commit) => pushed_commit,
-            Err(parse_err) => {
-                tracing::error!(
-                    task_id = %task_id,
-                    parse_error = %parse_err,
-                    "implementation omitted required PR-check structured output"
-                );
+        if let Some(pr_number) = req.pr {
+            let Some(review_prep) = review_prep.as_ref() else {
+                let error =
+                    format!("PR #{pr_number} preparation produced no rebase outcome sentinel");
                 mutate_and_persist(store, task_id, |s| {
                     s.status = TaskStatus::Failed;
                     s.turn = 2;
-                    s.error = Some(parse_err.clone());
+                    s.error = Some(error.clone());
                     s.rounds.push(RoundResult::new(
                         1,
                         "implement",
-                        "malformed_output",
+                        "missing_rebase_outcome",
                         if output.is_empty() {
                             None
                         } else {
@@ -984,7 +995,7 @@ pub(crate) async fn run_implement_phase(
                     "implement",
                     "task_implement",
                     Decision::Block,
-                    Some(parse_err.clone()),
+                    Some(error.clone()),
                     None,
                     Some(impl_telemetry.clone()),
                     None,
@@ -997,24 +1008,99 @@ pub(crate) async fn run_implement_phase(
                 if let Err(error) = events.log(&event).await {
                     tracing::warn!("failed to log task_implement event: {error}");
                 }
+                store.log_event(crate::event_replay::TaskEvent::Failed {
+                    task_id: task_id.0.clone(),
+                    ts: crate::event_replay::now_ts(),
+                    reason: "missing_rebase_outcome".to_string(),
+                });
                 tracing::info!(
-                    task_id = %task_id,
-                    status = "failed",
-                    turns = 2,
-                    pr_url = tracing::field::Empty,
-                    total_elapsed_secs = task_start.elapsed().as_secs(),
-                    "task_completed"
+                task_id = %task_id,
+                status = "failed",
+                turns = 2,
+                pr_url = tracing::field::Empty,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
                 );
                 return Ok(ImplementOutcome::Done);
-            }
-        };
+            };
+            tracing::debug!(
+                pr = pr_number,
+                ?review_prep,
+                "parsed pr review prep outcome"
+            );
+        }
+
+        let pushed_commit =
+            match resolve_pushed_commit_flag(req.pr.is_some(), pushed_commit, review_prep.as_ref())
+            {
+                Ok(pushed_commit) => pushed_commit,
+                Err(parse_err) => {
+                    tracing::error!(
+                        task_id = %task_id,
+                        parse_error = %parse_err,
+                        "implementation omitted required PR-check structured output"
+                    );
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.turn = 2;
+                        s.error = Some(parse_err.clone());
+                        s.rounds.push(RoundResult::new(
+                            1,
+                            "implement",
+                            "malformed_output",
+                            if output.is_empty() {
+                                None
+                            } else {
+                                Some(output.clone())
+                            },
+                            Some(impl_telemetry.clone()),
+                            None,
+                        ));
+                    })
+                    .await?;
+                    let event = build_task_event(
+                        task_id,
+                        1,
+                        "implement",
+                        "task_implement",
+                        Decision::Block,
+                        Some(parse_err.clone()),
+                        None,
+                        Some(impl_telemetry.clone()),
+                        None,
+                        if output.is_empty() {
+                            None
+                        } else {
+                            Some(output.clone())
+                        },
+                    );
+                    if let Err(error) = events.log(&event).await {
+                        tracing::warn!("failed to log task_implement event: {error}");
+                    }
+                    tracing::info!(
+                        task_id = %task_id,
+                        status = "failed",
+                        turns = 2,
+                        pr_url = tracing::field::Empty,
+                        total_elapsed_secs = task_start.elapsed().as_secs(),
+                        "task_completed"
+                    );
+                    return Ok(ImplementOutcome::Done);
+                }
+            };
 
         mutate_and_persist(store, task_id, |s| {
             s.pr_url = pr_url.clone();
             s.rounds.push(RoundResult::new(
                 1,
                 "implement",
-                if pr_num.is_some() {
+                if let Some(review_prep) = review_prep.as_ref() {
+                    match review_prep {
+                        prompts::PrReviewPrepOutcome::RebasePushed => "rebase_pushed",
+                        prompts::PrReviewPrepOutcome::RebaseSkipped => "rebase_skipped",
+                        prompts::PrReviewPrepOutcome::RebaseConflict { .. } => "rebase_conflict",
+                    }
+                } else if pr_num.is_some() {
                     "pr_created"
                 } else {
                     "no_pr"
@@ -1092,8 +1178,14 @@ pub(crate) async fn run_implement_phase(
         // Write PR checkpoint immediately after pr_url is persisted.
         // This is the most critical checkpoint — it prevents duplicate PR creation on resume.
         if let Some(pr_url_str) = pr_url.as_deref() {
+            let checkpoint_phase = match review_prep.as_ref() {
+                Some(prompts::PrReviewPrepOutcome::RebasePushed) => "rebase_pushed",
+                Some(prompts::PrReviewPrepOutcome::RebaseSkipped) => "rebase_skipped",
+                Some(prompts::PrReviewPrepOutcome::RebaseConflict { .. }) => "rebase_conflict",
+                None => "pr_created",
+            };
             if let Err(e) = store
-                .write_checkpoint(task_id, None, None, Some(pr_url_str), "pr_created")
+                .write_checkpoint(task_id, None, None, Some(pr_url_str), checkpoint_phase)
                 .await
             {
                 tracing::warn!(task_id = %task_id, "failed to write pr checkpoint: {e}");
@@ -1232,13 +1324,14 @@ pub(crate) async fn run_implement_phase(
             tracing::warn!("failed to log task_implement event: {error}");
         }
 
-        (pr_url, pr_num, pushed_commit)
+        (pr_url, pr_num, pushed_commit, review_prep)
     }; // end 'implement
 
     Ok(ImplementOutcome::Proceed {
         pr_url,
         pr_num,
         implementation_pushed_commit: pushed_commit,
+        review_prep,
         context_items,
         turn_timeout,
         initial_allowed_tools,
@@ -1292,6 +1385,59 @@ mod tests {
                 pr_num: Some(42),
                 created_issue_num: None,
                 pushed_commit: None,
+                review_prep: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_implementation_outcome_extracts_rebase_pushed() {
+        let output =
+            "Prepared.\nREBASE_PUSHED\nPR_URL=https://github.com/majiayu000/harness/pull/42";
+        let parsed = parse_implementation_outcome(output).expect("rebase prep should parse");
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::ParsedPr {
+                pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
+                pr_num: Some(42),
+                created_issue_num: None,
+                pushed_commit: None,
+                review_prep: Some(prompts::PrReviewPrepOutcome::RebasePushed),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_implementation_outcome_extracts_rebase_skipped() {
+        let output =
+            "Prepared.\nREBASE_SKIPPED\nPR_URL=https://github.com/majiayu000/harness/pull/42";
+        let parsed = parse_implementation_outcome(output).expect("rebase prep should parse");
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::ParsedPr {
+                pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
+                pr_num: Some(42),
+                created_issue_num: None,
+                pushed_commit: None,
+                review_prep: Some(prompts::PrReviewPrepOutcome::RebaseSkipped),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_implementation_outcome_extracts_rebase_conflict() {
+        let output = "Prepared.\nREBASE_CONFLICT paths=src/lib.rs,src/main.rs\nPR_URL=https://github.com/majiayu000/harness/pull/42";
+        let parsed = parse_implementation_outcome(output).expect("rebase prep should parse");
+        assert_eq!(
+            parsed,
+            ImplementationOutcome::ParsedPr {
+                pr_url: Some("https://github.com/majiayu000/harness/pull/42".to_string()),
+                pr_num: Some(42),
+                created_issue_num: None,
+                pushed_commit: None,
+                review_prep: Some(prompts::PrReviewPrepOutcome::RebaseConflict {
+                    paths: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                }),
             }
         );
     }
@@ -1308,6 +1454,7 @@ mod tests {
                 pr_num: Some(42),
                 created_issue_num: None,
                 pushed_commit: Some(true),
+                review_prep: None,
             }
         );
     }
@@ -1324,14 +1471,34 @@ mod tests {
 
     #[test]
     fn resolve_pushed_commit_flag_requires_marker_for_direct_pr_checks() {
-        assert_eq!(resolve_pushed_commit_flag(true, Some(true)), Ok(true));
-        assert_eq!(resolve_pushed_commit_flag(false, None), Ok(false));
+        assert_eq!(resolve_pushed_commit_flag(true, Some(true), None), Ok(true));
+        assert_eq!(resolve_pushed_commit_flag(false, None, None), Ok(false));
         assert_eq!(
-            resolve_pushed_commit_flag(true, None),
+            resolve_pushed_commit_flag(true, None, None),
             Err(
                 "missing required PUSHED_COMMIT marker in PR-check output; refusing to skip freshness gate"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn resolve_pushed_commit_flag_uses_rebase_prep_for_direct_pr_checks() {
+        assert_eq!(
+            resolve_pushed_commit_flag(
+                true,
+                None,
+                Some(&prompts::PrReviewPrepOutcome::RebasePushed)
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            resolve_pushed_commit_flag(
+                true,
+                None,
+                Some(&prompts::PrReviewPrepOutcome::RebaseSkipped)
+            ),
+            Ok(false)
         );
     }
 
