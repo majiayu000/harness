@@ -36,6 +36,7 @@ Implemented now:
 - runtime command dispatch can select runtime profiles per workflow definition
 - runtime profiles carry model and execution metadata into runtime jobs
 - server runtime workers pass runtime profile model overrides into agent turns
+- server turn lifecycle enforces runtime profile `timeout_secs` as an execution deadline
 
 Still intentionally not moved yet:
 
@@ -605,7 +606,7 @@ Implemented now:
 - profile overrides inherit default metadata for fields they do not set
 - dispatcher persists the full selected `RuntimeProfile` into runtime job input
 - runtime worker includes the parsed profile metadata in the prompt packet
-- runtime worker passes `model` and adapter `timeout_secs` into the turn lifecycle request
+- runtime worker passes `model` and `timeout_secs` into the turn lifecycle request
 
 Still intentionally not moved yet:
 
@@ -619,6 +620,30 @@ Tests:
 - dispatch profile selector inherits and overrides metadata correctly
 - dispatcher preserves full profile metadata in runtime job input
 - server worker passes a runtime profile model override to the agent request
+
+### Phase 14: Runtime Profile Execution Timeout
+
+Status: partially implemented.
+
+Apply `timeout_secs` as a server lifecycle deadline so runtime profiles constrain ordinary
+`CodeAgent` streaming execution as well as adapter-based turns.
+
+Implemented now:
+
+- turn lifecycle builds a hard execution deadline from `TurnLifecycleOptions::timeout_secs`
+- deadline expiry marks the agent turn failed with a timeout-specific error item
+- runtime worker completion converts the failed turn into a failed `ActivityResult`
+- runtime job output records the timeout reason as structured activity error data
+
+Still intentionally not moved yet:
+
+- timeout policy is per runtime job, not a workflow-level retry or reducer budget
+- `max_turns` is not enforced by the workflow runtime yet
+- reasoning effort, sandbox, and approval policy still require request/runtime contract work
+
+Tests:
+
+- runtime worker fails a blocked registered agent when profile `timeout_secs` expires
 
 ## Test Strategy
 

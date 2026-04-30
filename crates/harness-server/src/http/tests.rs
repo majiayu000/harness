@@ -1110,6 +1110,101 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
 }
 
 #[tokio::test]
+async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", BlockingAgent::new());
+    let state =
+        make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
+            .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:125"),
+    )
+    .with_id("issue-125")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 125,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-2");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-default",
+        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+    );
+    runtime_profile.timeout_secs = Some(1);
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": workflow.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key,
+                "command": command.command,
+                "runtime_profile": runtime_profile,
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.failed, 1);
+    assert_eq!(tick.succeeded, 0);
+    assert_eq!(tick.cancelled, 0);
+    assert!(!tick.idle);
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    assert_eq!(
+        completed.status,
+        harness_workflow::runtime::RuntimeJobStatus::Failed
+    );
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "implement_issue");
+    assert_eq!(
+        output.status,
+        harness_workflow::runtime::ActivityStatus::Failed
+    );
+    assert!(
+        output
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")),
+        "failed runtime job should include timeout error: {output:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir()?;

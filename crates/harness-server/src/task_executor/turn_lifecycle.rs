@@ -214,6 +214,17 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut last_activity = Instant::now();
+    let execution_deadline = options
+        .timeout_secs
+        .map(|secs| Instant::now() + Duration::from_secs(secs.max(1)));
+    let execution_timeout = async {
+        if let Some(deadline) = execution_deadline {
+            tokio::time::sleep_until(deadline).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(execution_timeout);
 
     'outer: while execution_result.is_none() || !stream_closed {
         tokio::select! {
@@ -253,6 +264,19 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 execution_result = Some(Err(HarnessError::AgentExecution(format!(
                     "Agent stream stalled: no output for {}s",
                     stall_timeout.as_secs()
+                ))));
+                break 'outer;
+            }
+            _ = &mut execution_timeout, if execution_result.is_none() => {
+                let timeout_secs = options.timeout_secs.unwrap_or_default().max(1);
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    timeout_secs,
+                    "agent turn execution timeout reached"
+                );
+                execution_result = Some(Err(HarnessError::AgentExecution(format!(
+                    "Agent turn timed out after {timeout_secs}s"
                 ))));
                 break 'outer;
             }
