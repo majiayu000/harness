@@ -44,6 +44,29 @@ fn is_rust_workspace(project_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn rust_cargo_scope(project_root: &Path) -> &'static str {
+    if is_rust_workspace(project_root) {
+        "--workspace --all-targets"
+    } else {
+        "--all-targets"
+    }
+}
+
+fn rust_command_with_scoped_target(
+    subdir: &str,
+    args_before_separator: &str,
+    args_after_separator: Option<&str>,
+) -> String {
+    match args_after_separator {
+        Some(args_after_separator) => format!(
+            "base=\"${{CARGO_TARGET_DIR:-target}}\" && CARGO_TARGET_DIR=\"$base/{subdir}\" cargo {args_before_separator} -j 6 -- {args_after_separator}"
+        ),
+        None => format!(
+            "base=\"${{CARGO_TARGET_DIR:-target}}\" && CARGO_TARGET_DIR=\"$base/{subdir}\" cargo {args_before_separator} -j 6"
+        ),
+    }
+}
+
 // ── TypeScript helpers ────────────────────────────────────────────────────────
 
 /// Detect the package manager from lock-file presence.
@@ -196,14 +219,15 @@ pub fn validation_prompt_instructions(lang: Language, project_root: &Path) -> St
 pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<String> {
     match lang {
         Language::Rust => {
-            let scope = if is_rust_workspace(project_root) {
-                "--workspace --all-targets"
-            } else {
-                "--all-targets"
-            };
+            let scope = rust_cargo_scope(project_root);
             vec![
                 "cargo fmt --all".to_string(),
-                format!("cargo clippy {scope} -- -D warnings"),
+                rust_command_with_scoped_target("cargo-check", &format!("check {scope}"), None),
+                rust_command_with_scoped_target(
+                    "cargo-clippy",
+                    &format!("clippy {scope}"),
+                    Some("-D warnings"),
+                ),
             ]
         }
         Language::Go => vec![
@@ -251,9 +275,13 @@ pub fn default_pre_push_commands(lang: Language, project_root: &Path) -> Vec<Str
     match lang {
         Language::Rust => {
             if is_rust_workspace(project_root) {
-                vec!["cargo test --workspace".to_string()]
+                vec![rust_command_with_scoped_target(
+                    "cargo-test",
+                    "test --workspace",
+                    None,
+                )]
             } else {
-                vec!["cargo test".to_string()]
+                vec![rust_command_with_scoped_target("cargo-test", "test", None)]
             }
         }
         Language::Go => vec!["go test ./...".to_string()],
@@ -415,7 +443,8 @@ mod tests {
             cmds,
             vec![
                 "cargo fmt --all",
-                "cargo clippy --all-targets -- -D warnings"
+                "base=\"${CARGO_TARGET_DIR:-target}\" && CARGO_TARGET_DIR=\"$base/cargo-check\" cargo check --all-targets -j 6",
+                "base=\"${CARGO_TARGET_DIR:-target}\" && CARGO_TARGET_DIR=\"$base/cargo-clippy\" cargo clippy --all-targets -j 6 -- -D warnings"
             ]
         );
     }
@@ -429,10 +458,13 @@ mod tests {
         )
         .unwrap();
         let cmds = default_pre_commit_commands(Language::Rust, dir.path());
-        assert!(!cmds.iter().any(|c| c.contains("cargo check")));
+        assert!(cmds.iter().any(|c| c.contains("cargo-check")));
         assert!(cmds
             .iter()
-            .any(|c| c.contains("--workspace") && c.contains("cargo clippy")));
+            .any(|c| c.contains("--workspace") && c.contains("cargo check")));
+        assert!(cmds.iter().any(|c| {
+            c.contains("--workspace") && c.contains("cargo clippy") && c.contains("cargo-clippy")
+        }));
         assert!(cmds.iter().any(|c| c.contains("--all-targets")));
     }
 
@@ -445,7 +477,12 @@ mod tests {
         )
         .unwrap();
         let cmds = default_pre_push_commands(Language::Rust, dir.path());
-        assert_eq!(cmds, vec!["cargo test --workspace"]);
+        assert_eq!(
+            cmds,
+            vec![
+                "base=\"${CARGO_TARGET_DIR:-target}\" && CARGO_TARGET_DIR=\"$base/cargo-test\" cargo test --workspace -j 6"
+            ]
+        );
     }
 
     #[test]
@@ -453,7 +490,10 @@ mod tests {
         let dir = tmpdir();
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"foo\"").unwrap();
         let cmds = default_pre_push_commands(Language::Rust, dir.path());
-        assert_eq!(cmds, vec!["cargo test"]);
+        assert_eq!(
+            cmds,
+            vec!["base=\"${CARGO_TARGET_DIR:-target}\" && CARGO_TARGET_DIR=\"$base/cargo-test\" cargo test -j 6"]
+        );
     }
 
     // ── Go commands ───────────────────────────────────────────────────────────
@@ -648,7 +688,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             primary_test_command(dir.path()),
-            Some("cargo test --workspace".to_string())
+            Some(
+                "base=\"${CARGO_TARGET_DIR:-target}\" && CARGO_TARGET_DIR=\"$base/cargo-test\" cargo test --workspace -j 6"
+                    .to_string()
+            )
         );
     }
 
@@ -658,7 +701,10 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"foo\"").unwrap();
         assert_eq!(
             primary_test_command(dir.path()),
-            Some("cargo test".to_string())
+            Some(
+                "base=\"${CARGO_TARGET_DIR:-target}\" && CARGO_TARGET_DIR=\"$base/cargo-test\" cargo test -j 6"
+                    .to_string()
+            )
         );
     }
 
@@ -685,9 +731,12 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"foo\"").unwrap();
         let instructions = validation_prompt_instructions(Language::Rust, dir.path());
         assert!(instructions.contains("cargo fmt"));
-        assert!(!instructions.contains("cargo check"));
+        assert!(instructions.contains("cargo-check"));
+        assert!(instructions.contains("cargo check"));
         assert!(instructions.contains("cargo clippy"));
         assert!(instructions.contains("cargo test"));
+        assert!(!instructions.contains("cargo_fast"));
+        assert!(!instructions.contains("target-dir = "));
     }
 
     #[test]

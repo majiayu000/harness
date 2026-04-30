@@ -149,7 +149,7 @@ pub fn implement_from_issue(
              1. Read the issue: `gh issue view {issue}`\n\
              2. Understand the requirements and existing code\n\
              3. Implement the change with the minimum necessary modifications\n\
-             4. Run `cargo check` and `cargo test` — fix any failures before proceeding\n\
+             4. Run the project's validation commands before proceeding — fix any failures first\n\
              5. Create a feature branch, commit with a descriptive message, push\n\
              6. Create a PR with `gh pr create` (see the mandatory PR body contract below).\n"
         ),
@@ -282,7 +282,7 @@ mod tests {
         assert!(s.contains("issue #42"));
         assert!(s.contains("PR_URL=<full PR URL>"));
         assert!(s.contains("Senior Engineer"));
-        assert!(s.contains("cargo check"));
+        assert!(s.contains("validation commands"));
         assert!(s.contains("gh pr create"));
         // The Closes-keyword contract lives in dynamic_payload; assert it
         // survives round-tripping through to_prompt_string so tasks that
