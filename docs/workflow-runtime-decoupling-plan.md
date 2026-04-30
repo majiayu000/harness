@@ -28,6 +28,8 @@ Implemented now:
 - generic runtime worker boundary for claiming jobs and recording structured activity results
 - workflow-first runtime tree API and dashboard panel for instances, commands, runtime jobs, and
   rejected decisions
+- runtime tree API and dashboard runtime job rows include runtime event counts, latest event type,
+  retry cooldown, and prompt packet digest summaries
 - workflow command outbox dispatcher that converts pending runtime commands into runtime jobs
 - opt-in server background loop for workflow command dispatch
 - opt-in server background runtime worker that executes runtime jobs through registered agents

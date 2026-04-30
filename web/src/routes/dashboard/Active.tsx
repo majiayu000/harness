@@ -110,7 +110,9 @@ function runtimeJobLabel(command: WorkflowRuntimeCommandNode): string {
   const job = command.runtime_jobs[0];
   if (!job) return `${command.runtime_jobs.length} jobs`;
   const notBefore = job.not_before ? ` - not before ${job.not_before}` : "";
-  return `${command.runtime_jobs.length} jobs - ${job.status}${notBefore}`;
+  const latestEvent = job.latest_runtime_event_type ? ` - event ${job.latest_runtime_event_type}` : "";
+  const promptDigest = job.prompt_packet_digest ? ` - prompt ${job.prompt_packet_digest.slice(0, 12)}` : "";
+  return `${command.runtime_jobs.length} jobs - ${job.status}${notBefore}${latestEvent}${promptDigest}`;
 }
 
 function rejectedDecisions(decisions: WorkflowRuntimeDecisionRecord[]) {

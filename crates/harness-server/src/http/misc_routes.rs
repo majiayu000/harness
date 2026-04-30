@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use harness_protocol::methods::RpcRequest;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
@@ -14,8 +14,8 @@ use std::sync::Arc;
 use super::{state::AppState, task_routes};
 use crate::{router, task_runner};
 use harness_workflow::runtime::{
-    RuntimeJob, WorkflowCommand, WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowEvent,
-    WorkflowInstance,
+    RuntimeEvent, RuntimeJob, WorkflowCommand, WorkflowCommandRecord, WorkflowDecisionRecord,
+    WorkflowEvent, WorkflowInstance,
 };
 
 fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
@@ -139,13 +139,13 @@ struct WorkflowRuntimeCommandNode {
     pub decision_id: Option<String>,
     pub status: String,
     pub command: WorkflowCommand,
-    pub runtime_jobs: Vec<RuntimeJob>,
+    pub runtime_jobs: Vec<WorkflowRuntimeJobNode>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl WorkflowRuntimeCommandNode {
-    fn new(record: WorkflowCommandRecord, runtime_jobs: Vec<RuntimeJob>) -> Self {
+    fn new(record: WorkflowCommandRecord, runtime_jobs: Vec<WorkflowRuntimeJobNode>) -> Self {
         Self {
             id: record.id,
             workflow_id: record.workflow_id,
@@ -155,6 +155,28 @@ impl WorkflowRuntimeCommandNode {
             runtime_jobs,
             created_at: record.created_at,
             updated_at: record.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct WorkflowRuntimeJobNode {
+    #[serde(flatten)]
+    pub job: RuntimeJob,
+    pub runtime_event_count: usize,
+    pub latest_runtime_event_type: Option<String>,
+    pub prompt_packet_digest: Option<String>,
+}
+
+impl WorkflowRuntimeJobNode {
+    fn new(job: RuntimeJob, runtime_events: Vec<RuntimeEvent>) -> Self {
+        let latest_runtime_event_type = runtime_events.last().map(|event| event.event_type.clone());
+        let prompt_packet_digest = prompt_packet_digest_from_events(&runtime_events);
+        Self {
+            job,
+            runtime_event_count: runtime_events.len(),
+            latest_runtime_event_type,
+            prompt_packet_digest,
         }
     }
 }
@@ -311,7 +333,11 @@ async fn build_workflow_runtime_tree(
         let decisions = store.decisions_for(&workflow_id).await?;
         let mut commands = Vec::new();
         for command in store.commands_for(&workflow_id).await? {
-            let runtime_jobs = store.runtime_jobs_for_command(&command.id).await?;
+            let mut runtime_jobs = Vec::new();
+            for job in store.runtime_jobs_for_command(&command.id).await? {
+                let runtime_events = store.runtime_events_for(&job.id).await?;
+                runtime_jobs.push(WorkflowRuntimeJobNode::new(job, runtime_events));
+            }
             commands.push(WorkflowRuntimeCommandNode::new(command, runtime_jobs));
         }
         by_id.insert(
@@ -354,6 +380,19 @@ async fn build_workflow_runtime_tree(
     Ok(WorkflowRuntimeTreeResponse {
         total_workflows: by_id.len(),
         workflows,
+    })
+}
+
+fn prompt_packet_digest_from_events(events: &[RuntimeEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if event.event_type != "RuntimePromptPrepared" {
+            return None;
+        }
+        event
+            .event
+            .get("prompt_packet_digest")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     })
 }
 

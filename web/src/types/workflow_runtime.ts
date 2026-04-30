@@ -76,6 +76,9 @@ export interface WorkflowRuntimeJob {
   output?: Record<string, unknown> | null;
   error?: string | null;
   not_before?: string | null;
+  runtime_event_count?: number;
+  latest_runtime_event_type?: string | null;
+  prompt_packet_digest?: string | null;
   created_at: string;
   updated_at: string;
 }

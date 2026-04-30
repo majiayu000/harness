@@ -946,13 +946,30 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
         .enqueue_command(&child.id, Some(&rejected.id), &command)
         .await?;
     let not_before = chrono::Utc::now() + chrono::Duration::minutes(5);
-    store
+    let runtime_job = store
         .enqueue_runtime_job_with_not_before(
             &command_id,
             harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
             "codex-high",
             serde_json::json!({ "workflow_id": child.id }),
             Some(not_before),
+        )
+        .await?;
+    let prompt_packet_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    store
+        .record_runtime_event(
+            &runtime_job.id,
+            "RuntimePromptPrepared",
+            serde_json::json!({
+                "prompt_packet_digest": prompt_packet_digest,
+            }),
+        )
+        .await?;
+    store
+        .record_runtime_event(
+            &runtime_job.id,
+            "ActivityResultReady",
+            serde_json::json!({ "status": "succeeded" }),
         )
         .await?;
 
@@ -984,6 +1001,18 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     assert_eq!(
         child_node["commands"][0]["runtime_jobs"][0]["not_before"],
         serde_json::json!(not_before)
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["runtime_event_count"],
+        2
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["latest_runtime_event_type"],
+        "ActivityResultReady"
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["prompt_packet_digest"],
+        prompt_packet_digest
     );
     Ok(())
 }

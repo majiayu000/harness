@@ -269,6 +269,10 @@ describe("<Active>", () => {
                         status: "pending",
                         input: {},
                         not_before: "2026-04-30T00:05:00Z",
+                        runtime_event_count: 2,
+                        latest_runtime_event_type: "ActivityResultReady",
+                        prompt_packet_digest:
+                          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                         created_at: "2026-04-30T00:00:00Z",
                         updated_at: "2026-04-30T00:00:00Z",
                       },
@@ -294,7 +298,9 @@ describe("<Active>", () => {
     expect(screen.getByText("github_issue_pr - issue:123")).toBeInTheDocument();
     expect(screen.getByText("activity: replan_issue")).toBeInTheDocument();
     expect(
-      screen.getByText("1 jobs - pending - not before 2026-04-30T00:05:00Z"),
+      screen.getByText(
+        "1 jobs - pending - not before 2026-04-30T00:05:00Z - event ActivityResultReady - prompt 0123456789ab",
+      ),
     ).toBeInTheDocument();
     expect(screen.getByText("rejected: replan limit exhausted")).toBeInTheDocument();
   });
