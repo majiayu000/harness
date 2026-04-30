@@ -34,6 +34,8 @@ Implemented now:
 - runtime job completion writes back command status and workflow completion events
 - runtime completion reducer advances known workflow states from activity output
 - runtime command dispatch can select runtime profiles per workflow definition
+- runtime profiles carry model and execution metadata into runtime jobs
+- server runtime workers pass runtime profile model overrides into agent turns
 
 Still intentionally not moved yet:
 
@@ -497,8 +499,8 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- runtime profile selection is workflow-specific, but model, effort, sandbox, and turn budget still
-  remain runtime execution metadata rather than enforced worker policy
+- runtime workers apply model overrides from runtime profiles, but reasoning effort, sandbox, max
+  turns, and timeout enforcement still remain metadata for later runtime policy work
 - workflow completion reducer coverage is intentionally limited to known activity/state pairs
 - runtime workers are process-local; distributed worker leasing beyond the job claim is not added yet
 
@@ -588,6 +590,35 @@ Tests:
 - workflow config parses per-workflow runtime profile overrides
 - dispatcher uses workflow definition overrides and falls back to the default profile
 - server dispatch config conversion preserves default and override behavior
+
+### Phase 13: Runtime Profile Metadata Application
+
+Status: partially implemented.
+
+Carry runtime profile metadata beyond profile names and apply safe fields during server-owned
+runtime execution.
+
+Implemented now:
+
+- `runtime_dispatch` and `runtime_dispatch.workflow_profiles` can configure `model`,
+  `reasoning_effort`, `sandbox`, `approval_policy`, `max_turns`, and `timeout_secs`
+- profile overrides inherit default metadata for fields they do not set
+- dispatcher persists the full selected `RuntimeProfile` into runtime job input
+- runtime worker includes the parsed profile metadata in the prompt packet
+- runtime worker passes `model` and adapter `timeout_secs` into the turn lifecycle request
+
+Still intentionally not moved yet:
+
+- Codex reasoning effort is not per-request yet because `AgentRequest` has no field for it
+- sandbox and approval policy still come from registered agent/server configuration
+- `max_turns` and timeout are not a workflow reducer budget yet
+
+Tests:
+
+- workflow config parses runtime profile metadata fields
+- dispatch profile selector inherits and overrides metadata correctly
+- dispatcher preserves full profile metadata in runtime job input
+- server worker passes a runtime profile model override to the agent request
 
 ## Test Strategy
 

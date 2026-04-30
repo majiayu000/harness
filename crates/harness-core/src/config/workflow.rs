@@ -38,6 +38,18 @@ pub struct RuntimeDispatchPolicy {
     #[serde(default = "default_runtime_dispatch_profile")]
     pub runtime_profile: String,
     #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    #[serde(default)]
+    pub approval_policy: Option<String>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
     pub workflow_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
 }
 
@@ -47,6 +59,18 @@ pub struct RuntimeDispatchProfileOverride {
     pub runtime_kind: Option<String>,
     #[serde(default)]
     pub runtime_profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    #[serde(default)]
+    pub approval_policy: Option<String>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +133,12 @@ impl Default for RuntimeDispatchPolicy {
             batch_limit: default_runtime_dispatch_batch_limit(),
             runtime_kind: default_runtime_dispatch_kind(),
             runtime_profile: default_runtime_dispatch_profile(),
+            model: None,
+            reasoning_effort: None,
+            sandbox: None,
+            approval_policy: None,
+            max_turns: None,
+            timeout_secs: None,
             workflow_profiles: BTreeMap::new(),
         }
     }
@@ -231,6 +261,12 @@ mod tests {
         assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
         assert_eq!(cfg.runtime_dispatch.runtime_kind, "codex_jsonrpc");
         assert_eq!(cfg.runtime_dispatch.runtime_profile, "codex-default");
+        assert_eq!(cfg.runtime_dispatch.model, None);
+        assert_eq!(cfg.runtime_dispatch.reasoning_effort, None);
+        assert_eq!(cfg.runtime_dispatch.sandbox, None);
+        assert_eq!(cfg.runtime_dispatch.approval_policy, None);
+        assert_eq!(cfg.runtime_dispatch.max_turns, None);
+        assert_eq!(cfg.runtime_dispatch.timeout_secs, None);
         assert!(cfg.runtime_dispatch.workflow_profiles.is_empty());
         assert!(!cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 5);
@@ -262,12 +298,22 @@ runtime_dispatch:
   batch_limit: 7
   runtime_kind: claude_code
   runtime_profile: claude-default
+  model: claude-sonnet-4-6
+  reasoning_effort: medium
+  sandbox: workspace-write
+  approval_policy: on-request
+  max_turns: 4
+  timeout_secs: 600
   workflow_profiles:
     github_issue_pr:
       runtime_kind: codex_jsonrpc
       runtime_profile: codex-high
+      model: gpt-5.4
+      reasoning_effort: high
+      max_turns: 8
     repo_backlog:
       runtime_profile: codex-backlog
+      timeout_secs: 120
 runtime_worker:
   enabled: true
   interval_secs: 3
@@ -296,6 +342,24 @@ Body
         assert_eq!(cfg.runtime_dispatch.batch_limit, 7);
         assert_eq!(cfg.runtime_dispatch.runtime_kind, "claude_code");
         assert_eq!(cfg.runtime_dispatch.runtime_profile, "claude-default");
+        assert_eq!(
+            cfg.runtime_dispatch.model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            cfg.runtime_dispatch.reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            cfg.runtime_dispatch.sandbox.as_deref(),
+            Some("workspace-write")
+        );
+        assert_eq!(
+            cfg.runtime_dispatch.approval_policy.as_deref(),
+            Some("on-request")
+        );
+        assert_eq!(cfg.runtime_dispatch.max_turns, Some(4));
+        assert_eq!(cfg.runtime_dispatch.timeout_secs, Some(600));
         let issue_profile = cfg
             .runtime_dispatch
             .workflow_profiles
@@ -303,6 +367,9 @@ Body
             .expect("issue workflow override should parse");
         assert_eq!(issue_profile.runtime_kind.as_deref(), Some("codex_jsonrpc"));
         assert_eq!(issue_profile.runtime_profile.as_deref(), Some("codex-high"));
+        assert_eq!(issue_profile.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(issue_profile.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(issue_profile.max_turns, Some(8));
         let backlog_profile = cfg
             .runtime_dispatch
             .workflow_profiles
@@ -313,6 +380,7 @@ Body
             backlog_profile.runtime_profile.as_deref(),
             Some("codex-backlog")
         );
+        assert_eq!(backlog_profile.timeout_secs, Some(120));
         assert!(cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 3);
         assert_eq!(cfg.runtime_worker.concurrency, 2);

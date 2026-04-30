@@ -1,10 +1,12 @@
 use crate::http::AppState;
+use crate::task_executor::turn_lifecycle::TurnLifecycleOptions;
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Duration;
 use harness_core::types::{AgentId, Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityResult, ActivitySignal, RuntimeJob, RuntimeJobExecutor,
-    RuntimeJobStatus, RuntimeKind, RuntimeWorker, WorkflowInstance,
+    RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker, WorkflowInstance,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -89,7 +91,9 @@ impl ServerRuntimeJobExecutor {
             anyhow::bail!("runtime agent `{agent_name}` is not registered");
         }
 
-        let prompt = build_runtime_job_prompt(&job, workflow.as_ref(), &project_root);
+        let runtime_profile = runtime_profile_for_job(&job)?;
+        let prompt =
+            build_runtime_job_prompt(&job, workflow.as_ref(), &project_root, &runtime_profile);
         let thread_id = self
             .state
             .core
@@ -103,7 +107,7 @@ impl ServerRuntimeJobExecutor {
         )?;
         persist_created_thread(&self.state, &thread_id).await;
 
-        crate::task_executor::run_turn_lifecycle(
+        crate::task_executor::turn_lifecycle::run_turn_lifecycle_with_options(
             self.state.core.server.clone(),
             self.state.core.thread_db.clone(),
             self.state.notifications.notify_tx.clone(),
@@ -112,6 +116,10 @@ impl ServerRuntimeJobExecutor {
             turn_id.clone(),
             prompt,
             agent_name.to_string(),
+            TurnLifecycleOptions {
+                model: runtime_profile.model.clone(),
+                timeout_secs: runtime_profile.timeout_secs,
+            },
         )
         .await;
 
@@ -208,11 +216,13 @@ fn build_runtime_job_prompt(
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
     project_root: &Path,
+    runtime_profile: &RuntimeProfile,
 ) -> String {
     let workflow_json = workflow
         .map(pretty_json)
         .unwrap_or_else(|| "null".to_string());
     let command_json = pretty_json(&job.input);
+    let profile_json = pretty_json(runtime_profile);
     format!(
         "You are executing a Harness workflow runtime job.\n\n\
          Runtime contract:\n\
@@ -224,6 +234,7 @@ fn build_runtime_job_prompt(
          Runtime job id: {job_id}\n\
          Runtime profile: {runtime_profile}\n\
          Activity: {activity}\n\n\
+         Runtime profile metadata:\n{profile_json}\n\n\
          Workflow instance:\n{workflow_json}\n\n\
          Runtime command input:\n{command_json}\n",
         project_root = project_root.display(),
@@ -231,6 +242,17 @@ fn build_runtime_job_prompt(
         runtime_profile = job.runtime_profile.as_str(),
         activity = activity_name(job),
     )
+}
+
+fn runtime_profile_for_job(job: &RuntimeJob) -> anyhow::Result<RuntimeProfile> {
+    let Some(value) = job.input.get("runtime_profile") else {
+        return Ok(RuntimeProfile::new(
+            job.runtime_profile.clone(),
+            job.runtime_kind,
+        ));
+    };
+    serde_json::from_value(value.clone())
+        .with_context(|| format!("runtime job {} has invalid runtime_profile input", job.id))
 }
 
 fn activity_result_from_turn(

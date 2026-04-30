@@ -509,7 +509,14 @@ fn runtime_dispatch_profile(
         );
         RuntimeKind::CodexJsonrpc
     });
-    RuntimeProfile::new(policy.runtime_profile.clone(), kind)
+    let mut profile = RuntimeProfile::new(policy.runtime_profile.clone(), kind);
+    profile.model = policy.model.clone();
+    profile.reasoning_effort = policy.reasoning_effort.clone();
+    profile.sandbox = policy.sandbox.clone();
+    profile.approval_policy = policy.approval_policy.clone();
+    profile.max_turns = policy.max_turns;
+    profile.timeout_secs = policy.timeout_secs;
+    profile
 }
 
 fn runtime_dispatch_profile_selector(
@@ -527,10 +534,28 @@ fn runtime_dispatch_profile_selector(
             .runtime_profile
             .clone()
             .unwrap_or_else(|| default_profile.name.clone());
-        selector = selector.with_workflow_profile(
-            definition_id.clone(),
-            RuntimeProfile::new(profile_name, kind),
-        );
+        let mut profile = RuntimeProfile::new(profile_name, kind);
+        profile.model = override_policy
+            .model
+            .clone()
+            .or_else(|| default_profile.model.clone());
+        profile.reasoning_effort = override_policy
+            .reasoning_effort
+            .clone()
+            .or_else(|| default_profile.reasoning_effort.clone());
+        profile.sandbox = override_policy
+            .sandbox
+            .clone()
+            .or_else(|| default_profile.sandbox.clone());
+        profile.approval_policy = override_policy
+            .approval_policy
+            .clone()
+            .or_else(|| default_profile.approval_policy.clone());
+        profile.max_turns = override_policy.max_turns.or(default_profile.max_turns);
+        profile.timeout_secs = override_policy
+            .timeout_secs
+            .or(default_profile.timeout_secs);
+        selector = selector.with_workflow_profile(definition_id.clone(), profile);
     }
     selector
 }
@@ -1889,6 +1914,8 @@ mod tests {
         let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
             runtime_kind: "claude_code".to_string(),
             runtime_profile: "claude-default".to_string(),
+            model: Some("claude-sonnet-4-6".to_string()),
+            timeout_secs: Some(600),
             ..Default::default()
         };
         policy.workflow_profiles.insert(
@@ -1896,6 +1923,9 @@ mod tests {
             harness_core::config::workflow::RuntimeDispatchProfileOverride {
                 runtime_kind: Some("codex_exec".to_string()),
                 runtime_profile: Some("codex-high".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                timeout_secs: Some(1200),
+                ..Default::default()
             },
         );
         policy.workflow_profiles.insert(
@@ -1903,6 +1933,7 @@ mod tests {
             harness_core::config::workflow::RuntimeDispatchProfileOverride {
                 runtime_kind: None,
                 runtime_profile: Some("codex-backlog".to_string()),
+                ..Default::default()
             },
         );
 
@@ -1910,12 +1941,18 @@ mod tests {
         let issue_profile = selector.select(Some("github_issue_pr"));
         assert_eq!(issue_profile.kind, RuntimeKind::CodexExec);
         assert_eq!(issue_profile.name, "codex-high");
+        assert_eq!(issue_profile.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(issue_profile.timeout_secs, Some(1200));
         let backlog_profile = selector.select(Some("repo_backlog"));
         assert_eq!(backlog_profile.kind, RuntimeKind::ClaudeCode);
         assert_eq!(backlog_profile.name, "codex-backlog");
+        assert_eq!(backlog_profile.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(backlog_profile.timeout_secs, Some(600));
         let default_profile = selector.select(Some("quality_gate"));
         assert_eq!(default_profile.kind, RuntimeKind::ClaudeCode);
         assert_eq!(default_profile.name, "claude-default");
+        assert_eq!(default_profile.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(default_profile.timeout_secs, Some(600));
     }
 
     // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in

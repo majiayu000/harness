@@ -30,12 +30,14 @@ impl CapturingAgent {
 
 struct RuntimeStreamAgent {
     prompts: Mutex<Vec<String>>,
+    models: Mutex<Vec<Option<String>>>,
 }
 
 impl RuntimeStreamAgent {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
+            models: Mutex::new(Vec::new()),
         })
     }
 }
@@ -135,6 +137,7 @@ impl CodeAgent for RuntimeStreamAgent {
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.models.lock().await.push(req.model.clone());
         self.prompts.lock().await.push(req.prompt);
         Ok(successful_agent_response())
     }
@@ -144,6 +147,7 @@ impl CodeAgent for RuntimeStreamAgent {
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        self.models.lock().await.push(req.model.clone());
         self.prompts.lock().await.push(req.prompt);
         let _ = tx
             .send(StreamItem::ItemCompleted {
@@ -1042,6 +1046,12 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-default",
+        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+    );
+    runtime_profile.model = Some("gpt-runtime".to_string());
+    runtime_profile.timeout_secs = Some(300);
     let runtime_job = store
         .enqueue_runtime_job(
             &command_id,
@@ -1053,6 +1063,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
                 "command_type": command.command_type,
                 "dedupe_key": command.dedupe_key,
                 "command": command.command,
+                "runtime_profile": runtime_profile,
             }),
         )
         .await?;
@@ -1090,6 +1101,11 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains("You are executing a Harness workflow runtime job."));
     assert!(prompts[0].contains("Activity: implement_issue"));
+    assert!(prompts[0].contains("Runtime profile metadata:"));
+    assert!(prompts[0].contains("gpt-runtime"));
+    drop(prompts);
+    let models = agent.models.lock().await;
+    assert_eq!(models.as_slice(), &[Some("gpt-runtime".to_string())]);
     Ok(())
 }
 

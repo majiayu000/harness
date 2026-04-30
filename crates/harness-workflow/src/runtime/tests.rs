@@ -1228,14 +1228,13 @@ async fn runtime_command_dispatcher_selects_profile_by_workflow_definition() -> 
         .enqueue_command(&backlog.id, None, &backlog_command)
         .await?;
 
-    let profile_selector = RuntimeProfileSelector::new(RuntimeProfile::new(
-        "codex-default",
-        RuntimeKind::CodexJsonrpc,
-    ))
-    .with_workflow_profile(
-        "github_issue_pr",
-        RuntimeProfile::new("codex-issue-high", RuntimeKind::CodexExec),
-    );
+    let mut default_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    default_profile.model = Some("gpt-default".to_string());
+    let mut issue_profile = RuntimeProfile::new("codex-issue-high", RuntimeKind::CodexExec);
+    issue_profile.model = Some("gpt-issue".to_string());
+    issue_profile.timeout_secs = Some(1200);
+    let profile_selector = RuntimeProfileSelector::new(default_profile)
+        .with_workflow_profile("github_issue_pr", issue_profile);
     let dispatcher = RuntimeCommandDispatcher::with_profile_selector(&store, profile_selector);
 
     let outcomes = dispatcher.dispatch_pending().await?;
@@ -1249,11 +1248,17 @@ async fn runtime_command_dispatcher_selects_profile_by_workflow_definition() -> 
         issue_jobs[0].input["runtime_profile"]["name"],
         "codex-issue-high"
     );
+    assert_eq!(issue_jobs[0].input["runtime_profile"]["model"], "gpt-issue");
+    assert_eq!(issue_jobs[0].input["runtime_profile"]["timeout_secs"], 1200);
 
     let backlog_jobs = store.runtime_jobs_for_command(&backlog_command_id).await?;
     assert_eq!(backlog_jobs.len(), 1);
     assert_eq!(backlog_jobs[0].runtime_kind, RuntimeKind::CodexJsonrpc);
     assert_eq!(backlog_jobs[0].runtime_profile, "codex-default");
+    assert_eq!(
+        backlog_jobs[0].input["runtime_profile"]["model"],
+        "gpt-default"
+    );
     Ok(())
 }
 

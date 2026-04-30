@@ -65,6 +65,37 @@ pub(crate) async fn run_turn_lifecycle(
     prompt: String,
     agent_name: String,
 ) {
+    run_turn_lifecycle_with_options(
+        server,
+        thread_db,
+        notify_tx,
+        notification_tx,
+        thread_id,
+        turn_id,
+        prompt,
+        agent_name,
+        TurnLifecycleOptions::default(),
+    )
+    .await;
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TurnLifecycleOptions {
+    pub model: Option<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+pub(crate) async fn run_turn_lifecycle_with_options(
+    server: Arc<crate::server::HarnessServer>,
+    thread_db: Option<crate::thread_db::ThreadDb>,
+    notify_tx: Option<crate::notify::NotifySender>,
+    notification_tx: tokio::sync::broadcast::Sender<RpcNotification>,
+    thread_id: harness_core::types::ThreadId,
+    turn_id: TurnId,
+    prompt: String,
+    agent_name: String,
+    options: TurnLifecycleOptions,
+) {
     let Some(project_root) = server
         .thread_manager
         .get_thread(&thread_id)
@@ -164,10 +195,10 @@ pub(crate) async fn run_turn_lifecycle(
         let turn_req = TurnRequest {
             prompt,
             project_root,
-            model: None,
+            model: options.model.clone(),
             allowed_tools: vec![],
             context: vec![],
-            timeout_secs: None,
+            timeout_secs: options.timeout_secs,
             capability_token: None,
         };
         Box::pin(async move { adapter_arc.start_turn(turn_req, event_tx).await })
@@ -175,6 +206,7 @@ pub(crate) async fn run_turn_lifecycle(
         let req = AgentRequest {
             prompt,
             project_root,
+            model: options.model.clone(),
             ..Default::default()
         };
         Box::pin(agent.execute_stream(req, stream_tx))
