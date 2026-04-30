@@ -93,6 +93,7 @@ impl<'a> RuntimeWorker<'a> {
                 &self.owner,
                 json!({
                     "command_id": command.id,
+                    "command": command.command,
                     "runtime_job_id": job.id,
                     "runtime_job_status": job.status,
                     "activity_result": result,

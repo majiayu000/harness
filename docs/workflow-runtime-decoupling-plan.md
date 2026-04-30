@@ -33,6 +33,8 @@ Implemented now:
 - opt-in server background runtime worker that executes runtime jobs through registered agents
 - runtime job completion writes back command status and workflow completion events
 - runtime completion reducer advances known workflow states from activity output
+- runtime completion reducer can retry failed activities when the workflow instance declares a
+  bounded retry policy
 - runtime command dispatch can select runtime profiles per workflow/activity pair, then activity,
   then workflow
 - runtime profiles carry model and execution metadata into runtime jobs
@@ -524,14 +526,14 @@ Implemented now:
 
 - runtime workers update the originating command status to `completed`, `failed`, or `cancelled`
 - runtime workers append `RuntimeJobCompleted` events to the parent workflow when the command row
-  is known
+  is known, including the original workflow command payload for retry/reducer policy
 - direct runtime jobs without a workflow command row still complete normally
 
 Still intentionally not moved yet:
 
 - reducer coverage is limited to known activity/state pairs
 - activity result schemas are not yet workflow-specific
-- retry policy for failed activity results is not yet modeled in workflow state
+- retry backoff and retry cooldown windows are not yet modeled
 
 Tests:
 
@@ -551,6 +553,8 @@ Implemented now:
   `awaiting_feedback`
 - failed, blocked, and cancelled activity results transition workflows to `failed`, `blocked`, or
   `cancelled` through validated workflow decisions
+- failed activity results retry the same activity before failing when
+  `runtime_retry_policy.max_failed_activity_retries` is present on the workflow instance data
 - unknown successful activity/state pairs are preserved as completion events without unsafe state
   changes
 
@@ -558,12 +562,14 @@ Still intentionally not moved yet:
 
 - implementation completion does not infer PR state from free-form agent text
 - activity result schemas are not yet workflow-specific enough to drive every state transition
-- failed activity retry policy is not yet modeled
+- retry policy supports bounded immediate retries only; backoff, cooldown, and per-activity
+  overrides are not yet modeled
 
 Tests:
 
 - reducer resumes implementation after replan completion
 - reducer ignores unmapped successful activity completions
+- reducer retries a failed activity until the configured retry budget is exhausted
 - runtime worker applies the reducer, records decisions, and updates workflow state
 
 ### Phase 12: Workflow Runtime Profile Selection

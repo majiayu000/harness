@@ -2,6 +2,7 @@ use super::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
+use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
 use serde_json::json;
 
 pub const RUNTIME_JOB_COMPLETED_EVENT: &str = "RuntimeJobCompleted";
@@ -23,7 +24,10 @@ pub fn reduce_runtime_job_completed(
     let decision = match result.status {
         ActivityStatus::Succeeded => reduce_success(instance, event, &result),
         ActivityStatus::Blocked => Some(runtime_blocked_decision(instance, event, &result)),
-        ActivityStatus::Failed => Some(runtime_failed_decision(instance, event, &result)),
+        ActivityStatus::Failed => Some(
+            retry_failed_activity_decision(instance, event, &result)
+                .unwrap_or_else(|| runtime_failed_decision(instance, event, &result)),
+        ),
         ActivityStatus::Cancelled => Some(runtime_cancelled_decision(instance, event, &result)),
     };
     Ok(decision)
@@ -102,6 +106,52 @@ fn runtime_failed_decision(
     .high_confidence()
 }
 
+fn retry_failed_activity_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if !supports_same_state_activity_retry(&instance.definition_id, &instance.state) {
+        return None;
+    }
+    let retry_limit = failed_activity_retry_limit(instance)?;
+    let retry_attempt = failed_activity_retry_attempt(event);
+    if retry_attempt >= retry_limit {
+        return None;
+    }
+    let next_attempt = retry_attempt + 1;
+    let activity = retry_activity_name(event, result)?;
+    let reason = runtime_failure_reason(result, "Runtime activity failed.");
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "retry_failed_runtime_activity",
+            &instance.state,
+            format!(
+                "Runtime activity `{activity}` failed; retrying attempt {next_attempt} of {retry_limit}. Last error: {reason}"
+            ),
+        )
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            format!(
+                "runtime-completion:{}:retry:{}:{}",
+                event.id, activity, next_attempt
+            ),
+            json!({
+                "activity": activity,
+                "retry_attempt": next_attempt,
+                "max_failed_activity_retries": retry_limit,
+                "previous_command_id": event_field_string(event, "command_id"),
+                "previous_runtime_job_id": event_field_string(event, "runtime_job_id"),
+                "previous_error": reason,
+            }),
+        ))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
+}
+
 fn runtime_cancelled_decision(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
@@ -132,6 +182,55 @@ fn runtime_failure_reason(result: &ActivityResult, fallback: &str) -> String {
         .or_else(|| (!result.summary.trim().is_empty()).then_some(result.summary.trim()))
         .unwrap_or(fallback)
         .to_string()
+}
+
+fn failed_activity_retry_limit(instance: &WorkflowInstance) -> Option<u64> {
+    instance
+        .data
+        .get("runtime_retry_policy")
+        .and_then(|policy| policy.get("max_failed_activity_retries"))
+        .and_then(|value| value.as_u64())
+        .filter(|limit| *limit > 0)
+}
+
+fn failed_activity_retry_attempt(event: &WorkflowEvent) -> u64 {
+    event
+        .event
+        .get("command")
+        .and_then(|command| command.get("command"))
+        .and_then(|command| command.get("retry_attempt"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+}
+
+fn retry_activity_name(event: &WorkflowEvent, result: &ActivityResult) -> Option<String> {
+    event
+        .event
+        .get("command")
+        .and_then(|command| command.get("command"))
+        .and_then(|command| command.get("activity"))
+        .and_then(|value| value.as_str())
+        .filter(|activity| !activity.trim().is_empty())
+        .or_else(|| (!result.activity.trim().is_empty()).then_some(result.activity.as_str()))
+        .map(str::to_string)
+}
+
+fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool {
+    matches!(
+        (definition_id, state),
+        (
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "implementing" | "awaiting_feedback" | "addressing_feedback"
+        ) | (REPO_BACKLOG_DEFINITION_ID, "dispatching" | "reconciling")
+    )
+}
+
+fn event_field_string(event: &WorkflowEvent, field: &str) -> Option<String> {
+    event
+        .event
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 fn runtime_completion_evidence(event: &WorkflowEvent, result: &ActivityResult) -> WorkflowEvidence {

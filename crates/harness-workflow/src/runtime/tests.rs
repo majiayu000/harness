@@ -293,6 +293,110 @@ fn runtime_completion_reducer_returns_none_for_unmapped_success() {
 }
 
 #[test]
+fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
+    let instance = issue_instance("implementing").with_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 1
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "implement-1");
+    let result = ActivityResult::failed(
+        "implement_issue",
+        "Implementation failed.",
+        "codex stdin not available",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("failed activity should produce a retry decision");
+
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(decision.next_state, "implementing");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::EnqueueActivity
+    );
+    assert_eq!(decision.commands[0].command["activity"], "implement_issue");
+    assert_eq!(decision.commands[0].command["retry_attempt"], 1);
+    assert_eq!(
+        decision.commands[0].command["previous_command_id"],
+        "command-1"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("retry decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_fails_after_retry_policy_exhausted() {
+    let instance = issue_instance("implementing").with_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 1
+        }
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "implement-retry-1",
+        json!({
+            "activity": "implement_issue",
+            "retry_attempt": 1
+        }),
+    );
+    let result = ActivityResult::failed(
+        "implement_issue",
+        "Implementation failed again.",
+        "codex stdin not available",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        2,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-2",
+        "command": command,
+        "runtime_job_id": "job-2",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("exhausted retry policy should fail the workflow");
+
+    assert_eq!(decision.decision, "fail_after_runtime_activity");
+    assert_eq!(decision.next_state, "failed");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkFailed
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("failed decision should validate");
+}
+
+#[test]
 fn repo_backlog_open_issue_without_workflow_starts_child_workflow() {
     let instance = repo_backlog_instance("idle");
     let output = build_open_issue_without_workflow_decision(
@@ -860,6 +964,10 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
         .expect("completion event should be appended");
     assert_eq!(event.source, "runtime-1");
     assert_eq!(event.event["command_id"], command_id);
+    assert_eq!(
+        event.event["command"]["command"]["activity"],
+        "replan_issue"
+    );
     assert_eq!(event.event["runtime_job_id"], job.id);
     assert_eq!(event.event["runtime_job_status"], "succeeded");
     assert_eq!(
