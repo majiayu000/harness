@@ -181,7 +181,14 @@ pub(crate) async fn resolve_project_from_registry(
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
     {
-        return Ok((Some(project_path), None));
+        let canonical_root = tokio::fs::canonicalize(&project_path)
+            .await
+            .unwrap_or(project_path);
+        return match registry.get_by_root(&canonical_root).await {
+            Ok(Some(project)) => Ok((Some(project.root), project.default_agent)),
+            Ok(None) => Ok((Some(canonical_root), None)),
+            Err(e) => Err(EnqueueTaskError::Internal(e.to_string())),
+        };
     }
 
     let id = project_path.to_string_lossy();
@@ -848,8 +855,9 @@ mod tests {
         let svc = make_minimal_svc(store, Some(registry)).await;
 
         let path = dir.path().to_path_buf();
+        let canonical_path = path.canonicalize()?;
         let result = svc.resolve_project(Some(path.clone())).await?;
-        assert_eq!(result.0, Some(path));
+        assert_eq!(result.0, Some(canonical_path));
         assert!(result.1.is_none());
         Ok(())
     }

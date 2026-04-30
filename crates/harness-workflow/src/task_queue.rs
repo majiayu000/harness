@@ -676,6 +676,20 @@ impl TaskQueue {
         }
     }
 
+    /// Remove an explicit project override so the queue falls back to the
+    /// global limit for future acquisitions.
+    pub fn reset_project_limit(&self, project_id: &str) {
+        let old_limit = self.project_limit(project_id);
+        self.project_limits.remove(project_id);
+        let new_limit = self.project_limit(project_id);
+        if let Some(project_queue) = self.project_queues.get(project_id) {
+            project_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reconfigure_capacity(old_limit, new_limit);
+        }
+    }
+
     /// Snapshot queue pressure for diagnostics and admission-failure logging.
     pub fn diagnostics(&self, project_id: &str) -> QueueDiagnostics {
         let project_limit = self.project_limit(project_id);

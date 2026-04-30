@@ -225,6 +225,26 @@ async fn set_project_limit_reconfigures_existing_project_queue() {
     );
 }
 
+#[tokio::test]
+async fn reset_project_limit_restores_global_fallback() {
+    let mut cfg = config(4, 16);
+    cfg.per_project.insert("proj".to_string(), 2);
+    let q = Arc::new(TaskQueue::new(&cfg));
+
+    let _p1 = q.acquire("proj", 0).await.unwrap();
+    let _p2 = q.acquire("proj", 0).await.unwrap();
+    assert_eq!(q.effective_project_limit("proj"), 2);
+
+    q.reset_project_limit("proj");
+    assert_eq!(q.effective_project_limit("proj"), 4);
+
+    let p3 = timeout(Duration::from_millis(100), q.acquire("proj", 0)).await;
+    assert!(
+        p3.is_ok(),
+        "project should regain the global fallback limit after reset"
+    );
+}
+
 // --- Priority tests ---
 
 #[tokio::test]
