@@ -17,7 +17,6 @@ use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::{config::project::load_project_config, lang_detect, prompts};
 use std::collections::HashMap;
 
-use crate::task_runner::RoundResult;
 use chrono::Utc;
 use helpers::update_status;
 
@@ -136,7 +135,9 @@ fn review_prep_from_checkpoint_phase(last_phase: &str) -> Option<prompts::PrRevi
     match last_phase {
         "rebase_pushed" => Some(prompts::PrReviewPrepOutcome::RebasePushed),
         "rebase_skipped" => Some(prompts::PrReviewPrepOutcome::RebaseSkipped),
-        "rebase_conflict" => Some(prompts::PrReviewPrepOutcome::RebaseConflict { paths: Vec::new() }),
+        "rebase_conflict" => {
+            Some(prompts::PrReviewPrepOutcome::RebaseConflict { paths: Vec::new() })
+        }
         _ => None,
     }
 }
@@ -1036,13 +1037,15 @@ pub(crate) async fn run_task(
                 review_prep,
                 context_items,
                 ..
-            } => break (
-                pr_url,
-                pr_num,
-                implementation_pushed_commit,
-                review_prep,
-                context_items,
-            ),
+            } => {
+                break (
+                    pr_url,
+                    pr_num,
+                    implementation_pushed_commit,
+                    review_prep,
+                    context_items,
+                )
+            }
             implement_pipeline::ImplementOutcome::Replan {
                 issue,
                 plan_issue,

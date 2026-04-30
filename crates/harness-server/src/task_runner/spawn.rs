@@ -1822,8 +1822,7 @@ mod tests {
         );
 
         let agent = PhaseCapturingAgent::new(vec![
-            "PR_URL=https://github.com/owner/repo/pull/7\nPUSHED_COMMIT=false\nWAITING".into(),
-            "MANUAL_RESOLUTION_REQUIRED".into(),
+            "REBASE_CONFLICT paths=src/lib.rs\nPR_URL=https://github.com/owner/repo/pull/7".into(),
         ]);
 
         let req = CreateTaskRequest {
@@ -1863,8 +1862,8 @@ mod tests {
         let phases = agent.captured_phases().await;
         assert_eq!(
             phases.len(),
-            2,
-            "manual-resolution outcome must stop before the normal review loop"
+            1,
+            "rebase-conflict outcome must stop before the normal review loop"
         );
         let state = store.get(&task_id).expect("task should exist");
         assert!(
@@ -1896,8 +1895,7 @@ mod tests {
         );
 
         let agent = PhaseCapturingAgent::new(vec![
-            "PR_URL=https://github.com/owner/repo/pull/8\nPUSHED_COMMIT=false\nWAITING".into(),
-            "CLEAN_PR".into(),
+            "REBASE_SKIPPED\nPR_URL=https://github.com/owner/repo/pull/8".into(),
             "LGTM".into(),
         ]);
 
@@ -1937,8 +1935,8 @@ mod tests {
 
         let phases = agent.captured_phases().await;
         assert!(
-            phases.len() >= 3,
-            "clean resumed PR must enter the review loop after the conflict gate"
+            phases.len() >= 2,
+            "clean pr:N prep must enter the review loop after rebase preparation"
         );
         Ok(())
     }
@@ -1961,8 +1959,7 @@ mod tests {
         );
 
         let agent = PhaseCapturingAgent::new(vec![
-            "PR_URL=https://github.com/owner/repo/pull/9\nPUSHED_COMMIT=false\nWAITING".into(),
-            "REBASE_PUSHED".into(),
+            "REBASE_PUSHED\nPR_URL=https://github.com/owner/repo/pull/9".into(),
             "LGTM".into(),
         ]);
 
@@ -2000,12 +1997,12 @@ mod tests {
         })
         .await?;
 
-        let prompts = wait_for_captured_prompts(agent.as_ref(), 3).await;
+        let prompts = wait_for_captured_prompts(agent.as_ref(), 2).await;
         assert!(
             prompts
-                .get(2)
+                .get(1)
                 .is_some_and(|prompt| prompt.contains("IMPORTANT — New review verification")),
-            "rebased resumed PRs must require a fresh reviewer pass before accepting LGTM"
+            "rebased pr:N tasks must require a fresh reviewer pass before accepting LGTM"
         );
         Ok(())
     }

@@ -903,7 +903,13 @@ pub(crate) async fn run_implement_phase(
                     created_issue_num,
                     pushed_commit,
                     review_prep,
-                }) => (pr_url, pr_num, created_issue_num, pushed_commit, review_prep),
+                }) => (
+                    pr_url,
+                    pr_num,
+                    created_issue_num,
+                    pushed_commit,
+                    review_prep,
+                ),
                 Err(parse_err) => {
                     tracing::error!(
                         task_id = %task_id,
@@ -1008,14 +1014,14 @@ pub(crate) async fn run_implement_phase(
                     reason: "missing_rebase_outcome".to_string(),
                 });
                 tracing::info!(
-                    task_id = %task_id,
-                    status = "failed",
-                    turns = 2,
-                    pr_url = tracing::field::Empty,
-                    total_elapsed_secs = task_start.elapsed().as_secs(),
-                    "task_completed"
-                    );
-                    return Ok(ImplementOutcome::Done);
+                task_id = %task_id,
+                status = "failed",
+                turns = 2,
+                pr_url = tracing::field::Empty,
+                total_elapsed_secs = task_start.elapsed().as_secs(),
+                "task_completed"
+                );
+                return Ok(ImplementOutcome::Done);
             };
             tracing::debug!(
                 pr = pr_number,
@@ -1024,66 +1030,64 @@ pub(crate) async fn run_implement_phase(
             );
         }
 
-        let pushed_commit = match resolve_pushed_commit_flag(
-            req.pr.is_some(),
-            pushed_commit,
-            review_prep.as_ref(),
-        ) {
-            Ok(pushed_commit) => pushed_commit,
-            Err(parse_err) => {
-                tracing::error!(
-                    task_id = %task_id,
-                    parse_error = %parse_err,
-                    "implementation omitted required PR-check structured output"
-                );
-                mutate_and_persist(store, task_id, |s| {
-                    s.status = TaskStatus::Failed;
-                    s.turn = 2;
-                    s.error = Some(parse_err.clone());
-                    s.rounds.push(RoundResult::new(
+        let pushed_commit =
+            match resolve_pushed_commit_flag(req.pr.is_some(), pushed_commit, review_prep.as_ref())
+            {
+                Ok(pushed_commit) => pushed_commit,
+                Err(parse_err) => {
+                    tracing::error!(
+                        task_id = %task_id,
+                        parse_error = %parse_err,
+                        "implementation omitted required PR-check structured output"
+                    );
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Failed;
+                        s.turn = 2;
+                        s.error = Some(parse_err.clone());
+                        s.rounds.push(RoundResult::new(
+                            1,
+                            "implement",
+                            "malformed_output",
+                            if output.is_empty() {
+                                None
+                            } else {
+                                Some(output.clone())
+                            },
+                            Some(impl_telemetry.clone()),
+                            None,
+                        ));
+                    })
+                    .await?;
+                    let event = build_task_event(
+                        task_id,
                         1,
                         "implement",
-                        "malformed_output",
+                        "task_implement",
+                        Decision::Block,
+                        Some(parse_err.clone()),
+                        None,
+                        Some(impl_telemetry.clone()),
+                        None,
                         if output.is_empty() {
                             None
                         } else {
                             Some(output.clone())
                         },
-                        Some(impl_telemetry.clone()),
-                        None,
-                    ));
-                })
-                .await?;
-                let event = build_task_event(
-                    task_id,
-                    1,
-                    "implement",
-                    "task_implement",
-                    Decision::Block,
-                    Some(parse_err.clone()),
-                    None,
-                    Some(impl_telemetry.clone()),
-                    None,
-                    if output.is_empty() {
-                        None
-                    } else {
-                        Some(output.clone())
-                    },
-                );
-                if let Err(error) = events.log(&event).await {
-                    tracing::warn!("failed to log task_implement event: {error}");
+                    );
+                    if let Err(error) = events.log(&event).await {
+                        tracing::warn!("failed to log task_implement event: {error}");
+                    }
+                    tracing::info!(
+                        task_id = %task_id,
+                        status = "failed",
+                        turns = 2,
+                        pr_url = tracing::field::Empty,
+                        total_elapsed_secs = task_start.elapsed().as_secs(),
+                        "task_completed"
+                    );
+                    return Ok(ImplementOutcome::Done);
                 }
-                tracing::info!(
-                    task_id = %task_id,
-                    status = "failed",
-                    turns = 2,
-                    pr_url = tracing::field::Empty,
-                    total_elapsed_secs = task_start.elapsed().as_secs(),
-                    "task_completed"
-                );
-                return Ok(ImplementOutcome::Done);
-            }
-        };
+            };
 
         mutate_and_persist(store, task_id, |s| {
             s.pr_url = pr_url.clone();
