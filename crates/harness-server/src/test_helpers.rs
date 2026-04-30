@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64},
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
 };
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use tokio::sync::OnceCell;
 /// spurious "project root must be within HOME" failures.
 pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
+static DATABASE_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
 static DB_STATE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 
 fn db_state_lock() -> Arc<tokio::sync::Mutex<()>> {
@@ -103,6 +104,9 @@ pub fn test_database_url() -> anyhow::Result<String> {
 }
 
 pub fn ensure_test_database_url_override() -> anyhow::Result<String> {
+    let _guard = DATABASE_URL_ENV_LOCK
+        .lock()
+        .expect("database URL env lock poisoned");
     if let Ok(url) = std::env::var("HARNESS_DATABASE_URL") {
         let url = url.trim();
         if !url.is_empty() {

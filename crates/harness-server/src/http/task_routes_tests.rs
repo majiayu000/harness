@@ -327,8 +327,8 @@ fn workflow_reuse_strategy_claimed_feedback_falls_back_to_pr() {
     workflow.state = IssueLifecycleState::FeedbackClaimed;
     workflow.pr_number = Some(100);
     match workflow_reuse_strategy(&workflow) {
-        WorkflowReuseStrategy::PrExternalId(ext_id) => assert_eq!(ext_id, "pr:100"),
-        _ => panic!("expected pr-external-id reuse strategy"),
+        WorkflowReuseStrategy::ActivePrExternalId(ext_id) => assert_eq!(ext_id, "pr:100"),
+        _ => panic!("expected active-pr-external-id reuse strategy"),
     }
 }
 
@@ -343,8 +343,8 @@ fn workflow_reuse_strategy_ignores_claim_placeholder_task_ids() {
     workflow.active_task_id = Some("claim:workflow-42".to_string());
     workflow.pr_number = Some(101);
     match workflow_reuse_strategy(&workflow) {
-        WorkflowReuseStrategy::PrExternalId(ext_id) => assert_eq!(ext_id, "pr:101"),
-        _ => panic!("expected pr-external-id reuse strategy"),
+        WorkflowReuseStrategy::ActivePrExternalId(ext_id) => assert_eq!(ext_id, "pr:101"),
+        _ => panic!("expected active-pr-external-id reuse strategy"),
     }
 }
 

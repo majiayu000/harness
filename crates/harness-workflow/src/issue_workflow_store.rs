@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::issue_lifecycle::{
     is_feedback_claim_placeholder, legacy_schema_for_path, workflow_id, IssueLifecycleEvent,
     IssueLifecycleEventKind, IssueLifecycleState, IssueWorkflowInstance,
+    FEEDBACK_CLAIM_TASK_PREFIX,
 };
 
 static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
@@ -420,13 +421,19 @@ impl IssueWorkflowStore {
         stale_before: DateTime<Utc>,
     ) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
         let mut tx = self.pool.begin().await?;
+        let claim_placeholder_like = format!("{FEEDBACK_CLAIM_TASK_PREFIX}%");
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, data FROM issue_workflows
              WHERE data::jsonb->>'pr_number' IS NOT NULL
                AND (
-                    data::jsonb->>'state' IN ('pr_open', 'awaiting_feedback')
-                    OR (
+                     data::jsonb->>'state' IN ('pr_open', 'awaiting_feedback')
+                     OR (
                         data::jsonb->>'state' = 'feedback_claimed'
+                        AND updated_at <= $2
+                    )
+                    OR (
+                        data::jsonb->>'state' = 'addressing_feedback'
+                        AND data::jsonb->>'active_task_id' LIKE $3
                         AND updated_at <= $2
                     )
                )
@@ -436,6 +443,7 @@ impl IssueWorkflowStore {
         )
         .bind(limit)
         .bind(stale_before)
+        .bind(claim_placeholder_like)
         .fetch_all(&mut *tx)
         .await?;
 

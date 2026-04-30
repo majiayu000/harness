@@ -139,9 +139,19 @@ struct PreparedEnqueue {
     reviewer: Option<Arc<dyn CodeAgent>>,
 }
 
+const WORKFLOW_FEEDBACK_SOURCE: &str = "workflow_feedback";
+
 enum PreparedEnqueueResult {
     Existing(TaskId),
     Ready(Box<PreparedEnqueue>),
+}
+
+fn is_workflow_feedback_request(req: &CreateTaskRequest) -> bool {
+    req.pr.is_some() && req.source.as_deref() == Some(WORKFLOW_FEEDBACK_SOURCE)
+}
+
+fn allows_terminal_pr_duplicate_reuse(req: &CreateTaskRequest) -> bool {
+    !is_workflow_feedback_request(req)
 }
 
 pub(crate) enum WorkflowReuseStrategy {
@@ -448,6 +458,9 @@ impl DefaultExecutionService {
         project_id: &str,
         req: &CreateTaskRequest,
     ) -> Option<TaskId> {
+        if !allows_terminal_pr_duplicate_reuse(req) {
+            return None;
+        }
         let ext_id = req.external_id.as_deref()?;
         let (existing_id, pr_url) = self
             .tasks
@@ -896,6 +909,24 @@ mod tests {
             ..Default::default()
         };
         assert!(DefaultExecutionService::validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn workflow_feedback_pr_request_bypasses_terminal_pr_duplicate_reuse() {
+        let feedback_req = CreateTaskRequest {
+            pr: Some(123),
+            source: Some(WORKFLOW_FEEDBACK_SOURCE.to_string()),
+            ..Default::default()
+        };
+        assert!(is_workflow_feedback_request(&feedback_req));
+        assert!(!allows_terminal_pr_duplicate_reuse(&feedback_req));
+
+        let regular_pr_req = CreateTaskRequest {
+            pr: Some(123),
+            ..Default::default()
+        };
+        assert!(!is_workflow_feedback_request(&regular_pr_req));
+        assert!(allows_terminal_pr_duplicate_reuse(&regular_pr_req));
     }
 
     #[tokio::test]

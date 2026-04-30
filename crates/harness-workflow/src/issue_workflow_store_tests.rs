@@ -239,6 +239,64 @@ async fn claim_feedback_candidates_reclaims_stale_claim_placeholders() -> anyhow
 }
 
 #[tokio::test]
+async fn claim_feedback_candidates_reclaims_legacy_addressing_feedback_placeholders(
+) -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/project-legacy-claim";
+    store
+        .record_issue_scheduled(project_id, Some("owner/repo"), 12, "task-1", &[], false)
+        .await?;
+    store
+        .record_pr_detected(
+            project_id,
+            Some("owner/repo"),
+            12,
+            "task-1",
+            80,
+            "https://github.com/owner/repo/pull/80",
+        )
+        .await?;
+    store
+        .record_feedback_task_scheduled(
+            project_id,
+            Some("owner/repo"),
+            80,
+            "claim:legacy-workflow-80",
+        )
+        .await?;
+
+    let workflow = store
+        .get_by_pr(project_id, Some("owner/repo"), 80)
+        .await?
+        .expect("workflow");
+    assert_eq!(workflow.state, IssueLifecycleState::AddressingFeedback);
+    assert_eq!(
+        workflow.active_task_id.as_deref(),
+        Some("claim:legacy-workflow-80")
+    );
+    sqlx::query(
+        "UPDATE issue_workflows
+         SET updated_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes'
+         WHERE id = $1",
+    )
+    .bind(&workflow.id)
+    .execute(&store.pool)
+    .await?;
+
+    let reclaimed = store
+        .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+        .await?;
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].pr_number, Some(80));
+    assert_eq!(reclaimed[0].state, IssueLifecycleState::FeedbackClaimed);
+    assert!(reclaimed[0].active_task_id.is_none());
+    assert!(reclaimed[0].feedback_claimed_at.is_some());
+    Ok(())
+}
+
+#[tokio::test]
 async fn bind_feedback_task_if_claimed_promotes_placeholder_to_active_feedback(
 ) -> anyhow::Result<()> {
     let Some(store) = open_test_store().await? else {
