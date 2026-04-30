@@ -1004,6 +1004,11 @@ impl TaskStore {
         self.db.pending_tasks_with_checkpoint().await
     }
 
+    /// Return pending tasks that have no PR URL and no checkpoint row.
+    pub(crate) async fn pending_orphan_tasks(&self) -> anyhow::Result<Vec<TaskState>> {
+        self.db.pending_orphan_tasks().await
+    }
+
     /// Overwrite `external_id` on an auto-fix task, even if one is already set.
     ///
     /// Used during streaming to implement "last sentinel wins" — the agent may
