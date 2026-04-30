@@ -32,6 +32,13 @@ export interface PasswordResetLimits {
   limit_per_hour: number;
 }
 
+export interface RuntimeLogsStatus {
+  state: "disabled" | "enabled" | "degraded";
+  active_path: string | null;
+  path_hint: string | null;
+  retention_days: number;
+}
+
 export interface OperatorSnapshotPayload {
   generated_at: string;
   retry: {
@@ -43,4 +50,5 @@ export interface OperatorSnapshotPayload {
     password_reset: PasswordResetLimits;
   };
   recent_failures: RecentFailure[];
+  runtime_logs: RuntimeLogsStatus;
 }

@@ -36,6 +36,7 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
     let count = state.core.tasks.count();
     let dirty = state.is_runtime_state_dirty();
     let degraded = &state.degraded_subsystems;
+    let runtime_logs = &state.core.server.runtime_logs;
     let startup_statuses: Vec<serde_json::Value> = state
         .startup_statuses
         .iter()
@@ -62,6 +63,11 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
             "startup": {
                 "stores": startup_statuses,
             }
+        },
+        "runtime_logs": {
+            "state": runtime_logs.state.as_str(),
+            "path_hint": runtime_logs.path_hint.clone(),
+            "retention_days": runtime_logs.retention_days,
         }
     }))
 }

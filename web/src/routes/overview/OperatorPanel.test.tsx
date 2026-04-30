@@ -51,6 +51,12 @@ function makeSnapshot(): OperatorSnapshotPayload {
         failed_at: null,
       },
     ],
+    runtime_logs: {
+      state: "enabled",
+      active_path: "/tmp/harness/logs/harness-serve-20260430T120000Z-pid1.log",
+      path_hint: "logs/harness-serve-20260430T120000Z-pid1.log",
+      retention_days: 30,
+    },
   };
 }
 
@@ -63,7 +69,7 @@ describe("<OperatorPanel>", () => {
 
     wrap(<OperatorPanel />);
 
-    expect(screen.getAllByText("Operator snapshot unavailable.").length).toBe(3);
+    expect(screen.getAllByText("Operator snapshot unavailable.").length).toBe(4);
     expect(screen.queryByText("No retry ticks recorded yet.")).not.toBeInTheDocument();
     expect(screen.queryByText("No recent failures.")).not.toBeInTheDocument();
     expect(screen.queryByText("/ 0 /min")).not.toBeInTheDocument();
@@ -82,5 +88,26 @@ describe("<OperatorPanel>", () => {
     expect(screen.queryByText("Operator snapshot unavailable.")).not.toBeInTheDocument();
     expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(2);
     expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("/tmp/harness/logs/harness-serve-20260430T120000Z-pid1.log"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows fallback copy when runtime-log metadata is unavailable", () => {
+    const snapshot = makeSnapshot();
+    snapshot.runtime_logs = {
+      state: "degraded",
+      active_path: null,
+      path_hint: "logs/harness-serve-20260430T120000Z-pid1.log",
+      retention_days: 30,
+    };
+    mockUseOperatorSnapshot.mockReturnValue({
+      data: snapshot,
+      isError: false,
+    });
+
+    wrap(<OperatorPanel />);
+
+    expect(screen.getByText("Runtime log path unavailable.")).toBeInTheDocument();
   });
 });

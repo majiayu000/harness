@@ -1253,6 +1253,7 @@ version = "0.6.33"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "clap",
  "harness-agents",
  "harness-core",

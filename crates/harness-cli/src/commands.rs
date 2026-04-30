@@ -1,9 +1,18 @@
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{ArgAction, Args, Parser, Subcommand};
-use std::path::PathBuf;
+use harness_server::server::RuntimeLogMetadata;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::writer::MakeWriter;
 
 mod exec;
 mod reconcile;
 mod serve;
+
+const RUNTIME_LOG_PREFIX: &str = "harness-serve-";
+const RUNTIME_LOG_SUFFIX: &str = ".log";
 
 #[derive(Parser)]
 #[command(name = "harness", about = "Harness — AI Code Agent Platform")]
@@ -281,39 +290,305 @@ fn configured_skill_store(
     Ok(store)
 }
 
-pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    // Load config
-    let mut config: harness_core::config::HarnessConfig = if let Some(config_path) = &cli.config {
-        let content = std::fs::read_to_string(config_path)?;
-        tracing::info!(
-            "config loaded from --config flag: {}",
-            config_path.display()
-        );
-        let mut cfg: harness_core::config::HarnessConfig = toml::from_str(&content)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigSource {
+    Flag(PathBuf),
+    Discovered(PathBuf),
+    BuiltInDefaults,
+}
+
+#[derive(Clone)]
+struct TeeMakeWriter {
+    runtime_log_file: Option<Arc<Mutex<File>>>,
+}
+
+struct TeeWriter {
+    stderr: io::Stderr,
+    runtime_log_file: Option<Arc<Mutex<File>>>,
+}
+
+impl<'a> MakeWriter<'a> for TeeMakeWriter {
+    type Writer = TeeWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TeeWriter {
+            stderr: io::stderr(),
+            runtime_log_file: self.runtime_log_file.clone(),
+        }
+    }
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stderr.write_all(buf)?;
+        if let Some(file) = &self.runtime_log_file {
+            let mut guard = match file.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stderr.flush()?;
+        if let Some(file) = &self.runtime_log_file {
+            let mut guard = match file.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.flush()?;
+        }
+        Ok(())
+    }
+}
+
+struct LoggingBootstrap {
+    runtime_logs: RuntimeLogMetadata,
+    runtime_log_file: Option<Arc<Mutex<File>>>,
+    setup_warning: Option<String>,
+    retention_warnings: Vec<String>,
+}
+
+fn load_config(
+    config_path: Option<&Path>,
+) -> anyhow::Result<(harness_core::config::HarnessConfig, ConfigSource)> {
+    if let Some(config_path) = config_path {
+        let content = fs::read_to_string(config_path)?;
+        let mut config: harness_core::config::HarnessConfig = toml::from_str(&content)?;
         if let Some(dir) = config_path.parent() {
-            cfg.rebase_relative_paths(dir);
+            config.rebase_relative_paths(dir);
         }
-        cfg
-    } else if let Some(discovered) = harness_core::config::dirs::find_config_file() {
-        let content = std::fs::read_to_string(&discovered)?;
-        tracing::info!("config loaded from {}", discovered.display());
-        let mut cfg: harness_core::config::HarnessConfig = toml::from_str(&content)?;
-        // Rebase relative paths against the config file's directory so that a
-        // global config like `project_root = "."` resolves relative to the
-        // config file rather than the operator's working directory.
+        return Ok((config, ConfigSource::Flag(config_path.to_path_buf())));
+    }
+
+    if let Some(discovered) = harness_core::config::dirs::find_config_file() {
+        let content = fs::read_to_string(&discovered)?;
+        let mut config: harness_core::config::HarnessConfig = toml::from_str(&content)?;
         if let Some(dir) = discovered.parent() {
-            cfg.rebase_relative_paths(dir);
+            config.rebase_relative_paths(dir);
         }
-        cfg
-    } else {
-        tracing::warn!("no config file found, using built-in defaults");
-        harness_core::config::HarnessConfig::default()
+        return Ok((config, ConfigSource::Discovered(discovered)));
+    }
+
+    Ok((
+        harness_core::config::HarnessConfig::default(),
+        ConfigSource::BuiltInDefaults,
+    ))
+}
+
+fn init_tracing(bootstrap: &LoggingBootstrap) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%dT%H:%M:%S%.3f%:z".to_string(),
+        ))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "harness=info,warn".into()),
+        )
+        .with_writer(TeeMakeWriter {
+            runtime_log_file: bootstrap.runtime_log_file.clone(),
+        })
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to initialize tracing subscriber: {error}"))
+}
+
+fn log_config_source(source: &ConfigSource) {
+    match source {
+        ConfigSource::Flag(path) => {
+            tracing::info!("config loaded from --config flag: {}", path.display());
+        }
+        ConfigSource::Discovered(path) => {
+            tracing::info!("config loaded from {}", path.display());
+        }
+        ConfigSource::BuiltInDefaults => {
+            tracing::warn!("no config file found, using built-in defaults");
+        }
+    }
+}
+
+fn log_runtime_log_status(bootstrap: &LoggingBootstrap) {
+    match bootstrap.runtime_logs.state {
+        harness_server::server::RuntimeLogState::Enabled => {
+            if let Some(path) = bootstrap.runtime_logs.active_path.as_ref() {
+                tracing::info!(
+                    path = %path.display(),
+                    retention_days = bootstrap.runtime_logs.retention_days,
+                    "runtime logs persisted to file"
+                );
+            }
+            for warning in &bootstrap.retention_warnings {
+                tracing::warn!(warning = %warning, "runtime log retention cleanup skipped an entry");
+            }
+        }
+        harness_server::server::RuntimeLogState::Degraded => {
+            tracing::warn!(
+                path_hint = bootstrap
+                    .runtime_logs
+                    .path_hint
+                    .as_deref()
+                    .unwrap_or("logs"),
+                retention_days = bootstrap.runtime_logs.retention_days,
+                error = bootstrap
+                    .setup_warning
+                    .as_deref()
+                    .unwrap_or("unknown setup error"),
+                "runtime log persistence unavailable; continuing with console logging only"
+            );
+        }
+        harness_server::server::RuntimeLogState::Disabled => {}
+    }
+}
+
+fn prepare_logging(
+    command: &Command,
+    config: &harness_core::config::HarnessConfig,
+) -> LoggingBootstrap {
+    match command {
+        Command::Serve { .. } => prepare_runtime_logs(config, Utc::now()),
+        _ => LoggingBootstrap {
+            runtime_logs: RuntimeLogMetadata::disabled(config.observe.log_retention_days),
+            runtime_log_file: None,
+            setup_warning: None,
+            retention_warnings: Vec::new(),
+        },
+    }
+}
+
+fn prepare_runtime_logs(
+    config: &harness_core::config::HarnessConfig,
+    started_at: DateTime<Utc>,
+) -> LoggingBootstrap {
+    let retention_days = config.observe.log_retention_days;
+    let log_path = runtime_log_path(&config.server.data_dir, started_at, std::process::id());
+    let path_hint = RuntimeLogMetadata::public_path_hint(&log_path);
+
+    match open_runtime_log_file(&log_path, retention_days, started_at) {
+        Ok((file, retention_warnings)) => LoggingBootstrap {
+            runtime_logs: RuntimeLogMetadata::enabled(log_path, retention_days),
+            runtime_log_file: Some(Arc::new(Mutex::new(file))),
+            setup_warning: None,
+            retention_warnings,
+        },
+        Err(error) => LoggingBootstrap {
+            runtime_logs: RuntimeLogMetadata::degraded(Some(path_hint), retention_days),
+            runtime_log_file: None,
+            setup_warning: Some(error.to_string()),
+            retention_warnings: Vec::new(),
+        },
+    }
+}
+
+fn runtime_log_path(data_dir: &Path, started_at: DateTime<Utc>, pid: u32) -> PathBuf {
+    data_dir.join("logs").join(format!(
+        "{RUNTIME_LOG_PREFIX}{}-pid{pid}{RUNTIME_LOG_SUFFIX}",
+        started_at.format("%Y%m%dT%H%M%SZ")
+    ))
+}
+
+fn open_runtime_log_file(
+    log_path: &Path,
+    retention_days: u32,
+    started_at: DateTime<Utc>,
+) -> io::Result<(File, Vec<String>)> {
+    let logs_dir = log_path
+        .parent()
+        .ok_or_else(|| io::Error::other("runtime log path missing parent directory"))?;
+    fs::create_dir_all(logs_dir)?;
+    let retention_warnings = purge_stale_runtime_logs(logs_dir, retention_days, started_at);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    Ok((file, retention_warnings))
+}
+
+fn purge_stale_runtime_logs(
+    logs_dir: &Path,
+    retention_days: u32,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    purge_stale_runtime_logs_with(logs_dir, retention_days, now, |path| fs::remove_file(path))
+}
+
+fn purge_stale_runtime_logs_with(
+    logs_dir: &Path,
+    retention_days: u32,
+    now: DateTime<Utc>,
+    mut remove_file: impl FnMut(&Path) -> io::Result<()>,
+) -> Vec<String> {
+    if !logs_dir.exists() {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    let cutoff = now - chrono::Duration::days(i64::from(retention_days));
+    let entries = match fs::read_dir(logs_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to scan runtime log directory {}: {error}",
+                logs_dir.display()
+            ));
+            return warnings;
+        }
     };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warnings.push(format!(
+                    "failed to read runtime log directory entry in {}: {error}",
+                    logs_dir.display()
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(started_at) = parse_runtime_log_started_at(file_name) else {
+            continue;
+        };
+        if started_at < cutoff {
+            if let Err(error) = remove_file(&path) {
+                warnings.push(format!(
+                    "failed to delete stale runtime log {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    warnings
+}
+
+fn parse_runtime_log_started_at(file_name: &str) -> Option<DateTime<Utc>> {
+    let trimmed = file_name
+        .strip_prefix(RUNTIME_LOG_PREFIX)?
+        .strip_suffix(RUNTIME_LOG_SUFFIX)?;
+    let (timestamp, _) = trimmed.rsplit_once("-pid")?;
+    let naive = NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%SZ").ok()?;
+    Some(DateTime::from_naive_utc_and_offset(naive, Utc))
+}
+
+pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    let (mut config, config_source) = load_config(cli.config.as_deref())?;
     // Apply env var overrides for all subcommands so that HARNESS_DATA_DIR,
     // HARNESS_PROJECT_ROOT, etc. are respected by gc, rule check, and skill
     // commands — not just `serve`.
     config.apply_env_overrides()?;
     harness_core::db::configure_pg_pool_from_server(&config.server);
+    let logging = prepare_logging(&cli.command, &config);
+    init_tracing(&logging)?;
+    log_config_source(&config_source);
+    log_runtime_log_status(&logging);
 
     match cli.command {
         Command::Serve {
@@ -330,6 +605,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 project_root,
                 projects,
                 default_project,
+                logging.runtime_logs.clone(),
             )
             .await?;
         }
@@ -574,6 +850,7 @@ mod tests {
         enforce_exec_privilege_policy_with, normalize_allow_list, resolve_exec_output_path,
         ExecSandboxMode,
     };
+    use chrono::TimeZone;
     use std::path::Path;
 
     #[test]
@@ -1084,5 +1361,131 @@ mod tests {
             }
             _ => panic!("expected Serve command"),
         }
+    }
+
+    #[test]
+    fn prepare_logging_creates_runtime_log_for_serve() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = harness_core::config::HarnessConfig::default();
+        config.server.data_dir = tempdir.path().to_path_buf();
+
+        let bootstrap = prepare_logging(
+            &Command::Serve {
+                transport: None,
+                port: None,
+                project_root: None,
+                projects: vec![],
+                default_project: None,
+            },
+            &config,
+        );
+
+        assert_eq!(bootstrap.runtime_logs.state.as_str(), "enabled");
+        let active_path = bootstrap
+            .runtime_logs
+            .active_path
+            .as_ref()
+            .expect("active path");
+        assert!(active_path.starts_with(tempdir.path().join("logs")));
+        assert!(active_path.exists(), "runtime log file should be created");
+        assert_eq!(
+            bootstrap.runtime_logs.path_hint.as_deref(),
+            active_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| format!("logs/{name}"))
+                .as_deref()
+        );
+    }
+
+    #[test]
+    fn purge_stale_runtime_logs_keeps_current_and_non_matching_files() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let logs_dir = tempdir.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let stale = runtime_log_path(
+            tempdir.path(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                .single()
+                .expect("stale timestamp"),
+            10,
+        );
+        let fresh = runtime_log_path(
+            tempdir.path(),
+            Utc.with_ymd_and_hms(2026, 4, 29, 12, 0, 0)
+                .single()
+                .expect("fresh timestamp"),
+            11,
+        );
+        let unrelated = logs_dir.join("notes.txt");
+        fs::write(&stale, "stale").expect("write stale");
+        fs::write(&fresh, "fresh").expect("write fresh");
+        fs::write(&unrelated, "keep").expect("write unrelated");
+
+        let warnings = purge_stale_runtime_logs(&logs_dir, 30, now);
+
+        assert!(warnings.is_empty(), "purge should not warn: {warnings:?}");
+        assert!(!stale.exists(), "stale runtime log should be deleted");
+        assert!(fresh.exists(), "fresh runtime log should be kept");
+        assert!(unrelated.exists(), "non-matching files should be kept");
+    }
+
+    #[test]
+    fn purge_stale_runtime_logs_reports_delete_errors_without_stopping() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let logs_dir = tempdir.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let stale = runtime_log_path(
+            tempdir.path(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                .single()
+                .expect("stale timestamp"),
+            10,
+        );
+        let fresh = runtime_log_path(
+            tempdir.path(),
+            Utc.with_ymd_and_hms(2026, 4, 29, 12, 0, 0)
+                .single()
+                .expect("fresh timestamp"),
+            11,
+        );
+        fs::write(&stale, "stale").expect("write stale");
+        fs::write(&fresh, "fresh").expect("write fresh");
+
+        let warnings = purge_stale_runtime_logs_with(&logs_dir, 30, now, |path| {
+            if path == stale.as_path() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated delete failure",
+                ));
+            }
+            fs::remove_file(path)
+        });
+
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("failed to delete stale runtime log"),
+            "warning should identify delete failure: {warnings:?}"
+        );
+        assert!(stale.exists(), "failed delete should leave stale file");
+        assert!(fresh.exists(), "fresh runtime log should be kept");
+    }
+
+    #[test]
+    fn prepare_logging_disables_file_persistence_for_non_serve_commands() {
+        let config = harness_core::config::HarnessConfig::default();
+        let bootstrap = prepare_logging(&Command::Version, &config);
+
+        assert_eq!(bootstrap.runtime_logs.state.as_str(), "disabled");
+        assert!(bootstrap.runtime_logs.active_path.is_none());
+        assert!(bootstrap.runtime_log_file.is_none());
     }
 }

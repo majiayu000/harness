@@ -633,6 +633,7 @@ struct HealthResponse {
     status: String,
     tasks: u64,
     persistence: PersistenceBlock,
+    runtime_logs: RuntimeLogsBlock,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -653,6 +654,13 @@ struct StoreHealth {
     critical: bool,
     ready: bool,
     error: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct RuntimeLogsBlock {
+    state: String,
+    path_hint: Option<String>,
+    retention_days: u32,
 }
 
 async fn call_health(state: Arc<AppState>) -> anyhow::Result<HealthResponse> {
@@ -679,6 +687,7 @@ async fn health_endpoint_returns_ok_and_task_count() -> anyhow::Result<()> {
     assert!(health.persistence.degraded_subsystems.is_empty());
     assert!(!health.persistence.runtime_state_dirty);
     assert!(health.persistence.startup.stores.is_empty());
+    assert_eq!(health.runtime_logs.state, "disabled");
     Ok(())
 }
 
@@ -705,6 +714,54 @@ async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
     assert_eq!(health.status, "degraded");
     assert!(health.persistence.degraded_subsystems.is_empty());
     assert!(health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_runtime_logs_redacts_absolute_path() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_test_state(dir.path()).await?;
+    let state_mut = Arc::get_mut(&mut state).expect("unique state");
+    let server = Arc::get_mut(&mut state_mut.core.server).expect("unique server");
+    server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(
+        dir.path()
+            .join("logs/harness-serve-20260430T120000Z-pid1.log"),
+        45,
+    );
+
+    let health = call_health(state).await?;
+    assert_eq!(health.runtime_logs.state, "enabled");
+    assert_eq!(
+        health.runtime_logs.path_hint.as_deref(),
+        Some("logs/harness-serve-20260430T120000Z-pid1.log")
+    );
+    assert_eq!(health.runtime_logs.retention_days, 45);
+    assert!(
+        !format!("{health:?}").contains(&dir.path().display().to_string()),
+        "health response must not expose an absolute runtime log path"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_runtime_logs_can_report_degraded_without_raw_error_text() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_test_state(dir.path()).await?;
+    let state_mut = Arc::get_mut(&mut state).expect("unique state");
+    let server = Arc::get_mut(&mut state_mut.core.server).expect("unique server");
+    server.runtime_logs = crate::server::RuntimeLogMetadata::degraded(
+        Some("logs/harness-serve-20260430T120000Z-pid1.log".to_string()),
+        7,
+    );
+
+    let health = call_health(state).await?;
+    assert_eq!(health.runtime_logs.state, "degraded");
+    assert_eq!(
+        health.runtime_logs.path_hint.as_deref(),
+        Some("logs/harness-serve-20260430T120000Z-pid1.log")
+    );
+    assert_eq!(health.runtime_logs.retention_days, 7);
+    assert!(!format!("{health:?}").contains("permission denied"));
     Ok(())
 }
 

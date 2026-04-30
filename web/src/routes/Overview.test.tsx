@@ -96,6 +96,12 @@ function makeSnapshot(): OperatorSnapshotPayload {
       },
     },
     recent_failures: [],
+    runtime_logs: {
+      state: "disabled",
+      active_path: null,
+      path_hint: null,
+      retention_days: 30,
+    },
   };
 }
 
