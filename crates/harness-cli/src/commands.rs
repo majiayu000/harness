@@ -348,6 +348,7 @@ struct LoggingBootstrap {
     runtime_logs: RuntimeLogMetadata,
     runtime_log_file: Option<Arc<Mutex<File>>>,
     setup_warning: Option<String>,
+    retention_warnings: Vec<String>,
 }
 
 fn load_config(
@@ -417,6 +418,9 @@ fn log_runtime_log_status(bootstrap: &LoggingBootstrap) {
                     "runtime logs persisted to file"
                 );
             }
+            for warning in &bootstrap.retention_warnings {
+                tracing::warn!(warning = %warning, "runtime log retention cleanup skipped an entry");
+            }
         }
         harness_server::server::RuntimeLogState::Degraded => {
             tracing::warn!(
@@ -447,6 +451,7 @@ fn prepare_logging(
             runtime_logs: RuntimeLogMetadata::disabled(config.observe.log_retention_days),
             runtime_log_file: None,
             setup_warning: None,
+            retention_warnings: Vec::new(),
         },
     }
 }
@@ -460,15 +465,17 @@ fn prepare_runtime_logs(
     let path_hint = RuntimeLogMetadata::public_path_hint(&log_path);
 
     match open_runtime_log_file(&log_path, retention_days, started_at) {
-        Ok(file) => LoggingBootstrap {
+        Ok((file, retention_warnings)) => LoggingBootstrap {
             runtime_logs: RuntimeLogMetadata::enabled(log_path, retention_days),
             runtime_log_file: Some(Arc::new(Mutex::new(file))),
             setup_warning: None,
+            retention_warnings,
         },
         Err(error) => LoggingBootstrap {
             runtime_logs: RuntimeLogMetadata::degraded(Some(path_hint), retention_days),
             runtime_log_file: None,
             setup_warning: Some(error.to_string()),
+            retention_warnings: Vec::new(),
         },
     }
 }
@@ -484,27 +491,60 @@ fn open_runtime_log_file(
     log_path: &Path,
     retention_days: u32,
     started_at: DateTime<Utc>,
-) -> io::Result<File> {
+) -> io::Result<(File, Vec<String>)> {
     let logs_dir = log_path
         .parent()
         .ok_or_else(|| io::Error::other("runtime log path missing parent directory"))?;
-    purge_stale_runtime_logs(logs_dir, retention_days, started_at)?;
     fs::create_dir_all(logs_dir)?;
-    OpenOptions::new().create(true).append(true).open(log_path)
+    let retention_warnings = purge_stale_runtime_logs(logs_dir, retention_days, started_at);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    Ok((file, retention_warnings))
 }
 
 fn purge_stale_runtime_logs(
     logs_dir: &Path,
     retention_days: u32,
     now: DateTime<Utc>,
-) -> io::Result<()> {
+) -> Vec<String> {
+    purge_stale_runtime_logs_with(logs_dir, retention_days, now, |path| fs::remove_file(path))
+}
+
+fn purge_stale_runtime_logs_with(
+    logs_dir: &Path,
+    retention_days: u32,
+    now: DateTime<Utc>,
+    mut remove_file: impl FnMut(&Path) -> io::Result<()>,
+) -> Vec<String> {
     if !logs_dir.exists() {
-        return Ok(());
+        return Vec::new();
     }
 
+    let mut warnings = Vec::new();
     let cutoff = now - chrono::Duration::days(i64::from(retention_days));
-    for entry in fs::read_dir(logs_dir)? {
-        let entry = entry?;
+    let entries = match fs::read_dir(logs_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to scan runtime log directory {}: {error}",
+                logs_dir.display()
+            ));
+            return warnings;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warnings.push(format!(
+                    "failed to read runtime log directory entry in {}: {error}",
+                    logs_dir.display()
+                ));
+                continue;
+            }
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -517,11 +557,16 @@ fn purge_stale_runtime_logs(
             continue;
         };
         if started_at < cutoff {
-            fs::remove_file(path)?;
+            if let Err(error) = remove_file(&path) {
+                warnings.push(format!(
+                    "failed to delete stale runtime log {}: {error}",
+                    path.display()
+                ));
+            }
         }
     }
 
-    Ok(())
+    warnings
 }
 
 fn parse_runtime_log_started_at(file_name: &str) -> Option<DateTime<Utc>> {
@@ -1381,11 +1426,57 @@ mod tests {
         fs::write(&fresh, "fresh").expect("write fresh");
         fs::write(&unrelated, "keep").expect("write unrelated");
 
-        purge_stale_runtime_logs(&logs_dir, 30, now).expect("purge");
+        let warnings = purge_stale_runtime_logs(&logs_dir, 30, now);
 
+        assert!(warnings.is_empty(), "purge should not warn: {warnings:?}");
         assert!(!stale.exists(), "stale runtime log should be deleted");
         assert!(fresh.exists(), "fresh runtime log should be kept");
         assert!(unrelated.exists(), "non-matching files should be kept");
+    }
+
+    #[test]
+    fn purge_stale_runtime_logs_reports_delete_errors_without_stopping() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let logs_dir = tempdir.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
+            .single()
+            .expect("timestamp");
+        let stale = runtime_log_path(
+            tempdir.path(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                .single()
+                .expect("stale timestamp"),
+            10,
+        );
+        let fresh = runtime_log_path(
+            tempdir.path(),
+            Utc.with_ymd_and_hms(2026, 4, 29, 12, 0, 0)
+                .single()
+                .expect("fresh timestamp"),
+            11,
+        );
+        fs::write(&stale, "stale").expect("write stale");
+        fs::write(&fresh, "fresh").expect("write fresh");
+
+        let warnings = purge_stale_runtime_logs_with(&logs_dir, 30, now, |path| {
+            if path == stale.as_path() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated delete failure",
+                ));
+            }
+            fs::remove_file(path)
+        });
+
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("failed to delete stale runtime log"),
+            "warning should identify delete failure: {warnings:?}"
+        );
+        assert!(stale.exists(), "failed delete should leave stale file");
+        assert!(fresh.exists(), "fresh runtime log should be kept");
     }
 
     #[test]
