@@ -1243,6 +1243,249 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
 }
 
 #[tokio::test]
+async fn runtime_job_worker_marks_bound_issue_done_without_agent_turn() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        1,
+        "reconciling",
+        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+    )
+    .with_id("repo-backlog-mark")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "last_issue_number": 127,
+        "last_pr_number": 77,
+        "last_pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    store.upsert_instance(&parent).await?;
+    let child_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 127);
+    let child = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:127"),
+    )
+    .with_id(child_id.clone())
+    .with_parent("repo-backlog-mark")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "issue_number": 127,
+    }));
+    store.upsert_instance(&child).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "mark_bound_issue_done",
+        "repo-backlog:owner/repo:pr:77:merged",
+    );
+    let command_id = store.enqueue_command(&parent.id, None, &command).await?;
+    let activity = command.runtime_activity_key().to_string();
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": parent.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key.clone(),
+                "activity": activity,
+                "command": command.command.clone(),
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    assert_eq!(tick.cancelled, 0);
+    let child_after = store
+        .get_instance(&child_id)
+        .await?
+        .expect("child workflow should still exist");
+    assert_eq!(child_after.state, "done");
+    assert_eq!(
+        child_after.parent_workflow_id.as_deref(),
+        Some("repo-backlog-mark")
+    );
+    assert_eq!(child_after.data["issue_number"], 127);
+    assert_eq!(child_after.data["pr_number"], 77);
+    assert_eq!(
+        child_after.data["pr_url"],
+        "https://github.com/owner/repo/pull/77"
+    );
+    assert_eq!(
+        child_after.data["started_by_runtime_job_id"],
+        runtime_job.id
+    );
+    let parent_after = store
+        .get_instance("repo-backlog-mark")
+        .await?
+        .expect("parent workflow should still exist");
+    assert_eq!(parent_after.state, "idle");
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "mark_bound_issue_done");
+    assert_eq!(
+        output.status,
+        harness_workflow::runtime::ActivityStatus::Succeeded
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_recovers_stale_issue_workflow_without_agent_turn() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        1,
+        "reconciling",
+        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+    )
+    .with_id("repo-backlog-recover")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "last_issue_number": 128,
+        "last_active_task_id": "task-128",
+        "last_observed_state": "implementing",
+        "last_recovery_reason": "active task disappeared during startup reconciliation",
+    }));
+    store.upsert_instance(&parent).await?;
+    let child_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 128);
+    let child = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:128"),
+    )
+    .with_id(child_id.clone())
+    .with_parent("repo-backlog-recover")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "issue_number": 128,
+    }));
+    store.upsert_instance(&child).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "recover_issue_workflow",
+        "repo-backlog:owner/repo:issue:128:recover",
+    );
+    let command_id = store.enqueue_command(&parent.id, None, &command).await?;
+    let activity = command.runtime_activity_key().to_string();
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": parent.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key.clone(),
+                "activity": activity,
+                "command": command.command.clone(),
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    assert_eq!(tick.cancelled, 0);
+    let child_after = store
+        .get_instance(&child_id)
+        .await?
+        .expect("child workflow should still exist");
+    assert_eq!(child_after.state, "scheduled");
+    assert_eq!(
+        child_after.parent_workflow_id.as_deref(),
+        Some("repo-backlog-recover")
+    );
+    assert_eq!(child_after.data["issue_number"], 128);
+    assert_eq!(child_after.data["previous_state"], "implementing");
+    assert_eq!(child_after.data["previous_active_task_id"], "task-128");
+    assert_eq!(
+        child_after.data["recovery_reason"],
+        "active task disappeared during startup reconciliation"
+    );
+    assert_eq!(
+        child_after.data["started_by_runtime_job_id"],
+        runtime_job.id
+    );
+    let parent_after = store
+        .get_instance("repo-backlog-recover")
+        .await?
+        .expect("parent workflow should still exist");
+    assert_eq!(parent_after.state, "idle");
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "recover_issue_workflow");
+    assert_eq!(
+        output.status,
+        harness_workflow::runtime::ActivityStatus::Succeeded
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

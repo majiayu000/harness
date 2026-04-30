@@ -41,6 +41,8 @@ Implemented now:
   overrides that are copied into workflow runtime instance data
 - runtime command dispatch can select runtime profiles per workflow/activity pair, then activity,
   then workflow
+- repo backlog lifecycle activities are handled as server-owned runtime worker operations for child
+  workflow creation, merged-PR completion, and stale workflow recovery
 - runtime profiles carry model and execution metadata into runtime jobs
 - server runtime workers pass runtime profile model overrides into agent turns
 - server turn lifecycle enforces runtime profile `timeout_secs` as an execution deadline
@@ -383,13 +385,14 @@ Still intentionally not moved yet:
 
 - GitHub polling still runs through the existing intake source implementations
 - sprint planning still uses the current task queue path
-- command outbox rows are not yet claimed by runtime workers
+- repo backlog polling still feeds workflow runtime decisions from existing server code
 
 Tests:
 
 - open issue without workflow emits start command
 - merged PR updates the bound issue workflow
 - stale active workflow emits recovery event
+- server runtime worker executes repo backlog lifecycle commands without sending an agent turn
 
 ### Phase 5: Runtime Worker Abstraction
 
@@ -507,8 +510,9 @@ Implemented now:
 - runtime jobs create normal Harness threads and turns, so agent output remains visible in the
   existing conversation/runtime log path
 - completed turns are written back as structured `ActivityResult` payloads
-- `start_child_workflow` is handled as a server-owned lifecycle command, creating or reusing the
-  child workflow without asking an agent to mutate workflow tables
+- repo backlog lifecycle activities are handled as server-owned commands, creating or reusing child
+  issue workflows, marking merged bound issues done, and recovering stale active issue workflows
+  without asking an agent to mutate workflow tables
 - `remote_host` jobs remain reserved for external runtime hosts and are not executed locally
 
 Still intentionally not moved yet:
@@ -521,8 +525,8 @@ Tests:
 
 - workflow config parses worker policy fields
 - server worker tick claims a job, runs a registered agent, and records a succeeded runtime job
-- server worker starts child workflows directly and feeds the completion back through the runtime
-  reducer
+- server worker starts child workflows, marks bound issues done, and recovers stale issue workflows
+  directly, then feeds the completion back through the runtime reducer
 
 ### Phase 10: Runtime Completion Feedback
 
