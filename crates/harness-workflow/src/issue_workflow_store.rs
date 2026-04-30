@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::issue_lifecycle::{
     is_feedback_claim_placeholder, legacy_schema_for_path, workflow_id, IssueLifecycleEvent,
-    IssueLifecycleEventKind, IssueLifecycleState, IssueWorkflowInstance,
+    IssueLifecycleEventKind, IssueLifecycleState, IssueWorkflowInstance, ReviewFallbackSnapshot,
     FEEDBACK_CLAIM_TASK_PREFIX,
 };
 
@@ -374,6 +374,25 @@ impl IssueWorkflowStore {
             } else {
                 IssueLifecycleEventKind::WorkflowFailed
             });
+            if let Some(detail) = detail {
+                event = event.with_detail(detail.to_string());
+            }
+            workflow.apply_event(event);
+        })
+        .await
+    }
+
+    pub async fn record_ready_to_merge_with_fallback(
+        &self,
+        project_id: &str,
+        repo: Option<&str>,
+        pr_number: u64,
+        detail: Option<&str>,
+        fallback: ReviewFallbackSnapshot,
+    ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
+        self.update_by_pr(project_id, repo, pr_number, |workflow| {
+            workflow.set_review_fallback(Some(fallback.clone()));
+            let mut event = IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable);
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }

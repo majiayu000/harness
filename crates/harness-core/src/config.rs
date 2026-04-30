@@ -276,6 +276,9 @@ mod tests {
         assert_eq!(config.max_rounds, 3);
         assert_eq!(config.review_bot_command, "/gemini review");
         assert!(config.review_bot_auto_trigger);
+        assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+        assert_eq!(config.silence_rounds_threshold, 3);
+        assert_eq!(config.silence_min_minutes_after_commit, 30);
     }
 
     #[test]
@@ -291,6 +294,9 @@ mod tests {
         assert_eq!(config.max_rounds, 5);
         assert_eq!(config.review_bot_command, "/gemini review");
         assert!(config.review_bot_auto_trigger);
+        assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+        assert_eq!(config.silence_rounds_threshold, 3);
+        assert_eq!(config.silence_min_minutes_after_commit, 30);
     }
 
     #[test]
@@ -304,6 +310,9 @@ mod tests {
         assert_eq!(config.max_rounds, 3);
         assert_eq!(config.review_bot_command, "/gemini review");
         assert!(config.review_bot_auto_trigger);
+        assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+        assert_eq!(config.silence_rounds_threshold, 3);
+        assert_eq!(config.silence_min_minutes_after_commit, 30);
     }
 
     #[test]
@@ -312,11 +321,17 @@ mod tests {
             enabled = true
             review_bot_command = "/reviewbot run"
             review_bot_auto_trigger = false
+            fallback_chain = ["gemini", "codex"]
+            silence_rounds_threshold = 4
+            silence_min_minutes_after_commit = 45
         "#;
         let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert_eq!(config.review_bot_command, "/reviewbot run");
         assert!(!config.review_bot_auto_trigger);
+        assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+        assert_eq!(config.silence_rounds_threshold, 4);
+        assert_eq!(config.silence_min_minutes_after_commit, 45);
     }
 
     #[test]
@@ -1032,6 +1047,7 @@ mod tests {
     fn agent_review_config_review_bot_command_default() {
         let config = AgentReviewConfig::default();
         assert_eq!(config.review_bot_command, "/gemini review");
+        assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
     }
 
     #[test]

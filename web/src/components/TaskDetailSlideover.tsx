@@ -161,14 +161,38 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
   );
 }
 
+function formatFallbackLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  return value.replaceAll("_", " ");
+}
+
 function SummaryContent({ task }: { task: FullTask }) {
   return (
     <dl className="flex flex-col gap-2 font-mono text-[11px]">
       <Field label="Kind" value={task.task_kind} />
       <Field label="Status" value={task.status} />
+      {task.workflow?.state && <Field label="Workflow" value={task.workflow.state} />}
       {task.phase && <Field label="Phase" value={task.phase} />}
       {task.repo && <Field label="Repo" value={task.repo} />}
       {task.description && <Field label="Description" value={task.description} />}
+      {task.workflow?.review_fallback && (
+        <>
+          <Field
+            label="Fallback Tier"
+            value={task.workflow.review_fallback.tier.toUpperCase()}
+          />
+          <Field
+            label="Fallback Trigger"
+            value={formatFallbackLabel(task.workflow.review_fallback.trigger)}
+          />
+          {task.workflow.review_fallback.active_bot && (
+            <Field
+              label="Fallback Bot"
+              value={task.workflow.review_fallback.active_bot}
+            />
+          )}
+        </>
+      )}
       {task.pr_url && (
         <div>
           <dt className="text-ink-3 mb-0.5">PR</dt>

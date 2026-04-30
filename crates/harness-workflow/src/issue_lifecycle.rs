@@ -47,6 +47,34 @@ pub enum IssueLifecycleEventKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFallbackSnapshot {
+    pub tier: ReviewFallbackTier,
+    pub trigger: ReviewFallbackTrigger,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_bot: Option<String>,
+    pub activated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReviewFallbackTier {
+    #[serde(rename = "a")]
+    A,
+    #[serde(rename = "b")]
+    B,
+    #[serde(rename = "c")]
+    C,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFallbackTrigger {
+    GeminiQuota,
+    CodexQuota,
+    AllBotsQuota,
+    Silence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssueLifecycleEvent {
     pub kind: IssueLifecycleEventKind,
     pub at: DateTime<Utc>,
@@ -112,6 +140,8 @@ pub struct IssueWorkflowInstance {
     pub plan_concern: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feedback_claimed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_fallback: Option<ReviewFallbackSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event: Option<IssueLifecycleEvent>,
     pub created_at: DateTime<Utc>,
@@ -137,6 +167,7 @@ impl IssueWorkflowInstance {
             force_execute: false,
             plan_concern: None,
             feedback_claimed_at: None,
+            review_fallback: None,
             last_event: None,
             created_at: now,
             updated_at: now,
@@ -148,21 +179,25 @@ impl IssueWorkflowInstance {
             IssueLifecycleEventKind::IssueScheduled => {
                 self.state = IssueLifecycleState::Scheduled;
                 self.active_task_id = event.task_id.clone();
+                self.review_fallback = None;
             }
             IssueLifecycleEventKind::ImplementStarted => {
                 self.state = IssueLifecycleState::Implementing;
                 self.active_task_id = event.task_id.clone();
+                self.review_fallback = None;
             }
             IssueLifecycleEventKind::PlanIssueDetected => {
                 self.state = IssueLifecycleState::Implementing;
                 self.active_task_id = event.task_id.clone();
                 self.plan_concern = event.detail.clone();
+                self.review_fallback = None;
             }
             IssueLifecycleEventKind::PrDetected => {
                 self.state = IssueLifecycleState::PrOpen;
                 self.active_task_id = event.task_id.clone();
                 self.pr_number = event.pr_number;
                 self.pr_url = event.pr_url.clone();
+                self.review_fallback = None;
             }
             IssueLifecycleEventKind::FeedbackFound => {
                 self.state = IssueLifecycleState::FeedbackClaimed;
@@ -179,6 +214,7 @@ impl IssueWorkflowInstance {
                 self.state = IssueLifecycleState::AddressingFeedback;
                 self.active_task_id = event.task_id.clone();
                 self.feedback_claimed_at = None;
+                self.review_fallback = None;
                 if event.pr_number.is_some() {
                     self.pr_number = event.pr_number;
                 }
@@ -191,6 +227,7 @@ impl IssueWorkflowInstance {
                 self.state = IssueLifecycleState::AwaitingFeedback;
                 self.active_task_id = None;
                 self.feedback_claimed_at = None;
+                self.review_fallback = None;
             }
             IssueLifecycleEventKind::Mergeable => {
                 self.state = IssueLifecycleState::ReadyToMerge;
@@ -222,6 +259,11 @@ impl IssueWorkflowInstance {
             }
         }
         self.last_event = Some(event);
+        self.updated_at = Utc::now();
+    }
+
+    pub fn set_review_fallback(&mut self, fallback: Option<ReviewFallbackSnapshot>) {
+        self.review_fallback = fallback;
         self.updated_at = Utc::now();
     }
 }
@@ -305,6 +347,31 @@ mod tests {
             IssueLifecycleEventKind::HumanMergeApproved,
         ));
         assert_eq!(wf.state, IssueLifecycleState::Done, "second call is no-op");
+    }
+
+    #[test]
+    fn mergeable_preserves_existing_review_fallback_snapshot() {
+        let mut wf = IssueWorkflowInstance::new("/tmp/p", Some("owner/repo".to_string()), 4);
+        let activated_at = Utc::now();
+        wf.set_review_fallback(Some(ReviewFallbackSnapshot {
+            tier: ReviewFallbackTier::C,
+            trigger: ReviewFallbackTrigger::Silence,
+            active_bot: Some("codex".to_string()),
+            activated_at,
+        }));
+
+        wf.apply_event(IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable));
+
+        assert_eq!(wf.state, IssueLifecycleState::ReadyToMerge);
+        assert_eq!(
+            wf.review_fallback,
+            Some(ReviewFallbackSnapshot {
+                tier: ReviewFallbackTier::C,
+                trigger: ReviewFallbackTrigger::Silence,
+                active_bot: Some("codex".to_string()),
+                activated_at,
+            })
+        );
     }
 
     #[test]

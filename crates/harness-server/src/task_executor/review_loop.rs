@@ -6,7 +6,7 @@ use super::helpers::{
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
@@ -105,41 +105,614 @@ fn issue_count_not_decreasing(counts: &[Option<u32>]) -> bool {
     matches!(tail, [Some(a), Some(b), Some(c)] if c >= a && c >= b)
 }
 
-const QUOTA_EXHAUSTED_THRESHOLD: u32 = 3;
-const MAX_QUOTA_HEURISTIC_GRADUATIONS: u32 = 2;
-const QUOTA_HEURISTIC_ATTEMPT_RESULT: &str = "quota_heuristic_attempt";
-const NEEDS_MANUAL_REVIEW_RESULT: &str = "needs_manual_review";
+const MAX_CONSECUTIVE_WAITS: u32 = 10;
+const CODEX_REVIEWER_NAME: &str = "chatgpt-codex-connector[bot]";
+const CODEX_REVIEW_COMMAND: &str = "@codex";
+const CODEX_APPROVAL_SIGNATURE: &str = "no major issues";
 
-fn update_quota_exhausted_rounds(current: u32, waiting: bool, quota_exhausted: bool) -> u32 {
-    if quota_exhausted {
-        current.saturating_add(1)
-    } else if waiting {
-        current
-    } else {
-        0
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReviewBotKey {
+    Gemini,
+    Codex,
+}
+
+impl ReviewBotKey {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Gemini => "gemini",
+            Self::Codex => "codex",
+        }
     }
 }
 
-fn quota_exhausted_streak(rounds: &[RoundResult]) -> u32 {
-    let mut streak = 0;
-    for round in rounds.iter().rev() {
-        if round.action != "review" {
-            continue;
-        }
-        if round.result == "quota_exhausted" {
-            streak += 1;
-        } else {
-            break;
-        }
-    }
-    streak
+#[derive(Debug, Clone)]
+struct ReviewBotDescriptor {
+    key: ReviewBotKey,
+    reviewer_name: String,
+    review_command: String,
 }
 
-fn quota_heuristic_attempt_count(rounds: &[RoundResult]) -> u32 {
-    rounds
+impl ReviewBotDescriptor {
+    fn from_chain_entry(
+        entry: &str,
+        review_config: &harness_core::config::agents::AgentReviewConfig,
+    ) -> Option<Self> {
+        match entry.trim().to_ascii_lowercase().as_str() {
+            "gemini" => Some(Self {
+                key: ReviewBotKey::Gemini,
+                reviewer_name: review_config.reviewer_name.clone(),
+                review_command: review_config.review_bot_command.clone(),
+            }),
+            "codex" => Some(Self {
+                key: ReviewBotKey::Codex,
+                reviewer_name: CODEX_REVIEWER_NAME.to_string(),
+                review_command: CODEX_REVIEW_COMMAND.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubGraphQlResponse<T> {
+    data: Option<T>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PullRequestQueryData {
+    repository: Option<PullRequestRepository>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PullRequestRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<PullRequestGraphQl>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PullRequestGraphQl {
+    commits: GraphQlConnection<CommitNode>,
+    reviews: GraphQlConnection<ReviewNode>,
+    comments: GraphQlConnection<CommentNode>,
+    #[serde(rename = "reviewThreads")]
+    review_threads: GraphQlConnection<ReviewThreadNode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GraphQlConnection<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommitNode {
+    commit: CommitDetails,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommitDetails {
+    #[serde(rename = "committedDate")]
+    committed_date: DateTime<Utc>,
+    #[serde(rename = "statusCheckRollup")]
+    status_check_rollup: Option<StatusCheckRollup>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StatusCheckRollup {
+    state: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReviewNode {
+    author: Option<ActorNode>,
+    body: String,
+    #[serde(rename = "submittedAt")]
+    submitted_at: Option<DateTime<Utc>>,
+    state: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommentNode {
+    author: Option<ActorNode>,
+    body: String,
+    #[serde(rename = "createdAt")]
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReviewThreadNode {
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
+    #[serde(rename = "isOutdated")]
+    is_outdated: bool,
+    comments: GraphQlConnection<ThreadCommentNode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ThreadCommentNode {
+    author: Option<ActorNode>,
+    body: String,
+    #[serde(rename = "publishedAt")]
+    published_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ActorNode {
+    login: String,
+}
+
+#[derive(Debug, Clone)]
+struct PullRequestSignals {
+    latest_commit_at: DateTime<Utc>,
+    ci_green: bool,
+    latest_bot_activity_at: Option<DateTime<Utc>>,
+    blocking_feedback: bool,
+    bots: HashMap<ReviewBotKey, BotSignals>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BotSignals {
+    latest_review_at: Option<DateTime<Utc>>,
+    latest_review_state: Option<String>,
+    latest_review_body: Option<String>,
+    latest_comment_at: Option<DateTime<Utc>>,
+    latest_comment_body: Option<String>,
+    reviewed_any_commit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BotClassification {
+    FreshApproval,
+    ActionableFeedback,
+    QuotaExhausted,
+    Silent,
+    NeverReviewed,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewFallbackState {
+    tier: harness_workflow::issue_lifecycle::ReviewFallbackTier,
+    trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger,
+    active_bot: Option<ReviewBotKey>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewLoopDecision {
+    active_bot: ReviewBotDescriptor,
+    fallback: Option<ReviewFallbackState>,
+    wait_for_bot: bool,
+}
+
+fn quota_trigger(bot: ReviewBotKey) -> harness_workflow::issue_lifecycle::ReviewFallbackTrigger {
+    match bot {
+        ReviewBotKey::Gemini => {
+            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::GeminiQuota
+        }
+        ReviewBotKey::Codex => harness_workflow::issue_lifecycle::ReviewFallbackTrigger::CodexQuota,
+    }
+}
+
+fn bot_fallback_chain(
+    review_config: &harness_core::config::agents::AgentReviewConfig,
+) -> Vec<ReviewBotDescriptor> {
+    let mut chain: Vec<ReviewBotDescriptor> = review_config
+        .fallback_chain
         .iter()
-        .filter(|round| round.action == "review" && round.result == QUOTA_HEURISTIC_ATTEMPT_RESULT)
-        .count() as u32
+        .filter_map(|entry| ReviewBotDescriptor::from_chain_entry(entry, review_config))
+        .collect();
+    if chain.is_empty() {
+        chain.push(ReviewBotDescriptor {
+            key: ReviewBotKey::Gemini,
+            reviewer_name: review_config.reviewer_name.clone(),
+            review_command: review_config.review_bot_command.clone(),
+        });
+    }
+    chain
+}
+
+fn bot_quota_exhausted(bot: ReviewBotKey, body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    match bot {
+        ReviewBotKey::Gemini => prompts::is_quota_exhausted(body),
+        ReviewBotKey::Codex => lower.contains("codex usage limits have been reached"),
+    }
+}
+
+fn bot_approval_signal(bot: ReviewBotKey, body: &str) -> bool {
+    match bot {
+        ReviewBotKey::Gemini => false,
+        ReviewBotKey::Codex => body.to_ascii_lowercase().contains(CODEX_APPROVAL_SIGNATURE),
+    }
+}
+
+fn review_bot_key_for_author(chain: &[ReviewBotDescriptor], author: &str) -> Option<ReviewBotKey> {
+    chain
+        .iter()
+        .find(|descriptor| descriptor.reviewer_name.eq_ignore_ascii_case(author))
+        .map(|descriptor| descriptor.key)
+}
+
+fn blocking_review_thread(thread: &ReviewThreadNode) -> bool {
+    if thread.is_resolved || thread.is_outdated {
+        return false;
+    }
+    thread.comments.nodes.iter().any(|comment| {
+        let body = comment.body.to_ascii_lowercase();
+        body.contains("critical") || body.contains("high")
+    })
+}
+
+fn latest_comment_body_after_commit(
+    bot: &BotSignals,
+    latest_commit_at: DateTime<Utc>,
+) -> Option<&str> {
+    match (bot.latest_comment_at, bot.latest_comment_body.as_deref()) {
+        (Some(at), Some(body)) if at >= latest_commit_at => Some(body),
+        _ => None,
+    }
+}
+
+fn record_bot_comment_signal(bot: &mut BotSignals, body: String, created_at: DateTime<Utc>) {
+    bot.reviewed_any_commit = true;
+    let replace = bot
+        .latest_comment_at
+        .map(|current| created_at >= current)
+        .unwrap_or(true);
+    if replace {
+        bot.latest_comment_at = Some(created_at);
+        bot.latest_comment_body = Some(body);
+    }
+}
+
+fn classify_bot(
+    descriptor: &ReviewBotDescriptor,
+    bot: &BotSignals,
+    latest_commit_at: DateTime<Utc>,
+    ci_green: bool,
+    blocking_feedback: bool,
+    silence_rounds: u32,
+    silence_rounds_threshold: u32,
+    silence_min_minutes_after_commit: u32,
+) -> BotClassification {
+    if let Some(review_at) = bot.latest_review_at {
+        if review_at >= latest_commit_at {
+            let review_state = bot.latest_review_state.as_deref().unwrap_or_default();
+            if review_state == "APPROVED"
+                || bot
+                    .latest_review_body
+                    .as_deref()
+                    .is_some_and(|body| bot_approval_signal(descriptor.key, body))
+            {
+                return BotClassification::FreshApproval;
+            }
+            if bot
+                .latest_review_body
+                .as_deref()
+                .is_some_and(|body| bot_quota_exhausted(descriptor.key, body))
+            {
+                return BotClassification::QuotaExhausted;
+            }
+            return BotClassification::ActionableFeedback;
+        }
+    }
+    if let Some(body) = latest_comment_body_after_commit(bot, latest_commit_at) {
+        if bot_quota_exhausted(descriptor.key, body) {
+            return BotClassification::QuotaExhausted;
+        }
+        if bot_approval_signal(descriptor.key, body) {
+            return BotClassification::FreshApproval;
+        }
+        return BotClassification::ActionableFeedback;
+    }
+    if !bot.reviewed_any_commit {
+        return BotClassification::NeverReviewed;
+    }
+    let commit_age_minutes = (Utc::now() - latest_commit_at).num_minutes();
+    if silence_rounds >= silence_rounds_threshold
+        && commit_age_minutes >= i64::from(silence_min_minutes_after_commit)
+        && ci_green
+        && !blocking_feedback
+    {
+        return BotClassification::Silent;
+    }
+    BotClassification::ActionableFeedback
+}
+
+async fn fetch_pull_request_signals(
+    repo_slug: &str,
+    pr_num: u64,
+    github_token: Option<&str>,
+    chain: &[ReviewBotDescriptor],
+) -> anyhow::Result<PullRequestSignals> {
+    let Some((owner, repo)) = repo_slug.split_once('/') else {
+        anyhow::bail!("invalid repo slug for review loop: {repo_slug}");
+    };
+    let query = r#"
+        query ReviewLoopSignals($owner: String!, $repo: String!, $pr: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $pr) {
+              commits(last: 1) {
+                nodes {
+                  commit {
+                    committedDate
+                    statusCheckRollup {
+                      state
+                    }
+                  }
+                }
+              }
+              reviews(last: 50) {
+                nodes {
+                  author { login }
+                  body
+                  submittedAt
+                  state
+                }
+              }
+              comments(last: 50) {
+                nodes {
+                  author { login }
+                  body
+                  createdAt
+                }
+              }
+              reviewThreads(last: 50) {
+                nodes {
+                  isResolved
+                  isOutdated
+                  comments(last: 10) {
+                    nodes {
+                      author { login }
+                      body
+                      publishedAt
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+    "#;
+
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post("https://api.github.com/graphql")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server")
+        .json(&serde_json::json!({
+            "query": query,
+            "variables": {
+                "owner": owner,
+                "repo": repo,
+                "pr": pr_num as i64,
+            }
+        }));
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
+    }
+    let response = tokio::time::timeout(Duration::from_secs(10), request.send()).await??;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "GitHub review signal query failed with status {}",
+            response.status()
+        );
+    }
+    let parsed = response
+        .json::<GitHubGraphQlResponse<PullRequestQueryData>>()
+        .await?;
+    let pr = parsed
+        .data
+        .and_then(|data| data.repository)
+        .and_then(|repo| repo.pull_request)
+        .ok_or_else(|| anyhow::anyhow!("GitHub review signal query returned no PR data"))?;
+    let latest_commit = pr
+        .commits
+        .nodes
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("PR has no commits"))?;
+    let latest_commit_at = latest_commit.commit.committed_date;
+    let ci_green = latest_commit
+        .commit
+        .status_check_rollup
+        .as_ref()
+        .is_some_and(|rollup| rollup.state == "SUCCESS");
+
+    let mut bots = HashMap::from([
+        (ReviewBotKey::Gemini, BotSignals::default()),
+        (ReviewBotKey::Codex, BotSignals::default()),
+    ]);
+
+    for review in pr.reviews.nodes {
+        let Some(author) = review.author.as_ref().map(|author| author.login.as_str()) else {
+            continue;
+        };
+        let Some(key) = review_bot_key_for_author(chain, author) else {
+            continue;
+        };
+        let entry = bots.entry(key).or_default();
+        entry.reviewed_any_commit = true;
+        if let Some(submitted_at) = review.submitted_at {
+            let replace = entry
+                .latest_review_at
+                .map(|current| submitted_at >= current)
+                .unwrap_or(true);
+            if replace {
+                entry.latest_review_at = Some(submitted_at);
+                entry.latest_review_state = Some(review.state);
+                entry.latest_review_body = Some(review.body);
+            }
+        }
+    }
+
+    for comment in pr.comments.nodes {
+        let Some(author) = comment.author.as_ref().map(|author| author.login.as_str()) else {
+            continue;
+        };
+        let Some(key) = review_bot_key_for_author(chain, author) else {
+            continue;
+        };
+        let entry = bots.entry(key).or_default();
+        record_bot_comment_signal(entry, comment.body, comment.created_at);
+    }
+
+    let blocking_feedback = pr.review_threads.nodes.iter().any(blocking_review_thread);
+    let mut latest_bot_activity_at: Option<DateTime<Utc>> = None;
+    for thread in pr.review_threads.nodes {
+        for comment in thread.comments.nodes {
+            let Some(author) = comment.author.as_ref().map(|author| author.login.as_str()) else {
+                continue;
+            };
+            if review_bot_key_for_author(chain, author).is_none() {
+                continue;
+            }
+            let published_at = comment.published_at.unwrap_or(latest_commit_at);
+            latest_bot_activity_at = Some(
+                latest_bot_activity_at
+                    .map(|current: DateTime<Utc>| current.max(published_at))
+                    .unwrap_or(published_at),
+            );
+        }
+    }
+    for bot in bots.values() {
+        if let Some(at) = bot.latest_review_at.or(bot.latest_comment_at) {
+            latest_bot_activity_at = Some(
+                latest_bot_activity_at
+                    .map(|current: DateTime<Utc>| current.max(at))
+                    .unwrap_or(at),
+            );
+        }
+    }
+
+    Ok(PullRequestSignals {
+        latest_commit_at,
+        ci_green,
+        latest_bot_activity_at,
+        blocking_feedback,
+        bots,
+    })
+}
+
+async fn post_review_bot_comment(
+    repo_slug: &str,
+    pr_num: u64,
+    body: &str,
+    github_token: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((owner, repo)) = repo_slug.split_once('/') else {
+        anyhow::bail!("invalid repo slug for review bot comment: {repo_slug}");
+    };
+    let mut request = reqwest::Client::new()
+        .post(format!(
+            "https://api.github.com/repos/{owner}/{repo}/issues/{pr_num}/comments"
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server")
+        .json(&serde_json::json!({ "body": body }));
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
+    }
+    let response = tokio::time::timeout(Duration::from_secs(10), request.send()).await??;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "GitHub review bot comment failed with status {}",
+            response.status()
+        )
+    }
+}
+
+fn decide_review_loop_action(
+    chain: &[ReviewBotDescriptor],
+    signals: &PullRequestSignals,
+    silence_rounds: u32,
+    review_config: &harness_core::config::agents::AgentReviewConfig,
+) -> anyhow::Result<ReviewLoopDecision> {
+    let primary = chain
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("review fallback chain is empty"))?;
+    let primary_signals = signals.bots.get(&primary.key).cloned().unwrap_or_default();
+    let primary_classification = classify_bot(
+        primary,
+        &primary_signals,
+        signals.latest_commit_at,
+        signals.ci_green,
+        signals.blocking_feedback,
+        silence_rounds,
+        review_config.silence_rounds_threshold,
+        review_config.silence_min_minutes_after_commit,
+    );
+    if primary_classification != BotClassification::QuotaExhausted {
+        return Ok(ReviewLoopDecision {
+            active_bot: primary.clone(),
+            fallback: None,
+            wait_for_bot: primary_classification == BotClassification::NeverReviewed,
+        });
+    }
+
+    let secondary = chain.get(1).cloned().unwrap_or_else(|| primary.clone());
+    let secondary_key = secondary.key;
+    let secondary_signals = signals
+        .bots
+        .get(&secondary.key)
+        .cloned()
+        .unwrap_or_default();
+    let secondary_classification = classify_bot(
+        &secondary,
+        &secondary_signals,
+        signals.latest_commit_at,
+        signals.ci_green,
+        signals.blocking_feedback,
+        silence_rounds,
+        review_config.silence_rounds_threshold,
+        review_config.silence_min_minutes_after_commit,
+    );
+    let fallback_b = Some(ReviewFallbackState {
+        tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::B,
+        trigger: quota_trigger(primary.key),
+        active_bot: Some(secondary.key),
+    });
+    match secondary_classification {
+        BotClassification::QuotaExhausted => Ok(ReviewLoopDecision {
+            active_bot: secondary,
+            fallback: Some(ReviewFallbackState {
+                tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::C,
+                trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger::AllBotsQuota,
+                active_bot: Some(secondary_key),
+            }),
+            wait_for_bot: false,
+        }),
+        BotClassification::Silent => Ok(ReviewLoopDecision {
+            active_bot: secondary,
+            fallback: Some(ReviewFallbackState {
+                tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::C,
+                trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger::Silence,
+                active_bot: Some(secondary_key),
+            }),
+            wait_for_bot: false,
+        }),
+        BotClassification::NeverReviewed => Ok(ReviewLoopDecision {
+            active_bot: secondary,
+            fallback: fallback_b,
+            wait_for_bot: true,
+        }),
+        _ => Ok(ReviewLoopDecision {
+            active_bot: secondary,
+            fallback: fallback_b,
+            wait_for_bot: false,
+        }),
+    }
+}
+
+fn update_silence_rounds(
+    current_rounds: u32,
+    last_activity_at: Option<DateTime<Utc>>,
+    next_activity_at: Option<DateTime<Utc>>,
+) -> (u32, Option<DateTime<Utc>>) {
+    if next_activity_at != last_activity_at {
+        (0, next_activity_at)
+    } else {
+        (current_rounds.saturating_add(1), last_activity_at)
+    }
 }
 
 /// Execute the external review bot wait loop.
@@ -154,6 +727,8 @@ pub(crate) async fn run_review_loop(
     agent: &dyn CodeAgent,
     review_config: &harness_core::config::agents::AgentReviewConfig,
     project_config: &harness_core::config::project::ProjectConfig,
+    issue_workflow_store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
+    project_root: &Path,
     req: &CreateTaskRequest,
     events: &Arc<harness_observe::event_store::EventStore>,
     interceptors: &Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
@@ -199,13 +774,10 @@ pub(crate) async fn run_review_loop(
     // Tracks the most recent non-waiting review output for Jaccard loop detection.
     let mut prev_review_output: Option<String> = None;
 
-    let existing_rounds = store
-        .get_with_db_fallback(task_id)
-        .await?
-        .map(|state| state.rounds)
-        .unwrap_or_default();
-    let mut quota_exhausted_rounds = quota_exhausted_streak(&existing_rounds);
-    let mut quota_heuristic_attempts = quota_heuristic_attempt_count(&existing_rounds);
+    let mut silence_rounds = 0u32;
+    let mut last_bot_activity_at = None;
+    let mut waiting_on_bot = None;
+    let bot_chain = bot_fallback_chain(review_config);
 
     // Review loop.
     // Use an explicit counter so WAITING responses don't consume a round — `continue`
@@ -276,6 +848,156 @@ pub(crate) async fn run_review_loop(
             PrExternalState::Open | PrExternalState::Unknown => {}
         }
 
+        let mut decision = ReviewLoopDecision {
+            active_bot: bot_chain
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("review fallback chain is empty"))?,
+            fallback: None,
+            wait_for_bot: false,
+        };
+        match fetch_pull_request_signals(&repo_slug, pr_num, github_token, &bot_chain).await {
+            Ok(signals) => {
+                (silence_rounds, last_bot_activity_at) = update_silence_rounds(
+                    silence_rounds,
+                    last_bot_activity_at,
+                    signals.latest_bot_activity_at,
+                );
+                decision =
+                    decide_review_loop_action(&bot_chain, &signals, silence_rounds, review_config)?;
+                if let Some(fallback) = &decision.fallback {
+                    let event = build_task_event(
+                        task_id,
+                        round,
+                        "review",
+                        "pr_review_fallback",
+                        Decision::Warn,
+                        Some(format!(
+                            "tier={:?}; trigger={:?}; active_bot={}",
+                            fallback.tier,
+                            fallback.trigger,
+                            fallback
+                                .active_bot
+                                .map(ReviewBotKey::as_str)
+                                .unwrap_or("none")
+                        )),
+                        Some(format!("pr={pr_num}")),
+                        None,
+                        None,
+                        None,
+                    );
+                    if let Err(error) = events.log(&event).await {
+                        tracing::warn!("failed to log pr_review_fallback event: {error}");
+                    }
+                }
+                if decision.fallback.as_ref().is_some_and(|fallback| {
+                    fallback.tier == harness_workflow::issue_lifecycle::ReviewFallbackTier::C
+                }) {
+                    let fallback = decision.fallback.expect("tier C fallback");
+                    let detail = format!(
+                        "Review fallback tier {} via {}",
+                        match fallback.tier {
+                            harness_workflow::issue_lifecycle::ReviewFallbackTier::A => "A",
+                            harness_workflow::issue_lifecycle::ReviewFallbackTier::B => "B",
+                            harness_workflow::issue_lifecycle::ReviewFallbackTier::C => "C",
+                        },
+                        match fallback.trigger {
+                            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::GeminiQuota => {
+                                "gemini_quota"
+                            }
+                            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::CodexQuota => {
+                                "codex_quota"
+                            }
+                            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::AllBotsQuota => {
+                                "all_bots_quota"
+                            }
+                            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::Silence => {
+                                "silence"
+                            }
+                        }
+                    );
+                    mutate_and_persist(store, task_id, |s| {
+                        s.status = TaskStatus::Done;
+                        s.turn = round;
+                        s.error = Some(detail.clone());
+                        s.rounds.push(RoundResult::new(
+                            round,
+                            "review",
+                            "ready_to_merge",
+                            Some(detail.clone()),
+                            None,
+                            None,
+                        ));
+                    })
+                    .await?;
+                    if let Some(workflows) = issue_workflow_store {
+                        let project_id = project_root.to_string_lossy().into_owned();
+                        let snapshot = harness_workflow::issue_lifecycle::ReviewFallbackSnapshot {
+                            tier: fallback.tier,
+                            trigger: fallback.trigger,
+                            active_bot: fallback.active_bot.map(|bot| bot.as_str().to_string()),
+                            activated_at: Utc::now(),
+                        };
+                        let _ = workflows
+                            .record_ready_to_merge_with_fallback(
+                                &project_id,
+                                req.repo.as_deref(),
+                                pr_num,
+                                Some(&detail),
+                                snapshot,
+                            )
+                            .await;
+                    }
+                    store.log_event(crate::event_replay::TaskEvent::Completed {
+                        task_id: task_id.0.clone(),
+                        ts: crate::event_replay::now_ts(),
+                    });
+                    return Ok(());
+                }
+                if decision.wait_for_bot {
+                    if decision.active_bot.key == ReviewBotKey::Codex
+                        && waiting_on_bot != Some(decision.active_bot.key)
+                    {
+                        if let Err(error) = post_review_bot_comment(
+                            &repo_slug,
+                            pr_num,
+                            &decision.active_bot.review_command,
+                            github_token,
+                        )
+                        .await
+                        {
+                            tracing::warn!(pr = pr_num, "failed to summon Codex reviewer: {error}");
+                        } else {
+                            waiting_on_bot = Some(decision.active_bot.key);
+                        }
+                    }
+                    tracing::info!(
+                        pr = pr_num,
+                        active_bot = decision.active_bot.key.as_str(),
+                        silence_rounds,
+                        "waiting for review bot activity"
+                    );
+                    waiting_count = waiting_count.saturating_add(1);
+                    if waiting_count >= MAX_CONSECUTIVE_WAITS {
+                        round += 1;
+                        waiting_count = 0;
+                    }
+                    update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+                    sleep(Duration::from_secs(wait_secs)).await;
+                    continue;
+                }
+                waiting_on_bot = None;
+            }
+            Err(error) => {
+                waiting_on_bot = None;
+                tracing::warn!(
+                    pr = pr_num,
+                    error = %error,
+                    "review loop: GitHub signal fetch failed, falling back to prompt-driven review"
+                );
+            }
+        }
+
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
 
         let base_prompt = prompts::review_prompt(
@@ -283,8 +1005,8 @@ pub(crate) async fn run_review_loop(
             pr_num,
             round,
             prev_fixed,
-            &review_config.review_bot_command,
-            &review_config.reviewer_name,
+            &decision.active_bot.review_command,
+            &decision.active_bot.reviewer_name,
             &repo_slug,
             impasse,
         );
@@ -498,14 +1220,11 @@ pub(crate) async fn run_review_loop(
 
         let raw_lgtm = prompts::is_lgtm(&output);
         let waiting = prompts::is_waiting(&output);
-        let quota_exhausted = !raw_lgtm && !waiting && prompts::is_quota_exhausted(&output);
-        quota_exhausted_rounds =
-            update_quota_exhausted_rounds(quota_exhausted_rounds, waiting, quota_exhausted);
         // If post-execute validation failed this round, block LGTM acceptance even
         // if the reviewer approved — the local validator caught an issue that must be
         // fixed before the PR can be marked done.
         let lgtm = raw_lgtm && pending_test_failure.is_none();
-        let fixed = !lgtm && !waiting && !quota_exhausted;
+        let fixed = !lgtm && !waiting;
 
         // Parse issue count before the Jaccard check so loop detection can distinguish
         // genuine forward progress (decreasing issue count) from true stuck loops.
@@ -515,8 +1234,7 @@ pub(crate) async fn run_review_loop(
         // too similar indicate the reviewer is stuck repeating itself without making progress.
         // Skip when the raw output is an approval: repeated LGTM is legitimate convergence
         // (e.g., reviewer approves again after a test-gate previously blocked acceptance).
-        // Quota-exhausted rounds are also skipped — they contain no real review content.
-        if !waiting && !raw_lgtm && !quota_exhausted {
+        if !waiting && !raw_lgtm {
             if let Some(ref prev) = prev_review_output {
                 let score = jaccard_word_similarity(prev, &output);
                 if score >= jaccard_threshold {
@@ -550,7 +1268,7 @@ pub(crate) async fn run_review_loop(
             prev_review_output = None;
         }
 
-        if !waiting && !quota_exhausted {
+        if !waiting {
             issue_counts.push(current_issues);
         }
 
@@ -569,10 +1287,9 @@ pub(crate) async fn run_review_loop(
             }
         }
 
-        // WAITING means review bot hasn't posted yet (e.g., quota exhausted).
+        // WAITING means the active review bot has not yet posted a fresh review.
         // Don't consume a round — just sleep and retry without incrementing.
         // Cap consecutive waits to prevent infinite loops when the bot never responds.
-        const MAX_CONSECUTIVE_WAITS: u32 = 10;
         if waiting {
             if waiting_count >= MAX_CONSECUTIVE_WAITS {
                 tracing::warn!(
@@ -594,145 +1311,6 @@ pub(crate) async fn run_review_loop(
                 sleep(Duration::from_secs(wait_secs)).await;
                 continue;
             }
-        }
-
-        // Quota-exhausted: reviewer posted a quota warning instead of a real review.
-        // Don't consume a round — sleep and retry. After K consecutive quota rounds,
-        // run the test gate as a heuristic graduation check.
-        if quota_exhausted {
-            tracing::info!(
-                round,
-                quota_exhausted_rounds,
-                "PR #{pr_num} reviewer quota exhausted; not consuming a review round"
-            );
-            mutate_and_persist(store, task_id, |s| {
-                s.rounds.push(RoundResult::new(
-                    round,
-                    "review",
-                    "quota_exhausted",
-                    None,
-                    Some(review_telemetry.clone()),
-                    None,
-                ));
-            })
-            .await?;
-            let event = build_task_event(
-                task_id,
-                round,
-                "review",
-                "pr_review",
-                Decision::Warn,
-                Some(format!("round {round}: quota exhausted")),
-                Some(format!("pr={pr_num}")),
-                Some(review_telemetry.clone()),
-                None,
-                Some(output.clone()),
-            );
-            if let Err(error) = events.log(&event).await {
-                tracing::warn!("failed to log pr_review event: {error}");
-            }
-
-            if quota_exhausted_rounds >= QUOTA_EXHAUSTED_THRESHOLD && !lgtm_test_gate_rejected {
-                quota_heuristic_attempts += 1;
-                let attempt_num = quota_heuristic_attempts;
-                mutate_and_persist(store, task_id, |s| {
-                    s.rounds.push(RoundResult::new(
-                        round,
-                        "review",
-                        QUOTA_HEURISTIC_ATTEMPT_RESULT,
-                        Some(format!(
-                            "attempt={attempt_num}/{MAX_QUOTA_HEURISTIC_GRADUATIONS}; quota_rounds={quota_exhausted_rounds}"
-                        )),
-                        None,
-                        None,
-                    ));
-                })
-                .await?;
-
-                if attempt_num > MAX_QUOTA_HEURISTIC_GRADUATIONS {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        attempt_num,
-                        max_attempts = MAX_QUOTA_HEURISTIC_GRADUATIONS,
-                        "quota-heuristic graduation cap exceeded; manual review required"
-                    );
-                    mutate_and_persist(store, task_id, |s| {
-                        s.status = TaskStatus::Failed;
-                        s.turn = round.saturating_add(1);
-                        s.error = Some(format!(
-                            "needs_manual_review: reviewer quota remained exhausted after {} quota-heuristic attempts",
-                            MAX_QUOTA_HEURISTIC_GRADUATIONS
-                        ));
-                        s.rounds.push(RoundResult::new(
-                            round,
-                            "review",
-                            NEEDS_MANUAL_REVIEW_RESULT,
-                            Some(format!(
-                                "quota_heuristic_attempts={attempt_num}; quota_rounds={quota_exhausted_rounds}"
-                            )),
-                            None,
-                            None,
-                        ));
-                    })
-                    .await?;
-                    return Ok(());
-                }
-
-                tracing::info!(
-                    task_id = %task_id,
-                    quota_exhausted_rounds,
-                    attempt_num,
-                    "quota-heuristic graduation: running test gate after {} quota-exhausted rounds",
-                    quota_exhausted_rounds
-                );
-                match super::run_test_gate(
-                    project,
-                    &project_config.validation.pre_push,
-                    project_config.validation.test_gate_timeout_secs,
-                    cargo_env,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        tracing::info!(
-                            task_id = %task_id,
-                            quota_exhausted_rounds,
-                            "quota-heuristic graduation: tests passed — marking done"
-                        );
-                        mutate_and_persist(store, task_id, |s| {
-                            s.status = TaskStatus::Done;
-                            s.turn = round.saturating_add(1);
-                            s.error = Some(format!(
-                                "LGTM via quota-heuristic: external reviewer quota exhausted after {} rounds, tests passed",
-                                quota_exhausted_rounds
-                            ));
-                        })
-                        .await?;
-                        return Ok(());
-                    }
-                    Err(_test_output) => {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            quota_exhausted_rounds,
-                            "quota-heuristic graduation: tests failed — marking failed"
-                        );
-                        mutate_and_persist(store, task_id, |s| {
-                            s.status = TaskStatus::Failed;
-                            s.turn = round.saturating_add(1);
-                            s.error = Some(format!(
-                                "Quota-heuristic: tests failed after {} quota-exhausted rounds",
-                                quota_exhausted_rounds
-                            ));
-                        })
-                        .await?;
-                        return Ok(());
-                    }
-                }
-            }
-
-            update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
-            sleep(Duration::from_secs(wait_secs)).await;
-            continue; // Don't increment round — quota rounds are free
         }
 
         let result_label = if lgtm { "lgtm" } else { "fixed" };
@@ -900,44 +1478,301 @@ pub(crate) async fn run_review_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn descriptor(key: ReviewBotKey) -> ReviewBotDescriptor {
+        match key {
+            ReviewBotKey::Gemini => ReviewBotDescriptor {
+                key,
+                reviewer_name: "gemini-code-assist[bot]".to_string(),
+                review_command: "/gemini review".to_string(),
+            },
+            ReviewBotKey::Codex => ReviewBotDescriptor {
+                key,
+                reviewer_name: CODEX_REVIEWER_NAME.to_string(),
+                review_command: CODEX_REVIEW_COMMAND.to_string(),
+            },
+        }
+    }
 
-    fn review_round(result: &str) -> RoundResult {
-        RoundResult::new(1, "review", result, None, None, None)
+    fn bot_signals() -> BotSignals {
+        BotSignals::default()
+    }
+
+    fn review_config() -> harness_core::config::agents::AgentReviewConfig {
+        harness_core::config::agents::AgentReviewConfig::default()
+    }
+
+    fn review_config_with_chain(chain: &[&str]) -> harness_core::config::agents::AgentReviewConfig {
+        let mut config = review_config();
+        config.fallback_chain = chain.iter().map(|entry| (*entry).to_string()).collect();
+        config
     }
 
     #[test]
-    fn quota_counter_resets_on_real_review_response() {
-        assert_eq!(update_quota_exhausted_rounds(2, false, false), 0);
+    fn review_bot_author_matching_uses_configured_reviewer_name() {
+        let mut config = review_config_with_chain(&["gemini", "codex"]);
+        config.reviewer_name = "custom-reviewer".to_string();
+        let chain = bot_fallback_chain(&config);
+
+        assert_eq!(
+            review_bot_key_for_author(&chain, "custom-reviewer"),
+            Some(ReviewBotKey::Gemini)
+        );
+        assert_eq!(
+            review_bot_key_for_author(&chain, CODEX_REVIEWER_NAME),
+            Some(ReviewBotKey::Codex)
+        );
+        assert_eq!(
+            review_bot_key_for_author(&chain, "unconfigured-reviewer[bot]"),
+            None
+        );
     }
 
     #[test]
-    fn quota_counter_keeps_waiting_streak_intact() {
-        assert_eq!(update_quota_exhausted_rounds(2, true, false), 2);
+    fn comment_signal_marks_prior_bot_participation() {
+        let mut bot = bot_signals();
+        let comment_at = Utc::now() - chrono::Duration::minutes(60);
+
+        record_bot_comment_signal(&mut bot, "previous review comment".to_string(), comment_at);
+
+        assert!(bot.reviewed_any_commit);
+        assert_eq!(bot.latest_comment_at, Some(comment_at));
+        assert_eq!(
+            bot.latest_comment_body.as_deref(),
+            Some("previous review comment")
+        );
     }
 
     #[test]
-    fn quota_counter_increments_on_quota_round() {
-        assert_eq!(update_quota_exhausted_rounds(2, false, true), 3);
+    fn stale_comment_participation_can_satisfy_silence_fallback() {
+        let mut bot = bot_signals();
+        let latest_commit_at = Utc::now() - chrono::Duration::minutes(45);
+        record_bot_comment_signal(
+            &mut bot,
+            "previous review comment".to_string(),
+            Utc::now() - chrono::Duration::minutes(60),
+        );
+
+        let classification = classify_bot(
+            &descriptor(ReviewBotKey::Codex),
+            &bot,
+            latest_commit_at,
+            true,
+            false,
+            3,
+            3,
+            30,
+        );
+
+        assert_eq!(classification, BotClassification::Silent);
+    }
+
+    fn signals_with(primary: BotSignals, secondary: BotSignals) -> PullRequestSignals {
+        let latest_commit_at = Utc::now() - chrono::Duration::minutes(45);
+        let mut bots = HashMap::new();
+        bots.insert(ReviewBotKey::Gemini, primary);
+        bots.insert(ReviewBotKey::Codex, secondary);
+        PullRequestSignals {
+            latest_commit_at,
+            ci_green: true,
+            latest_bot_activity_at: None,
+            blocking_feedback: false,
+            bots,
+        }
     }
 
     #[test]
-    fn quota_exhausted_streak_uses_trailing_review_rounds() {
-        let rounds = vec![
-            review_round("fixed"),
-            review_round("quota_exhausted"),
-            review_round("quota_exhausted"),
-        ];
-        assert_eq!(quota_exhausted_streak(&rounds), 2);
+    fn classifies_gemini_quota_body() {
+        let mut bot = bot_signals();
+        bot.reviewed_any_commit = true;
+        bot.latest_comment_at = Some(Utc::now());
+        bot.latest_comment_body =
+            Some("You have reached your daily quota limit for Gemini Code Assist.".to_string());
+        let classification = classify_bot(
+            &descriptor(ReviewBotKey::Gemini),
+            &bot,
+            Utc::now() - chrono::Duration::minutes(5),
+            true,
+            false,
+            0,
+            3,
+            30,
+        );
+        assert_eq!(classification, BotClassification::QuotaExhausted);
     }
 
     #[test]
-    fn quota_heuristic_attempt_count_uses_persisted_rounds() {
-        let rounds = vec![
-            review_round("quota_exhausted"),
-            review_round(QUOTA_HEURISTIC_ATTEMPT_RESULT),
-            review_round("fixed"),
-            review_round(QUOTA_HEURISTIC_ATTEMPT_RESULT),
-        ];
-        assert_eq!(quota_heuristic_attempt_count(&rounds), 2);
+    fn classifies_codex_quota_body() {
+        let mut bot = bot_signals();
+        bot.reviewed_any_commit = true;
+        bot.latest_comment_at = Some(Utc::now());
+        bot.latest_comment_body =
+            Some("Codex usage limits have been reached for this account.".to_string());
+        let classification = classify_bot(
+            &descriptor(ReviewBotKey::Codex),
+            &bot,
+            Utc::now() - chrono::Duration::minutes(5),
+            true,
+            false,
+            0,
+            3,
+            30,
+        );
+        assert_eq!(classification, BotClassification::QuotaExhausted);
+    }
+
+    #[test]
+    fn decides_tier_c_when_both_bots_are_quota_exhausted() {
+        let mut gemini = bot_signals();
+        gemini.reviewed_any_commit = true;
+        gemini.latest_comment_at = Some(Utc::now());
+        gemini.latest_comment_body =
+            Some("You have reached your daily quota limit for Gemini Code Assist.".to_string());
+        let mut codex = bot_signals();
+        codex.reviewed_any_commit = true;
+        codex.latest_comment_at = Some(Utc::now());
+        codex.latest_comment_body =
+            Some("Codex usage limits have been reached for this account.".to_string());
+        let decision = decide_review_loop_action(
+            &bot_fallback_chain(&review_config()),
+            &signals_with(gemini, codex),
+            0,
+            &review_config(),
+        )
+        .expect("decision");
+        assert_eq!(decision.active_bot.key, ReviewBotKey::Codex);
+        let fallback = decision.fallback.expect("fallback");
+        assert_eq!(
+            fallback.tier,
+            harness_workflow::issue_lifecycle::ReviewFallbackTier::C
+        );
+        assert_eq!(
+            fallback.trigger,
+            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::AllBotsQuota
+        );
+    }
+
+    #[test]
+    fn classifies_silence_when_all_guards_are_met() {
+        let mut bot = bot_signals();
+        bot.reviewed_any_commit = true;
+        bot.latest_review_at = Some(Utc::now() - chrono::Duration::minutes(60));
+        bot.latest_review_state = Some("COMMENTED".to_string());
+        let classification = classify_bot(
+            &descriptor(ReviewBotKey::Codex),
+            &bot,
+            Utc::now() - chrono::Duration::minutes(45),
+            true,
+            false,
+            3,
+            3,
+            30,
+        );
+        assert_eq!(classification, BotClassification::Silent);
+    }
+
+    #[test]
+    fn silence_rounds_reset_on_new_bot_activity() {
+        let initial_activity = Some(Utc::now() - chrono::Duration::minutes(10));
+        let new_activity = Some(Utc::now());
+        assert_eq!(
+            update_silence_rounds(2, initial_activity, new_activity),
+            (0, new_activity)
+        );
+    }
+
+    #[test]
+    fn silence_is_blocked_by_red_ci() {
+        let mut bot = bot_signals();
+        bot.reviewed_any_commit = true;
+        bot.latest_review_at = Some(Utc::now() - chrono::Duration::minutes(60));
+        let classification = classify_bot(
+            &descriptor(ReviewBotKey::Codex),
+            &bot,
+            Utc::now() - chrono::Duration::minutes(45),
+            false,
+            false,
+            3,
+            3,
+            30,
+        );
+        assert_eq!(classification, BotClassification::ActionableFeedback);
+    }
+
+    #[test]
+    fn silence_is_blocked_by_unresolved_high_feedback() {
+        let mut bot = bot_signals();
+        bot.reviewed_any_commit = true;
+        bot.latest_review_at = Some(Utc::now() - chrono::Duration::minutes(60));
+        let classification = classify_bot(
+            &descriptor(ReviewBotKey::Codex),
+            &bot,
+            Utc::now() - chrono::Duration::minutes(45),
+            true,
+            true,
+            3,
+            3,
+            30,
+        );
+        assert_eq!(classification, BotClassification::ActionableFeedback);
+    }
+
+    #[test]
+    fn silence_is_blocked_when_no_prior_bot_review_exists() {
+        let classification = classify_bot(
+            &descriptor(ReviewBotKey::Codex),
+            &bot_signals(),
+            Utc::now() - chrono::Duration::minutes(45),
+            true,
+            false,
+            3,
+            3,
+            30,
+        );
+        assert_eq!(classification, BotClassification::NeverReviewed);
+    }
+
+    #[test]
+    fn normal_fresh_gemini_path_stays_primary() {
+        let mut gemini = bot_signals();
+        gemini.reviewed_any_commit = true;
+        gemini.latest_review_at = Some(Utc::now());
+        gemini.latest_review_state = Some("APPROVED".to_string());
+        let decision = decide_review_loop_action(
+            &bot_fallback_chain(&review_config()),
+            &signals_with(gemini, bot_signals()),
+            0,
+            &review_config(),
+        )
+        .expect("decision");
+        assert_eq!(decision.active_bot.key, ReviewBotKey::Gemini);
+        assert!(decision.fallback.is_none());
+        assert!(!decision.wait_for_bot);
+    }
+
+    #[test]
+    fn respects_configured_secondary_order() {
+        let mut codex = bot_signals();
+        codex.reviewed_any_commit = true;
+        codex.latest_comment_at = Some(Utc::now());
+        codex.latest_comment_body =
+            Some("Codex usage limits have been reached for this account.".to_string());
+        let decision = decide_review_loop_action(
+            &bot_fallback_chain(&review_config_with_chain(&["codex", "gemini"])),
+            &signals_with(bot_signals(), codex),
+            0,
+            &review_config_with_chain(&["codex", "gemini"]),
+        )
+        .expect("decision");
+        assert_eq!(decision.active_bot.key, ReviewBotKey::Gemini);
+        let fallback = decision.fallback.expect("fallback");
+        assert_eq!(
+            fallback.tier,
+            harness_workflow::issue_lifecycle::ReviewFallbackTier::B
+        );
+        assert_eq!(
+            fallback.trigger,
+            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::CodexQuota
+        );
+        assert!(decision.wait_for_bot);
     }
 }

@@ -49,6 +49,14 @@ export interface WorkflowSummary {
   pr_number?: number | null;
   force_execute?: boolean;
   plan_concern?: string | null;
+  review_fallback?: ReviewFallbackSummary | null;
+}
+
+export interface ReviewFallbackSummary {
+  tier: string;
+  trigger: string;
+  active_bot?: string | null;
+  activated_at: string;
 }
 
 export interface RoundItem {

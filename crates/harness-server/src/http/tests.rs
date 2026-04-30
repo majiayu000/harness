@@ -2,6 +2,7 @@ use super::*;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
+use chrono::Utc;
 use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
     types::Capability, types::TokenUsage, types::TurnFailure, types::TurnFailureKind,
@@ -306,6 +307,75 @@ async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>>
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await
+}
+
+async fn make_test_state_with_issue_workflows(
+    dir: &std::path::Path,
+) -> anyhow::Result<Arc<AppState>> {
+    let state = make_test_state(dir).await?;
+    let workflow_store = harness_workflow::issue_lifecycle::IssueWorkflowStore::open(
+        &harness_core::config::dirs::default_db_path(dir, "issue_workflows"),
+    )
+    .await?;
+    Ok(Arc::new(AppState {
+        core: crate::http::CoreServices {
+            server: state.core.server.clone(),
+            project_root: state.core.project_root.clone(),
+            home_dir: state.core.home_dir.clone(),
+            tasks: state.core.tasks.clone(),
+            thread_db: None,
+            plan_db: None,
+            plan_cache: state.core.plan_cache.clone(),
+            issue_workflow_store: Some(Arc::new(workflow_store)),
+            project_workflow_store: None,
+            project_registry: None,
+            runtime_state_store: None,
+            q_values: None,
+            maintenance_active: state.core.maintenance_active.clone(),
+        },
+        engines: crate::http::EngineServices {
+            skills: state.engines.skills.clone(),
+            rules: state.engines.rules.clone(),
+            gc_agent: state.engines.gc_agent.clone(),
+        },
+        observability: crate::http::ObservabilityServices {
+            events: state.observability.events.clone(),
+            signal_rate_limiter: state.observability.signal_rate_limiter.clone(),
+            password_reset_rate_limiter: state.observability.password_reset_rate_limiter.clone(),
+            review_store: None,
+        },
+        concurrency: crate::http::ConcurrencyServices {
+            task_queue: state.concurrency.task_queue.clone(),
+            review_task_queue: state.concurrency.review_task_queue.clone(),
+            workspace_mgr: None,
+        },
+        #[cfg(test)]
+        _db_state_guard: None,
+        runtime_hosts: state.runtime_hosts.clone(),
+        runtime_project_cache: state.runtime_project_cache.clone(),
+        runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+        runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        notifications: crate::http::NotificationServices {
+            notification_tx: tokio::sync::broadcast::channel(32).0,
+            notification_lagged_total: Arc::new(AtomicU64::new(0)),
+            notification_lag_log_every: 1,
+            notify_tx: None,
+            initializing: Arc::new(AtomicBool::new(true)),
+            initialized: Arc::new(AtomicBool::new(true)),
+            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        },
+        interceptors: vec![],
+        startup_statuses: vec![],
+        degraded_subsystems: vec![],
+        intake: crate::http::IntakeServices {
+            feishu_intake: None,
+            github_pollers: vec![],
+            completion_callback: None,
+        },
+        project_svc: state.project_svc.clone(),
+        task_svc: state.task_svc.clone(),
+        execution_svc: state.execution_svc.clone(),
+    }))
 }
 
 #[tokio::test]
@@ -2150,6 +2220,102 @@ async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Resul
     assert_eq!(pr_json["workflow"]["issue_number"], 77);
     assert_eq!(pr_json["workflow"]["pr_number"], 101);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_issue_workflows(dir.path()).await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state.clone());
+
+    let task = task_runner::TaskState {
+        id: task_runner::TaskId::new(),
+        task_kind: task_runner::TaskKind::Issue,
+        status: task_runner::TaskStatus::Done,
+        turn: 3,
+        pr_url: Some("https://github.com/owner/repo/pull/501".to_string()),
+        rounds: vec![],
+        error: Some("Review fallback tier C via silence".to_string()),
+        source: Some("github".to_string()),
+        external_id: Some("issue:945".to_string()),
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: Some(dir.path().to_path_buf()),
+        issue: Some(945),
+        repo: Some("owner/repo".to_string()),
+        description: Some("issue #945".to_string()),
+        created_at: None,
+        updated_at: None,
+        priority: 0,
+        phase: task_runner::TaskPhase::Terminal,
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: task_runner::TaskSchedulerState::queued(),
+        failure_kind: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+    };
+    state.core.tasks.insert(&task).await;
+    let workflows = state
+        .core
+        .issue_workflow_store
+        .as_ref()
+        .expect("workflow store");
+    workflows
+        .record_issue_scheduled(
+            &dir.path().to_string_lossy(),
+            Some("owner/repo"),
+            945,
+            task.id.as_str(),
+            &[],
+            false,
+        )
+        .await?;
+    workflows
+        .record_pr_detected(
+            &dir.path().to_string_lossy(),
+            Some("owner/repo"),
+            945,
+            task.id.as_str(),
+            501,
+            "https://github.com/owner/repo/pull/501",
+        )
+        .await?;
+    workflows
+        .record_ready_to_merge_with_fallback(
+            &dir.path().to_string_lossy(),
+            Some("owner/repo"),
+            501,
+            Some("fallback via silence"),
+            harness_workflow::issue_lifecycle::ReviewFallbackSnapshot {
+                tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::C,
+                trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger::Silence,
+                active_bot: Some("codex".to_string()),
+                activated_at: Utc::now(),
+            },
+        )
+        .await?;
+
+    let response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let tasks: serde_json::Value = serde_json::from_slice(&body)?;
+    let task = tasks
+        .as_array()
+        .and_then(|tasks| tasks.first())
+        .expect("task row");
+    assert_eq!(task["workflow"]["state"], "ready_to_merge");
+    assert_eq!(task["workflow"]["review_fallback"]["tier"], "c");
+    assert_eq!(task["workflow"]["review_fallback"]["trigger"], "silence");
+    assert_eq!(task["workflow"]["review_fallback"]["active_bot"], "codex");
     Ok(())
 }
 

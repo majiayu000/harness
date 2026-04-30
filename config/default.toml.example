@@ -48,6 +48,9 @@ max_tokens = 4096
 enabled = false
 reviewer_agent = "codex"
 max_rounds = 3
+fallback_chain = ["gemini", "codex"]
+silence_rounds_threshold = 3
+silence_min_minutes_after_commit = 30
 
 [gc]
 max_drafts_per_run = 5
