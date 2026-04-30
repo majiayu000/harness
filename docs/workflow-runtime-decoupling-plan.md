@@ -33,6 +33,8 @@ Implemented now:
 - opt-in server background runtime worker that executes runtime jobs through registered agents
 - runtime job completion writes back command status and workflow completion events
 - runtime completion reducer advances known workflow states from activity output
+- runtime completion reducer returns repo backlog workflows to `idle` after successful dispatch or
+  reconciliation activities
 - runtime completion reducer can retry failed activities when the workflow instance declares a
   bounded retry policy
 - `WORKFLOW.md` can define a global failed activity retry budget and activity-specific retry
@@ -555,6 +557,8 @@ Implemented now:
 - `replan_issue` completion moves GitHub issue workflows from `replanning` to `implementing`
 - `address_pr_feedback` completion moves GitHub issue workflows from `addressing_feedback` to
   `awaiting_feedback`
+- successful repo backlog dispatch and reconciliation activity completion moves `dispatching` and
+  `reconciling` backlog workflows back to `idle`
 - failed, blocked, and cancelled activity results transition workflows to `failed`, `blocked`, or
   `cancelled` through validated workflow decisions
 - failed activity results retry the same activity before failing when
@@ -573,6 +577,7 @@ Still intentionally not moved yet:
 Tests:
 
 - reducer resumes implementation after replan completion
+- reducer idles repo backlog workflows after dispatch and reconciliation completion
 - reducer ignores unmapped successful activity completions
 - reducer retries a failed activity until the configured retry budget is exhausted
 - reducer honors activity-specific retry budget overrides

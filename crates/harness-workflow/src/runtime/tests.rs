@@ -562,6 +562,84 @@ fn repo_backlog_stale_workflow_requests_recovery() {
         .expect("repo backlog recovery decision should validate");
 }
 
+#[test]
+fn runtime_completion_reducer_idles_repo_backlog_after_dispatch() {
+    let instance = repo_backlog_instance("dispatching");
+    let command = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:123",
+        "repo-backlog:owner/repo:issue:123:start",
+    );
+    let result = ActivityResult::succeeded("workflow_activity", "Child workflow started.");
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("dispatch completion should idle repo backlog");
+
+    assert_eq!(decision.decision, "finish_issue_workflow_dispatch");
+    assert_eq!(decision.next_state, "idle");
+    assert!(decision.commands.is_empty());
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("repo backlog dispatch completion should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_idles_repo_backlog_after_reconciliation() {
+    let instance = repo_backlog_instance("reconciling");
+    let command = WorkflowCommand::enqueue_activity(
+        "mark_bound_issue_done",
+        "repo-backlog:owner/repo:pr:77:merged",
+    );
+    let result = ActivityResult::succeeded(
+        "mark_bound_issue_done",
+        "Bound issue workflow was marked done.",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("reconciliation completion should idle repo backlog");
+
+    assert_eq!(decision.decision, "finish_bound_issue_reconciliation");
+    assert_eq!(decision.next_state, "idle");
+    assert!(decision.commands.is_empty());
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("repo backlog reconciliation completion should validate");
+}
+
 fn leased_issue_instance(state: &str) -> WorkflowInstance {
     issue_instance(state).with_lease("controller-1", Utc::now() + Duration::minutes(5))
 }

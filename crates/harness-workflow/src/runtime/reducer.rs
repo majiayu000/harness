@@ -53,6 +53,25 @@ fn reduce_success(
             "await_feedback_after_rework",
             "PR feedback rework activity completed; wait for fresh feedback",
         ),
+        (REPO_BACKLOG_DEFINITION_ID, "dispatching", _)
+            if event_command_type(event) == Some("start_child_workflow") =>
+        {
+            (
+                "idle",
+                "finish_issue_workflow_dispatch",
+                "repo backlog child workflow dispatch completed",
+            )
+        }
+        (REPO_BACKLOG_DEFINITION_ID, "reconciling", "mark_bound_issue_done") => (
+            "idle",
+            "finish_bound_issue_reconciliation",
+            "bound issue reconciliation activity completed",
+        ),
+        (REPO_BACKLOG_DEFINITION_ID, "reconciling", "recover_issue_workflow") => (
+            "idle",
+            "finish_issue_workflow_recovery",
+            "issue workflow recovery activity completed",
+        ),
         _ => return None,
     };
 
@@ -238,6 +257,14 @@ fn event_field_string(event: &WorkflowEvent, field: &str) -> Option<String> {
         .get(field)
         .and_then(|value| value.as_str())
         .map(str::to_string)
+}
+
+fn event_command_type(event: &WorkflowEvent) -> Option<&str> {
+    event
+        .event
+        .get("command")
+        .and_then(|command| command.get("command_type"))
+        .and_then(|value| value.as_str())
 }
 
 fn runtime_completion_evidence(event: &WorkflowEvent, result: &ActivityResult) -> WorkflowEvidence {
