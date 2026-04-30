@@ -1,4 +1,4 @@
-use super::model::{ActivityResult, RuntimeJob};
+use super::model::{ActivityResult, ActivityStatus, RuntimeJob};
 use super::store::WorkflowRuntimeStore;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -61,9 +61,43 @@ impl<'a> RuntimeWorker<'a> {
                 serde_json::to_value(&result)?,
             )
             .await?;
+        let completed = self.store.complete_runtime_job(&job.id, &result).await?;
+        self.record_workflow_completion(&completed, &result).await?;
+        Ok(Some(completed))
+    }
+
+    async fn record_workflow_completion(
+        &self,
+        job: &RuntimeJob,
+        result: &ActivityResult,
+    ) -> anyhow::Result<()> {
+        let Some(command) = self.store.get_command(&job.command_id).await? else {
+            return Ok(());
+        };
         self.store
-            .complete_runtime_job(&job.id, &result)
-            .await
-            .map(Some)
+            .mark_command_status(&command.id, command_status_for_activity(result.status))
+            .await?;
+        self.store
+            .append_event(
+                &command.workflow_id,
+                "RuntimeJobCompleted",
+                &self.owner,
+                json!({
+                    "command_id": command.id,
+                    "runtime_job_id": job.id,
+                    "runtime_job_status": job.status,
+                    "activity_result": result,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+fn command_status_for_activity(status: ActivityStatus) -> &'static str {
+    match status {
+        ActivityStatus::Succeeded => "completed",
+        ActivityStatus::Failed | ActivityStatus::Blocked => "failed",
+        ActivityStatus::Cancelled => "cancelled",
     }
 }

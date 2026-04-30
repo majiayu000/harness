@@ -749,6 +749,57 @@ async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn runtime_worker_records_completion_event_and_command_status() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = issue_instance("implementing");
+    store.upsert_instance(&workflow).await?;
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "impl-1");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        )
+        .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded("implement_issue", "Implementation completed."),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    assert_eq!(
+        store.commands_for(&workflow.id).await?[0].status,
+        "completed"
+    );
+    let workflow_events = store.events_for(&workflow.id).await?;
+    let event = workflow_events
+        .iter()
+        .find(|event| event.event_type == "RuntimeJobCompleted")
+        .expect("completion event should be appended");
+    assert_eq!(event.source, "runtime-1");
+    assert_eq!(event.event["command_id"], command_id);
+    assert_eq!(event.event["runtime_job_id"], job.id);
+    assert_eq!(event.event["runtime_job_status"], "succeeded");
+    assert_eq!(
+        event.event["activity_result"]["summary"],
+        "Implementation completed."
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_worker_records_failed_activity_result() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

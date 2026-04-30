@@ -31,6 +31,7 @@ Implemented now:
 - workflow command outbox dispatcher that converts pending runtime commands into runtime jobs
 - opt-in server background loop for workflow command dispatch
 - opt-in server background runtime worker that executes runtime jobs through registered agents
+- runtime job completion writes back command status and workflow completion events
 
 Still intentionally not moved yet:
 
@@ -495,13 +496,38 @@ Implemented now:
 Still intentionally not moved yet:
 
 - workflow-specific runtime profiles do not yet select model, effort, sandbox, or turn budget
-- command completion does not yet feed a reducer that advances workflow state from activity output
+- workflow completion events do not yet feed a reducer that advances workflow state from activity
+  output
 - runtime workers are process-local; distributed worker leasing beyond the job claim is not added yet
 
 Tests:
 
 - workflow config parses worker policy fields
 - server worker tick claims a job, runs a registered agent, and records a succeeded runtime job
+
+### Phase 10: Runtime Completion Feedback
+
+Status: partially implemented.
+
+Feed runtime job completion back into the workflow event stream.
+
+Implemented now:
+
+- runtime workers update the originating command status to `completed`, `failed`, or `cancelled`
+- runtime workers append `RuntimeJobCompleted` events to the parent workflow when the command row
+  is known
+- direct runtime jobs without a workflow command row still complete normally
+
+Still intentionally not moved yet:
+
+- no reducer consumes `RuntimeJobCompleted` to advance state automatically
+- activity result schemas are not yet workflow-specific
+- retry policy for failed activity results is not yet modeled in workflow state
+
+Tests:
+
+- runtime worker completion updates command status and appends a workflow event
+- existing runtime worker tests still cover direct jobs without command rows
 
 ## Test Strategy
 
