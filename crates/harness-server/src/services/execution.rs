@@ -144,7 +144,7 @@ enum PreparedEnqueueResult {
 
 pub(crate) enum WorkflowReuseStrategy {
     ActiveTask(TaskId),
-    PrExternalId(String),
+    ActivePrExternalId(String),
     None,
 }
 
@@ -163,7 +163,7 @@ pub(crate) fn workflow_reuse_strategy(workflow: &IssueWorkflowInstance) -> Workf
         return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
     }
     if let Some(pr_number) = workflow.pr_number {
-        return WorkflowReuseStrategy::PrExternalId(format!("pr:{pr_number}"));
+        return WorkflowReuseStrategy::ActivePrExternalId(format!("pr:{pr_number}"));
     }
     WorkflowReuseStrategy::None
 }
@@ -389,7 +389,16 @@ impl DefaultExecutionService {
             None
         }?;
 
-        match workflow_reuse_strategy(&workflow) {
+        self.lookup_workflow_reuse_candidate(project_id, &workflow)
+            .await
+    }
+
+    async fn lookup_workflow_reuse_candidate(
+        &self,
+        project_id: &str,
+        workflow: &IssueWorkflowInstance,
+    ) -> Option<TaskId> {
+        match workflow_reuse_strategy(workflow) {
             WorkflowReuseStrategy::ActiveTask(task_id) => {
                 if self
                     .tasks
@@ -400,21 +409,11 @@ impl DefaultExecutionService {
                     return Some(task_id);
                 }
             }
-            WorkflowReuseStrategy::PrExternalId(pr_ext_id) => {
-                if let Some(task_id) = self
+            WorkflowReuseStrategy::ActivePrExternalId(pr_ext_id) => {
+                return self
                     .tasks
                     .find_active_duplicate(project_id, &pr_ext_id)
-                    .await
-                {
-                    return Some(task_id);
-                }
-                if let Some((task_id, _)) = self
-                    .tasks
-                    .find_terminal_pr_duplicate(project_id, &pr_ext_id)
-                    .await
-                {
-                    return Some(task_id);
-                }
+                    .await;
             }
             WorkflowReuseStrategy::None => {}
         }
