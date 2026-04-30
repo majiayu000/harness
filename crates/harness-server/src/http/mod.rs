@@ -279,6 +279,7 @@ mod startup_tests {
         let project_root = sandbox.path().join("project");
         std::fs::create_dir_all(&project_root)?;
         let data_dir = sandbox.path().join("data");
+        let database_url = crate::test_helpers::ensure_test_database_url_override()?;
 
         // Redirect HOME to an empty sandbox directory so that
         // $HOME/.harness/skills/ cannot shadow the persisted skill under
@@ -292,10 +293,12 @@ mod startup_tests {
         let startup = |project_root: &std::path::Path, data_dir: &std::path::Path| {
             let project_root = project_root.to_path_buf();
             let data_dir = data_dir.to_path_buf();
+            let database_url = database_url.clone();
             async move {
                 let mut config = HarnessConfig::default();
                 config.server.project_root = project_root;
                 config.server.data_dir = data_dir;
+                config.server.database_url = Some(database_url);
                 let server = Arc::new(HarnessServer::new(
                     config,
                     ThreadManager::new(),

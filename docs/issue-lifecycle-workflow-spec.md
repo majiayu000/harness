@@ -187,6 +187,7 @@ scheduled
 implementing
 pr_open
 awaiting_feedback
+feedback_claimed
 addressing_feedback
 ready_to_merge
 blocked
@@ -211,6 +212,10 @@ cancelled
 
 - `awaiting_feedback`
   - The PR exists and the workflow is waiting for new actionable feedback or mergeability.
+
+- `feedback_claimed`
+  - Actionable PR feedback was claimed by the sweeper, but enqueue has not yet
+    persisted a real PR task id.
 
 - `addressing_feedback`
   - Actionable PR feedback has been detected and a fix round is active.
@@ -252,6 +257,7 @@ cancelled
 
 - `feedback_sweep_completed`
 - `feedback_found`
+- `feedback_task_scheduled`
 - `no_feedback_found`
 - `changes_requested`
 - `approved`
@@ -320,7 +326,7 @@ Instead it triggers a policy decision:
 
 ```text
 pr_open --feedback_sweep_completed--> awaiting_feedback
-awaiting_feedback --feedback_found--> addressing_feedback
+awaiting_feedback --feedback_found--> feedback_claimed
 awaiting_feedback --mergeable--> ready_to_merge
 awaiting_feedback --conflicting--> blocked
 awaiting_feedback --ci_failed--> awaiting_feedback
@@ -330,6 +336,8 @@ awaiting_feedback --no_feedback_found--> awaiting_feedback
 ### Feedback loop
 
 ```text
+feedback_claimed --feedback_task_scheduled--> addressing_feedback
+feedback_claimed --no_feedback_found--> awaiting_feedback
 addressing_feedback --implement_started--> addressing_feedback
 addressing_feedback --pr_detected--> pr_open
 addressing_feedback --implement_failed--> failed
@@ -437,7 +445,8 @@ This must be a first-class activity, not an incidental webhook side effect.
 
 - structured actionable feedback list
 - workflow events:
-  - `feedback_found`
+  - `feedback_found` (claim placeholder persisted)
+  - `feedback_task_scheduled`
   - `no_feedback_found`
   - `approved`
   - `changes_requested`

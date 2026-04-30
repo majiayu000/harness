@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
 use harness_core::{agent::CodeAgent, config::HarnessConfig, interceptor::TurnInterceptor};
 use harness_skills::store::SkillStore;
-use harness_workflow::issue_lifecycle::{IssueLifecycleState, IssueWorkflowInstance};
+use harness_workflow::issue_lifecycle::{
+    is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
@@ -137,9 +139,19 @@ struct PreparedEnqueue {
     reviewer: Option<Arc<dyn CodeAgent>>,
 }
 
+const WORKFLOW_FEEDBACK_SOURCE: &str = "workflow_feedback";
+
 enum PreparedEnqueueResult {
     Existing(TaskId),
     Ready(Box<PreparedEnqueue>),
+}
+
+fn is_workflow_feedback_request(req: &CreateTaskRequest) -> bool {
+    req.pr.is_some() && req.source.as_deref() == Some(WORKFLOW_FEEDBACK_SOURCE)
+}
+
+fn allows_terminal_pr_duplicate_reuse(req: &CreateTaskRequest) -> bool {
+    !is_workflow_feedback_request(req)
 }
 
 pub(crate) enum WorkflowReuseStrategy {
@@ -160,7 +172,9 @@ pub(crate) fn workflow_reuse_strategy(workflow: &IssueWorkflowInstance) -> Workf
         return WorkflowReuseStrategy::None;
     }
     if let Some(task_id) = workflow.active_task_id.as_ref() {
-        return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
+        if !is_feedback_claim_placeholder(task_id) {
+            return WorkflowReuseStrategy::ActiveTask(harness_core::types::TaskId(task_id.clone()));
+        }
     }
     if let Some(pr_number) = workflow.pr_number {
         return WorkflowReuseStrategy::ActivePrExternalId(format!("pr:{pr_number}"));
@@ -444,6 +458,9 @@ impl DefaultExecutionService {
         project_id: &str,
         req: &CreateTaskRequest,
     ) -> Option<TaskId> {
+        if !allows_terminal_pr_duplicate_reuse(req) {
+            return None;
+        }
         let ext_id = req.external_id.as_deref()?;
         let (existing_id, pr_url) = self
             .tasks
@@ -892,6 +909,24 @@ mod tests {
             ..Default::default()
         };
         assert!(DefaultExecutionService::validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn workflow_feedback_pr_request_bypasses_terminal_pr_duplicate_reuse() {
+        let feedback_req = CreateTaskRequest {
+            pr: Some(123),
+            source: Some(WORKFLOW_FEEDBACK_SOURCE.to_string()),
+            ..Default::default()
+        };
+        assert!(is_workflow_feedback_request(&feedback_req));
+        assert!(!allows_terminal_pr_duplicate_reuse(&feedback_req));
+
+        let regular_pr_req = CreateTaskRequest {
+            pr: Some(123),
+            ..Default::default()
+        };
+        assert!(!is_workflow_feedback_request(&regular_pr_req));
+        assert!(allows_terminal_pr_duplicate_reuse(&regular_pr_req));
     }
 
     #[tokio::test]

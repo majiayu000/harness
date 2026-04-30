@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64},
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
 };
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use tokio::sync::OnceCell;
 /// spurious "project root must be within HOME" failures.
 pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
+static DATABASE_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
 static DB_STATE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 
 fn db_state_lock() -> Arc<tokio::sync::Mutex<()>> {
@@ -102,6 +103,24 @@ pub fn test_database_url() -> anyhow::Result<String> {
     resolve_database_url(None)
 }
 
+pub fn ensure_test_database_url_override() -> anyhow::Result<String> {
+    let _guard = DATABASE_URL_ENV_LOCK
+        .lock()
+        .expect("database URL env lock poisoned");
+    if let Ok(url) = std::env::var("HARNESS_DATABASE_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            return Ok(url.to_string());
+        }
+    }
+
+    let url = test_database_url()?;
+    unsafe {
+        std::env::set_var("HARNESS_DATABASE_URL", &url);
+    }
+    Ok(url)
+}
+
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
     err.to_string()
         .contains("pool timed out while waiting for an open connection")
@@ -159,21 +178,27 @@ async fn make_state_inner(
     dir: &std::path::Path,
     project_root: &std::path::Path,
     agent_registry: AgentRegistry,
-    config: HarnessConfig,
+    mut config: HarnessConfig,
 ) -> anyhow::Result<AppState> {
     #[cfg(test)]
     let db_state_guard = Some(acquire_db_state_guard().await);
+    let database_url = ensure_test_database_url_override()?;
+    config.server.database_url = Some(database_url.clone());
     let server = Arc::new(HarnessServer::new(
         config,
         ThreadManager::new(),
         agent_registry,
     ));
     let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
-    let tasks = crate::task_runner::TaskStore::open(&harness_core::config::dirs::default_db_path(
-        dir, "tasks",
-    ))
+    let tasks = crate::task_runner::TaskStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir, "tasks"),
+        Some(&database_url),
+    )
     .await?;
-    let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
+    let events = Arc::new(
+        harness_observe::event_store::EventStore::new_with_database_url(dir, Some(&database_url))
+            .await?,
+    );
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
         server.config.gc.signal_thresholds.clone().into(),
         harness_core::types::ProjectId::new(),
@@ -185,9 +210,10 @@ async fn make_state_inner(
         draft_store,
         project_root.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open(&harness_core::config::dirs::default_db_path(
-        dir, "threads",
-    ))
+    let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir, "threads"),
+        Some(&database_url),
+    )
     .await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new(&Default::default()));
@@ -195,8 +221,9 @@ async fn make_state_inner(
     // Service layer — use concrete defaults backed by the same infrastructure.
     let project_svc = crate::services::project::DefaultProjectService::new(
         // Tests that don't need a registry still get a lightweight one.
-        crate::project_registry::ProjectRegistry::open(
+        crate::project_registry::ProjectRegistry::open_with_database_url(
             &harness_core::config::dirs::default_db_path(dir, "projects"),
+            Some(&database_url),
         )
         .await?,
         project_root.to_path_buf(),

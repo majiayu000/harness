@@ -5,8 +5,9 @@ use sqlx::Postgres;
 use std::path::Path;
 
 use crate::issue_lifecycle::{
-    legacy_schema_for_path, workflow_id, IssueLifecycleEvent, IssueLifecycleEventKind,
-    IssueLifecycleState, IssueWorkflowInstance,
+    is_feedback_claim_placeholder, legacy_schema_for_path, workflow_id, IssueLifecycleEvent,
+    IssueLifecycleEventKind, IssueLifecycleState, IssueWorkflowInstance,
+    FEEDBACK_CLAIM_TASK_PREFIX,
 };
 
 static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
@@ -297,6 +298,43 @@ impl IssueWorkflowStore {
         .await
     }
 
+    pub async fn bind_feedback_task_if_claimed(
+        &self,
+        project_id: &str,
+        repo: Option<&str>,
+        pr_number: u64,
+        task_id: &str,
+    ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
+        let mut tx = self.pool.begin().await?;
+        let Some((wf_id, mut workflow)) = self
+            .load_for_update_by_pr(&mut tx, project_id, repo, pr_number)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let needs_binding = workflow.state == IssueLifecycleState::FeedbackClaimed
+            || workflow
+                .active_task_id
+                .as_deref()
+                .is_some_and(is_feedback_claim_placeholder);
+        if !needs_binding {
+            tx.commit().await?;
+            return Ok(Some(workflow));
+        }
+
+        let mut event = IssueLifecycleEvent::new(IssueLifecycleEventKind::FeedbackTaskScheduled)
+            .with_task_id(task_id.to_string());
+        if let Some(pr_url) = workflow.pr_url.clone() {
+            event = event.with_pr(pr_number, pr_url);
+        }
+        workflow.apply_event(event);
+        self.upsert_in_tx(&mut tx, &workflow).await?;
+        debug_assert_eq!(workflow.id, wf_id);
+        tx.commit().await?;
+        Ok(Some(workflow))
+    }
+
     pub async fn record_terminal_for_issue(
         &self,
         project_id: &str,
@@ -383,13 +421,19 @@ impl IssueWorkflowStore {
         stale_before: DateTime<Utc>,
     ) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
         let mut tx = self.pool.begin().await?;
+        let claim_placeholder_like = format!("{FEEDBACK_CLAIM_TASK_PREFIX}%");
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, data FROM issue_workflows
              WHERE data::jsonb->>'pr_number' IS NOT NULL
                AND (
-                    data::jsonb->>'state' IN ('pr_open', 'awaiting_feedback')
+                     data::jsonb->>'state' IN ('pr_open', 'awaiting_feedback')
+                     OR (
+                        data::jsonb->>'state' = 'feedback_claimed'
+                        AND updated_at <= $2
+                    )
                     OR (
                         data::jsonb->>'state' = 'addressing_feedback'
+                        AND data::jsonb->>'active_task_id' LIKE $3
                         AND updated_at <= $2
                     )
                )
@@ -399,6 +443,7 @@ impl IssueWorkflowStore {
         )
         .bind(limit)
         .bind(stale_before)
+        .bind(claim_placeholder_like)
         .fetch_all(&mut *tx)
         .await?;
 
@@ -414,12 +459,10 @@ impl IssueWorkflowStore {
                     continue;
                 }
             };
-            let claim_id = format!("claim:{}", workflow.id);
             if let Some(pr_number) = workflow.pr_number {
                 let pr_url = workflow.pr_url.clone().unwrap_or_default();
                 workflow.apply_event(
-                    IssueLifecycleEvent::new(IssueLifecycleEventKind::FeedbackTaskScheduled)
-                        .with_task_id(claim_id)
+                    IssueLifecycleEvent::new(IssueLifecycleEventKind::FeedbackFound)
                         .with_pr(pr_number, pr_url),
                 );
                 self.upsert_in_tx(&mut tx, &workflow).await?;

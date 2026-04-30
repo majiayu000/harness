@@ -141,11 +141,12 @@ async fn issue_workflow_store_records_cancelled_pr_tasks_as_cancelled() -> anyho
 }
 
 #[tokio::test]
-async fn claim_feedback_candidates_reclaims_stale_claims() -> anyhow::Result<()> {
+async fn claim_feedback_candidates_does_not_reclaim_live_addressing_feedback_tasks(
+) -> anyhow::Result<()> {
     let Some(store) = open_test_store().await? else {
         return Ok(());
     };
-    let project_id = "/tmp/project-stale-claim";
+    let project_id = "/tmp/project-live-feedback";
     store
         .record_issue_scheduled(project_id, Some("owner/repo"), 9, "task-1", &[], false)
         .await?;
@@ -163,12 +164,10 @@ async fn claim_feedback_candidates_reclaims_stale_claims() -> anyhow::Result<()>
         .record_feedback_task_scheduled(project_id, Some("owner/repo"), 77, "task-2")
         .await?;
 
-    let mut workflow = store
+    let workflow = store
         .get_by_pr(project_id, Some("owner/repo"), 77)
         .await?
         .expect("workflow");
-    workflow.feedback_claimed_at = Some(Utc::now() - chrono::Duration::minutes(10));
-    store.upsert(&workflow).await?;
     sqlx::query(
         "UPDATE issue_workflows
          SET updated_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes'
@@ -181,9 +180,197 @@ async fn claim_feedback_candidates_reclaims_stale_claims() -> anyhow::Result<()>
     let claimed = store
         .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
         .await?;
+    assert!(claimed.is_empty());
+
+    let persisted = store
+        .get_by_pr(project_id, Some("owner/repo"), 77)
+        .await?
+        .expect("workflow");
+    assert_eq!(persisted.state, IssueLifecycleState::AddressingFeedback);
+    assert_eq!(persisted.active_task_id.as_deref(), Some("task-2"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn claim_feedback_candidates_reclaims_stale_claim_placeholders() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/project-stale-claim";
+    store
+        .record_issue_scheduled(project_id, Some("owner/repo"), 10, "task-1", &[], false)
+        .await?;
+    store
+        .record_pr_detected(
+            project_id,
+            Some("owner/repo"),
+            10,
+            "task-1",
+            78,
+            "https://github.com/owner/repo/pull/78",
+        )
+        .await?;
+
+    let claimed = store
+        .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+        .await?;
     assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].pr_number, Some(77));
-    assert_eq!(claimed[0].state, IssueLifecycleState::AddressingFeedback);
+    assert_eq!(claimed[0].pr_number, Some(78));
+    assert_eq!(claimed[0].state, IssueLifecycleState::FeedbackClaimed);
+    assert!(claimed[0].active_task_id.is_none());
+
+    sqlx::query(
+        "UPDATE issue_workflows
+         SET updated_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes'
+         WHERE id = $1",
+    )
+    .bind(&claimed[0].id)
+    .execute(&store.pool)
+    .await?;
+
+    let reclaimed = store
+        .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+        .await?;
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].pr_number, Some(78));
+    assert_eq!(reclaimed[0].state, IssueLifecycleState::FeedbackClaimed);
+    assert!(reclaimed[0].active_task_id.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn claim_feedback_candidates_reclaims_legacy_addressing_feedback_placeholders(
+) -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/project-legacy-claim";
+    store
+        .record_issue_scheduled(project_id, Some("owner/repo"), 12, "task-1", &[], false)
+        .await?;
+    store
+        .record_pr_detected(
+            project_id,
+            Some("owner/repo"),
+            12,
+            "task-1",
+            80,
+            "https://github.com/owner/repo/pull/80",
+        )
+        .await?;
+    store
+        .record_feedback_task_scheduled(
+            project_id,
+            Some("owner/repo"),
+            80,
+            "claim:legacy-workflow-80",
+        )
+        .await?;
+
+    let workflow = store
+        .get_by_pr(project_id, Some("owner/repo"), 80)
+        .await?
+        .expect("workflow");
+    assert_eq!(workflow.state, IssueLifecycleState::AddressingFeedback);
+    assert_eq!(
+        workflow.active_task_id.as_deref(),
+        Some("claim:legacy-workflow-80")
+    );
+    sqlx::query(
+        "UPDATE issue_workflows
+         SET updated_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes'
+         WHERE id = $1",
+    )
+    .bind(&workflow.id)
+    .execute(&store.pool)
+    .await?;
+
+    let reclaimed = store
+        .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+        .await?;
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].pr_number, Some(80));
+    assert_eq!(reclaimed[0].state, IssueLifecycleState::FeedbackClaimed);
+    assert!(reclaimed[0].active_task_id.is_none());
+    assert!(reclaimed[0].feedback_claimed_at.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn bind_feedback_task_if_claimed_promotes_placeholder_to_active_feedback(
+) -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/project-bind-feedback";
+    store
+        .record_issue_scheduled(project_id, Some("owner/repo"), 11, "task-1", &[], false)
+        .await?;
+    store
+        .record_pr_detected(
+            project_id,
+            Some("owner/repo"),
+            11,
+            "task-1",
+            79,
+            "https://github.com/owner/repo/pull/79",
+        )
+        .await?;
+    let claimed = store
+        .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+        .await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].state, IssueLifecycleState::FeedbackClaimed);
+
+    let workflow = store
+        .bind_feedback_task_if_claimed(project_id, Some("owner/repo"), 79, "task-2")
+        .await?
+        .expect("workflow");
+    assert_eq!(workflow.state, IssueLifecycleState::AddressingFeedback);
+    assert_eq!(workflow.active_task_id.as_deref(), Some("task-2"));
+    assert!(workflow.feedback_claimed_at.is_none());
+
+    let persisted = store
+        .get_by_pr(project_id, Some("owner/repo"), 79)
+        .await?
+        .expect("workflow");
+    assert_eq!(persisted.state, IssueLifecycleState::AddressingFeedback);
+    assert_eq!(persisted.active_task_id.as_deref(), Some("task-2"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn release_feedback_claim_returns_placeholder_to_awaiting_feedback() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/project-release-feedback";
+    store
+        .record_issue_scheduled(project_id, Some("owner/repo"), 12, "task-1", &[], false)
+        .await?;
+    store
+        .record_pr_detected(
+            project_id,
+            Some("owner/repo"),
+            12,
+            "task-1",
+            80,
+            "https://github.com/owner/repo/pull/80",
+        )
+        .await?;
+    let claimed = store
+        .claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5))
+        .await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].state, IssueLifecycleState::FeedbackClaimed);
+
+    let workflow = store
+        .release_feedback_claim(project_id, Some("owner/repo"), 80, "enqueue failed")
+        .await?
+        .expect("workflow");
+    assert_eq!(workflow.state, IssueLifecycleState::AwaitingFeedback);
+    assert!(workflow.active_task_id.is_none());
+    assert!(workflow.feedback_claimed_at.is_none());
     Ok(())
 }
 

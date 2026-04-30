@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
 use crate::task_runner;
-use harness_workflow::issue_lifecycle::{workflow_id, IssueLifecycleState, IssueWorkflowInstance};
+use harness_workflow::issue_lifecycle::{
+    is_feedback_claim_placeholder, workflow_id, IssueLifecycleState, IssueWorkflowInstance,
+};
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     task.external_id
@@ -497,6 +499,24 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
 
                 match task_routes::enqueue_task_background(state.clone(), req, None).await {
                     Ok(task_id) => {
+                        if let Err(e) = issue_workflows
+                            .bind_feedback_task_if_claimed(
+                                &workflow.project_id,
+                                workflow.repo.as_deref(),
+                                pr_number,
+                                &task_id.0,
+                            )
+                            .await
+                        {
+                            incomplete_projects.insert(project_key.clone());
+                            tracing::warn!(
+                                project_id = %workflow.project_id,
+                                pr = pr_number,
+                                task_id = %task_id.0,
+                                "workflow feedback sweep: failed to bind real task id: {e}"
+                            );
+                            continue;
+                        }
                         tracing::info!(
                             project_id = %workflow.project_id,
                             pr = pr_number,
@@ -824,6 +844,7 @@ fn workflow_recovery_task_ids(
             workflow
                 .active_task_id
                 .as_deref()
+                .filter(|task_id| !is_feedback_claim_placeholder(task_id))
                 .map(|task_id| harness_core::types::TaskId(task_id.to_string()))
         })
         .collect()
@@ -1368,6 +1389,20 @@ mod tests {
         let ids = workflow_recovery_task_ids(&[addressing, waiting, no_task]);
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&harness_core::types::TaskId("task-1".to_string())));
+    }
+
+    #[test]
+    fn workflow_recovery_task_ids_ignores_claim_placeholder_ids() {
+        let mut claimed = IssueWorkflowInstance::new(
+            "/tmp/project".to_string(),
+            Some("owner/repo".to_string()),
+            4,
+        );
+        claimed.state = IssueLifecycleState::AddressingFeedback;
+        claimed.active_task_id = Some("claim:workflow-4".to_string());
+
+        let ids = workflow_recovery_task_ids(&[claimed]);
+        assert!(ids.is_empty());
     }
 
     #[test]
