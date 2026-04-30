@@ -77,6 +77,15 @@ pub struct ProjectGcConfig {
     pub max_drafts_per_run: Option<usize>,
 }
 
+/// Per-project triage configuration overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectTriageConfig {
+    /// When `true`, preserve legacy "review label may skip" behavior for
+    /// non-actionable issues. Actionable issues are still promoted.
+    #[serde(default)]
+    pub skip_on_review_label: Option<bool>,
+}
+
 /// Git configuration for a project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitConfig {
@@ -138,6 +147,9 @@ pub struct ProjectConfig {
     /// Per-project GC overrides. `None` inherits from server defaults.
     #[serde(default)]
     pub gc: Option<ProjectGcConfig>,
+    /// Per-project triage overrides. `None` inherits from defaults.
+    #[serde(default)]
+    pub triage: Option<ProjectTriageConfig>,
     /// Project type used to select review focus criteria. Default: mixed.
     #[serde(default)]
     pub review_type: ReviewType,
@@ -172,6 +184,13 @@ mod tests {
         assert_eq!(config.git.base_branch, "main");
         assert_eq!(config.git.remote, "origin");
         assert_eq!(config.review_type, ReviewType::Mixed);
+        assert_eq!(
+            config
+                .triage
+                .as_ref()
+                .and_then(|triage| triage.skip_on_review_label),
+            None
+        );
         Ok(())
     }
 
@@ -204,6 +223,9 @@ base_branch = "develop"
 remote = "upstream"
 branch_prefix = "featx/"
 
+[triage]
+skip_on_review_label = true
+
 review_type = "rust"
 "#,
         )?;
@@ -212,6 +234,13 @@ review_type = "rust"
         assert_eq!(config.git.base_branch, "develop");
         assert_eq!(config.git.remote, "upstream");
         assert_eq!(config.git.branch_prefix, "featx/");
+        assert_eq!(
+            config
+                .triage
+                .as_ref()
+                .and_then(|triage| triage.skip_on_review_label),
+            Some(true)
+        );
         Ok(())
     }
 }

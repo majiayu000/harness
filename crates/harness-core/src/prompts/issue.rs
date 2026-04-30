@@ -43,11 +43,14 @@ pub fn triage_prompt(issue: u64) -> PromptParts {
              - SKIP — ONLY if the issue is a literal duplicate of another issue, or fundamentally impossible\n\n\
              **IMPORTANT RULES:**\n\
              - Default to PROCEED or PROCEED_WITH_PLAN. Most issues should be attempted.\n\
+             - Treat a `review` label as advisory context, never as a skip signal by itself.\n\
+             - If the issue has concrete file:line references plus a recommended fix, acceptance criteria, or explicit steps/code, choose PROCEED_WITH_PLAN rather than SKIP.\n\
              - Do NOT skip issues just because they are large, complex, or ambitious.\n\
              - Do NOT use NEEDS_CLARIFICATION — if the issue is unclear, PROCEED_WITH_PLAN and let the planner figure it out.\n\
              - Large refactors (4+ files) → PROCEED_WITH_PLAN, never SKIP.\n\n\
-             **OUTPUT FORMAT (mandatory, must be the last 2 lines):**\n\
+             **OUTPUT FORMAT (mandatory, must be the last 3 lines):**\n\
              COMPLEXITY=<low|medium|high>\n\
+             TRIAGE_REASON=<short_snake_case_reason>\n\
              TRIAGE=<PROCEED|PROCEED_WITH_PLAN|SKIP>"
         ),
         context: String::new(),
@@ -346,6 +349,7 @@ mod tests {
         assert!(s.contains("PROCEED_WITH_PLAN"));
         assert!(s.contains("SKIP"));
         assert!(s.contains("TRIAGE="));
+        assert!(s.contains("TRIAGE_REASON="));
     }
 
     #[test]
@@ -368,6 +372,10 @@ mod tests {
         assert!(
             p.contains("TRIAGE="),
             "triage prompt must instruct TRIAGE= output"
+        );
+        assert!(
+            p.contains("TRIAGE_REASON="),
+            "triage prompt must instruct TRIAGE_REASON= output"
         );
     }
 }

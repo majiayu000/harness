@@ -922,7 +922,18 @@ pub(crate) async fn run_task(
             (None, prompts::TriageComplexity::Medium, 0u32)
         } else {
             match triage_pipeline::run_triage_plan_pipeline(
-                agent, store, task_id, issue, &cargo_env, &project, req, &skills, &events,
+                agent,
+                store,
+                task_id,
+                issue,
+                &repo_slug,
+                server_config.server.github_token.as_deref(),
+                project_config.triage.as_ref(),
+                &cargo_env,
+                &project,
+                req,
+                &skills,
+                &events,
             )
             .await?
             {

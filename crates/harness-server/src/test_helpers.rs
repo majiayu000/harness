@@ -110,9 +110,18 @@ pub fn test_database_url() -> anyhow::Result<String> {
         return Ok(database_url.clone());
     }
 
-    let database_url = resolve_database_url(None)?;
-    let _ = TEST_DATABASE_URL.set(database_url.clone());
-    Ok(database_url)
+    if let Ok(url) = std::env::var("HARNESS_DATABASE_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            let url = url.to_string();
+            let _ = TEST_DATABASE_URL.set(url.clone());
+            return Ok(url);
+        }
+    }
+
+    let url = resolve_database_url(None)?;
+    let _ = TEST_DATABASE_URL.set(url.clone());
+    Ok(url)
 }
 
 pub fn ensure_test_database_url_override() -> anyhow::Result<String> {
