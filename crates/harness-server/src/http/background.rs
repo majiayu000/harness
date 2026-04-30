@@ -564,6 +564,77 @@ pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
     });
 }
 
+fn runtime_worker_lease_ttl(
+    policy: &harness_core::config::workflow::RuntimeWorkerPolicy,
+) -> chrono::Duration {
+    let lease_ttl_secs = i64::try_from(policy.lease_ttl_secs.max(1)).unwrap_or(i64::MAX);
+    chrono::Duration::seconds(lease_ttl_secs)
+}
+
+pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
+    if state.core.workflow_runtime_store.is_none() {
+        tracing::debug!("workflow runtime job workers disabled: store unavailable");
+        return;
+    }
+
+    let weak_state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let state = match weak_state.upgrade() {
+                Some(state) => state,
+                None => break,
+            };
+            let workflow_cfg =
+                harness_core::config::workflow::load_workflow_config(&state.core.project_root)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "workflow runtime job workers: failed to load WORKFLOW.md, using default config: {e}"
+                        );
+                        harness_core::config::workflow::WorkflowConfig::default()
+                    });
+            let policy = workflow_cfg.runtime_worker;
+            let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
+            if policy.enabled {
+                let concurrency = policy.concurrency.max(1);
+                let lease_ttl = runtime_worker_lease_ttl(&policy);
+                let mut handles = Vec::with_capacity(concurrency as usize);
+                for worker_idx in 0..concurrency {
+                    let state = state.clone();
+                    let owner = format!("server-runtime-worker-{worker_idx}");
+                    handles.push(tokio::spawn(async move {
+                        crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+                            &state, owner, lease_ttl,
+                        )
+                        .await
+                    }));
+                }
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(tick)) if tick.touched_anything() => {
+                            tracing::info!(
+                                succeeded = tick.succeeded,
+                                failed = tick.failed,
+                                cancelled = tick.cancelled,
+                                "workflow runtime job worker tick complete"
+                            );
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!("workflow runtime job worker tick failed: {e}");
+                        }
+                        Err(e) => {
+                            tracing::warn!("workflow runtime job worker task panicked: {e}");
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!("workflow runtime job workers disabled by WORKFLOW.md");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
 /// Spawn a background sweeper that turns `pr_open` / `awaiting_feedback`
 /// issue workflows into `pr:N` review tasks.
 ///

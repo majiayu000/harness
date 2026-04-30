@@ -30,12 +30,13 @@ Implemented now:
   rejected decisions
 - workflow command outbox dispatcher that converts pending runtime commands into runtime jobs
 - opt-in server background loop for workflow command dispatch
+- opt-in server background runtime worker that executes runtime jobs through registered agents
 
 Still intentionally not moved yet:
 
 - existing task runner ownership of process execution
 - repo backlog polling as the primary controller
-- server-owned runtime worker execution loop
+- workflow-first replacement for legacy task submission routes
 - dashboard write actions still use existing task routes
 
 ## Non-Goals
@@ -461,7 +462,7 @@ Implemented now:
 - `WORKFLOW.md` supports `runtime_dispatch` policy fields
 - the server spawns a weak-reference runtime command dispatcher loop when the workflow runtime store
   is available
-- the loop is disabled by default until runtime workers are server-owned
+- the loop is disabled by default while workflow runtime execution remains opt-in
 - each tick converts pending command rows into runtime jobs using the configured runtime profile
 
 Still intentionally not moved yet:
@@ -474,6 +475,33 @@ Tests:
 
 - workflow config parses dispatch policy fields
 - server dispatch tick creates runtime jobs and marks commands dispatched
+
+### Phase 9: Server Runtime Worker Loop
+
+Status: partially implemented.
+
+Run claimed runtime jobs through the existing agent turn lifecycle while keeping the workflow
+runtime opt-in.
+
+Implemented now:
+
+- `WORKFLOW.md` supports `runtime_worker` policy fields
+- the server can claim pending runtime jobs on a configurable worker tick
+- runtime jobs create normal Harness threads and turns, so agent output remains visible in the
+  existing conversation/runtime log path
+- completed turns are written back as structured `ActivityResult` payloads
+- `remote_host` jobs remain reserved for external runtime hosts and are not executed locally
+
+Still intentionally not moved yet:
+
+- workflow-specific runtime profiles do not yet select model, effort, sandbox, or turn budget
+- command completion does not yet feed a reducer that advances workflow state from activity output
+- runtime workers are process-local; distributed worker leasing beyond the job claim is not added yet
+
+Tests:
+
+- workflow config parses worker policy fields
+- server worker tick claims a job, runs a registered agent, and records a succeeded runtime job
 
 ## Test Strategy
 

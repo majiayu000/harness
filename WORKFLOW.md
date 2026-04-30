@@ -12,6 +12,11 @@ runtime_dispatch:
   batch_limit: 25
   runtime_kind: codex_jsonrpc
   runtime_profile: codex-default
+runtime_worker:
+  enabled: false
+  interval_secs: 5
+  concurrency: 1
+  lease_ttl_secs: 900
 storage:
   schema_namespace: workflow
 ---
@@ -41,7 +46,7 @@ Current externally configurable rules:
 
 - `runtime_dispatch.enabled`
   - Enables the experimental workflow command outbox dispatcher. It is disabled
-    by default until server-owned runtime workers are connected.
+    by default while workflow runtime execution remains opt-in.
 
 - `runtime_dispatch.interval_secs`
   - Background interval for converting pending workflow commands into runtime jobs.
@@ -56,6 +61,19 @@ Current externally configurable rules:
 
 - `runtime_dispatch.runtime_profile`
   - Runtime profile name stored on newly created runtime jobs.
+
+- `runtime_worker.enabled`
+  - Enables the experimental server-owned runtime job worker. It is disabled
+    by default while workflow migration remains opt-in.
+
+- `runtime_worker.interval_secs`
+  - Background interval for claiming pending runtime jobs.
+
+- `runtime_worker.concurrency`
+  - Number of runtime job claims attempted per worker tick.
+
+- `runtime_worker.lease_ttl_secs`
+  - Lease duration recorded on claimed runtime jobs.
 
 - `storage.schema_namespace`
   - Stable namespace used for workflow persistence in Postgres so multiple instances do not split by local `data_dir` path.

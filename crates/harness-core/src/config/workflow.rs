@@ -38,6 +38,18 @@ pub struct RuntimeDispatchPolicy {
     pub runtime_profile: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeWorkerPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_runtime_worker_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_runtime_worker_concurrency")]
+    pub concurrency: u32,
+    #[serde(default = "default_runtime_worker_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowConfig {
     #[serde(default)]
@@ -46,6 +58,8 @@ pub struct WorkflowConfig {
     pub pr_feedback: PrFeedbackPolicy,
     #[serde(default)]
     pub runtime_dispatch: RuntimeDispatchPolicy,
+    #[serde(default)]
+    pub runtime_worker: RuntimeWorkerPolicy,
     #[serde(default)]
     pub storage: WorkflowStoragePolicy,
 }
@@ -88,6 +102,17 @@ impl Default for RuntimeDispatchPolicy {
     }
 }
 
+impl Default for RuntimeWorkerPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_runtime_worker_interval_secs(),
+            concurrency: default_runtime_worker_concurrency(),
+            lease_ttl_secs: default_runtime_worker_lease_ttl_secs(),
+        }
+    }
+}
+
 impl Default for WorkflowStoragePolicy {
     fn default() -> Self {
         Self {
@@ -122,6 +147,18 @@ fn default_runtime_dispatch_kind() -> String {
 
 fn default_runtime_dispatch_profile() -> String {
     "codex-default".to_string()
+}
+
+fn default_runtime_worker_interval_secs() -> u64 {
+    5
+}
+
+fn default_runtime_worker_concurrency() -> u32 {
+    1
+}
+
+fn default_runtime_worker_lease_ttl_secs() -> u64 {
+    900
 }
 
 fn default_workflow_schema_namespace() -> String {
@@ -182,6 +219,10 @@ mod tests {
         assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
         assert_eq!(cfg.runtime_dispatch.runtime_kind, "codex_jsonrpc");
         assert_eq!(cfg.runtime_dispatch.runtime_profile, "codex-default");
+        assert!(!cfg.runtime_worker.enabled);
+        assert_eq!(cfg.runtime_worker.interval_secs, 5);
+        assert_eq!(cfg.runtime_worker.concurrency, 1);
+        assert_eq!(cfg.runtime_worker.lease_ttl_secs, 900);
         assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
         assert_eq!(cfg.storage.schema_namespace, "workflow");
         assert!(!cfg.issue_workflow.require_human_gate_before_merge);
@@ -208,6 +249,11 @@ runtime_dispatch:
   batch_limit: 7
   runtime_kind: claude_code
   runtime_profile: claude-default
+runtime_worker:
+  enabled: true
+  interval_secs: 3
+  concurrency: 2
+  lease_ttl_secs: 120
 storage:
   schema_namespace: orchestration
 ---
@@ -231,6 +277,10 @@ Body
         assert_eq!(cfg.runtime_dispatch.batch_limit, 7);
         assert_eq!(cfg.runtime_dispatch.runtime_kind, "claude_code");
         assert_eq!(cfg.runtime_dispatch.runtime_profile, "claude-default");
+        assert!(cfg.runtime_worker.enabled);
+        assert_eq!(cfg.runtime_worker.interval_secs, 3);
+        assert_eq!(cfg.runtime_worker.concurrency, 2);
+        assert_eq!(cfg.runtime_worker.lease_ttl_secs, 120);
         assert_eq!(cfg.storage.schema_namespace, "orchestration");
         Ok(())
     }

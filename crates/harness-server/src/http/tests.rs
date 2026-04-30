@@ -5,7 +5,7 @@ use axum::http::Request;
 use chrono::Utc;
 use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
-    types::Capability, types::TokenUsage, types::TurnFailure, types::TurnFailureKind,
+    types::Capability, types::Item, types::TokenUsage, types::TurnFailure, types::TurnFailureKind,
     types::TurnTelemetry,
 };
 use hmac::{Hmac, Mac};
@@ -21,6 +21,18 @@ struct CapturingAgent {
 }
 
 impl CapturingAgent {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            prompts: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+struct RuntimeStreamAgent {
+    prompts: Mutex<Vec<String>>,
+}
+
+impl RuntimeStreamAgent {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
@@ -108,6 +120,39 @@ impl CodeAgent for CapturingAgent {
         _req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CodeAgent for RuntimeStreamAgent {
+    fn name(&self) -> &str {
+        "runtime-stream-agent"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.prompts.lock().await.push(req.prompt);
+        Ok(successful_agent_response())
+    }
+
+    async fn execute_stream(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.prompts.lock().await.push(req.prompt);
+        let _ = tx
+            .send(StreamItem::ItemCompleted {
+                item: Item::AgentReasoning {
+                    content: "runtime done".to_string(),
+                },
+            })
+            .await;
+        let _ = tx.send(StreamItem::Done).await;
         Ok(())
     }
 }
@@ -384,7 +429,23 @@ async fn make_test_state_with_issue_workflows(
 async fn make_test_state_with_workflow_runtime(
     dir: &std::path::Path,
 ) -> anyhow::Result<Arc<AppState>> {
-    let state = make_test_state(dir).await?;
+    make_test_state_with_workflow_runtime_and_registry(
+        dir,
+        dir,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await
+}
+
+async fn make_test_state_with_workflow_runtime_and_registry(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    agent_registry: harness_agents::registry::AgentRegistry,
+) -> anyhow::Result<Arc<AppState>> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.database_url = Some(crate::test_helpers::test_database_url()?);
+    let state =
+        make_test_state_with_project_root(dir, project_root, config, agent_registry).await?;
     let workflow_runtime_store =
         harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
             &harness_core::config::dirs::default_db_path(dir, "workflow_runtime"),
@@ -397,7 +458,7 @@ async fn make_test_state_with_workflow_runtime(
             project_root: state.core.project_root.clone(),
             home_dir: state.core.home_dir.clone(),
             tasks: state.core.tasks.clone(),
-            thread_db: None,
+            thread_db: state.core.thread_db.clone(),
             plan_db: None,
             plan_cache: state.core.plan_cache.clone(),
             issue_workflow_store: None,
@@ -942,6 +1003,93 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
         store.commands_for(&workflow.id).await?[0].status,
         "dispatched"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let agent = RuntimeStreamAgent::new();
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", agent.clone());
+    let state =
+        make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
+            .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:124"),
+    )
+    .with_id("issue-124")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 124,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-1");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": workflow.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key,
+                "command": command.command,
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    assert_eq!(tick.cancelled, 0);
+    assert!(!tick.idle);
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    assert_eq!(
+        completed.status,
+        harness_workflow::runtime::RuntimeJobStatus::Succeeded
+    );
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "implement_issue");
+    assert_eq!(output.summary, "runtime done");
+    let events = store.runtime_events_for(&runtime_job.id).await?;
+    assert_eq!(events[0].event_type, "RuntimeJobClaimed");
+    assert_eq!(events[1].event_type, "ActivityResultReady");
+    let prompts = agent.prompts.lock().await;
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("You are executing a Harness workflow runtime job."));
+    assert!(prompts[0].contains("Activity: implement_issue"));
     Ok(())
 }
 

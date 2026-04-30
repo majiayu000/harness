@@ -177,9 +177,13 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // enqueue `pr:N` tasks so PR feedback is handled without manual resubmission.
     background::spawn_issue_workflow_feedback_sweeper(&state);
 
-    // Optionally convert workflow command outbox rows into runtime jobs. This
-    // is disabled by default until server-owned runtime workers are connected.
+    // Optionally convert workflow command outbox rows into runtime jobs.
+    // Workflow runtime execution remains opt-in while the migration is staged.
     background::spawn_runtime_command_dispatcher(&state);
+
+    // Optionally execute pending workflow runtime jobs through registered agent
+    // runtimes. This is also disabled by default while workflow mode is opt-in.
+    background::spawn_runtime_job_workers(&state);
 
     let initial_grade = {
         let events = state
