@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
-use super::state::{TaskState, TaskSummary};
+use super::state::{SchedulerOwnerKind, TaskState, TaskSummary};
 use super::types::{TaskId, TaskStatus};
 use super::CompletionCallback;
 
@@ -477,16 +477,22 @@ impl TaskStore {
             return Ok(None);
         }
         let original_scheduler = entry.scheduler.clone();
-        if entry.scheduler.owner.is_some() {
-            // Scheduler owner: never allow a runtime host to steal the task.
-            // RuntimeHost with live lease: the claim is still active.
-            if entry.scheduler.runtime_host_id().is_none()
-                || entry.scheduler.has_live_runtime_host_lease(now)
-            {
-                return Ok(None);
+        if let Some(owner) = entry.scheduler.owner.as_ref() {
+            match owner.kind {
+                SchedulerOwnerKind::Scheduler => {
+                    // Pending rows owned by the local scheduler are unreachable today,
+                    // but if one ever appears we must not let a runtime host steal it.
+                    return Ok(None);
+                }
+                SchedulerOwnerKind::RuntimeHost => {
+                    // RuntimeHost with live lease: the claim is still active.
+                    if entry.scheduler.has_live_runtime_host_lease(now) {
+                        return Ok(None);
+                    }
+                    // RuntimeHost with a stale lease: safe to clear and re-claim.
+                    entry.scheduler.clear_to_queued();
+                }
             }
-            // RuntimeHost with a stale lease: safe to clear and re-claim.
-            entry.scheduler.clear_to_queued();
         }
 
         entry.scheduler.claim_runtime_host(host_id, expires_at);
@@ -1860,6 +1866,148 @@ mod tests {
             .get(&non_pending_id)
             .expect("non-pending task should remain cached");
         assert_eq!(non_pending_task.scheduler.runtime_host_id(), Some("host-a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_for_runtime_host_blocks_scheduler_owned_pending_tasks() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut task = pending_task("scheduler-owned");
+        task.scheduler.claim_scheduler("local-scheduler");
+        let task_id = task.id.clone();
+        store.insert(&task).await;
+
+        let claim = store
+            .claim_for_runtime_host(&task_id, "host-a", Some(30))
+            .await?;
+        assert!(claim.is_none());
+
+        let cached = store
+            .get(&task_id)
+            .expect("scheduler-owned task should remain cached");
+        assert!(matches!(
+            cached
+                .scheduler
+                .owner
+                .as_ref()
+                .map(|owner| (&owner.kind, owner.id.as_str())),
+            Some((
+                crate::task_runner::SchedulerOwnerKind::Scheduler,
+                "local-scheduler"
+            ))
+        ));
+        assert!(matches!(
+            cached.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Running
+        ));
+        assert_eq!(cached.scheduler.run_generation, 1);
+
+        let persisted = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .expect("scheduler-owned task should remain persisted");
+        assert!(matches!(
+            persisted
+                .scheduler
+                .owner
+                .as_ref()
+                .map(|owner| (&owner.kind, owner.id.as_str())),
+            Some((
+                crate::task_runner::SchedulerOwnerKind::Scheduler,
+                "local-scheduler"
+            ))
+        ));
+        assert!(matches!(
+            persisted.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Running
+        ));
+        assert_eq!(persisted.scheduler.run_generation, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_for_runtime_host_blocks_live_runtime_host_leases() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut task = pending_task("leased");
+        task.scheduler
+            .claim_runtime_host("host-a", Utc::now() + chrono::TimeDelta::seconds(60));
+        let task_id = task.id.clone();
+        store.insert(&task).await;
+
+        let claim = store
+            .claim_for_runtime_host(&task_id, "host-b", Some(30))
+            .await?;
+        assert!(claim.is_none());
+
+        let cached = store
+            .get(&task_id)
+            .expect("leased task should remain cached");
+        assert_eq!(cached.scheduler.runtime_host_id(), Some("host-a"));
+        assert!(matches!(
+            cached.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Leased
+        ));
+        assert_eq!(cached.scheduler.run_generation, 1);
+
+        let persisted = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .expect("leased task should remain persisted");
+        assert_eq!(persisted.scheduler.runtime_host_id(), Some("host-a"));
+        assert!(matches!(
+            persisted.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Leased
+        ));
+        assert_eq!(persisted.scheduler.run_generation, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_for_runtime_host_reclaims_expired_runtime_host_leases() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let mut task = pending_task("expired-lease");
+        task.scheduler
+            .claim_runtime_host("host-a", Utc::now() - chrono::TimeDelta::seconds(60));
+        let task_id = task.id.clone();
+        store.insert(&task).await;
+
+        let claim = store
+            .claim_for_runtime_host(&task_id, "host-b", Some(30))
+            .await?;
+        let claim = claim.expect("expired lease should be reclaimed");
+        assert_eq!(claim.task_id, task_id);
+
+        let cached = store
+            .get(&task_id)
+            .expect("reclaimed task should remain cached");
+        assert_eq!(cached.scheduler.runtime_host_id(), Some("host-b"));
+        assert!(matches!(
+            cached.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Leased
+        ));
+        assert_eq!(cached.scheduler.run_generation, 2);
+        assert!(cached.scheduler.lease_expiry().is_some());
+
+        let persisted = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .expect("reclaimed task should remain persisted");
+        assert_eq!(persisted.scheduler.runtime_host_id(), Some("host-b"));
+        assert!(matches!(
+            persisted.scheduler.authority_state,
+            crate::task_runner::SchedulerAuthorityState::Leased
+        ));
+        assert_eq!(persisted.scheduler.run_generation, 2);
+        assert!(persisted.scheduler.lease_expiry().is_some());
         Ok(())
     }
 

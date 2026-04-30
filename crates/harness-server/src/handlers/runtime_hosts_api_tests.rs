@@ -386,6 +386,144 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn claim_endpoint_skips_scheduler_owned_pending_tasks() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
+
+    let mut scheduler_owned = crate::task_runner::TaskState {
+        id: crate::task_runner::TaskId::new(),
+        task_kind: crate::task_runner::TaskKind::Prompt,
+        status: crate::task_runner::TaskStatus::Pending,
+        failure_kind: None,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        issue: None,
+        repo: None,
+        description: Some("scheduler-owned pending task".to_string()),
+        created_at: Some("2026-04-02T00:00:00Z".to_string()),
+        updated_at: None,
+        priority: 0,
+        phase: crate::task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: crate::task_runner::TaskSchedulerState::queued(),
+    };
+    scheduler_owned.scheduler.claim_scheduler("local-scheduler");
+    let scheduler_owned_id = scheduler_owned.id.clone();
+
+    let claimable = crate::task_runner::TaskState {
+        id: crate::task_runner::TaskId::new(),
+        task_kind: crate::task_runner::TaskKind::Prompt,
+        status: crate::task_runner::TaskStatus::Pending,
+        failure_kind: None,
+        turn: 0,
+        pr_url: None,
+        rounds: vec![],
+        error: None,
+        source: None,
+        external_id: None,
+        parent_id: None,
+        depends_on: vec![],
+        subtask_ids: vec![],
+        project_root: None,
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        issue: None,
+        repo: None,
+        description: Some("claimable pending task".to_string()),
+        created_at: Some("2026-04-02T00:00:01Z".to_string()),
+        updated_at: None,
+        priority: 0,
+        phase: crate::task_runner::TaskPhase::default(),
+        triage_output: None,
+        plan_output: None,
+        request_settings: None,
+        scheduler: crate::task_runner::TaskSchedulerState::queued(),
+    };
+    let claimable_id = claimable.id.clone();
+
+    state.core.tasks.insert(&scheduler_owned).await;
+    state.core.tasks.insert(&claimable).await;
+
+    let app = runtime_hosts_app(state.clone());
+
+    let register = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "host_id": "host-a" }).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(register.status(), axum::http::StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/tasks/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "lease_secs": 30 }).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(
+        &http_body_util::BodyExt::collect(response.into_body())
+            .await?
+            .to_bytes(),
+    )?;
+    assert_eq!(json["claimed"], true);
+    assert_eq!(json["task_id"], claimable_id.to_string());
+
+    let blocked = state
+        .core
+        .tasks
+        .get(&scheduler_owned_id)
+        .expect("scheduler-owned task should remain cached");
+    assert!(matches!(
+        blocked
+            .scheduler
+            .owner
+            .as_ref()
+            .map(|owner| (&owner.kind, owner.id.as_str())),
+        Some((
+            crate::task_runner::SchedulerOwnerKind::Scheduler,
+            "local-scheduler"
+        ))
+    ));
+    assert_eq!(blocked.scheduler.runtime_host_id(), None);
+
+    let claimed = state
+        .core
+        .tasks
+        .get(&claimable_id)
+        .expect("claimable task should remain cached");
+    assert_eq!(claimed.scheduler.runtime_host_id(), Some("host-a"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn claim_endpoint_rejects_out_of_range_lease_secs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some(state) = make_test_state(dir.path()).await? else {
