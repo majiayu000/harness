@@ -103,6 +103,14 @@ impl CodexAdapter {
         Ok(id)
     }
 
+    async fn send_notification(
+        state: &mut AdapterState,
+        method: &str,
+        params: Value,
+    ) -> harness_core::error::Result<()> {
+        Self::send_json_line(state, &notification_payload(method, params)).await
+    }
+
     async fn send_response(
         state: &mut AdapterState,
         id: Value,
@@ -216,6 +224,8 @@ impl CodexAdapter {
                 }
             }
         }
+
+        Self::send_notification(state, "initialized", Value::Null).await?;
 
         let thread_id_request = Self::send_request(
             state,
@@ -403,14 +413,25 @@ impl AgentAdapter for CodexAdapter {
         let mut state = self.state.lock().await;
         let request_id: Value =
             serde_json::from_str(&id).unwrap_or_else(|_| Value::String(id.clone()));
-        let result = match decision {
-            ApprovalDecision::Accept => Value::String("approved".to_string()),
-            ApprovalDecision::Reject { reason } => json!({
-                "decision": "denied",
-                "reason": reason,
-            }),
-        };
+        let result = approval_decision_result(decision);
         Self::send_response(&mut state, request_id, result).await
+    }
+}
+
+fn notification_payload(method: &str, params: Value) -> Value {
+    json!({
+        "method": method,
+        "params": params,
+    })
+}
+
+fn approval_decision_result(decision: ApprovalDecision) -> Value {
+    match decision {
+        ApprovalDecision::Accept => json!({ "decision": "accept" }),
+        ApprovalDecision::Reject { reason } => json!({
+            "decision": "decline",
+            "reason": reason,
+        }),
     }
 }
 
@@ -776,6 +797,34 @@ mod tests {
     fn parse_invalid_json_returns_none() {
         assert!(parse_codex_message("not json").is_none());
         assert!(parse_codex_message("").is_none());
+    }
+
+    #[test]
+    fn initialized_notification_payload_has_no_request_id() {
+        assert_eq!(
+            notification_payload("initialized", Value::Null),
+            json!({
+                "method": "initialized",
+                "params": null,
+            })
+        );
+    }
+
+    #[test]
+    fn approval_decision_result_uses_app_server_shape() {
+        assert_eq!(
+            approval_decision_result(ApprovalDecision::Accept),
+            json!({ "decision": "accept" })
+        );
+        assert_eq!(
+            approval_decision_result(ApprovalDecision::Reject {
+                reason: "nope".into()
+            }),
+            json!({
+                "decision": "decline",
+                "reason": "nope",
+            })
+        );
     }
 
     #[tokio::test]
