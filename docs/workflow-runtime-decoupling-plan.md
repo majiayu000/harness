@@ -29,12 +29,13 @@ Implemented now:
 - workflow-first runtime tree API and dashboard panel for instances, commands, runtime jobs, and
   rejected decisions
 - workflow command outbox dispatcher that converts pending runtime commands into runtime jobs
+- opt-in server background loop for workflow command dispatch
 
 Still intentionally not moved yet:
 
 - existing task runner ownership of process execution
 - repo backlog polling as the primary controller
-- server-owned background command dispatcher loop
+- server-owned runtime worker execution loop
 - dashboard write actions still use existing task routes
 
 ## Non-Goals
@@ -448,6 +449,31 @@ Tests:
 
 - activity commands enqueue runtime jobs with prompt input context
 - non-runtime commands are skipped without creating jobs
+
+### Phase 8: Server Dispatch Loop
+
+Status: partially implemented.
+
+Run the command outbox dispatcher from the server as an opt-in background loop.
+
+Implemented now:
+
+- `WORKFLOW.md` supports `runtime_dispatch` policy fields
+- the server spawns a weak-reference runtime command dispatcher loop when the workflow runtime store
+  is available
+- the loop is disabled by default until runtime workers are server-owned
+- each tick converts pending command rows into runtime jobs using the configured runtime profile
+
+Still intentionally not moved yet:
+
+- no server-owned runtime worker loop consumes the jobs
+- runtime profile selection is not yet workflow-specific
+- command claiming is still single-dispatcher safe but not a distributed lease protocol
+
+Tests:
+
+- workflow config parses dispatch policy fields
+- server dispatch tick creates runtime jobs and marks commands dispatched
 
 ## Test Strategy
 

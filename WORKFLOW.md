@@ -6,6 +6,12 @@ pr_feedback:
   enabled: true
   sweep_interval_secs: 60
   claim_stale_after_secs: 300
+runtime_dispatch:
+  enabled: false
+  interval_secs: 30
+  batch_limit: 25
+  runtime_kind: codex_jsonrpc
+  runtime_profile: codex-default
 storage:
   schema_namespace: workflow
 ---
@@ -32,6 +38,24 @@ Current externally configurable rules:
   - Maximum age for a `feedback_claimed` placeholder before the sweeper reclaims it
     after an interrupted enqueue path. This does not reclaim live
     `addressing_feedback` tasks with a real `active_task_id`.
+
+- `runtime_dispatch.enabled`
+  - Enables the experimental workflow command outbox dispatcher. It is disabled
+    by default until server-owned runtime workers are connected.
+
+- `runtime_dispatch.interval_secs`
+  - Background interval for converting pending workflow commands into runtime jobs.
+
+- `runtime_dispatch.batch_limit`
+  - Maximum command outbox rows dispatched per tick.
+
+- `runtime_dispatch.runtime_kind`
+  - Runtime kind for newly created runtime jobs. Supported values are
+    `codex_exec`, `codex_jsonrpc`, `claude_code`, `anthropic_api`, and
+    `remote_host`.
+
+- `runtime_dispatch.runtime_profile`
+  - Runtime profile name stored on newly created runtime jobs.
 
 - `storage.schema_namespace`
   - Stable namespace used for workflow persistence in Postgres so multiple instances do not split by local `data_dir` path.

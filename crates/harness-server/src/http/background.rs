@@ -5,6 +5,9 @@ use crate::task_runner;
 use harness_workflow::issue_lifecycle::{
     is_feedback_claim_placeholder, workflow_id, IssueLifecycleState, IssueWorkflowInstance,
 };
+use harness_workflow::runtime::{
+    CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
+};
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     let (issue_from_external_id, pr_from_external_id) = task
@@ -440,6 +443,123 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                     .await;
                 });
             }
+        }
+    });
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RuntimeCommandDispatchTick {
+    pub enqueued: usize,
+    pub already_dispatched: usize,
+    pub skipped: usize,
+}
+
+impl RuntimeCommandDispatchTick {
+    fn from_outcomes(outcomes: &[CommandDispatchOutcome]) -> Self {
+        let mut tick = Self::default();
+        for outcome in outcomes {
+            match outcome {
+                CommandDispatchOutcome::Enqueued { .. } => tick.enqueued += 1,
+                CommandDispatchOutcome::AlreadyDispatched { .. } => tick.already_dispatched += 1,
+                CommandDispatchOutcome::Skipped { .. } => tick.skipped += 1,
+            }
+        }
+        tick
+    }
+
+    fn touched_anything(&self) -> bool {
+        self.enqueued > 0 || self.already_dispatched > 0 || self.skipped > 0
+    }
+}
+
+pub(super) async fn run_runtime_command_dispatch_tick(
+    state: &Arc<AppState>,
+    runtime_profile: RuntimeProfile,
+    batch_limit: i64,
+) -> anyhow::Result<RuntimeCommandDispatchTick> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(RuntimeCommandDispatchTick::default());
+    };
+    let outcomes = RuntimeCommandDispatcher::new(store, runtime_profile)
+        .with_batch_limit(batch_limit)
+        .dispatch_pending()
+        .await?;
+    Ok(RuntimeCommandDispatchTick::from_outcomes(&outcomes))
+}
+
+fn runtime_kind_from_config(value: &str) -> Option<RuntimeKind> {
+    match value {
+        "codex_exec" => Some(RuntimeKind::CodexExec),
+        "codex_jsonrpc" => Some(RuntimeKind::CodexJsonrpc),
+        "claude_code" => Some(RuntimeKind::ClaudeCode),
+        "anthropic_api" => Some(RuntimeKind::AnthropicApi),
+        "remote_host" => Some(RuntimeKind::RemoteHost),
+        _ => None,
+    }
+}
+
+fn runtime_dispatch_profile(
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> RuntimeProfile {
+    let kind = runtime_kind_from_config(&policy.runtime_kind).unwrap_or_else(|| {
+        tracing::warn!(
+            runtime_kind = policy.runtime_kind,
+            "workflow runtime command dispatcher: unknown runtime_kind, falling back to codex_jsonrpc"
+        );
+        RuntimeKind::CodexJsonrpc
+    });
+    RuntimeProfile::new(policy.runtime_profile.clone(), kind)
+}
+
+pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
+    if state.core.workflow_runtime_store.is_none() {
+        tracing::debug!("workflow runtime command dispatcher disabled: store unavailable");
+        return;
+    }
+
+    let weak_state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let state = match weak_state.upgrade() {
+                Some(state) => state,
+                None => break,
+            };
+            let workflow_cfg =
+                harness_core::config::workflow::load_workflow_config(&state.core.project_root)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "workflow runtime command dispatcher: failed to load WORKFLOW.md, using default config: {e}"
+                        );
+                        harness_core::config::workflow::WorkflowConfig::default()
+                    });
+            let policy = workflow_cfg.runtime_dispatch;
+            let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
+            if policy.enabled {
+                let profile = runtime_dispatch_profile(&policy);
+                match run_runtime_command_dispatch_tick(
+                    &state,
+                    profile,
+                    i64::from(policy.batch_limit.max(1)),
+                )
+                .await
+                {
+                    Ok(tick) if tick.touched_anything() => {
+                        tracing::info!(
+                            enqueued = tick.enqueued,
+                            already_dispatched = tick.already_dispatched,
+                            skipped = tick.skipped,
+                            "workflow runtime command dispatcher tick complete"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("workflow runtime command dispatcher tick failed: {e}");
+                    }
+                }
+            } else {
+                tracing::debug!("workflow runtime command dispatcher disabled by WORKFLOW.md");
+            }
+            tokio::time::sleep(interval).await;
         }
     });
 }

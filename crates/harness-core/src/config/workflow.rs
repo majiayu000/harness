@@ -24,12 +24,28 @@ pub struct PrFeedbackPolicy {
     pub claim_stale_after_secs: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeDispatchPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_runtime_dispatch_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_runtime_dispatch_batch_limit")]
+    pub batch_limit: u32,
+    #[serde(default = "default_runtime_dispatch_kind")]
+    pub runtime_kind: String,
+    #[serde(default = "default_runtime_dispatch_profile")]
+    pub runtime_profile: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowConfig {
     #[serde(default)]
     pub issue_workflow: IssueWorkflowPolicy,
     #[serde(default)]
     pub pr_feedback: PrFeedbackPolicy,
+    #[serde(default)]
+    pub runtime_dispatch: RuntimeDispatchPolicy,
     #[serde(default)]
     pub storage: WorkflowStoragePolicy,
 }
@@ -60,6 +76,18 @@ impl Default for PrFeedbackPolicy {
     }
 }
 
+impl Default for RuntimeDispatchPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_runtime_dispatch_interval_secs(),
+            batch_limit: default_runtime_dispatch_batch_limit(),
+            runtime_kind: default_runtime_dispatch_kind(),
+            runtime_profile: default_runtime_dispatch_profile(),
+        }
+    }
+}
+
 impl Default for WorkflowStoragePolicy {
     fn default() -> Self {
         Self {
@@ -78,6 +106,22 @@ fn default_feedback_sweep_interval_secs() -> u64 {
 
 fn default_feedback_claim_stale_after_secs() -> u64 {
     300
+}
+
+fn default_runtime_dispatch_interval_secs() -> u64 {
+    30
+}
+
+fn default_runtime_dispatch_batch_limit() -> u32 {
+    25
+}
+
+fn default_runtime_dispatch_kind() -> String {
+    "codex_jsonrpc".to_string()
+}
+
+fn default_runtime_dispatch_profile() -> String {
+    "codex-default".to_string()
 }
 
 fn default_workflow_schema_namespace() -> String {
@@ -133,6 +177,11 @@ mod tests {
         assert!(cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 60);
         assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 300);
+        assert!(!cfg.runtime_dispatch.enabled);
+        assert_eq!(cfg.runtime_dispatch.interval_secs, 30);
+        assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
+        assert_eq!(cfg.runtime_dispatch.runtime_kind, "codex_jsonrpc");
+        assert_eq!(cfg.runtime_dispatch.runtime_profile, "codex-default");
         assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
         assert_eq!(cfg.storage.schema_namespace, "workflow");
         assert!(!cfg.issue_workflow.require_human_gate_before_merge);
@@ -153,6 +202,12 @@ pr_feedback:
   enabled: false
   sweep_interval_secs: 15
   claim_stale_after_secs: 45
+runtime_dispatch:
+  enabled: true
+  interval_secs: 5
+  batch_limit: 7
+  runtime_kind: claude_code
+  runtime_profile: claude-default
 storage:
   schema_namespace: orchestration
 ---
@@ -171,6 +226,11 @@ Body
         assert!(!cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 15);
         assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 45);
+        assert!(cfg.runtime_dispatch.enabled);
+        assert_eq!(cfg.runtime_dispatch.interval_secs, 5);
+        assert_eq!(cfg.runtime_dispatch.batch_limit, 7);
+        assert_eq!(cfg.runtime_dispatch.runtime_kind, "claude_code");
+        assert_eq!(cfg.runtime_dispatch.runtime_profile, "claude-default");
         assert_eq!(cfg.storage.schema_namespace, "orchestration");
         Ok(())
     }

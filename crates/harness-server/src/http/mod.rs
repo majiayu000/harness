@@ -177,6 +177,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // enqueue `pr:N` tasks so PR feedback is handled without manual resubmission.
     background::spawn_issue_workflow_feedback_sweeper(&state);
 
+    // Optionally convert workflow command outbox rows into runtime jobs. This
+    // is disabled by default until server-owned runtime workers are connected.
+    background::spawn_runtime_command_dispatcher(&state);
+
     let initial_grade = {
         let events = state
             .observability

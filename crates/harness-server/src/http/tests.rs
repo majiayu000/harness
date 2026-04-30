@@ -893,6 +893,59 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
 }
 
 #[tokio::test]
+async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "replanning",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:123"),
+    )
+    .with_id("issue-123")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 123,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "codex-high",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 1);
+    assert_eq!(tick.already_dispatched, 0);
+    assert_eq!(tick.skipped, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].runtime_profile, "codex-high");
+    assert_eq!(
+        store.commands_for(&workflow.id).await?[0].status,
+        "dispatched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir()?;
