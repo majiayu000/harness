@@ -33,7 +33,8 @@ Implemented now:
 - opt-in server background runtime worker that executes runtime jobs through registered agents
 - runtime job completion writes back command status and workflow completion events
 - runtime completion reducer advances known workflow states from activity output
-- runtime command dispatch can select runtime profiles per activity, before workflow fallback
+- runtime command dispatch can select runtime profiles per workflow/activity pair, then activity,
+  then workflow
 - runtime profiles carry model and execution metadata into runtime jobs
 - server runtime workers pass runtime profile model overrides into agent turns
 - server turn lifecycle enforces runtime profile `timeout_secs` as an execution deadline
@@ -575,28 +576,27 @@ runtime profile.
 Implemented now:
 
 - `WORKFLOW.md` front matter can define `runtime_dispatch.workflow_profiles` overrides keyed by
-  workflow definition id and `runtime_dispatch.activity_profiles` overrides keyed by activity name
-- command dispatch loads the command's workflow instance and activity name, then selects the
-  matching runtime profile when available
-- unmatched activities, unmatched workflows, and missing workflow rows fall back to the configured
-  default runtime profile
+  workflow definition id, `runtime_dispatch.activity_profiles` overrides keyed by activity name,
+  and `runtime_dispatch.workflow_activity_profiles` overrides keyed first by workflow definition id
+  and then by activity name
+- command dispatch loads the command's workflow instance and activity name, then selects the most
+  specific matching runtime profile when available
+- selection precedence is workflow/activity pair, global activity, workflow, then configured default
+  runtime profile
 - server background dispatch builds the same profile selector from project workflow config
 
 Still intentionally not moved yet:
 
-- workflow-and-activity combined override scopes are not modeled
-- runtime workers do not yet enforce profile fields such as model, effort, sandbox, max turns, or
-  timeout
 - profile definitions are still lightweight config entries, not durable workflow definition
   artifacts
 
 Tests:
 
-- workflow config parses per-workflow and per-activity runtime profile overrides
-- dispatcher uses activity overrides first, then workflow definition overrides, then the default
-  profile
-- server dispatch config conversion preserves default, workflow override, and activity override
-  behavior
+- workflow config parses per-workflow, per-activity, and workflow/activity runtime profile overrides
+- dispatcher uses workflow/activity overrides first, then activity overrides, then workflow
+  definition overrides, then the default profile
+- server dispatch config conversion preserves default, workflow override, activity override, and
+  workflow/activity override behavior
 
 ### Phase 13: Runtime Profile Metadata Application
 
@@ -607,9 +607,10 @@ runtime execution.
 
 Implemented now:
 
-- `runtime_dispatch`, `runtime_dispatch.workflow_profiles`, and
-  `runtime_dispatch.activity_profiles` can configure `model`, `reasoning_effort`, `sandbox`,
-  `approval_policy`, `max_turns`, and `timeout_secs`
+- `runtime_dispatch`, `runtime_dispatch.workflow_profiles`,
+  `runtime_dispatch.activity_profiles`, and `runtime_dispatch.workflow_activity_profiles` can
+  configure `model`, `reasoning_effort`, `sandbox`, `approval_policy`, `max_turns`, and
+  `timeout_secs`
 - profile overrides inherit default metadata for fields they do not set
 - dispatcher persists the full selected `RuntimeProfile` into runtime job input
 - runtime worker includes the parsed profile metadata in the prompt packet

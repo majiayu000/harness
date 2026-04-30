@@ -1319,7 +1319,7 @@ async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() 
 }
 
 #[tokio::test]
-async fn runtime_command_dispatcher_prefers_activity_profile() -> anyhow::Result<()> {
+async fn runtime_command_dispatcher_prefers_workflow_activity_profile() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -1335,7 +1335,9 @@ async fn runtime_command_dispatcher_prefers_activity_profile() -> anyhow::Result
         WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-profile");
     let issue_implement_command =
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-profile");
-    let backlog_command =
+    let backlog_replan_command =
+        WorkflowCommand::enqueue_activity("replan_issue", "repo-backlog-replan-profile");
+    let backlog_scan_command =
         WorkflowCommand::enqueue_activity("scan_repo", "repo-backlog-scan-profile");
     let issue_replan_command_id = store
         .enqueue_command(&issue.id, None, &issue_replan_command)
@@ -1343,8 +1345,11 @@ async fn runtime_command_dispatcher_prefers_activity_profile() -> anyhow::Result
     let issue_implement_command_id = store
         .enqueue_command(&issue.id, None, &issue_implement_command)
         .await?;
-    let backlog_command_id = store
-        .enqueue_command(&backlog.id, None, &backlog_command)
+    let backlog_replan_command_id = store
+        .enqueue_command(&backlog.id, None, &backlog_replan_command)
+        .await?;
+    let backlog_scan_command_id = store
+        .enqueue_command(&backlog.id, None, &backlog_scan_command)
         .await?;
 
     let mut default_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
@@ -1355,29 +1360,34 @@ async fn runtime_command_dispatcher_prefers_activity_profile() -> anyhow::Result
     let mut replan_profile = RuntimeProfile::new("codex-replan", RuntimeKind::CodexJsonrpc);
     replan_profile.model = Some("gpt-replan".to_string());
     replan_profile.timeout_secs = Some(300);
+    let mut issue_replan_profile =
+        RuntimeProfile::new("codex-issue-replan", RuntimeKind::CodexExec);
+    issue_replan_profile.model = Some("gpt-issue-replan".to_string());
+    issue_replan_profile.timeout_secs = Some(90);
     let profile_selector = RuntimeProfileSelector::new(default_profile)
         .with_workflow_profile("github_issue_pr", issue_profile)
-        .with_activity_profile("replan_issue", replan_profile);
+        .with_activity_profile("replan_issue", replan_profile)
+        .with_workflow_activity_profile("github_issue_pr", "replan_issue", issue_replan_profile);
     let dispatcher = RuntimeCommandDispatcher::with_profile_selector(&store, profile_selector);
 
     let outcomes = dispatcher.dispatch_pending().await?;
-    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes.len(), 4);
 
     let replan_jobs = store
         .runtime_jobs_for_command(&issue_replan_command_id)
         .await?;
     assert_eq!(replan_jobs.len(), 1);
-    assert_eq!(replan_jobs[0].runtime_kind, RuntimeKind::CodexJsonrpc);
-    assert_eq!(replan_jobs[0].runtime_profile, "codex-replan");
+    assert_eq!(replan_jobs[0].runtime_kind, RuntimeKind::CodexExec);
+    assert_eq!(replan_jobs[0].runtime_profile, "codex-issue-replan");
     assert_eq!(
         replan_jobs[0].input["runtime_profile"]["name"],
-        "codex-replan"
+        "codex-issue-replan"
     );
     assert_eq!(
         replan_jobs[0].input["runtime_profile"]["model"],
-        "gpt-replan"
+        "gpt-issue-replan"
     );
-    assert_eq!(replan_jobs[0].input["runtime_profile"]["timeout_secs"], 300);
+    assert_eq!(replan_jobs[0].input["runtime_profile"]["timeout_secs"], 90);
 
     let implement_jobs = store
         .runtime_jobs_for_command(&issue_implement_command_id)
@@ -1398,12 +1408,32 @@ async fn runtime_command_dispatcher_prefers_activity_profile() -> anyhow::Result
         1200
     );
 
-    let backlog_jobs = store.runtime_jobs_for_command(&backlog_command_id).await?;
-    assert_eq!(backlog_jobs.len(), 1);
-    assert_eq!(backlog_jobs[0].runtime_kind, RuntimeKind::CodexJsonrpc);
-    assert_eq!(backlog_jobs[0].runtime_profile, "codex-default");
+    let backlog_replan_jobs = store
+        .runtime_jobs_for_command(&backlog_replan_command_id)
+        .await?;
+    assert_eq!(backlog_replan_jobs.len(), 1);
     assert_eq!(
-        backlog_jobs[0].input["runtime_profile"]["model"],
+        backlog_replan_jobs[0].runtime_kind,
+        RuntimeKind::CodexJsonrpc
+    );
+    assert_eq!(backlog_replan_jobs[0].runtime_profile, "codex-replan");
+    assert_eq!(
+        backlog_replan_jobs[0].input["runtime_profile"]["model"],
+        "gpt-replan"
+    );
+    assert_eq!(
+        backlog_replan_jobs[0].input["runtime_profile"]["timeout_secs"],
+        300
+    );
+
+    let backlog_scan_jobs = store
+        .runtime_jobs_for_command(&backlog_scan_command_id)
+        .await?;
+    assert_eq!(backlog_scan_jobs.len(), 1);
+    assert_eq!(backlog_scan_jobs[0].runtime_kind, RuntimeKind::CodexJsonrpc);
+    assert_eq!(backlog_scan_jobs[0].runtime_profile, "codex-default");
+    assert_eq!(
+        backlog_scan_jobs[0].input["runtime_profile"]["model"],
         "gpt-default"
     );
     Ok(())

@@ -523,14 +523,46 @@ fn runtime_dispatch_profile_selector(
     policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
 ) -> RuntimeProfileSelector {
     let default_profile = runtime_dispatch_profile(policy);
+    let workflow_profiles = policy
+        .workflow_profiles
+        .iter()
+        .map(|(definition_id, override_policy)| {
+            (
+                definition_id.clone(),
+                apply_runtime_dispatch_profile_override(&default_profile, override_policy),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let activity_profiles = policy
+        .activity_profiles
+        .iter()
+        .map(|(activity, override_policy)| {
+            (
+                activity.clone(),
+                apply_runtime_dispatch_profile_override(&default_profile, override_policy),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut selector = RuntimeProfileSelector::new(default_profile.clone());
-    for (definition_id, override_policy) in &policy.workflow_profiles {
-        let profile = apply_runtime_dispatch_profile_override(&default_profile, override_policy);
-        selector = selector.with_workflow_profile(definition_id.clone(), profile);
+    for (definition_id, profile) in &workflow_profiles {
+        selector = selector.with_workflow_profile(definition_id.clone(), profile.clone());
     }
-    for (activity, override_policy) in &policy.activity_profiles {
-        let profile = apply_runtime_dispatch_profile_override(&default_profile, override_policy);
-        selector = selector.with_activity_profile(activity.clone(), profile);
+    for (activity, profile) in &activity_profiles {
+        selector = selector.with_activity_profile(activity.clone(), profile.clone());
+    }
+    for (definition_id, activity_overrides) in &policy.workflow_activity_profiles {
+        for (activity, override_policy) in activity_overrides {
+            let base_profile = activity_profiles
+                .get(activity)
+                .or_else(|| workflow_profiles.get(definition_id))
+                .unwrap_or(&default_profile);
+            let profile = apply_runtime_dispatch_profile_override(base_profile, override_policy);
+            selector = selector.with_workflow_activity_profile(
+                definition_id.clone(),
+                activity.clone(),
+                profile,
+            );
+        }
     }
     selector
 }
@@ -1957,6 +1989,18 @@ mod tests {
                 ..Default::default()
             },
         );
+        policy.workflow_activity_profiles.insert(
+            "github_issue_pr".to_string(),
+            std::collections::BTreeMap::from([(
+                "replan_issue".to_string(),
+                harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                    runtime_profile: Some("codex-issue-replan".to_string()),
+                    model: Some("gpt-5.5".to_string()),
+                    timeout_secs: Some(900),
+                    ..Default::default()
+                },
+            )]),
+        );
 
         let selector = runtime_dispatch_profile_selector(&policy);
         let issue_profile = selector.select_for_workflow(Some("github_issue_pr"));
@@ -1966,9 +2010,14 @@ mod tests {
         assert_eq!(issue_profile.timeout_secs, Some(1200));
         let replan_profile = selector.select(Some("github_issue_pr"), Some("replan_issue"));
         assert_eq!(replan_profile.kind, RuntimeKind::CodexJsonrpc);
-        assert_eq!(replan_profile.name, "codex-replan");
-        assert_eq!(replan_profile.model.as_deref(), Some("gpt-5.4-mini"));
-        assert_eq!(replan_profile.timeout_secs, Some(600));
+        assert_eq!(replan_profile.name, "codex-issue-replan");
+        assert_eq!(replan_profile.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(replan_profile.timeout_secs, Some(900));
+        let global_replan_profile = selector.select(Some("repo_backlog"), Some("replan_issue"));
+        assert_eq!(global_replan_profile.kind, RuntimeKind::CodexJsonrpc);
+        assert_eq!(global_replan_profile.name, "codex-replan");
+        assert_eq!(global_replan_profile.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(global_replan_profile.timeout_secs, Some(600));
         let backlog_profile = selector.select_for_workflow(Some("repo_backlog"));
         assert_eq!(backlog_profile.kind, RuntimeKind::ClaudeCode);
         assert_eq!(backlog_profile.name, "codex-backlog");

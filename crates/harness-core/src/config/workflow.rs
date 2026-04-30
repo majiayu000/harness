@@ -53,6 +53,9 @@ pub struct RuntimeDispatchPolicy {
     pub workflow_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
     #[serde(default)]
     pub activity_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
+    #[serde(default)]
+    pub workflow_activity_profiles:
+        BTreeMap<String, BTreeMap<String, RuntimeDispatchProfileOverride>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -143,6 +146,7 @@ impl Default for RuntimeDispatchPolicy {
             timeout_secs: None,
             workflow_profiles: BTreeMap::new(),
             activity_profiles: BTreeMap::new(),
+            workflow_activity_profiles: BTreeMap::new(),
         }
     }
 }
@@ -272,6 +276,7 @@ mod tests {
         assert_eq!(cfg.runtime_dispatch.timeout_secs, None);
         assert!(cfg.runtime_dispatch.workflow_profiles.is_empty());
         assert!(cfg.runtime_dispatch.activity_profiles.is_empty());
+        assert!(cfg.runtime_dispatch.workflow_activity_profiles.is_empty());
         assert!(!cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 5);
         assert_eq!(cfg.runtime_worker.concurrency, 1);
@@ -323,6 +328,12 @@ runtime_dispatch:
       runtime_profile: codex-replan
       model: gpt-5.4-mini
       timeout_secs: 180
+  workflow_activity_profiles:
+    github_issue_pr:
+      replan_issue:
+        runtime_profile: codex-issue-replan
+        model: gpt-5.4
+        timeout_secs: 90
 runtime_worker:
   enabled: true
   interval_secs: 3
@@ -401,6 +412,18 @@ Body
         );
         assert_eq!(replan_profile.model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(replan_profile.timeout_secs, Some(180));
+        let issue_replan_profile = cfg
+            .runtime_dispatch
+            .workflow_activity_profiles
+            .get("github_issue_pr")
+            .and_then(|profiles| profiles.get("replan_issue"))
+            .expect("workflow activity profile override should parse");
+        assert_eq!(
+            issue_replan_profile.runtime_profile.as_deref(),
+            Some("codex-issue-replan")
+        );
+        assert_eq!(issue_replan_profile.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(issue_replan_profile.timeout_secs, Some(90));
         assert!(cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 3);
         assert_eq!(cfg.runtime_worker.concurrency, 2);

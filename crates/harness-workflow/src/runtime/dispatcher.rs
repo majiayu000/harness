@@ -27,6 +27,7 @@ pub struct RuntimeProfileSelector {
     default_profile: RuntimeProfile,
     workflow_profiles: BTreeMap<String, RuntimeProfile>,
     activity_profiles: BTreeMap<String, RuntimeProfile>,
+    workflow_activity_profiles: BTreeMap<String, BTreeMap<String, RuntimeProfile>>,
 }
 
 impl RuntimeProfileSelector {
@@ -35,6 +36,7 @@ impl RuntimeProfileSelector {
             default_profile,
             workflow_profiles: BTreeMap::new(),
             activity_profiles: BTreeMap::new(),
+            workflow_activity_profiles: BTreeMap::new(),
         }
     }
 
@@ -56,9 +58,29 @@ impl RuntimeProfileSelector {
         self
     }
 
+    pub fn with_workflow_activity_profile(
+        mut self,
+        definition_id: impl Into<String>,
+        activity: impl Into<String>,
+        profile: RuntimeProfile,
+    ) -> Self {
+        self.workflow_activity_profiles
+            .entry(definition_id.into())
+            .or_default()
+            .insert(activity.into(), profile);
+        self
+    }
+
     pub fn select(&self, definition_id: Option<&str>, activity: Option<&str>) -> &RuntimeProfile {
-        activity
-            .and_then(|name| self.activity_profiles.get(name))
+        definition_id
+            .and_then(|id| {
+                activity.and_then(|name| {
+                    self.workflow_activity_profiles
+                        .get(id)
+                        .and_then(|profiles| profiles.get(name))
+                })
+            })
+            .or_else(|| activity.and_then(|name| self.activity_profiles.get(name)))
             .or_else(|| definition_id.and_then(|id| self.workflow_profiles.get(id)))
             .unwrap_or(&self.default_profile)
     }
