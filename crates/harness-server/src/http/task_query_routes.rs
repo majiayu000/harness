@@ -21,6 +21,24 @@ struct FullTaskResponse {
     workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
 }
 
+#[derive(Serialize)]
+struct RuntimeTaskResponse {
+    id: String,
+    task_id: String,
+    status: String,
+    execution_path: &'static str,
+    workflow_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue: Option<u64>,
+    workflow: harness_workflow::runtime::WorkflowInstance,
+}
+
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
     match state.core.tasks.list_all_summaries_with_terminal().await {
         Ok(mut summaries) => {
@@ -92,12 +110,8 @@ pub(crate) async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state
-        .core
-        .tasks
-        .get_with_db_fallback(&harness_core::types::TaskId(id))
-        .await
-    {
+    let task_id = harness_core::types::TaskId(id);
+    match state.core.tasks.get_with_db_fallback(&task_id).await {
         Ok(Some(task)) => {
             let workflow = enrich_task_workflow(&state, &task).await;
             Json(FullTaskResponse {
@@ -106,11 +120,22 @@ pub(crate) async fn get_task(
             })
             .into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "task not found"})),
-        )
-            .into_response(),
+        Ok(None) => match runtime_task_response_by_handle(&state, &task_id).await {
+            Ok(Some(runtime_task)) => Json(runtime_task).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "task not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("get_task: runtime workflow lookup failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response()
+            }
+        },
         Err(e) => {
             tracing::error!("get_task: database error: {e}");
             (
@@ -120,6 +145,44 @@ pub(crate) async fn get_task(
                 .into_response()
         }
     }
+}
+
+async fn runtime_task_response_by_handle(
+    state: &AppState,
+    task_id: &harness_core::types::TaskId,
+) -> anyhow::Result<Option<RuntimeTaskResponse>> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(None);
+    };
+    let Some(workflow) =
+        crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id).await?
+    else {
+        return Ok(None);
+    };
+    let issue = workflow
+        .data
+        .get("issue_number")
+        .and_then(|value| value.as_u64());
+    Ok(Some(RuntimeTaskResponse {
+        id: task_id.as_str().to_string(),
+        task_id: task_id.as_str().to_string(),
+        status: workflow.state.clone(),
+        execution_path: "workflow_runtime",
+        workflow_id: workflow.id.clone(),
+        external_id: issue.map(|issue_number| format!("issue:{issue_number}")),
+        repo: workflow
+            .data
+            .get("repo")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        project: workflow
+            .data
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        issue,
+        workflow,
+    }))
 }
 
 /// Look up the issue-workflow instance for a task using targeted store queries.

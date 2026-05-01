@@ -535,6 +535,7 @@ impl DefaultExecutionService {
                 "issue submission requires an issue number".to_string(),
             ));
         };
+        let dependencies_blocked = self.dependencies_blocked(&prepared.req).await;
 
         let task_id = TaskId::new();
         let project_root = prepared
@@ -552,6 +553,8 @@ impl DefaultExecutionService {
                 labels: &prepared.req.labels,
                 force_execute: prepared.req.force_execute,
                 additional_prompt: prepared.req.prompt.as_deref(),
+                depends_on: &prepared.req.depends_on,
+                dependencies_blocked,
             },
         )
         .await
@@ -567,7 +570,7 @@ impl DefaultExecutionService {
                     .unwrap_or("decision rejected")
             )));
         }
-        if record.command_ids.is_empty() {
+        if record.command_ids.is_empty() && !dependencies_blocked {
             return Err(EnqueueTaskError::Internal(format!(
                 "workflow runtime accepted issue submission for workflow {} without commands",
                 record.workflow_id
@@ -612,12 +615,6 @@ impl DefaultExecutionService {
         Self::populate_external_id(&mut req);
 
         if req.issue.is_some() {
-            if !req.depends_on.is_empty() {
-                return Err(EnqueueTaskError::BadRequest(
-                    "workflow runtime issue submissions do not support task dependencies"
-                        .to_string(),
-                ));
-            }
             if self.workflow_runtime_store.is_none() {
                 return Err(EnqueueTaskError::Internal(
                     "workflow runtime store is required for GitHub issue submissions".to_string(),
@@ -1102,6 +1099,59 @@ mod tests {
             "preserve caller guidance"
         );
         assert_eq!(runtime_store.pending_commands(10).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_issue_submission_preserves_runtime_dependencies(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let dep_id = TaskId::from_str("dep-issue-runtime");
+        let dep = crate::task_runner::TaskState::new(dep_id.clone());
+        store.insert(&dep).await;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
+        let req = CreateTaskRequest {
+            issue: Some(43),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            depends_on: vec![dep_id],
+            ..Default::default()
+        };
+
+        let task_id = svc.enqueue_background(req).await?;
+        let canonical_project_root = project_root.canonicalize()?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &canonical_project_root.to_string_lossy(),
+            Some("owner/repo"),
+            43,
+        );
+        let instance = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("runtime workflow should be recorded");
+
+        assert_eq!(instance.state, "awaiting_dependencies");
+        assert_eq!(instance.data["task_id"], task_id.0);
+        assert_eq!(
+            instance.data["depends_on"],
+            serde_json::json!(["dep-issue-runtime"])
+        );
+        assert!(runtime_store.commands_for(&workflow_id).await?.is_empty());
         Ok(())
     }
 

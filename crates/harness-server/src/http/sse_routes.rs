@@ -33,13 +33,26 @@ pub(crate) async fn stream_task_sse(
         Some(rx) => rx,
         None => {
             match state.core.tasks.get_with_db_fallback(&task_id).await {
-                Ok(None) => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({"error": "task not found"})),
-                    )
-                        .into_response();
-                }
+                Ok(None) => match runtime_task_sse_replay(&state, &task_id).await {
+                    Ok(Some(events)) => {
+                        return Sse::new(futures::stream::iter(events)).into_response();
+                    }
+                    Ok(None) => {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": "task not found"})),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => {
+                        tracing::error!("stream_task_sse: runtime workflow lookup failed: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": "internal server error"})),
+                        )
+                            .into_response();
+                    }
+                },
                 Err(e) => {
                     tracing::error!("stream_task_sse: database error: {e}");
                     return (
@@ -117,4 +130,49 @@ pub(crate) async fn stream_task_sse(
                 .text("heartbeat"),
         )
         .into_response()
+}
+
+async fn runtime_task_sse_replay(
+    state: &AppState,
+    task_id: &harness_core::types::TaskId,
+) -> anyhow::Result<Option<Vec<Result<Event, std::convert::Infallible>>>> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(None);
+    };
+    let Some(workflow) =
+        crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id).await?
+    else {
+        return Ok(None);
+    };
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "[workflow] {} state={}",
+        workflow.id, workflow.state
+    ));
+    for event in store.events_for(&workflow.id).await? {
+        lines.push(format!(
+            "[event {}] {} {}",
+            event.sequence, event.event_type, event.event
+        ));
+    }
+    for command in store.commands_for(&workflow.id).await? {
+        lines.push(format!(
+            "[command] {} status={} activity={}",
+            command.id,
+            command.status,
+            command.command.runtime_activity_key()
+        ));
+    }
+    let mut events: Vec<Result<Event, std::convert::Infallible>> = lines
+        .into_iter()
+        .filter_map(|text| {
+            serde_json::to_string(&StreamItem::MessageDelta { text })
+                .ok()
+                .map(|data| Ok(Event::default().data(data)))
+        })
+        .collect();
+    if let Ok(data) = serde_json::to_string(&StreamItem::Done) {
+        events.push(Ok(Event::default().data(data)));
+    }
+    Ok(Some(events))
 }

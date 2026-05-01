@@ -98,6 +98,15 @@ impl TransitionAllowlist {
         };
 
         Self::default()
+            .allow("discovered", "awaiting_dependencies", [Wait])
+            .allow("failed", "awaiting_dependencies", [Wait])
+            .allow("cancelled", "awaiting_dependencies", [Wait])
+            .allow("awaiting_dependencies", "awaiting_dependencies", [Wait])
+            .allow(
+                "awaiting_dependencies",
+                "scheduled",
+                [EnqueueActivity, Wait],
+            )
             .allow("discovered", "scheduled", [EnqueueActivity, Wait])
             .allow("scheduled", "scheduled", [EnqueueActivity, Wait])
             .allow("failed", "scheduled", [EnqueueActivity, Wait])

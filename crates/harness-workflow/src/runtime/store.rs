@@ -130,6 +130,14 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_runtime_jobs_ready
               ON runtime_jobs (status, not_before, created_at)",
     },
+    Migration {
+        version: 4,
+        description: "index runtime workflow handle lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_state
+              ON workflow_instances (definition_id, state, updated_at);
+              CREATE INDEX IF NOT EXISTS idx_workflow_instances_task_id
+              ON workflow_instances ((data->'data'->>'task_id'))",
+    },
 ];
 
 pub struct WorkflowRuntimeStore {
@@ -239,6 +247,48 @@ impl WorkflowRuntimeStore {
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub async fn get_instance_by_task_id(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE data->'data'->>'task_id' = $1
+             ORDER BY updated_at DESC
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(data,)| serde_json::from_str(&data))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn list_instances_by_state(
+        &self,
+        definition_id: &str,
+        state: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND state = $2
+             ORDER BY updated_at ASC
+             LIMIT $3",
+        )
+        .bind(definition_id)
+        .bind(state)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
     }
 
     pub async fn list_instances(

@@ -863,6 +863,21 @@ async fn assert_runtime_issue_submission(
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
     assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+
+    let get_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/tasks/{}", task_id.0))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let runtime_task = response_json(get_response).await?;
+    assert_eq!(runtime_task["task_id"], task_id.0);
+    assert_eq!(runtime_task["status"], "scheduled");
+    assert_eq!(runtime_task["execution_path"], "workflow_runtime");
+    assert_eq!(runtime_task["workflow_id"], workflow_id);
     Ok(())
 }
 

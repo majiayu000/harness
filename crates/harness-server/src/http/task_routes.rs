@@ -347,10 +347,44 @@ pub(super) async fn cancel_task(
     let task = match state.core.tasks.get_with_db_fallback(&task_id).await {
         Ok(Some(t)) => t,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "task not found" })),
-            );
+            let Some(runtime_store) = state.core.workflow_runtime_store.as_ref() else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "task not found" })),
+                );
+            };
+            return match crate::workflow_runtime_submission::cancel_issue_submission_by_task_id(
+                runtime_store,
+                &task_id,
+            )
+            .await
+            {
+                Ok(Some(workflow)) if workflow.state == "cancelled" => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "cancelled",
+                        "execution_path": "workflow_runtime",
+                        "workflow_id": workflow.id,
+                    })),
+                ),
+                Ok(Some(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "task already in terminal state" })),
+                ),
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "task not found" })),
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        "cancel_task: runtime workflow lookup failed for {task_id:?}: {e}"
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "failed to cancel runtime workflow" })),
+                    )
+                }
+            };
         }
         Err(e) => {
             tracing::error!("cancel_task: DB lookup failed for {task_id:?}: {e}");

@@ -82,6 +82,8 @@ fn issue_submission_decision_schedules_discovered_issue() {
             labels: &labels,
             force_execute: false,
             additional_prompt: Some("prefer a minimal patch"),
+            depends_on: &[],
+            dependencies_blocked: false,
         },
     );
 
@@ -126,6 +128,8 @@ fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
             labels: &labels,
             force_execute: true,
             additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
         },
     );
 
@@ -136,6 +140,36 @@ fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
             &ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen(),
         )
         .expect("explicit issue submission should reopen failed workflows");
+}
+
+#[test]
+fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
+    let labels = Vec::new();
+    let depends_on = vec!["task-upstream".to_string()];
+    let instance = issue_instance("discovered");
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-3",
+            repo: Some("owner/repo"),
+            issue_number: 125,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &depends_on,
+            dependencies_blocked: true,
+        },
+    );
+
+    assert_eq!(output.decision.next_state, "awaiting_dependencies");
+    assert!(output.decision.commands.is_empty());
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("blocked issue submission should validate without dispatching");
 }
 
 #[test]
