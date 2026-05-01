@@ -1092,6 +1092,52 @@ fn rejects_unallowed_command_for_transition() {
 }
 
 #[test]
+fn rejects_pr_open_transition_without_bind_pr_command() {
+    let instance = issue_instance("implementing");
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "implementing",
+        "agent_reported_pr_open",
+        "pr_open",
+        "The agent reported a PR without binding PR metadata.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "PR metadata was omitted.",
+        "issue-123-pr-open-wait",
+    ));
+
+    let err = DecisionValidator::github_issue_pr()
+        .validate(&instance, &decision, &validation_context())
+        .expect_err("pr_open transition should require BindPr");
+
+    assert_eq!(
+        err.kind,
+        WorkflowDecisionRejectionKind::RequiredCommandMissing
+    );
+}
+
+#[test]
+fn rejects_done_transition_without_mark_done_command() {
+    let instance = issue_instance("ready_to_merge");
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "ready_to_merge",
+        "agent_reported_done",
+        "done",
+        "The agent reported merge completion without a terminal command.",
+    );
+
+    let err = DecisionValidator::github_issue_pr()
+        .validate(&instance, &decision, &validation_context())
+        .expect_err("done transition should require MarkDone");
+
+    assert_eq!(
+        err.kind,
+        WorkflowDecisionRejectionKind::RequiredCommandMissing
+    );
+}
+
+#[test]
 fn rejects_active_duplicate_command() {
     let instance = issue_instance("implementing");
     let decision = WorkflowDecision::new(

@@ -280,6 +280,7 @@ pub enum WorkflowDecisionRejectionKind {
     ReplanLimitExhausted,
     WaitLimitExhausted,
     TerminalReopenDenied,
+    RequiredCommandMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,6 +445,24 @@ impl DecisionValidator {
             }
         }
 
+        if let Some(required_command) =
+            required_command_for_transition(&decision.observed_state, &decision.next_state)
+        {
+            if !decision
+                .commands
+                .iter()
+                .any(|command| command.command_type == required_command)
+            {
+                return Err(WorkflowDecisionRejection::new(
+                    WorkflowDecisionRejectionKind::RequiredCommandMissing,
+                    format!(
+                        "transition '{}' -> '{}' requires command {:?}",
+                        decision.observed_state, decision.next_state, required_command
+                    ),
+                ));
+            }
+        }
+
         if decision.decision == "run_replan" && !context.replan_available {
             return Err(WorkflowDecisionRejection::new(
                 WorkflowDecisionRejectionKind::ReplanLimitExhausted,
@@ -493,4 +512,18 @@ impl DecisionValidator {
 
 fn is_replan_command(command: &WorkflowCommand) -> bool {
     command.activity_name() == Some("replan_issue")
+}
+
+fn required_command_for_transition(
+    from_state: &str,
+    to_state: &str,
+) -> Option<WorkflowCommandType> {
+    match (from_state, to_state) {
+        ("implementing", "pr_open") => Some(WorkflowCommandType::BindPr),
+        (_, "done") => Some(WorkflowCommandType::MarkDone),
+        (_, "blocked") => Some(WorkflowCommandType::MarkBlocked),
+        (_, "failed") => Some(WorkflowCommandType::MarkFailed),
+        (_, "cancelled") => Some(WorkflowCommandType::MarkCancelled),
+        _ => None,
+    }
 }
