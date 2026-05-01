@@ -123,6 +123,16 @@ pub struct WorkflowRuntimeStore {
     sequence_lock: tokio::sync::Mutex<()>,
 }
 
+type WorkflowCommandRecordRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    DateTime<Utc>,
+    DateTime<Utc>,
+);
+
 impl WorkflowRuntimeStore {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_database_url(path, None).await
@@ -367,15 +377,7 @@ impl WorkflowRuntimeStore {
         &self,
         workflow_id: &str,
     ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
-        let rows: Vec<(
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            chrono::DateTime<chrono::Utc>,
-            chrono::DateTime<chrono::Utc>,
-        )> = sqlx::query_as(
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
                  FROM workflow_commands
                  WHERE workflow_id = $1
@@ -405,15 +407,7 @@ impl WorkflowRuntimeStore {
         &self,
         command_id: &str,
     ) -> anyhow::Result<Option<WorkflowCommandRecord>> {
-        let row: Option<(
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            chrono::DateTime<chrono::Utc>,
-            chrono::DateTime<chrono::Utc>,
-        )> = sqlx::query_as(
+        let row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
              FROM workflow_commands
              WHERE id = $1",
@@ -439,15 +433,7 @@ impl WorkflowRuntimeStore {
 
     pub async fn pending_commands(&self, limit: i64) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
         let limit = limit.clamp(1, 500);
-        let rows: Vec<(
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            chrono::DateTime<chrono::Utc>,
-            chrono::DateTime<chrono::Utc>,
-        )> = sqlx::query_as(
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
              FROM workflow_commands
              WHERE status = 'pending'

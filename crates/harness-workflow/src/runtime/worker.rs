@@ -136,7 +136,7 @@ impl<'a> RuntimeWorker<'a> {
                 let record = super::model::WorkflowDecisionRecord::rejected(
                     decision,
                     Some(event.id.clone()),
-                    &error.to_string(),
+                    error.to_string(),
                 );
                 self.store.record_decision(&record).await?;
                 return Ok(());
