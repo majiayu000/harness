@@ -138,6 +138,12 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_workflow_instances_task_id
               ON workflow_instances ((data->'data'->>'task_id'))",
     },
+    Migration {
+        version: 5,
+        description: "index runtime workflow handle history",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_task_ids
+              ON workflow_instances USING GIN ((data->'data'->'task_ids'))",
+    },
 ];
 
 pub struct WorkflowRuntimeStore {
@@ -256,6 +262,7 @@ impl WorkflowRuntimeStore {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT data::text FROM workflow_instances
              WHERE data->'data'->>'task_id' = $1
+                OR data->'data'->'task_ids' ? $1
              ORDER BY updated_at DESC
              LIMIT 1",
         )
@@ -289,6 +296,14 @@ impl WorkflowRuntimeStore {
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
+    }
+
+    pub async fn touch_instance(&self, workflow_id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE workflow_instances SET updated_at = clock_timestamp() WHERE id = $1")
+            .bind(workflow_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn list_instances(

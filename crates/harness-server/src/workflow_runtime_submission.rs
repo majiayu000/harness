@@ -47,6 +47,41 @@ pub(crate) struct IssueDependencyReleaseSummary {
     pub skipped: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssueDependencyStatus {
+    Done,
+    Failed,
+    Cancelled,
+    Waiting,
+}
+
+pub(crate) async fn resolve_issue_dependency_status(
+    store: Option<&WorkflowRuntimeStore>,
+    tasks: &TaskStore,
+    task_id: &TaskId,
+) -> anyhow::Result<IssueDependencyStatus> {
+    match tasks.dep_status(task_id).await {
+        Some(TaskStatus::Done) => return Ok(IssueDependencyStatus::Done),
+        Some(TaskStatus::Failed) => return Ok(IssueDependencyStatus::Failed),
+        Some(TaskStatus::Cancelled) => return Ok(IssueDependencyStatus::Cancelled),
+        Some(_) => return Ok(IssueDependencyStatus::Waiting),
+        None => {}
+    }
+
+    let Some(store) = store else {
+        return Ok(IssueDependencyStatus::Waiting);
+    };
+    let Some(instance) = store.get_instance_by_task_id(task_id.as_str()).await? else {
+        return Ok(IssueDependencyStatus::Waiting);
+    };
+    Ok(match instance.state.as_str() {
+        "done" => IssueDependencyStatus::Done,
+        "failed" => IssueDependencyStatus::Failed,
+        "cancelled" => IssueDependencyStatus::Cancelled,
+        _ => IssueDependencyStatus::Waiting,
+    })
+}
+
 pub(crate) async fn release_ready_issue_dependencies(
     store: &WorkflowRuntimeStore,
     tasks: &TaskStore,
@@ -69,23 +104,24 @@ pub(crate) async fn release_ready_issue_dependencies(
                     "workflow runtime dependency release skipped malformed issue data: {error}"
                 );
                 summary.skipped += 1;
+                store.touch_instance(&instance.id).await?;
                 continue;
             }
         };
         let mut all_done = true;
         let mut terminal_failure: Option<(TaskId, &'static str)> = None;
         for dep_id in &depends_on {
-            match tasks.dep_status(dep_id).await {
-                Some(TaskStatus::Done) => {}
-                Some(TaskStatus::Failed) => {
+            match resolve_issue_dependency_status(Some(store), tasks, dep_id).await? {
+                IssueDependencyStatus::Done => {}
+                IssueDependencyStatus::Failed => {
                     terminal_failure = Some((dep_id.clone(), "failed"));
                     break;
                 }
-                Some(TaskStatus::Cancelled) => {
+                IssueDependencyStatus::Cancelled => {
                     terminal_failure = Some((dep_id.clone(), "cancelled"));
                     break;
                 }
-                _ => all_done = false,
+                IssueDependencyStatus::Waiting => all_done = false,
             }
         }
         if let Some((dep_id, label)) = terminal_failure {
@@ -95,6 +131,7 @@ pub(crate) async fn release_ready_issue_dependencies(
             release_issue_after_dependencies(store, instance, &depends_on).await?;
             summary.released += 1;
         } else {
+            store.touch_instance(&instance.id).await?;
             summary.waiting += 1;
         }
     }
@@ -106,6 +143,14 @@ pub(crate) async fn runtime_issue_by_task_id(
     task_id: &TaskId,
 ) -> anyhow::Result<Option<WorkflowInstance>> {
     store.get_instance_by_task_id(task_id.as_str()).await
+}
+
+pub(crate) fn runtime_issue_task_handle(instance: &WorkflowInstance) -> Option<TaskId> {
+    string_array_field(&instance.data, "task_ids")
+        .ok()
+        .and_then(|task_ids| task_ids.into_iter().next())
+        .or_else(|| optional_string_field(&instance.data, "task_id"))
+        .map(|task_id| TaskId::from_str(&task_id))
 }
 
 pub(crate) async fn cancel_issue_submission_by_task_id(
@@ -174,7 +219,7 @@ async fn persist_issue_submission(
             true,
         ),
     };
-    let submitted_data = issue_submission_data(ctx, &project_id);
+    let submitted_data = issue_submission_data(ctx, &project_id, &instance.data);
     let output = build_issue_submission_decision(
         &instance,
         IssueSubmissionDecisionInput {
@@ -432,6 +477,7 @@ fn issue_instance(
 fn issue_submission_data(
     ctx: &IssueSubmissionRuntimeContext<'_>,
     project_id: &str,
+    existing_data: &serde_json::Value,
 ) -> serde_json::Value {
     crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
@@ -440,6 +486,7 @@ fn issue_submission_data(
             "repo": ctx.repo,
             "issue_number": ctx.issue_number,
             "task_id": ctx.task_id.as_str(),
+            "task_ids": task_id_history(existing_data, ctx.task_id),
             "labels": ctx.labels,
             "force_execute": ctx.force_execute,
             "additional_prompt": ctx.additional_prompt,
@@ -494,6 +541,26 @@ fn task_ids_from_data(data: &serde_json::Value, field: &str) -> anyhow::Result<V
         .into_iter()
         .map(|task_id| TaskId::from_str(&task_id))
         .collect())
+}
+
+fn task_id_history(existing_data: &serde_json::Value, new_task_id: &TaskId) -> Vec<String> {
+    let mut task_ids = Vec::new();
+    if let Ok(existing_ids) = string_array_field(existing_data, "task_ids") {
+        for task_id in existing_ids {
+            push_unique_task_id(&mut task_ids, task_id);
+        }
+    }
+    if let Some(task_id) = optional_string_field(existing_data, "task_id") {
+        push_unique_task_id(&mut task_ids, task_id);
+    }
+    push_unique_task_id(&mut task_ids, new_task_id.as_str().to_string());
+    task_ids
+}
+
+fn push_unique_task_id(task_ids: &mut Vec<String>, task_id: String) {
+    if !task_ids.iter().any(|existing| existing == &task_id) {
+        task_ids.push(task_id);
+    }
 }
 
 fn depends_on_strings(depends_on: &[TaskId]) -> Vec<String> {
@@ -602,6 +669,7 @@ mod tests {
             .expect("workflow should be persisted");
         assert_eq!(instance.state, "scheduled");
         assert_eq!(instance.data["task_id"], "task-1");
+        assert_eq!(instance.data["task_ids"], serde_json::json!(["task-1"]));
         assert_eq!(
             instance.data["additional_prompt"],
             "include the regression test first"
@@ -630,6 +698,83 @@ mod tests {
             .runtime_jobs_for_command(&commands[0].id)
             .await?
             .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_submission_preserves_prior_task_handles_for_lookup() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = open_runtime_store(dir.path()).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let labels = vec!["bug".to_string()];
+        let first_task_id = TaskId::from_str("runtime-handle-first");
+        let second_task_id = TaskId::from_str("runtime-handle-second");
+
+        record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 44,
+                task_id: &first_task_id,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        )
+        .await?;
+        let result = record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 44,
+                task_id: &second_task_id,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        )
+        .await?;
+
+        assert!(result.accepted);
+        let workflow = store
+            .get_instance(&result.workflow_id)
+            .await?
+            .expect("workflow should remain persisted");
+        assert_eq!(
+            workflow.data["task_ids"],
+            serde_json::json!(["runtime-handle-first", "runtime-handle-second"])
+        );
+        assert_eq!(
+            runtime_issue_task_handle(&workflow)
+                .expect("runtime workflow should expose a stable handle")
+                .as_str(),
+            "runtime-handle-first"
+        );
+        assert_eq!(
+            runtime_issue_by_task_id(&store, &first_task_id)
+                .await?
+                .expect("first handle should resolve")
+                .id,
+            workflow.id
+        );
+        assert_eq!(
+            runtime_issue_by_task_id(&store, &second_task_id)
+                .await?
+                .expect("second handle should resolve")
+                .id,
+            workflow.id
+        );
         Ok(())
     }
 
@@ -775,6 +920,139 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
         assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> anyhow::Result<()>
+    {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = open_runtime_store(dir.path()).await?;
+        let task_store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let labels = vec!["bug".to_string()];
+        let dep_id = TaskId::from_str("runtime-dep-handle");
+        let dep_result = record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 78,
+                task_id: &dep_id,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        )
+        .await?;
+        let mut dep_workflow = store
+            .get_instance(&dep_result.workflow_id)
+            .await?
+            .expect("dependency workflow should exist");
+        dep_workflow.state = "done".to_string();
+        store.upsert_instance(&dep_workflow).await?;
+
+        let task_id = TaskId::from_str("runtime-dependent-handle");
+        let blocked = record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 79,
+                task_id: &task_id,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: std::slice::from_ref(&dep_id),
+                dependencies_blocked: true,
+            },
+        )
+        .await?;
+
+        let released = release_ready_issue_dependencies(&store, &task_store, 10).await?;
+        assert_eq!(released.released, 1);
+        let workflow = store
+            .get_instance(&blocked.workflow_id)
+            .await?
+            .expect("dependent workflow should remain persisted");
+        assert_eq!(workflow.state, "scheduled");
+        assert_eq!(store.commands_for(&blocked.workflow_id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dependency_release_rotates_waiting_rows_to_prevent_starvation() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = open_runtime_store(dir.path()).await?;
+        let task_store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let labels = vec!["bug".to_string()];
+
+        let old_dep_id = TaskId::from_str("old-blocked-dep");
+        let old_dep = crate::task_runner::TaskState::new(old_dep_id.clone());
+        task_store.insert(&old_dep).await;
+        let old_task_id = TaskId::from_str("old-waiting-handle");
+        record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 80,
+                task_id: &old_task_id,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: std::slice::from_ref(&old_dep_id),
+                dependencies_blocked: true,
+            },
+        )
+        .await?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let ready_dep_id = TaskId::from_str("ready-dep");
+        let mut ready_dep = crate::task_runner::TaskState::new(ready_dep_id.clone());
+        ready_dep.status = TaskStatus::Done;
+        task_store.insert(&ready_dep).await;
+        let ready_task_id = TaskId::from_str("ready-waiting-handle");
+        let ready = record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 81,
+                task_id: &ready_task_id,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: std::slice::from_ref(&ready_dep_id),
+                dependencies_blocked: true,
+            },
+        )
+        .await?;
+
+        let first = release_ready_issue_dependencies(&store, &task_store, 1).await?;
+        assert_eq!(first.waiting, 1);
+        assert_eq!(first.released, 0);
+        let second = release_ready_issue_dependencies(&store, &task_store, 1).await?;
+        assert_eq!(second.released, 1);
+        let workflow = store
+            .get_instance(&ready.workflow_id)
+            .await?
+            .expect("ready workflow should remain persisted");
+        assert_eq!(workflow.state, "scheduled");
         Ok(())
     }
 }

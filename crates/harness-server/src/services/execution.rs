@@ -484,19 +484,63 @@ impl DefaultExecutionService {
         Some(existing_id)
     }
 
-    async fn dependencies_blocked(&self, req: &CreateTaskRequest) -> bool {
+    async fn dependencies_blocked(
+        &self,
+        req: &CreateTaskRequest,
+    ) -> Result<bool, EnqueueTaskError> {
         if req.depends_on.is_empty() {
-            return false;
+            return Ok(false);
         }
         for dep_id in &req.depends_on {
+            let status = crate::workflow_runtime_submission::resolve_issue_dependency_status(
+                self.workflow_runtime_store.as_deref(),
+                &self.tasks,
+                dep_id,
+            )
+            .await
+            .map_err(|error| {
+                EnqueueTaskError::Internal(format!(
+                    "dependency status lookup failed for {}: {error}",
+                    dep_id.as_str()
+                ))
+            })?;
             if !matches!(
-                self.tasks.dep_status(dep_id).await,
-                Some(task_runner::TaskStatus::Done)
+                status,
+                crate::workflow_runtime_submission::IssueDependencyStatus::Done
             ) {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
+    }
+
+    async fn check_runtime_issue_duplicate(
+        &self,
+        project_id: &str,
+        req: &CreateTaskRequest,
+    ) -> Result<Option<TaskId>, EnqueueTaskError> {
+        let Some(issue_number) = req.issue else {
+            return Ok(None);
+        };
+        let Some(store) = self.workflow_runtime_store.as_ref() else {
+            return Ok(None);
+        };
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            project_id,
+            req.repo.as_deref(),
+            issue_number,
+        );
+        let Some(instance) = store
+            .get_instance(&workflow_id)
+            .await
+            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if instance.is_terminal() {
+            return Ok(None);
+        }
+        Ok(crate::workflow_runtime_submission::runtime_issue_task_handle(&instance))
     }
 
     async fn track_pr_workflow(&self, project_id: &str, req: &CreateTaskRequest, task_id: &TaskId) {
@@ -535,7 +579,7 @@ impl DefaultExecutionService {
                 "issue submission requires an issue number".to_string(),
             ));
         };
-        let dependencies_blocked = self.dependencies_blocked(&prepared.req).await;
+        let dependencies_blocked = self.dependencies_blocked(&prepared.req).await?;
 
         let task_id = TaskId::new();
         let project_root = prepared
@@ -620,6 +664,12 @@ impl DefaultExecutionService {
                     "workflow runtime store is required for GitHub issue submissions".to_string(),
                 ));
             }
+            if let Some(existing_id) = self
+                .check_runtime_issue_duplicate(&project_id, &req)
+                .await?
+            {
+                return Ok(PreparedEnqueueResult::Existing(existing_id));
+            }
             return Ok(PreparedEnqueueResult::RuntimeIssueSubmission(Box::new(
                 PreparedRuntimeIssueSubmission { req, project_id },
             )));
@@ -635,7 +685,7 @@ impl DefaultExecutionService {
             return Ok(PreparedEnqueueResult::Existing(existing_id));
         }
 
-        if self.dependencies_blocked(&req).await {
+        if self.dependencies_blocked(&req).await? {
             let workflow_req = req.clone();
             let task_id = task_runner::spawn_task_awaiting_deps(self.tasks.clone(), req)
                 .await
@@ -1103,6 +1153,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_background_issue_submission_reuses_active_runtime_handle() -> anyhow::Result<()>
+    {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
+        let req = CreateTaskRequest {
+            issue: Some(42),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            ..Default::default()
+        };
+
+        let first = svc.enqueue_background(req.clone()).await?;
+        let second = svc.enqueue_background(req).await?;
+
+        assert_eq!(second, first);
+        let canonical_project_root = project_root.canonicalize()?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &canonical_project_root.to_string_lossy(),
+            Some("owner/repo"),
+            42,
+        );
+        assert_eq!(runtime_store.commands_for(&workflow_id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn enqueue_background_issue_submission_preserves_runtime_dependencies(
     ) -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
@@ -1152,6 +1243,77 @@ mod tests {
             serde_json::json!(["dep-issue-runtime"])
         );
         assert!(runtime_store.commands_for(&workflow_id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_issue_submission_accepts_completed_runtime_dependency(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
+        let dep_req = CreateTaskRequest {
+            issue: Some(44),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            ..Default::default()
+        };
+        let dep_id = svc.enqueue_background(dep_req).await?;
+        let canonical_project_root = project_root.canonicalize()?;
+        let dep_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &canonical_project_root.to_string_lossy(),
+            Some("owner/repo"),
+            44,
+        );
+        let mut dep_workflow = runtime_store
+            .get_instance(&dep_workflow_id)
+            .await?
+            .expect("dependency workflow should be recorded");
+        dep_workflow.state = "done".to_string();
+        runtime_store.upsert_instance(&dep_workflow).await?;
+        let dep_handle = dep_id.as_str().to_string();
+
+        let dependent_req = CreateTaskRequest {
+            issue: Some(45),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            depends_on: vec![dep_id],
+            ..Default::default()
+        };
+        let dependent_id = svc.enqueue_background(dependent_req).await?;
+        let dependent_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &canonical_project_root.to_string_lossy(),
+            Some("owner/repo"),
+            45,
+        );
+        let workflow = runtime_store
+            .get_instance(&dependent_workflow_id)
+            .await?
+            .expect("dependent workflow should be recorded");
+        assert_eq!(workflow.state, "scheduled");
+        assert_eq!(workflow.data["task_id"], dependent_id.0);
+        assert_eq!(workflow.data["depends_on"], serde_json::json!([dep_handle]));
+        assert_eq!(
+            runtime_store
+                .commands_for(&dependent_workflow_id)
+                .await?
+                .len(),
+            1
+        );
         Ok(())
     }
 
