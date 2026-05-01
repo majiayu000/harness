@@ -447,12 +447,12 @@ Implemented now:
 - `RuntimeWorker` that claims one pending runtime job, records claim/result events, executes the
   adapter, and completes the durable job
 - `ActivityResult::cancelled` so cancellation can be represented as a structured runtime result
+- command outbox rows are automatically converted into runtime jobs by the server dispatch loop
+- server-owned runtime workers claim pending runtime jobs through registered agent runtimes
 
 Still intentionally not moved yet:
 
-- Codex exec/jsonrpc and Claude Code adapters still run through the current task executor
-- command outbox rows are not yet automatically converted into runtime jobs
-- runtime workers are not yet spawned as server-owned background processes
+- prompt-only and PR feedback submissions still use the current task executor
 
 Tests:
 
