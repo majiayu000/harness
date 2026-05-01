@@ -327,6 +327,26 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn list_instances_by_definition(
+        &self,
+        definition_id: &str,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND ($2::text IS NULL OR data->'data'->>'project_id' = $2)
+             ORDER BY updated_at DESC",
+        )
+        .bind(definition_id)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     pub async fn append_event(
         &self,
         workflow_id: &str,

@@ -2360,6 +2360,78 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
 }
 
 #[tokio::test]
+async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let before_count = state.core.tasks.count();
+    let app = Router::new()
+        .route("/tasks", get(list_tasks).post(task_routes::create_task))
+        .with_state(state.clone());
+
+    let body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "repo": "owner/repo",
+        "issue": 52,
+        "labels": ["bug"]
+    });
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+    let created = response_json(create_response).await?;
+    let task_id = created["task_id"]
+        .as_str()
+        .expect("runtime submission should return a task handle")
+        .to_string();
+    assert_eq!(state.core.tasks.count(), before_count);
+
+    let list_response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .await?;
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed = response_json(list_response).await?;
+    let tasks = listed.as_array().expect("tasks should be an array");
+    let runtime_task = tasks
+        .iter()
+        .find(|task| task["id"] == task_id)
+        .expect("runtime issue submission should be listed");
+    let canonical_project_root = project_root.canonicalize()?;
+
+    assert_eq!(runtime_task["task_kind"], "issue");
+    assert_eq!(runtime_task["status"], "pending");
+    assert_eq!(runtime_task["external_id"], "issue:52");
+    assert_eq!(runtime_task["repo"], "owner/repo");
+    assert_eq!(runtime_task["description"], "issue #52");
+    assert_eq!(
+        runtime_task["project"],
+        canonical_project_root.to_string_lossy().as_ref()
+    );
+    assert_eq!(runtime_task["scheduler"]["authority_state"], "queued");
+    assert!(runtime_task.get("workflow").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_task_with_blocked_issue_returns_runtime_state() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
