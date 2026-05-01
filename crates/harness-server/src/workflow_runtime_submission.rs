@@ -43,13 +43,16 @@ async fn persist_issue_submission(
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, ctx.issue_number);
     upsert_github_issue_pr_definition(store).await?;
-    let instance = match store.get_instance(&workflow_id).await? {
-        Some(instance) => instance,
-        None => issue_instance(
-            workflow_id,
-            project_id.clone(),
-            ctx.repo.map(ToOwned::to_owned),
-            ctx.issue_number,
+    let (instance, new_instance) = match store.get_instance(&workflow_id).await? {
+        Some(instance) => (instance, false),
+        None => (
+            issue_instance(
+                workflow_id,
+                project_id.clone(),
+                ctx.repo.map(ToOwned::to_owned),
+                ctx.issue_number,
+            ),
+            true,
         ),
     };
     let submitted_data = issue_submission_data(ctx, &project_id);
@@ -63,12 +66,21 @@ async fn persist_issue_submission(
             force_execute: ctx.force_execute,
         },
     );
-    apply_decision(store, instance, output.decision, ctx, submitted_data).await
+    apply_decision(
+        store,
+        instance,
+        new_instance,
+        output.decision,
+        ctx,
+        submitted_data,
+    )
+    .await
 }
 
 async fn apply_decision(
     store: &WorkflowRuntimeStore,
     mut instance: WorkflowInstance,
+    new_instance: bool,
     decision: WorkflowDecision,
     ctx: &IssueSubmissionRuntimeContext<'_>,
     accepted_data: serde_json::Value,
@@ -80,6 +92,9 @@ async fn apply_decision(
     };
     let validation =
         DecisionValidator::github_issue_pr().validate(&instance, &decision, &validation_context);
+    if new_instance {
+        store.upsert_instance(&instance).await?;
+    }
     let event = store
         .append_event(
             &instance.id,
