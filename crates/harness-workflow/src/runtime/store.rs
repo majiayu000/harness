@@ -8,6 +8,7 @@ use harness_core::db::{Migration, PgStoreContext};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
+use std::collections::BTreeMap;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -295,6 +296,31 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn events_for_workflows(
+        &self,
+        workflow_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, Vec<WorkflowEvent>>> {
+        if workflow_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT workflow_id, data::text FROM workflow_events
+             WHERE workflow_id = ANY($1::text[])
+             ORDER BY workflow_id ASC, sequence ASC",
+        )
+        .bind(workflow_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_workflow = BTreeMap::new();
+        for (workflow_id, data) in rows {
+            by_workflow
+                .entry(workflow_id)
+                .or_insert_with(Vec::new)
+                .push(serde_json::from_str(&data)?);
+        }
+        Ok(by_workflow)
+    }
+
     pub async fn record_decision(&self, record: &WorkflowDecisionRecord) -> anyhow::Result<()> {
         let data = to_jsonb_string(record)?;
         sqlx::query(
@@ -332,6 +358,31 @@ impl WorkflowRuntimeStore {
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
+    }
+
+    pub async fn decisions_for_workflows(
+        &self,
+        workflow_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, Vec<WorkflowDecisionRecord>>> {
+        if workflow_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT workflow_id, data::text FROM workflow_decisions
+             WHERE workflow_id = ANY($1::text[])
+             ORDER BY workflow_id ASC, created_at ASC",
+        )
+        .bind(workflow_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_workflow = BTreeMap::new();
+        for (workflow_id, data) in rows {
+            by_workflow
+                .entry(workflow_id)
+                .or_insert_with(Vec::new)
+                .push(serde_json::from_str(&data)?);
+        }
+        Ok(by_workflow)
     }
 
     pub async fn enqueue_command(
@@ -401,6 +452,40 @@ impl WorkflowRuntimeStore {
                 },
             )
             .collect()
+    }
+
+    pub async fn commands_for_workflows(
+        &self,
+        workflow_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, Vec<WorkflowCommandRecord>>> {
+        if workflow_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
+            "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
+             FROM workflow_commands
+             WHERE workflow_id = ANY($1::text[])
+             ORDER BY workflow_id ASC, created_at ASC",
+        )
+        .bind(workflow_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_workflow = BTreeMap::new();
+        for (id, workflow_id, decision_id, status, data, created_at, updated_at) in rows {
+            by_workflow
+                .entry(workflow_id.clone())
+                .or_insert_with(Vec::new)
+                .push(WorkflowCommandRecord {
+                    id,
+                    workflow_id,
+                    decision_id,
+                    status,
+                    command: serde_json::from_str(&data)?,
+                    created_at,
+                    updated_at,
+                });
+        }
+        Ok(by_workflow)
     }
 
     pub async fn get_command(
@@ -634,6 +719,31 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn runtime_events_for_jobs(
+        &self,
+        runtime_job_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, Vec<RuntimeEvent>>> {
+        if runtime_job_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT runtime_job_id, data::text FROM runtime_events
+             WHERE runtime_job_id = ANY($1::text[])
+             ORDER BY runtime_job_id ASC, sequence ASC",
+        )
+        .bind(runtime_job_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_job = BTreeMap::new();
+        for (runtime_job_id, data) in rows {
+            by_job
+                .entry(runtime_job_id)
+                .or_insert_with(Vec::new)
+                .push(serde_json::from_str(&data)?);
+        }
+        Ok(by_job)
+    }
+
     pub async fn complete_runtime_job(
         &self,
         runtime_job_id: &str,
@@ -693,6 +803,31 @@ impl WorkflowRuntimeStore {
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
+    }
+
+    pub async fn runtime_jobs_for_commands(
+        &self,
+        command_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, Vec<RuntimeJob>>> {
+        if command_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT command_id, data::text FROM runtime_jobs
+             WHERE command_id = ANY($1::text[])
+             ORDER BY command_id ASC, created_at ASC",
+        )
+        .bind(command_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_command = BTreeMap::new();
+        for (command_id, data) in rows {
+            by_command
+                .entry(command_id)
+                .or_insert_with(Vec::new)
+                .push(serde_json::from_str(&data)?);
+        }
+        Ok(by_command)
     }
 
     pub async fn runtime_turns_started_for_workflow(

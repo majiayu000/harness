@@ -319,6 +319,24 @@ async fn build_workflow_runtime_tree(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     instances: Vec<WorkflowInstance>,
 ) -> anyhow::Result<WorkflowRuntimeTreeResponse> {
+    let workflow_ids: Vec<String> = instances
+        .iter()
+        .map(|instance| instance.id.clone())
+        .collect();
+    let mut events_by_workflow = store.events_for_workflows(&workflow_ids).await?;
+    let mut decisions_by_workflow = store.decisions_for_workflows(&workflow_ids).await?;
+    let mut commands_by_workflow = store.commands_for_workflows(&workflow_ids).await?;
+    let command_ids: Vec<String> = commands_by_workflow
+        .values()
+        .flat_map(|commands| commands.iter().map(|command| command.id.clone()))
+        .collect();
+    let mut runtime_jobs_by_command = store.runtime_jobs_for_commands(&command_ids).await?;
+    let runtime_job_ids: Vec<String> = runtime_jobs_by_command
+        .values()
+        .flat_map(|jobs| jobs.iter().map(|job| job.id.clone()))
+        .collect();
+    let mut runtime_events_by_job = store.runtime_events_for_jobs(&runtime_job_ids).await?;
+
     let mut by_id = BTreeMap::new();
     let mut children_by_parent: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for instance in instances {
@@ -329,17 +347,28 @@ async fn build_workflow_runtime_tree(
                 .or_default()
                 .push(workflow_id.clone());
         }
-        let events = store.events_for(&workflow_id).await?;
-        let decisions = store.decisions_for(&workflow_id).await?;
-        let mut commands = Vec::new();
-        for command in store.commands_for(&workflow_id).await? {
-            let mut runtime_jobs = Vec::new();
-            for job in store.runtime_jobs_for_command(&command.id).await? {
-                let runtime_events = store.runtime_events_for(&job.id).await?;
-                runtime_jobs.push(WorkflowRuntimeJobNode::new(job, runtime_events));
-            }
-            commands.push(WorkflowRuntimeCommandNode::new(command, runtime_jobs));
-        }
+        let events = events_by_workflow.remove(&workflow_id).unwrap_or_default();
+        let decisions = decisions_by_workflow
+            .remove(&workflow_id)
+            .unwrap_or_default();
+        let commands = commands_by_workflow
+            .remove(&workflow_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|command| {
+                let runtime_jobs = runtime_jobs_by_command
+                    .remove(&command.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|job| {
+                        let runtime_events =
+                            runtime_events_by_job.remove(&job.id).unwrap_or_default();
+                        WorkflowRuntimeJobNode::new(job, runtime_events)
+                    })
+                    .collect();
+                WorkflowRuntimeCommandNode::new(command, runtime_jobs)
+            })
+            .collect();
         by_id.insert(
             workflow_id,
             WorkflowRuntimeTreeNode {
