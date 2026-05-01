@@ -56,6 +56,8 @@ Implemented now:
   app-server requests
 - server runtime workers build a structured prompt packet for agent jobs and record
   `RuntimePromptPrepared` with a SHA-256 packet digest before the agent turn starts
+- prompt packets include a workflow/activity-specific `activity_result_schema` that tells the
+  runtime agent which summary fields and reducer transitions apply to the current activity
 
 Still intentionally not moved yet:
 
@@ -283,6 +285,8 @@ Implemented now:
 
 - server-owned runtime jobs build `harness.runtime.prompt_packet.v1`
 - the generated prompt is derived from that packet instead of separate ad hoc prompt sections
+- prompt packets include `harness.runtime.activity_result.v1` schema guidance for known
+  workflow/activity pairs such as `implement_issue`, `replan_issue`, and `address_pr_feedback`
 - runtime events persist `RuntimePromptPrepared` with `prompt_packet_digest` and the redacted packet
 - agent-backed activity results include a `runtime_prompt_packet` artifact that references the
   digest used for the turn
@@ -558,13 +562,14 @@ Implemented now:
   `WORKFLOW.md` when policy is present
 - runtime jobs can carry `not_before` cooldown timestamps and the worker claim query leaves future
   retry jobs pending until the cooldown expires
+- runtime prompt packets include workflow/activity-specific activity result schemas for known
+  GitHub issue PR and repo backlog activities
 
 Still intentionally not moved yet:
 
 - reducer coverage is limited to known activity/state pairs
-- activity result schemas are not yet workflow-specific
-- retry cooldown scheduling is best-effort local timing; distributed scheduling visibility is not
-  yet exposed in the dashboard
+- retry cooldown scheduling is best-effort local timing; distributed lease ownership remains a
+  separate runtime-host concern
 
 Tests:
 
@@ -601,8 +606,7 @@ Implemented now:
 Still intentionally not moved yet:
 
 - implementation completion does not infer PR state from free-form agent text
-- activity result schemas are not yet workflow-specific enough to drive every state transition
-- retry policy supports bounded immediate retries only; backoff and cooldown are not yet modeled
+- retry policy does not yet model richer classes such as fatal/non-fatal error taxonomies
 
 Tests:
 

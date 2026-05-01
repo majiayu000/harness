@@ -544,6 +544,7 @@ fn build_runtime_prompt_packet(
             "agent_executes_repository_and_github_work": true,
             "follow_project_instructions": true,
         },
+        "activity_result_schema": activity_result_schema(job, workflow),
         "required_structured_output": {
             "summary": "Concise final activity summary.",
             "changed_files": "Files changed by this runtime activity, if any.",
@@ -581,6 +582,7 @@ fn build_runtime_job_prompt(prompt_packet: &Value) -> String {
          - Treat the workflow database as the source of orchestration state, but do not edit workflow tables directly.\n\
          - Harness server only manages lifecycle. You, the agent, perform repository and GitHub work when the activity requires it.\n\
          - Follow the project instructions loaded by the runtime.\n\
+         - Use the prompt packet activity_result_schema to shape your final summary; Harness will wrap your turn into an ActivityResult.\n\
          - Return a concise final summary with changed files, validation commands, and remaining blockers.\n\n\
          Project root: {project_root}\n\
          Runtime job id: {job_id}\n\
@@ -588,6 +590,105 @@ fn build_runtime_job_prompt(prompt_packet: &Value) -> String {
          Activity: {activity}\n\n\
          Prompt packet:\n{prompt_packet_json}\n",
     )
+}
+
+fn activity_result_schema(job: &RuntimeJob, workflow: Option<&WorkflowInstance>) -> Value {
+    let activity = activity_name(job);
+    let workflow_definition = workflow
+        .map(|workflow| workflow.definition_id.as_str())
+        .unwrap_or("unknown");
+    let transition_contract = activity_transition_contract(workflow_definition, &activity);
+    let summary_contract = agent_summary_contract(workflow_definition, &activity);
+    json!({
+        "schema": "harness.runtime.activity_result.v1",
+        "activity": activity,
+        "workflow_definition": workflow_definition,
+        "result_type": "ActivityResult",
+        "required_fields": ["activity", "status", "summary"],
+        "optional_fields": ["artifacts", "signals", "validation", "error"],
+        "allowed_statuses": ["succeeded", "failed", "blocked", "cancelled"],
+        "status_contract": {
+            "succeeded": "The activity completed and its output is ready for the workflow reducer.",
+            "failed": "The activity hit an execution error and may be retried by workflow policy.",
+            "blocked": "The activity cannot proceed without external input or budget.",
+            "cancelled": "The activity was intentionally stopped.",
+        },
+        "transition_contract": transition_contract,
+        "agent_summary_contract": summary_contract,
+    })
+}
+
+fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Value {
+    match (workflow_definition, activity) {
+        ("github_issue_pr", "replan_issue") => json!({
+            "on_succeeded": {
+                "reducer_next_state": "implementing",
+                "required_summary": "Explain the revised implementation direction and validation plan."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
+        ("github_issue_pr", "address_pr_feedback") => json!({
+            "on_succeeded": {
+                "reducer_next_state": "awaiting_feedback",
+                "required_summary": "Describe addressed review feedback and validation evidence."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
+        ("github_issue_pr", "implement_issue") => json!({
+            "on_succeeded": {
+                "reducer_next_state": "unchanged_until_pr_detected",
+                "required_summary": "Include changed files, validation commands, and the PR URL when one is created."
+            },
+            "follow_up_event": "PrDetected binds PR metadata and advances the issue workflow."
+        }),
+        ("repo_backlog", "start_child_workflow") => json!({
+            "on_succeeded": {
+                "reducer_next_state": "idle",
+                "required_artifact": "child_workflow"
+            }
+        }),
+        ("repo_backlog", "mark_bound_issue_done") | ("repo_backlog", "recover_issue_workflow") => {
+            json!({
+                "on_succeeded": {
+                    "reducer_next_state": "idle",
+                    "required_artifact": "child_workflow"
+                }
+            })
+        }
+        _ => json!({
+            "on_succeeded": {
+                "reducer_next_state": "unchanged",
+                "reason": "No reducer transition is registered for this workflow/activity pair."
+            }
+        }),
+    }
+}
+
+fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
+    match (workflow_definition, activity) {
+        ("github_issue_pr", "implement_issue") => json!({
+            "must_include": ["changed files", "validation commands", "PR URL or blocker"],
+            "must_not_include": ["workflow table mutations", "unverified merge claims"],
+        }),
+        ("github_issue_pr", "replan_issue") => json!({
+            "must_include": ["reason for replan", "new implementation plan", "validation plan"],
+            "must_not_include": ["direct workflow state changes"],
+        }),
+        ("github_issue_pr", "address_pr_feedback") => json!({
+            "must_include": ["review feedback addressed", "changed files", "validation commands"],
+            "must_not_include": ["claiming review approval without a fresh review signal"],
+        }),
+        _ => json!({
+            "must_include": ["summary", "validation commands", "remaining blockers"],
+            "must_not_include": ["direct workflow table mutations"],
+        }),
+    }
 }
 
 fn prompt_packet_digest(prompt_packet: &Value) -> String {

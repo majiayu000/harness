@@ -1168,6 +1168,24 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         events[1].event["prompt_packet"]["required_structured_output"]["validation_commands"],
         "Validation commands run and their results."
     );
+    assert_eq!(
+        events[1].event["prompt_packet"]["activity_result_schema"]["schema"],
+        "harness.runtime.activity_result.v1"
+    );
+    assert_eq!(
+        events[1].event["prompt_packet"]["activity_result_schema"]["activity"],
+        "implement_issue"
+    );
+    assert_eq!(
+        events[1].event["prompt_packet"]["activity_result_schema"]["transition_contract"]
+            ["on_succeeded"]["reducer_next_state"],
+        "unchanged_until_pr_detected"
+    );
+    assert_eq!(
+        events[1].event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
+            ["must_include"][2],
+        "PR URL or blocker"
+    );
     let prompt_packet_digest = events[1].event["prompt_packet_digest"]
         .as_str()
         .expect("prompt packet digest should be recorded");
@@ -1184,6 +1202,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert!(prompts[0].contains("You are executing a Harness workflow runtime job."));
     assert!(prompts[0].contains("Activity: implement_issue"));
     assert!(prompts[0].contains("Prompt packet:"));
+    assert!(prompts[0].contains("activity_result_schema"));
     assert!(prompts[0].contains("required_structured_output"));
     assert!(prompts[0].contains("gpt-runtime"));
     drop(prompts);
