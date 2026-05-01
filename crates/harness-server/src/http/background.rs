@@ -593,15 +593,29 @@ fn apply_runtime_dispatch_profile_override(
         .sandbox
         .clone()
         .or_else(|| default_profile.sandbox.clone());
-    profile.approval_policy = override_policy
-        .approval_policy
-        .clone()
-        .or_else(|| default_profile.approval_policy.clone());
+    profile.approval_policy =
+        runtime_dispatch_approval_policy(default_profile, override_policy, kind);
     profile.max_turns = override_policy.max_turns.or(default_profile.max_turns);
     profile.timeout_secs = override_policy
         .timeout_secs
         .or(default_profile.timeout_secs);
     profile
+}
+
+fn runtime_dispatch_approval_policy(
+    default_profile: &RuntimeProfile,
+    override_policy: &harness_core::config::workflow::RuntimeDispatchProfileOverride,
+    kind: RuntimeKind,
+) -> Option<String> {
+    override_policy.approval_policy.clone().or_else(|| {
+        runtime_kind_supports_approval_policy(kind)
+            .then(|| default_profile.approval_policy.clone())
+            .flatten()
+    })
+}
+
+fn runtime_kind_supports_approval_policy(kind: RuntimeKind) -> bool {
+    matches!(kind, RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc)
 }
 
 pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
@@ -2028,6 +2042,42 @@ mod tests {
         assert_eq!(default_profile.name, "claude-default");
         assert_eq!(default_profile.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(default_profile.timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn runtime_dispatch_profile_selector_drops_codex_approval_for_non_codex_override() {
+        let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: "codex_jsonrpc".to_string(),
+            runtime_profile: "codex-default".to_string(),
+            approval_policy: Some("on-request".to_string()),
+            ..Default::default()
+        };
+        policy.workflow_profiles.insert(
+            "claude_review".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: Some("claude_code".to_string()),
+                runtime_profile: Some("claude-review".to_string()),
+                ..Default::default()
+            },
+        );
+        policy.workflow_profiles.insert(
+            "codex_review".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_profile: Some("codex-review".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let selector = runtime_dispatch_profile_selector(&policy);
+        let claude_profile = selector.select_for_workflow(Some("claude_review"));
+        assert_eq!(claude_profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(claude_profile.name, "claude-review");
+        assert_eq!(claude_profile.approval_policy, None);
+
+        let codex_profile = selector.select_for_workflow(Some("codex_review"));
+        assert_eq!(codex_profile.kind, RuntimeKind::CodexJsonrpc);
+        assert_eq!(codex_profile.name, "codex-review");
+        assert_eq!(codex_profile.approval_policy.as_deref(), Some("on-request"));
     }
 
     // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in
