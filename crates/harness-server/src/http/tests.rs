@@ -1177,6 +1177,10 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         "implement_issue"
     );
     assert_eq!(
+        events[1].event["prompt_packet"]["activity_result_schema"]["allowed_error_kinds"][1],
+        "fatal"
+    );
+    assert_eq!(
         events[1].event["prompt_packet"]["activity_result_schema"]["transition_contract"]
             ["on_succeeded"]["reducer_next_state"],
         "unchanged_until_pr_detected"

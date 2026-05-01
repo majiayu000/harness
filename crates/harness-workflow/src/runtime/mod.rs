@@ -21,11 +21,11 @@ mod tests;
 pub use bus::InMemoryWorkflowBus;
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use model::{
-    ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, RuntimeEvent, RuntimeJob,
-    RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand,
-    WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowEvent, WorkflowEvidence, WorkflowInstance, WorkflowLease,
-    WorkflowSubject,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, ActivityStatus,
+    RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord,
+    WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision,
+    WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
+    WorkflowLease, WorkflowSubject,
 };
 pub use plan_issue::{
     build_plan_issue_decision, PlanIssueDecisionInput, PlanIssueDecisionOutput,

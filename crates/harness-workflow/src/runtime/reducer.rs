@@ -1,6 +1,6 @@
 use super::model::{
-    ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowEvent, WorkflowEvidence, WorkflowInstance,
+    ActivityErrorKind, ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType,
+    WorkflowDecision, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
 use chrono::{DateTime, Duration, Utc};
@@ -110,6 +110,12 @@ fn runtime_failed_decision(
     result: &ActivityResult,
 ) -> WorkflowDecision {
     let reason = runtime_failure_reason(result, "Runtime activity failed.");
+    let mut command_payload = json!({ "reason": reason.as_str() });
+    if let Some(error_kind) = result.error_kind {
+        if let Some(object) = command_payload.as_object_mut() {
+            object.insert("error_kind".to_string(), json!(error_kind));
+        }
+    }
     WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -120,7 +126,7 @@ fn runtime_failed_decision(
     .with_command(WorkflowCommand::new(
         WorkflowCommandType::MarkFailed,
         format!("runtime-completion:{}:failed", event.id),
-        json!({ "reason": reason }),
+        command_payload,
     ))
     .with_evidence(runtime_completion_evidence(event, result))
     .high_confidence()
@@ -131,6 +137,9 @@ fn retry_failed_activity_decision(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
+    if !is_retryable_error_kind(result.error_kind) {
+        return None;
+    }
     if !supports_same_state_activity_retry(&instance.definition_id, &instance.state) {
         return None;
     }
@@ -156,6 +165,7 @@ fn retry_failed_activity_decision(
         .with_command(retry_command(
             event,
             &activity,
+            result.error_kind,
             next_attempt,
             retry_limit,
             &reason,
@@ -163,6 +173,13 @@ fn retry_failed_activity_decision(
         ))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
+    )
+}
+
+fn is_retryable_error_kind(error_kind: Option<ActivityErrorKind>) -> bool {
+    !matches!(
+        error_kind,
+        Some(ActivityErrorKind::Fatal | ActivityErrorKind::Configuration)
     )
 }
 
@@ -273,6 +290,7 @@ fn retry_activity_name(event: &WorkflowEvent, result: &ActivityResult) -> Option
 fn retry_command(
     event: &WorkflowEvent,
     activity: &str,
+    error_kind: Option<ActivityErrorKind>,
     next_attempt: u64,
     retry_limit: u64,
     reason: &str,
@@ -305,6 +323,9 @@ fn retry_command(
             optional_json_string(event_field_string(event, "runtime_job_id")),
         );
         object.insert("previous_error".to_string(), json!(reason));
+        if let Some(error_kind) = error_kind {
+            object.insert("previous_error_kind".to_string(), json!(error_kind));
+        }
         if let Some(schedule) = retry_schedule {
             object.insert("retry_delay_secs".to_string(), json!(schedule.delay_secs));
             object.insert(
@@ -321,6 +342,11 @@ fn retry_command(
             "previous_runtime_job_id": event_field_string(event, "runtime_job_id"),
             "previous_error": reason,
         });
+        if let Some(error_kind) = error_kind {
+            if let Some(object) = command_payload.as_object_mut() {
+                object.insert("previous_error_kind".to_string(), json!(error_kind));
+            }
+        }
         if let Some(schedule) = retry_schedule {
             if let Some(object) = command_payload.as_object_mut() {
                 object.insert("retry_delay_secs".to_string(), json!(schedule.delay_secs));

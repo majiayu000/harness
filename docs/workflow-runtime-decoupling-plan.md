@@ -564,6 +564,8 @@ Implemented now:
   retry jobs pending until the cooldown expires
 - runtime prompt packets include workflow/activity-specific activity result schemas for known
   GitHub issue PR and repo backlog activities
+- activity result schemas expose `error_kind`, allowing agents to mark fatal or configuration
+  failures as non-retryable
 
 Still intentionally not moved yet:
 
@@ -600,13 +602,16 @@ Implemented now:
   overrides, and writes `retry_not_before` metadata into retry commands
 - failed command retries preserve the original workflow command type and payload before adding
   retry metadata
+- failed activity results can carry `error_kind`; `fatal` and `configuration` failures bypass retry
+  policy and fail the workflow immediately
 - unknown successful activity/state pairs are preserved as completion events without unsafe state
   changes
 
 Still intentionally not moved yet:
 
 - implementation completion does not infer PR state from free-form agent text
-- retry policy does not yet model richer classes such as fatal/non-fatal error taxonomies
+- retry policy does not yet model provider-specific or runtime-specific error taxonomies beyond the
+  portable activity error kinds
 
 Tests:
 
@@ -617,6 +622,7 @@ Tests:
 - reducer honors activity-specific retry budget overrides
 - reducer adds cooldown metadata to retry commands when retry delay policy is configured
 - reducer preserves `StartChildWorkflow` command type when retrying failed child workflow dispatch
+- reducer skips retries for non-retryable `fatal` and `configuration` activity errors
 - runtime worker applies the reducer, records decisions, and updates workflow state
 
 ### Phase 12: Workflow Runtime Profile Selection

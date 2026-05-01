@@ -220,5 +220,6 @@ fn runtime_budget_blocked_result(
         signals: Vec::new(),
         validation: Vec::new(),
         error: Some(error),
+        error_kind: None,
     }
 }

@@ -592,6 +592,16 @@ pub enum ActivityStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityErrorKind {
+    Retryable,
+    Fatal,
+    Configuration,
+    ExternalDependency,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActivityArtifact {
     pub artifact_type: String,
@@ -660,6 +670,8 @@ pub struct ActivityResult {
     pub validation: Vec<ValidationRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<ActivityErrorKind>,
 }
 
 impl ActivityResult {
@@ -672,6 +684,7 @@ impl ActivityResult {
             signals: Vec::new(),
             validation: Vec::new(),
             error: None,
+            error_kind: None,
         }
     }
 
@@ -688,6 +701,7 @@ impl ActivityResult {
             signals: Vec::new(),
             validation: Vec::new(),
             error: Some(error.into()),
+            error_kind: None,
         }
     }
 
@@ -700,7 +714,13 @@ impl ActivityResult {
             signals: Vec::new(),
             validation: Vec::new(),
             error: None,
+            error_kind: None,
         }
+    }
+
+    pub fn with_error_kind(mut self, error_kind: ActivityErrorKind) -> Self {
+        self.error_kind = Some(error_kind);
+        self
     }
 
     pub fn with_artifact(mut self, artifact: ActivityArtifact) -> Self {

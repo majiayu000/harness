@@ -1,8 +1,8 @@
 use super::model::{
-    ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, RuntimeJob, RuntimeJobStatus,
-    RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand, WorkflowCommandRecord,
-    WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition,
-    WorkflowEvent, WorkflowEvidence, WorkflowInstance, WorkflowSubject,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, ActivityStatus,
+    RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand,
+    WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowDefinition, WorkflowEvent, WorkflowEvidence, WorkflowInstance, WorkflowSubject,
 };
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
@@ -304,7 +304,8 @@ fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
         "implement_issue",
         "Implementation failed.",
         "codex stdin not available",
-    );
+    )
+    .with_error_kind(ActivityErrorKind::ExternalDependency);
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -335,6 +336,10 @@ fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
         decision.commands[0].command["previous_command_id"],
         "command-1"
     );
+    assert_eq!(
+        decision.commands[0].command["previous_error_kind"],
+        "external_dependency"
+    );
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
@@ -342,6 +347,49 @@ fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("retry decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_does_not_retry_fatal_activity_failure() {
+    let instance = issue_instance("implementing").with_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 3
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "implement-1");
+    let result = ActivityResult::failed(
+        "implement_issue",
+        "Implementation cannot continue.",
+        "repository instructions forbid this operation",
+    )
+    .with_error_kind(ActivityErrorKind::Fatal);
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("fatal failure should fail the workflow immediately");
+
+    assert_eq!(decision.decision, "fail_after_runtime_activity");
+    assert_eq!(decision.next_state, "failed");
+    assert_eq!(decision.commands[0].command["error_kind"], "fatal");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("fatal failure decision should validate");
 }
 
 #[test]
