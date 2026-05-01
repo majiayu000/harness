@@ -7,8 +7,8 @@ use harness_workflow::runtime::{
 use serde_json::json;
 use std::path::Path;
 
-const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
 const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
+const EXECUTION_PATH_WORKFLOW_RUNTIME: &str = "workflow_runtime";
 
 pub(crate) struct IssueSubmissionRuntimeContext<'a> {
     pub project_root: &'a Path,
@@ -19,27 +19,26 @@ pub(crate) struct IssueSubmissionRuntimeContext<'a> {
     pub force_execute: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IssueSubmissionRuntimeRecord {
+    pub workflow_id: String,
+    pub accepted: bool,
+    pub decision_id: String,
+    pub command_ids: Vec<String>,
+    pub rejection_reason: Option<String>,
+}
+
 pub(crate) async fn record_issue_submission(
-    store: Option<&WorkflowRuntimeStore>,
+    store: &WorkflowRuntimeStore,
     ctx: IssueSubmissionRuntimeContext<'_>,
-) {
-    let Some(store) = store else {
-        return;
-    };
-    if let Err(error) = persist_issue_submission(store, &ctx).await {
-        tracing::warn!(
-            issue = ctx.issue_number,
-            repo = ctx.repo,
-            task_id = %ctx.task_id.0,
-            "workflow runtime issue submission write failed: {error}"
-        );
-    }
+) -> anyhow::Result<IssueSubmissionRuntimeRecord> {
+    persist_issue_submission(store, &ctx).await
 }
 
 async fn persist_issue_submission(
     store: &WorkflowRuntimeStore,
     ctx: &IssueSubmissionRuntimeContext<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<IssueSubmissionRuntimeRecord> {
     let project_id = ctx.project_root.to_string_lossy().into_owned();
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, ctx.issue_number);
@@ -73,7 +72,7 @@ async fn apply_decision(
     decision: WorkflowDecision,
     ctx: &IssueSubmissionRuntimeContext<'_>,
     accepted_data: serde_json::Value,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<IssueSubmissionRuntimeRecord> {
     let validation_context = if instance.is_terminal() {
         ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
     } else {
@@ -92,7 +91,7 @@ async fn apply_decision(
                 "issue_number": ctx.issue_number,
                 "labels": ctx.labels,
                 "force_execute": ctx.force_execute,
-                "execution_path": "legacy_task_runner",
+                "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
             }),
         )
         .await?;
@@ -102,30 +101,35 @@ async fn apply_decision(
             let reason = error.to_string();
             let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
             store.record_decision(&record).await?;
-            return Ok(());
+            return Ok(IssueSubmissionRuntimeRecord {
+                workflow_id: instance.id,
+                accepted: false,
+                decision_id: record.id,
+                command_ids: Vec::new(),
+                rejection_reason: Some(reason),
+            });
         }
     };
     store.record_decision(&record).await?;
+    let mut command_ids = Vec::with_capacity(decision.commands.len());
     for command in &decision.commands {
-        if command.requires_runtime_job() {
-            store
-                .enqueue_command_with_status(
-                    &instance.id,
-                    Some(&record.id),
-                    command,
-                    COMMAND_STATUS_HANDLED_INLINE,
-                )
-                .await?;
-        } else {
+        command_ids.push(
             store
                 .enqueue_command(&instance.id, Some(&record.id), command)
-                .await?;
-        }
+                .await?,
+        );
     }
     instance.state = decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
     instance.data = merge_last_decision(accepted_data, &decision.decision);
-    store.upsert_instance(&instance).await
+    store.upsert_instance(&instance).await?;
+    Ok(IssueSubmissionRuntimeRecord {
+        workflow_id: instance.id,
+        accepted: true,
+        decision_id: record.id,
+        command_ids,
+        rejection_reason: None,
+    })
 }
 
 async fn upsert_github_issue_pr_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
@@ -178,7 +182,10 @@ fn issue_submission_data(
 fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_json::Value {
     if let Some(object) = data.as_object_mut() {
         object.insert("last_decision".to_string(), json!(decision));
-        object.insert("execution_path".to_string(), json!("legacy_task_runner"));
+        object.insert(
+            "execution_path".to_string(),
+            json!(EXECUTION_PATH_WORKFLOW_RUNTIME),
+        );
     }
     data
 }
@@ -194,7 +201,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issue_submission_records_inline_implementation_command() -> anyhow::Result<()> {
+    async fn issue_submission_records_pending_runtime_implementation_command() -> anyhow::Result<()>
+    {
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
@@ -206,8 +214,8 @@ mod tests {
         let task_id = TaskId::from_str("task-1");
         let labels = vec!["bug".to_string(), "force-execute".to_string()];
 
-        record_issue_submission(
-            Some(&store),
+        let result = record_issue_submission(
+            &store,
             IssueSubmissionRuntimeContext {
                 project_root: &project_root,
                 repo: Some("owner/repo"),
@@ -217,7 +225,11 @@ mod tests {
                 force_execute: true,
             },
         )
-        .await;
+        .await?;
+
+        assert!(result.accepted);
+        assert_eq!(result.command_ids.len(), 1);
+        assert!(result.rejection_reason.is_none());
 
         let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
             &project_root.to_string_lossy(),
@@ -231,7 +243,10 @@ mod tests {
         assert_eq!(instance.state, "scheduled");
         assert_eq!(instance.data["task_id"], "task-1");
         assert_eq!(instance.data["last_decision"], "submit_issue");
-        assert_eq!(instance.data["execution_path"], "legacy_task_runner");
+        assert_eq!(
+            instance.data["execution_path"],
+            EXECUTION_PATH_WORKFLOW_RUNTIME
+        );
 
         let events = store.events_for(&workflow_id).await?;
         assert!(events
@@ -240,12 +255,9 @@ mod tests {
 
         let commands = store.commands_for(&workflow_id).await?;
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].status, COMMAND_STATUS_HANDLED_INLINE);
+        assert_eq!(commands[0].status, "pending");
         assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
-        assert!(
-            store.pending_commands(10).await?.is_empty(),
-            "inline implementation command should not be visible as pending"
-        );
+        assert_eq!(store.pending_commands(10).await?.len(), 1);
         assert!(store
             .runtime_jobs_for_command(&commands[0].id)
             .await?
@@ -286,8 +298,8 @@ mod tests {
 
         let task_id = TaskId::from_str("new-task");
         let labels = vec!["bug".to_string()];
-        record_issue_submission(
-            Some(&store),
+        let result = record_issue_submission(
+            &store,
             IssueSubmissionRuntimeContext {
                 project_root: &project_root,
                 repo: Some("owner/repo"),
@@ -297,7 +309,14 @@ mod tests {
                 force_execute: false,
             },
         )
-        .await;
+        .await?;
+
+        assert!(!result.accepted);
+        assert!(result.command_ids.is_empty());
+        assert!(result
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("TransitionNotAllowed")));
 
         let persisted = store
             .get_instance(&workflow_id)

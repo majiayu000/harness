@@ -140,10 +140,16 @@ struct PreparedEnqueue {
     reviewer: Option<Arc<dyn CodeAgent>>,
 }
 
+struct PreparedRuntimeIssueSubmission {
+    req: CreateTaskRequest,
+    project_id: String,
+}
+
 const WORKFLOW_FEEDBACK_SOURCE: &str = "workflow_feedback";
 
 enum PreparedEnqueueResult {
     Existing(TaskId),
+    RuntimeIssueSubmission(Box<PreparedRuntimeIssueSubmission>),
     Ready(Box<PreparedEnqueue>),
 }
 
@@ -493,50 +499,7 @@ impl DefaultExecutionService {
         false
     }
 
-    async fn track_issue_workflow(
-        &self,
-        project_id: &str,
-        req: &CreateTaskRequest,
-        task_id: &TaskId,
-    ) {
-        if let Some(issue_number) = req.issue {
-            if let Some(workflows) = self.issue_workflow_store.as_ref() {
-                if let Err(e) = workflows
-                    .record_issue_scheduled(
-                        project_id,
-                        req.repo.as_deref(),
-                        issue_number,
-                        &task_id.0,
-                        &req.labels,
-                        req.force_execute,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        issue = issue_number,
-                        task_id = %task_id.0,
-                        "issue workflow enqueue tracking failed: {e}"
-                    );
-                }
-            }
-            let project_root = req
-                .project
-                .as_deref()
-                .unwrap_or_else(|| std::path::Path::new(project_id));
-            crate::workflow_runtime_submission::record_issue_submission(
-                self.workflow_runtime_store.as_deref(),
-                crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
-                    project_root,
-                    repo: req.repo.as_deref(),
-                    issue_number,
-                    task_id,
-                    labels: &req.labels,
-                    force_execute: req.force_execute,
-                },
-            )
-            .await;
-            return;
-        }
+    async fn track_pr_workflow(&self, project_id: &str, req: &CreateTaskRequest, task_id: &TaskId) {
         if let Some(pr_number) = req.pr {
             if let Some(workflows) = self.issue_workflow_store.as_ref() {
                 if let Err(e) = workflows
@@ -556,6 +519,66 @@ impl DefaultExecutionService {
                 }
             }
         }
+    }
+
+    async fn submit_issue_to_workflow_runtime(
+        &self,
+        prepared: PreparedRuntimeIssueSubmission,
+    ) -> Result<TaskId, EnqueueTaskError> {
+        let Some(store) = self.workflow_runtime_store.as_deref() else {
+            return Err(EnqueueTaskError::Internal(
+                "workflow runtime store is required for GitHub issue submissions".to_string(),
+            ));
+        };
+        let Some(issue_number) = prepared.req.issue else {
+            return Err(EnqueueTaskError::BadRequest(
+                "issue submission requires an issue number".to_string(),
+            ));
+        };
+
+        let task_id = TaskId::new();
+        let project_root = prepared
+            .req
+            .project
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(&prepared.project_id));
+        let record = crate::workflow_runtime_submission::record_issue_submission(
+            store,
+            crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+                project_root,
+                repo: prepared.req.repo.as_deref(),
+                issue_number,
+                task_id: &task_id,
+                labels: &prepared.req.labels,
+                force_execute: prepared.req.force_execute,
+            },
+        )
+        .await
+        .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
+
+        if !record.accepted {
+            return Err(EnqueueTaskError::BadRequest(format!(
+                "workflow runtime rejected issue submission for workflow {}: {}",
+                record.workflow_id,
+                record
+                    .rejection_reason
+                    .as_deref()
+                    .unwrap_or("decision rejected")
+            )));
+        }
+        if record.command_ids.is_empty() {
+            return Err(EnqueueTaskError::Internal(format!(
+                "workflow runtime accepted issue submission for workflow {} without commands",
+                record.workflow_id
+            )));
+        }
+        tracing::info!(
+            workflow_id = %record.workflow_id,
+            task_id = %task_id.0,
+            command_count = record.command_ids.len(),
+            "execution service: accepted issue submission into workflow runtime"
+        );
+        Ok(task_id)
     }
 
     async fn prepare_enqueue(
@@ -587,6 +610,23 @@ impl DefaultExecutionService {
         task_runner::fill_missing_repo_from_project(&mut req).await;
         Self::populate_external_id(&mut req);
 
+        if req.issue.is_some() {
+            if !req.depends_on.is_empty() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "workflow runtime issue submissions do not support task dependencies"
+                        .to_string(),
+                ));
+            }
+            if self.workflow_runtime_store.is_none() {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime store is required for GitHub issue submissions".to_string(),
+                ));
+            }
+            return Ok(PreparedEnqueueResult::RuntimeIssueSubmission(Box::new(
+                PreparedRuntimeIssueSubmission { req, project_id },
+            )));
+        }
+
         if let Some(existing_id) = self.check_workflow_duplicate(&project_id, &req).await {
             return Ok(PreparedEnqueueResult::Existing(existing_id));
         }
@@ -602,7 +642,7 @@ impl DefaultExecutionService {
             let task_id = task_runner::spawn_task_awaiting_deps(self.tasks.clone(), req)
                 .await
                 .map_err(|e| EnqueueTaskError::BadRequest(e.to_string()))?;
-            self.track_issue_workflow(&project_id, &workflow_req, &task_id)
+            self.track_pr_workflow(&project_id, &workflow_req, &task_id)
                 .await;
             return Ok(PreparedEnqueueResult::Existing(task_id));
         }
@@ -641,6 +681,9 @@ impl ExecutionService for DefaultExecutionService {
     ) -> Result<TaskId, EnqueueTaskError> {
         let prepared = match self.prepare_enqueue(req).await? {
             PreparedEnqueueResult::Existing(task_id) => return Ok(task_id),
+            PreparedEnqueueResult::RuntimeIssueSubmission(prepared) => {
+                return self.submit_issue_to_workflow_runtime(*prepared).await;
+            }
             PreparedEnqueueResult::Ready(prepared) => *prepared,
         };
 
@@ -678,7 +721,7 @@ impl ExecutionService for DefaultExecutionService {
         )
         .await;
 
-        self.track_issue_workflow(&prepared.project_id, &workflow_req, &task_id)
+        self.track_pr_workflow(&prepared.project_id, &workflow_req, &task_id)
             .await;
 
         Ok(task_id)
@@ -696,6 +739,9 @@ impl ExecutionService for DefaultExecutionService {
     ) -> Result<TaskId, EnqueueTaskError> {
         let prepared = match self.prepare_enqueue(req).await? {
             PreparedEnqueueResult::Existing(task_id) => return Ok(task_id),
+            PreparedEnqueueResult::RuntimeIssueSubmission(prepared) => {
+                return self.submit_issue_to_workflow_runtime(*prepared).await;
+            }
             PreparedEnqueueResult::Ready(prepared) => *prepared,
         };
 
@@ -725,7 +771,7 @@ impl ExecutionService for DefaultExecutionService {
         let allowed_project_roots = self.allowed_project_roots.clone();
         let task_id2 = task_id.clone();
         let project_id = prepared.project_id;
-        self.track_issue_workflow(&project_id, &prepared.req, &task_id)
+        self.track_pr_workflow(&project_id, &prepared.req, &task_id)
             .await;
         let req = prepared.req;
         let agent = prepared.agent;
@@ -994,7 +1040,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn track_issue_workflow_records_runtime_submission() -> anyhow::Result<()> {
+    async fn enqueue_background_issue_submission_uses_workflow_runtime_without_task_runner(
+    ) -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
@@ -1003,6 +1050,7 @@ mod tests {
         let project_root = dir.path().join("project");
         std::fs::create_dir(&project_root)?;
         let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let task_store = store.clone();
         let database_url = crate::test_helpers::test_database_url()?;
         let runtime_store = Arc::new(
             harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
@@ -1019,13 +1067,16 @@ mod tests {
             labels: vec!["bug".to_string()],
             ..Default::default()
         };
-        let task_id = TaskId::from_str("task-1");
 
-        svc.track_issue_workflow(&project_root.to_string_lossy(), &req, &task_id)
-            .await;
+        let task_id = svc.enqueue_background(req).await?;
+        assert!(
+            task_store.get_with_db_fallback(&task_id).await?.is_none(),
+            "workflow runtime issue submissions must not register legacy task rows"
+        );
 
+        let canonical_project_root = project_root.canonicalize()?;
         let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
+            &canonical_project_root.to_string_lossy(),
             Some("owner/repo"),
             42,
         );
@@ -1034,10 +1085,13 @@ mod tests {
             .await?
             .expect("runtime workflow should be recorded");
         assert_eq!(instance.state, "scheduled");
+        assert_eq!(instance.data["task_id"], task_id.0);
+        assert_eq!(instance.data["execution_path"], "workflow_runtime");
         let commands = runtime_store.commands_for(&workflow_id).await?;
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].status, "handled_inline");
+        assert_eq!(commands[0].status, "pending");
         assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+        assert_eq!(runtime_store.pending_commands(10).await?.len(), 1);
         Ok(())
     }
 

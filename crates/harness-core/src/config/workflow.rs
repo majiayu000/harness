@@ -166,7 +166,7 @@ impl Default for PrFeedbackPolicy {
 impl Default for RuntimeDispatchPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             interval_secs: default_runtime_dispatch_interval_secs(),
             batch_limit: default_runtime_dispatch_batch_limit(),
             runtime_kind: default_runtime_dispatch_kind(),
@@ -187,7 +187,7 @@ impl Default for RuntimeDispatchPolicy {
 impl Default for RuntimeWorkerPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             interval_secs: default_runtime_worker_interval_secs(),
             concurrency: default_runtime_worker_concurrency(),
             lease_ttl_secs: default_runtime_worker_lease_ttl_secs(),
@@ -316,7 +316,7 @@ mod tests {
         assert!(cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 60);
         assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 300);
-        assert!(!cfg.runtime_dispatch.enabled);
+        assert!(cfg.runtime_dispatch.enabled);
         assert_eq!(cfg.runtime_dispatch.interval_secs, 30);
         assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
         assert_eq!(cfg.runtime_dispatch.runtime_kind, "codex_jsonrpc");
@@ -330,7 +330,7 @@ mod tests {
         assert!(cfg.runtime_dispatch.workflow_profiles.is_empty());
         assert!(cfg.runtime_dispatch.activity_profiles.is_empty());
         assert!(cfg.runtime_dispatch.workflow_activity_profiles.is_empty());
-        assert!(!cfg.runtime_worker.enabled);
+        assert!(cfg.runtime_worker.enabled);
         assert_eq!(cfg.runtime_worker.interval_secs, 5);
         assert_eq!(cfg.runtime_worker.concurrency, 1);
         assert_eq!(cfg.runtime_worker.lease_ttl_secs, 900);

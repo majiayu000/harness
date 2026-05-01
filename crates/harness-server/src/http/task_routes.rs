@@ -242,18 +242,29 @@ pub(super) async fn create_tasks_batch(
         let sem = task_semaphores[i].take();
         let is_serialized = sem.is_some();
         let conflict_files = std::mem::take(&mut task_conflict_files[i]);
+        let is_issue_submission = task_req.issue.is_some();
         let entry = match enqueue_task_background(state.clone(), task_req, sem).await {
             Ok(task_id) => {
                 all_maintenance_window = false;
+                let status = if is_issue_submission {
+                    "scheduled"
+                } else {
+                    "queued"
+                };
                 if is_serialized {
                     json!({
                         "task_id": task_id.0,
-                        "status": "queued",
+                        "status": status,
                         "serialized": true,
                         "conflict_files": conflict_files,
+                        "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
                     })
                 } else {
-                    json!({ "task_id": task_id.0, "status": "queued" })
+                    json!({
+                        "task_id": task_id.0,
+                        "status": status,
+                        "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
+                    })
                 }
             }
             Err(EnqueueTaskError::BadRequest(error)) => {
@@ -289,12 +300,14 @@ pub(super) async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<task_runner::CreateTaskRequest>,
 ) -> Response {
+    let is_issue_submission = req.issue.is_some();
     match enqueue_task_background(state, req, None).await {
         Ok(task_id) => (
             StatusCode::ACCEPTED,
             Json(json!({
                 "task_id": task_id.0,
-                "status": "queued"
+                "status": if is_issue_submission { "scheduled" } else { "queued" },
+                "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" }
             })),
         )
             .into_response(),

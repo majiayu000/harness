@@ -475,12 +475,29 @@ async fn make_test_state_with_workflow_runtime_and_registry(
     config.server.database_url = Some(crate::test_helpers::test_database_url()?);
     let state =
         make_test_state_with_project_root(dir, project_root, config, agent_registry).await?;
-    let workflow_runtime_store =
+    let workflow_runtime_store = Arc::new(
         harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
             &harness_core::config::dirs::default_db_path(dir, "workflow_runtime"),
             Some(&crate::test_helpers::test_database_url()?),
         )
-        .await?;
+        .await?,
+    );
+    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+        state.core.tasks.clone(),
+        state.core.server.agent_registry.clone(),
+        Arc::new(state.core.server.config.clone()),
+        state.engines.skills.clone(),
+        state.observability.events.clone(),
+        state.interceptors.clone(),
+        None,
+        state.concurrency.task_queue.clone(),
+        state.concurrency.review_task_queue.clone(),
+        None,
+        None,
+        Some(workflow_runtime_store.clone()),
+        None,
+        vec![],
+    );
     Ok(Arc::new(AppState {
         core: crate::http::CoreServices {
             server: state.core.server.clone(),
@@ -492,7 +509,7 @@ async fn make_test_state_with_workflow_runtime_and_registry(
             plan_cache: state.core.plan_cache.clone(),
             issue_workflow_store: None,
             project_workflow_store: None,
-            workflow_runtime_store: Some(Arc::new(workflow_runtime_store)),
+            workflow_runtime_store: Some(workflow_runtime_store),
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -539,7 +556,7 @@ async fn make_test_state_with_workflow_runtime_and_registry(
         },
         project_svc: state.project_svc.clone(),
         task_svc: state.task_svc.clone(),
-        execution_svc: state.execution_svc.clone(),
+        execution_svc,
     }))
 }
 
@@ -2172,6 +2189,80 @@ async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
     assert!(resp["task_id"].is_string());
     assert_eq!(resp["status"], "queued");
     assert_eq!(state.core.tasks.count(), before_count + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let before_count = state.core.tasks.count();
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "repo": "owner/repo",
+        "issue": 42,
+        "labels": ["bug"]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let resp = response_json(response).await?;
+    assert!(resp["task_id"].is_string());
+    assert_eq!(resp["status"], "scheduled");
+    assert_eq!(resp["execution_path"], "workflow_runtime");
+    let task_id = task_runner::TaskId::from_str(resp["task_id"].as_str().unwrap());
+    assert!(state
+        .core
+        .tasks
+        .get_with_db_fallback(&task_id)
+        .await?
+        .is_none());
+    assert_eq!(state.core.tasks.count(), before_count);
+
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let canonical_project_root = project_root.canonicalize()?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &canonical_project_root.to_string_lossy(),
+        Some("owner/repo"),
+        42,
+    );
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should be persisted");
+    assert_eq!(instance.state, "scheduled");
+    assert_eq!(instance.data["task_id"], task_id.0);
+    assert_eq!(instance.data["execution_path"], "workflow_runtime");
+    let commands = store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "pending");
+    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
     Ok(())
 }
 

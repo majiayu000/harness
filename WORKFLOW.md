@@ -7,13 +7,13 @@ pr_feedback:
   sweep_interval_secs: 60
   claim_stale_after_secs: 300
 runtime_dispatch:
-  enabled: false
+  enabled: true
   interval_secs: 30
   batch_limit: 25
   runtime_kind: codex_jsonrpc
   runtime_profile: codex-default
 runtime_worker:
-  enabled: false
+  enabled: true
   interval_secs: 5
   concurrency: 1
   lease_ttl_secs: 900
@@ -47,8 +47,8 @@ Current externally configurable rules:
     `addressing_feedback` tasks with a real `active_task_id`.
 
 - `runtime_dispatch.enabled`
-  - Enables the experimental workflow command outbox dispatcher. It is disabled
-    by default while workflow runtime execution remains opt-in.
+  - Enables the workflow command outbox dispatcher. It is enabled by default
+    so accepted workflow commands become runtime jobs.
 
 - `runtime_dispatch.interval_secs`
   - Background interval for converting pending workflow commands into runtime jobs.
@@ -65,8 +65,8 @@ Current externally configurable rules:
   - Runtime profile name stored on newly created runtime jobs.
 
 - `runtime_worker.enabled`
-  - Enables the experimental server-owned runtime job worker. It is disabled
-    by default while workflow migration remains opt-in.
+  - Enables the server-owned runtime job worker. It is enabled by default so
+    pending runtime jobs are claimed and executed by registered runtime agents.
 
 - `runtime_worker.interval_secs`
   - Background interval for claiming pending runtime jobs.
