@@ -2360,6 +2360,69 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
 }
 
 #[tokio::test]
+async fn create_task_with_blocked_issue_returns_runtime_state() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "repo": "owner/repo",
+        "issue": 43,
+        "depends_on": ["missing-dependency"]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let resp = response_json(response).await?;
+    assert!(resp["task_id"].is_string());
+    assert_eq!(resp["status"], "awaiting_dependencies");
+    assert_eq!(resp["execution_path"], "workflow_runtime");
+
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let canonical_project_root = project_root.canonicalize()?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &canonical_project_root.to_string_lossy(),
+        Some("owner/repo"),
+        43,
+    );
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should be persisted");
+    assert_eq!(instance.state, "awaiting_dependencies");
+    assert_eq!(
+        instance.data["depends_on"],
+        serde_json::json!(["missing-dependency"])
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_task_empty_request_returns_bad_request() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
@@ -3030,6 +3093,95 @@ async fn closed_task_sse_replay_includes_observability_fields() -> anyhow::Resul
     assert!(saw_timeout_failure);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn runtime_issue_sse_stream_keeps_active_workflow_open_without_done() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+
+    let create_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project_root.display().to_string(),
+                        "repo": "owner/repo",
+                        "issue": 44,
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+    let create_json = response_json(create_response).await?;
+    let task_id = create_json["task_id"]
+        .as_str()
+        .expect("task id should be present");
+
+    let response = Router::new()
+        .route("/tasks/{id}/stream", get(stream_task_sse))
+        .with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{task_id}/stream"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    use http_body_util::BodyExt;
+    let mut body = response.into_body();
+    let mut body_text = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !body_text.contains("[workflow]") && tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    body_text.push_str(&String::from_utf8_lossy(&data));
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error.into()),
+            Ok(None) => anyhow::bail!("active runtime workflow stream closed before replay"),
+            Err(_) => break,
+        }
+    }
+    assert!(body_text.contains("[workflow]"));
+    assert!(!body_text.contains("\"type\":\"done\""));
+    assert!(!body_text.contains("\"type\":\"Done\""));
+
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_millis(100), body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    body_text.push_str(&String::from_utf8_lossy(&data));
+                    assert!(!body_text.contains("\"type\":\"done\""));
+                    assert!(!body_text.contains("\"type\":\"Done\""));
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error.into()),
+            Ok(None) => anyhow::bail!("active runtime workflow stream closed"),
+            Err(_) => return Ok(()),
+        }
+    }
+
+    anyhow::bail!("active runtime workflow stream did not become idle")
 }
 
 #[tokio::test]

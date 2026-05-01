@@ -58,6 +58,32 @@ pub(crate) async fn enqueue_task_background_in_domain(
         .await
 }
 
+async fn task_response_status(
+    state: &AppState,
+    task_id: &task_runner::TaskId,
+    is_issue_submission: bool,
+) -> Result<String, EnqueueTaskError> {
+    if !is_issue_submission {
+        return Ok("queued".to_string());
+    }
+
+    let store = state.core.workflow_runtime_store.as_ref().ok_or_else(|| {
+        EnqueueTaskError::Internal(
+            "workflow runtime store is required for GitHub issue submissions".to_string(),
+        )
+    })?;
+    let workflow = crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id)
+        .await
+        .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
+        .ok_or_else(|| {
+            EnqueueTaskError::Internal(format!(
+                "workflow runtime submission not found for task {}",
+                task_id.as_str()
+            ))
+        })?;
+    Ok(workflow.state)
+}
+
 /// A single task entry in the detailed batch format.
 #[derive(Debug, Deserialize)]
 pub struct BatchTaskItem {
@@ -246,25 +272,30 @@ pub(super) async fn create_tasks_batch(
         let entry = match enqueue_task_background(state.clone(), task_req, sem).await {
             Ok(task_id) => {
                 all_maintenance_window = false;
-                let status = if is_issue_submission {
-                    "scheduled"
-                } else {
-                    "queued"
-                };
-                if is_serialized {
-                    json!({
-                        "task_id": task_id.0,
-                        "status": status,
-                        "serialized": true,
-                        "conflict_files": conflict_files,
-                        "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
-                    })
-                } else {
-                    json!({
-                        "task_id": task_id.0,
-                        "status": status,
-                        "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
-                    })
+                match task_response_status(&state, &task_id, is_issue_submission).await {
+                    Ok(status) => {
+                        if is_serialized {
+                            json!({
+                                "task_id": task_id.0,
+                                "status": status,
+                                "serialized": true,
+                                "conflict_files": conflict_files,
+                                "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
+                            })
+                        } else {
+                            json!({
+                                "task_id": task_id.0,
+                                "status": status,
+                                "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
+                            })
+                        }
+                    }
+                    Err(EnqueueTaskError::BadRequest(error)) => json!({ "error": error }),
+                    Err(EnqueueTaskError::Internal(error)) => json!({ "error": error }),
+                    Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => {
+                        mw_retry_after.get_or_insert(retry_after_secs);
+                        json!({ "error": "maintenance_window", "retry_after": retry_after_secs })
+                    }
                 }
             }
             Err(EnqueueTaskError::BadRequest(error)) => {
@@ -301,16 +332,35 @@ pub(super) async fn create_task(
     Json(req): Json<task_runner::CreateTaskRequest>,
 ) -> Response {
     let is_issue_submission = req.issue.is_some();
-    match enqueue_task_background(state, req, None).await {
-        Ok(task_id) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "task_id": task_id.0,
-                "status": if is_issue_submission { "scheduled" } else { "queued" },
-                "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" }
-            })),
-        )
-            .into_response(),
+    match enqueue_task_background(state.clone(), req, None).await {
+        Ok(task_id) => match task_response_status(&state, &task_id, is_issue_submission).await {
+            Ok(status) => (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "task_id": task_id.0,
+                    "status": status,
+                    "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" }
+                })),
+            )
+                .into_response(),
+            Err(EnqueueTaskError::BadRequest(error)) => {
+                (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+            }
+            Err(EnqueueTaskError::Internal(error)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response(),
+            Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    retry_after_secs.to_string(),
+                )],
+                Json(json!({ "error": "maintenance_window", "retry_after": retry_after_secs })),
+            )
+                .into_response(),
+        },
         Err(EnqueueTaskError::BadRequest(error)) => {
             (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
         }

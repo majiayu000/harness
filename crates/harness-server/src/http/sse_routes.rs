@@ -10,7 +10,14 @@ use axum::{
 };
 use harness_core::agent::StreamItem;
 use serde_json::json;
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
+    sync::Arc,
+    time::Duration,
+};
+
+use futures::{stream::BoxStream, StreamExt};
 
 /// GET /tasks/{id}/stream — real-time SSE stream of agent execution events.
 ///
@@ -33,9 +40,11 @@ pub(crate) async fn stream_task_sse(
         Some(rx) => rx,
         None => {
             match state.core.tasks.get_with_db_fallback(&task_id).await {
-                Ok(None) => match runtime_task_sse_replay(&state, &task_id).await {
-                    Ok(Some(events)) => {
-                        return Sse::new(futures::stream::iter(events)).into_response();
+                Ok(None) => match runtime_task_sse_stream(state.clone(), task_id.clone()).await {
+                    Ok(Some(stream)) => {
+                        return Sse::new(stream)
+                            .keep_alive(sse_keep_alive())
+                            .into_response();
                     }
                     Ok(None) => {
                         return (
@@ -124,55 +133,146 @@ pub(crate) async fn stream_task_sse(
     // Send a heartbeat comment every 30 s so reverse proxies (nginx default
     // 60 s idle timeout) don't drop the connection while the agent is silent.
     Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(std::time::Duration::from_secs(30))
-                .text("heartbeat"),
-        )
+        .keep_alive(sse_keep_alive())
         .into_response()
 }
 
-async fn runtime_task_sse_replay(
-    state: &AppState,
-    task_id: &harness_core::types::TaskId,
-) -> anyhow::Result<Option<Vec<Result<Event, std::convert::Infallible>>>> {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+fn sse_keep_alive() -> KeepAlive {
+    KeepAlive::new()
+        .interval(Duration::from_secs(30))
+        .text("heartbeat")
+}
+
+type SseEvent = Result<Event, Infallible>;
+
+async fn runtime_task_sse_stream(
+    state: Arc<AppState>,
+    task_id: harness_core::types::TaskId,
+) -> anyhow::Result<Option<BoxStream<'static, SseEvent>>> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref().cloned() else {
         return Ok(None);
     };
     let Some(workflow) =
-        crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id).await?
+        crate::workflow_runtime_submission::runtime_issue_by_task_id(&store, &task_id).await?
     else {
         return Ok(None);
     };
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "[workflow] {} state={}",
-        workflow.id, workflow.state
-    ));
-    for event in store.events_for(&workflow.id).await? {
-        lines.push(format!(
-            "[event {}] {} {}",
-            event.sequence, event.event_type, event.event
-        ));
-    }
-    for command in store.commands_for(&workflow.id).await? {
-        lines.push(format!(
-            "[command] {} status={} activity={}",
-            command.id,
-            command.status,
-            command.command.runtime_activity_key()
-        ));
-    }
-    let mut events: Vec<Result<Event, std::convert::Infallible>> = lines
-        .into_iter()
-        .filter_map(|text| {
-            serde_json::to_string(&StreamItem::MessageDelta { text })
-                .ok()
-                .map(|data| Ok(Event::default().data(data)))
+
+    let mut cursor = RuntimeTaskSseCursor::new(store, workflow.id);
+    cursor.refresh().await?;
+    Ok(Some(
+        futures::stream::unfold(cursor, |mut cursor| async move {
+            loop {
+                if let Some(event) = cursor.pending.pop_front() {
+                    return Some((event, cursor));
+                }
+                if cursor.finished {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Err(error) = cursor.refresh().await {
+                    tracing::error!(
+                        "runtime_task_sse_stream: runtime workflow refresh failed: {error}"
+                    );
+                    cursor.push_item(StreamItem::Error {
+                        message: "runtime workflow stream failed".to_string(),
+                    });
+                    cursor.finished = true;
+                }
+            }
         })
-        .collect();
-    if let Ok(data) = serde_json::to_string(&StreamItem::Done) {
-        events.push(Ok(Event::default().data(data)));
+        .boxed(),
+    ))
+}
+
+struct RuntimeTaskSseCursor {
+    store: Arc<harness_workflow::runtime::WorkflowRuntimeStore>,
+    workflow_id: String,
+    pending: VecDeque<SseEvent>,
+    last_state: Option<String>,
+    last_event_sequence: u64,
+    command_statuses: HashMap<String, String>,
+    finished: bool,
+}
+
+impl RuntimeTaskSseCursor {
+    fn new(
+        store: Arc<harness_workflow::runtime::WorkflowRuntimeStore>,
+        workflow_id: String,
+    ) -> Self {
+        Self {
+            store,
+            workflow_id,
+            pending: VecDeque::new(),
+            last_state: None,
+            last_event_sequence: 0,
+            command_statuses: HashMap::new(),
+            finished: false,
+        }
     }
-    Ok(Some(events))
+
+    async fn refresh(&mut self) -> anyhow::Result<()> {
+        let Some(workflow) = self.store.get_instance(&self.workflow_id).await? else {
+            self.push_item(StreamItem::Error {
+                message: "runtime workflow not found".to_string(),
+            });
+            self.finished = true;
+            return Ok(());
+        };
+
+        if self.last_state.as_deref() != Some(workflow.state.as_str()) {
+            self.push_text(format!(
+                "[workflow] {} state={}",
+                workflow.id, workflow.state
+            ));
+            self.last_state = Some(workflow.state.clone());
+        }
+
+        for event in self.store.events_for(&workflow.id).await? {
+            if event.sequence <= self.last_event_sequence {
+                continue;
+            }
+            self.push_text(format!(
+                "[event {}] {} {}",
+                event.sequence, event.event_type, event.event
+            ));
+            self.last_event_sequence = event.sequence;
+        }
+
+        for command in self.store.commands_for(&workflow.id).await? {
+            let changed = self
+                .command_statuses
+                .get(&command.id)
+                .is_none_or(|status| status != &command.status);
+            if changed {
+                self.push_text(format!(
+                    "[command] {} status={} activity={}",
+                    command.id,
+                    command.status,
+                    command.command.runtime_activity_key()
+                ));
+                self.command_statuses
+                    .insert(command.id.clone(), command.status.clone());
+            }
+        }
+
+        if workflow.is_terminal() {
+            self.push_item(StreamItem::Done);
+            self.finished = true;
+        }
+        Ok(())
+    }
+
+    fn push_text(&mut self, text: String) {
+        self.push_item(StreamItem::MessageDelta { text });
+    }
+
+    fn push_item(&mut self, item: StreamItem) {
+        match serde_json::to_string(&item) {
+            Ok(data) => self.pending.push_back(Ok(Event::default().data(data))),
+            Err(error) => {
+                tracing::warn!("runtime_task_sse_stream: failed to serialize event: {error}")
+            }
+        }
+    }
 }
