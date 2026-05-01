@@ -375,6 +375,63 @@ fn runtime_completion_reducer_binds_pr_from_structured_pull_request_artifact() {
 }
 
 #[test]
+fn runtime_completion_reducer_binds_pr_when_structured_workflow_decision_is_invalid() {
+    let instance = issue_instance("implementing");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "planning",
+        "run_replan",
+        "replanning",
+        "This decision observed a stale workflow state.",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "replan_issue",
+        "stale-replan-1",
+    ));
+    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
+        .with_artifact(ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77"
+            }),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("structured pull request artifact should bind the PR");
+
+    assert_eq!(decision.decision, "bind_pr");
+    assert_eq!(decision.next_state, "pr_open");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::BindPr
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("fallback PR binding should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_accepts_structured_workflow_decision_artifact() {
     let instance = issue_instance("pr_open");
     let proposed_decision = WorkflowDecision::new(

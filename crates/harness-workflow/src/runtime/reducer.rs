@@ -4,6 +4,7 @@ use super::model::{
 };
 use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
+use super::validator::{DecisionValidator, ValidationContext};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 
@@ -40,11 +41,20 @@ fn reduce_success(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
-    if let Some(decision) = workflow_decision_from_activity_result(instance, event, result) {
+    let structured_decision = workflow_decision_from_activity_result(instance, event, result);
+    if let Some(decision) = structured_decision
+        .as_ref()
+        .filter(|decision| structured_decision_validates(instance, event, decision))
+        .cloned()
+    {
         return Some(decision);
     }
 
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+
+    if let Some(decision) = structured_decision {
         return Some(decision);
     }
 
@@ -110,6 +120,26 @@ fn workflow_decision_from_activity_result(
             serde_json::from_value::<WorkflowDecision>(artifact.artifact.clone()).ok()
         })
         .map(|decision| decision.with_evidence(runtime_completion_evidence(event, result)))
+}
+
+fn structured_decision_validates(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    decision: &WorkflowDecision,
+) -> bool {
+    let validator = match instance.definition_id.as_str() {
+        GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
+        QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
+        REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
+        _ => return true,
+    };
+    validator
+        .validate(
+            instance,
+            decision,
+            &ValidationContext::new(event.source.as_str(), Utc::now()),
+        )
+        .is_ok()
 }
 
 fn bind_pr_from_activity_result(
