@@ -513,7 +513,9 @@ fn runtime_dispatch_profile(
     profile.model = policy.model.clone();
     profile.reasoning_effort = policy.reasoning_effort.clone();
     profile.sandbox = policy.sandbox.clone();
-    profile.approval_policy = policy.approval_policy.clone();
+    profile.approval_policy = runtime_kind_supports_approval_policy(kind)
+        .then(|| policy.approval_policy.clone())
+        .flatten();
     profile.max_turns = policy.max_turns;
     profile.timeout_secs = policy.timeout_secs;
     profile
@@ -607,11 +609,14 @@ fn runtime_dispatch_approval_policy(
     override_policy: &harness_core::config::workflow::RuntimeDispatchProfileOverride,
     kind: RuntimeKind,
 ) -> Option<String> {
-    override_policy.approval_policy.clone().or_else(|| {
-        runtime_kind_supports_approval_policy(kind)
-            .then(|| default_profile.approval_policy.clone())
-            .flatten()
-    })
+    runtime_kind_supports_approval_policy(kind)
+        .then(|| {
+            override_policy
+                .approval_policy
+                .clone()
+                .or_else(|| default_profile.approval_policy.clone())
+        })
+        .flatten()
 }
 
 fn runtime_kind_supports_approval_policy(kind: RuntimeKind) -> bool {
@@ -2057,6 +2062,7 @@ mod tests {
             harness_core::config::workflow::RuntimeDispatchProfileOverride {
                 runtime_kind: Some("claude_code".to_string()),
                 runtime_profile: Some("claude-review".to_string()),
+                approval_policy: Some("never".to_string()),
                 ..Default::default()
             },
         );
@@ -2078,6 +2084,21 @@ mod tests {
         assert_eq!(codex_profile.kind, RuntimeKind::CodexJsonrpc);
         assert_eq!(codex_profile.name, "codex-review");
         assert_eq!(codex_profile.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    #[test]
+    fn runtime_dispatch_profile_drops_codex_approval_for_non_codex_default() {
+        let policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: "claude_code".to_string(),
+            runtime_profile: "claude-default".to_string(),
+            approval_policy: Some("on-request".to_string()),
+            ..Default::default()
+        };
+
+        let profile = runtime_dispatch_profile(&policy);
+        assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(profile.name, "claude-default");
+        assert_eq!(profile.approval_policy, None);
     }
 
     // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in
