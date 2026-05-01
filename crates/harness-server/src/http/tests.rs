@@ -471,8 +471,21 @@ async fn make_test_state_with_workflow_runtime_and_registry(
     project_root: &std::path::Path,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.server.database_url = Some(crate::test_helpers::test_database_url()?);
+    make_test_state_with_workflow_runtime_config_and_registry(
+        dir,
+        project_root,
+        harness_core::config::HarnessConfig::default(),
+        agent_registry,
+    )
+    .await
+}
+
+async fn make_test_state_with_workflow_runtime_config_and_registry(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+    agent_registry: harness_agents::registry::AgentRegistry,
+) -> anyhow::Result<Arc<AppState>> {
     let state =
         make_test_state_with_project_root(dir, project_root, config, agent_registry).await?;
     let workflow_runtime_store = Arc::new(
@@ -809,6 +822,48 @@ async fn wait_for_task_project_root(
     }
 
     anyhow::bail!("task {task_id} did not resolve a project root")
+}
+
+async fn assert_runtime_issue_submission(
+    state: &Arc<AppState>,
+    project_root: &std::path::Path,
+    repo: &str,
+    issue_number: u64,
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let task_id = task_runner::TaskId::from_str(task_id);
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_id)
+            .await?
+            .is_none(),
+        "workflow runtime issue submissions must not register legacy task rows"
+    );
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let canonical_project_root = project_root.canonicalize()?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &canonical_project_root.to_string_lossy(),
+        Some(repo),
+        issue_number,
+    );
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should be persisted");
+    assert_eq!(instance.state, "scheduled");
+    assert_eq!(instance.data["task_id"], task_id.0);
+    assert_eq!(instance.data["execution_path"], "workflow_runtime");
+    let commands = store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "pending");
+    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    Ok(())
 }
 
 fn webhook_signature(secret: &str, payload: &[u8]) -> String {
@@ -1881,11 +1936,23 @@ async fn token_usage_route_is_registered() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
+async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) =
-        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "majiayu000/harness".to_string(),
+        ..Default::default()
+    });
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1911,7 +1978,18 @@ async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "scheduled");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    assert_eq!(state.core.tasks.count(), before_count);
+    assert_runtime_issue_submission(
+        &state,
+        dir.path(),
+        "majiayu000/harness",
+        106,
+        json["task_id"].as_str().expect("task id should be present"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -3548,12 +3626,24 @@ async fn feishu_webhook_rejects_invalid_token() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Result<()> {
+async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     init_fake_git_repo(dir.path())?;
     let secret = "secret";
-    let (state, _agent) =
-        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "org/repo".to_string(),
+        ..Default::default()
+    });
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -3581,12 +3671,23 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "scheduled");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    assert_eq!(state.core.tasks.count(), before_count);
+    assert_runtime_issue_submission(
+        &state,
+        dir.path(),
+        "org/repo",
+        77,
+        json["task_id"].as_str().expect("task id should be present"),
+    )
+    .await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+async fn webhook_routes_runtime_issue_to_repo_specific_project_root() -> anyhow::Result<()> {
     let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-repo-a-")?;
     let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-repo-b-")?;
@@ -3603,8 +3704,13 @@ async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::R
         ..Default::default()
     });
 
-    let (state, _agent) =
-        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        repo_a_dir.path(),
+        repo_a_dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -3632,12 +3738,16 @@ async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::R
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    let task_root = wait_for_task_project_root(
+    assert_eq!(json["status"], "scheduled");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    assert_runtime_issue_submission(
         &state,
+        repo_b_dir.path(),
+        "org/repo-b",
+        77,
         json["task_id"].as_str().expect("task id should be present"),
     )
     .await?;
-    assert_eq!(task_root.canonicalize()?, repo_b_dir.path().canonicalize()?);
     Ok(())
 }
 

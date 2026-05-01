@@ -723,13 +723,15 @@ pub(crate) async fn github_webhook(
         });
     }
 
+    let is_issue_submission = req.issue.is_some();
     match task_routes::enqueue_task(&state, req).await {
         Ok(task_id) => (
             StatusCode::ACCEPTED,
             Json(json!({
-                "status": "accepted",
+                "status": if is_issue_submission { "scheduled" } else { "accepted" },
                 "reason": reason,
                 "task_id": task_id.0,
+                "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
             })),
         ),
         Err(crate::services::execution::EnqueueTaskError::BadRequest(error)) => {
