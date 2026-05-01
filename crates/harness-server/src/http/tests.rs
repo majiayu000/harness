@@ -827,7 +827,7 @@ async fn wait_for_task_project_root(
 async fn assert_runtime_issue_submission(
     state: &Arc<AppState>,
     project_root: &std::path::Path,
-    repo: &str,
+    repo: Option<&str>,
     issue_number: u64,
     task_id: &str,
 ) -> anyhow::Result<()> {
@@ -849,7 +849,7 @@ async fn assert_runtime_issue_submission(
     let canonical_project_root = project_root.canonicalize()?;
     let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
         &canonical_project_root.to_string_lossy(),
-        Some(repo),
+        repo,
         issue_number,
     );
     let instance = store
@@ -1985,7 +1985,7 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     assert_runtime_issue_submission(
         &state,
         dir.path(),
-        "majiayu000/harness",
+        Some("majiayu000/harness"),
         106,
         json["task_id"].as_str().expect("task id should be present"),
     )
@@ -2796,6 +2796,63 @@ async fn create_tasks_batch_remains_queued_under_saturation() -> anyhow::Result<
     let mut all_task_ids = vec![blocker_task_id];
     all_task_ids.extend(queued_task_ids);
     wait_for_task_statuses(&state, &all_task_ids, task_runner::TaskStatus::Done).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let before_count = state.core.tasks.count();
+    let response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project_root.display().to_string(),
+                        "issues": [42, 43],
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let batch_json = response_json(response).await?;
+    let entries = batch_json
+        .as_array()
+        .expect("batch response should be an array");
+    assert_eq!(entries.len(), 2);
+    for (entry, issue_number) in entries.iter().zip([42_u64, 43]) {
+        assert_eq!(entry["status"], "scheduled");
+        assert_eq!(entry["execution_path"], "workflow_runtime");
+        assert_runtime_issue_submission(
+            &state,
+            &project_root,
+            None,
+            issue_number,
+            entry["task_id"]
+                .as_str()
+                .expect("task id should be present"),
+        )
+        .await?;
+    }
+    assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
 }
 
@@ -3678,7 +3735,7 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
     assert_runtime_issue_submission(
         &state,
         dir.path(),
-        "org/repo",
+        Some("org/repo"),
         77,
         json["task_id"].as_str().expect("task id should be present"),
     )
@@ -3743,7 +3800,7 @@ async fn webhook_routes_runtime_issue_to_repo_specific_project_root() -> anyhow:
     assert_runtime_issue_submission(
         &state,
         repo_b_dir.path(),
-        "org/repo-b",
+        Some("org/repo-b"),
         77,
         json["task_id"].as_str().expect("task id should be present"),
     )
