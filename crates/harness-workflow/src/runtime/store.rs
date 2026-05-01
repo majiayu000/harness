@@ -544,12 +544,19 @@ impl WorkflowRuntimeStore {
         let mut tx = self.pool.begin().await?;
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT id, data::text FROM runtime_jobs
-             WHERE status = 'pending'
-               AND CASE
-                   WHEN data ? 'not_before'
-                   THEN (data->>'not_before')::timestamptz <= CURRENT_TIMESTAMP
-                   ELSE TRUE
-               END
+             WHERE (
+                 status = 'pending'
+                 AND CASE
+                     WHEN data ? 'not_before'
+                     THEN (data->>'not_before')::timestamptz <= CURRENT_TIMESTAMP
+                     ELSE TRUE
+                 END
+             ) OR (
+                 status = 'running'
+                 AND data ? 'lease'
+                 AND (data->'lease' ? 'expires_at')
+                 AND (data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
+             )
              ORDER BY created_at ASC
              LIMIT 1
              FOR UPDATE SKIP LOCKED",

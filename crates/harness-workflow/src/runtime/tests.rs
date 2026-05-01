@@ -1444,6 +1444,81 @@ async fn runtime_worker_skips_runtime_jobs_before_not_before() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn runtime_store_reclaims_expired_running_job() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = store
+        .enqueue_runtime_job(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "check" }),
+        )
+        .await?;
+
+    let first_claim = store
+        .claim_next_runtime_job("runtime-1", Utc::now() - Duration::minutes(1))
+        .await?
+        .expect("runtime job should be claimable");
+    assert_eq!(first_claim.id, job.id);
+    assert_eq!(first_claim.status, RuntimeJobStatus::Running);
+    assert_eq!(
+        first_claim
+            .lease
+            .as_ref()
+            .expect("lease should exist")
+            .owner,
+        "runtime-1"
+    );
+
+    let reclaimed = store
+        .claim_next_runtime_job("runtime-2", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("expired running job should be reclaimable");
+    assert_eq!(reclaimed.id, job.id);
+    assert_eq!(reclaimed.status, RuntimeJobStatus::Running);
+    assert_eq!(
+        reclaimed.lease.as_ref().expect("lease should exist").owner,
+        "runtime-2"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_store_does_not_reclaim_unexpired_running_job() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = store
+        .enqueue_runtime_job(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "check" }),
+        )
+        .await?;
+
+    let first_claim = store
+        .claim_next_runtime_job("runtime-1", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("runtime job should be claimable");
+    assert_eq!(first_claim.id, job.id);
+
+    assert!(store
+        .claim_next_runtime_job("runtime-2", Utc::now() + Duration::minutes(10))
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_worker_records_completion_event_and_command_status() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
