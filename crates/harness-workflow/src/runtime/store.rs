@@ -473,6 +473,23 @@ impl WorkflowRuntimeStore {
         Ok(())
     }
 
+    pub async fn mark_pending_command_status(
+        &self,
+        command_id: &str,
+        status: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workflow_commands
+             SET status = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $2 AND status = 'pending'",
+        )
+        .bind(status)
+        .bind(command_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn enqueue_runtime_job(
         &self,
         command_id: &str,

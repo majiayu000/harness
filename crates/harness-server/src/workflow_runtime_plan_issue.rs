@@ -8,6 +8,8 @@ use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 
+const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
+
 pub(crate) enum PlanIssueRuntimeAction {
     RunReplan,
     ForceContinue,
@@ -148,9 +150,14 @@ async fn persist_plan_issue_decision(
     };
     store.record_decision(&record).await?;
     for command in &output.decision.commands {
-        store
+        let command_id = store
             .enqueue_command(&instance.id, Some(&record.id), command)
             .await?;
+        if command.requires_runtime_job() {
+            store
+                .mark_pending_command_status(&command_id, COMMAND_STATUS_HANDLED_INLINE)
+                .await?;
+        }
     }
     instance.state = output.decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
@@ -276,6 +283,9 @@ fn issue_instance(
 mod tests {
     use super::*;
     use harness_core::db::resolve_database_url;
+    use harness_workflow::runtime::{
+        RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile, WorkflowCommandType,
+    };
 
     #[tokio::test]
     async fn plan_issue_decision_persists_replan_command() -> anyhow::Result<()> {
@@ -347,6 +357,25 @@ Workflow policy
         assert!(events
             .iter()
             .any(|event| event.event_type == "PlanIssueRaised"));
+        let commands = store.commands_for(&workflow_id).await?;
+        let replan_command = commands
+            .iter()
+            .find(|command| command.command.command_type == WorkflowCommandType::EnqueueActivity)
+            .expect("replan activity command should be recorded");
+        assert_eq!(replan_command.status, COMMAND_STATUS_HANDLED_INLINE);
+
+        let dispatcher = RuntimeCommandDispatcher::new(
+            &store,
+            RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc),
+        );
+        dispatcher.dispatch_pending().await?;
+        assert!(
+            store
+                .runtime_jobs_for_command(&replan_command.id)
+                .await?
+                .is_empty(),
+            "inline replan command should not be dispatched again"
+        );
         Ok(())
     }
 
