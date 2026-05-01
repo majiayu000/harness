@@ -58,6 +58,8 @@ Implemented now:
   `RuntimePromptPrepared` with a SHA-256 packet digest before the agent turn starts
 - prompt packets include a workflow/activity-specific `activity_result_schema` that tells the
   runtime agent which summary fields and reducer transitions apply to the current activity
+- server runtime workers can parse a final fenced `harness-activity-result` JSON block from
+  completed agent turns when the structured activity name matches the runtime job activity
 
 Still intentionally not moved yet:
 
@@ -287,6 +289,8 @@ Implemented now:
 - the generated prompt is derived from that packet instead of separate ad hoc prompt sections
 - prompt packets include `harness.runtime.activity_result.v1` schema guidance for known
   workflow/activity pairs such as `implement_issue`, `replan_issue`, and `address_pr_feedback`
+- agent prompts instruct runtimes to return optional structured activity output in a final fenced
+  `harness-activity-result` JSON block, and mismatched activity names are ignored
 - runtime events persist `RuntimePromptPrepared` with `prompt_packet_digest` and the redacted packet
 - agent-backed activity results include a `runtime_prompt_packet` artifact that references the
   digest used for the turn
@@ -528,6 +532,8 @@ Implemented now:
 - runtime jobs create normal Harness threads and turns, so agent output remains visible in the
   existing conversation/runtime log path
 - completed turns are written back as structured `ActivityResult` payloads
+- completed turns can provide a dedicated `harness-activity-result` JSON block so runtime agents
+  can return reducer-visible artifacts and validation records without server text inference
 - repo backlog lifecycle activities are handled as server-owned commands, creating or reusing child
   issue workflows, marking merged bound issues done, and recovering stale active issue workflows
   without asking an agent to mutate workflow tables

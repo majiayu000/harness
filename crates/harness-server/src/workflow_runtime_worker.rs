@@ -582,7 +582,9 @@ fn build_runtime_job_prompt(prompt_packet: &Value) -> String {
          - Treat the workflow database as the source of orchestration state, but do not edit workflow tables directly.\n\
          - Harness server only manages lifecycle. You, the agent, perform repository and GitHub work when the activity requires it.\n\
          - Follow the project instructions loaded by the runtime.\n\
-         - Use the prompt packet activity_result_schema to shape your final summary; Harness will wrap your turn into an ActivityResult.\n\
+         - Use the prompt packet activity_result_schema to shape your final summary.\n\
+         - When returning structured activity output, put a JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.\n\
+         - The structured result activity field must match this runtime job activity exactly.\n\
          - Return a concise final summary with changed files, validation commands, and remaining blockers.\n\n\
          Project root: {project_root}\n\
          Runtime job id: {job_id}\n\
@@ -786,7 +788,8 @@ fn activity_result_from_turn(
         TurnStatus::Running => "Agent turn is still running after lifecycle returned.".to_string(),
     });
     let result = match status {
-        TurnStatus::Completed => ActivityResult::succeeded(activity, summary),
+        TurnStatus::Completed => structured_activity_result(items, &activity)
+            .unwrap_or_else(|| ActivityResult::succeeded(activity, summary)),
         TurnStatus::Cancelled => ActivityResult::cancelled(activity, summary),
         TurnStatus::Failed | TurnStatus::Running => ActivityResult::failed(
             activity,
@@ -812,6 +815,61 @@ fn activity_result_from_turn(
                 "runtime_job_id": job.id.as_str(),
             }),
         ))
+}
+
+fn structured_activity_result(items: &[Item], expected_activity: &str) -> Option<ActivityResult> {
+    items
+        .iter()
+        .rev()
+        .filter_map(|item| match item {
+            Item::AgentReasoning { content } => {
+                extract_fenced_block(content, "harness-activity-result")
+            }
+            _ => None,
+        })
+        .find_map(|block| {
+            serde_json::from_str::<ActivityResult>(block)
+                .ok()
+                .filter(|result| result.activity == expected_activity)
+        })
+}
+
+fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
+    let mut result = None;
+    let mut offset = 0;
+    let mut lines = text.split_inclusive('\n');
+    while let Some(line_with_end) = lines.next() {
+        let line = line_with_end.trim_end_matches('\n').trim_end_matches('\r');
+        if !opening_fence_matches(line, lang) {
+            offset += line_with_end.len();
+            continue;
+        }
+        let content_start = offset + line_with_end.len();
+        let mut content_end = text.len();
+        let mut inner_offset = content_start;
+        for inner_line_with_end in lines.by_ref() {
+            let inner_line = inner_line_with_end
+                .trim_end_matches('\n')
+                .trim_end_matches('\r');
+            if inner_line.trim().starts_with("```") {
+                content_end = inner_offset;
+                inner_offset += inner_line_with_end.len();
+                break;
+            }
+            inner_offset += inner_line_with_end.len();
+        }
+        result = Some(text[content_start..content_end].trim());
+        offset = inner_offset;
+    }
+    result
+}
+
+fn opening_fence_matches(line: &str, lang: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(after_ticks) = trimmed.strip_prefix("```") else {
+        return false;
+    };
+    !after_ticks.starts_with('`') && after_ticks.trim() == lang
 }
 
 fn activity_name(job: &RuntimeJob) -> String {
@@ -956,6 +1014,127 @@ mod tests {
         );
 
         assert_eq!(activity_name(&job), "start_child_workflow");
+    }
+
+    #[test]
+    fn activity_result_from_turn_parses_structured_activity_result_block() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue"
+            }),
+        );
+        let items = vec![Item::AgentReasoning {
+            content: r#"Work completed.
+
+```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":"stale summary","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":66,"pr_url":"https://github.com/owner/repo/pull/66"}}]}
+```
+
+Final result:
+
+```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":77,"pr_url":"https://github.com/owner/repo/pull/77"}}]}
+```"#
+                .to_string(),
+        }];
+
+        let result = activity_result_from_turn(
+            &job,
+            &TurnStatus::Completed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "codex",
+            Path::new("/project"),
+            "digest-1",
+        );
+
+        assert_eq!(result.activity, "implement_issue");
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Succeeded
+        );
+        assert_eq!(result.summary, "Implementation completed.");
+        let pr_artifact = result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "pull_request")
+            .expect("structured pull request artifact should be preserved");
+        assert_eq!(pr_artifact.artifact["pr_number"], 77);
+        assert_eq!(
+            pr_artifact.artifact["pr_url"],
+            "https://github.com/owner/repo/pull/77"
+        );
+        let prompt_artifact = result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "runtime_prompt_packet")
+            .expect("runtime prompt artifact should be appended");
+        assert_eq!(prompt_artifact.artifact["digest"], "digest-1");
+        let turn_artifact = result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "runtime_turn")
+            .expect("runtime turn artifact should be appended");
+        assert_eq!(turn_artifact.artifact["thread_id"], "thread-1");
+        assert_eq!(turn_artifact.artifact["turn_id"], "turn-1");
+        assert!(result
+            .signals
+            .iter()
+            .any(|signal| signal.signal_type == "RuntimeTurnCompleted"));
+    }
+
+    #[test]
+    fn activity_result_from_turn_ignores_mismatched_structured_activity() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue"
+            }),
+        );
+        let content = r#"Wrong activity result.
+
+```harness-activity-result
+{"activity":"replan_issue","status":"succeeded","summary":"Wrong activity.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":77,"pr_url":"https://github.com/owner/repo/pull/77"}}]}
+```"#;
+        let items = vec![Item::AgentReasoning {
+            content: content.to_string(),
+        }];
+
+        let result = activity_result_from_turn(
+            &job,
+            &TurnStatus::Completed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "codex",
+            Path::new("/project"),
+            "digest-1",
+        );
+
+        assert_eq!(result.activity, "implement_issue");
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Succeeded
+        );
+        assert_eq!(result.summary, content);
+        assert!(!result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "pull_request"));
+        assert!(result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "runtime_prompt_packet"));
+        assert!(result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "runtime_turn"));
     }
 }
 
