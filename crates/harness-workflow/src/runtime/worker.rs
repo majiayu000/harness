@@ -11,6 +11,10 @@ use serde_json::json;
 
 #[async_trait]
 pub trait RuntimeJobExecutor: Send + Sync {
+    fn consumes_runtime_turn(&self, _job: &RuntimeJob) -> bool {
+        true
+    }
+
     async fn execute(&self, job: RuntimeJob) -> ActivityResult;
 }
 
@@ -58,9 +62,26 @@ impl<'a> RuntimeWorker<'a> {
             )
             .await?;
 
-        let result = match self.max_turns_budget_result(&job).await? {
+        let consumes_runtime_turn = executor.consumes_runtime_turn(&job);
+        let result = match self
+            .max_turns_budget_result(&job, consumes_runtime_turn)
+            .await?
+        {
             Some(result) => result,
-            None => executor.execute(job.clone()).await,
+            None => {
+                if consumes_runtime_turn {
+                    self.store
+                        .record_runtime_event(
+                            &job.id,
+                            "RuntimeTurnStarted",
+                            json!({
+                                "owner": self.owner.as_str(),
+                            }),
+                        )
+                        .await?;
+                }
+                executor.execute(job.clone()).await
+            }
         };
         self.store
             .record_runtime_event(
@@ -157,7 +178,11 @@ impl<'a> RuntimeWorker<'a> {
     async fn max_turns_budget_result(
         &self,
         job: &RuntimeJob,
+        consumes_runtime_turn: bool,
     ) -> anyhow::Result<Option<ActivityResult>> {
+        if !consumes_runtime_turn {
+            return Ok(None);
+        }
         let Some(profile) = runtime_profile_for_job(job)? else {
             return Ok(None);
         };

@@ -1433,11 +1433,13 @@ async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Resu
     assert!(worker.run_once(&executor).await?.is_none());
 
     let events = store.runtime_events_for(&completed.id).await?;
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert_eq!(events[0].event_type, "RuntimeJobClaimed");
     assert_eq!(events[0].sequence, 1);
-    assert_eq!(events[1].event_type, "ActivityResultReady");
+    assert_eq!(events[1].event_type, "RuntimeTurnStarted");
     assert_eq!(events[1].sequence, 2);
+    assert_eq!(events[2].event_type, "ActivityResultReady");
+    assert_eq!(events[2].sequence, 3);
     assert_eq!(
         store
             .runtime_job_count_by_status(RuntimeJobStatus::Pending)
@@ -1707,7 +1709,7 @@ async fn runtime_worker_blocks_when_profile_max_turns_is_exhausted() -> anyhow::
         store
             .runtime_turns_started_for_workflow(&workflow.id, None)
             .await?,
-        2
+        1
     );
 
     let output: ActivityResult =

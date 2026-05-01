@@ -1158,50 +1158,53 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(output.activity, "implement_issue");
     assert_eq!(output.summary, "runtime done");
     let events = store.runtime_events_for(&runtime_job.id).await?;
+    assert_eq!(events.len(), 4);
     assert_eq!(events[0].event_type, "RuntimeJobClaimed");
-    assert_eq!(events[1].event_type, "RuntimePromptPrepared");
+    assert_eq!(events[1].event_type, "RuntimeTurnStarted");
+    assert_eq!(events[2].event_type, "RuntimePromptPrepared");
+    let prompt_event = &events[2];
     assert_eq!(
-        events[1].event["prompt_packet"]["schema"],
+        prompt_event.event["prompt_packet"]["schema"],
         "harness.runtime.prompt_packet.v1"
     );
     assert_eq!(
-        events[1].event["prompt_packet"]["required_structured_output"]["validation_commands"],
+        prompt_event.event["prompt_packet"]["required_structured_output"]["validation_commands"],
         "Validation commands run and their results."
     );
     assert_eq!(
-        events[1].event["prompt_packet"]["activity_result_schema"]["schema"],
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["schema"],
         "harness.runtime.activity_result.v1"
     );
     assert_eq!(
-        events[1].event["prompt_packet"]["activity_result_schema"]["activity"],
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["activity"],
         "implement_issue"
     );
     assert_eq!(
-        events[1].event["prompt_packet"]["activity_result_schema"]["allowed_error_kinds"][1],
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["allowed_error_kinds"][1],
         "fatal"
     );
     assert_eq!(
-        events[1].event["prompt_packet"]["activity_result_schema"]["transition_contract"]
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["transition_contract"]
             ["on_succeeded"]["reducer_next_state"],
         "unchanged_until_pr_detected"
     );
     assert_eq!(
-        events[1].event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
             ["must_include"][2],
         "PR URL or blocker"
     );
     assert_eq!(
-        events[1].event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
             ["artifacts"]["pull_request"]["fields"][1],
         "pr_url"
     );
     assert_eq!(
-        events[1].event["prompt_packet"]["activity_result_schema"]["optional_artifacts"]
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["optional_artifacts"]
             ["workflow_decision"]["allowed_confidence"][2],
         "high"
     );
-    let decision_contract =
-        &events[1].event["prompt_packet"]["activity_result_schema"]["workflow_decision_contract"];
+    let decision_contract = &prompt_event.event["prompt_packet"]["activity_result_schema"]
+        ["workflow_decision_contract"];
     assert_eq!(decision_contract["workflow_id"], "issue-124");
     assert_eq!(decision_contract["observed_state"], "implementing");
     assert!(decision_contract["allowed_transitions"]
@@ -1209,11 +1212,11 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         .expect("allowed transitions should be an array")
         .iter()
         .any(|transition| transition["next_state"] == "pr_open"));
-    let prompt_packet_digest = events[1].event["prompt_packet_digest"]
+    let prompt_packet_digest = prompt_event.event["prompt_packet_digest"]
         .as_str()
         .expect("prompt packet digest should be recorded");
     assert_eq!(prompt_packet_digest.len(), 64);
-    assert_eq!(events[2].event_type, "ActivityResultReady");
+    assert_eq!(events[3].event_type, "ActivityResultReady");
     let prompt_artifact = output
         .artifacts
         .iter()
@@ -1281,6 +1284,11 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
     );
     let command_id = store.enqueue_command(&parent.id, None, &command).await?;
     let activity = command.runtime_activity_key().to_string();
+    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-default",
+        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+    );
+    runtime_profile.max_turns = Some(0);
     let runtime_job = store
         .enqueue_runtime_job(
             &command_id,
@@ -1293,6 +1301,7 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
                 "dedupe_key": command.dedupe_key.clone(),
                 "activity": activity,
                 "command": command.command.clone(),
+                "runtime_profile": runtime_profile,
             }),
         )
         .await?;
@@ -1335,6 +1344,12 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
     assert_eq!(
         output.status,
         harness_workflow::runtime::ActivityStatus::Succeeded
+    );
+    assert_eq!(
+        store
+            .runtime_turns_started_for_workflow(&parent.id, None)
+            .await?,
+        0
     );
     Ok(())
 }

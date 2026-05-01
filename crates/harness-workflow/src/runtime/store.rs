@@ -852,10 +852,11 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<i64> {
         let (count,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*)
-             FROM runtime_jobs r
+             FROM runtime_events e
+             JOIN runtime_jobs r ON r.id = e.runtime_job_id
              JOIN workflow_commands c ON c.id = r.command_id
              WHERE c.workflow_id = $1
-               AND r.status <> 'pending'
+               AND e.event_type = 'RuntimeTurnStarted'
                AND ($2::text IS NULL OR r.id <> $2)",
         )
         .bind(workflow_id)

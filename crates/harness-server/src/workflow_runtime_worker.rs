@@ -466,6 +466,10 @@ impl ServerRuntimeJobExecutor {
 
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor {
+    fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
+        !is_builtin_lifecycle_activity(job)
+    }
+
     async fn execute(&self, job: RuntimeJob) -> ActivityResult {
         let activity = activity_name(&job);
         match self.execute_inner(job).await {
@@ -971,6 +975,13 @@ fn activity_name(job: &RuntimeJob) -> String {
         })
         .unwrap_or("workflow_activity")
         .to_string()
+}
+
+fn is_builtin_lifecycle_activity(job: &RuntimeJob) -> bool {
+    matches!(
+        activity_name(job).as_str(),
+        "start_child_workflow" | "mark_bound_issue_done" | "recover_issue_workflow"
+    )
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str> {
