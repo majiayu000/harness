@@ -110,12 +110,18 @@ pub(crate) async fn build_intake(
                 "intake: GitHub Issues poller registered"
             );
             let key = format!("github:{}", repo_cfg.repo);
+            let task_checker = Arc::new(
+                crate::intake::github_issues::RuntimeAwareDispatchedTaskChecker::new(
+                    tasks.clone(),
+                    registry.workflow_runtime_store.clone(),
+                ),
+            );
             let poller = crate::intake::github_issues::GitHubIssuesPoller::new_with_token(
                 &repo_cfg,
                 Some(data_dir),
                 server.config.server.github_token.clone(),
             )
-            .with_task_checker(tasks.clone());
+            .with_task_checker(task_checker);
             match poller.reconcile_dispatched_with_store().await {
                 Ok(pruned) if pruned > 0 => tracing::info!(
                     repo = %repo_cfg.repo,

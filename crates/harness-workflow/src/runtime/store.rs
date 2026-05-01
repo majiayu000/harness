@@ -994,6 +994,59 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn cancel_command_and_unfinished_runtime_jobs(
+        &self,
+        command_id: &str,
+        activity: &str,
+        summary: &str,
+    ) -> anyhow::Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let _command_row: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM workflow_commands WHERE id = $1 FOR UPDATE")
+                .bind(command_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, data::text FROM runtime_jobs
+             WHERE command_id = $1
+               AND status IN ('pending', 'running')
+             FOR UPDATE",
+        )
+        .bind(command_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut cancelled = 0usize;
+        for (id, data) in rows {
+            let mut job: RuntimeJob = serde_json::from_str(&data)?;
+            job.complete(&ActivityResult::cancelled(activity, summary))?;
+            let updated = to_jsonb_string(&job)?;
+            let status = enum_str(&job.status)?;
+            sqlx::query(
+                "UPDATE runtime_jobs
+                 SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $4",
+            )
+            .bind(&status)
+            .bind(job.not_before)
+            .bind(&updated)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            cancelled += 1;
+        }
+        sqlx::query(
+            "UPDATE workflow_commands
+             SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1
+               AND status IN ('pending', 'dispatched')",
+        )
+        .bind(command_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
     pub async fn runtime_jobs_for_commands(
         &self,
         command_ids: &[String],

@@ -190,8 +190,14 @@ pub(crate) async fn cancel_issue_submission_by_task_id(
     let mut cancelled = commit_runtime_decision(store, instance, decision, event.id, None).await?;
     let commands = store.commands_for(&cancelled.id).await?;
     for command in commands {
-        if command.status == "pending" {
-            store.mark_command_status(&command.id, "cancelled").await?;
+        if matches!(command.status.as_str(), "pending" | "dispatched") {
+            store
+                .cancel_command_and_unfinished_runtime_jobs(
+                    &command.id,
+                    "cancel_issue_submission",
+                    "Runtime issue submission was cancelled before execution.",
+                )
+                .await?;
         }
     }
     cancelled.data = set_data_bool(cancelled.data, "cancelled", true);
@@ -775,6 +781,77 @@ mod tests {
                 .id,
             workflow.id
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_issue_submission_cancels_dispatched_runtime_jobs() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = open_runtime_store(dir.path()).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("runtime-handle-cancel");
+        let labels = vec!["bug".to_string()];
+        let result = record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 42,
+                task_id: &task_id,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        )
+        .await?;
+        let command_id = result
+            .command_ids
+            .first()
+            .expect("issue submission should enqueue an implementation command")
+            .clone();
+        store
+            .enqueue_runtime_job_for_pending_command(
+                &command_id,
+                harness_workflow::runtime::RuntimeKind::CodexExec,
+                "default",
+                json!({ "task_id": task_id.as_str() }),
+                None,
+            )
+            .await?;
+        assert_eq!(
+            store
+                .get_command(&command_id)
+                .await?
+                .expect("command should exist")
+                .status,
+            "dispatched"
+        );
+
+        let cancelled = cancel_issue_submission_by_task_id(&store, &task_id)
+            .await?
+            .expect("runtime issue submission should resolve by task id");
+        assert_eq!(cancelled.state, "cancelled");
+
+        let commands = store.commands_for(&result.workflow_id).await?;
+        let original_command = commands
+            .iter()
+            .find(|command| command.id == command_id)
+            .expect("original implementation command should remain visible");
+        assert_eq!(original_command.status, "cancelled");
+        let jobs = store.runtime_jobs_for_command(&command_id).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].status,
+            harness_workflow::runtime::RuntimeJobStatus::Cancelled
+        );
+        assert!(jobs[0].lease.is_none());
         Ok(())
     }
 

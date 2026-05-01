@@ -21,6 +21,39 @@ impl DispatchedTaskChecker for crate::task_runner::TaskStore {
     }
 }
 
+pub(crate) struct RuntimeAwareDispatchedTaskChecker {
+    tasks: Arc<crate::task_runner::TaskStore>,
+    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
+}
+
+impl RuntimeAwareDispatchedTaskChecker {
+    pub(crate) fn new(
+        tasks: Arc<crate::task_runner::TaskStore>,
+        workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
+    ) -> Self {
+        Self {
+            tasks,
+            workflow_runtime_store,
+        }
+    }
+}
+
+#[async_trait]
+impl DispatchedTaskChecker for RuntimeAwareDispatchedTaskChecker {
+    async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool> {
+        if self.tasks.exists_with_db_fallback(task_id).await? {
+            return Ok(true);
+        }
+        let Some(store) = self.workflow_runtime_store.as_ref() else {
+            return Ok(false);
+        };
+        Ok(store
+            .get_instance_by_task_id(task_id.as_str())
+            .await?
+            .is_some())
+    }
+}
+
 pub struct GitHubIssuesPoller {
     repo: String,
     label: String,
@@ -818,6 +851,58 @@ mod tests {
 
         assert_eq!(pruned, 0);
         assert!(poller.dispatched.contains_key("1"));
+    }
+
+    #[tokio::test]
+    async fn runtime_aware_checker_preserves_runtime_issue_handles() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let _db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
+        let database_url = crate::test_helpers::ensure_test_database_url_override()?;
+        let dir = tempfile::tempdir()?;
+        let tasks = crate::task_runner::TaskStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir.path(), "tasks"),
+            Some(&database_url),
+        )
+        .await?;
+        let runtime_store =
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("runtime-issue-handle");
+        let labels = vec!["bug".to_string()];
+
+        crate::workflow_runtime_submission::record_issue_submission(
+            &runtime_store,
+            crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 42,
+                task_id: &task_id,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        )
+        .await?;
+
+        let checker = RuntimeAwareDispatchedTaskChecker::new(tasks, Some(Arc::new(runtime_store)));
+
+        assert!(checker.exists(&task_id).await?);
+        assert!(
+            !checker
+                .exists(&TaskId::from_str("missing-runtime-handle"))
+                .await?
+        );
+        Ok(())
     }
 
     // Surface 3 regression guard: the dispatched JSON file stores only
