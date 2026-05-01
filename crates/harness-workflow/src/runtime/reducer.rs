@@ -2,6 +2,7 @@ use super::model::{
     ActivityErrorKind, ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType,
     WorkflowDecision, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
+use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
@@ -80,6 +81,11 @@ fn reduce_success(
             "idle",
             "finish_issue_workflow_recovery",
             "issue workflow recovery activity completed",
+        ),
+        (QUALITY_GATE_DEFINITION_ID, "checking", QUALITY_GATE_ACTIVITY) => (
+            "passed",
+            "quality_passed",
+            "quality gate activity completed successfully",
         ),
         _ => return None,
     };
@@ -450,6 +456,7 @@ fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool 
             GITHUB_ISSUE_PR_DEFINITION_ID,
             "implementing" | "awaiting_feedback" | "addressing_feedback"
         ) | (REPO_BACKLOG_DEFINITION_ID, "dispatching" | "reconciling")
+            | (QUALITY_GATE_DEFINITION_ID, "checking")
     )
 }
 

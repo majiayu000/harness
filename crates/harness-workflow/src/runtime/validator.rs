@@ -213,6 +213,24 @@ impl TransitionAllowlist {
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
     }
+
+    pub fn quality_gate_defaults() -> Self {
+        use WorkflowCommandType::{
+            EnqueueActivity, MarkBlocked, MarkCancelled, MarkFailed, RequestOperatorAttention, Wait,
+        };
+
+        Self::default()
+            .allow("pending", "checking", [EnqueueActivity, Wait])
+            .allow("checking", "checking", [EnqueueActivity, Wait])
+            .allow(
+                "checking",
+                "passed",
+                std::iter::empty::<WorkflowCommandType>(),
+            )
+            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
+            .allow_from_any("failed", [MarkFailed])
+            .allow_from_any("cancelled", [MarkCancelled])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +340,10 @@ impl DecisionValidator {
 
     pub fn repo_backlog() -> Self {
         Self::new(TransitionAllowlist::repo_backlog_defaults())
+    }
+
+    pub fn quality_gate() -> Self {
+        Self::new(TransitionAllowlist::quality_gate_defaults())
     }
 
     pub fn validate(

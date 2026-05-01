@@ -64,6 +64,8 @@ Implemented now:
   completed agent turns when the structured activity name matches the runtime job activity
 - prompt packets include the current workflow decision contract with validator-derived allowed
   next states and command types for structured `workflow_decision` artifacts
+- `quality_gate` is registered as a first-class runtime workflow contract with a run decision
+  helper, transition validator, completion reducer, retry support, and activity result schema
 
 Still intentionally not moved yet:
 
@@ -216,6 +218,15 @@ Purpose:
 
 - verify configured validation commands
 - convert runtime validation into structured artifacts
+
+Status:
+
+- first-class definition id: `quality_gate`
+- first-class runtime activity: `run_quality_gate`
+- validator states: `pending -> checking -> passed`, plus `blocked`, `failed`, and `cancelled`
+- successful `run_quality_gate` runtime completion reduces `checking` to `passed`
+- failed `run_quality_gate` can use the generic bounded runtime retry policy before terminal failure
+- prompt packets expose the quality-gate transition and summary contract to the runtime agent
 
 Main outputs:
 

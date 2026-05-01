@@ -140,6 +140,7 @@ impl<'a> RuntimeWorker<'a> {
 
         let validator = match instance.definition_id.as_str() {
             super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
+            super::quality_gate::QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
             super::repo_backlog::REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
             _ => return Ok(()),
         };

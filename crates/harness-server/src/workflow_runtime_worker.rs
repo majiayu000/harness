@@ -8,7 +8,9 @@ use harness_core::types::{AgentId, Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityResult, ActivitySignal, DecisionValidator, RuntimeJob,
     RuntimeJobExecutor, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker,
-    WorkflowDefinition, WorkflowInstance, WorkflowSubject,
+    WorkflowDefinition, WorkflowInstance, WorkflowSubject, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -677,6 +679,7 @@ fn workflow_decision_contract(workflow: Option<&WorkflowInstance>) -> Value {
 fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
     match definition_id {
         "github_issue_pr" => Some(DecisionValidator::github_issue_pr()),
+        QUALITY_GATE_DEFINITION_ID => Some(DecisionValidator::quality_gate()),
         "repo_backlog" => Some(DecisionValidator::repo_backlog()),
         _ => None,
     }
@@ -725,6 +728,23 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 }
             })
         }
+        (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => json!({
+            "on_succeeded": {
+                "reducer_next_state": "passed",
+                "output_signal": QUALITY_PASSED_SIGNAL,
+                "required_summary": "Describe validation commands run and passing evidence."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "output_signal": QUALITY_FAILED_SIGNAL,
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            },
+            "on_blocked": {
+                "reducer_next_state": "blocked",
+                "output_signal": QUALITY_BLOCKED_SIGNAL,
+                "required_summary": "Describe the missing dependency, budget, or external input."
+            }
+        }),
         _ => json!({
             "on_succeeded": {
                 "reducer_next_state": "unchanged",
@@ -753,6 +773,16 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
         ("github_issue_pr", "address_pr_feedback") => json!({
             "must_include": ["review feedback addressed", "changed files", "validation commands"],
             "must_not_include": ["claiming review approval without a fresh review signal"],
+        }),
+        (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => json!({
+            "must_include": ["validation commands", "pass/fail evidence", "remaining blockers"],
+            "must_not_include": ["workflow table mutations", "unverified pass claims"],
+            "artifacts": {
+                "validation_report": {
+                    "required_when": "The activity records detailed validation results.",
+                    "fields": ["commands", "passed", "failed", "blocked"]
+                }
+            }
         }),
         _ => json!({
             "must_include": ["summary", "validation commands", "remaining blockers"],
@@ -1104,6 +1134,46 @@ mod tests {
         );
 
         assert_eq!(activity_name(&job), "start_child_workflow");
+    }
+
+    #[test]
+    fn activity_result_schema_describes_quality_gate_contract() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": QUALITY_GATE_ACTIVITY
+            }),
+        );
+        let workflow = WorkflowInstance::new(
+            QUALITY_GATE_DEFINITION_ID,
+            1,
+            "checking",
+            WorkflowSubject::new("quality_gate", "issue:123"),
+        )
+        .with_id("quality-gate-1");
+
+        let schema = activity_result_schema(&job, Some(&workflow));
+
+        assert_eq!(schema["workflow_definition"], QUALITY_GATE_DEFINITION_ID);
+        assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
+            "passed"
+        );
+        assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["output_signal"],
+            QUALITY_PASSED_SIGNAL
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["must_include"][0],
+            "validation commands"
+        );
+        assert!(schema["workflow_decision_contract"]["allowed_transitions"]
+            .as_array()
+            .expect("allowed transitions should be an array")
+            .iter()
+            .any(|transition| transition["next_state"] == "passed"));
     }
 
     #[test]

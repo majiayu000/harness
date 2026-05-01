@@ -8,12 +8,14 @@ use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRej
 use super::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,
     build_plan_issue_decision, build_pr_detected_decision, build_pr_feedback_decision,
-    build_stale_active_workflow_decision, reduce_runtime_job_completed, CommandDispatchOutcome,
-    InMemoryWorkflowBus, MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput,
-    PlanIssueWorkflowAction, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
-    PrFeedbackWorkflowAction, RepoBacklogWorkflowAction, RuntimeCommandDispatcher,
-    RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput,
-    WorkflowRuntimeStore, REPO_BACKLOG_DEFINITION_ID,
+    build_quality_gate_run_decision, build_stale_active_workflow_decision,
+    reduce_runtime_job_completed, CommandDispatchOutcome, InMemoryWorkflowBus,
+    MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
+    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
+    QualityGateDecisionInput, QualityGateWorkflowAction, RepoBacklogWorkflowAction,
+    RuntimeCommandDispatcher, RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker,
+    StaleWorkflowDecisionInput, WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -39,6 +41,15 @@ fn repo_backlog_instance(state: &str) -> WorkflowInstance {
         1,
         state,
         WorkflowSubject::new("repo", "owner/repo"),
+    )
+}
+
+fn quality_gate_instance(state: &str) -> WorkflowInstance {
+    WorkflowInstance::new(
+        QUALITY_GATE_DEFINITION_ID,
+        1,
+        state,
+        WorkflowSubject::new("quality_gate", "issue:123"),
     )
 }
 
@@ -982,6 +993,126 @@ fn runtime_completion_reducer_idles_repo_backlog_after_reconciliation() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("repo backlog reconciliation completion should validate");
+}
+
+#[test]
+fn quality_gate_run_decision_starts_runtime_activity() {
+    let instance = quality_gate_instance("pending");
+    let commands = vec!["cargo check".to_string(), "cargo test".to_string()];
+    let output = build_quality_gate_run_decision(
+        &instance,
+        QualityGateDecisionInput {
+            reason: "Run validation before merge.",
+            validation_commands: &commands,
+        },
+    );
+
+    assert_eq!(output.action, QualityGateWorkflowAction::RunQualityGate);
+    assert_eq!(output.decision.decision, "run_quality_gate");
+    assert_eq!(output.decision.next_state, "checking");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some(QUALITY_GATE_ACTIVITY)
+    );
+    assert_eq!(
+        output.decision.commands[0].command["validation_commands"][1],
+        "cargo test"
+    );
+    DecisionValidator::quality_gate()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("quality gate run decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_passes_quality_gate_after_success() {
+    let instance = quality_gate_instance("checking");
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_validation(ValidationRecord::new("cargo check", "passed"))
+        .with_validation(ValidationRecord::new("cargo test", "passed"));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate completion should pass the workflow");
+
+    assert_eq!(decision.decision, "quality_passed");
+    assert_eq!(decision.next_state, "passed");
+    assert!(decision.commands.is_empty());
+    DecisionValidator::quality_gate()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("quality gate pass transition should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_retries_quality_gate_transient_failure() {
+    let instance = quality_gate_instance("checking").with_data(json!({
+        "runtime_retry_policy": {
+            "activity_retries": {
+                "run_quality_gate": {
+                    "max_failed_activity_retries": 2,
+                    "retry_delay_secs": 1
+                }
+            }
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
+    let result = ActivityResult::failed(
+        QUALITY_GATE_ACTIVITY,
+        "Validation command could not start.",
+        "temporary process error",
+    )
+    .with_error_kind(ActivityErrorKind::Retryable);
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate transient failure should retry");
+
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(decision.next_state, "checking");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some(QUALITY_GATE_ACTIVITY)
+    );
+    assert_eq!(decision.commands[0].command["retry_attempt"], 1);
+    DecisionValidator::quality_gate()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("quality gate retry transition should validate");
 }
 
 fn leased_issue_instance(state: &str) -> WorkflowInstance {

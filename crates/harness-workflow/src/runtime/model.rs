@@ -90,7 +90,10 @@ impl WorkflowInstance {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self.state.as_str(), "done" | "failed" | "cancelled")
+        matches!(
+            self.state.as_str(),
+            "done" | "passed" | "failed" | "cancelled"
+        )
     }
 
     pub fn with_id(mut self, id: impl Into<String>) -> Self {

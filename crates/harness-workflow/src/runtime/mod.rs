@@ -9,6 +9,7 @@ pub mod dispatcher;
 pub mod model;
 pub mod plan_issue;
 pub mod pr_feedback;
+pub mod quality_gate;
 pub mod reducer;
 pub mod repo_backlog;
 pub mod store;
@@ -34,6 +35,12 @@ pub use plan_issue::{
 pub use pr_feedback::{
     build_pr_detected_decision, build_pr_feedback_decision, PrDetectedDecisionInput,
     PrFeedbackDecisionInput, PrFeedbackDecisionOutput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
+};
+pub use quality_gate::{
+    build_quality_gate_run_decision, quality_gate_workflow_id, QualityGateDecisionInput,
+    QualityGateDecisionOutput, QualityGateWorkflowAction, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL,
 };
 pub use reducer::{
     reduce_runtime_job_completed, GITHUB_ISSUE_PR_DEFINITION_ID, RUNTIME_JOB_COMPLETED_EVENT,
