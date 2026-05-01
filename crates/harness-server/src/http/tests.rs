@@ -2286,6 +2286,40 @@ async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn create_task_with_issue_reports_task_runner_fallback_without_runtime_store(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let before_count = state.core.tasks.count();
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({
+        "repo": "owner/repo",
+        "issue": 42,
+        "labels": ["bug"]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let resp = response_json(response).await?;
+    assert!(resp["task_id"].is_string());
+    assert_eq!(resp["status"], "queued");
+    assert_eq!(resp["execution_path"], "task_runner");
+    assert_eq!(state.core.tasks.count(), before_count + 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -3003,6 +3037,44 @@ async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow:
         .await?;
     }
     assert_eq!(state.core.tasks.count(), before_count);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_tasks_batch_with_issues_reports_task_runner_fallback_without_runtime_store(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let before_count = state.core.tasks.count();
+    let response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "issues": [42, 43],
+                        "repo": "owner/repo",
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let batch_json = response_json(response).await?;
+    let entries = batch_json
+        .as_array()
+        .expect("batch response should be an array");
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(entry["status"], "queued");
+        assert_eq!(entry["execution_path"], "task_runner");
+        assert!(entry["task_id"].is_string());
+    }
+    assert_eq!(state.core.tasks.count(), before_count + 2);
     Ok(())
 }
 
@@ -3979,6 +4051,56 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
         json["task_id"].as_str().expect("task id should be present"),
     )
     .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_issues_opened_reports_task_runner_fallback_without_runtime_store(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
+    let secret = "secret";
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "org/repo".to_string(),
+        ..Default::default()
+    });
+    let (state, _agent) =
+        make_test_state_with_agent_and_config(dir.path(), dir.path(), config).await?;
+    let before_count = state.core.tasks.count();
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 77,
+            "body": "@harness please implement this feature"
+        },
+        "repository": { "full_name": "org/repo" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issues")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "accepted");
+    assert_eq!(json["execution_path"], "task_runner");
+    assert_eq!(state.core.tasks.count(), before_count + 1);
+    assert!(json["task_id"].is_string());
     Ok(())
 }
 

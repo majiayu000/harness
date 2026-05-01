@@ -58,30 +58,54 @@ pub(crate) async fn enqueue_task_background_in_domain(
         .await
 }
 
-async fn task_response_status(
+pub(crate) struct TaskResponseDetails {
+    pub(crate) status: String,
+    pub(crate) execution_path: &'static str,
+}
+
+pub(crate) async fn task_response_details(
     state: &AppState,
     task_id: &task_runner::TaskId,
     is_issue_submission: bool,
-) -> Result<String, EnqueueTaskError> {
+) -> Result<TaskResponseDetails, EnqueueTaskError> {
     if !is_issue_submission {
-        return Ok("queued".to_string());
+        return Ok(TaskResponseDetails {
+            status: "queued".to_string(),
+            execution_path: "task_runner",
+        });
     }
 
-    let store = state.core.workflow_runtime_store.as_ref().ok_or_else(|| {
-        EnqueueTaskError::Internal(
-            "workflow runtime store is required for GitHub issue submissions".to_string(),
-        )
-    })?;
-    let workflow = crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id)
+    if let Some(store) = state.core.workflow_runtime_store.as_ref() {
+        if let Some(workflow) =
+            crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id)
+                .await
+                .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
+        {
+            return Ok(TaskResponseDetails {
+                status: workflow.state,
+                execution_path: "workflow_runtime",
+            });
+        }
+    }
+
+    if state
+        .core
+        .tasks
+        .get_with_db_fallback(task_id)
         .await
         .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
-        .ok_or_else(|| {
-            EnqueueTaskError::Internal(format!(
-                "workflow runtime submission not found for task {}",
-                task_id.as_str()
-            ))
-        })?;
-    Ok(workflow.state)
+        .is_some()
+    {
+        return Ok(TaskResponseDetails {
+            status: "queued".to_string(),
+            execution_path: "task_runner",
+        });
+    }
+
+    Err(EnqueueTaskError::Internal(format!(
+        "submission not found for task {}",
+        task_id.as_str()
+    )))
 }
 
 /// A single task entry in the detailed batch format.
@@ -272,21 +296,21 @@ pub(super) async fn create_tasks_batch(
         let entry = match enqueue_task_background(state.clone(), task_req, sem).await {
             Ok(task_id) => {
                 all_maintenance_window = false;
-                match task_response_status(&state, &task_id, is_issue_submission).await {
-                    Ok(status) => {
+                match task_response_details(&state, &task_id, is_issue_submission).await {
+                    Ok(details) => {
                         if is_serialized {
                             json!({
                                 "task_id": task_id.0,
-                                "status": status,
+                                "status": details.status,
                                 "serialized": true,
                                 "conflict_files": conflict_files,
-                                "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
+                                "execution_path": details.execution_path,
                             })
                         } else {
                             json!({
                                 "task_id": task_id.0,
-                                "status": status,
-                                "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
+                                "status": details.status,
+                                "execution_path": details.execution_path,
                             })
                         }
                     }
@@ -333,13 +357,13 @@ pub(super) async fn create_task(
 ) -> Response {
     let is_issue_submission = req.issue.is_some();
     match enqueue_task_background(state.clone(), req, None).await {
-        Ok(task_id) => match task_response_status(&state, &task_id, is_issue_submission).await {
-            Ok(status) => (
+        Ok(task_id) => match task_response_details(&state, &task_id, is_issue_submission).await {
+            Ok(details) => (
                 StatusCode::ACCEPTED,
                 Json(json!({
                     "task_id": task_id.0,
-                    "status": status,
-                    "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" }
+                    "status": details.status,
+                    "execution_path": details.execution_path,
                 })),
             )
                 .into_response(),

@@ -725,15 +725,36 @@ pub(crate) async fn github_webhook(
 
     let is_issue_submission = req.issue.is_some();
     match task_routes::enqueue_task(&state, req).await {
-        Ok(task_id) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "status": if is_issue_submission { "scheduled" } else { "accepted" },
-                "reason": reason,
-                "task_id": task_id.0,
-                "execution_path": if is_issue_submission { "workflow_runtime" } else { "task_runner" },
-            })),
-        ),
+        Ok(task_id) => {
+            match task_routes::task_response_details(&state, &task_id, is_issue_submission).await {
+                Ok(details) => (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": if details.execution_path == "workflow_runtime" {
+                            details.status
+                        } else {
+                            "accepted".to_string()
+                        },
+                        "reason": reason,
+                        "task_id": task_id.0,
+                        "execution_path": details.execution_path,
+                    })),
+                ),
+                Err(crate::services::execution::EnqueueTaskError::BadRequest(error)) => {
+                    (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
+                }
+                Err(crate::services::execution::EnqueueTaskError::Internal(error)) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": error })),
+                ),
+                Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow {
+                    retry_after_secs,
+                }) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "maintenance_window", "retry_after": retry_after_secs })),
+                ),
+            }
+        }
         Err(crate::services::execution::EnqueueTaskError::BadRequest(error)) => {
             (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
         }
