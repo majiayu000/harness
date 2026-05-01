@@ -12,6 +12,7 @@ pub struct IssueSubmissionDecisionInput<'a> {
     pub issue_number: u64,
     pub labels: &'a [String],
     pub force_execute: bool,
+    pub additional_prompt: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,24 +32,29 @@ pub fn build_issue_submission_decision(
         "scheduled",
         "operator submitted the GitHub issue for implementation",
     )
-    .with_command(WorkflowCommand::enqueue_activity(
-        "implement_issue",
+    .with_command(WorkflowCommand::new(
+        super::model::WorkflowCommandType::EnqueueActivity,
         format!(
             "issue-submit:{}:issue:{}:task:{}:implement",
             repo_key(input.repo),
             input.issue_number,
             input.task_id
         ),
+        serde_json::json!({
+            "activity": "implement_issue",
+            "additional_prompt": input.additional_prompt,
+        }),
     ))
     .with_evidence(WorkflowEvidence::new(
         "task_submission",
         format!(
-            "task_id={} repo={} issue={} labels={} force_execute={}",
+            "task_id={} repo={} issue={} labels={} force_execute={} additional_prompt={}",
             input.task_id,
             repo_key(input.repo),
             input.issue_number,
             labels_summary(input.labels),
-            input.force_execute
+            input.force_execute,
+            input.additional_prompt.is_some()
         ),
     ))
     .high_confidence();

@@ -81,6 +81,7 @@ fn issue_submission_decision_schedules_discovered_issue() {
             issue_number: 123,
             labels: &labels,
             force_execute: false,
+            additional_prompt: Some("prefer a minimal patch"),
         },
     );
 
@@ -98,6 +99,10 @@ fn issue_submission_decision_schedules_discovered_issue() {
     assert_eq!(
         output.decision.commands[0].dedupe_key,
         "issue-submit:owner/repo:issue:123:task:task-1:implement"
+    );
+    assert_eq!(
+        output.decision.commands[0].command["additional_prompt"],
+        "prefer a minimal patch"
     );
     DecisionValidator::github_issue_pr()
         .validate(
@@ -120,6 +125,7 @@ fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
             issue_number: 124,
             labels: &labels,
             force_execute: true,
+            additional_prompt: None,
         },
     );
 

@@ -17,6 +17,7 @@ pub(crate) struct IssueSubmissionRuntimeContext<'a> {
     pub task_id: &'a TaskId,
     pub labels: &'a [String],
     pub force_execute: bool,
+    pub additional_prompt: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,7 @@ async fn persist_issue_submission(
             issue_number: ctx.issue_number,
             labels: ctx.labels,
             force_execute: ctx.force_execute,
+            additional_prompt: ctx.additional_prompt,
         },
     );
     apply_decision(
@@ -106,6 +108,7 @@ async fn apply_decision(
                 "issue_number": ctx.issue_number,
                 "labels": ctx.labels,
                 "force_execute": ctx.force_execute,
+                "additional_prompt": ctx.additional_prompt,
                 "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
             }),
         )
@@ -190,6 +193,7 @@ fn issue_submission_data(
             "task_id": ctx.task_id.as_str(),
             "labels": ctx.labels,
             "force_execute": ctx.force_execute,
+            "additional_prompt": ctx.additional_prompt,
         }),
     )
 }
@@ -238,6 +242,7 @@ mod tests {
                 task_id: &task_id,
                 labels: &labels,
                 force_execute: true,
+                additional_prompt: Some("include the regression test first"),
             },
         )
         .await?;
@@ -257,6 +262,10 @@ mod tests {
             .expect("workflow should be persisted");
         assert_eq!(instance.state, "scheduled");
         assert_eq!(instance.data["task_id"], "task-1");
+        assert_eq!(
+            instance.data["additional_prompt"],
+            "include the regression test first"
+        );
         assert_eq!(instance.data["last_decision"], "submit_issue");
         assert_eq!(
             instance.data["execution_path"],
@@ -272,6 +281,10 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
         assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+        assert_eq!(
+            commands[0].command.command["additional_prompt"],
+            "include the regression test first"
+        );
         assert_eq!(store.pending_commands(10).await?.len(), 1);
         assert!(store
             .runtime_jobs_for_command(&commands[0].id)
@@ -322,6 +335,7 @@ mod tests {
                 task_id: &task_id,
                 labels: &labels,
                 force_execute: false,
+                additional_prompt: Some("do not clobber existing metadata"),
             },
         )
         .await?;

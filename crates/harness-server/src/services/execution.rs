@@ -551,6 +551,7 @@ impl DefaultExecutionService {
                 task_id: &task_id,
                 labels: &prepared.req.labels,
                 force_execute: prepared.req.force_execute,
+                additional_prompt: prepared.req.prompt.as_deref(),
             },
         )
         .await
@@ -1061,6 +1062,7 @@ mod tests {
         );
         let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
         let req = CreateTaskRequest {
+            prompt: Some("preserve caller guidance".to_string()),
             issue: Some(42),
             repo: Some("owner/repo".to_string()),
             project: Some(project_root.clone()),
@@ -1086,11 +1088,19 @@ mod tests {
             .expect("runtime workflow should be recorded");
         assert_eq!(instance.state, "scheduled");
         assert_eq!(instance.data["task_id"], task_id.0);
+        assert_eq!(
+            instance.data["additional_prompt"],
+            "preserve caller guidance"
+        );
         assert_eq!(instance.data["execution_path"], "workflow_runtime");
         let commands = runtime_store.commands_for(&workflow_id).await?;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
         assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+        assert_eq!(
+            commands[0].command.command["additional_prompt"],
+            "preserve caller guidance"
+        );
         assert_eq!(runtime_store.pending_commands(10).await?.len(), 1);
         Ok(())
     }
