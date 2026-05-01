@@ -658,12 +658,7 @@ impl DefaultExecutionService {
         task_runner::fill_missing_repo_from_project(&mut req).await;
         Self::populate_external_id(&mut req);
 
-        if req.issue.is_some() {
-            if self.workflow_runtime_store.is_none() {
-                return Err(EnqueueTaskError::Internal(
-                    "workflow runtime store is required for GitHub issue submissions".to_string(),
-                ));
-            }
+        if req.issue.is_some() && self.workflow_runtime_store.is_some() {
             if let Some(existing_id) = self
                 .check_runtime_issue_duplicate(&project_id, &req)
                 .await?
@@ -887,6 +882,10 @@ impl ExecutionService for DefaultExecutionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::{
+        agent::{AgentRequest, AgentResponse, StreamItem},
+        types::{Capability, TokenUsage},
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Minimal mock that always succeeds without touching any infrastructure.
@@ -903,6 +902,47 @@ mod tests {
                 }),
                 called,
             )
+        }
+    }
+
+    struct NoopAgent;
+
+    #[async_trait]
+    impl CodeAgent for NoopAgent {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            Vec::new()
+        }
+
+        async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+            Ok(noop_agent_response())
+        }
+
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn noop_agent_response() -> AgentResponse {
+        AgentResponse {
+            output: String::new(),
+            stderr: String::new(),
+            items: Vec::new(),
+            token_usage: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cost_usd: 0.0,
+            },
+            model: "test".to_string(),
+            exit_code: Some(0),
         }
     }
 
@@ -1084,6 +1124,40 @@ mod tests {
         let svc = make_svc_with_allowed_roots(store, vec![]).await;
         let any = PathBuf::from("/anywhere/repo");
         assert!(svc.check_allowed_roots(&any).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_issue_submission_falls_back_without_runtime_store(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let task_store = store.clone();
+        let svc = make_svc_with_agent_without_workflow_runtime(store).await;
+        let req = CreateTaskRequest {
+            issue: Some(42),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            ..Default::default()
+        };
+
+        let task_id = svc.enqueue_background(req).await?;
+        let task = task_store
+            .get_with_db_fallback(&task_id)
+            .await?
+            .expect("issue submission should fall back to a task runner row");
+        let canonical_project_root = project_root.canonicalize()?;
+
+        assert_eq!(task.id, task_id);
+        assert_eq!(task.task_kind, task_runner::TaskKind::Issue);
+        assert_eq!(task.external_id.as_deref(), Some("issue:42"));
+        assert_eq!(task.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(
+            task.project_root.as_deref(),
+            Some(canonical_project_root.as_path())
+        );
         Ok(())
     }
 
@@ -1379,6 +1453,30 @@ mod tests {
             None,
             None,
             allowed,
+        )
+    }
+
+    async fn make_svc_with_agent_without_workflow_runtime(
+        store: Arc<TaskStore>,
+    ) -> Arc<DefaultExecutionService> {
+        let config = Arc::new(HarnessConfig::default());
+        let mut agent_registry = AgentRegistry::new("test");
+        agent_registry.register("test", Arc::new(NoopAgent));
+        DefaultExecutionService::new(
+            store,
+            Arc::new(agent_registry),
+            config,
+            Default::default(),
+            make_event_store_noop().await,
+            vec![],
+            None,
+            make_task_queue(),
+            make_task_queue(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
         )
     }
 
