@@ -610,6 +610,13 @@ fn activity_result_schema(job: &RuntimeJob, workflow: Option<&WorkflowInstance>)
         "optional_fields": ["artifacts", "signals", "validation", "error", "error_kind"],
         "allowed_statuses": ["succeeded", "failed", "blocked", "cancelled"],
         "allowed_error_kinds": ["retryable", "fatal", "configuration", "external_dependency", "unknown"],
+        "optional_artifacts": {
+            "workflow_decision": {
+                "description": "A proposed WorkflowDecision. Harness validates it before applying any transition or command.",
+                "required_fields": ["workflow_id", "observed_state", "decision", "next_state", "reason", "confidence"],
+                "allowed_confidence": ["low", "medium", "high"]
+            }
+        },
         "status_contract": {
             "succeeded": "The activity completed and its output is ready for the workflow reducer.",
             "failed": "The activity hit an execution error. Use error_kind=fatal or configuration when retry would not help.",

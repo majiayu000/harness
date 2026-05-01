@@ -39,6 +39,10 @@ fn reduce_success(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
+    if let Some(decision) = workflow_decision_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
         return Some(decision);
     }
@@ -85,6 +89,21 @@ fn reduce_success(
             .with_evidence(runtime_completion_evidence(event, result))
             .high_confidence(),
     )
+}
+
+fn workflow_decision_from_activity_result(
+    _instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "workflow_decision")
+        .find_map(|artifact| {
+            serde_json::from_value::<WorkflowDecision>(artifact.artifact.clone()).ok()
+        })
+        .map(|decision| decision.with_evidence(runtime_completion_evidence(event, result)))
 }
 
 fn bind_pr_from_activity_result(

@@ -346,6 +346,113 @@ fn runtime_completion_reducer_binds_pr_from_structured_pull_request_artifact() {
 }
 
 #[test]
+fn runtime_completion_reducer_accepts_structured_workflow_decision_artifact() {
+    let instance = issue_instance("pr_open");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "pr_open",
+        "wait_for_pr_feedback",
+        "awaiting_feedback",
+        "PR feedback check completed without actionable feedback.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "Waiting for fresh PR feedback.",
+        "wait-feedback-1",
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "pr_feedback",
+        "No actionable feedback found.",
+    ))
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        "inspect_pr_feedback",
+        "No actionable PR feedback was found.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("structured workflow decision artifact should reduce");
+
+    assert_eq!(decision.decision, "wait_for_pr_feedback");
+    assert_eq!(decision.next_state, "awaiting_feedback");
+    assert_eq!(decision.commands.len(), 1);
+    assert!(decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "runtime_completion"));
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("structured workflow decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_returns_invalid_structured_workflow_decision_for_audit() {
+    let instance = issue_instance("pr_open");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "implementing",
+        "wait_for_pr_feedback",
+        "awaiting_feedback",
+        "This decision observed the wrong state.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "Waiting for fresh PR feedback.",
+        "wait-feedback-1",
+    ));
+    let result = ActivityResult::succeeded(
+        "inspect_pr_feedback",
+        "No actionable PR feedback was found.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("invalid structured workflow decision should still be returned");
+
+    let error = DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect_err("validator should reject stale observed state");
+    assert_eq!(error.kind, WorkflowDecisionRejectionKind::StateMismatch);
+}
+
+#[test]
 fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
     let instance = issue_instance("implementing").with_data(json!({
         "runtime_retry_policy": {

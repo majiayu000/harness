@@ -39,6 +39,8 @@ Implemented now:
   reconciliation activities
 - runtime completion reducer can retry failed activities when the workflow instance declares a
   bounded retry policy
+- runtime completion reducer can apply validated `workflow_decision` artifacts returned by
+  activity results before falling back to built-in reducer mappings
 - `WORKFLOW.md` can define a global failed activity retry budget and activity-specific retry
   overrides that are copied into workflow runtime instance data
 - runtime command dispatch can select runtime profiles per workflow/activity pair, then activity,
@@ -599,6 +601,8 @@ Implemented now:
 - successful `implement_issue` completion can bind a PR and move GitHub issue workflows from
   `implementing` to `pr_open` when the activity result includes a structured `pull_request`
   artifact
+- successful activity results can return a structured `workflow_decision` artifact; the runtime
+  worker records it only after the normal transition validator accepts it
 - successful repo backlog dispatch and reconciliation activity completion moves `dispatching` and
   `reconciling` backlog workflows back to `idle`
 - failed, blocked, and cancelled activity results transition workflows to `failed`, `blocked`, or
@@ -627,6 +631,8 @@ Tests:
 
 - reducer resumes implementation after replan completion
 - reducer binds PR metadata from structured `pull_request` artifacts on implementation completion
+- reducer returns structured `workflow_decision` artifacts so normal validation can accept or reject
+  agent-proposed workflow transitions
 - reducer idles repo backlog workflows after dispatch and reconciliation completion
 - reducer ignores unmapped successful activity completions
 - reducer retries a failed activity until the configured retry budget is exhausted
