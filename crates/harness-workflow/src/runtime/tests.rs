@@ -138,6 +138,23 @@ fn plan_issue_decision_blocks_repeated_replan() {
 }
 
 #[test]
+fn decision_validator_lists_allowed_transitions_from_state() {
+    let validator = DecisionValidator::github_issue_pr();
+    let rules = validator
+        .transition_rules_from("ready_to_merge")
+        .collect::<Vec<_>>();
+
+    assert!(rules.iter().any(|rule| rule.to_state == "done"
+        && rule
+            .allowed_commands
+            .contains(&WorkflowCommandType::MarkDone)));
+    assert!(rules.iter().any(|rule| rule.to_state == "blocked"
+        && rule
+            .allowed_commands
+            .contains(&WorkflowCommandType::MarkBlocked)));
+}
+
+#[test]
 fn pr_detected_decision_binds_pr_from_implementation() {
     let instance = issue_instance("implementing");
     let output = build_pr_detected_decision(

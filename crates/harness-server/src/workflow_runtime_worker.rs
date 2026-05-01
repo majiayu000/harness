@@ -6,9 +6,9 @@ use chrono::Duration;
 use harness_core::config::agents::SandboxMode;
 use harness_core::types::{AgentId, Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, ActivitySignal, RuntimeJob, RuntimeJobExecutor,
-    RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker, WorkflowDefinition,
-    WorkflowInstance, WorkflowSubject,
+    ActivityArtifact, ActivityResult, ActivitySignal, DecisionValidator, RuntimeJob,
+    RuntimeJobExecutor, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker,
+    WorkflowDefinition, WorkflowInstance, WorkflowSubject,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -601,6 +601,7 @@ fn activity_result_schema(job: &RuntimeJob, workflow: Option<&WorkflowInstance>)
         .unwrap_or("unknown");
     let transition_contract = activity_transition_contract(workflow_definition, &activity);
     let summary_contract = agent_summary_contract(workflow_definition, &activity);
+    let decision_contract = workflow_decision_contract(workflow);
     json!({
         "schema": "harness.runtime.activity_result.v1",
         "activity": activity,
@@ -624,8 +625,57 @@ fn activity_result_schema(job: &RuntimeJob, workflow: Option<&WorkflowInstance>)
             "cancelled": "The activity was intentionally stopped.",
         },
         "transition_contract": transition_contract,
+        "workflow_decision_contract": decision_contract,
         "agent_summary_contract": summary_contract,
     })
+}
+
+fn workflow_decision_contract(workflow: Option<&WorkflowInstance>) -> Value {
+    let Some(workflow) = workflow else {
+        return json!({
+            "available": false,
+            "reason": "No workflow instance was loaded for this runtime job."
+        });
+    };
+    let Some(validator) = decision_validator_for_definition(&workflow.definition_id) else {
+        return json!({
+            "available": false,
+            "workflow_id": workflow.id.as_str(),
+            "workflow_definition": workflow.definition_id.as_str(),
+            "observed_state": workflow.state.as_str(),
+            "reason": "No transition validator is registered for this workflow definition."
+        });
+    };
+    let allowed_transitions = validator
+        .transition_rules_from(&workflow.state)
+        .map(|rule| {
+            let allowed_commands = rule
+                .allowed_commands
+                .iter()
+                .map(|command| command.as_str())
+                .collect::<Vec<_>>();
+            json!({
+                "from_state": rule.from_state.as_deref().unwrap_or("*"),
+                "next_state": rule.to_state.as_str(),
+                "allowed_commands": allowed_commands,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "available": true,
+        "workflow_id": workflow.id.as_str(),
+        "workflow_definition": workflow.definition_id.as_str(),
+        "observed_state": workflow.state.as_str(),
+        "allowed_transitions": allowed_transitions,
+    })
+}
+
+fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
+    match definition_id {
+        "github_issue_pr" => Some(DecisionValidator::github_issue_pr()),
+        "repo_backlog" => Some(DecisionValidator::repo_backlog()),
+        _ => None,
+    }
 }
 
 fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Value {

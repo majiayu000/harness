@@ -80,6 +80,17 @@ impl TransitionAllowlist {
             .find(|rule| rule.matches(from_state, to_state))
     }
 
+    pub fn rules_from<'a>(
+        &'a self,
+        from_state: &'a str,
+    ) -> impl Iterator<Item = &'a TransitionRule> + 'a {
+        self.rules.iter().filter(move |rule| {
+            rule.from_state
+                .as_deref()
+                .is_none_or(|rule_from| rule_from == from_state)
+        })
+    }
+
     pub fn github_issue_pr_defaults() -> Self {
         use WorkflowCommandType::{
             BindPr, EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
@@ -381,6 +392,13 @@ impl DecisionValidator {
         };
 
         self.validate_commands(rule, decision, context)
+    }
+
+    pub fn transition_rules_from<'a>(
+        &'a self,
+        from_state: &'a str,
+    ) -> impl Iterator<Item = &'a TransitionRule> + 'a {
+        self.allowlist.rules_from(from_state)
     }
 
     fn validate_commands(

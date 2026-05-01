@@ -1200,6 +1200,15 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
             ["workflow_decision"]["allowed_confidence"][2],
         "high"
     );
+    let decision_contract =
+        &events[1].event["prompt_packet"]["activity_result_schema"]["workflow_decision_contract"];
+    assert_eq!(decision_contract["workflow_id"], "issue-124");
+    assert_eq!(decision_contract["observed_state"], "implementing");
+    assert!(decision_contract["allowed_transitions"]
+        .as_array()
+        .expect("allowed transitions should be an array")
+        .iter()
+        .any(|transition| transition["next_state"] == "pr_open"));
     let prompt_packet_digest = events[1].event["prompt_packet_digest"]
         .as_str()
         .expect("prompt packet digest should be recorded");

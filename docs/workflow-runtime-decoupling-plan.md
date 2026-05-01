@@ -62,6 +62,8 @@ Implemented now:
   runtime agent which summary fields and reducer transitions apply to the current activity
 - server runtime workers can parse a final fenced `harness-activity-result` JSON block from
   completed agent turns when the structured activity name matches the runtime job activity
+- prompt packets include the current workflow decision contract with validator-derived allowed
+  next states and command types for structured `workflow_decision` artifacts
 
 Still intentionally not moved yet:
 
@@ -293,6 +295,8 @@ Implemented now:
   workflow/activity pairs such as `implement_issue`, `replan_issue`, and `address_pr_feedback`
 - agent prompts instruct runtimes to return optional structured activity output in a final fenced
   `harness-activity-result` JSON block, and mismatched activity names are ignored
+- prompt packets include validator-derived `workflow_decision_contract` data when a workflow
+  instance is available, so agents can propose only visible next states and command types
 - runtime events persist `RuntimePromptPrepared` with `prompt_packet_digest` and the redacted packet
 - agent-backed activity results include a `runtime_prompt_packet` artifact that references the
   digest used for the turn
