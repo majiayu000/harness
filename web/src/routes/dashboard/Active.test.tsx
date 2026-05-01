@@ -266,15 +266,30 @@ describe("<Active>", () => {
                         command_id: "command-1",
                         runtime_kind: "codex_jsonrpc",
                         runtime_profile: "codex-high",
-                        status: "pending",
+                        status: "failed",
                         input: {},
                         not_before: "2026-04-30T00:05:00Z",
                         runtime_event_count: 2,
-                        latest_runtime_event_type: "ActivityResultReady",
+                        latest_runtime_event_type: "ActivityFailed",
                         prompt_packet_digest:
                           "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                         created_at: "2026-04-30T00:00:00Z",
-                        updated_at: "2026-04-30T00:00:00Z",
+                        updated_at: "2026-04-30T00:01:00Z",
+                      },
+                      {
+                        id: "job-2",
+                        command_id: "command-1",
+                        runtime_kind: "codex_jsonrpc",
+                        runtime_profile: "codex-high",
+                        status: "running",
+                        input: {},
+                        not_before: null,
+                        runtime_event_count: 3,
+                        latest_runtime_event_type: "ActivityStarted",
+                        prompt_packet_digest:
+                          "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                        created_at: "2026-04-30T00:02:00Z",
+                        updated_at: "2026-04-30T00:03:00Z",
                       },
                     ],
                     created_at: "2026-04-30T00:00:00Z",
@@ -299,7 +314,7 @@ describe("<Active>", () => {
     expect(screen.getByText("activity: replan_issue")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "1 jobs - pending - not before 2026-04-30T00:05:00Z - event ActivityResultReady - prompt 0123456789ab",
+        "2 jobs - running - event ActivityStarted - prompt abcdef012345",
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("rejected: replan limit exhausted")).toBeInTheDocument();

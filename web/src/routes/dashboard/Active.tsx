@@ -8,6 +8,7 @@ import type {
   Task,
   WorkflowRuntimeCommandNode,
   WorkflowRuntimeDecisionRecord,
+  WorkflowRuntimeJob,
   WorkflowRuntimeTreeNode,
   WorkflowRuntimeTreePayload,
   WorkflowSummary,
@@ -106,8 +107,25 @@ function commandLabel(command: WorkflowRuntimeCommandNode): string {
   return command.command.command_type.replaceAll("_", " ");
 }
 
+function timestampValue(value?: string | null): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function runtimeJobUpdatedAt(job: WorkflowRuntimeJob): number {
+  return Math.max(timestampValue(job.updated_at), timestampValue(job.created_at));
+}
+
+function latestRuntimeJob(command: WorkflowRuntimeCommandNode): WorkflowRuntimeJob | null {
+  return command.runtime_jobs.reduce<WorkflowRuntimeJob | null>((latest, job) => {
+    if (!latest) return job;
+    return runtimeJobUpdatedAt(job) >= runtimeJobUpdatedAt(latest) ? job : latest;
+  }, null);
+}
+
 function runtimeJobLabel(command: WorkflowRuntimeCommandNode): string {
-  const job = command.runtime_jobs[0];
+  const job = latestRuntimeJob(command);
   if (!job) return `${command.runtime_jobs.length} jobs`;
   const notBefore = job.not_before ? ` - not before ${job.not_before}` : "";
   const latestEvent = job.latest_runtime_event_type ? ` - event ${job.latest_runtime_event_type}` : "";
