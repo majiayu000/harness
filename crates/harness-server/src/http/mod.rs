@@ -44,8 +44,8 @@ pub use state::{
 // Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
 pub(crate) use misc_routes::{
     get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
-    github_webhook, handle_rpc, health_check, ingest_signal, intake_status, password_reset,
-    project_queue_stats,
+    get_workflow_runtime_tree, github_webhook, handle_rpc, health_check, ingest_signal,
+    intake_status, password_reset, project_queue_stats,
 };
 pub(crate) use sse_routes::stream_task_sse;
 pub(crate) use task_query_routes::{get_task, get_task_artifacts, get_task_prompts, list_tasks};
@@ -176,6 +176,14 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Periodically sweep issue workflows with attached PRs and automatically
     // enqueue `pr:N` tasks so PR feedback is handled without manual resubmission.
     background::spawn_issue_workflow_feedback_sweeper(&state);
+
+    // Optionally convert workflow command outbox rows into runtime jobs.
+    // Workflow runtime execution remains opt-in while the migration is staged.
+    background::spawn_runtime_command_dispatcher(&state);
+
+    // Optionally execute pending workflow runtime jobs through registered agent
+    // runtimes. This is also disabled by default while workflow mode is opt-in.
+    background::spawn_runtime_job_workers(&state);
 
     let initial_grade = {
         let events = state

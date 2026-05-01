@@ -9,4 +9,5 @@ pub mod issue_lifecycle;
 pub mod issue_workflow_store;
 pub mod plan_db;
 pub mod project_lifecycle;
+pub mod runtime;
 pub mod task_queue;

@@ -1,7 +1,15 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiJson, apiFetch } from "./api";
-import type { DashboardPayload, FullTask, OperatorSnapshotPayload, OverviewPayload, StreamItem, Task } from "@/types";
+import type {
+  DashboardPayload,
+  FullTask,
+  OperatorSnapshotPayload,
+  OverviewPayload,
+  StreamItem,
+  Task,
+  WorkflowRuntimeTreePayload,
+} from "@/types";
 
 export function useDashboard() {
   return useQuery<DashboardPayload, Error>({
@@ -31,6 +39,22 @@ export function useTasks() {
     // Task list/detail/stream routes are exposed at `/tasks`; only aggregate
     // dashboard endpoints are mounted under `/api/*`.
     queryFn: ({ signal }) => apiJson<Task[]>("/tasks", { signal }),
+  });
+}
+
+export function useWorkflowRuntimeTree(projectId?: string | null) {
+  return useQuery<WorkflowRuntimeTreePayload, Error>({
+    queryKey: ["workflow-runtime-tree", projectId ?? null],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams();
+      params.set("limit", "100");
+      if (projectId) params.set("project_id", projectId);
+      return apiJson<WorkflowRuntimeTreePayload>(`/api/workflows/runtime/tree?${params}`, {
+        signal,
+      });
+    },
+    retry: false,
+    refetchInterval: 30_000,
   });
 }
 

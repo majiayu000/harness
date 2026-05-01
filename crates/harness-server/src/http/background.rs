@@ -5,6 +5,10 @@ use crate::task_runner;
 use harness_workflow::issue_lifecycle::{
     is_feedback_claim_placeholder, workflow_id, IssueLifecycleState, IssueWorkflowInstance,
 };
+use harness_workflow::runtime::{
+    CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
+    RuntimeProfileSelector,
+};
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     let (issue_from_external_id, pr_from_external_id) = task
@@ -81,6 +85,31 @@ fn build_recovered_request(
         }
     }
     req
+}
+
+async fn record_runtime_recovery_requested(
+    state: &Arc<AppState>,
+    project_root: &std::path::Path,
+    task: &task_runner::TaskState,
+    issue_number: Option<u64>,
+    recovery_kind: &'static str,
+) {
+    let Some(issue_number) = issue_number else {
+        return;
+    };
+    let reason = format!("startup {recovery_kind} recovery requested redispatch");
+    crate::workflow_runtime_repo_backlog::record_stale_active_workflow(
+        state.core.workflow_runtime_store.as_deref(),
+        crate::workflow_runtime_repo_backlog::StaleWorkflowRuntimeContext {
+            project_root,
+            repo: task.repo.as_deref(),
+            issue_number,
+            active_task_id: Some(task.id.as_str()),
+            observed_state: task.status.as_ref(),
+            reason: &reason,
+        },
+    )
+    .await;
 }
 
 fn task_has_restart_safe_prompt(task: &task_runner::TaskState) -> bool {
@@ -402,11 +431,318 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                         permit,
                         state.intake.completion_callback.clone(),
                         state.core.issue_workflow_store.clone(),
+                        state.core.workflow_runtime_store.clone(),
+                        state
+                            .core
+                            .server
+                            .config
+                            .server
+                            .allowed_project_roots
+                            .clone(),
                         None,
                     )
                     .await;
                 });
             }
+        }
+    });
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RuntimeCommandDispatchTick {
+    pub enqueued: usize,
+    pub already_dispatched: usize,
+    pub skipped: usize,
+}
+
+impl RuntimeCommandDispatchTick {
+    fn from_outcomes(outcomes: &[CommandDispatchOutcome]) -> Self {
+        let mut tick = Self::default();
+        for outcome in outcomes {
+            match outcome {
+                CommandDispatchOutcome::Enqueued { .. } => tick.enqueued += 1,
+                CommandDispatchOutcome::AlreadyDispatched { .. } => tick.already_dispatched += 1,
+                CommandDispatchOutcome::Skipped { .. } => tick.skipped += 1,
+            }
+        }
+        tick
+    }
+
+    fn touched_anything(&self) -> bool {
+        self.enqueued > 0 || self.already_dispatched > 0 || self.skipped > 0
+    }
+}
+
+pub(super) async fn run_runtime_command_dispatch_tick(
+    state: &Arc<AppState>,
+    runtime_profiles: impl Into<RuntimeProfileSelector>,
+    batch_limit: i64,
+) -> anyhow::Result<RuntimeCommandDispatchTick> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(RuntimeCommandDispatchTick::default());
+    };
+    let outcomes = RuntimeCommandDispatcher::with_profile_selector(store, runtime_profiles.into())
+        .with_batch_limit(batch_limit)
+        .dispatch_pending()
+        .await?;
+    Ok(RuntimeCommandDispatchTick::from_outcomes(&outcomes))
+}
+
+fn runtime_kind_from_config(value: &str) -> Option<RuntimeKind> {
+    match value {
+        "codex_exec" => Some(RuntimeKind::CodexExec),
+        "codex_jsonrpc" => Some(RuntimeKind::CodexJsonrpc),
+        "claude_code" => Some(RuntimeKind::ClaudeCode),
+        "anthropic_api" => Some(RuntimeKind::AnthropicApi),
+        "remote_host" => Some(RuntimeKind::RemoteHost),
+        _ => None,
+    }
+}
+
+fn runtime_dispatch_profile(
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> RuntimeProfile {
+    let kind = runtime_kind_from_config(&policy.runtime_kind).unwrap_or_else(|| {
+        tracing::warn!(
+            runtime_kind = policy.runtime_kind,
+            "workflow runtime command dispatcher: unknown runtime_kind, falling back to codex_jsonrpc"
+        );
+        RuntimeKind::CodexJsonrpc
+    });
+    let mut profile = RuntimeProfile::new(policy.runtime_profile.clone(), kind);
+    profile.model = policy.model.clone();
+    profile.reasoning_effort = policy.reasoning_effort.clone();
+    profile.sandbox = policy.sandbox.clone();
+    profile.approval_policy = runtime_kind_supports_approval_policy(kind)
+        .then(|| policy.approval_policy.clone())
+        .flatten();
+    profile.max_turns = policy.max_turns;
+    profile.timeout_secs = policy.timeout_secs;
+    profile
+}
+
+fn runtime_dispatch_profile_selector(
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> RuntimeProfileSelector {
+    let default_profile = runtime_dispatch_profile(policy);
+    let workflow_profiles = policy
+        .workflow_profiles
+        .iter()
+        .map(|(definition_id, override_policy)| {
+            (
+                definition_id.clone(),
+                apply_runtime_dispatch_profile_override(&default_profile, override_policy),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let activity_profiles = policy
+        .activity_profiles
+        .iter()
+        .map(|(activity, override_policy)| {
+            (
+                activity.clone(),
+                apply_runtime_dispatch_profile_override(&default_profile, override_policy),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut selector = RuntimeProfileSelector::new(default_profile.clone());
+    for (definition_id, profile) in &workflow_profiles {
+        selector = selector.with_workflow_profile(definition_id.clone(), profile.clone());
+    }
+    for (activity, profile) in &activity_profiles {
+        selector = selector.with_activity_profile(activity.clone(), profile.clone());
+    }
+    for (definition_id, activity_overrides) in &policy.workflow_activity_profiles {
+        for (activity, override_policy) in activity_overrides {
+            let base_profile = activity_profiles
+                .get(activity)
+                .or_else(|| workflow_profiles.get(definition_id))
+                .unwrap_or(&default_profile);
+            let profile = apply_runtime_dispatch_profile_override(base_profile, override_policy);
+            selector = selector.with_workflow_activity_profile(
+                definition_id.clone(),
+                activity.clone(),
+                profile,
+            );
+        }
+    }
+    selector
+}
+
+fn apply_runtime_dispatch_profile_override(
+    default_profile: &RuntimeProfile,
+    override_policy: &harness_core::config::workflow::RuntimeDispatchProfileOverride,
+) -> RuntimeProfile {
+    let kind = override_policy
+        .runtime_kind
+        .as_deref()
+        .and_then(runtime_kind_from_config)
+        .unwrap_or(default_profile.kind);
+    let profile_name = override_policy
+        .runtime_profile
+        .clone()
+        .unwrap_or_else(|| default_profile.name.clone());
+    let mut profile = RuntimeProfile::new(profile_name, kind);
+    profile.model = override_policy
+        .model
+        .clone()
+        .or_else(|| default_profile.model.clone());
+    profile.reasoning_effort = override_policy
+        .reasoning_effort
+        .clone()
+        .or_else(|| default_profile.reasoning_effort.clone());
+    profile.sandbox = override_policy
+        .sandbox
+        .clone()
+        .or_else(|| default_profile.sandbox.clone());
+    profile.approval_policy =
+        runtime_dispatch_approval_policy(default_profile, override_policy, kind);
+    profile.max_turns = override_policy.max_turns.or(default_profile.max_turns);
+    profile.timeout_secs = override_policy
+        .timeout_secs
+        .or(default_profile.timeout_secs);
+    profile
+}
+
+fn runtime_dispatch_approval_policy(
+    default_profile: &RuntimeProfile,
+    override_policy: &harness_core::config::workflow::RuntimeDispatchProfileOverride,
+    kind: RuntimeKind,
+) -> Option<String> {
+    runtime_kind_supports_approval_policy(kind)
+        .then(|| {
+            override_policy
+                .approval_policy
+                .clone()
+                .or_else(|| default_profile.approval_policy.clone())
+        })
+        .flatten()
+}
+
+fn runtime_kind_supports_approval_policy(kind: RuntimeKind) -> bool {
+    matches!(kind, RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc)
+}
+
+pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
+    if state.core.workflow_runtime_store.is_none() {
+        tracing::debug!("workflow runtime command dispatcher disabled: store unavailable");
+        return;
+    }
+
+    let weak_state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let state = match weak_state.upgrade() {
+                Some(state) => state,
+                None => break,
+            };
+            let workflow_cfg =
+                harness_core::config::workflow::load_workflow_config(&state.core.project_root)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "workflow runtime command dispatcher: failed to load WORKFLOW.md, using default config: {e}"
+                        );
+                        harness_core::config::workflow::WorkflowConfig::default()
+                    });
+            let policy = workflow_cfg.runtime_dispatch;
+            let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
+            if policy.enabled {
+                let profile_selector = runtime_dispatch_profile_selector(&policy);
+                match run_runtime_command_dispatch_tick(
+                    &state,
+                    profile_selector,
+                    i64::from(policy.batch_limit.max(1)),
+                )
+                .await
+                {
+                    Ok(tick) if tick.touched_anything() => {
+                        tracing::info!(
+                            enqueued = tick.enqueued,
+                            already_dispatched = tick.already_dispatched,
+                            skipped = tick.skipped,
+                            "workflow runtime command dispatcher tick complete"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("workflow runtime command dispatcher tick failed: {e}");
+                    }
+                }
+            } else {
+                tracing::debug!("workflow runtime command dispatcher disabled by WORKFLOW.md");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+fn runtime_worker_lease_ttl(
+    policy: &harness_core::config::workflow::RuntimeWorkerPolicy,
+) -> chrono::Duration {
+    let lease_ttl_secs = i64::try_from(policy.lease_ttl_secs.max(1)).unwrap_or(i64::MAX);
+    chrono::Duration::seconds(lease_ttl_secs)
+}
+
+pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
+    if state.core.workflow_runtime_store.is_none() {
+        tracing::debug!("workflow runtime job workers disabled: store unavailable");
+        return;
+    }
+
+    let weak_state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let state = match weak_state.upgrade() {
+                Some(state) => state,
+                None => break,
+            };
+            let workflow_cfg =
+                harness_core::config::workflow::load_workflow_config(&state.core.project_root)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "workflow runtime job workers: failed to load WORKFLOW.md, using default config: {e}"
+                        );
+                        harness_core::config::workflow::WorkflowConfig::default()
+                    });
+            let policy = workflow_cfg.runtime_worker;
+            let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
+            if policy.enabled {
+                let concurrency = policy.concurrency.max(1);
+                let lease_ttl = runtime_worker_lease_ttl(&policy);
+                let mut handles = Vec::with_capacity(concurrency as usize);
+                for worker_idx in 0..concurrency {
+                    let state = state.clone();
+                    let owner = format!("server-runtime-worker-{worker_idx}");
+                    handles.push(tokio::spawn(async move {
+                        crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+                            &state, owner, lease_ttl,
+                        )
+                        .await
+                    }));
+                }
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(tick)) if tick.touched_anything() => {
+                            tracing::info!(
+                                succeeded = tick.succeeded,
+                                failed = tick.failed,
+                                cancelled = tick.cancelled,
+                                "workflow runtime job worker tick complete"
+                            );
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!("workflow runtime job worker tick failed: {e}");
+                        }
+                        Err(e) => {
+                            tracing::warn!("workflow runtime job worker task panicked: {e}");
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!("workflow runtime job workers disabled by WORKFLOW.md");
+            }
+            tokio::time::sleep(interval).await;
         }
     });
 }
@@ -884,6 +1220,14 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
                     permit,
                     state.intake.completion_callback.clone(),
                     state.core.issue_workflow_store.clone(),
+                    state.core.workflow_runtime_store.clone(),
+                    state
+                        .core
+                        .server
+                        .config
+                        .server
+                        .allowed_project_roots
+                        .clone(),
                     None,
                 )
                 .await;
@@ -1122,6 +1466,14 @@ pub(super) fn spawn_system_task_recovery(state: &Arc<AppState>) {
                     permit,
                     state.intake.completion_callback.clone(),
                     state.core.issue_workflow_store.clone(),
+                    state.core.workflow_runtime_store.clone(),
+                    state
+                        .core
+                        .server
+                        .config
+                        .server
+                        .allowed_project_roots
+                        .clone(),
                     None,
                 )
                 .await;
@@ -1262,6 +1614,14 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     }
                 };
                 let project_id = canonical.to_string_lossy().into_owned();
+                record_runtime_recovery_requested(
+                    &state,
+                    &canonical,
+                    &task,
+                    issue_num,
+                    "checkpoint",
+                )
+                .await;
 
                 let permit = match state
                     .concurrency
@@ -1357,6 +1717,14 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     permit,
                     state.intake.completion_callback.clone(),
                     state.core.issue_workflow_store.clone(),
+                    state.core.workflow_runtime_store.clone(),
+                    state
+                        .core
+                        .server
+                        .config
+                        .server
+                        .allowed_project_roots
+                        .clone(),
                     None,
                 )
                 .await;
@@ -1497,6 +1865,7 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
                 }
             };
             let project_id = canonical.to_string_lossy().into_owned();
+            record_runtime_recovery_requested(&state, &canonical, &task, issue, "orphan").await;
 
             let queue = match recovery_queue_domain(task.task_kind) {
                 task_routes::QueueDomain::Primary => state.concurrency.task_queue.clone(),
@@ -1582,6 +1951,14 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
                 permit,
                 state.intake.completion_callback.clone(),
                 state.core.issue_workflow_store.clone(),
+                state.core.workflow_runtime_store.clone(),
+                state
+                    .core
+                    .server
+                    .config
+                    .server
+                    .allowed_project_roots
+                    .clone(),
                 None,
             )
             .await;
@@ -1594,6 +1971,135 @@ mod tests {
     use super::*;
 
     const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn runtime_dispatch_profile_selector_applies_workflow_overrides() {
+        let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: "claude_code".to_string(),
+            runtime_profile: "claude-default".to_string(),
+            model: Some("claude-sonnet-4-6".to_string()),
+            timeout_secs: Some(600),
+            ..Default::default()
+        };
+        policy.workflow_profiles.insert(
+            "github_issue_pr".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: Some("codex_exec".to_string()),
+                runtime_profile: Some("codex-high".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                timeout_secs: Some(1200),
+                ..Default::default()
+            },
+        );
+        policy.workflow_profiles.insert(
+            "repo_backlog".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: None,
+                runtime_profile: Some("codex-backlog".to_string()),
+                ..Default::default()
+            },
+        );
+        policy.activity_profiles.insert(
+            "replan_issue".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: Some("codex_jsonrpc".to_string()),
+                runtime_profile: Some("codex-replan".to_string()),
+                model: Some("gpt-5.4-mini".to_string()),
+                ..Default::default()
+            },
+        );
+        policy.workflow_activity_profiles.insert(
+            "github_issue_pr".to_string(),
+            std::collections::BTreeMap::from([(
+                "replan_issue".to_string(),
+                harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                    runtime_profile: Some("codex-issue-replan".to_string()),
+                    model: Some("gpt-5.5".to_string()),
+                    timeout_secs: Some(900),
+                    ..Default::default()
+                },
+            )]),
+        );
+
+        let selector = runtime_dispatch_profile_selector(&policy);
+        let issue_profile = selector.select_for_workflow(Some("github_issue_pr"));
+        assert_eq!(issue_profile.kind, RuntimeKind::CodexExec);
+        assert_eq!(issue_profile.name, "codex-high");
+        assert_eq!(issue_profile.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(issue_profile.timeout_secs, Some(1200));
+        let replan_profile = selector.select(Some("github_issue_pr"), Some("replan_issue"));
+        assert_eq!(replan_profile.kind, RuntimeKind::CodexJsonrpc);
+        assert_eq!(replan_profile.name, "codex-issue-replan");
+        assert_eq!(replan_profile.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(replan_profile.timeout_secs, Some(900));
+        let global_replan_profile = selector.select(Some("repo_backlog"), Some("replan_issue"));
+        assert_eq!(global_replan_profile.kind, RuntimeKind::CodexJsonrpc);
+        assert_eq!(global_replan_profile.name, "codex-replan");
+        assert_eq!(global_replan_profile.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(global_replan_profile.timeout_secs, Some(600));
+        let backlog_profile = selector.select_for_workflow(Some("repo_backlog"));
+        assert_eq!(backlog_profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(backlog_profile.name, "codex-backlog");
+        assert_eq!(backlog_profile.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(backlog_profile.timeout_secs, Some(600));
+        let default_profile = selector.select_for_workflow(Some("quality_gate"));
+        assert_eq!(default_profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(default_profile.name, "claude-default");
+        assert_eq!(default_profile.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(default_profile.timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn runtime_dispatch_profile_selector_drops_codex_approval_for_non_codex_override() {
+        let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: "codex_jsonrpc".to_string(),
+            runtime_profile: "codex-default".to_string(),
+            approval_policy: Some("on-request".to_string()),
+            ..Default::default()
+        };
+        policy.workflow_profiles.insert(
+            "claude_review".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: Some("claude_code".to_string()),
+                runtime_profile: Some("claude-review".to_string()),
+                approval_policy: Some("never".to_string()),
+                ..Default::default()
+            },
+        );
+        policy.workflow_profiles.insert(
+            "codex_review".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_profile: Some("codex-review".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let selector = runtime_dispatch_profile_selector(&policy);
+        let claude_profile = selector.select_for_workflow(Some("claude_review"));
+        assert_eq!(claude_profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(claude_profile.name, "claude-review");
+        assert_eq!(claude_profile.approval_policy, None);
+
+        let codex_profile = selector.select_for_workflow(Some("codex_review"));
+        assert_eq!(codex_profile.kind, RuntimeKind::CodexJsonrpc);
+        assert_eq!(codex_profile.name, "codex-review");
+        assert_eq!(codex_profile.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    #[test]
+    fn runtime_dispatch_profile_drops_codex_approval_for_non_codex_default() {
+        let policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: "claude_code".to_string(),
+            runtime_profile: "claude-default".to_string(),
+            approval_policy: Some("on-request".to_string()),
+            ..Default::default()
+        };
+
+        let profile = runtime_dispatch_profile(&policy);
+        assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(profile.name, "claude-default");
+        assert_eq!(profile.approval_policy, None);
+    }
 
     // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in
     // reconciliation.rs, but with an injectable gh_bin so tests run without a live

@@ -3,9 +3,10 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
 use chrono::Utc;
+use harness_core::config::agents::SandboxMode;
 use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
-    types::Capability, types::TokenUsage, types::TurnFailure, types::TurnFailureKind,
+    types::Capability, types::Item, types::TokenUsage, types::TurnFailure, types::TurnFailureKind,
     types::TurnTelemetry,
 };
 use hmac::{Hmac, Mac};
@@ -24,6 +25,26 @@ impl CapturingAgent {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+struct RuntimeStreamAgent {
+    prompts: Mutex<Vec<String>>,
+    models: Mutex<Vec<Option<String>>>,
+    reasoning_efforts: Mutex<Vec<Option<String>>>,
+    sandbox_modes: Mutex<Vec<Option<SandboxMode>>>,
+    approval_policies: Mutex<Vec<Option<String>>>,
+}
+
+impl RuntimeStreamAgent {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            prompts: Mutex::new(Vec::new()),
+            models: Mutex::new(Vec::new()),
+            reasoning_efforts: Mutex::new(Vec::new()),
+            sandbox_modes: Mutex::new(Vec::new()),
+            approval_policies: Mutex::new(Vec::new()),
         })
     }
 }
@@ -108,6 +129,59 @@ impl CodeAgent for CapturingAgent {
         _req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CodeAgent for RuntimeStreamAgent {
+    fn name(&self) -> &str {
+        "runtime-stream-agent"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.models.lock().await.push(req.model.clone());
+        self.reasoning_efforts
+            .lock()
+            .await
+            .push(req.reasoning_effort.clone());
+        self.sandbox_modes.lock().await.push(req.sandbox_mode);
+        self.approval_policies
+            .lock()
+            .await
+            .push(req.approval_policy.clone());
+        self.prompts.lock().await.push(req.prompt);
+        Ok(successful_agent_response())
+    }
+
+    async fn execute_stream(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.models.lock().await.push(req.model.clone());
+        self.reasoning_efforts
+            .lock()
+            .await
+            .push(req.reasoning_effort.clone());
+        self.sandbox_modes.lock().await.push(req.sandbox_mode);
+        self.approval_policies
+            .lock()
+            .await
+            .push(req.approval_policy.clone());
+        self.prompts.lock().await.push(req.prompt);
+        let _ = tx
+            .send(StreamItem::ItemCompleted {
+                item: Item::AgentReasoning {
+                    content: "runtime done".to_string(),
+                },
+            })
+            .await;
+        let _ = tx.send(StreamItem::Done).await;
         Ok(())
     }
 }
@@ -225,6 +299,7 @@ async fn make_test_state_with_project_root(
         None,
         None,
         None,
+        None,
         vec![],
     );
     Ok(Arc::new(AppState {
@@ -240,6 +315,7 @@ async fn make_test_state_with_project_root(
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
             project_workflow_store: None,
+            workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -328,6 +404,95 @@ async fn make_test_state_with_issue_workflows(
             plan_cache: state.core.plan_cache.clone(),
             issue_workflow_store: Some(Arc::new(workflow_store)),
             project_workflow_store: None,
+            workflow_runtime_store: None,
+            project_registry: None,
+            runtime_state_store: None,
+            q_values: None,
+            maintenance_active: state.core.maintenance_active.clone(),
+        },
+        engines: crate::http::EngineServices {
+            skills: state.engines.skills.clone(),
+            rules: state.engines.rules.clone(),
+            gc_agent: state.engines.gc_agent.clone(),
+        },
+        observability: crate::http::ObservabilityServices {
+            events: state.observability.events.clone(),
+            signal_rate_limiter: state.observability.signal_rate_limiter.clone(),
+            password_reset_rate_limiter: state.observability.password_reset_rate_limiter.clone(),
+            review_store: None,
+        },
+        concurrency: crate::http::ConcurrencyServices {
+            task_queue: state.concurrency.task_queue.clone(),
+            review_task_queue: state.concurrency.review_task_queue.clone(),
+            workspace_mgr: None,
+        },
+        #[cfg(test)]
+        _db_state_guard: None,
+        runtime_hosts: state.runtime_hosts.clone(),
+        runtime_project_cache: state.runtime_project_cache.clone(),
+        runtime_state_persist_lock: tokio::sync::Mutex::new(()),
+        runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        notifications: crate::http::NotificationServices {
+            notification_tx: tokio::sync::broadcast::channel(32).0,
+            notification_lagged_total: Arc::new(AtomicU64::new(0)),
+            notification_lag_log_every: 1,
+            notify_tx: None,
+            initializing: Arc::new(AtomicBool::new(true)),
+            initialized: Arc::new(AtomicBool::new(true)),
+            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        },
+        interceptors: vec![],
+        startup_statuses: vec![],
+        degraded_subsystems: vec![],
+        intake: crate::http::IntakeServices {
+            feishu_intake: None,
+            github_pollers: vec![],
+            completion_callback: None,
+        },
+        project_svc: state.project_svc.clone(),
+        task_svc: state.task_svc.clone(),
+        execution_svc: state.execution_svc.clone(),
+    }))
+}
+
+async fn make_test_state_with_workflow_runtime(
+    dir: &std::path::Path,
+) -> anyhow::Result<Arc<AppState>> {
+    make_test_state_with_workflow_runtime_and_registry(
+        dir,
+        dir,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await
+}
+
+async fn make_test_state_with_workflow_runtime_and_registry(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    agent_registry: harness_agents::registry::AgentRegistry,
+) -> anyhow::Result<Arc<AppState>> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.database_url = Some(crate::test_helpers::test_database_url()?);
+    let state =
+        make_test_state_with_project_root(dir, project_root, config, agent_registry).await?;
+    let workflow_runtime_store =
+        harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir, "workflow_runtime"),
+            Some(&crate::test_helpers::test_database_url()?),
+        )
+        .await?;
+    Ok(Arc::new(AppState {
+        core: crate::http::CoreServices {
+            server: state.core.server.clone(),
+            project_root: state.core.project_root.clone(),
+            home_dir: state.core.home_dir.clone(),
+            tasks: state.core.tasks.clone(),
+            thread_db: state.core.thread_db.clone(),
+            plan_db: None,
+            plan_cache: state.core.plan_cache.clone(),
+            issue_workflow_store: None,
+            project_workflow_store: None,
+            workflow_runtime_store: Some(Arc::new(workflow_runtime_store)),
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -486,6 +651,15 @@ fn token_usage_app(state: Arc<AppState>) -> Router {
         .route(
             "/api/token-usage",
             get(crate::handlers::token_usage::token_usage),
+        )
+        .with_state(state)
+}
+
+fn workflow_runtime_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/api/workflows/runtime/tree",
+            get(get_workflow_runtime_tree),
         )
         .with_state(state)
 }
@@ -701,6 +875,820 @@ async fn health_degraded_when_subsystem_missing() -> anyhow::Result<()> {
     assert_eq!(health.status, "degraded");
     assert_eq!(health.persistence.degraded_subsystems, ["q_value_store"]);
     assert!(!health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        1,
+        "dispatching",
+        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+    )
+    .with_id("repo-backlog")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+    }));
+    let child = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "replanning",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:123"),
+    )
+    .with_id("issue-123")
+    .with_parent(parent.id.clone())
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 123,
+    }));
+    store.upsert_instance(&parent).await?;
+    store.upsert_instance(&child).await?;
+    let event = store
+        .append_event(
+            &child.id,
+            "PlanIssueRaised",
+            "workflow-runtime-test",
+            serde_json::json!({ "issue_number": 123 }),
+        )
+        .await?;
+    let decision = harness_workflow::runtime::WorkflowDecision::new(
+        child.id.clone(),
+        "replanning",
+        "run_replan",
+        "replanning",
+        "Replan requested after the budget was exhausted.",
+    );
+    let rejected = harness_workflow::runtime::WorkflowDecisionRecord::rejected(
+        decision,
+        Some(event.id),
+        "replan limit exhausted",
+    );
+    store.record_decision(&rejected).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "replan_issue",
+        "issue-123-replan-2",
+    );
+    let command_id = store
+        .enqueue_command(&child.id, Some(&rejected.id), &command)
+        .await?;
+    let not_before = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let runtime_job = store
+        .enqueue_runtime_job_with_not_before(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            serde_json::json!({ "workflow_id": child.id }),
+            Some(not_before),
+        )
+        .await?;
+    let prompt_packet_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    store
+        .record_runtime_event(
+            &runtime_job.id,
+            "RuntimePromptPrepared",
+            serde_json::json!({
+                "prompt_packet_digest": prompt_packet_digest,
+            }),
+        )
+        .await?;
+    store
+        .record_runtime_event(
+            &runtime_job.id,
+            "ActivityResultReady",
+            serde_json::json!({ "status": "succeeded" }),
+        )
+        .await?;
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["total_workflows"], 2);
+    assert_eq!(body["workflows"][0]["workflow"]["id"], "repo-backlog");
+    let child_node = &body["workflows"][0]["children"][0];
+    assert_eq!(child_node["workflow"]["id"], "issue-123");
+    assert_eq!(
+        child_node["decisions"][0]["rejection_reason"],
+        "replan limit exhausted"
+    );
+    assert_eq!(
+        child_node["commands"][0]["command"]["command"]["activity"],
+        "replan_issue"
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["runtime_profile"],
+        "codex-high"
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["not_before"],
+        serde_json::json!(not_before)
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["runtime_event_count"],
+        2
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["latest_runtime_event_type"],
+        "ActivityResultReady"
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["prompt_packet_digest"],
+        prompt_packet_digest
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "replanning",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:123"),
+    )
+    .with_id("issue-123")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 123,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "codex-high",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 1);
+    assert_eq!(tick.already_dispatched, 0);
+    assert_eq!(tick.skipped, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].runtime_profile, "codex-high");
+    assert_eq!(
+        store.commands_for(&workflow.id).await?[0].status,
+        "dispatched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let agent = RuntimeStreamAgent::new();
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", agent.clone());
+    let state =
+        make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
+            .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:124"),
+    )
+    .with_id("issue-124")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 124,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-1");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-default",
+        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+    );
+    runtime_profile.model = Some("gpt-runtime".to_string());
+    runtime_profile.reasoning_effort = Some("medium".to_string());
+    runtime_profile.sandbox = Some("read-only".to_string());
+    runtime_profile.approval_policy = Some("on-request".to_string());
+    runtime_profile.timeout_secs = Some(300);
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": workflow.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key,
+                "command": command.command,
+                "runtime_profile": runtime_profile,
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    assert_eq!(tick.cancelled, 0);
+    assert!(!tick.idle);
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    assert_eq!(
+        completed.status,
+        harness_workflow::runtime::RuntimeJobStatus::Succeeded
+    );
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "implement_issue");
+    assert_eq!(output.summary, "runtime done");
+    let events = store.runtime_events_for(&runtime_job.id).await?;
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].event_type, "RuntimeJobClaimed");
+    assert_eq!(events[1].event_type, "RuntimeTurnStarted");
+    assert_eq!(events[2].event_type, "RuntimePromptPrepared");
+    let prompt_event = &events[2];
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["schema"],
+        "harness.runtime.prompt_packet.v1"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["required_structured_output"]["validation_commands"],
+        "Validation commands run and their results."
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["schema"],
+        "harness.runtime.activity_result.v1"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["activity"],
+        "implement_issue"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["allowed_error_kinds"][1],
+        "fatal"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["transition_contract"]
+            ["on_succeeded"]["reducer_next_state"],
+        "unchanged_until_pr_detected"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
+            ["must_include"][2],
+        "PR URL or blocker"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
+            ["artifacts"]["pull_request"]["fields"][1],
+        "pr_url"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["optional_artifacts"]
+            ["workflow_decision"]["allowed_confidence"][2],
+        "high"
+    );
+    let decision_contract = &prompt_event.event["prompt_packet"]["activity_result_schema"]
+        ["workflow_decision_contract"];
+    assert_eq!(decision_contract["workflow_id"], "issue-124");
+    assert_eq!(decision_contract["observed_state"], "implementing");
+    assert!(decision_contract["allowed_transitions"]
+        .as_array()
+        .expect("allowed transitions should be an array")
+        .iter()
+        .any(|transition| transition["next_state"] == "pr_open"));
+    let prompt_packet_digest = prompt_event.event["prompt_packet_digest"]
+        .as_str()
+        .expect("prompt packet digest should be recorded");
+    assert_eq!(prompt_packet_digest.len(), 64);
+    assert_eq!(events[3].event_type, "ActivityResultReady");
+    let prompt_artifact = output
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "runtime_prompt_packet")
+        .expect("runtime output should reference the prompt packet");
+    assert_eq!(prompt_artifact.artifact["digest"], prompt_packet_digest);
+    let prompts = agent.prompts.lock().await;
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("You are executing a Harness workflow runtime job."));
+    assert!(prompts[0].contains("Activity: implement_issue"));
+    assert!(prompts[0].contains("Prompt packet:"));
+    assert!(prompts[0].contains("activity_result_schema"));
+    assert!(prompts[0].contains("required_structured_output"));
+    assert!(prompts[0].contains("gpt-runtime"));
+    drop(prompts);
+    let models = agent.models.lock().await;
+    assert_eq!(models.as_slice(), &[Some("gpt-runtime".to_string())]);
+    drop(models);
+    let reasoning_efforts = agent.reasoning_efforts.lock().await;
+    assert_eq!(reasoning_efforts.as_slice(), &[Some("medium".to_string())]);
+    drop(reasoning_efforts);
+    let sandbox_modes = agent.sandbox_modes.lock().await;
+    assert_eq!(sandbox_modes.as_slice(), &[Some(SandboxMode::ReadOnly)]);
+    drop(sandbox_modes);
+    let approval_policies = agent.approval_policies.lock().await;
+    assert_eq!(
+        approval_policies.as_slice(),
+        &[Some("on-request".to_string())]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        1,
+        "dispatching",
+        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+    )
+    .with_id("repo-backlog")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+    }));
+    store.upsert_instance(&parent).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:126",
+        "repo-backlog:owner/repo:issue:126:start",
+    );
+    let command_id = store.enqueue_command(&parent.id, None, &command).await?;
+    let activity = command.runtime_activity_key().to_string();
+    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-default",
+        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+    );
+    runtime_profile.max_turns = Some(0);
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": parent.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key.clone(),
+                "activity": activity,
+                "command": command.command.clone(),
+                "runtime_profile": runtime_profile,
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    assert_eq!(tick.cancelled, 0);
+    let child_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 126);
+    let child = store
+        .get_instance(&child_id)
+        .await?
+        .expect("child workflow should be created");
+    assert_eq!(child.state, "discovered");
+    assert_eq!(child.parent_workflow_id.as_deref(), Some("repo-backlog"));
+    assert_eq!(child.data["issue_number"], 126);
+    assert_eq!(child.data["started_by_runtime_job_id"], runtime_job.id);
+    let parent_after = store
+        .get_instance("repo-backlog")
+        .await?
+        .expect("parent workflow should still exist");
+    assert_eq!(parent_after.state, "idle");
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "start_child_workflow");
+    assert_eq!(
+        output.status,
+        harness_workflow::runtime::ActivityStatus::Succeeded
+    );
+    assert_eq!(
+        store
+            .runtime_turns_started_for_workflow(&parent.id, None)
+            .await?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_marks_bound_issue_done_without_agent_turn() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        1,
+        "reconciling",
+        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+    )
+    .with_id("repo-backlog-mark")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "last_issue_number": 127,
+        "last_pr_number": 77,
+        "last_pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    store.upsert_instance(&parent).await?;
+    let child_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 127);
+    let child = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:127"),
+    )
+    .with_id(child_id.clone())
+    .with_parent("repo-backlog-mark")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "issue_number": 127,
+    }));
+    store.upsert_instance(&child).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "mark_bound_issue_done",
+        "repo-backlog:owner/repo:pr:77:merged",
+    );
+    let command_id = store.enqueue_command(&parent.id, None, &command).await?;
+    let activity = command.runtime_activity_key().to_string();
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": parent.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key.clone(),
+                "activity": activity,
+                "command": command.command.clone(),
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    assert_eq!(tick.cancelled, 0);
+    let child_after = store
+        .get_instance(&child_id)
+        .await?
+        .expect("child workflow should still exist");
+    assert_eq!(child_after.state, "done");
+    assert_eq!(
+        child_after.parent_workflow_id.as_deref(),
+        Some("repo-backlog-mark")
+    );
+    assert_eq!(child_after.data["issue_number"], 127);
+    assert_eq!(child_after.data["pr_number"], 77);
+    assert_eq!(
+        child_after.data["pr_url"],
+        "https://github.com/owner/repo/pull/77"
+    );
+    assert_eq!(
+        child_after.data["started_by_runtime_job_id"],
+        runtime_job.id
+    );
+    let parent_after = store
+        .get_instance("repo-backlog-mark")
+        .await?
+        .expect("parent workflow should still exist");
+    assert_eq!(parent_after.state, "idle");
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "mark_bound_issue_done");
+    assert_eq!(
+        output.status,
+        harness_workflow::runtime::ActivityStatus::Succeeded
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_recovers_stale_issue_workflow_without_agent_turn() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        1,
+        "reconciling",
+        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+    )
+    .with_id("repo-backlog-recover")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "last_issue_number": 128,
+        "last_active_task_id": "task-128",
+        "last_observed_state": "implementing",
+        "last_recovery_reason": "active task disappeared during startup reconciliation",
+    }));
+    store.upsert_instance(&parent).await?;
+    let child_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 128);
+    let child = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:128"),
+    )
+    .with_id(child_id.clone())
+    .with_parent("repo-backlog-recover")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "issue_number": 128,
+    }));
+    store.upsert_instance(&child).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "recover_issue_workflow",
+        "repo-backlog:owner/repo:issue:128:recover",
+    );
+    let command_id = store.enqueue_command(&parent.id, None, &command).await?;
+    let activity = command.runtime_activity_key().to_string();
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": parent.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key.clone(),
+                "activity": activity,
+                "command": command.command.clone(),
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    assert_eq!(tick.cancelled, 0);
+    let child_after = store
+        .get_instance(&child_id)
+        .await?
+        .expect("child workflow should still exist");
+    assert_eq!(child_after.state, "scheduled");
+    assert_eq!(
+        child_after.parent_workflow_id.as_deref(),
+        Some("repo-backlog-recover")
+    );
+    assert_eq!(child_after.data["issue_number"], 128);
+    assert_eq!(child_after.data["previous_state"], "implementing");
+    assert_eq!(child_after.data["previous_active_task_id"], "task-128");
+    assert_eq!(
+        child_after.data["recovery_reason"],
+        "active task disappeared during startup reconciliation"
+    );
+    assert_eq!(
+        child_after.data["started_by_runtime_job_id"],
+        runtime_job.id
+    );
+    let parent_after = store
+        .get_instance("repo-backlog-recover")
+        .await?
+        .expect("parent workflow should still exist");
+    assert_eq!(parent_after.state, "idle");
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "recover_issue_workflow");
+    assert_eq!(
+        output.status,
+        harness_workflow::runtime::ActivityStatus::Succeeded
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", BlockingAgent::new());
+    let state =
+        make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
+            .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:125"),
+    )
+    .with_id("issue-125")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 125,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-2");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-default",
+        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+    );
+    runtime_profile.timeout_secs = Some(1);
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": workflow.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key,
+                "command": command.command,
+                "runtime_profile": runtime_profile,
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.failed, 1);
+    assert_eq!(tick.succeeded, 0);
+    assert_eq!(tick.cancelled, 0);
+    assert!(!tick.idle);
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    assert_eq!(
+        completed.status,
+        harness_workflow::runtime::RuntimeJobStatus::Failed
+    );
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "implement_issue");
+    assert_eq!(
+        output.status,
+        harness_workflow::runtime::ActivityStatus::Failed
+    );
+    assert!(
+        output
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")),
+        "failed runtime job should include timeout error: {output:?}"
+    );
     Ok(())
 }
 

@@ -281,6 +281,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             plan_cache: registry.plan_cache,
             issue_workflow_store: registry.issue_workflow_store,
             project_workflow_store: registry.project_workflow_store,
+            workflow_runtime_store: registry.workflow_runtime_store,
             project_registry: Some(
                 registry
                     .project_registry

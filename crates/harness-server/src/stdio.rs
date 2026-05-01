@@ -223,6 +223,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             vec![],
         );
 
@@ -239,6 +240,7 @@ mod tests {
                 plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
                 issue_workflow_store: None,
                 project_workflow_store: None,
+                workflow_runtime_store: None,
                 project_registry: None,
                 runtime_state_store: None,
                 q_values: None,

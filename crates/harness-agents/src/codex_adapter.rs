@@ -2,6 +2,7 @@ use crate::codex::{parse_codex_item, parse_codex_token_usage};
 use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
 use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::config::agents::SandboxMode;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -227,16 +228,8 @@ impl CodexAdapter {
 
         Self::send_notification(state, "initialized", Value::Null).await?;
 
-        let thread_id_request = Self::send_request(
-            state,
-            "thread/start",
-            json!({
-                "cwd": req.project_root,
-                "model": req.model,
-                "ephemeral": true,
-            }),
-        )
-        .await?;
+        let thread_id_request =
+            Self::send_request(state, "thread/start", thread_start_params(req)).await?;
 
         loop {
             match Self::read_next_message(&mut lines).await? {
@@ -300,17 +293,7 @@ impl AgentAdapter for CodexAdapter {
         Self::send_request(
             &mut state,
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "cwd": req.project_root,
-                "model": req.model,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": req.prompt,
-                    }
-                ],
-            }),
+            turn_start_params(&req, &thread_id),
         )
         .await?;
 
@@ -433,6 +416,55 @@ fn approval_decision_result(decision: ApprovalDecision) -> Value {
             "reason": reason,
         }),
     }
+}
+
+fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
+    mode.map(|value| {
+        match value {
+            SandboxMode::ReadOnly => "readOnly",
+            SandboxMode::WorkspaceWrite => "workspaceWrite",
+            SandboxMode::DangerFullAccess => "dangerFullAccess",
+        }
+        .to_string()
+    })
+}
+
+fn sandbox_policy_value(mode: Option<SandboxMode>, project_root: &PathBuf) -> Option<Value> {
+    mode.map(|value| match value {
+        SandboxMode::ReadOnly => json!({ "type": "readOnly" }),
+        SandboxMode::WorkspaceWrite => json!({
+            "type": "workspaceWrite",
+            "writableRoots": [project_root],
+        }),
+        SandboxMode::DangerFullAccess => json!({ "type": "dangerFullAccess" }),
+    })
+}
+
+fn thread_start_params(req: &TurnRequest) -> Value {
+    json!({
+        "cwd": req.project_root,
+        "model": req.model,
+        "sandbox": sandbox_mode_value(req.sandbox_mode),
+        "approvalPolicy": req.approval_policy,
+        "ephemeral": true,
+    })
+}
+
+fn turn_start_params(req: &TurnRequest, thread_id: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "cwd": req.project_root,
+        "model": req.model,
+        "effort": req.reasoning_effort,
+        "sandboxPolicy": sandbox_policy_value(req.sandbox_mode, &req.project_root),
+        "approvalPolicy": req.approval_policy,
+        "input": [
+            {
+                "type": "text",
+                "text": req.prompt,
+            }
+        ],
+    })
 }
 
 fn response_id_matches(actual: &Value, expected: u64) -> bool {
@@ -825,6 +857,70 @@ mod tests {
                 "reason": "nope",
             })
         );
+    }
+
+    #[test]
+    fn start_params_include_runtime_profile_overrides() {
+        let req = TurnRequest {
+            prompt: "ping".to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            model: Some("gpt-runtime".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+            approval_policy: Some("on-request".to_string()),
+            allowed_tools: vec![],
+            context: vec![],
+            timeout_secs: Some(60),
+            capability_token: None,
+        };
+
+        assert_eq!(
+            thread_start_params(&req),
+            json!({
+                "cwd": "/tmp/project",
+                "model": "gpt-runtime",
+                "sandbox": "workspaceWrite",
+                "approvalPolicy": "on-request",
+                "ephemeral": true,
+            })
+        );
+        assert_eq!(
+            turn_start_params(&req, "thread-1"),
+            json!({
+                "threadId": "thread-1",
+                "cwd": "/tmp/project",
+                "model": "gpt-runtime",
+                "effort": "medium",
+                "sandboxPolicy": {
+                    "type": "workspaceWrite",
+                    "writableRoots": ["/tmp/project"],
+                },
+                "approvalPolicy": "on-request",
+                "input": [
+                    {
+                        "type": "text",
+                        "text": "ping",
+                    }
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn sandbox_mode_value_uses_app_server_enum_shape() {
+        assert_eq!(
+            sandbox_mode_value(Some(SandboxMode::ReadOnly)).as_deref(),
+            Some("readOnly")
+        );
+        assert_eq!(
+            sandbox_mode_value(Some(SandboxMode::WorkspaceWrite)).as_deref(),
+            Some("workspaceWrite")
+        );
+        assert_eq!(
+            sandbox_mode_value(Some(SandboxMode::DangerFullAccess)).as_deref(),
+            Some("dangerFullAccess")
+        );
+        assert_eq!(sandbox_mode_value(None), None);
     }
 
     #[tokio::test]

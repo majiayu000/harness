@@ -64,6 +64,10 @@ impl ClaudeCodeAgent {
         req.model.as_deref().unwrap_or(&self.default_model)
     }
 
+    fn effective_sandbox_mode(&self, req: &AgentRequest) -> SandboxMode {
+        req.sandbox_mode.unwrap_or(self.sandbox_mode)
+    }
+
     /// Build CLI arguments for the Claude Code agent.
     ///
     /// **Critical**: the prompt MUST be the token immediately after `-p`.
@@ -111,6 +115,9 @@ impl ClaudeCodeAgent {
         if let Some(phase) = req.execution_phase {
             base_args.push(OsString::from("--effort"));
             base_args.push(OsString::from(phase.effort_level()));
+        } else if let Some(reasoning_effort) = req.reasoning_effort.as_deref() {
+            base_args.push(OsString::from("--effort"));
+            base_args.push(OsString::from(reasoning_effort));
         }
 
         if let Some(budget) = req.max_budget_usd {
@@ -149,11 +156,12 @@ impl CodeAgent for ClaudeCodeAgent {
 
         // Narrow sandbox write paths to token scope when present.
         // See also: claude_adapter.rs — both files must stay in sync on this conversion.
+        let sandbox_mode = self.effective_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
         };
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
@@ -239,11 +247,12 @@ impl CodeAgent for ClaudeCodeAgent {
         }
 
         let base_args = self.base_args(&req);
+        let sandbox_mode = self.effective_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
         };
         let wrapped_command =
             wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
@@ -578,6 +587,24 @@ mod tests {
         assert_eq!(agent.resolve_model(&req_with_model), "explicit-model");
         // No budget, no req.model → default_model
         assert_eq!(agent.resolve_model(&req_no_model), "default-model");
+    }
+
+    #[test]
+    fn base_args_uses_request_reasoning_effort_when_phase_is_absent() {
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "default-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        );
+        let req = AgentRequest {
+            reasoning_effort: Some("medium".to_string()),
+            ..AgentRequest::default()
+        };
+
+        let args = args_to_strings(&agent.base_args(&req));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--effort", "medium"]));
     }
 
     #[test]

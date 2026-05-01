@@ -128,6 +128,7 @@ pub struct DefaultExecutionService {
     review_task_queue: Arc<TaskQueue>,
     completion_callback: Option<CompletionCallback>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
     project_registry: Option<Arc<ProjectRegistry>>,
     allowed_project_roots: Vec<PathBuf>,
 }
@@ -301,6 +302,7 @@ impl DefaultExecutionService {
         review_task_queue: Arc<TaskQueue>,
         completion_callback: Option<CompletionCallback>,
         issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+        workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
         project_registry: Option<Arc<ProjectRegistry>>,
         allowed_project_roots: Vec<PathBuf>,
     ) -> Arc<Self> {
@@ -316,6 +318,7 @@ impl DefaultExecutionService {
             review_task_queue,
             completion_callback,
             issue_workflow_store,
+            workflow_runtime_store,
             project_registry,
             allowed_project_roots,
         })
@@ -653,6 +656,8 @@ impl ExecutionService for DefaultExecutionService {
             permit,
             self.completion_callback.clone(),
             self.issue_workflow_store.clone(),
+            self.workflow_runtime_store.clone(),
+            self.allowed_project_roots.clone(),
         )
         .await;
 
@@ -699,6 +704,8 @@ impl ExecutionService for DefaultExecutionService {
         let group_sem = options.group_sem;
         let completion_callback = self.completion_callback.clone();
         let issue_workflow_store = self.issue_workflow_store.clone();
+        let workflow_runtime_store = self.workflow_runtime_store.clone();
+        let allowed_project_roots = self.allowed_project_roots.clone();
         let task_id2 = task_id.clone();
         let project_id = prepared.project_id;
         self.track_issue_workflow(&project_id, &prepared.req, &task_id)
@@ -728,6 +735,8 @@ impl ExecutionService for DefaultExecutionService {
                         permit,
                         completion_callback,
                         issue_workflow_store,
+                        workflow_runtime_store,
+                        allowed_project_roots,
                         group_permit,
                     )
                     .await;
@@ -1002,6 +1011,7 @@ mod tests {
             make_task_queue(),
             None,
             None,
+            None,
             registry,
             vec![],
         )
@@ -1023,6 +1033,7 @@ mod tests {
             None,
             make_task_queue(),
             make_task_queue(),
+            None,
             None,
             None,
             None,

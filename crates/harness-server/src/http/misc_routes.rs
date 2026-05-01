@@ -6,12 +6,17 @@ use axum::{
     Json,
 };
 use harness_protocol::methods::RpcRequest;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
 use crate::{router, task_runner};
+use harness_workflow::runtime::{
+    RuntimeEvent, RuntimeJob, WorkflowCommand, WorkflowCommandRecord, WorkflowDecisionRecord,
+    WorkflowEvent, WorkflowInstance,
+};
 
 fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
     let error = error?;
@@ -121,6 +126,76 @@ pub(crate) struct ProjectWorkflowByProjectQuery {
     pub repo: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct WorkflowRuntimeTreeQuery {
+    pub project_id: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct WorkflowRuntimeCommandNode {
+    pub id: String,
+    pub workflow_id: String,
+    pub decision_id: Option<String>,
+    pub status: String,
+    pub command: WorkflowCommand,
+    pub runtime_jobs: Vec<WorkflowRuntimeJobNode>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl WorkflowRuntimeCommandNode {
+    fn new(record: WorkflowCommandRecord, runtime_jobs: Vec<WorkflowRuntimeJobNode>) -> Self {
+        Self {
+            id: record.id,
+            workflow_id: record.workflow_id,
+            decision_id: record.decision_id,
+            status: record.status,
+            command: record.command,
+            runtime_jobs,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct WorkflowRuntimeJobNode {
+    #[serde(flatten)]
+    pub job: RuntimeJob,
+    pub runtime_event_count: usize,
+    pub latest_runtime_event_type: Option<String>,
+    pub prompt_packet_digest: Option<String>,
+}
+
+impl WorkflowRuntimeJobNode {
+    fn new(job: RuntimeJob, runtime_events: Vec<RuntimeEvent>) -> Self {
+        let latest_runtime_event_type = runtime_events.last().map(|event| event.event_type.clone());
+        let prompt_packet_digest = prompt_packet_digest_from_events(&runtime_events);
+        Self {
+            job,
+            runtime_event_count: runtime_events.len(),
+            latest_runtime_event_type,
+            prompt_packet_digest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct WorkflowRuntimeTreeNode {
+    pub workflow: WorkflowInstance,
+    pub events: Vec<WorkflowEvent>,
+    pub decisions: Vec<WorkflowDecisionRecord>,
+    pub commands: Vec<WorkflowRuntimeCommandNode>,
+    pub children: Vec<WorkflowRuntimeTreeNode>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct WorkflowRuntimeTreeResponse {
+    pub workflows: Vec<WorkflowRuntimeTreeNode>,
+    pub total_workflows: usize,
+}
+
 pub(crate) async fn get_issue_workflow_by_issue(
     State(state): State<Arc<AppState>>,
     Query(query): Query<IssueWorkflowByIssueQuery>,
@@ -206,6 +281,168 @@ pub(crate) async fn get_project_workflow_by_project(
         )
             .into_response(),
     }
+}
+
+pub(crate) async fn get_workflow_runtime_tree(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WorkflowRuntimeTreeQuery>,
+) -> Response {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "workflow runtime store unavailable" })),
+        )
+            .into_response();
+    };
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    match store
+        .list_instances(query.project_id.as_deref(), limit)
+        .await
+    {
+        Ok(instances) => match build_workflow_runtime_tree(store, instances).await {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn build_workflow_runtime_tree(
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    instances: Vec<WorkflowInstance>,
+) -> anyhow::Result<WorkflowRuntimeTreeResponse> {
+    let workflow_ids: Vec<String> = instances
+        .iter()
+        .map(|instance| instance.id.clone())
+        .collect();
+    let mut events_by_workflow = store.events_for_workflows(&workflow_ids).await?;
+    let mut decisions_by_workflow = store.decisions_for_workflows(&workflow_ids).await?;
+    let mut commands_by_workflow = store.commands_for_workflows(&workflow_ids).await?;
+    let command_ids: Vec<String> = commands_by_workflow
+        .values()
+        .flat_map(|commands| commands.iter().map(|command| command.id.clone()))
+        .collect();
+    let mut runtime_jobs_by_command = store.runtime_jobs_for_commands(&command_ids).await?;
+    let runtime_job_ids: Vec<String> = runtime_jobs_by_command
+        .values()
+        .flat_map(|jobs| jobs.iter().map(|job| job.id.clone()))
+        .collect();
+    let mut runtime_events_by_job = store.runtime_events_for_jobs(&runtime_job_ids).await?;
+
+    let mut by_id = BTreeMap::new();
+    let mut children_by_parent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for instance in instances {
+        let workflow_id = instance.id.clone();
+        if let Some(parent_id) = instance.parent_workflow_id.as_ref() {
+            children_by_parent
+                .entry(parent_id.clone())
+                .or_default()
+                .push(workflow_id.clone());
+        }
+        let events = events_by_workflow.remove(&workflow_id).unwrap_or_default();
+        let decisions = decisions_by_workflow
+            .remove(&workflow_id)
+            .unwrap_or_default();
+        let commands = commands_by_workflow
+            .remove(&workflow_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|command| {
+                let runtime_jobs = runtime_jobs_by_command
+                    .remove(&command.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|job| {
+                        let runtime_events =
+                            runtime_events_by_job.remove(&job.id).unwrap_or_default();
+                        WorkflowRuntimeJobNode::new(job, runtime_events)
+                    })
+                    .collect();
+                WorkflowRuntimeCommandNode::new(command, runtime_jobs)
+            })
+            .collect();
+        by_id.insert(
+            workflow_id,
+            WorkflowRuntimeTreeNode {
+                workflow: instance,
+                events,
+                decisions,
+                commands,
+                children: Vec::new(),
+            },
+        );
+    }
+
+    let mut root_ids = Vec::new();
+    for (workflow_id, node) in &by_id {
+        let parent_present = node
+            .workflow
+            .parent_workflow_id
+            .as_ref()
+            .is_some_and(|parent_id| by_id.contains_key(parent_id));
+        if !parent_present {
+            root_ids.push(workflow_id.clone());
+        }
+    }
+    if root_ids.is_empty() {
+        root_ids.extend(by_id.keys().cloned());
+    }
+
+    let mut workflows = Vec::new();
+    for root_id in root_ids {
+        let mut path = BTreeSet::new();
+        if let Some(node) =
+            attach_workflow_children(&root_id, &by_id, &children_by_parent, &mut path)
+        {
+            workflows.push(node);
+        }
+    }
+
+    Ok(WorkflowRuntimeTreeResponse {
+        total_workflows: by_id.len(),
+        workflows,
+    })
+}
+
+fn prompt_packet_digest_from_events(events: &[RuntimeEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if event.event_type != "RuntimePromptPrepared" {
+            return None;
+        }
+        event
+            .event
+            .get("prompt_packet_digest")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn attach_workflow_children(
+    workflow_id: &str,
+    by_id: &BTreeMap<String, WorkflowRuntimeTreeNode>,
+    children_by_parent: &BTreeMap<String, Vec<String>>,
+    path: &mut BTreeSet<String>,
+) -> Option<WorkflowRuntimeTreeNode> {
+    if !path.insert(workflow_id.to_string()) {
+        return None;
+    }
+    let mut node = by_id.get(workflow_id)?.clone();
+    node.children = children_by_parent
+        .get(workflow_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|child_id| attach_workflow_children(child_id, by_id, children_by_parent, path))
+        .collect();
+    path.remove(workflow_id);
+    Some(node)
 }
 
 pub(crate) async fn handle_rpc(
