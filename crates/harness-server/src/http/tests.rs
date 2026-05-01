@@ -1190,6 +1190,11 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
             ["must_include"][2],
         "PR URL or blocker"
     );
+    assert_eq!(
+        events[1].event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
+            ["artifacts"]["pull_request"]["fields"][1],
+        "pr_url"
+    );
     let prompt_packet_digest = events[1].event["prompt_packet_digest"]
         .as_str()
         .expect("prompt packet digest should be recorded");

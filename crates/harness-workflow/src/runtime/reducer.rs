@@ -39,6 +39,10 @@ fn reduce_success(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
+    if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+
     let (next_state, decision, reason) = match (
         instance.definition_id.as_str(),
         instance.state.as_str(),
@@ -81,6 +85,59 @@ fn reduce_success(
             .with_evidence(runtime_completion_evidence(event, result))
             .high_confidence(),
     )
+}
+
+fn bind_pr_from_activity_result(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "implementing",
+        "implement_issue",
+    ) {
+        return None;
+    }
+    let (pr_number, pr_url) = pull_request_artifact(result)?;
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "bind_pr",
+            "pr_open",
+            "implementation activity returned a structured pull request artifact",
+        )
+        .with_command(WorkflowCommand::bind_pr(
+            pr_number,
+            pr_url.clone(),
+            format!("runtime-completion:{}:bind-pr:{pr_number}", event.id),
+        ))
+        .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
+}
+
+fn pull_request_artifact(result: &ActivityResult) -> Option<(u64, String)> {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "pull_request")
+        .find_map(|artifact| {
+            let pr_number = artifact.artifact.get("pr_number")?.as_u64()?;
+            let pr_url = artifact
+                .artifact
+                .get("pr_url")?
+                .as_str()
+                .filter(|value| !value.trim().is_empty())?
+                .to_string();
+            Some((pr_number, pr_url))
+        })
 }
 
 fn runtime_blocked_decision(

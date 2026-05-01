@@ -676,6 +676,12 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
         ("github_issue_pr", "implement_issue") => json!({
             "must_include": ["changed files", "validation commands", "PR URL or blocker"],
             "must_not_include": ["workflow table mutations", "unverified merge claims"],
+            "artifacts": {
+                "pull_request": {
+                    "required_when": "A PR was created or reused by the activity.",
+                    "fields": ["pr_number", "pr_url"]
+                }
+            }
         }),
         ("github_issue_pr", "replan_issue") => json!({
             "must_include": ["reason for replan", "new implementation plan", "validation plan"],

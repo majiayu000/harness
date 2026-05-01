@@ -590,6 +590,9 @@ Implemented now:
 - `replan_issue` completion moves GitHub issue workflows from `replanning` to `implementing`
 - `address_pr_feedback` completion moves GitHub issue workflows from `addressing_feedback` to
   `awaiting_feedback`
+- successful `implement_issue` completion can bind a PR and move GitHub issue workflows from
+  `implementing` to `pr_open` when the activity result includes a structured `pull_request`
+  artifact
 - successful repo backlog dispatch and reconciliation activity completion moves `dispatching` and
   `reconciling` backlog workflows back to `idle`
 - failed, blocked, and cancelled activity results transition workflows to `failed`, `blocked`, or
@@ -609,13 +612,15 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- implementation completion does not infer PR state from free-form agent text
+- implementation completion does not infer PR state from free-form agent text; only structured
+  `pull_request` artifacts drive this reducer path
 - retry policy does not yet model provider-specific or runtime-specific error taxonomies beyond the
   portable activity error kinds
 
 Tests:
 
 - reducer resumes implementation after replan completion
+- reducer binds PR metadata from structured `pull_request` artifacts on implementation completion
 - reducer idles repo backlog workflows after dispatch and reconciliation completion
 - reducer ignores unmapped successful activity completions
 - reducer retries a failed activity until the configured retry budget is exhausted

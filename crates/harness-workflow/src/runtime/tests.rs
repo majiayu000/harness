@@ -293,6 +293,59 @@ fn runtime_completion_reducer_returns_none_for_unmapped_success() {
 }
 
 #[test]
+fn runtime_completion_reducer_binds_pr_from_structured_pull_request_artifact() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_url": "missing number"
+            }),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77"
+            }),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("structured pull request artifact should bind the PR");
+
+    assert_eq!(decision.decision, "bind_pr");
+    assert_eq!(decision.next_state, "pr_open");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::BindPr
+    );
+    assert_eq!(decision.commands[0].command["pr_number"], 77);
+    assert_eq!(
+        decision.commands[0].command["pr_url"],
+        "https://github.com/owner/repo/pull/77"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("structured PR binding should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
     let instance = issue_instance("implementing").with_data(json!({
         "runtime_retry_policy": {
