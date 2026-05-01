@@ -121,7 +121,6 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
 
 pub struct WorkflowRuntimeStore {
     pool: PgPool,
-    sequence_lock: tokio::sync::Mutex<()>,
 }
 
 type WorkflowCommandRecordRow = (
@@ -147,10 +146,7 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool(WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
-        Ok(Self {
-            pool,
-            sequence_lock: tokio::sync::Mutex::new(()),
-        })
+        Ok(Self { pool })
     }
 
     pub async fn open_with_context(
@@ -160,10 +156,7 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
-        Ok(Self {
-            pool,
-            sequence_lock: tokio::sync::Mutex::new(()),
-        })
+        Ok(Self { pool })
     }
 
     pub async fn upsert_definition(&self, definition: &WorkflowDefinition) -> anyhow::Result<()> {
@@ -256,12 +249,16 @@ impl WorkflowRuntimeStore {
         source: &str,
         payload: Value,
     ) -> anyhow::Result<WorkflowEvent> {
-        let _guard = self.sequence_lock.lock().await;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("workflow_events:{workflow_id}"))
+            .execute(&mut *tx)
+            .await?;
         let (next_sequence,): (i64,) = sqlx::query_as(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
         )
         .bind(workflow_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         let event = WorkflowEvent::new(workflow_id, next_sequence as u64, event_type, source)
             .with_payload(payload);
@@ -277,8 +274,9 @@ impl WorkflowRuntimeStore {
         .bind(&event.event_type)
         .bind(&event.source)
         .bind(&data)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(event)
     }
 
@@ -678,12 +676,16 @@ impl WorkflowRuntimeStore {
         event_type: &str,
         payload: Value,
     ) -> anyhow::Result<RuntimeEvent> {
-        let _guard = self.sequence_lock.lock().await;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("runtime_events:{runtime_job_id}"))
+            .execute(&mut *tx)
+            .await?;
         let (next_sequence,): (i64,) = sqlx::query_as(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM runtime_events WHERE runtime_job_id = $1",
         )
         .bind(runtime_job_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         let event = RuntimeEvent::new(runtime_job_id, next_sequence as u64, event_type, payload);
         let data = to_jsonb_string(&event)?;
@@ -697,8 +699,9 @@ impl WorkflowRuntimeStore {
         .bind(event.sequence as i64)
         .bind(&event.event_type)
         .bind(&data)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(event)
     }
 
