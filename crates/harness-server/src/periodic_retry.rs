@@ -684,6 +684,30 @@ mod tests {
         let mut registry = AgentRegistry::new("test");
         registry.register("test", Arc::new(RetryTestAgent));
         let mut state = test_helpers::make_test_state_with_registry(dir.path(), registry).await?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+                Some(&test_helpers::test_database_url()?),
+            )
+            .await?,
+        );
+        state.core.workflow_runtime_store = Some(runtime_store.clone());
+        state.execution_svc = crate::services::execution::DefaultExecutionService::new(
+            state.core.tasks.clone(),
+            state.core.server.agent_registry.clone(),
+            Arc::new(state.core.server.config.clone()),
+            state.engines.skills.clone(),
+            state.observability.events.clone(),
+            state.interceptors.clone(),
+            None,
+            state.concurrency.task_queue.clone(),
+            state.concurrency.review_task_queue.clone(),
+            None,
+            None,
+            Some(runtime_store.clone()),
+            None,
+            vec![],
+        );
 
         let workspace_root = dir.path().join("workspaces");
         let workspace_mgr = Arc::new(crate::workspace::WorkspaceManager::new(
@@ -732,8 +756,23 @@ mod tests {
             "original stalled task should be cancelled before retry"
         );
         assert!(
-            tasks.iter().any(|t| t.id != task_id),
-            "retry tick should enqueue a successor task after cleanup even if it finishes quickly"
+            tasks.iter().all(|t| t.id == task_id),
+            "runtime-first issue retry should not enqueue a successor task row"
+        );
+        let workflow_id =
+            harness_workflow::issue_lifecycle::workflow_id(dir.path().to_str().unwrap(), None, 42);
+        let instance = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("retry should submit the issue to workflow runtime");
+        assert_eq!(instance.data["execution_path"], "workflow_runtime");
+        let commands = runtime_store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, "pending");
+        assert_eq!(commands[0].command.command["activity"], "implement_issue");
+        assert!(
+            commands[0].id != task_id.0,
+            "runtime command id should be independent of the cancelled legacy task"
         );
         Ok(())
     }
