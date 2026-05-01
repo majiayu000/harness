@@ -117,6 +117,19 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_runtime_events_job_sequence
               ON runtime_events (runtime_job_id, sequence)",
     },
+    Migration {
+        version: 3,
+        description: "promote runtime job not_before to indexed column",
+        sql: "ALTER TABLE runtime_jobs
+              ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;
+              UPDATE runtime_jobs
+              SET not_before = (data->>'not_before')::timestamptz
+              WHERE not_before IS NULL
+                AND jsonb_typeof(data->'not_before') = 'string'
+                AND data->>'not_before' ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}';
+              CREATE INDEX IF NOT EXISTS idx_runtime_jobs_ready
+              ON runtime_jobs (status, not_before, created_at)",
+    },
 ];
 
 pub struct WorkflowRuntimeStore {
@@ -605,14 +618,15 @@ impl WorkflowRuntimeStore {
         let runtime_kind = enum_str(&job.runtime_kind)?;
         sqlx::query(
             "INSERT INTO runtime_jobs
-                (id, command_id, runtime_kind, runtime_profile, status, data)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+                (id, command_id, runtime_kind, runtime_profile, status, not_before, data)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
         )
         .bind(&job.id)
         .bind(&job.command_id)
         .bind(&runtime_kind)
         .bind(&job.runtime_profile)
         .bind(&status)
+        .bind(job.not_before)
         .bind(&data)
         .execute(&self.pool)
         .await?;
@@ -629,11 +643,7 @@ impl WorkflowRuntimeStore {
             "SELECT id, data::text FROM runtime_jobs
              WHERE (
                  status = 'pending'
-                 AND CASE
-                     WHEN data ? 'not_before'
-                     THEN (data->>'not_before')::timestamptz <= CURRENT_TIMESTAMP
-                     ELSE TRUE
-                 END
+                 AND (not_before IS NULL OR not_before <= CURRENT_TIMESTAMP)
              ) OR (
                  status = 'running'
                  AND data ? 'lease'
@@ -658,10 +668,11 @@ impl WorkflowRuntimeStore {
         let status = enum_str(&job.status)?;
         sqlx::query(
             "UPDATE runtime_jobs
-             SET status = $1, data = $2::jsonb, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $3",
+             SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4",
         )
         .bind(&status)
+        .bind(job.not_before)
         .bind(&updated)
         .bind(&id)
         .execute(&mut *tx)
@@ -766,10 +777,11 @@ impl WorkflowRuntimeStore {
         let status = enum_str(&job.status)?;
         sqlx::query(
             "UPDATE runtime_jobs
-             SET status = $1, data = $2::jsonb, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $3",
+             SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4",
         )
         .bind(&status)
+        .bind(job.not_before)
         .bind(&updated)
         .bind(runtime_job_id)
         .execute(&self.pool)
