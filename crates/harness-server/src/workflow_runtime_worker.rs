@@ -845,8 +845,13 @@ fn activity_result_from_turn(
         TurnStatus::Running => "Agent turn is still running after lifecycle returned.".to_string(),
     });
     let result = match status {
-        TurnStatus::Completed => structured_activity_result(items, &activity)
-            .unwrap_or_else(|| ActivityResult::succeeded(activity, summary)),
+        TurnStatus::Completed => match structured_activity_result(items, &activity) {
+            StructuredActivityResult::Parsed(result) => result,
+            StructuredActivityResult::Missing => ActivityResult::succeeded(activity, summary),
+            StructuredActivityResult::Invalid(error) => {
+                ActivityResult::failed(activity, "Structured activity result was invalid.", error)
+            }
+        },
         TurnStatus::Cancelled => ActivityResult::cancelled(activity, summary),
         TurnStatus::Failed | TurnStatus::Running => ActivityResult::failed(
             activity,
@@ -874,21 +879,38 @@ fn activity_result_from_turn(
         ))
 }
 
-fn structured_activity_result(items: &[Item], expected_activity: &str) -> Option<ActivityResult> {
-    items
-        .iter()
-        .rev()
-        .filter_map(|item| match item {
-            Item::AgentReasoning { content } => {
-                extract_fenced_block(content, "harness-activity-result")
-            }
-            _ => None,
-        })
-        .find_map(|block| {
-            serde_json::from_str::<ActivityResult>(block)
-                .ok()
-                .filter(|result| result.activity == expected_activity)
-        })
+enum StructuredActivityResult {
+    Missing,
+    Parsed(ActivityResult),
+    Invalid(String),
+}
+
+fn structured_activity_result(items: &[Item], expected_activity: &str) -> StructuredActivityResult {
+    let Some(block) = latest_activity_result_block(items) else {
+        return StructuredActivityResult::Missing;
+    };
+
+    match serde_json::from_str::<ActivityResult>(block) {
+        Ok(result) if result.activity == expected_activity => {
+            StructuredActivityResult::Parsed(result)
+        }
+        Ok(result) => StructuredActivityResult::Invalid(format!(
+            "activity result block reported activity `{}`, expected `{expected_activity}`",
+            result.activity
+        )),
+        Err(error) => StructuredActivityResult::Invalid(format!(
+            "activity result block is invalid JSON: {error}"
+        )),
+    }
+}
+
+fn latest_activity_result_block(items: &[Item]) -> Option<&str> {
+    items.iter().rev().find_map(|item| match item {
+        Item::AgentReasoning { content } => {
+            extract_fenced_block(content, "harness-activity-result")
+        }
+        _ => None,
+    })
 }
 
 fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
@@ -1145,7 +1167,7 @@ Final result:
     }
 
     #[test]
-    fn activity_result_from_turn_ignores_mismatched_structured_activity() {
+    fn activity_result_from_turn_fails_mismatched_structured_activity() {
         let job = RuntimeJob::pending(
             "command-1",
             RuntimeKind::CodexJsonrpc,
@@ -1177,9 +1199,73 @@ Final result:
         assert_eq!(result.activity, "implement_issue");
         assert_eq!(
             result.status,
-            harness_workflow::runtime::ActivityStatus::Succeeded
+            harness_workflow::runtime::ActivityStatus::Failed
         );
-        assert_eq!(result.summary, content);
+        assert_eq!(result.summary, "Structured activity result was invalid.");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("activity result block reported activity `replan_issue`, expected `implement_issue`")
+        );
+        assert!(!result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "pull_request"));
+        assert!(result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "runtime_prompt_packet"));
+        assert!(result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "runtime_turn"));
+    }
+
+    #[test]
+    fn activity_result_from_turn_fails_latest_malformed_structured_activity() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue"
+            }),
+        );
+        let items = vec![Item::AgentReasoning {
+            content: r#"Work completed.
+
+```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":"stale summary","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":66,"pr_url":"https://github.com/owner/repo/pull/66"}}]}
+```
+
+Final result:
+
+```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":
+```"#
+                .to_string(),
+        }];
+
+        let result = activity_result_from_turn(
+            &job,
+            &TurnStatus::Completed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "codex",
+            Path::new("/project"),
+            "digest-1",
+        );
+
+        assert_eq!(result.activity, "implement_issue");
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(result.summary, "Structured activity result was invalid.");
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("activity result block is invalid JSON:")));
         assert!(!result
             .artifacts
             .iter()
