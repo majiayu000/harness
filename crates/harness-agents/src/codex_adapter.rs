@@ -419,7 +419,14 @@ fn approval_decision_result(decision: ApprovalDecision) -> Value {
 }
 
 fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
-    mode.map(|value| value.to_string())
+    mode.map(|value| {
+        match value {
+            SandboxMode::ReadOnly => "readOnly",
+            SandboxMode::WorkspaceWrite => "workspaceWrite",
+            SandboxMode::DangerFullAccess => "dangerFullAccess",
+        }
+        .to_string()
+    })
 }
 
 fn sandbox_policy_value(mode: Option<SandboxMode>, project_root: &PathBuf) -> Option<Value> {
@@ -872,7 +879,7 @@ mod tests {
             json!({
                 "cwd": "/tmp/project",
                 "model": "gpt-runtime",
-                "sandbox": "workspace-write",
+                "sandbox": "workspaceWrite",
                 "approvalPolicy": "on-request",
                 "ephemeral": true,
             })
@@ -897,6 +904,23 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn sandbox_mode_value_uses_app_server_enum_shape() {
+        assert_eq!(
+            sandbox_mode_value(Some(SandboxMode::ReadOnly)).as_deref(),
+            Some("readOnly")
+        );
+        assert_eq!(
+            sandbox_mode_value(Some(SandboxMode::WorkspaceWrite)).as_deref(),
+            Some("workspaceWrite")
+        );
+        assert_eq!(
+            sandbox_mode_value(Some(SandboxMode::DangerFullAccess)).as_deref(),
+            Some("dangerFullAccess")
+        );
+        assert_eq!(sandbox_mode_value(None), None);
     }
 
     #[tokio::test]
