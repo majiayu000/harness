@@ -13,6 +13,7 @@ pub mod quality_gate;
 pub mod reducer;
 pub mod repo_backlog;
 pub mod store;
+pub mod submission;
 pub mod validator;
 pub mod worker;
 
@@ -52,6 +53,10 @@ pub use repo_backlog::{
     StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID,
 };
 pub use store::WorkflowRuntimeStore;
+pub use submission::{
+    build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,
+    IssueSubmissionWorkflowAction,
+};
 pub use validator::{
     DecisionValidator, TransitionAllowlist, TransitionRule, ValidationContext,
     WorkflowDecisionRejection, WorkflowDecisionRejectionKind,

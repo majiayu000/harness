@@ -7,10 +7,11 @@ use super::model::{
 use super::store::RuntimeJobEnqueueOutcome;
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
-    build_merged_pr_decision, build_open_issue_without_workflow_decision,
-    build_plan_issue_decision, build_pr_detected_decision, build_pr_feedback_decision,
-    build_quality_gate_run_decision, build_stale_active_workflow_decision,
-    reduce_runtime_job_completed, CommandDispatchOutcome, InMemoryWorkflowBus,
+    build_issue_submission_decision, build_merged_pr_decision,
+    build_open_issue_without_workflow_decision, build_plan_issue_decision,
+    build_pr_detected_decision, build_pr_feedback_decision, build_quality_gate_run_decision,
+    build_stale_active_workflow_decision, reduce_runtime_job_completed, CommandDispatchOutcome,
+    InMemoryWorkflowBus, IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction,
     MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
     PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
     QualityGateDecisionInput, QualityGateWorkflowAction, RepoBacklogWorkflowAction,
@@ -69,6 +70,69 @@ fn project_issue_instance(project_id: &str, issue_number: u64, state: &str) -> W
 }
 
 #[test]
+fn issue_submission_decision_schedules_discovered_issue() {
+    let labels = vec!["bug".to_string(), "p1".to_string()];
+    let instance = issue_instance("discovered");
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-1",
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            labels: &labels,
+            force_execute: false,
+        },
+    );
+
+    assert_eq!(
+        output.action,
+        IssueSubmissionWorkflowAction::RunImplementation
+    );
+    assert_eq!(output.decision.decision, "submit_issue");
+    assert_eq!(output.decision.next_state, "scheduled");
+    assert_eq!(output.decision.commands.len(), 1);
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("implement_issue")
+    );
+    assert_eq!(
+        output.decision.commands[0].dedupe_key,
+        "issue-submit:owner/repo:issue:123:task:task-1:implement"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("issue submission decision should validate");
+}
+
+#[test]
+fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
+    let labels = Vec::new();
+    let instance = issue_instance("failed");
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-2",
+            repo: None,
+            issue_number: 124,
+            labels: &labels,
+            force_execute: true,
+        },
+    );
+
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen(),
+        )
+        .expect("explicit issue submission should reopen failed workflows");
+}
+
+#[test]
 fn plan_issue_decision_runs_replan_when_policy_allows() {
     let instance = issue_instance("implementing");
     let output = build_plan_issue_decision(
@@ -96,6 +160,32 @@ fn plan_issue_decision_runs_replan_when_policy_allows() {
 }
 
 #[test]
+fn plan_issue_decision_replans_after_shadow_issue_submission() {
+    let instance = issue_instance("scheduled");
+    let output = build_plan_issue_decision(
+        &instance,
+        PlanIssueDecisionInput {
+            task_id: "task-1",
+            plan_issue: "plan missed rollback",
+            force_execute: false,
+            auto_replan_on_plan_issue: true,
+            replan_already_attempted: false,
+            turn_budget_exhausted: false,
+        },
+    );
+
+    assert_eq!(output.action, PlanIssueWorkflowAction::RunReplan);
+    assert_eq!(output.decision.next_state, "replanning");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("shadow-submitted issues should be allowed to replan");
+}
+
+#[test]
 fn plan_issue_decision_force_execute_continues_implementation() {
     let instance = issue_instance("implementing");
     let output = build_plan_issue_decision(
@@ -120,6 +210,32 @@ fn plan_issue_decision_force_execute_continues_implementation() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("force continue decision should validate");
+}
+
+#[test]
+fn plan_issue_force_continue_after_shadow_issue_submission() {
+    let instance = issue_instance("scheduled");
+    let output = build_plan_issue_decision(
+        &instance,
+        PlanIssueDecisionInput {
+            task_id: "task-1",
+            plan_issue: "plan missed rollback",
+            force_execute: true,
+            auto_replan_on_plan_issue: true,
+            replan_already_attempted: false,
+            turn_budget_exhausted: false,
+        },
+    );
+
+    assert_eq!(output.action, PlanIssueWorkflowAction::ForceContinue);
+    assert_eq!(output.decision.next_state, "implementing");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("shadow-submitted issues should allow force continue");
 }
 
 #[test]
@@ -189,6 +305,29 @@ fn pr_detected_decision_binds_pr_from_implementation() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("PR binding decision should validate");
+}
+
+#[test]
+fn pr_detected_decision_binds_pr_after_shadow_issue_submission() {
+    let instance = issue_instance("scheduled");
+    let output = build_pr_detected_decision(
+        &instance,
+        PrDetectedDecisionInput {
+            task_id: "task-1",
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::BindPr);
+    assert_eq!(output.decision.next_state, "pr_open");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("shadow-submitted issues should bind a produced PR");
 }
 
 #[test]
@@ -1306,6 +1445,31 @@ fn rejects_pr_open_transition_without_bind_pr_command() {
 }
 
 #[test]
+fn rejects_scheduled_pr_open_transition_without_bind_pr_command() {
+    let instance = issue_instance("scheduled");
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "scheduled",
+        "agent_reported_pr_open",
+        "pr_open",
+        "The legacy implementation produced a PR without binding PR metadata.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "PR metadata was omitted.",
+        "issue-123-pr-open-wait",
+    ));
+
+    let err = DecisionValidator::github_issue_pr()
+        .validate(&instance, &decision, &validation_context())
+        .expect_err("scheduled -> pr_open should require BindPr");
+
+    assert_eq!(
+        err.kind,
+        WorkflowDecisionRejectionKind::RequiredCommandMissing
+    );
+}
+
+#[test]
 fn rejects_done_transition_without_mark_done_command() {
     let instance = issue_instance("ready_to_merge");
     let decision = WorkflowDecision::new(
@@ -2263,6 +2427,33 @@ async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() 
         "dispatched"
     );
     assert!(dispatcher.dispatch_once().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_store_can_insert_non_pending_command_atomically() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "scheduled");
+    store.upsert_instance(&instance).await?;
+    let command =
+        WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-inline");
+    let command_id = store
+        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .await?;
+
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].id, command_id);
+    assert_eq!(commands[0].status, "handled_inline");
+    assert!(
+        store.pending_commands(10).await?.is_empty(),
+        "inline commands must never be visible to the dispatcher as pending"
+    );
     Ok(())
 }
 

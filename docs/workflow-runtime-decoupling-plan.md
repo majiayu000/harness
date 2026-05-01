@@ -66,12 +66,15 @@ Implemented now:
   next states and command types for structured `workflow_decision` artifacts
 - `quality_gate` is registered as a first-class runtime workflow contract with a run decision
   helper, transition validator, completion reducer, retry support, and activity result schema
+- issue `POST /tasks` submissions now shadow-write `github_issue_pr` workflow runtime state with
+  `IssueSubmitted`, a validated `submit_issue` decision, and an inline-handled `implement_issue`
+  command while the legacy task runner remains the execution path
 
 Still intentionally not moved yet:
 
 - existing task runner ownership of process execution
 - repo backlog polling as the primary controller
-- workflow-first replacement for legacy task submission routes
+- full workflow-first replacement for legacy task submission routes
 - dashboard write actions still use existing task routes
 
 ## Non-Goals
@@ -843,6 +846,40 @@ Tests:
 - Codex app-server thread and turn payloads include `approvalPolicy`
 - runtime worker passes profile approval policy into the agent request
 - runtime worker rejects unknown approval policies and non-Codex approval policy usage
+
+### Phase 18: Workflow-First Task Submission Shadow
+
+Status: partially implemented.
+
+Record operator task submissions in the workflow runtime before replacing the legacy task runner as
+the execution path.
+
+Implemented now:
+
+- issue `POST /tasks` submissions write an `IssueSubmitted` event to the matching
+  `github_issue_pr` workflow instance
+- the workflow policy records a validated `submit_issue` decision from `discovered`,
+  `scheduled`, `failed`, or `cancelled` to `scheduled`
+- the accepted decision writes an `implement_issue` command with task-scoped dedupe so explicit
+  resubmissions create a new auditable workflow command
+- the command is marked `handled_inline` so the existing task runner can execute the work without
+  the runtime dispatcher starting a duplicate agent turn
+- runtime submission tracking is independent from the legacy issue workflow store, so runtime state
+  is still recorded when only `WorkflowRuntimeStore` is configured
+
+Still intentionally not moved yet:
+
+- prompt-only submissions remain task-runner native
+- PR feedback submissions remain on the existing PR feedback sweep/task path
+- `POST /tasks` still returns task ids and starts the legacy task runner for execution
+- pending submission commands are not yet materialized into runtime jobs by default
+
+Tests:
+
+- issue submission decisions validate in the workflow contract layer
+- failed issue workflows can be explicitly reopened by operator submission
+- server submission tracking records `IssueSubmitted`, scheduled state, and an inline-handled
+  `implement_issue` command without creating a runtime job
 
 ## Test Strategy
 

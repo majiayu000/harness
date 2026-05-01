@@ -57,6 +57,7 @@ pub(crate) mod workflow_runtime_plan_issue;
 pub(crate) mod workflow_runtime_policy;
 pub(crate) mod workflow_runtime_pr_feedback;
 pub(crate) mod workflow_runtime_repo_backlog;
+pub(crate) mod workflow_runtime_submission;
 pub(crate) mod workflow_runtime_worker;
 pub use harness_workflow::task_queue;
 pub mod task_runner;

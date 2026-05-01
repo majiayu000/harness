@@ -499,44 +499,61 @@ impl DefaultExecutionService {
         req: &CreateTaskRequest,
         task_id: &TaskId,
     ) {
-        let Some(workflows) = self.issue_workflow_store.as_ref() else {
-            return;
-        };
         if let Some(issue_number) = req.issue {
-            if let Err(e) = workflows
-                .record_issue_scheduled(
-                    project_id,
-                    req.repo.as_deref(),
-                    issue_number,
-                    &task_id.0,
-                    &req.labels,
-                    req.force_execute,
-                )
-                .await
-            {
-                tracing::warn!(
-                    issue = issue_number,
-                    task_id = %task_id.0,
-                    "issue workflow enqueue tracking failed: {e}"
-                );
+            if let Some(workflows) = self.issue_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_issue_scheduled(
+                        project_id,
+                        req.repo.as_deref(),
+                        issue_number,
+                        &task_id.0,
+                        &req.labels,
+                        req.force_execute,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        issue = issue_number,
+                        task_id = %task_id.0,
+                        "issue workflow enqueue tracking failed: {e}"
+                    );
+                }
             }
+            let project_root = req
+                .project
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(project_id));
+            crate::workflow_runtime_submission::record_issue_submission(
+                self.workflow_runtime_store.as_deref(),
+                crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+                    project_root,
+                    repo: req.repo.as_deref(),
+                    issue_number,
+                    task_id,
+                    labels: &req.labels,
+                    force_execute: req.force_execute,
+                },
+            )
+            .await;
             return;
         }
         if let Some(pr_number) = req.pr {
-            if let Err(e) = workflows
-                .record_feedback_task_scheduled(
-                    project_id,
-                    req.repo.as_deref(),
-                    pr_number,
-                    &task_id.0,
-                )
-                .await
-            {
-                tracing::warn!(
-                    pr = pr_number,
-                    task_id = %task_id.0,
-                    "issue workflow PR enqueue tracking failed: {e}"
-                );
+            if let Some(workflows) = self.issue_workflow_store.as_ref() {
+                if let Err(e) = workflows
+                    .record_feedback_task_scheduled(
+                        project_id,
+                        req.repo.as_deref(),
+                        pr_number,
+                        &task_id.0,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        pr = pr_number,
+                        task_id = %task_id.0,
+                        "issue workflow PR enqueue tracking failed: {e}"
+                    );
+                }
             }
         }
     }
@@ -976,6 +993,54 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn track_issue_workflow_records_runtime_submission() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
+        let req = CreateTaskRequest {
+            issue: Some(42),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            labels: vec!["bug".to_string()],
+            ..Default::default()
+        };
+        let task_id = TaskId::from_str("task-1");
+
+        svc.track_issue_workflow(&project_root.to_string_lossy(), &req, &task_id)
+            .await;
+
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            42,
+        );
+        let instance = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("runtime workflow should be recorded");
+        assert_eq!(instance.state, "scheduled");
+        let commands = runtime_store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, "handled_inline");
+        assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+        Ok(())
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     async fn make_event_store_noop() -> Arc<harness_observe::event_store::EventStore> {
@@ -1038,6 +1103,30 @@ mod tests {
             None,
             None,
             allowed,
+        )
+    }
+
+    async fn make_svc_with_workflow_runtime(
+        store: Arc<TaskStore>,
+        runtime_store: Arc<harness_workflow::runtime::WorkflowRuntimeStore>,
+    ) -> Arc<DefaultExecutionService> {
+        let config = Arc::new(HarnessConfig::default());
+        let agent_registry = Arc::new(AgentRegistry::new("test"));
+        DefaultExecutionService::new(
+            store,
+            agent_registry,
+            config,
+            Default::default(),
+            make_event_store_noop().await,
+            vec![],
+            None,
+            make_task_queue(),
+            make_task_queue(),
+            None,
+            None,
+            Some(runtime_store),
+            None,
+            vec![],
         )
     }
 }

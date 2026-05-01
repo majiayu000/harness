@@ -150,12 +150,18 @@ async fn persist_plan_issue_decision(
     };
     store.record_decision(&record).await?;
     for command in &output.decision.commands {
-        let command_id = store
-            .enqueue_command(&instance.id, Some(&record.id), command)
-            .await?;
         if command.requires_runtime_job() {
             store
-                .mark_pending_command_status(&command_id, COMMAND_STATUS_HANDLED_INLINE)
+                .enqueue_command_with_status(
+                    &instance.id,
+                    Some(&record.id),
+                    command,
+                    COMMAND_STATUS_HANDLED_INLINE,
+                )
+                .await?;
+        } else {
+            store
+                .enqueue_command(&instance.id, Some(&record.id), command)
                 .await?;
         }
     }

@@ -409,12 +409,23 @@ impl WorkflowRuntimeStore {
         decision_id: Option<&str>,
         command: &WorkflowCommand,
     ) -> anyhow::Result<String> {
+        self.enqueue_command_with_status(workflow_id, decision_id, command, "pending")
+            .await
+    }
+
+    pub async fn enqueue_command_with_status(
+        &self,
+        workflow_id: &str,
+        decision_id: Option<&str>,
+        command: &WorkflowCommand,
+        status: &str,
+    ) -> anyhow::Result<String> {
         let data = to_jsonb_string(command)?;
         let command_type = enum_str(&command.command_type)?;
         let row: Option<(String,)> = sqlx::query_as(
             "INSERT INTO workflow_commands
                 (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-             VALUES ($1, $2, $3, $4, $5, 'pending', $6::jsonb)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
              ON CONFLICT (workflow_id, dedupe_key) DO NOTHING
              RETURNING id",
         )
@@ -423,6 +434,7 @@ impl WorkflowRuntimeStore {
         .bind(decision_id)
         .bind(&command_type)
         .bind(&command.dedupe_key)
+        .bind(status)
         .bind(&data)
         .fetch_optional(&self.pool)
         .await?;
