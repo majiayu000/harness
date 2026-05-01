@@ -2458,6 +2458,70 @@ async fn runtime_store_can_insert_non_pending_command_atomically() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn runtime_store_non_pending_status_updates_existing_pending_command() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "scheduled");
+    store.upsert_instance(&instance).await?;
+    let command =
+        WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-inline");
+    let pending_id = store.enqueue_command(&instance.id, None, &command).await?;
+    let inline_id = store
+        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .await?;
+
+    assert_eq!(inline_id, pending_id);
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "handled_inline");
+    assert!(
+        store.pending_commands(10).await?.is_empty(),
+        "dedupe conflict must not leave an inline command visible as pending"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_store_dedupe_status_update_does_not_regress_dispatched_command(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "replanning");
+    store.upsert_instance(&instance).await?;
+    let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-dispatched");
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    let outcome = store
+        .enqueue_runtime_job_for_pending_command(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({"activity": "replan_issue"}),
+            None,
+        )
+        .await?;
+    assert!(matches!(outcome, RuntimeJobEnqueueOutcome::Enqueued(_)));
+
+    let duplicate_id = store
+        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .await?;
+
+    assert_eq!(duplicate_id, command_id);
+    assert_eq!(
+        store.commands_for(&instance.id).await?[0].status,
+        "dispatched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_store_pending_command_enqueue_is_idempotent_across_concurrent_claims(
 ) -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {

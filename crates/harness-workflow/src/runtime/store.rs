@@ -422,11 +422,21 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<String> {
         let data = to_jsonb_string(command)?;
         let command_type = enum_str(&command.command_type)?;
-        let row: Option<(String,)> = sqlx::query_as(
+        let (id,): (String,) = sqlx::query_as(
             "INSERT INTO workflow_commands
                 (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-             ON CONFLICT (workflow_id, dedupe_key) DO NOTHING
+             ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
+                status = CASE
+                    WHEN workflow_commands.status = 'pending' THEN EXCLUDED.status
+                    ELSE workflow_commands.status
+                END,
+                updated_at = CASE
+                    WHEN workflow_commands.status = 'pending'
+                         AND workflow_commands.status <> EXCLUDED.status
+                    THEN CURRENT_TIMESTAMP
+                    ELSE workflow_commands.updated_at
+                END
              RETURNING id",
         )
         .bind(Uuid::new_v4().to_string())
@@ -436,19 +446,6 @@ impl WorkflowRuntimeStore {
         .bind(&command.dedupe_key)
         .bind(status)
         .bind(&data)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some((id,)) = row {
-            return Ok(id);
-        }
-
-        let (id,): (String,) = sqlx::query_as(
-            "SELECT id FROM workflow_commands
-             WHERE workflow_id = $1 AND dedupe_key = $2",
-        )
-        .bind(workflow_id)
-        .bind(&command.dedupe_key)
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
