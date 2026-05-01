@@ -1,11 +1,10 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
-use super::store::WorkflowRuntimeStore;
+use super::store::{RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::collections::BTreeMap;
 
-const COMMAND_STATUS_DISPATCHED: &str = "dispatched";
 const COMMAND_STATUS_SKIPPED: &str = "skipped";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,28 +156,12 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             });
         }
 
-        if let Some(runtime_job) = self
-            .store
-            .runtime_jobs_for_command(&command.id)
-            .await?
-            .into_iter()
-            .next()
-        {
-            self.store
-                .mark_command_status(&command.id, COMMAND_STATUS_DISPATCHED)
-                .await?;
-            return Ok(CommandDispatchOutcome::AlreadyDispatched {
-                command_id: command.id,
-                runtime_job,
-            });
-        }
-
         let activity = command.command.runtime_activity_key().to_string();
         let runtime_profile = self.profile_for_command(&command).await?;
         let not_before = retry_not_before_for_command(&command)?;
-        let runtime_job = self
+        match self
             .store
-            .enqueue_runtime_job_with_not_before(
+            .enqueue_runtime_job_for_pending_command(
                 &command.id,
                 runtime_profile.kind,
                 &runtime_profile.name,
@@ -193,14 +176,27 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                 }),
                 not_before,
             )
-            .await?;
-        self.store
-            .mark_command_status(&command.id, COMMAND_STATUS_DISPATCHED)
-            .await?;
-        Ok(CommandDispatchOutcome::Enqueued {
-            command_id: command.id,
-            runtime_job,
-        })
+            .await?
+        {
+            RuntimeJobEnqueueOutcome::Enqueued(runtime_job) => {
+                Ok(CommandDispatchOutcome::Enqueued {
+                    command_id: command.id,
+                    runtime_job,
+                })
+            }
+            RuntimeJobEnqueueOutcome::AlreadyExists(runtime_job) => {
+                Ok(CommandDispatchOutcome::AlreadyDispatched {
+                    command_id: command.id,
+                    runtime_job,
+                })
+            }
+            RuntimeJobEnqueueOutcome::CommandNotPending { status } => {
+                Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: format!("command status changed to `{status}` before dispatch"),
+                })
+            }
+        }
     }
 
     async fn profile_for_command(

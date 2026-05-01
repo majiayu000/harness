@@ -4,6 +4,7 @@ use super::model::{
     WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
     WorkflowDefinition, WorkflowEvent, WorkflowEvidence, WorkflowInstance, WorkflowSubject,
 };
+use super::store::RuntimeJobEnqueueOutcome;
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,
@@ -2205,6 +2206,80 @@ async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() 
         "dispatched"
     );
     assert!(dispatcher.dispatch_once().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_store_pending_command_enqueue_is_idempotent_across_concurrent_claims(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "replanning");
+    store.upsert_instance(&instance).await?;
+    let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-idempotent");
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+
+    let first = store.enqueue_runtime_job_for_pending_command(
+        &command_id,
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({"activity": "replan_issue"}),
+        None,
+    );
+    let second = store.enqueue_runtime_job_for_pending_command(
+        &command_id,
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({"activity": "replan_issue"}),
+        None,
+    );
+    let (first, second) = tokio::join!(first, second);
+    let outcomes = [first?, second?];
+    let enqueued: Vec<&RuntimeJobEnqueueOutcome> = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, RuntimeJobEnqueueOutcome::Enqueued(_)))
+        .collect();
+    let already_exists: Vec<&RuntimeJobEnqueueOutcome> = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, RuntimeJobEnqueueOutcome::AlreadyExists(_)))
+        .collect();
+    assert_eq!(enqueued.len(), 1);
+    assert_eq!(already_exists.len(), 1);
+
+    let first_job_id = match enqueued[0] {
+        RuntimeJobEnqueueOutcome::Enqueued(job) => job.id.clone(),
+        other => panic!("unexpected enqueue outcome: {other:?}"),
+    };
+    match already_exists[0] {
+        RuntimeJobEnqueueOutcome::AlreadyExists(job) => assert_eq!(job.id, first_job_id),
+        other => panic!("unexpected idempotent enqueue outcome: {other:?}"),
+    }
+
+    let third = store
+        .enqueue_runtime_job_for_pending_command(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({"activity": "replan_issue"}),
+            None,
+        )
+        .await?;
+    match third {
+        RuntimeJobEnqueueOutcome::AlreadyExists(job) => assert_eq!(job.id, first_job_id),
+        other => panic!("unexpected third enqueue outcome: {other:?}"),
+    }
+
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, first_job_id);
+    assert_eq!(
+        store.commands_for(&instance.id).await?[0].status,
+        "dispatched"
+    );
     Ok(())
 }
 

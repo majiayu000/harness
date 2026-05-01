@@ -146,6 +146,13 @@ type WorkflowCommandRecordRow = (
     DateTime<Utc>,
 );
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeJobEnqueueOutcome {
+    Enqueued(RuntimeJob),
+    AlreadyExists(RuntimeJob),
+    CommandNotPending { status: String },
+}
+
 impl WorkflowRuntimeStore {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_database_url(path, None).await
@@ -633,6 +640,79 @@ impl WorkflowRuntimeStore {
         Ok(job)
     }
 
+    pub async fn enqueue_runtime_job_for_pending_command(
+        &self,
+        command_id: &str,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: Value,
+        not_before: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
+        let mut job = RuntimeJob::pending(command_id, runtime_kind, runtime_profile, input);
+        job.not_before = not_before;
+        let data = to_jsonb_string(&job)?;
+        let status = enum_str(&job.status)?;
+        let runtime_kind = enum_str(&job.runtime_kind)?;
+        let mut tx = self.pool.begin().await?;
+        let command_row: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM workflow_commands WHERE id = $1 FOR UPDATE")
+                .bind(command_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((command_status,)) = command_row else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+
+        if command_status != "pending" {
+            let existing = runtime_job_for_command_tx(&mut tx, command_id).await?;
+            tx.commit().await?;
+            return Ok(match existing {
+                Some(runtime_job) => RuntimeJobEnqueueOutcome::AlreadyExists(runtime_job),
+                None => RuntimeJobEnqueueOutcome::CommandNotPending {
+                    status: command_status,
+                },
+            });
+        }
+
+        if let Some(existing) = runtime_job_for_command_tx(&mut tx, command_id).await? {
+            sqlx::query(
+                "UPDATE workflow_commands
+                 SET status = 'dispatched', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1",
+            )
+            .bind(command_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(RuntimeJobEnqueueOutcome::AlreadyExists(existing));
+        }
+
+        sqlx::query(
+            "INSERT INTO runtime_jobs
+                (id, command_id, runtime_kind, runtime_profile, status, not_before, data)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+        )
+        .bind(&job.id)
+        .bind(&job.command_id)
+        .bind(&runtime_kind)
+        .bind(&job.runtime_profile)
+        .bind(&status)
+        .bind(job.not_before)
+        .bind(&data)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_commands
+             SET status = 'dispatched', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1",
+        )
+        .bind(command_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(RuntimeJobEnqueueOutcome::Enqueued(job))
+    }
+
     pub async fn claim_next_runtime_job(
         &self,
         owner: &str,
@@ -889,4 +969,22 @@ fn enum_str(value: &impl Serialize) -> anyhow::Result<String> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("serialized enum did not produce a string"))
+}
+
+async fn runtime_job_for_command_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    command_id: &str,
+) -> anyhow::Result<Option<RuntimeJob>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT data::text FROM runtime_jobs
+         WHERE command_id = $1
+         ORDER BY created_at ASC
+         LIMIT 1",
+    )
+    .bind(command_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|(data,)| serde_json::from_str(&data))
+        .transpose()
+        .map_err(Into::into)
 }
