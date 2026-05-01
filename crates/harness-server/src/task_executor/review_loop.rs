@@ -717,6 +717,7 @@ fn update_silence_rounds(
 }
 
 async fn record_runtime_pr_feedback(
+    issue_workflow_store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
     workflow_runtime_store: Option<&harness_workflow::runtime::WorkflowRuntimeStore>,
     project_root: &Path,
     req: &CreateTaskRequest,
@@ -726,12 +727,21 @@ async fn record_runtime_pr_feedback(
     outcome: PrFeedbackOutcome,
     summary: &str,
 ) {
+    let issue_number = resolve_runtime_feedback_issue_number(
+        issue_workflow_store,
+        project_root,
+        req.repo.as_deref(),
+        req.issue,
+        pr_num,
+    )
+    .await;
+
     crate::workflow_runtime_pr_feedback::record_pr_feedback(
         workflow_runtime_store,
         crate::workflow_runtime_pr_feedback::PrFeedbackRuntimeContext {
             project_root,
             repo: req.repo.as_deref(),
-            issue_number: req.issue,
+            issue_number,
             task_id,
             pr_number: pr_num,
             pr_url,
@@ -740,6 +750,34 @@ async fn record_runtime_pr_feedback(
         },
     )
     .await;
+}
+
+async fn resolve_runtime_feedback_issue_number(
+    issue_workflow_store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
+    project_root: &Path,
+    repo: Option<&str>,
+    explicit_issue: Option<u64>,
+    pr_num: u64,
+) -> Option<u64> {
+    if explicit_issue.is_some() {
+        return explicit_issue;
+    }
+
+    let workflows = issue_workflow_store?;
+    let project_id = project_root.to_string_lossy();
+    match workflows.get_by_pr(project_id.as_ref(), repo, pr_num).await {
+        Ok(Some(workflow)) => Some(workflow.issue_number),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                project = %project_id,
+                repo = repo.unwrap_or(""),
+                pr = pr_num,
+                "failed to resolve runtime feedback issue number: {error}"
+            );
+            None
+        }
+    }
 }
 
 /// Execute the external review bot wait loop.
@@ -977,6 +1015,7 @@ pub(crate) async fn run_review_loop(
                             .await;
                     }
                     record_runtime_pr_feedback(
+                        issue_workflow_store,
                         workflow_runtime_store,
                         project_root,
                         req,
@@ -1017,6 +1056,7 @@ pub(crate) async fn run_review_loop(
                         "waiting for review bot activity"
                     );
                     record_runtime_pr_feedback(
+                        issue_workflow_store,
                         workflow_runtime_store,
                         project_root,
                         req,
@@ -1357,6 +1397,7 @@ pub(crate) async fn run_review_loop(
                     "PR #{pr_num} review bot has not responded yet; sleeping without consuming round"
                 );
                 record_runtime_pr_feedback(
+                    issue_workflow_store,
                     workflow_runtime_store,
                     project_root,
                     req,
@@ -1431,6 +1472,7 @@ pub(crate) async fn run_review_loop(
                 Ok(()) => {
                     tracing::info!("PR #{pr_num} approved at round {round}");
                     record_runtime_pr_feedback(
+                        issue_workflow_store,
                         workflow_runtime_store,
                         project_root,
                         req,
@@ -1476,6 +1518,7 @@ pub(crate) async fn run_review_loop(
                     lgtm_test_gate_rejected = true;
                     pending_test_failure = Some(output);
                     record_runtime_pr_feedback(
+                        issue_workflow_store,
                         workflow_runtime_store,
                         project_root,
                         req,
@@ -1497,6 +1540,7 @@ pub(crate) async fn run_review_loop(
         prev_fixed = fixed || pending_test_failure.is_some();
         if !lgtm {
             record_runtime_pr_feedback(
+                issue_workflow_store,
                 workflow_runtime_store,
                 project_root,
                 req,
@@ -1533,6 +1577,7 @@ pub(crate) async fn run_review_loop(
             "review loop exhausted but few issues remain — marking done with warning"
         );
         record_runtime_pr_feedback(
+            issue_workflow_store,
             workflow_runtime_store,
             project_root,
             req,
@@ -1612,6 +1657,80 @@ mod tests {
         let mut config = review_config();
         config.fallback_chain = chain.iter().map(|entry| (*entry).to_string()).collect();
         config
+    }
+
+    async fn open_issue_workflow_test_store(
+    ) -> anyhow::Result<Option<harness_workflow::issue_lifecycle::IssueWorkflowStore>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir()?;
+        match harness_workflow::issue_lifecycle::IssueWorkflowStore::open(
+            &dir.path().join("issue_workflows.db"),
+        )
+        .await
+        {
+            Ok(store) => Ok(Some(store)),
+            Err(error) => {
+                tracing::warn!("issue workflow store test skipped: {error}");
+                Ok(None)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_issue_resolution_keeps_explicit_issue() {
+        let issue_number = resolve_runtime_feedback_issue_number(
+            None,
+            std::path::Path::new("/tmp/project"),
+            Some("owner/repo"),
+            Some(42),
+            99,
+        )
+        .await;
+
+        assert_eq!(issue_number, Some(42));
+    }
+
+    #[tokio::test]
+    async fn runtime_feedback_issue_resolution_looks_up_pr_only_task() -> anyhow::Result<()> {
+        let Some(store) = open_issue_workflow_test_store().await? else {
+            return Ok(());
+        };
+        let project_root = tempfile::tempdir()?;
+        let project_id = project_root.path().to_string_lossy().into_owned();
+        store
+            .record_issue_scheduled(
+                &project_id,
+                Some("owner/repo"),
+                123,
+                "task-issue",
+                &[],
+                false,
+            )
+            .await?;
+        store
+            .record_pr_detected(
+                &project_id,
+                Some("owner/repo"),
+                123,
+                "task-issue",
+                77,
+                "https://github.com/owner/repo/pull/77",
+            )
+            .await?;
+
+        let issue_number = resolve_runtime_feedback_issue_number(
+            Some(&store),
+            project_root.path(),
+            Some("owner/repo"),
+            None,
+            77,
+        )
+        .await;
+
+        assert_eq!(issue_number, Some(123));
+        Ok(())
     }
 
     #[test]
