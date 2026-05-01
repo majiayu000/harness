@@ -279,9 +279,29 @@ pub fn load_workflow_config(project_root: &Path) -> anyhow::Result<WorkflowConfi
 }
 
 fn extract_front_matter(contents: &str) -> Option<&str> {
-    let rest = contents.strip_prefix("---\n")?;
-    let end = rest.find("\n---\n")?;
-    Some(&rest[..end])
+    let rest = contents
+        .strip_prefix("---\r\n")
+        .or_else(|| contents.strip_prefix("---\n"))?;
+
+    let mut search_start = 0;
+    while let Some(relative_idx) = rest[search_start..].find("---") {
+        let idx = search_start + relative_idx;
+        let at_line_start = idx == 0 || rest.as_bytes().get(idx - 1) == Some(&b'\n');
+        let after = &rest[idx + 3..];
+        let delimiter_ends_line =
+            after.starts_with("\r\n") || after.starts_with('\n') || after.is_empty();
+        if at_line_start && delimiter_ends_line {
+            let front_matter = &rest[..idx];
+            return Some(
+                front_matter
+                    .strip_suffix("\r\n")
+                    .or_else(|| front_matter.strip_suffix('\n'))
+                    .unwrap_or(front_matter),
+            );
+        }
+        search_start = idx + 3;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -499,6 +519,48 @@ Body
             Some(60)
         );
         assert_eq!(cfg.storage.schema_namespace, "orchestration");
+        Ok(())
+    }
+
+    #[test]
+    fn load_workflow_config_reads_crlf_front_matter() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            "---\r\nruntime_dispatch:\r\n  enabled: true\r\n  batch_limit: 9\r\n---\r\nBody\r\n",
+        )?;
+
+        let cfg = load_workflow_config(dir.path())?;
+        assert!(cfg.runtime_dispatch.enabled);
+        assert_eq!(cfg.runtime_dispatch.batch_limit, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn load_workflow_config_reads_front_matter_delimiter_at_eof() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            "---\nruntime_worker:\n  enabled: true\n  concurrency: 3\n---",
+        )?;
+
+        let cfg = load_workflow_config(dir.path())?;
+        assert!(cfg.runtime_worker.enabled);
+        assert_eq!(cfg.runtime_worker.concurrency, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn load_workflow_config_reads_crlf_front_matter_delimiter_at_eof() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            "---\r\nruntime_dispatch:\r\n  enabled: true\r\n  batch_limit: 11\r\n---",
+        )?;
+
+        let cfg = load_workflow_config(dir.path())?;
+        assert!(cfg.runtime_dispatch.enabled);
+        assert_eq!(cfg.runtime_dispatch.batch_limit, 11);
         Ok(())
     }
 }
