@@ -127,6 +127,7 @@ async fn make_test_state_with_config_and_registry(
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],
+            legacy_github_fallback_enabled: true,
             completion_callback: None,
         },
         project_svc,
@@ -1467,6 +1468,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],
+            legacy_github_fallback_enabled: true,
             completion_callback: None,
         },
         project_svc,

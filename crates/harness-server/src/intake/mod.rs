@@ -1244,6 +1244,7 @@ pub fn build_orchestrator(
     data_dir: Option<&std::path::Path>,
     feishu_intake: Option<Arc<feishu::FeishuIntake>>,
     github_sources: Vec<Arc<dyn IntakeSource>>,
+    allow_github_fallback: bool,
     github_token: Option<String>,
 ) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
@@ -1264,7 +1265,7 @@ pub fn build_orchestrator(
                     .retry_backoff_max_secs
                     .max(gh_config.retry_backoff_base_secs),
             );
-            if github_sources.is_empty() {
+            if github_sources.is_empty() && allow_github_fallback {
                 // Fallback: build fresh pollers when no shared instances are supplied
                 // (e.g. during testing or when called without pre-built sources).
                 for repo_cfg in gh_config.effective_repos() {
@@ -1911,7 +1912,7 @@ mod tests {
     #[test]
     fn build_orchestrator_with_no_config_returns_empty_orchestrator() {
         let config = harness_core::config::intake::IntakeConfig::default();
-        let orchestrator = build_orchestrator(&config, None, None, vec![], None);
+        let orchestrator = build_orchestrator(&config, None, None, vec![], true, None);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -1923,7 +1924,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None, None, vec![], None);
+        let orchestrator = build_orchestrator(&config, None, None, vec![], true, None);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -1940,13 +1941,28 @@ mod tests {
             retry_backoff_max_secs: 90,
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None, None, vec![], None);
+        let orchestrator = build_orchestrator(&config, None, None, vec![], true, None);
         assert_eq!(orchestrator.sources.len(), 1);
         assert_eq!(orchestrator.sources[0].name(), "github");
         assert_eq!(orchestrator.poll_interval, Duration::from_secs(60));
         assert_eq!(orchestrator.sprint_timeout, Duration::from_secs(7200));
         assert_eq!(orchestrator.retry_backoff_base, Duration::from_secs(10));
         assert_eq!(orchestrator.retry_backoff_max, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn build_orchestrator_with_disabled_github_fallback_registers_no_source() {
+        let mut config = harness_core::config::intake::IntakeConfig::default();
+        config.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+            enabled: true,
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            ..Default::default()
+        });
+
+        let orchestrator = build_orchestrator(&config, None, None, vec![], false, None);
+
+        assert!(orchestrator.sources.is_empty());
     }
 
     #[test]
@@ -1961,7 +1977,7 @@ mod tests {
             default_repo: None,
         });
 
-        let orchestrator = build_orchestrator(&config, None, None, vec![], None);
+        let orchestrator = build_orchestrator(&config, None, None, vec![], true, None);
         assert!(orchestrator.sources.is_empty());
     }
 }

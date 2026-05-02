@@ -221,6 +221,8 @@ impl TransitionAllowlist {
                 "dispatching",
                 [StartChildWorkflow, EnqueueActivity, Wait],
             )
+            .allow("idle", "scanning", [EnqueueActivity, Wait])
+            .allow("scanning", "scanning", [EnqueueActivity, Wait])
             .allow("idle", "reconciling", [EnqueueActivity, Wait])
             .allow(
                 "scanning",
@@ -228,6 +230,7 @@ impl TransitionAllowlist {
                 [StartChildWorkflow, EnqueueActivity, Wait],
             )
             .allow("scanning", "reconciling", [EnqueueActivity, Wait])
+            .allow("scanning", "idle", [Wait])
             .allow(
                 "dispatching",
                 "dispatching",

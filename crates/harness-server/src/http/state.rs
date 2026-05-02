@@ -129,6 +129,7 @@ pub struct IntakeServices {
     /// `on_task_complete` (e.g. evicting a failed issue from `dispatched`)
     /// operates on the live poller rather than a detached clone.
     pub github_pollers: Vec<Arc<dyn crate::intake::IntakeSource>>,
+    pub legacy_github_fallback_enabled: bool,
     /// Completion callback invoked when a task reaches a terminal state.
     pub completion_callback: Option<task_runner::CompletionCallback>,
 }

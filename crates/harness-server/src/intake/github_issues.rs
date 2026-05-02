@@ -21,11 +21,13 @@ impl DispatchedTaskChecker for crate::task_runner::TaskStore {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct RuntimeAwareDispatchedTaskChecker {
     tasks: Arc<crate::task_runner::TaskStore>,
     workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
 }
 
+#[cfg(test)]
 impl RuntimeAwareDispatchedTaskChecker {
     pub(crate) fn new(
         tasks: Arc<crate::task_runner::TaskStore>,
@@ -38,6 +40,7 @@ impl RuntimeAwareDispatchedTaskChecker {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl DispatchedTaskChecker for RuntimeAwareDispatchedTaskChecker {
     async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool> {
@@ -93,6 +96,7 @@ impl GitHubIssuesPoller {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_task_checker(
         mut self,
         task_checker: Arc<dyn DispatchedTaskChecker>,

@@ -621,6 +621,174 @@ fn load_runtime_workflow_config_or_default(
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RuntimeRepoBacklogPollTick {
+    pub requested: usize,
+    pub active_command_exists: usize,
+    pub skipped: usize,
+    pub rejected: usize,
+}
+
+impl RuntimeRepoBacklogPollTick {
+    fn touched_anything(&self) -> bool {
+        self.requested > 0
+            || self.active_command_exists > 0
+            || self.skipped > 0
+            || self.rejected > 0
+    }
+}
+
+pub(super) async fn run_runtime_repo_backlog_poll_tick(
+    state: &Arc<AppState>,
+    limit: usize,
+) -> anyhow::Result<RuntimeRepoBacklogPollTick> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(RuntimeRepoBacklogPollTick::default());
+    };
+    let Some(github_config) = state
+        .core
+        .server
+        .config
+        .intake
+        .github
+        .as_ref()
+        .filter(|config| config.enabled)
+    else {
+        return Ok(RuntimeRepoBacklogPollTick::default());
+    };
+
+    let mut tick = RuntimeRepoBacklogPollTick::default();
+    let mut considered_repos = 0usize;
+    for repo_config in github_config.effective_repos() {
+        if considered_repos >= limit.max(1) {
+            break;
+        }
+        let project_root = repo_backlog_project_root(&repo_config, &state.core.project_root).await;
+        if !project_root.exists() {
+            tracing::warn!(
+                repo = %repo_config.repo,
+                project_root = %project_root.display(),
+                "workflow runtime repo backlog poll skipped unresolvable project path"
+            );
+            tick.skipped += 1;
+            continue;
+        }
+        let workflow_cfg = load_runtime_workflow_config_or_default(
+            &project_root,
+            "workflow runtime repo backlog poller",
+        );
+        if !workflow_cfg.repo_backlog.enabled
+            || !workflow_cfg.runtime_dispatch.enabled
+            || !workflow_cfg.runtime_worker.enabled
+        {
+            tick.skipped += 1;
+            continue;
+        }
+        considered_repos += 1;
+        match crate::workflow_runtime_repo_backlog::request_repo_backlog_poll(
+            store,
+            crate::workflow_runtime_repo_backlog::RepoBacklogPollRuntimeContext {
+                project_root: &project_root,
+                repo: Some(repo_config.repo.as_str()),
+                label: Some(repo_config.label.as_str()),
+            },
+        )
+        .await?
+        {
+            crate::workflow_runtime_repo_backlog::RepoBacklogPollRequestOutcome::Requested {
+                ..
+            } => tick.requested += 1,
+            crate::workflow_runtime_repo_backlog::RepoBacklogPollRequestOutcome::ActiveCommandExists {
+                ..
+            } => tick.active_command_exists += 1,
+            crate::workflow_runtime_repo_backlog::RepoBacklogPollRequestOutcome::NotCandidate {
+                ..
+            } => tick.skipped += 1,
+            crate::workflow_runtime_repo_backlog::RepoBacklogPollRequestOutcome::Rejected {
+                ..
+            } => tick.rejected += 1,
+        }
+    }
+    Ok(tick)
+}
+
+async fn repo_backlog_project_root(
+    repo_config: &harness_core::config::intake::GitHubRepoConfig,
+    fallback: &Path,
+) -> PathBuf {
+    let configured = repo_config
+        .project_root
+        .as_ref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| expand_home_path(path))
+        .unwrap_or_else(|| fallback.to_path_buf());
+    match task_runner::resolve_canonical_project(Some(configured.clone())).await {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(
+                repo = %repo_config.repo,
+                project_root = %configured.display(),
+                "workflow runtime repo backlog poller failed to canonicalize project root: {error}"
+            );
+            configured
+        }
+    }
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+pub(super) fn spawn_runtime_repo_backlog_poller(state: &Arc<AppState>) {
+    if state.core.workflow_runtime_store.is_none() {
+        tracing::debug!("workflow runtime repo backlog poller disabled: store unavailable");
+        return;
+    }
+
+    let weak_state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let state = match weak_state.upgrade() {
+                Some(state) => state,
+                None => break,
+            };
+            let workflow_cfg = load_runtime_workflow_config_or_default(
+                &state.core.project_root,
+                "workflow runtime repo backlog poller",
+            );
+            let interval =
+                std::time::Duration::from_secs(workflow_cfg.repo_backlog.poll_interval_secs.max(1));
+            let batch_limit = workflow_cfg.repo_backlog.batch_limit.max(1) as usize;
+            match run_runtime_repo_backlog_poll_tick(&state, batch_limit).await {
+                Ok(tick) if tick.touched_anything() => {
+                    tracing::info!(
+                        requested = tick.requested,
+                        active_command_exists = tick.active_command_exists,
+                        skipped = tick.skipped,
+                        rejected = tick.rejected,
+                        "workflow runtime repo backlog poller tick complete"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("workflow runtime repo backlog poller tick failed: {error}");
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RuntimePrFeedbackSweepTick {
     pub requested: usize,
     pub active_command_exists: usize,

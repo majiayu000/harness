@@ -26,6 +26,16 @@ pub struct PrFeedbackPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoBacklogPolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_repo_backlog_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_repo_backlog_batch_limit")]
+    pub batch_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeDispatchPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -126,6 +136,8 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub issue_workflow: IssueWorkflowPolicy,
     #[serde(default)]
+    pub repo_backlog: RepoBacklogPolicy,
+    #[serde(default)]
     pub pr_feedback: PrFeedbackPolicy,
     #[serde(default)]
     pub runtime_dispatch: RuntimeDispatchPolicy,
@@ -159,6 +171,16 @@ impl Default for PrFeedbackPolicy {
             enabled: default_true(),
             sweep_interval_secs: default_feedback_sweep_interval_secs(),
             claim_stale_after_secs: default_feedback_claim_stale_after_secs(),
+        }
+    }
+}
+
+impl Default for RepoBacklogPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            poll_interval_secs: default_repo_backlog_poll_interval_secs(),
+            batch_limit: default_repo_backlog_batch_limit(),
         }
     }
 }
@@ -213,6 +235,14 @@ fn default_feedback_sweep_interval_secs() -> u64 {
 
 fn default_feedback_claim_stale_after_secs() -> u64 {
     300
+}
+
+fn default_repo_backlog_poll_interval_secs() -> u64 {
+    60
+}
+
+fn default_repo_backlog_batch_limit() -> u32 {
+    128
 }
 
 fn default_runtime_dispatch_interval_secs() -> u64 {
@@ -316,6 +346,9 @@ mod tests {
         assert!(cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 60);
         assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 300);
+        assert!(cfg.repo_backlog.enabled);
+        assert_eq!(cfg.repo_backlog.poll_interval_secs, 60);
+        assert_eq!(cfg.repo_backlog.batch_limit, 128);
         assert!(cfg.runtime_dispatch.enabled);
         assert_eq!(cfg.runtime_dispatch.interval_secs, 30);
         assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
@@ -355,6 +388,10 @@ pr_feedback:
   enabled: false
   sweep_interval_secs: 15
   claim_stale_after_secs: 45
+repo_backlog:
+  enabled: false
+  poll_interval_secs: 20
+  batch_limit: 9
 runtime_dispatch:
   enabled: true
   interval_secs: 5
@@ -420,6 +457,9 @@ Body
         assert!(!cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 15);
         assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 45);
+        assert!(!cfg.repo_backlog.enabled);
+        assert_eq!(cfg.repo_backlog.poll_interval_secs, 20);
+        assert_eq!(cfg.repo_backlog.batch_limit, 9);
         assert!(cfg.runtime_dispatch.enabled);
         assert_eq!(cfg.runtime_dispatch.interval_secs, 5);
         assert_eq!(cfg.runtime_dispatch.batch_limit, 7);

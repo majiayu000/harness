@@ -13,6 +13,7 @@ pub(crate) struct IntakeBundle {
     /// GitHub pollers keyed as `"github:{owner/repo}"` for per-repo routing.
     /// The same `Arc` instances are shared with the completion callback.
     pub github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)>,
+    pub legacy_github_fallback_enabled: bool,
     pub completion_callback: Option<task_runner::CompletionCallback>,
 }
 
@@ -27,13 +28,8 @@ pub(crate) async fn build_intake(
     engines: &EnginesBundle,
     registry: &RegistryBundle,
     project_root: &Path,
-    data_dir: &Path,
+    _data_dir: &Path,
 ) -> anyhow::Result<IntakeBundle> {
-    let tasks = storage
-        .tasks
-        .as_ref()
-        .expect("build_intake requires a ready task store")
-        .clone();
     let events = engines
         .events
         .as_ref()
@@ -88,14 +84,12 @@ pub(crate) async fn build_intake(
         )))
     });
 
-    // ── GitHub pollers ────────────────────────────────────────────────────────
-    // Build ALL GitHub pollers once. The same Arc instances are shared between
-    // the completion callback and the orchestrator, so on_task_complete operates
-    // on the live poller's dispatched map rather than a detached clone.
-    // Keyed as "github:{owner/repo}" for per-repo routing in the callback;
-    // a "github" fallback entry (first poller) supports tasks persisted before
-    // this multi-repo routing was introduced.
-    let mut github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = Vec::new();
+    // ── GitHub backlog ownership ──────────────────────────────────────────────
+    // GitHub issue polling is workflow-owned. The server does not register the
+    // legacy GitHub poller; repo backlog scans are requested through runtime
+    // commands and executed by agents.
+    let github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = Vec::new();
+    let mut legacy_github_fallback_enabled = true;
     if let Some(cfg) = server
         .config
         .intake
@@ -103,39 +97,21 @@ pub(crate) async fn build_intake(
         .as_ref()
         .filter(|cfg| cfg.enabled)
     {
+        legacy_github_fallback_enabled = false;
         for repo_cfg in cfg.effective_repos() {
-            tracing::info!(
-                repo = %repo_cfg.repo,
-                label = %repo_cfg.label,
-                "intake: GitHub Issues poller registered"
-            );
-            let key = format!("github:{}", repo_cfg.repo);
-            let task_checker = Arc::new(
-                crate::intake::github_issues::RuntimeAwareDispatchedTaskChecker::new(
-                    tasks.clone(),
-                    registry.workflow_runtime_store.clone(),
-                ),
-            );
-            let poller = crate::intake::github_issues::GitHubIssuesPoller::new_with_token(
-                &repo_cfg,
-                Some(data_dir),
-                server.config.server.github_token.clone(),
-            )
-            .with_task_checker(task_checker);
-            match poller.reconcile_dispatched_with_store().await {
-                Ok(pruned) if pruned > 0 => tracing::info!(
+            if runtime_repo_backlog_owns_github_polling(project_root, &repo_cfg, registry) {
+                tracing::info!(
                     repo = %repo_cfg.repo,
-                    pruned,
-                    "intake: pruned stale GitHub dispatched entries at startup"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
+                    label = %repo_cfg.label,
+                    "intake: GitHub issue polling owned by workflow runtime repo backlog"
+                );
+            } else {
+                tracing::warn!(
                     repo = %repo_cfg.repo,
-                    "intake: failed to reconcile GitHub dispatched entries at startup: {e}"
-                ),
+                    label = %repo_cfg.label,
+                    "intake: GitHub issue polling disabled because workflow runtime repo backlog is unavailable or disabled"
+                );
             }
-            let poller = Arc::new(poller) as Arc<dyn crate::intake::IntakeSource>;
-            github_pollers.push((key, poller));
         }
     }
 
@@ -256,8 +232,50 @@ pub(crate) async fn build_intake(
         review_task_queue,
         feishu_intake,
         github_pollers,
+        legacy_github_fallback_enabled,
         completion_callback,
     })
+}
+
+fn runtime_repo_backlog_owns_github_polling(
+    fallback_project_root: &Path,
+    repo_config: &harness_core::config::intake::GitHubRepoConfig,
+    registry: &RegistryBundle,
+) -> bool {
+    if registry.workflow_runtime_store.is_none() {
+        return false;
+    }
+    let project_root = repo_config
+        .project_root
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(expand_home_path)
+        .unwrap_or_else(|| fallback_project_root.to_path_buf());
+    let workflow_cfg = harness_core::config::workflow::load_workflow_config(&project_root)
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                project_root = %project_root.display(),
+                "intake: failed to load WORKFLOW.md for runtime repo backlog handoff, using default config: {error}"
+            );
+            harness_core::config::workflow::WorkflowConfig::default()
+        });
+    workflow_cfg.repo_backlog.enabled
+        && workflow_cfg.runtime_dispatch.enabled
+        && workflow_cfg.runtime_worker.enabled
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 async fn runtime_issue_concurrency_config(
@@ -452,6 +470,58 @@ mod tests {
         assert!(
             bundle.github_pollers.is_empty(),
             "github_pollers should be empty without config"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_intake_is_owned_by_runtime_not_legacy_poller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = HarnessConfig::default();
+        config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+            enabled: true,
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            ..Default::default()
+        });
+        let server = Arc::new(HarnessServer::new(
+            config,
+            ThreadManager::new(),
+            AgentRegistry::new("test"),
+        ));
+        let storage = crate::http::builders::storage::build_storage(dir.path())
+            .await
+            .expect("storage");
+        let engines =
+            crate::http::builders::engines::build_engines(&server, dir.path(), dir.path())
+                .await
+                .expect("engines");
+        let registry = crate::http::builders::registry::build_registry(
+            &server,
+            dir.path(),
+            dir.path(),
+            storage.tasks.as_ref().expect("tasks store"),
+        )
+        .await
+        .expect("registry");
+
+        let bundle = build_intake(
+            &server,
+            &storage,
+            &engines,
+            &registry,
+            dir.path(),
+            dir.path(),
+        )
+        .await
+        .expect("build_intake");
+
+        assert!(
+            bundle.github_pollers.is_empty(),
+            "configured GitHub intake should not register legacy pollers"
+        );
+        assert!(
+            !bundle.legacy_github_fallback_enabled,
+            "configured GitHub intake should not fall back to legacy server polling"
         );
     }
 

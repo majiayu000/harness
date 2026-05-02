@@ -10,16 +10,16 @@ use super::{
     build_issue_submission_decision, build_merged_pr_decision,
     build_open_issue_without_workflow_decision, build_plan_issue_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
-    build_quality_gate_run_decision, build_stale_active_workflow_decision,
-    reduce_runtime_job_completed, CommandDispatchOutcome, InMemoryWorkflowBus,
-    IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction, MergedPrDecisionInput,
-    OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
+    build_quality_gate_run_decision, build_repo_backlog_poll_decision,
+    build_stale_active_workflow_decision, reduce_runtime_job_completed, CommandDispatchOutcome,
+    InMemoryWorkflowBus, IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction,
+    MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
     PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, QualityGateDecisionInput,
-    QualityGateWorkflowAction, RepoBacklogWorkflowAction, RuntimeCommandDispatcher,
-    RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput,
-    WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    REPO_BACKLOG_DEFINITION_ID,
+    QualityGateWorkflowAction, RepoBacklogPollDecisionInput, RepoBacklogWorkflowAction,
+    RuntimeCommandDispatcher, RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker,
+    StaleWorkflowDecisionInput, WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -1210,6 +1210,34 @@ fn repo_backlog_open_issue_without_workflow_starts_child_workflow() {
 }
 
 #[test]
+fn repo_backlog_poll_decision_starts_runtime_scan() {
+    let instance = repo_backlog_instance("idle");
+    let output = build_repo_backlog_poll_decision(
+        &instance,
+        RepoBacklogPollDecisionInput {
+            repo: Some("owner/repo"),
+            label: Some("harness"),
+            dedupe_key: "repo-backlog-poll:owner/repo",
+        },
+    );
+
+    assert_eq!(output.action, RepoBacklogWorkflowAction::PollBacklog);
+    assert_eq!(output.decision.decision, "poll_repo_backlog");
+    assert_eq!(output.decision.next_state, "scanning");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some(REPO_BACKLOG_POLL_ACTIVITY)
+    );
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("repo backlog poll decision should validate");
+}
+
+#[test]
 fn repo_backlog_merged_pr_marks_bound_issue_done() {
     let instance = repo_backlog_instance("idle");
     let output = build_merged_pr_decision(
@@ -1366,6 +1394,106 @@ fn runtime_completion_reducer_idles_repo_backlog_after_reconciliation() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("repo backlog reconciliation completion should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_dispatches_repo_backlog_issue_signals() {
+    let instance = repo_backlog_instance("scanning").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::enqueue_activity(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "repo-backlog:owner/repo:poll",
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "Found one open issue without a runtime workflow.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueDiscovered",
+        json!({
+            "issue_number": "42",
+            "issue_url": "https://github.com/owner/repo/issues/42",
+            "labels": ["harness"]
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("repo backlog scan signals should start issue workflows");
+
+    assert_eq!(decision.decision, "start_issue_workflows_from_scan");
+    assert_eq!(decision.next_state, "dispatching");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(decision.commands[0].command["auto_submit"], true);
+    assert_eq!(decision.commands[0].command["labels"][0], "harness");
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("repo backlog scan dispatch should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_idles_repo_backlog_after_empty_scan() {
+    let instance = repo_backlog_instance("scanning");
+    let command = WorkflowCommand::enqueue_activity(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "repo-backlog:owner/repo:poll",
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "No open issues require a new runtime workflow.",
+    )
+    .with_signal(ActivitySignal::new(
+        "NoOpenIssueFound",
+        json!({"repo": "owner/repo"}),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("empty repo backlog scan should idle workflow");
+
+    assert_eq!(decision.decision, "finish_repo_backlog_scan");
+    assert_eq!(decision.next_state, "idle");
+    assert!(decision.commands.is_empty());
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("repo backlog scan idle completion should validate");
 }
 
 #[test]
