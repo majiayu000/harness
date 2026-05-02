@@ -69,11 +69,16 @@ Implemented now:
 - issue `POST /tasks` submissions now write `github_issue_pr` workflow runtime state with
   `IssueSubmitted`, a validated `submit_issue` decision, and a pending `implement_issue`
   command that is dispatched to runtime jobs instead of the legacy task runner
+- runtime issue workflows with bound PRs now request `sweep_pr_feedback` through the workflow
+  command outbox; runtime agents inspect GitHub and return structured `workflow_decision`
+  artifacts or reducer-visible feedback signals
 
 Still intentionally not moved yet:
 
 - repo backlog polling as the primary controller
-- prompt-only and PR feedback task submissions still use the existing task routes
+- prompt-only task submissions still use the existing task routes
+- legacy issue-workflow feedback fallback still uses existing PR task routes when no runtime
+  workflow exists
 - dashboard write actions still use existing task routes
 
 ## Non-Goals
@@ -392,11 +397,15 @@ Implemented now:
 - review waits record `NoFeedbackFound` / `wait_for_pr_feedback`
 - actionable review or validation failures record `FeedbackFound` / `address_pr_feedback`
 - approved reviews and graduated low-risk exits record `PrReadyToMerge` / `mark_ready_to_merge`
+- runtime `github_issue_pr` workflows with attached PRs are swept by a server background loop that
+  writes a validated `sweep_pr_feedback` decision and pending runtime command instead of enqueueing
+  a legacy `pr:N` task
+- `sweep_pr_feedback` runtime completions can advance the parent workflow through structured
+  `workflow_decision` artifacts or explicit feedback signals
 
 Still intentionally not moved yet:
 
-- GitHub signal interpretation still runs in the existing review loop
-- feedback fix execution still runs through task runner turns
+- legacy task-runner PR feedback still runs the existing review loop
 - `pr_feedback` is not yet a separate child workflow with its own runtime job
 
 Tests:
@@ -404,6 +413,8 @@ Tests:
 - feedback report with blocking items moves parent workflow to `addressing_feedback`
 - no actionable feedback keeps parent workflow in `awaiting_feedback`
 - approved and checks-passed events can move parent workflow to `ready_to_merge`
+- runtime PR feedback sweep requests enqueue a `sweep_pr_feedback` command and suppress duplicate
+  active sweep commands
 
 ### Phase 4: Repo Backlog Workflow
 
@@ -452,7 +463,9 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- prompt-only and PR feedback submissions still use the current task executor
+- prompt-only submissions still use the current task executor
+- legacy issue-workflow feedback fallback still uses the current PR task executor when no runtime
+  workflow exists
 
 Tests:
 
@@ -866,7 +879,8 @@ Implemented now:
 Still intentionally not moved yet:
 
 - prompt-only submissions remain task-runner native
-- PR feedback submissions remain on the existing PR feedback sweep/task path
+- legacy issue-workflow PR feedback remains on the existing PR feedback sweep/task path when no
+  runtime workflow exists
 - the `task_id` returned for issue submissions is now a workflow submission correlation id, not a
   legacy task row id
 

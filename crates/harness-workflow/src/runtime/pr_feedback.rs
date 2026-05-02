@@ -3,6 +3,7 @@ use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, Workflow
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrFeedbackWorkflowAction {
     BindPr,
+    SweepFeedback,
     AddressFeedback,
     AwaitFeedback,
     ReadyToMerge,
@@ -28,6 +29,16 @@ pub struct PrFeedbackDecisionInput<'a> {
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
     pub outcome: PrFeedbackOutcome,
+    pub summary: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrFeedbackSweepDecisionInput<'a> {
+    pub dedupe_key: &'a str,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
+    pub issue_number: Option<u64>,
+    pub repo: Option<&'a str>,
     pub summary: &'a str,
 }
 
@@ -121,10 +132,59 @@ pub fn build_pr_feedback_decision(
     }
 }
 
+pub fn build_pr_feedback_sweep_decision(
+    instance: &WorkflowInstance,
+    input: PrFeedbackSweepDecisionInput<'_>,
+) -> PrFeedbackDecisionOutput {
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "sweep_pr_feedback",
+        "awaiting_feedback",
+        input.summary,
+    )
+    .with_command(WorkflowCommand::new(
+        super::model::WorkflowCommandType::EnqueueActivity,
+        input.dedupe_key,
+        serde_json::json!({
+            "activity": "sweep_pr_feedback",
+            "pr_number": input.pr_number,
+            "pr_url": input.pr_url,
+            "issue_number": input.issue_number,
+            "repo": input.repo,
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "pr_feedback_sweep",
+        feedback_sweep_summary(input),
+    ))
+    .high_confidence();
+
+    PrFeedbackDecisionOutput {
+        action: PrFeedbackWorkflowAction::SweepFeedback,
+        decision,
+    }
+}
+
 fn feedback_evidence(input: PrFeedbackDecisionInput<'_>) -> WorkflowEvidence {
     let summary = match input.pr_url {
         Some(pr_url) => format!("pr={} url={} {}", input.pr_number, pr_url, input.summary),
         None => format!("pr={} {}", input.pr_number, input.summary),
     };
     WorkflowEvidence::new("pr_feedback", summary)
+}
+
+fn feedback_sweep_summary(input: PrFeedbackSweepDecisionInput<'_>) -> String {
+    let mut parts = vec![format!("pr={}", input.pr_number)];
+    if let Some(pr_url) = input.pr_url {
+        parts.push(format!("url={pr_url}"));
+    }
+    if let Some(issue_number) = input.issue_number {
+        parts.push(format!("issue={issue_number}"));
+    }
+    if let Some(repo) = input.repo {
+        parts.push(format!("repo={repo}"));
+    }
+    parts.push(input.summary.to_string());
+    parts.join(" ")
 }

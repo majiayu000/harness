@@ -822,6 +822,21 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "retry_policy": "runtime_retry_policy may retry this activity before failure."
             }
         }),
+        ("github_issue_pr", "sweep_pr_feedback") => json!({
+            "on_succeeded": {
+                "reducer_next_state": "derived_from_structured_decision_or_signals",
+                "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
+                "required_summary": "Describe inspected PR feedback, review state, checks, and mergeability."
+            },
+            "structured_decision": {
+                "preferred": true,
+                "description": "Return a workflow_decision artifact for address_pr_feedback, wait_for_pr_feedback, or mark_ready_to_merge."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
         ("github_issue_pr", "implement_issue") => json!({
             "on_succeeded": {
                 "reducer_next_state": "unchanged_until_pr_detected",
@@ -888,6 +903,21 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
         ("github_issue_pr", "address_pr_feedback") => json!({
             "must_include": ["review feedback addressed", "changed files", "validation commands"],
             "must_not_include": ["claiming review approval without a fresh review signal"],
+        }),
+        ("github_issue_pr", "sweep_pr_feedback") => json!({
+            "must_include": ["PR comments reviewed", "review states", "check status", "mergeability", "next workflow action"],
+            "must_not_include": ["repository code changes", "workflow table mutations", "unverified approval claims"],
+            "artifacts": {
+                "workflow_decision": {
+                    "preferred": true,
+                    "allowed_decisions": ["address_pr_feedback", "wait_for_pr_feedback", "mark_ready_to_merge"]
+                }
+            },
+            "signals": {
+                "FeedbackFound": "Use when actionable feedback, requested changes, or failed checks require a fix round.",
+                "NoFeedbackFound": "Use when no actionable feedback is present yet.",
+                "PrReadyToMerge": "Use only when review, checks, and mergeability are all ready."
+            }
         }),
         (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => json!({
             "must_include": ["validation commands", "pass/fail evidence", "remaining blockers"],

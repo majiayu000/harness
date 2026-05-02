@@ -1,9 +1,9 @@
 use crate::task_runner::TaskId;
 use harness_workflow::runtime::{
-    build_pr_detected_decision, build_pr_feedback_decision, DecisionValidator,
-    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, ValidationContext,
-    WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject,
+    build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
+    DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
+    PrFeedbackSweepDecisionInput, ValidationContext, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
 };
 use serde_json::json;
 use std::path::Path;
@@ -26,6 +26,14 @@ pub(crate) struct PrFeedbackRuntimeContext<'a> {
     pub pr_url: Option<&'a str>,
     pub outcome: PrFeedbackOutcome,
     pub summary: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrFeedbackSweepRequestOutcome {
+    Requested { workflow_id: String },
+    NotCandidate { workflow_id: String, state: String },
+    ActiveCommandExists { workflow_id: String },
+    Rejected { workflow_id: String, reason: String },
 }
 
 pub(crate) async fn record_pr_detected(
@@ -63,6 +71,29 @@ pub(crate) async fn record_pr_feedback(
             "workflow runtime PR feedback write failed: {error}"
         );
     }
+}
+
+pub(crate) async fn request_pr_feedback_sweep(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    let Some(instance) = store.get_instance(workflow_id).await? else {
+        anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
+    };
+    if instance.definition_id != "github_issue_pr"
+        || !matches!(instance.state.as_str(), "pr_open" | "awaiting_feedback")
+    {
+        return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
+            workflow_id: instance.id,
+            state: instance.state,
+        });
+    }
+    if has_active_pr_feedback_command(store, &instance.id).await? {
+        return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+            workflow_id: instance.id,
+        });
+    }
+    persist_pr_feedback_sweep_request(store, instance).await
 }
 
 async fn persist_pr_detected(
@@ -117,6 +148,74 @@ async fn persist_pr_detected(
         },
     );
     apply_decision(store, instance, output.decision, Some(event.id)).await
+}
+
+async fn persist_pr_feedback_sweep_request(
+    store: &WorkflowRuntimeStore,
+    mut instance: WorkflowInstance,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    let pr_number = required_u64_field(&instance.data, "pr_number")?;
+    let pr_url = optional_string_field(&instance.data, "pr_url");
+    let issue_number = instance
+        .data
+        .get("issue_number")
+        .and_then(|value| value.as_u64());
+    let repo = optional_string_field(&instance.data, "repo");
+    let event = store
+        .append_event(
+            &instance.id,
+            "PrFeedbackSweepRequested",
+            "workflow_runtime_pr_feedback",
+            json!({
+                "issue_number": issue_number,
+                "repo": repo.as_deref(),
+                "pr_number": pr_number,
+                "pr_url": pr_url.as_deref(),
+            }),
+        )
+        .await?;
+    let output = build_pr_feedback_sweep_decision(
+        &instance,
+        PrFeedbackSweepDecisionInput {
+            dedupe_key: &format!("pr-feedback-sweep:{}:{}", instance.id, event.id),
+            pr_number,
+            pr_url: pr_url.as_deref(),
+            issue_number,
+            repo: repo.as_deref(),
+            summary: "Runtime workflow requested a PR feedback sweep.",
+        },
+    );
+    let validator = DecisionValidator::github_issue_pr();
+    let validation = validator.validate(
+        &instance,
+        &output.decision,
+        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
+    );
+    let record = match validation {
+        Ok(()) => WorkflowDecisionRecord::accepted(output.decision.clone(), Some(event.id)),
+        Err(error) => {
+            let reason = error.to_string();
+            let record = WorkflowDecisionRecord::rejected(output.decision, Some(event.id), &reason);
+            store.record_decision(&record).await?;
+            return Ok(PrFeedbackSweepRequestOutcome::Rejected {
+                workflow_id: instance.id,
+                reason,
+            });
+        }
+    };
+    store.record_decision(&record).await?;
+    for command in &output.decision.commands {
+        store
+            .enqueue_command(&instance.id, Some(&record.id), command)
+            .await?;
+    }
+    instance.state = output.decision.next_state.clone();
+    instance.version = instance.version.saturating_add(1);
+    instance.data = merge_last_decision(instance.data, &output.decision.decision);
+    store.upsert_instance(&instance).await?;
+    Ok(PrFeedbackSweepRequestOutcome::Requested {
+        workflow_id: instance.id,
+    })
 }
 
 async fn persist_pr_feedback(
@@ -212,6 +311,23 @@ async fn apply_decision(
     store.upsert_instance(&instance).await
 }
 
+async fn has_active_pr_feedback_command(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(store
+        .commands_for(workflow_id)
+        .await?
+        .into_iter()
+        .any(|record| {
+            matches!(record.status.as_str(), "pending" | "dispatched")
+                && matches!(
+                    record.command.activity_name(),
+                    Some("sweep_pr_feedback" | "address_pr_feedback")
+                )
+        }))
+}
+
 async fn upsert_github_issue_pr_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
     store
         .upsert_definition(&WorkflowDefinition::new(
@@ -265,6 +381,19 @@ fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_jso
         object.insert("last_decision".to_string(), json!(decision));
     }
     data
+}
+
+fn optional_string_field(data: &serde_json::Value, field: &str) -> Option<String> {
+    data.get(field)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn required_u64_field(data: &serde_json::Value, field: &str) -> anyhow::Result<u64> {
+    data.get(field)
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("runtime issue workflow is missing {field}"))
 }
 
 fn event_type(outcome: PrFeedbackOutcome) -> &'static str {
@@ -393,6 +522,77 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "PrReadyToMerge"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_pr_feedback_sweep_records_runtime_command() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let instance = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "pr_open",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 123,
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "task-1",
+        }));
+        store.upsert_instance(&instance).await?;
+
+        let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
+        assert_eq!(
+            outcome,
+            PrFeedbackSweepRequestOutcome::Requested {
+                workflow_id: workflow_id.clone()
+            }
+        );
+        let updated = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("workflow should still exist");
+        assert_eq!(updated.state, "awaiting_feedback");
+        assert_eq!(updated.data["last_decision"], "sweep_pr_feedback");
+        let commands = store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, "pending");
+        assert_eq!(
+            commands[0].command.activity_name(),
+            Some("sweep_pr_feedback")
+        );
+        assert_eq!(commands[0].command.command["pr_number"], 77);
+
+        let second = request_pr_feedback_sweep(&store, &workflow_id).await?;
+        assert_eq!(
+            second,
+            PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                workflow_id: workflow_id.clone()
+            }
+        );
+        assert_eq!(store.commands_for(&workflow_id).await?.len(), 1);
         Ok(())
     }
 }

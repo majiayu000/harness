@@ -1164,6 +1164,166 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn runtime_pr_feedback_sweep_tick_enqueues_runtime_command() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-feedback");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
+    )
+    .with_id("issue-226")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 226,
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-226",
+    }));
+    store.upsert_instance(&workflow).await?;
+
+    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;
+
+    assert_eq!(tick.requested, 1);
+    assert_eq!(tick.active_command_exists, 0);
+    assert_eq!(tick.skipped, 0);
+    assert_eq!(tick.rejected, 0);
+    let updated = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "awaiting_feedback");
+    let commands = store.commands_for(&workflow.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "pending");
+    assert_eq!(
+        commands[0].command.activity_name(),
+        Some("sweep_pr_feedback")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-feedback-limit");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let valid_workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
+    )
+    .with_id("issue-227")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 227,
+        "pr_number": 78,
+        "pr_url": "https://github.com/owner/repo/pull/78",
+        "task_id": "runtime-task-227",
+    }));
+    store.upsert_instance(&valid_workflow).await?;
+    let skipped_workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:228"),
+    )
+    .with_id("issue-228")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 228,
+        "task_id": "runtime-task-228",
+    }));
+    store.upsert_instance(&skipped_workflow).await?;
+
+    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 1).await?;
+
+    assert_eq!(tick.requested, 1);
+    assert_eq!(tick.skipped, 1);
+    assert_eq!(store.commands_for(&valid_workflow.id).await?.len(), 1);
+    assert!(store.commands_for(&skipped_workflow.id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_pr_feedback_sweep_respects_project_runtime_policy() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-feedback-disabled-runtime");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: false\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:229"),
+    )
+    .with_id("issue-229")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 229,
+        "pr_number": 79,
+        "pr_url": "https://github.com/owner/repo/pull/79",
+        "task_id": "runtime-task-229",
+    }));
+    store.upsert_instance(&workflow).await?;
+
+    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;
+
+    assert_eq!(tick.requested, 0);
+    assert_eq!(tick.skipped, 1);
+    assert!(store.commands_for(&workflow.id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_command_dispatch_tick_uses_command_project_policy_when_server_root_disabled(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
