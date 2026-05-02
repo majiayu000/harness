@@ -1111,6 +1111,12 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
     }
 
     let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-a");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: codex-high\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
     let state = make_test_state_with_workflow_runtime(dir.path()).await?;
     let store = state
         .core
@@ -1125,7 +1131,7 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
     )
     .with_id("issue-123")
     .with_data(serde_json::json!({
-        "project_id": "/project-a",
+        "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 123,
     }));
@@ -1154,6 +1160,136 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
         store.commands_for(&workflow.id).await?[0].status,
         "dispatched"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatch_tick_uses_command_project_policy_when_server_root_disabled(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let server_root = dir.path().join("server-root");
+    let project_root = dir.path().join("project-root");
+    std::fs::create_dir(&server_root)?;
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        server_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: false\n  runtime_profile: server-disabled\nruntime_worker:\n  enabled: false\n---\n",
+    )?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: project-runtime\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &server_root,
+        harness_core::config::HarnessConfig::default(),
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:224"),
+    )
+    .with_id("issue-224")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 224,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-224");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-disabled",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 1);
+    assert_eq!(tick.already_dispatched, 0);
+    assert_eq!(tick.skipped, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].runtime_profile, "project-runtime");
+    assert_eq!(
+        store.commands_for(&workflow.id).await?[0].status,
+        "dispatched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatch_tick_skips_when_command_project_runtime_disabled(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-root");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: project-runtime\nruntime_worker:\n  enabled: false\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:225"),
+    )
+    .with_id("issue-225")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 225,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-225");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 0);
+    assert_eq!(tick.already_dispatched, 0);
+    assert_eq!(tick.skipped, 1);
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "skipped");
     Ok(())
 }
 
