@@ -1061,6 +1061,13 @@ enum SprintIssueOutcome {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSprintIssueLookup {
+    Missing,
+    ActiveOrUnknown,
+    Outcome(SprintIssueOutcome),
+}
+
 impl SprintIssueOutcome {
     fn as_str(self) -> &'static str {
         match self {
@@ -1088,12 +1095,12 @@ async fn workflow_sprint_issue_outcome(
     repo: &str,
     issue_num: u64,
 ) -> Option<SprintIssueOutcome> {
-    if let Some(outcome) =
-        issue_workflow_sprint_issue_outcome(store, project_id, repo, issue_num).await
-    {
-        return Some(outcome);
+    match runtime_workflow_sprint_issue_outcome(runtime_store, project_id, repo, issue_num).await {
+        RuntimeSprintIssueLookup::Outcome(outcome) => return Some(outcome),
+        RuntimeSprintIssueLookup::ActiveOrUnknown => return None,
+        RuntimeSprintIssueLookup::Missing => {}
     }
-    runtime_workflow_sprint_issue_outcome(runtime_store, project_id, repo, issue_num).await
+    issue_workflow_sprint_issue_outcome(store, project_id, repo, issue_num).await
 }
 
 async fn issue_workflow_sprint_issue_outcome(
@@ -1123,8 +1130,10 @@ async fn runtime_workflow_sprint_issue_outcome(
     project_id: &str,
     repo: &str,
     issue_num: u64,
-) -> Option<SprintIssueOutcome> {
-    let store = store?;
+) -> RuntimeSprintIssueLookup {
+    let Some(store) = store else {
+        return RuntimeSprintIssueLookup::Missing;
+    };
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(project_id, Some(repo), issue_num);
     let workflow = match store.get_instance(&workflow_id).await {
@@ -1136,10 +1145,15 @@ async fn runtime_workflow_sprint_issue_outcome(
                 workflow_id,
                 "intake: failed to load runtime workflow state for running issue: {e}"
             );
-            return None;
+            return RuntimeSprintIssueLookup::ActiveOrUnknown;
         }
-    }?;
+    };
+    let Some(workflow) = workflow else {
+        return RuntimeSprintIssueLookup::Missing;
+    };
     runtime_workflow_state_to_sprint_outcome(&workflow.state)
+        .map(RuntimeSprintIssueLookup::Outcome)
+        .unwrap_or(RuntimeSprintIssueLookup::ActiveOrUnknown)
 }
 
 fn issue_workflow_state_to_sprint_outcome(
@@ -1740,6 +1754,71 @@ mod tests {
             workflow_sprint_issue_outcome(None, Some(&store), project_id, repo, issue).await;
 
         assert_eq!(outcome, Some(SprintIssueOutcome::UnblocksDependents));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_sprint_issue_outcome_prefers_active_runtime_over_stale_legacy(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let issue_store =
+            harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
+                &dir.path().join("issue_workflows.db"),
+                Some(&database_url),
+            )
+            .await?;
+        let runtime_store =
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime.db"),
+                Some(&database_url),
+            )
+            .await?;
+        let project_id = "/projects/runtime-sprint-active";
+        let repo = "owner/repo";
+        let issue = 43;
+        issue_store
+            .record_issue_scheduled(project_id, Some(repo), issue, "legacy-task", &[], false)
+            .await?;
+        issue_store
+            .record_terminal_for_issue(
+                project_id,
+                Some(repo),
+                issue,
+                harness_workflow::issue_lifecycle::IssueLifecycleState::Done,
+                Some("stale legacy terminal state"),
+            )
+            .await?;
+        let workflow_id =
+            harness_workflow::issue_lifecycle::workflow_id(project_id, Some(repo), issue);
+        let instance = harness_workflow::runtime::WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "implementing",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:43"),
+        )
+        .with_id(workflow_id)
+        .with_data(serde_json::json!({
+            "project_id": project_id,
+            "repo": repo,
+            "issue_number": issue,
+        }));
+        runtime_store.upsert_instance(&instance).await?;
+
+        let outcome = workflow_sprint_issue_outcome(
+            Some(&issue_store),
+            Some(&runtime_store),
+            project_id,
+            repo,
+            issue,
+        )
+        .await;
+
+        assert_eq!(outcome, None);
         Ok(())
     }
 
