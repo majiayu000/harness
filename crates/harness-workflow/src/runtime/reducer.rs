@@ -230,7 +230,11 @@ fn repo_backlog_sprint_plan_decision_from_activity_result(
     }
 
     let parent_repo = optional_data_string(instance, "repo");
-    let selected = sprint_plan_selected_issues(result, event, parent_repo.as_deref());
+    let selected = normalize_selected_sprint_dependencies(sprint_plan_selected_issues(
+        result,
+        event,
+        parent_repo.as_deref(),
+    ));
     if selected.is_empty() {
         return None;
     }
@@ -477,6 +481,33 @@ fn dedupe_issue_candidates(
             seen.insert(key)
         })
         .collect()
+}
+
+fn normalize_selected_sprint_dependencies(
+    mut candidates: Vec<RepoBacklogIssueCandidate>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    let selected: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.repo.clone().unwrap_or_default(),
+                candidate.issue_number,
+            )
+        })
+        .collect();
+
+    for candidate in &mut candidates {
+        let repo = candidate.repo.clone().unwrap_or_default();
+        let mut seen = std::collections::BTreeSet::new();
+        let issue_number = candidate.issue_number;
+        candidate.depends_on.retain(|dependency| {
+            *dependency != issue_number
+                && selected.contains(&(repo.clone(), *dependency))
+                && seen.insert(*dependency)
+        });
+    }
+
+    candidates
 }
 
 fn structured_decision_validates(

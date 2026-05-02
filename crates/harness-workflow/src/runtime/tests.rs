@@ -1615,7 +1615,7 @@ fn runtime_completion_reducer_uses_scan_candidates_for_sprint_plan_artifact() {
         "Move sprint planning into runtime"
     );
     assert_eq!(decision.commands[0].command["labels"][0], "runtime");
-    assert_eq!(decision.commands[0].command["depends_on"][0], 42);
+    assert_eq!(decision.commands[0].command["depends_on"], json!([]));
 }
 
 #[test]
@@ -1675,7 +1675,7 @@ fn runtime_completion_reducer_uses_scan_candidates_for_sprint_task_signal() {
         "Dispatch sprint tasks"
     );
     assert_eq!(decision.commands[0].command["labels"][0], "runtime");
-    assert_eq!(decision.commands[0].command["depends_on"][0], 44);
+    assert_eq!(decision.commands[0].command["depends_on"], json!([]));
 }
 
 #[test]
