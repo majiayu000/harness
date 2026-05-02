@@ -1,16 +1,23 @@
 import { useState } from "react";
-import { useTaskStream, useCancelTask } from "@/lib/queries";
+import { useTaskStream, useCancelTask, useCancelWorkflowRuntime } from "@/lib/queries";
 import { TOKEN_KEY } from "@/lib/api";
 
 interface Props {
   taskId: string;
+  workflowId?: string | null;
+  executionPath?: string | null;
   onReset: () => void;
 }
 
-export function SubmitSuccess({ taskId, onReset }: Props) {
+export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Props) {
   const [output, setOutput] = useState<string>("");
   const [streamError, setStreamError] = useState<string | null>(null);
-  const cancel = useCancelTask();
+  const cancelTask = useCancelTask();
+  const cancelWorkflowRuntime = useCancelWorkflowRuntime();
+  const canCancelWorkflowRuntime = executionPath === "workflow_runtime" && !!workflowId;
+  const cancelPending = canCancelWorkflowRuntime
+    ? cancelWorkflowRuntime.isPending
+    : cancelTask.isPending;
 
   useTaskStream(
     taskId,
@@ -26,7 +33,11 @@ export function SubmitSuccess({ taskId, onReset }: Props) {
   }
 
   function handleCancel() {
-    cancel.mutate(taskId, { onSuccess: onReset });
+    if (canCancelWorkflowRuntime && workflowId) {
+      cancelWorkflowRuntime.mutate(workflowId, { onSuccess: onReset });
+    } else {
+      cancelTask.mutate(taskId, { onSuccess: onReset });
+    }
   }
 
   return (
@@ -50,11 +61,11 @@ export function SubmitSuccess({ taskId, onReset }: Props) {
         </button>
         <button
           type="button"
-          disabled={cancel.isPending}
+          disabled={cancelPending}
           onClick={handleCancel}
           className="font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {cancel.isPending ? "Cancelling…" : "Cancel"}
+          {cancelPending ? "Cancelling..." : "Cancel"}
         </button>
         <button
           type="button"

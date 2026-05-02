@@ -62,6 +62,7 @@ pub(crate) async fn enqueue_task_background_in_domain(
 pub(crate) struct TaskResponseDetails {
     pub(crate) status: String,
     pub(crate) execution_path: &'static str,
+    pub(crate) workflow_id: Option<String>,
 }
 
 pub(crate) async fn task_response_details(
@@ -78,6 +79,7 @@ pub(crate) async fn task_response_details(
             return Ok(TaskResponseDetails {
                 status: workflow.state,
                 execution_path: "workflow_runtime",
+                workflow_id: Some(workflow.id),
             });
         }
     }
@@ -86,6 +88,7 @@ pub(crate) async fn task_response_details(
         return Ok(TaskResponseDetails {
             status: "queued".to_string(),
             execution_path: "task_runner",
+            workflow_id: None,
         });
     }
 
@@ -100,6 +103,7 @@ pub(crate) async fn task_response_details(
         return Ok(TaskResponseDetails {
             status: "queued".to_string(),
             execution_path: "task_runner",
+            workflow_id: None,
         });
     }
 
@@ -137,6 +141,21 @@ pub struct BatchCreateTaskRequest {
     pub turn_timeout_secs: Option<u64>,
     /// Project root or registry ID applied to all tasks in this batch.
     pub project: Option<std::path::PathBuf>,
+}
+
+fn task_submission_response(
+    task_id: &task_runner::TaskId,
+    details: TaskResponseDetails,
+) -> serde_json::Value {
+    let mut response = json!({
+        "task_id": task_id.0,
+        "status": details.status,
+        "execution_path": details.execution_path,
+    });
+    if let Some(workflow_id) = details.workflow_id {
+        response["workflow_id"] = json!(workflow_id);
+    }
+    response
 }
 
 /// Compute connected conflict groups from per-task file-reference sets.
@@ -312,21 +331,12 @@ pub(super) async fn create_tasks_batch(
                 all_maintenance_window = false;
                 match task_response_details(&state, &task_id, is_issue_submission).await {
                     Ok(details) => {
+                        let mut response = task_submission_response(&task_id, details);
                         if is_serialized {
-                            json!({
-                                "task_id": task_id.0,
-                                "status": details.status,
-                                "serialized": true,
-                                "conflict_files": conflict_files,
-                                "execution_path": details.execution_path,
-                            })
-                        } else {
-                            json!({
-                                "task_id": task_id.0,
-                                "status": details.status,
-                                "execution_path": details.execution_path,
-                            })
+                            response["serialized"] = json!(true);
+                            response["conflict_files"] = json!(conflict_files);
                         }
+                        response
                     }
                     Err(EnqueueTaskError::BadRequest(error)) => json!({ "error": error }),
                     Err(EnqueueTaskError::Internal(error)) => json!({ "error": error }),
@@ -374,11 +384,7 @@ pub(super) async fn create_task(
         Ok(task_id) => match task_response_details(&state, &task_id, is_issue_submission).await {
             Ok(details) => (
                 StatusCode::ACCEPTED,
-                Json(json!({
-                    "task_id": task_id.0,
-                    "status": details.status,
-                    "execution_path": details.execution_path,
-                })),
+                Json(task_submission_response(&task_id, details)),
             )
                 .into_response(),
             Err(EnqueueTaskError::BadRequest(error)) => {

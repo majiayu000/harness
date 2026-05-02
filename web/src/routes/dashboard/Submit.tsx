@@ -22,6 +22,12 @@ interface Props {
   projectFilter?: string | null;
 }
 
+interface CreatedSubmission {
+  taskId: string;
+  workflowId: string | null;
+  executionPath: string | null;
+}
+
 function parsePositiveInteger(input: string): number | null {
   const trimmed = input.trim();
   if (!/^[1-9]\d*$/.test(trimmed)) return null;
@@ -329,7 +335,7 @@ export function Submit({ projectFilter }: Props) {
     maxTurns: "",
     turnTimeoutSecs: "",
   });
-  const [createdTaskId, setCreatedTaskId] = useState<string | null>(null);
+  const [createdSubmission, setCreatedSubmission] = useState<CreatedSubmission | null>(null);
   const [busy, setBusy] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -408,7 +414,11 @@ export function Submit({ projectFilter }: Props) {
         body: JSON.stringify({ ...modePayload, ...common }),
       });
       const json = (await resp.json()) as CreateTaskResponse;
-      setCreatedTaskId(json.task_id);
+      setCreatedSubmission({
+        taskId: json.task_id,
+        workflowId: json.workflow_id ?? null,
+        executionPath: json.execution_path ?? null,
+      });
       setStep("success");
     } catch (e) {
       setSubmitError((e as Error).message);
@@ -418,7 +428,7 @@ export function Submit({ projectFilter }: Props) {
   }
 
   function handleReset() {
-    setCreatedTaskId(null);
+    setCreatedSubmission(null);
     setStep("mode");
     setWizardState({
       mode: null,
@@ -472,8 +482,13 @@ export function Submit({ projectFilter }: Props) {
             error={submitError}
           />
         )}
-        {step === "success" && createdTaskId && (
-          <SubmitSuccess taskId={createdTaskId} onReset={handleReset} />
+        {step === "success" && createdSubmission && (
+          <SubmitSuccess
+            taskId={createdSubmission.taskId}
+            workflowId={createdSubmission.workflowId}
+            executionPath={createdSubmission.executionPath}
+            onReset={handleReset}
+          />
         )}
       </div>
     </div>
