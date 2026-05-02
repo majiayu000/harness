@@ -69,8 +69,11 @@ function columnCount(label: string): string {
   return within(header).getAllByText(/\d+/)[0].textContent ?? "";
 }
 
-function wrap(ui: React.ReactElement) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function makeQueryClient() {
+  return new QueryClient({ defaultOptions: { queries: { retry: false } } });
+}
+
+function wrap(ui: React.ReactElement, qc = makeQueryClient()) {
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter>{ui}</MemoryRouter>
@@ -343,6 +346,101 @@ describe("<Active>", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("rejected: replan limit exhausted")).toBeInTheDocument();
+  });
+
+  it("cancels a non-terminal runtime issue workflow from the runtime panel", async () => {
+    mockUseTasks.mockReturnValue({ data: [], isLoading: false, isError: false });
+    mockUseWorkflowRuntimeTree.mockReturnValue({
+      data: {
+        total_workflows: 1,
+        workflows: [
+          {
+            workflow: {
+              id: "runtime-issue-901",
+              definition_id: "github_issue_pr",
+              definition_version: 1,
+              state: "implementing",
+              subject: { subject_type: "issue", subject_key: "issue:901" },
+              data: { task_id: "runtime-task-901" },
+              version: 1,
+              created_at: "2026-04-30T00:00:00Z",
+              updated_at: "2026-04-30T00:00:00Z",
+            },
+            events: [],
+            decisions: [],
+            commands: [],
+            children: [],
+          },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    });
+
+    wrap(<Active projectFilter="harness" />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith("/api/workflows/runtime/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow_id: "runtime-issue-901" }),
+      });
+    });
+  });
+
+  it("refreshes runtime data when workflow cancellation returns a conflict", async () => {
+    mockApiFetch.mockRejectedValueOnce(new Error("workflow already terminal"));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const qc = makeQueryClient();
+    const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
+    mockUseTasks.mockReturnValue({ data: [], isLoading: false, isError: false });
+    mockUseWorkflowRuntimeTree.mockReturnValue({
+      data: {
+        total_workflows: 1,
+        workflows: [
+          {
+            workflow: {
+              id: "runtime-issue-conflict",
+              definition_id: "github_issue_pr",
+              definition_version: 1,
+              state: "implementing",
+              subject: { subject_type: "issue", subject_key: "issue:902" },
+              data: { task_id: "runtime-task-902" },
+              version: 1,
+              created_at: "2026-04-30T00:00:00Z",
+              updated_at: "2026-04-30T00:00:00Z",
+            },
+            events: [],
+            decisions: [],
+            commands: [],
+            children: [],
+          },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    });
+
+    wrap(<Active projectFilter="harness" />, qc);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith("/api/workflows/runtime/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow_id: "runtime-issue-conflict" }),
+      });
+    });
+    await waitFor(() => {
+      expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["tasks"] });
+      expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workflow-runtime-tree"] });
+    });
+    expect(consoleError).toHaveBeenCalledWith(
+      "Failed to cancel runtime workflow",
+      expect.any(Error),
+    );
+    consoleError.mockRestore();
   });
 
   it("clicking a standard task card opens the slide-over with that task's id", () => {

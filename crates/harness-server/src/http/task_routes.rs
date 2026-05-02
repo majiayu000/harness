@@ -2,6 +2,7 @@ use super::AppState;
 use crate::{
     services::execution::{EnqueueBackgroundOptions, EnqueueTaskError},
     task_runner,
+    workflow_runtime_submission::{RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome},
 };
 use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
 use serde::Deserialize;
@@ -446,7 +447,7 @@ pub(super) async fn cancel_task(
             )
             .await
             {
-                Ok(Some(workflow)) if workflow.state == "cancelled" => {
+                Ok(RuntimeSubmissionCancelOutcome::Cancelled(workflow)) => {
                     if let Err(error) =
                         crate::workflow_runtime_worker::notify_runtime_submission_terminal_workflow(
                             &state,
@@ -469,13 +470,20 @@ pub(super) async fn cancel_task(
                         })),
                     )
                 }
-                Ok(Some(_)) => (
+                Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(_)) => (
                     StatusCode::CONFLICT,
                     Json(json!({ "error": "task already in terminal state" })),
                 ),
-                Ok(None) => (
+                Ok(RuntimeSubmissionCancelOutcome::NotFound) => (
                     StatusCode::NOT_FOUND,
                     Json(json!({ "error": "task not found" })),
+                ),
+                Err(RuntimeSubmissionCancelError::UnsupportedDefinition { definition_id }) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "task cannot be cancelled as a runtime submission",
+                        "definition_id": definition_id,
+                    })),
                 ),
                 Err(e) => {
                     tracing::error!(

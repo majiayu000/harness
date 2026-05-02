@@ -1,4 +1,7 @@
 use super::AppState;
+use crate::workflow_runtime_submission::{
+    RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
+};
 use axum::{extract::State, http::StatusCode, Json};
 use harness_workflow::issue_lifecycle::IssueLifecycleState;
 use serde::Deserialize;
@@ -7,6 +10,11 @@ use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct WorkflowRuntimeMergeRequest {
+    pub workflow_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkflowRuntimeCancelRequest {
     pub workflow_id: String,
 }
 
@@ -143,6 +151,74 @@ pub(super) async fn merge_workflow_runtime(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "failed to approve workflow runtime merge" })),
+            )
+        }
+    }
+}
+
+pub(super) async fn cancel_workflow_runtime(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WorkflowRuntimeCancelRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "workflow runtime store unavailable" })),
+        );
+    };
+
+    match crate::workflow_runtime_submission::cancel_submission_by_workflow_id(
+        store,
+        &request.workflow_id,
+    )
+    .await
+    {
+        Ok(RuntimeSubmissionCancelOutcome::Cancelled(workflow)) => {
+            if let Err(error) =
+                crate::workflow_runtime_worker::notify_runtime_submission_terminal_workflow(
+                    &state,
+                    &workflow.id,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    workflow_id = %workflow.id,
+                    "cancel_workflow_runtime: terminal notification failed: {error}"
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "cancelled",
+                    "execution_path": "workflow_runtime",
+                    "workflow_id": workflow.id,
+                })),
+            )
+        }
+        Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(workflow)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "workflow already terminal",
+                "state": workflow.state,
+            })),
+        ),
+        Ok(RuntimeSubmissionCancelOutcome::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "workflow not found" })),
+        ),
+        Err(RuntimeSubmissionCancelError::UnsupportedDefinition { definition_id }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "workflow cannot be cancelled as a runtime submission",
+                "definition_id": definition_id,
+            })),
+        ),
+        Err(error) => {
+            tracing::error!("cancel_workflow_runtime: cancellation failed: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to cancel workflow runtime submission" })),
             )
         }
     }

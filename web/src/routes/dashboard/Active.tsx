@@ -138,6 +138,13 @@ function runtimeMergeWorkflowId(workflow?: WorkflowSummary | null): string | nul
   return null;
 }
 
+function runtimeWorkflowCanCancel(workflow: WorkflowRuntimeTreeNode["workflow"]): boolean {
+  return (
+    (workflow.definition_id === "github_issue_pr" || workflow.definition_id === "prompt_task") &&
+    !TERMINAL_STATUSES.has(workflow.state)
+  );
+}
+
 function rejectedDecisions(decisions: WorkflowRuntimeDecisionRecord[]) {
   return decisions.filter((decision) => !decision.accepted);
 }
@@ -159,12 +166,24 @@ function workflowRuntimeCounts(nodes: WorkflowRuntimeTreeNode[]) {
   return { workflows, commands, jobs, rejected };
 }
 
-function WorkflowRuntimeNode({ node, depth = 0 }: { node: WorkflowRuntimeTreeNode; depth?: number }) {
+function WorkflowRuntimeNode({
+  node,
+  depth = 0,
+  onCancel,
+  cancellingWorkflowIds,
+}: {
+  node: WorkflowRuntimeTreeNode;
+  depth?: number;
+  onCancel?: (workflowId: string) => void;
+  cancellingWorkflowIds?: Set<string>;
+}) {
   const rejected = rejectedDecisions(node.decisions);
+  const canCancel = runtimeWorkflowCanCancel(node.workflow);
+  const cancelling = cancellingWorkflowIds?.has(node.workflow.id) ?? false;
   return (
     <div className="border-t border-line first:border-t-0 py-2">
       <div
-        className="grid grid-cols-[minmax(120px,1fr)_auto_auto] items-start gap-2"
+        className="grid grid-cols-[minmax(120px,1fr)_auto_auto_auto] items-start gap-2"
         style={{ paddingLeft: `${depth * 14}px` }}
       >
         <div className="min-w-0">
@@ -182,6 +201,19 @@ function WorkflowRuntimeNode({ node, depth = 0 }: { node: WorkflowRuntimeTreeNod
           <span className="border border-rust/40 bg-rust/10 px-1.5 py-[1px] font-mono text-[10px] text-rust">
             rejected {rejected.length}
           </span>
+        ) : null}
+        {canCancel && onCancel ? (
+          <button
+            type="button"
+            disabled={cancelling}
+            onClick={(event) => {
+              event.stopPropagation();
+              onCancel(node.workflow.id);
+            }}
+            className="border border-line bg-bg px-1.5 py-[1px] font-mono text-[10px] text-ink-2 hover:border-rust/60 hover:text-rust transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {cancelling ? "Cancelling..." : "Cancel"}
+          </button>
         ) : null}
       </div>
       {node.commands.length > 0 ? (
@@ -213,7 +245,13 @@ function WorkflowRuntimeNode({ node, depth = 0 }: { node: WorkflowRuntimeTreeNod
       {node.children.length > 0 ? (
         <div className="mt-2">
           {node.children.map((child) => (
-            <WorkflowRuntimeNode key={child.workflow.id} node={child} depth={depth + 1} />
+            <WorkflowRuntimeNode
+              key={child.workflow.id}
+              node={child}
+              depth={depth + 1}
+              onCancel={onCancel}
+              cancellingWorkflowIds={cancellingWorkflowIds}
+            />
           ))}
         </div>
       ) : null}
@@ -225,10 +263,14 @@ function WorkflowRuntimePanel({
   payload,
   isLoading,
   isError,
+  onCancel,
+  cancellingWorkflowIds,
 }: {
   payload?: WorkflowRuntimeTreePayload;
   isLoading: boolean;
   isError: boolean;
+  onCancel?: (workflowId: string) => void;
+  cancellingWorkflowIds?: Set<string>;
 }) {
   const workflows = payload?.workflows ?? [];
   const counts = workflowRuntimeCounts(workflows);
@@ -256,7 +298,14 @@ function WorkflowRuntimePanel({
         ) : empty ? (
           <div className="py-3 font-mono text-[11px] text-ink-4">—</div>
         ) : (
-          workflows.map((node) => <WorkflowRuntimeNode key={node.workflow.id} node={node} />)
+          workflows.map((node) => (
+            <WorkflowRuntimeNode
+              key={node.workflow.id}
+              node={node}
+              onCancel={onCancel}
+              cancellingWorkflowIds={cancellingWorkflowIds}
+            />
+          ))
         )}
       </div>
     </section>
@@ -360,6 +409,7 @@ interface Props {
 export function Active({ projectFilter }: Props) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [merging, setMerging] = useState<Set<string>>(new Set());
+  const [cancellingWorkflows, setCancellingWorkflows] = useState<Set<string>>(new Set());
   const { data, isLoading, isError } = useTasks();
   const { data: dashboard } = useDashboard();
   const queryClient = useQueryClient();
@@ -383,6 +433,37 @@ export function Active({ projectFilter }: Props) {
       setMerging((prev) => {
         const next = new Set(prev);
         next.delete(taskId);
+        return next;
+      });
+    }
+  };
+
+  const handleCancelWorkflow = async (workflowId: string) => {
+    setCancellingWorkflows((prev) => new Set(prev).add(workflowId));
+    try {
+      await apiFetch("/api/workflows/runtime/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow_id: workflowId }),
+      });
+    } catch (error) {
+      console.error("Failed to cancel runtime workflow", error);
+    } finally {
+      const refreshResults = await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+        queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] }),
+      ]);
+      for (const result of refreshResults) {
+        if (result.status === "rejected") {
+          console.error(
+            "Failed to refresh dashboard after runtime workflow cancellation",
+            result.reason,
+          );
+        }
+      }
+      setCancellingWorkflows((prev) => {
+        const next = new Set(prev);
+        next.delete(workflowId);
         return next;
       });
     }
@@ -413,6 +494,8 @@ export function Active({ projectFilter }: Props) {
         payload={workflowRuntime.data}
         isLoading={workflowRuntime.isLoading}
         isError={workflowRuntime.isError}
+        onCancel={handleCancelWorkflow}
+        cancellingWorkflowIds={cancellingWorkflows}
       />
       <div
         className="grid gap-3"
