@@ -433,14 +433,29 @@ pub(super) async fn cancel_task(
             )
             .await
             {
-                Ok(Some(workflow)) if workflow.state == "cancelled" => (
-                    StatusCode::OK,
-                    Json(json!({
-                        "status": "cancelled",
-                        "execution_path": "workflow_runtime",
-                        "workflow_id": workflow.id,
-                    })),
-                ),
+                Ok(Some(workflow)) if workflow.state == "cancelled" => {
+                    if let Err(error) =
+                        crate::workflow_runtime_worker::notify_runtime_issue_terminal_workflow(
+                            &state,
+                            &workflow.id,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            workflow_id = %workflow.id,
+                            "cancel_task: runtime issue completion notification failed: {error}"
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "status": "cancelled",
+                            "execution_path": "workflow_runtime",
+                            "workflow_id": workflow.id,
+                        })),
+                    )
+                }
                 Ok(Some(_)) => (
                     StatusCode::CONFLICT,
                     Json(json!({ "error": "task already in terminal state" })),

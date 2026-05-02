@@ -890,6 +890,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: &[],
                 dependencies_blocked: false,
+                source: None,
+                external_id: None,
             },
         )
         .await?;

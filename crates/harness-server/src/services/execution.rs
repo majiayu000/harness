@@ -16,7 +16,7 @@ use harness_skills::store::SkillStore;
 use harness_workflow::issue_lifecycle::{
     is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 
@@ -366,6 +366,10 @@ impl DefaultExecutionService {
             .map_err(EnqueueTaskError::BadRequest)
     }
 
+    fn runtime_issue_submission_enabled(&self) -> Result<bool, EnqueueTaskError> {
+        workflow_runtime_loops_enabled(&self.server_config.server.project_root)
+    }
+
     fn queue_for(&self, domain: QueueDomain) -> Arc<TaskQueue> {
         match domain {
             QueueDomain::Primary => self.task_queue.clone(),
@@ -599,6 +603,8 @@ impl DefaultExecutionService {
                 additional_prompt: prepared.req.prompt.as_deref(),
                 depends_on: &prepared.req.depends_on,
                 dependencies_blocked,
+                source: prepared.req.source.as_deref(),
+                external_id: prepared.req.external_id.as_deref(),
             },
         )
         .await
@@ -665,7 +671,10 @@ impl DefaultExecutionService {
             return Ok(PreparedEnqueueResult::Existing(existing_id));
         }
 
-        if req.issue.is_some() && self.workflow_runtime_store.is_some() {
+        if req.issue.is_some()
+            && self.workflow_runtime_store.is_some()
+            && self.runtime_issue_submission_enabled()?
+        {
             if let Some(existing_id) = self
                 .check_runtime_issue_duplicate(&project_id, &req)
                 .await?
@@ -710,6 +719,17 @@ impl DefaultExecutionService {
             reviewer,
         })))
     }
+}
+
+fn workflow_runtime_loops_enabled(project_root: &Path) -> Result<bool, EnqueueTaskError> {
+    let workflow_cfg =
+        harness_core::config::workflow::load_workflow_config(project_root).map_err(|error| {
+            EnqueueTaskError::Internal(format!(
+                "failed to load workflow runtime config at {}: {error}",
+                project_root.display()
+            ))
+        })?;
+    Ok(workflow_cfg.runtime_dispatch.enabled && workflow_cfg.runtime_worker.enabled)
 }
 
 #[async_trait]
@@ -1228,6 +1248,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_background_issue_submission_falls_back_when_runtime_loops_disabled(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        std::fs::write(
+            project_root.join("WORKFLOW.md"),
+            "---\nruntime_dispatch:\n  enabled: false\nruntime_worker:\n  enabled: true\n---\n",
+        )?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let task_store = store.clone();
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project_root.clone();
+        let svc =
+            make_svc_with_workflow_runtime_agent_and_config(store, runtime_store.clone(), config)
+                .await;
+        let req = CreateTaskRequest {
+            issue: Some(42),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            ..Default::default()
+        };
+
+        let task_id = svc.enqueue_background(req).await?;
+        let task = task_store
+            .get_with_db_fallback(&task_id)
+            .await?
+            .expect("disabled runtime loops should use the task runner path");
+        let canonical_project_root = project_root.canonicalize()?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &canonical_project_root.to_string_lossy(),
+            Some("owner/repo"),
+            42,
+        );
+
+        assert_eq!(task.task_kind, task_runner::TaskKind::Issue);
+        assert_eq!(task.external_id.as_deref(), Some("issue:42"));
+        assert!(
+            runtime_store.get_instance(&workflow_id).await?.is_none(),
+            "disabled runtime loops must not create a pending runtime workflow"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn enqueue_background_issue_submission_reuses_active_runtime_handle() -> anyhow::Result<()>
     {
         if !crate::test_helpers::db_tests_enabled().await {
@@ -1559,6 +1636,31 @@ mod tests {
             store,
             agent_registry,
             config,
+            Default::default(),
+            make_event_store_noop().await,
+            vec![],
+            None,
+            make_task_queue(),
+            make_task_queue(),
+            None,
+            None,
+            Some(runtime_store),
+            None,
+            vec![],
+        )
+    }
+
+    async fn make_svc_with_workflow_runtime_agent_and_config(
+        store: Arc<TaskStore>,
+        runtime_store: Arc<harness_workflow::runtime::WorkflowRuntimeStore>,
+        config: HarnessConfig,
+    ) -> Arc<DefaultExecutionService> {
+        let mut agent_registry = AgentRegistry::new("test");
+        agent_registry.register("test", Arc::new(NoopAgent));
+        DefaultExecutionService::new(
+            store,
+            Arc::new(agent_registry),
+            Arc::new(config),
             Default::default(),
             make_event_store_noop().await,
             vec![],

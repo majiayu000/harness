@@ -21,6 +21,8 @@ pub(crate) struct IssueSubmissionRuntimeContext<'a> {
     pub additional_prompt: Option<&'a str>,
     pub depends_on: &'a [TaskId],
     pub dependencies_blocked: bool,
+    pub source: Option<&'a str>,
+    pub external_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,6 +500,8 @@ fn issue_submission_data(
             "additional_prompt": ctx.additional_prompt,
             "depends_on": depends_on_strings(ctx.depends_on),
             "dependencies_blocked": ctx.dependencies_blocked,
+            "source": ctx.source,
+            "external_id": ctx.external_id,
         }),
     )
 }
@@ -656,6 +660,8 @@ mod tests {
                 additional_prompt: Some("include the regression test first"),
                 depends_on: &[],
                 dependencies_blocked: false,
+                source: Some("github"),
+                external_id: Some("issue:42"),
             },
         )
         .await?;
@@ -680,6 +686,8 @@ mod tests {
             instance.data["additional_prompt"],
             "include the regression test first"
         );
+        assert_eq!(instance.data["source"], "github");
+        assert_eq!(instance.data["external_id"], "issue:42");
         assert_eq!(instance.data["last_decision"], "submit_issue");
         assert_eq!(
             instance.data["execution_path"],
@@ -733,6 +741,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: &[],
                 dependencies_blocked: false,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
@@ -748,6 +758,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: &[],
                 dependencies_blocked: false,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
@@ -808,6 +820,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: &[],
                 dependencies_blocked: false,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
@@ -900,6 +914,8 @@ mod tests {
                 additional_prompt: Some("do not clobber existing metadata"),
                 depends_on: &[],
                 dependencies_blocked: false,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
@@ -965,6 +981,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: std::slice::from_ref(&dep_id),
                 dependencies_blocked: true,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
@@ -1026,6 +1044,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: &[],
                 dependencies_blocked: false,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
@@ -1049,6 +1069,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: std::slice::from_ref(&dep_id),
                 dependencies_blocked: true,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
@@ -1093,6 +1115,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: std::slice::from_ref(&old_dep_id),
                 dependencies_blocked: true,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
@@ -1116,6 +1140,8 @@ mod tests {
                 additional_prompt: None,
                 depends_on: std::slice::from_ref(&ready_dep_id),
                 dependencies_blocked: true,
+                source: None,
+                external_id: None,
             },
         )
         .await?;
