@@ -144,7 +144,7 @@ async fn append_runtime_definition_summaries(
     task_kind: TaskKind,
 ) -> anyhow::Result<()> {
     let workflows = store
-        .list_instances_by_definition(definition_id, None)
+        .list_instances_by_definition(definition_id, None, None)
         .await?;
     let mut listed_ids: HashSet<String> = summaries
         .iter()
@@ -186,7 +186,10 @@ fn runtime_workflow_task_summary(
                 .map(|issue_number| format!("issue #{issue_number}"))
                 .unwrap_or_else(|| workflow.subject.subject_key.clone()),
         ),
-        TaskKind::Prompt => runtime_string_field(&workflow.data, "prompt"),
+        TaskKind::Prompt => Some(
+            runtime_string_field(&workflow.data, "prompt_summary")
+                .unwrap_or_else(|| "prompt task".to_string()),
+        ),
         _ => Some(workflow.subject.subject_key.clone()),
     };
     TaskSummary {

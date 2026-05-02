@@ -316,6 +316,8 @@ impl TransitionAllowlist {
             .allow("failed", "implementing", [EnqueueActivity, Wait])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])
             .allow("implementing", "implementing", [EnqueueActivity, Wait])
+            .allow("blocked", "awaiting_dependencies", [Wait])
+            .allow("blocked", "implementing", [EnqueueActivity, Wait])
             .allow("implementing", "done", [MarkDone])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])

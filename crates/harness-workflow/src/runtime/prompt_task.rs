@@ -12,6 +12,7 @@ pub enum PromptTaskWorkflowAction {
 pub struct PromptSubmissionDecisionInput<'a> {
     pub task_id: &'a str,
     pub prompt: &'a str,
+    pub prompt_ref: &'a str,
     pub source: Option<&'a str>,
     pub external_id: Option<&'a str>,
     pub depends_on: &'a [String],
@@ -55,7 +56,8 @@ pub fn build_prompt_submission_decision(
             ),
             serde_json::json!({
                 "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                "prompt": input.prompt,
+                "prompt_ref": input.prompt_ref,
+                "prompt_chars": input.prompt.chars().count(),
                 "source": input.source,
                 "external_id": input.external_id,
                 "task_id": input.task_id,

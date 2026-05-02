@@ -831,6 +831,7 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
         .list_instances_by_definition(
             harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
             None,
+            None,
         )
         .await?;
     let mut tick = RuntimePrFeedbackSweepTick::default();

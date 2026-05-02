@@ -256,14 +256,18 @@ pub(super) async fn create_tasks_batch(
     let n = task_requests.len();
     let mut task_semaphores: Vec<Option<Arc<tokio::sync::Semaphore>>> = vec![None; n];
     let mut task_conflict_files: Vec<Vec<String>> = vec![Vec::new(); n];
+    let mut task_conflict_group: Vec<Option<usize>> = vec![None; n];
+    let mut conflict_group_tail: Vec<Option<task_runner::TaskId>> =
+        vec![None; conflict_groups.len()];
 
-    for group in &conflict_groups {
+    for (group_idx, group) in conflict_groups.iter().enumerate() {
         if group.len() < 2 {
             continue;
         }
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
         for &idx in group {
             task_semaphores[idx] = Some(Arc::clone(&sem));
+            task_conflict_group[idx] = Some(group_idx);
             // Collect files from this task that overlap with any other group member.
             let mut shared: std::collections::HashSet<String> = std::collections::HashSet::new();
             for &other in group {
@@ -288,13 +292,22 @@ pub(super) async fn create_tasks_batch(
     let mut results = Vec::with_capacity(n);
     let mut all_maintenance_window = n > 0;
     let mut mw_retry_after: Option<u64> = None;
-    for (i, task_req) in task_requests.into_iter().enumerate() {
+    for (i, mut task_req) in task_requests.into_iter().enumerate() {
         let sem = task_semaphores[i].take();
         let is_serialized = sem.is_some();
         let conflict_files = std::mem::take(&mut task_conflict_files[i]);
+        let conflict_group = task_conflict_group[i];
+        if let Some(group_idx) = conflict_group {
+            if let Some(previous_task_id) = conflict_group_tail[group_idx].clone() {
+                task_req.serialization_depends_on.push(previous_task_id);
+            }
+        }
         let is_issue_submission = task_req.issue.is_some();
         let entry = match enqueue_task_background(state.clone(), task_req, sem).await {
             Ok(task_id) => {
+                if let Some(group_idx) = conflict_group {
+                    conflict_group_tail[group_idx] = Some(task_id.clone());
+                }
                 all_maintenance_window = false;
                 match task_response_details(&state, &task_id, is_issue_submission).await {
                     Ok(details) => {
@@ -435,7 +448,7 @@ pub(super) async fn cancel_task(
             {
                 Ok(Some(workflow)) if workflow.state == "cancelled" => {
                     if let Err(error) =
-                        crate::workflow_runtime_worker::notify_runtime_issue_terminal_workflow(
+                        crate::workflow_runtime_worker::notify_runtime_submission_terminal_workflow(
                             &state,
                             &workflow.id,
                             None,
@@ -444,7 +457,7 @@ pub(super) async fn cancel_task(
                     {
                         tracing::warn!(
                             workflow_id = %workflow.id,
-                            "cancel_task: runtime issue completion notification failed: {error}"
+                            "cancel_task: runtime completion notification failed: {error}"
                         );
                     }
                     (

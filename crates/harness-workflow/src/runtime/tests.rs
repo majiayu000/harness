@@ -194,6 +194,7 @@ fn prompt_submission_decision_starts_runtime_implementation() {
         PromptSubmissionDecisionInput {
             task_id: "task-prompt-1",
             prompt: "Fix the flaky login test.",
+            prompt_ref: "prompt-ref-1",
             source: None,
             external_id: Some("manual-prompt-1"),
             depends_on: &[],
@@ -209,8 +210,13 @@ fn prompt_submission_decision_starts_runtime_implementation() {
         Some(PROMPT_TASK_IMPLEMENT_ACTIVITY)
     );
     assert_eq!(
-        output.decision.commands[0].command["prompt"],
-        "Fix the flaky login test."
+        output.decision.commands[0].command["prompt_ref"],
+        "prompt-ref-1"
+    );
+    assert!(output.decision.commands[0].command.get("prompt").is_none());
+    assert_eq!(
+        output.decision.commands[0].command["prompt_chars"],
+        "Fix the flaky login test.".chars().count()
     );
     DecisionValidator::prompt_task()
         .validate(
@@ -230,6 +236,7 @@ fn prompt_submission_decision_waits_for_dependencies_without_runtime_command() {
         PromptSubmissionDecisionInput {
             task_id: "task-prompt-2",
             prompt: "Refactor the settings panel.",
+            prompt_ref: "prompt-ref-2",
             source: None,
             external_id: None,
             depends_on: &depends_on,
@@ -246,6 +253,37 @@ fn prompt_submission_decision_waits_for_dependencies_without_runtime_command() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("blocked prompt submission should validate without dispatching");
+}
+
+#[test]
+fn prompt_submission_decision_reopens_blocked_prompt_task() {
+    let instance = prompt_task_instance("blocked");
+    let output = build_prompt_submission_decision(
+        &instance,
+        PromptSubmissionDecisionInput {
+            task_id: "task-prompt-retry",
+            prompt: "Retry the prompt task after payload loss.",
+            prompt_ref: "prompt-ref-retry",
+            source: None,
+            external_id: Some("manual-prompt-retry"),
+            depends_on: &[],
+            dependencies_blocked: false,
+        },
+    );
+
+    assert_eq!(output.decision.next_state, "implementing");
+    assert_eq!(output.decision.commands.len(), 1);
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some(PROMPT_TASK_IMPLEMENT_ACTIVITY)
+    );
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("blocked prompt task resubmission should validate");
 }
 
 #[test]

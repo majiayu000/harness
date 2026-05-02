@@ -1274,7 +1274,11 @@ async fn runtime_repo_backlog_poll_tick_enqueues_runtime_command() -> anyhow::Re
     assert_eq!(tick.skipped, 0);
     assert_eq!(tick.rejected, 0);
     let instances = store
-        .list_instances_by_definition(harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID, None)
+        .list_instances_by_definition(
+            harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+            None,
+            None,
+        )
         .await?;
     assert_eq!(instances.len(), 1);
     let workflow_id = instances[0].id.clone();
@@ -1891,6 +1895,7 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
         .list_instances_by_definition(
             harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
             Some(&project_id),
+            None,
         )
         .await?;
     assert_eq!(children.len(), 1);
@@ -3142,7 +3147,19 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
     assert_eq!(instance.definition_id, "prompt_task");
     assert_eq!(instance.state, "implementing");
     assert_eq!(instance.data["task_id"], task_id.0);
-    assert_eq!(instance.data["prompt"], "fix the prompt-only bug");
+    assert!(instance.data.get("prompt").is_none());
+    assert_eq!(instance.data["prompt_summary"], "prompt task");
+    assert_eq!(
+        instance.data["prompt_chars"],
+        "fix the prompt-only bug".chars().count()
+    );
+    let prompt_ref = instance.data["prompt_ref"]
+        .as_str()
+        .expect("prompt ref should be persisted");
+    assert_eq!(
+        crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref).as_deref(),
+        Some("fix the prompt-only bug")
+    );
     assert_eq!(instance.data["source"], "dashboard");
     assert_eq!(instance.data["external_id"], "manual:prompt:http");
     assert_eq!(instance.data["execution_path"], "workflow_runtime");
@@ -3153,6 +3170,8 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
         commands[0].command.activity_name(),
         Some("implement_prompt")
     );
+    assert!(commands[0].command.command.get("prompt").is_none());
+    assert_eq!(commands[0].command.command["prompt_ref"], prompt_ref);
 
     let detail_response = app
         .oneshot(
@@ -3412,7 +3431,7 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
     assert_eq!(runtime_task["status"], "implementing");
     assert_eq!(runtime_task["source"], "dashboard");
     assert_eq!(runtime_task["external_id"], "manual:prompt:list");
-    assert_eq!(runtime_task["description"], "fix listed runtime prompt");
+    assert_eq!(runtime_task["description"], "prompt task");
     assert_eq!(
         runtime_task["project"],
         canonical_project_root.to_string_lossy().as_ref()
@@ -3998,6 +4017,60 @@ async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow:
 }
 
 #[tokio::test]
+async fn create_tasks_batch_with_legacy_conflicts_does_not_add_dependencies() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": dir.path().display().to_string(),
+                        "tasks": [
+                            { "description": "update src/lib.rs first" },
+                            { "description": "update src/lib.rs second" }
+                        ]
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let batch_json = response_json(response).await?;
+    let entries = batch_json
+        .as_array()
+        .expect("batch response should be an array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["serialized"], true);
+    assert_eq!(entries[1]["serialized"], true);
+    for entry in entries {
+        let task_id = task_runner::TaskId::from_str(
+            entry["task_id"]
+                .as_str()
+                .expect("task id should be present"),
+        );
+        let task = state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_id)
+            .await?
+            .expect("legacy task should be persisted");
+        assert!(task.depends_on.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_tasks_batch_with_prompts_returns_runtime_submissions() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -4064,10 +4137,119 @@ async fn create_tasks_batch_with_prompts_returns_runtime_submissions() -> anyhow
             .expect("runtime prompt submission should be persisted");
         assert_eq!(instance.definition_id, "prompt_task");
         assert_eq!(instance.state, "implementing");
-        assert_eq!(instance.data["prompt"], prompt);
-        assert_eq!(store.commands_for(&instance.id).await?.len(), 1);
+        assert!(instance.data.get("prompt").is_none());
+        assert_eq!(instance.data["prompt_summary"], "prompt task");
+        assert_eq!(instance.data["prompt_chars"], prompt.chars().count());
+        let prompt_ref = instance.data["prompt_ref"]
+            .as_str()
+            .expect("prompt ref should be persisted");
+        assert_eq!(
+            crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref)
+                .as_deref(),
+            Some(prompt)
+        );
+        let commands = store.commands_for(&instance.id).await?;
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].command.command.get("prompt").is_none());
+        assert_eq!(commands[0].command.command["prompt_ref"], prompt_ref);
     }
     assert_eq!(state.core.tasks.count(), before_count);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_tasks_batch_with_conflicting_runtime_prompts_adds_dependencies(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project_root.display().to_string(),
+                        "tasks": [
+                            { "description": "update src/lib.rs first" },
+                            { "description": "update src/lib.rs second" }
+                        ]
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let batch_json = response_json(response).await?;
+    let entries = batch_json
+        .as_array()
+        .expect("batch response should be an array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["serialized"], true);
+    assert_eq!(entries[1]["serialized"], true);
+    assert_eq!(
+        entries[0]["conflict_files"],
+        serde_json::json!(["src/lib.rs"])
+    );
+    assert_eq!(
+        entries[1]["conflict_files"],
+        serde_json::json!(["src/lib.rs"])
+    );
+    assert_eq!(entries[0]["status"], "implementing");
+    assert!(
+        entries[1]["status"] == "awaiting_dependencies" || entries[1]["status"] == "implementing"
+    );
+
+    let first_task_id = entries[0]["task_id"]
+        .as_str()
+        .expect("first task id should be present");
+    let second_task_id = entries[1]["task_id"]
+        .as_str()
+        .expect("second task id should be present");
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let first = store
+        .get_instance_by_task_id(first_task_id)
+        .await?
+        .expect("first runtime prompt submission should be persisted");
+    let second = store
+        .get_instance_by_task_id(second_task_id)
+        .await?
+        .expect("second runtime prompt submission should be persisted");
+
+    assert_eq!(
+        second.data["depends_on"],
+        serde_json::json!([first_task_id])
+    );
+    assert_eq!(second.data["required_depends_on"], serde_json::json!([]));
+    assert_eq!(
+        second.data["serialization_depends_on"],
+        serde_json::json!([first_task_id])
+    );
+    assert_eq!(store.commands_for(&first.id).await?.len(), 1);
+    let second_commands = store.commands_for(&second.id).await?.len();
+    match second.state.as_str() {
+        "awaiting_dependencies" => assert_eq!(second_commands, 0),
+        "implementing" => assert_eq!(second_commands, 1),
+        state => panic!("unexpected second runtime prompt state {state}"),
+    }
     Ok(())
 }
 
