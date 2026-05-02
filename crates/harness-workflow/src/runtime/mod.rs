@@ -34,8 +34,9 @@ pub use plan_issue::{
     PlanIssueWorkflowAction,
 };
 pub use pr_feedback::{
-    build_pr_detected_decision, build_pr_feedback_decision, PrDetectedDecisionInput,
-    PrFeedbackDecisionInput, PrFeedbackDecisionOutput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
+    build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
+    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackDecisionOutput, PrFeedbackOutcome,
+    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction,
 };
 pub use quality_gate::{
     build_quality_gate_run_decision, quality_gate_workflow_id, QualityGateDecisionInput,

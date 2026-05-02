@@ -620,6 +620,136 @@ fn load_runtime_workflow_config_or_default(
     })
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RuntimePrFeedbackSweepTick {
+    pub requested: usize,
+    pub active_command_exists: usize,
+    pub skipped: usize,
+    pub rejected: usize,
+}
+
+impl RuntimePrFeedbackSweepTick {
+    fn touched_anything(&self) -> bool {
+        self.requested > 0
+            || self.active_command_exists > 0
+            || self.skipped > 0
+            || self.rejected > 0
+    }
+}
+
+pub(super) async fn run_runtime_pr_feedback_sweep_tick(
+    state: &Arc<AppState>,
+    limit: usize,
+) -> anyhow::Result<RuntimePrFeedbackSweepTick> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(RuntimePrFeedbackSweepTick::default());
+    };
+    let workflows = store
+        .list_instances_by_definition(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            None,
+        )
+        .await?;
+    let mut tick = RuntimePrFeedbackSweepTick::default();
+    let mut considered_candidates = 0usize;
+    for workflow in workflows {
+        if !matches!(workflow.state.as_str(), "pr_open" | "awaiting_feedback") {
+            continue;
+        }
+        if workflow
+            .data
+            .get("pr_number")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        {
+            tick.skipped += 1;
+            continue;
+        }
+        let Some(project_root) = workflow_project_root(&workflow) else {
+            tick.skipped += 1;
+            continue;
+        };
+        if !project_root.exists() {
+            tracing::warn!(
+                workflow_id = %workflow.id,
+                project_root = %project_root.display(),
+                "workflow runtime PR feedback sweep skipped unresolvable project path"
+            );
+            tick.skipped += 1;
+            continue;
+        }
+        let workflow_cfg = load_runtime_workflow_config_or_default(
+            &project_root,
+            "workflow runtime PR feedback sweeper",
+        );
+        if !workflow_cfg.pr_feedback.enabled {
+            tick.skipped += 1;
+            continue;
+        }
+        if considered_candidates >= limit.max(1) {
+            break;
+        }
+        considered_candidates += 1;
+
+        match crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &workflow.id)
+            .await?
+        {
+            crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
+                ..
+            } => tick.requested += 1,
+            crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                ..
+            } => tick.active_command_exists += 1,
+            crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::NotCandidate {
+                ..
+            } => tick.skipped += 1,
+            crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Rejected {
+                ..
+            } => tick.rejected += 1,
+        }
+    }
+    Ok(tick)
+}
+
+pub(super) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) {
+    if state.core.workflow_runtime_store.is_none() {
+        tracing::debug!("workflow runtime PR feedback sweeper disabled: store unavailable");
+        return;
+    }
+
+    let weak_state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let state = match weak_state.upgrade() {
+                Some(state) => state,
+                None => break,
+            };
+            let workflow_cfg = load_runtime_workflow_config_or_default(
+                &state.core.project_root,
+                "workflow runtime PR feedback sweeper",
+            );
+            let interval =
+                std::time::Duration::from_secs(workflow_cfg.pr_feedback.sweep_interval_secs.max(1));
+            match run_runtime_pr_feedback_sweep_tick(&state, 128).await {
+                Ok(tick) if tick.touched_anything() => {
+                    tracing::info!(
+                        requested = tick.requested,
+                        active_command_exists = tick.active_command_exists,
+                        skipped = tick.skipped,
+                        rejected = tick.rejected,
+                        "workflow runtime PR feedback sweeper tick complete"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("workflow runtime PR feedback sweeper tick failed: {error}");
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
 fn runtime_kind_from_config(value: &str) -> Option<RuntimeKind> {
     match value {
         "codex_exec" => Some(RuntimeKind::CodexExec),

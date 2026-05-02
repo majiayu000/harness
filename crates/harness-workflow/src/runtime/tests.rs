@@ -9,15 +9,17 @@ use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRej
 use super::{
     build_issue_submission_decision, build_merged_pr_decision,
     build_open_issue_without_workflow_decision, build_plan_issue_decision,
-    build_pr_detected_decision, build_pr_feedback_decision, build_quality_gate_run_decision,
-    build_stale_active_workflow_decision, reduce_runtime_job_completed, CommandDispatchOutcome,
-    InMemoryWorkflowBus, IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction,
-    MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
-    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackWorkflowAction,
-    QualityGateDecisionInput, QualityGateWorkflowAction, RepoBacklogWorkflowAction,
-    RuntimeCommandDispatcher, RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker,
-    StaleWorkflowDecisionInput, WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY,
-    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID,
+    build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
+    build_quality_gate_run_decision, build_stale_active_workflow_decision,
+    reduce_runtime_job_completed, CommandDispatchOutcome, InMemoryWorkflowBus,
+    IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction, MergedPrDecisionInput,
+    OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
+    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
+    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, QualityGateDecisionInput,
+    QualityGateWorkflowAction, RepoBacklogWorkflowAction, RuntimeCommandDispatcher,
+    RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput,
+    WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    REPO_BACKLOG_DEFINITION_ID,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -397,6 +399,43 @@ fn pr_feedback_decision_addresses_blocking_feedback() {
 }
 
 #[test]
+fn pr_feedback_sweep_decision_enqueues_runtime_activity() {
+    let instance = issue_instance("pr_open");
+    let output = build_pr_feedback_sweep_decision(
+        &instance,
+        PrFeedbackSweepDecisionInput {
+            dedupe_key: "pr-feedback-sweep:123:77",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            issue_number: Some(123),
+            repo: Some("owner/repo"),
+            summary: "Runtime workflow requested a PR feedback sweep.",
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::SweepFeedback);
+    assert_eq!(output.decision.decision, "sweep_pr_feedback");
+    assert_eq!(output.decision.next_state, "awaiting_feedback");
+    assert_eq!(output.decision.commands.len(), 1);
+    assert_eq!(
+        output.decision.commands[0].command_type,
+        WorkflowCommandType::EnqueueActivity
+    );
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("sweep_pr_feedback")
+    );
+    assert_eq!(output.decision.commands[0].command["pr_number"], 77);
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("PR feedback sweep decision should validate");
+}
+
+#[test]
 fn pr_feedback_decision_waits_when_no_actionable_feedback_exists() {
     let instance = issue_instance("pr_open");
     let output = build_pr_feedback_decision(
@@ -667,6 +706,53 @@ fn runtime_completion_reducer_accepts_structured_workflow_decision_artifact() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("structured workflow decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_maps_pr_feedback_sweep_signal_to_address_command() {
+    let instance = issue_instance("awaiting_feedback").with_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+    }));
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent found actionable PR feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "FeedbackFound",
+        json!({ "count": 2, "pr_number": 77 }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("feedback sweep signal should reduce");
+
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("feedback sweep signal decision should validate");
 }
 
 #[test]

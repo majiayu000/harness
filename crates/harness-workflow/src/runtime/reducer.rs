@@ -2,6 +2,7 @@ use super::model::{
     ActivityErrorKind, ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType,
     WorkflowDecision, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
+use super::pr_feedback::{build_pr_feedback_decision, PrFeedbackDecisionInput, PrFeedbackOutcome};
 use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
 use super::validator::{DecisionValidator, ValidationContext};
@@ -51,6 +52,11 @@ fn reduce_success(
     }
 
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+
+    if let Some(decision) = pr_feedback_sweep_decision_from_activity_result(instance, event, result)
+    {
         return Some(decision);
     }
 
@@ -193,6 +199,100 @@ fn pull_request_artifact(result: &ActivityResult) -> Option<(u64, String)> {
                 .to_string();
             Some((pr_number, pr_url))
         })
+}
+
+fn pr_feedback_sweep_decision_from_activity_result(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || result.activity != "sweep_pr_feedback"
+    {
+        return None;
+    }
+    if !matches!(
+        instance.state.as_str(),
+        "pr_open" | "awaiting_feedback" | "addressing_feedback"
+    ) {
+        return None;
+    }
+    let outcome = pr_feedback_outcome_from_signals(result)?;
+    let pr_number = result_signal_u64(result, "pr_number").or_else(|| {
+        instance
+            .data
+            .get("pr_number")
+            .and_then(|value| value.as_u64())
+    })?;
+    let pr_url =
+        result_signal_string(result, "pr_url").or_else(|| optional_data_string(instance, "pr_url"));
+    let task_id = event_field_string(event, "runtime_job_id")
+        .or_else(|| optional_data_string(instance, "task_id"))
+        .unwrap_or_else(|| event.id.clone());
+    Some(
+        build_pr_feedback_decision(
+            instance,
+            PrFeedbackDecisionInput {
+                task_id: &task_id,
+                pr_number,
+                pr_url: pr_url.as_deref(),
+                outcome,
+                summary: result.summary.as_str(),
+            },
+        )
+        .decision
+        .with_evidence(runtime_completion_evidence(event, result)),
+    )
+}
+
+fn pr_feedback_outcome_from_signals(result: &ActivityResult) -> Option<PrFeedbackOutcome> {
+    if has_signal(result, "PrReadyToMerge") {
+        return Some(PrFeedbackOutcome::ReadyToMerge);
+    }
+    if has_signal(result, "FeedbackFound")
+        || has_signal(result, "ChangesRequested")
+        || has_signal(result, "ChecksFailed")
+    {
+        return Some(PrFeedbackOutcome::BlockingFeedback);
+    }
+    if has_signal(result, "NoFeedbackFound") {
+        return Some(PrFeedbackOutcome::NoActionableFeedback);
+    }
+    None
+}
+
+fn has_signal(result: &ActivityResult, signal_type: &str) -> bool {
+    result
+        .signals
+        .iter()
+        .any(|signal| signal.signal_type == signal_type)
+}
+
+fn result_signal_u64(result: &ActivityResult, field: &str) -> Option<u64> {
+    result
+        .signals
+        .iter()
+        .find_map(|signal| signal.signal.get(field).and_then(|value| value.as_u64()))
+}
+
+fn result_signal_string(result: &ActivityResult, field: &str) -> Option<String> {
+    result.signals.iter().find_map(|signal| {
+        signal
+            .signal
+            .get(field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn optional_data_string(instance: &WorkflowInstance, field: &str) -> Option<String> {
+    instance
+        .data
+        .get(field)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn runtime_blocked_decision(
