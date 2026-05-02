@@ -1,13 +1,14 @@
 use crate::http::AppState;
 use crate::task_executor::turn_lifecycle::TurnLifecycleOptions;
+use crate::task_runner::{TaskFailureKind, TaskKind, TaskState, TaskStatus};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Duration;
 use harness_core::config::agents::SandboxMode;
 use harness_core::types::{AgentId, Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, ActivitySignal, DecisionValidator, RuntimeJob,
-    RuntimeJobExecutor, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, DecisionValidator,
+    RuntimeJob, RuntimeJobExecutor, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker,
     WorkflowDefinition, WorkflowInstance, WorkflowSubject, QUALITY_BLOCKED_SIGNAL,
     QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
     QUALITY_PASSED_SIGNAL,
@@ -69,7 +70,121 @@ pub(crate) async fn run_runtime_job_worker_tick(
     let worker = RuntimeWorker::new(store.as_ref(), owner).with_lease_ttl(lease_ttl);
     let executor = ServerRuntimeJobExecutor::new(state.clone());
     let completed = worker.run_once(&executor).await?;
+    if let Some(job) = completed.as_ref() {
+        if let Err(error) = notify_runtime_issue_terminal(state, job).await {
+            tracing::warn!(
+                runtime_job_id = %job.id,
+                "workflow runtime issue completion notification failed: {error}"
+            );
+        }
+    }
     Ok(RuntimeJobWorkerTick::from_completed_job(completed))
+}
+
+pub(crate) async fn notify_runtime_issue_terminal(
+    state: &AppState,
+    job: &RuntimeJob,
+) -> anyhow::Result<bool> {
+    let Some(workflow_id) = job.input.get("workflow_id").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let result = runtime_job_activity_result(job);
+    notify_runtime_issue_terminal_workflow(state, workflow_id, result.as_ref()).await
+}
+
+pub(crate) async fn notify_runtime_issue_terminal_workflow(
+    state: &AppState,
+    workflow_id: &str,
+    result: Option<&ActivityResult>,
+) -> anyhow::Result<bool> {
+    let Some(callback) = state.intake.completion_callback.as_ref() else {
+        return Ok(false);
+    };
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(false);
+    };
+    let Some(instance) = store.get_instance(workflow_id).await? else {
+        return Ok(false);
+    };
+    let Some(task) = runtime_issue_completion_task(&instance, result) else {
+        return Ok(false);
+    };
+    callback(task).await;
+    Ok(true)
+}
+
+fn runtime_issue_completion_task(
+    instance: &WorkflowInstance,
+    result: Option<&ActivityResult>,
+) -> Option<TaskState> {
+    if instance.definition_id != "github_issue_pr" || !instance.is_terminal() {
+        return None;
+    }
+    let source = optional_data_string(instance, "source")?;
+    let external_id = optional_data_string(instance, "external_id")?;
+    let task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(instance)?;
+    let status = task_status_for_runtime_state(&instance.state)?;
+    let mut task = TaskState::new(task_id);
+    task.task_kind = TaskKind::Issue;
+    task.status = status.clone();
+    task.failure_kind = runtime_failure_kind(&status, result);
+    task.source = Some(source);
+    task.external_id = Some(external_id);
+    task.repo = optional_data_string(instance, "repo");
+    task.issue = optional_data_u64(instance, "issue_number");
+    task.project_root = optional_data_string(instance, "project_id").map(PathBuf::from);
+    task.pr_url = optional_data_string(instance, "last_pr_url");
+    task.description = task.issue.map(|issue| format!("issue #{issue}"));
+    task.error = runtime_completion_error(&status, result);
+    Some(task)
+}
+
+fn task_status_for_runtime_state(state: &str) -> Option<TaskStatus> {
+    match state {
+        "done" => Some(TaskStatus::Done),
+        "failed" => Some(TaskStatus::Failed),
+        "cancelled" => Some(TaskStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn runtime_job_activity_result(job: &RuntimeJob) -> Option<ActivityResult> {
+    job.output
+        .as_ref()
+        .and_then(|output| serde_json::from_value(output.clone()).ok())
+}
+
+fn runtime_failure_kind(
+    status: &TaskStatus,
+    result: Option<&ActivityResult>,
+) -> Option<TaskFailureKind> {
+    if !status.is_failure() {
+        return None;
+    }
+    match result.and_then(|result| result.error_kind) {
+        Some(ActivityErrorKind::Retryable | ActivityErrorKind::ExternalDependency) => {
+            Some(TaskFailureKind::WorkspaceLifecycle)
+        }
+        _ => Some(TaskFailureKind::Task),
+    }
+}
+
+fn runtime_completion_error(
+    status: &TaskStatus,
+    result: Option<&ActivityResult>,
+) -> Option<String> {
+    if !status.is_failure() {
+        return None;
+    }
+    result
+        .and_then(|result| {
+            result
+                .error
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| (!result.summary.trim().is_empty()).then_some(result.summary.trim()))
+        })
+        .map(ToOwned::to_owned)
 }
 
 struct ServerRuntimeJobExecutor {
@@ -1042,6 +1157,15 @@ fn optional_data_u64(workflow: &WorkflowInstance, field: &str) -> Option<u64> {
     })
 }
 
+fn optional_data_string(workflow: &WorkflowInstance, field: &str) -> Option<String> {
+    workflow
+        .data
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn parse_issue_subject_key(subject_key: &str) -> anyhow::Result<u64> {
     subject_key
         .strip_prefix("issue:")
@@ -1407,6 +1531,70 @@ where
 #[cfg(test)]
 mod profile_tests {
     use super::*;
+
+    #[test]
+    fn runtime_issue_completion_task_preserves_intake_identity() {
+        let instance = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "cancelled",
+            WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_data(json!({
+            "task_id": "runtime-task-42",
+            "project_id": "/tmp/project",
+            "repo": "owner/repo",
+            "issue_number": 42,
+            "source": "github",
+            "external_id": "issue:42",
+        }));
+        let result = ActivityResult::cancelled("implement_issue", "Runtime job was cancelled.");
+
+        let task = runtime_issue_completion_task(&instance, Some(&result))
+            .expect("terminal runtime issue should map to an intake task");
+
+        assert_eq!(task.id.as_str(), "runtime-task-42");
+        assert_eq!(task.task_kind, TaskKind::Issue);
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.source.as_deref(), Some("github"));
+        assert_eq!(task.external_id.as_deref(), Some("issue:42"));
+        assert_eq!(task.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(task.issue, Some(42));
+    }
+
+    #[test]
+    fn runtime_issue_completion_task_marks_retryable_failures_as_transient() {
+        let instance = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "failed",
+            WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_data(json!({
+            "task_id": "runtime-task-42",
+            "project_id": "/tmp/project",
+            "repo": "owner/repo",
+            "issue_number": 42,
+            "source": "github",
+            "external_id": "issue:42",
+        }));
+        let result = ActivityResult::failed(
+            "implement_issue",
+            "Runtime dependency failed.",
+            "provider temporarily unavailable",
+        )
+        .with_error_kind(ActivityErrorKind::ExternalDependency);
+
+        let task = runtime_issue_completion_task(&instance, Some(&result))
+            .expect("terminal runtime issue should map to an intake task");
+
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.failure_kind, Some(TaskFailureKind::WorkspaceLifecycle));
+        assert_eq!(
+            task.error.as_deref(),
+            Some("provider temporarily unavailable")
+        );
+    }
 
     #[test]
     fn runtime_profile_approval_policy_accepts_codex_values() {

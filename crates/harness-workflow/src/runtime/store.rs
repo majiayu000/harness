@@ -130,6 +130,20 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_runtime_jobs_ready
               ON runtime_jobs (status, not_before, created_at)",
     },
+    Migration {
+        version: 4,
+        description: "index runtime workflow handle lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_state
+              ON workflow_instances (definition_id, state, updated_at);
+              CREATE INDEX IF NOT EXISTS idx_workflow_instances_task_id
+              ON workflow_instances ((data->'data'->>'task_id'))",
+    },
+    Migration {
+        version: 5,
+        description: "index runtime workflow handle history",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_task_ids
+              ON workflow_instances USING GIN ((data->'data'->'task_ids'))",
+    },
 ];
 
 pub struct WorkflowRuntimeStore {
@@ -241,6 +255,57 @@ impl WorkflowRuntimeStore {
             .map_err(Into::into)
     }
 
+    pub async fn get_instance_by_task_id(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE data->'data'->>'task_id' = $1
+                OR data->'data'->'task_ids' ? $1
+             ORDER BY updated_at DESC
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(data,)| serde_json::from_str(&data))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn list_instances_by_state(
+        &self,
+        definition_id: &str,
+        state: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND state = $2
+             ORDER BY updated_at ASC
+             LIMIT $3",
+        )
+        .bind(definition_id)
+        .bind(state)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
+    pub async fn touch_instance(&self, workflow_id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE workflow_instances SET updated_at = clock_timestamp() WHERE id = $1")
+            .bind(workflow_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn list_instances(
         &self,
         project_id: Option<&str>,
@@ -255,6 +320,26 @@ impl WorkflowRuntimeStore {
         )
         .bind(project_id)
         .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
+    pub async fn list_instances_by_definition(
+        &self,
+        definition_id: &str,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND ($2::text IS NULL OR data->'data'->>'project_id' = $2)
+             ORDER BY updated_at DESC",
+        )
+        .bind(definition_id)
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -409,13 +494,34 @@ impl WorkflowRuntimeStore {
         decision_id: Option<&str>,
         command: &WorkflowCommand,
     ) -> anyhow::Result<String> {
+        self.enqueue_command_with_status(workflow_id, decision_id, command, "pending")
+            .await
+    }
+
+    pub async fn enqueue_command_with_status(
+        &self,
+        workflow_id: &str,
+        decision_id: Option<&str>,
+        command: &WorkflowCommand,
+        status: &str,
+    ) -> anyhow::Result<String> {
         let data = to_jsonb_string(command)?;
         let command_type = enum_str(&command.command_type)?;
-        let row: Option<(String,)> = sqlx::query_as(
+        let (id,): (String,) = sqlx::query_as(
             "INSERT INTO workflow_commands
                 (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-             VALUES ($1, $2, $3, $4, $5, 'pending', $6::jsonb)
-             ON CONFLICT (workflow_id, dedupe_key) DO NOTHING
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+             ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
+                status = CASE
+                    WHEN workflow_commands.status = 'pending' THEN EXCLUDED.status
+                    ELSE workflow_commands.status
+                END,
+                updated_at = CASE
+                    WHEN workflow_commands.status = 'pending'
+                         AND workflow_commands.status <> EXCLUDED.status
+                    THEN CURRENT_TIMESTAMP
+                    ELSE workflow_commands.updated_at
+                END
              RETURNING id",
         )
         .bind(Uuid::new_v4().to_string())
@@ -423,20 +529,8 @@ impl WorkflowRuntimeStore {
         .bind(decision_id)
         .bind(&command_type)
         .bind(&command.dedupe_key)
+        .bind(status)
         .bind(&data)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some((id,)) = row {
-            return Ok(id);
-        }
-
-        let (id,): (String,) = sqlx::query_as(
-            "SELECT id FROM workflow_commands
-             WHERE workflow_id = $1 AND dedupe_key = $2",
-        )
-        .bind(workflow_id)
-        .bind(&command.dedupe_key)
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
@@ -898,6 +992,59 @@ impl WorkflowRuntimeStore {
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
+    }
+
+    pub async fn cancel_command_and_unfinished_runtime_jobs(
+        &self,
+        command_id: &str,
+        activity: &str,
+        summary: &str,
+    ) -> anyhow::Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let _command_row: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM workflow_commands WHERE id = $1 FOR UPDATE")
+                .bind(command_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, data::text FROM runtime_jobs
+             WHERE command_id = $1
+               AND status IN ('pending', 'running')
+             FOR UPDATE",
+        )
+        .bind(command_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut cancelled = 0usize;
+        for (id, data) in rows {
+            let mut job: RuntimeJob = serde_json::from_str(&data)?;
+            job.complete(&ActivityResult::cancelled(activity, summary))?;
+            let updated = to_jsonb_string(&job)?;
+            let status = enum_str(&job.status)?;
+            sqlx::query(
+                "UPDATE runtime_jobs
+                 SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $4",
+            )
+            .bind(&status)
+            .bind(job.not_before)
+            .bind(&updated)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            cancelled += 1;
+        }
+        sqlx::query(
+            "UPDATE workflow_commands
+             SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1
+               AND status IN ('pending', 'dispatched')",
+        )
+        .bind(command_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(cancelled)
     }
 
     pub async fn runtime_jobs_for_commands(

@@ -6,10 +6,14 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::state::AppState;
+use crate::task_runner::{
+    SchedulerAuthorityState, TaskFailureKind, TaskKind, TaskPhase, TaskSchedulerState, TaskStatus,
+    TaskSummary,
+};
 
 /// Response type for `GET /tasks/{id}` — `TaskState` fields plus the optional workflow summary
 /// that requires a separate workflow-store lookup (not persisted on `TaskState` itself).
@@ -19,6 +23,24 @@ struct FullTaskResponse {
     inner: crate::task_runner::TaskState,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
+}
+
+#[derive(Serialize)]
+struct RuntimeTaskResponse {
+    id: String,
+    task_id: String,
+    status: String,
+    execution_path: &'static str,
+    workflow_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue: Option<u64>,
+    workflow: harness_workflow::runtime::WorkflowInstance,
 }
 
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
@@ -75,6 +97,9 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
                     };
                 }
             }
+            if let Err(e) = append_runtime_issue_summaries(&state, &mut summaries).await {
+                tracing::error!("list_tasks: failed to append runtime issue summaries: {e}");
+            }
             Json(summaries).into_response()
         }
         Err(e) => {
@@ -88,16 +113,143 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+async fn append_runtime_issue_summaries(
+    state: &AppState,
+    summaries: &mut Vec<TaskSummary>,
+) -> anyhow::Result<()> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(());
+    };
+    let workflows = store
+        .list_instances_by_definition(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            None,
+        )
+        .await?;
+    let mut listed_ids: HashSet<String> = summaries
+        .iter()
+        .map(|summary| summary.id.as_str().to_string())
+        .collect();
+    for workflow in workflows {
+        let Some(task_id) =
+            crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
+        else {
+            continue;
+        };
+        if !listed_ids.insert(task_id.as_str().to_string()) {
+            continue;
+        }
+        summaries.push(runtime_issue_task_summary(workflow, task_id));
+    }
+    Ok(())
+}
+
+fn runtime_issue_task_summary(
+    workflow: harness_workflow::runtime::WorkflowInstance,
+    task_id: harness_core::types::TaskId,
+) -> TaskSummary {
+    let status = runtime_workflow_state_to_task_status(&workflow.state);
+    let scheduler = runtime_workflow_scheduler_state(&status);
+    let issue = workflow
+        .data
+        .get("issue_number")
+        .and_then(|value| value.as_u64());
+    TaskSummary {
+        id: task_id,
+        task_kind: TaskKind::Issue,
+        status: status.clone(),
+        failure_kind: status.is_failure().then_some(TaskFailureKind::Task),
+        turn: 0,
+        pr_url: runtime_string_field(&workflow.data, "pr_url"),
+        error: runtime_string_field(&workflow.data, "failure_reason"),
+        source: runtime_string_field(&workflow.data, "source"),
+        parent_id: None,
+        external_id: issue.map(|issue_number| format!("issue:{issue_number}")),
+        repo: runtime_string_field(&workflow.data, "repo"),
+        description: Some(
+            issue
+                .map(|issue_number| format!("issue #{issue_number}"))
+                .unwrap_or_else(|| workflow.subject.subject_key.clone()),
+        ),
+        created_at: Some(workflow.created_at.to_rfc3339()),
+        phase: runtime_workflow_state_to_task_phase(&workflow.state),
+        depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
+        subtask_ids: Vec::new(),
+        project: runtime_string_field(&workflow.data, "project_id"),
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        workflow: None,
+        scheduler,
+    }
+}
+
+fn runtime_workflow_state_to_task_status(state: &str) -> TaskStatus {
+    match state {
+        "awaiting_dependencies" => TaskStatus::AwaitingDeps,
+        "scheduled" | "discovered" => TaskStatus::Pending,
+        "implementing" | "replanning" | "addressing_feedback" => TaskStatus::Implementing,
+        "pr_open" | "awaiting_feedback" | "ready_to_merge" | "blocked" => TaskStatus::Waiting,
+        "done" | "passed" => TaskStatus::Done,
+        "failed" => TaskStatus::Failed,
+        "cancelled" => TaskStatus::Cancelled,
+        _ => TaskStatus::Waiting,
+    }
+}
+
+fn runtime_workflow_state_to_task_phase(state: &str) -> TaskPhase {
+    match state {
+        "done" | "passed" | "failed" | "cancelled" => TaskPhase::Terminal,
+        "pr_open" | "awaiting_feedback" | "ready_to_merge" => TaskPhase::Review,
+        "replanning" | "blocked" => TaskPhase::Plan,
+        _ => TaskPhase::Implement,
+    }
+}
+
+fn runtime_workflow_scheduler_state(status: &TaskStatus) -> TaskSchedulerState {
+    match status {
+        TaskStatus::AwaitingDeps => TaskSchedulerState::awaiting_dependencies(),
+        TaskStatus::Pending => TaskSchedulerState::queued(),
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
+            let mut scheduler = TaskSchedulerState::queued();
+            scheduler.mark_terminal(status);
+            scheduler
+        }
+        _ => TaskSchedulerState {
+            authority_state: SchedulerAuthorityState::Running,
+            owner: None,
+            run_generation: 0,
+            recovery_generation: 0,
+            lease_expires_at: None,
+        },
+    }
+}
+
+fn runtime_string_field(data: &serde_json::Value, field: &str) -> Option<String> {
+    data.get(field)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn runtime_task_id_array(
+    data: &serde_json::Value,
+    field: &str,
+) -> Vec<harness_core::types::TaskId> {
+    data.get(field)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(harness_core::types::TaskId::from_str)
+        .collect()
+}
+
 pub(crate) async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state
-        .core
-        .tasks
-        .get_with_db_fallback(&harness_core::types::TaskId(id))
-        .await
-    {
+    let task_id = harness_core::types::TaskId(id);
+    match state.core.tasks.get_with_db_fallback(&task_id).await {
         Ok(Some(task)) => {
             let workflow = enrich_task_workflow(&state, &task).await;
             Json(FullTaskResponse {
@@ -106,11 +258,22 @@ pub(crate) async fn get_task(
             })
             .into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "task not found"})),
-        )
-            .into_response(),
+        Ok(None) => match runtime_task_response_by_handle(&state, &task_id).await {
+            Ok(Some(runtime_task)) => Json(runtime_task).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "task not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("get_task: runtime workflow lookup failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response()
+            }
+        },
         Err(e) => {
             tracing::error!("get_task: database error: {e}");
             (
@@ -120,6 +283,44 @@ pub(crate) async fn get_task(
                 .into_response()
         }
     }
+}
+
+async fn runtime_task_response_by_handle(
+    state: &AppState,
+    task_id: &harness_core::types::TaskId,
+) -> anyhow::Result<Option<RuntimeTaskResponse>> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(None);
+    };
+    let Some(workflow) =
+        crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id).await?
+    else {
+        return Ok(None);
+    };
+    let issue = workflow
+        .data
+        .get("issue_number")
+        .and_then(|value| value.as_u64());
+    Ok(Some(RuntimeTaskResponse {
+        id: task_id.as_str().to_string(),
+        task_id: task_id.as_str().to_string(),
+        status: workflow.state.clone(),
+        execution_path: "workflow_runtime",
+        workflow_id: workflow.id.clone(),
+        external_id: issue.map(|issue_number| format!("issue:{issue_number}")),
+        repo: workflow
+            .data
+            .get("repo")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        project: workflow
+            .data
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        issue,
+        workflow,
+    }))
 }
 
 /// Look up the issue-workflow instance for a task using targeted store queries.

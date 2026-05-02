@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
@@ -7,7 +8,7 @@ use harness_workflow::issue_lifecycle::{
 };
 use harness_workflow::runtime::{
     CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
-    RuntimeProfileSelector,
+    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowInstance, WorkflowRuntimeStore,
 };
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
@@ -481,11 +482,142 @@ pub(super) async fn run_runtime_command_dispatch_tick(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(RuntimeCommandDispatchTick::default());
     };
-    let outcomes = RuntimeCommandDispatcher::with_profile_selector(store, runtime_profiles.into())
-        .with_batch_limit(batch_limit)
-        .dispatch_pending()
-        .await?;
+    let release = crate::workflow_runtime_submission::release_ready_issue_dependencies(
+        store,
+        &state.core.tasks,
+        batch_limit,
+    )
+    .await?;
+    if release.released > 0 || release.failed > 0 || release.skipped > 0 {
+        tracing::info!(
+            released = release.released,
+            failed = release.failed,
+            waiting = release.waiting,
+            skipped = release.skipped,
+            "workflow runtime dependency release tick complete"
+        );
+    }
+    let fallback_profile_selector = runtime_profiles.into();
+    let commands = store.pending_commands(batch_limit).await?;
+    let mut outcomes = Vec::with_capacity(commands.len());
+    for command in commands {
+        outcomes.push(
+            dispatch_runtime_command_with_project_policy(
+                state,
+                store,
+                command,
+                fallback_profile_selector.clone(),
+            )
+            .await?,
+        );
+    }
     Ok(RuntimeCommandDispatchTick::from_outcomes(&outcomes))
+}
+
+async fn dispatch_runtime_command_with_project_policy(
+    state: &Arc<AppState>,
+    store: &WorkflowRuntimeStore,
+    command: WorkflowCommandRecord,
+    fallback_profile_selector: RuntimeProfileSelector,
+) -> anyhow::Result<CommandDispatchOutcome> {
+    if !command.command.requires_runtime_job() {
+        return RuntimeCommandDispatcher::with_profile_selector(store, fallback_profile_selector)
+            .dispatch_command(command)
+            .await;
+    }
+
+    let Some(profile_selector) =
+        runtime_dispatch_profile_selector_for_command(state, store, &command).await?
+    else {
+        let command_id = command.id.clone();
+        let skipped = store
+            .mark_pending_command_status(&command_id, "skipped")
+            .await?;
+        let reason = if skipped {
+            "workflow runtime dispatch or worker is disabled for the command project".to_string()
+        } else {
+            "command status changed before workflow runtime policy dispatch".to_string()
+        };
+        return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
+    };
+
+    RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
+        .dispatch_command(command)
+        .await
+}
+
+async fn runtime_dispatch_profile_selector_for_command(
+    state: &Arc<AppState>,
+    store: &WorkflowRuntimeStore,
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<Option<RuntimeProfileSelector>> {
+    let project_root =
+        runtime_command_project_root(store, command, &state.core.project_root).await?;
+    let workflow_cfg = load_runtime_workflow_config_or_default(
+        &project_root,
+        "workflow runtime command dispatcher",
+    );
+    if !workflow_cfg.runtime_dispatch.enabled || !workflow_cfg.runtime_worker.enabled {
+        tracing::debug!(
+            workflow_id = %command.workflow_id,
+            command_id = %command.id,
+            project_root = %project_root.display(),
+            dispatch_enabled = workflow_cfg.runtime_dispatch.enabled,
+            worker_enabled = workflow_cfg.runtime_worker.enabled,
+            "workflow runtime command skipped by project runtime policy"
+        );
+        return Ok(None);
+    }
+    Ok(Some(runtime_dispatch_profile_selector(
+        &workflow_cfg.runtime_dispatch,
+    )))
+}
+
+async fn runtime_command_project_root(
+    store: &WorkflowRuntimeStore,
+    command: &WorkflowCommandRecord,
+    fallback_project_root: &Path,
+) -> anyhow::Result<PathBuf> {
+    let Some(instance) = store.get_instance(&command.workflow_id).await? else {
+        tracing::warn!(
+            workflow_id = %command.workflow_id,
+            command_id = %command.id,
+            fallback_project_root = %fallback_project_root.display(),
+            "workflow runtime command has no workflow instance; using fallback project root"
+        );
+        return Ok(fallback_project_root.to_path_buf());
+    };
+    Ok(workflow_project_root(&instance).unwrap_or_else(|| {
+        tracing::warn!(
+            workflow_id = %command.workflow_id,
+            command_id = %command.id,
+            fallback_project_root = %fallback_project_root.display(),
+            "workflow runtime command workflow has no project_id; using fallback project root"
+        );
+        fallback_project_root.to_path_buf()
+    }))
+}
+
+fn workflow_project_root(instance: &WorkflowInstance) -> Option<PathBuf> {
+    instance
+        .data
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|project_id| !project_id.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn load_runtime_workflow_config_or_default(
+    project_root: &Path,
+    subsystem: &str,
+) -> harness_core::config::workflow::WorkflowConfig {
+    harness_core::config::workflow::load_workflow_config(project_root).unwrap_or_else(|e| {
+        tracing::warn!(
+            project_root = %project_root.display(),
+            "{subsystem}: failed to load WORKFLOW.md, using default config: {e}"
+        );
+        harness_core::config::workflow::WorkflowConfig::default()
+    })
 }
 
 fn runtime_kind_from_config(value: &str) -> Option<RuntimeKind> {
@@ -636,40 +768,32 @@ pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg =
-                harness_core::config::workflow::load_workflow_config(&state.core.project_root)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "workflow runtime command dispatcher: failed to load WORKFLOW.md, using default config: {e}"
-                        );
-                        harness_core::config::workflow::WorkflowConfig::default()
-                    });
+            let workflow_cfg = load_runtime_workflow_config_or_default(
+                &state.core.project_root,
+                "workflow runtime command dispatcher",
+            );
             let policy = workflow_cfg.runtime_dispatch;
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
-            if policy.enabled {
-                let profile_selector = runtime_dispatch_profile_selector(&policy);
-                match run_runtime_command_dispatch_tick(
-                    &state,
-                    profile_selector,
-                    i64::from(policy.batch_limit.max(1)),
-                )
-                .await
-                {
-                    Ok(tick) if tick.touched_anything() => {
-                        tracing::info!(
-                            enqueued = tick.enqueued,
-                            already_dispatched = tick.already_dispatched,
-                            skipped = tick.skipped,
-                            "workflow runtime command dispatcher tick complete"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("workflow runtime command dispatcher tick failed: {e}");
-                    }
+            let profile_selector = runtime_dispatch_profile_selector(&policy);
+            match run_runtime_command_dispatch_tick(
+                &state,
+                profile_selector,
+                i64::from(policy.batch_limit.max(1)),
+            )
+            .await
+            {
+                Ok(tick) if tick.touched_anything() => {
+                    tracing::info!(
+                        enqueued = tick.enqueued,
+                        already_dispatched = tick.already_dispatched,
+                        skipped = tick.skipped,
+                        "workflow runtime command dispatcher tick complete"
+                    );
                 }
-            } else {
-                tracing::debug!("workflow runtime command dispatcher disabled by WORKFLOW.md");
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("workflow runtime command dispatcher tick failed: {e}");
+                }
             }
             tokio::time::sleep(interval).await;
         }
@@ -681,6 +805,16 @@ fn runtime_worker_lease_ttl(
 ) -> chrono::Duration {
     let lease_ttl_secs = i64::try_from(policy.lease_ttl_secs.max(1)).unwrap_or(i64::MAX);
     chrono::Duration::seconds(lease_ttl_secs)
+}
+
+fn runtime_worker_loop_policy(
+    policy: harness_core::config::workflow::RuntimeWorkerPolicy,
+) -> harness_core::config::workflow::RuntimeWorkerPolicy {
+    if policy.enabled {
+        policy
+    } else {
+        harness_core::config::workflow::RuntimeWorkerPolicy::default()
+    }
 }
 
 pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
@@ -696,51 +830,43 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg =
-                harness_core::config::workflow::load_workflow_config(&state.core.project_root)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "workflow runtime job workers: failed to load WORKFLOW.md, using default config: {e}"
-                        );
-                        harness_core::config::workflow::WorkflowConfig::default()
-                    });
-            let policy = workflow_cfg.runtime_worker;
+            let workflow_cfg = load_runtime_workflow_config_or_default(
+                &state.core.project_root,
+                "workflow runtime job workers",
+            );
+            let policy = runtime_worker_loop_policy(workflow_cfg.runtime_worker);
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
-            if policy.enabled {
-                let concurrency = policy.concurrency.max(1);
-                let lease_ttl = runtime_worker_lease_ttl(&policy);
-                let mut handles = Vec::with_capacity(concurrency as usize);
-                for worker_idx in 0..concurrency {
-                    let state = state.clone();
-                    let owner = format!("server-runtime-worker-{worker_idx}");
-                    handles.push(tokio::spawn(async move {
-                        crate::workflow_runtime_worker::run_runtime_job_worker_tick(
-                            &state, owner, lease_ttl,
-                        )
-                        .await
-                    }));
-                }
-                for handle in handles {
-                    match handle.await {
-                        Ok(Ok(tick)) if tick.touched_anything() => {
-                            tracing::info!(
-                                succeeded = tick.succeeded,
-                                failed = tick.failed,
-                                cancelled = tick.cancelled,
-                                "workflow runtime job worker tick complete"
-                            );
-                        }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!("workflow runtime job worker tick failed: {e}");
-                        }
-                        Err(e) => {
-                            tracing::warn!("workflow runtime job worker task panicked: {e}");
-                        }
+            let concurrency = policy.concurrency.max(1);
+            let lease_ttl = runtime_worker_lease_ttl(&policy);
+            let mut handles = Vec::with_capacity(concurrency as usize);
+            for worker_idx in 0..concurrency {
+                let state = state.clone();
+                let owner = format!("server-runtime-worker-{worker_idx}");
+                handles.push(tokio::spawn(async move {
+                    crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+                        &state, owner, lease_ttl,
+                    )
+                    .await
+                }));
+            }
+            for handle in handles {
+                match handle.await {
+                    Ok(Ok(tick)) if tick.touched_anything() => {
+                        tracing::info!(
+                            succeeded = tick.succeeded,
+                            failed = tick.failed,
+                            cancelled = tick.cancelled,
+                            "workflow runtime job worker tick complete"
+                        );
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!("workflow runtime job worker tick failed: {e}");
+                    }
+                    Err(e) => {
+                        tracing::warn!("workflow runtime job worker task panicked: {e}");
                     }
                 }
-            } else {
-                tracing::debug!("workflow runtime job workers disabled by WORKFLOW.md");
             }
             tokio::time::sleep(interval).await;
         }
@@ -2099,6 +2225,21 @@ mod tests {
         assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
         assert_eq!(profile.name, "claude-default");
         assert_eq!(profile.approval_policy, None);
+    }
+
+    #[test]
+    fn runtime_worker_loop_policy_keeps_polling_when_server_root_disables_worker() {
+        let policy = harness_core::config::workflow::RuntimeWorkerPolicy {
+            enabled: false,
+            concurrency: 8,
+            ..Default::default()
+        };
+
+        let effective = runtime_worker_loop_policy(policy);
+
+        assert!(effective.enabled);
+        assert_eq!(effective.concurrency, 1);
+        assert_eq!(effective.interval_secs, 5);
     }
 
     // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in

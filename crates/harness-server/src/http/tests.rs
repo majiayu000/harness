@@ -471,16 +471,46 @@ async fn make_test_state_with_workflow_runtime_and_registry(
     project_root: &std::path::Path,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.server.database_url = Some(crate::test_helpers::test_database_url()?);
+    make_test_state_with_workflow_runtime_config_and_registry(
+        dir,
+        project_root,
+        harness_core::config::HarnessConfig::default(),
+        agent_registry,
+    )
+    .await
+}
+
+async fn make_test_state_with_workflow_runtime_config_and_registry(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+    agent_registry: harness_agents::registry::AgentRegistry,
+) -> anyhow::Result<Arc<AppState>> {
     let state =
         make_test_state_with_project_root(dir, project_root, config, agent_registry).await?;
-    let workflow_runtime_store =
+    let workflow_runtime_store = Arc::new(
         harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
             &harness_core::config::dirs::default_db_path(dir, "workflow_runtime"),
             Some(&crate::test_helpers::test_database_url()?),
         )
-        .await?;
+        .await?,
+    );
+    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+        state.core.tasks.clone(),
+        state.core.server.agent_registry.clone(),
+        Arc::new(state.core.server.config.clone()),
+        state.engines.skills.clone(),
+        state.observability.events.clone(),
+        state.interceptors.clone(),
+        None,
+        state.concurrency.task_queue.clone(),
+        state.concurrency.review_task_queue.clone(),
+        None,
+        None,
+        Some(workflow_runtime_store.clone()),
+        None,
+        vec![],
+    );
     Ok(Arc::new(AppState {
         core: crate::http::CoreServices {
             server: state.core.server.clone(),
@@ -492,7 +522,7 @@ async fn make_test_state_with_workflow_runtime_and_registry(
             plan_cache: state.core.plan_cache.clone(),
             issue_workflow_store: None,
             project_workflow_store: None,
-            workflow_runtime_store: Some(Arc::new(workflow_runtime_store)),
+            workflow_runtime_store: Some(workflow_runtime_store),
             project_registry: None,
             runtime_state_store: None,
             q_values: None,
@@ -539,7 +569,7 @@ async fn make_test_state_with_workflow_runtime_and_registry(
         },
         project_svc: state.project_svc.clone(),
         task_svc: state.task_svc.clone(),
-        execution_svc: state.execution_svc.clone(),
+        execution_svc,
     }))
 }
 
@@ -794,6 +824,63 @@ async fn wait_for_task_project_root(
     anyhow::bail!("task {task_id} did not resolve a project root")
 }
 
+async fn assert_runtime_issue_submission(
+    state: &Arc<AppState>,
+    project_root: &std::path::Path,
+    repo: Option<&str>,
+    issue_number: u64,
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let task_id = task_runner::TaskId::from_str(task_id);
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_id)
+            .await?
+            .is_none(),
+        "workflow runtime issue submissions must not register legacy task rows"
+    );
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let canonical_project_root = project_root.canonicalize()?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &canonical_project_root.to_string_lossy(),
+        repo,
+        issue_number,
+    );
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should be persisted");
+    assert_eq!(instance.state, "implementing");
+    assert_eq!(instance.data["task_id"], task_id.0);
+    assert_eq!(instance.data["execution_path"], "workflow_runtime");
+    let commands = store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "pending");
+    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+
+    let get_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/tasks/{}", task_id.0))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let runtime_task = response_json(get_response).await?;
+    assert_eq!(runtime_task["task_id"], task_id.0);
+    assert_eq!(runtime_task["status"], "implementing");
+    assert_eq!(runtime_task["execution_path"], "workflow_runtime");
+    assert_eq!(runtime_task["workflow_id"], workflow_id);
+    Ok(())
+}
+
 fn webhook_signature(secret: &str, payload: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid hmac key");
     mac.update(payload);
@@ -1024,6 +1111,12 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
     }
 
     let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-a");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: codex-high\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
     let state = make_test_state_with_workflow_runtime(dir.path()).await?;
     let store = state
         .core
@@ -1038,7 +1131,7 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
     )
     .with_id("issue-123")
     .with_data(serde_json::json!({
-        "project_id": "/project-a",
+        "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 123,
     }));
@@ -1067,6 +1160,136 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
         store.commands_for(&workflow.id).await?[0].status,
         "dispatched"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatch_tick_uses_command_project_policy_when_server_root_disabled(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let server_root = dir.path().join("server-root");
+    let project_root = dir.path().join("project-root");
+    std::fs::create_dir(&server_root)?;
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        server_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: false\n  runtime_profile: server-disabled\nruntime_worker:\n  enabled: false\n---\n",
+    )?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: project-runtime\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &server_root,
+        harness_core::config::HarnessConfig::default(),
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:224"),
+    )
+    .with_id("issue-224")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 224,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-224");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-disabled",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 1);
+    assert_eq!(tick.already_dispatched, 0);
+    assert_eq!(tick.skipped, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].runtime_profile, "project-runtime");
+    assert_eq!(
+        store.commands_for(&workflow.id).await?[0].status,
+        "dispatched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatch_tick_skips_when_command_project_runtime_disabled(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-root");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: project-runtime\nruntime_worker:\n  enabled: false\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:225"),
+    )
+    .with_id("issue-225")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 225,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-225");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 0);
+    assert_eq!(tick.already_dispatched, 0);
+    assert_eq!(tick.skipped, 1);
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "skipped");
     Ok(())
 }
 
@@ -1864,11 +2087,23 @@ async fn token_usage_route_is_registered() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
+async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) =
-        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "majiayu000/harness".to_string(),
+        ..Default::default()
+    });
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -1894,7 +2129,18 @@ async fn webhook_issue_mention_creates_issue_task() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    assert_eq!(state.core.tasks.count(), before_count);
+    assert_runtime_issue_submission(
+        &state,
+        dir.path(),
+        Some("majiayu000/harness"),
+        106,
+        json["task_id"].as_str().expect("task id should be present"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2172,6 +2418,249 @@ async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
     assert!(resp["task_id"].is_string());
     assert_eq!(resp["status"], "queued");
     assert_eq!(state.core.tasks.count(), before_count + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_with_issue_reports_task_runner_fallback_without_runtime_store(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let before_count = state.core.tasks.count();
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({
+        "repo": "owner/repo",
+        "issue": 42,
+        "labels": ["bug"]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let resp = response_json(response).await?;
+    assert!(resp["task_id"].is_string());
+    assert_eq!(resp["status"], "queued");
+    assert_eq!(resp["execution_path"], "task_runner");
+    assert_eq!(state.core.tasks.count(), before_count + 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let before_count = state.core.tasks.count();
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "repo": "owner/repo",
+        "issue": 42,
+        "labels": ["bug"]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let resp = response_json(response).await?;
+    assert!(resp["task_id"].is_string());
+    assert_eq!(resp["status"], "implementing");
+    assert_eq!(resp["execution_path"], "workflow_runtime");
+    let task_id = task_runner::TaskId::from_str(resp["task_id"].as_str().unwrap());
+    assert!(state
+        .core
+        .tasks
+        .get_with_db_fallback(&task_id)
+        .await?
+        .is_none());
+    assert_eq!(state.core.tasks.count(), before_count);
+
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let canonical_project_root = project_root.canonicalize()?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &canonical_project_root.to_string_lossy(),
+        Some("owner/repo"),
+        42,
+    );
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should be persisted");
+    assert_eq!(instance.state, "implementing");
+    assert_eq!(instance.data["task_id"], task_id.0);
+    assert_eq!(instance.data["execution_path"], "workflow_runtime");
+    let commands = store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "pending");
+    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let before_count = state.core.tasks.count();
+    let app = Router::new()
+        .route("/tasks", get(list_tasks).post(task_routes::create_task))
+        .with_state(state.clone());
+
+    let body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "repo": "owner/repo",
+        "issue": 52,
+        "labels": ["bug"]
+    });
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+    let created = response_json(create_response).await?;
+    let task_id = created["task_id"]
+        .as_str()
+        .expect("runtime submission should return a task handle")
+        .to_string();
+    assert_eq!(state.core.tasks.count(), before_count);
+
+    let list_response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .await?;
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed = response_json(list_response).await?;
+    let tasks = listed.as_array().expect("tasks should be an array");
+    let runtime_task = tasks
+        .iter()
+        .find(|task| task["id"] == task_id)
+        .expect("runtime issue submission should be listed");
+    let canonical_project_root = project_root.canonicalize()?;
+
+    assert_eq!(runtime_task["task_kind"], "issue");
+    assert_eq!(runtime_task["status"], "implementing");
+    assert_eq!(runtime_task["external_id"], "issue:52");
+    assert_eq!(runtime_task["repo"], "owner/repo");
+    assert_eq!(runtime_task["description"], "issue #52");
+    assert_eq!(
+        runtime_task["project"],
+        canonical_project_root.to_string_lossy().as_ref()
+    );
+    assert_eq!(runtime_task["scheduler"]["authority_state"], "running");
+    assert!(runtime_task.get("workflow").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_task_with_blocked_issue_returns_runtime_state() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "repo": "owner/repo",
+        "issue": 43,
+        "depends_on": ["missing-dependency"]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let resp = response_json(response).await?;
+    assert!(resp["task_id"].is_string());
+    assert_eq!(resp["status"], "awaiting_dependencies");
+    assert_eq!(resp["execution_path"], "workflow_runtime");
+
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let canonical_project_root = project_root.canonicalize()?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &canonical_project_root.to_string_lossy(),
+        Some("owner/repo"),
+        43,
+    );
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should be persisted");
+    assert_eq!(instance.state, "awaiting_dependencies");
+    assert_eq!(
+        instance.data["depends_on"],
+        serde_json::json!(["missing-dependency"])
+    );
     Ok(())
 }
 
@@ -2631,6 +3120,101 @@ async fn create_tasks_batch_remains_queued_under_saturation() -> anyhow::Result<
 }
 
 #[tokio::test]
+async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let before_count = state.core.tasks.count();
+    let response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project_root.display().to_string(),
+                        "issues": [42, 43],
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let batch_json = response_json(response).await?;
+    let entries = batch_json
+        .as_array()
+        .expect("batch response should be an array");
+    assert_eq!(entries.len(), 2);
+    for (entry, issue_number) in entries.iter().zip([42_u64, 43]) {
+        assert_eq!(entry["status"], "implementing");
+        assert_eq!(entry["execution_path"], "workflow_runtime");
+        assert_runtime_issue_submission(
+            &state,
+            &project_root,
+            None,
+            issue_number,
+            entry["task_id"]
+                .as_str()
+                .expect("task id should be present"),
+        )
+        .await?;
+    }
+    assert_eq!(state.core.tasks.count(), before_count);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_tasks_batch_with_issues_reports_task_runner_fallback_without_runtime_store(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    let before_count = state.core.tasks.count();
+    let response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/batch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "issues": [42, 43],
+                        "repo": "owner/repo",
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let batch_json = response_json(response).await?;
+    let entries = batch_json
+        .as_array()
+        .expect("batch response should be an array");
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(entry["status"], "queued");
+        assert_eq!(entry["execution_path"], "task_runner");
+        assert!(entry["task_id"].is_string());
+    }
+    assert_eq!(state.core.tasks.count(), before_count + 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
     use axum::response::IntoResponse;
 
@@ -2789,6 +3373,95 @@ async fn closed_task_sse_replay_includes_observability_fields() -> anyhow::Resul
     assert!(saw_timeout_failure);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn runtime_issue_sse_stream_keeps_active_workflow_open_without_done() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+
+    let create_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project_root.display().to_string(),
+                        "repo": "owner/repo",
+                        "issue": 44,
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+    let create_json = response_json(create_response).await?;
+    let task_id = create_json["task_id"]
+        .as_str()
+        .expect("task id should be present");
+
+    let response = Router::new()
+        .route("/tasks/{id}/stream", get(stream_task_sse))
+        .with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{task_id}/stream"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    use http_body_util::BodyExt;
+    let mut body = response.into_body();
+    let mut body_text = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !body_text.contains("[workflow]") && tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    body_text.push_str(&String::from_utf8_lossy(&data));
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error.into()),
+            Ok(None) => anyhow::bail!("active runtime workflow stream closed before replay"),
+            Err(_) => break,
+        }
+    }
+    assert!(body_text.contains("[workflow]"));
+    assert!(!body_text.contains("\"type\":\"done\""));
+    assert!(!body_text.contains("\"type\":\"Done\""));
+
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_millis(100), body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    body_text.push_str(&String::from_utf8_lossy(&data));
+                    assert!(!body_text.contains("\"type\":\"done\""));
+                    assert!(!body_text.contains("\"type\":\"Done\""));
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error.into()),
+            Ok(None) => anyhow::bail!("active runtime workflow stream closed"),
+            Err(_) => return Ok(()),
+        }
+    }
+
+    anyhow::bail!("active runtime workflow stream did not become idle")
 }
 
 #[tokio::test]
@@ -3457,12 +4130,24 @@ async fn feishu_webhook_rejects_invalid_token() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Result<()> {
+async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     init_fake_git_repo(dir.path())?;
     let secret = "secret";
-    let (state, _agent) =
-        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "org/repo".to_string(),
+        ..Default::default()
+    });
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -3490,12 +4175,73 @@ async fn webhook_issues_opened_with_mention_creates_issue_task() -> anyhow::Resu
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    assert_eq!(state.core.tasks.count(), before_count);
+    assert_runtime_issue_submission(
+        &state,
+        dir.path(),
+        Some("org/repo"),
+        77,
+        json["task_id"].as_str().expect("task id should be present"),
+    )
+    .await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+async fn webhook_issues_opened_reports_task_runner_fallback_without_runtime_store(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    init_fake_git_repo(dir.path())?;
+    let secret = "secret";
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "org/repo".to_string(),
+        ..Default::default()
+    });
+    let (state, _agent) =
+        make_test_state_with_agent_and_config(dir.path(), dir.path(), config).await?;
+    let before_count = state.core.tasks.count();
+    let app = webhook_app(state.clone());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 77,
+            "body": "@harness please implement this feature"
+        },
+        "repository": { "full_name": "org/repo" }
+    });
+    let payload_body = payload.to_string();
+    let signature = webhook_signature(secret, payload_body.as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issues")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload_body))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "accepted");
+    assert_eq!(json["execution_path"], "task_runner");
+    assert_eq!(state.core.tasks.count(), before_count + 1);
+    assert!(json["task_id"].is_string());
+    Ok(())
+}
+
+#[tokio::test]
+async fn webhook_routes_runtime_issue_to_repo_specific_project_root() -> anyhow::Result<()> {
     let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-repo-a-")?;
     let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-repo-b-")?;
@@ -3512,8 +4258,13 @@ async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::R
         ..Default::default()
     });
 
-    let (state, _agent) =
-        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        repo_a_dir.path(),
+        repo_a_dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -3541,12 +4292,16 @@ async fn webhook_routes_issue_tasks_to_repo_specific_project_root() -> anyhow::R
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    let task_root = wait_for_task_project_root(
+    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    assert_runtime_issue_submission(
         &state,
+        repo_b_dir.path(),
+        Some("org/repo-b"),
+        77,
         json["task_id"].as_str().expect("task id should be present"),
     )
     .await?;
-    assert_eq!(task_root.canonicalize()?, repo_b_dir.path().canonicalize()?);
     Ok(())
 }
 

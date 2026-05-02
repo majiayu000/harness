@@ -98,9 +98,38 @@ impl TransitionAllowlist {
         };
 
         Self::default()
+            .allow("discovered", "awaiting_dependencies", [Wait])
+            .allow("failed", "awaiting_dependencies", [Wait])
+            .allow("cancelled", "awaiting_dependencies", [Wait])
+            .allow("awaiting_dependencies", "awaiting_dependencies", [Wait])
+            .allow(
+                "awaiting_dependencies",
+                "scheduled",
+                [EnqueueActivity, Wait],
+            )
+            .allow(
+                "awaiting_dependencies",
+                "implementing",
+                [EnqueueActivity, Wait],
+            )
             .allow("discovered", "scheduled", [EnqueueActivity, Wait])
+            .allow("discovered", "implementing", [EnqueueActivity, Wait])
+            .allow("scheduled", "scheduled", [EnqueueActivity, Wait])
+            .allow("failed", "scheduled", [EnqueueActivity, Wait])
+            .allow("failed", "implementing", [EnqueueActivity, Wait])
+            .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
+            .allow("cancelled", "implementing", [EnqueueActivity, Wait])
             .allow("scheduled", "planning", [EnqueueActivity, Wait])
-            .allow("scheduled", "implementing", [EnqueueActivity, Wait])
+            .allow(
+                "scheduled",
+                "implementing",
+                [EnqueueActivity, RecordPlanConcern, Wait],
+            )
+            .allow(
+                "scheduled",
+                "replanning",
+                [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
+            )
             .allow("planning", "implementing", [EnqueueActivity, MarkBlocked])
             .allow(
                 "implementing",
@@ -119,6 +148,11 @@ impl TransitionAllowlist {
             )
             .allow(
                 "implementing",
+                "pr_open",
+                [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "scheduled",
                 "pr_open",
                 [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
             )
@@ -541,7 +575,7 @@ fn required_command_for_transition(
     to_state: &str,
 ) -> Option<WorkflowCommandType> {
     match (from_state, to_state) {
-        ("implementing", "pr_open") => Some(WorkflowCommandType::BindPr),
+        (from_state, "pr_open") if from_state != "pr_open" => Some(WorkflowCommandType::BindPr),
         (_, "done") => Some(WorkflowCommandType::MarkDone),
         (_, "blocked") => Some(WorkflowCommandType::MarkBlocked),
         (_, "failed") => Some(WorkflowCommandType::MarkFailed),

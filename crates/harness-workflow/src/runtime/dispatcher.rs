@@ -142,7 +142,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         Ok(outcomes)
     }
 
-    async fn dispatch_command(
+    pub async fn dispatch_command(
         &self,
         command: WorkflowCommandRecord,
     ) -> anyhow::Result<CommandDispatchOutcome> {
