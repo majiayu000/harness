@@ -223,6 +223,14 @@ impl TransitionAllowlist {
             )
             .allow("idle", "scanning", [EnqueueActivity, Wait])
             .allow("scanning", "scanning", [EnqueueActivity, Wait])
+            .allow("scanning", "planning_batch", [EnqueueActivity, Wait])
+            .allow("planning_batch", "planning_batch", [EnqueueActivity, Wait])
+            .allow(
+                "planning_batch",
+                "dispatching",
+                [StartChildWorkflow, EnqueueActivity, Wait],
+            )
+            .allow("planning_batch", "idle", [Wait])
             .allow("idle", "reconciling", [EnqueueActivity, Wait])
             .allow(
                 "scanning",

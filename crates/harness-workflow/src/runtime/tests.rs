@@ -20,6 +20,7 @@ use super::{
     RuntimeCommandDispatcher, RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker,
     StaleWorkflowDecisionInput, WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY,
     QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
+    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -1464,17 +1465,23 @@ fn runtime_completion_reducer_dispatches_repo_backlog_issue_signals() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("repo backlog scan signals should start issue workflows");
+        .expect("repo backlog scan signals should start sprint planning");
 
-    assert_eq!(decision.decision, "start_issue_workflows_from_scan");
-    assert_eq!(decision.next_state, "dispatching");
+    assert_eq!(decision.decision, "plan_repo_sprint_from_scan");
+    assert_eq!(decision.next_state, "planning_batch");
     assert_eq!(decision.commands.len(), 1);
     assert_eq!(
         decision.commands[0].command_type,
-        WorkflowCommandType::StartChildWorkflow
+        WorkflowCommandType::EnqueueActivity
     );
-    assert_eq!(decision.commands[0].command["auto_submit"], true);
-    assert_eq!(decision.commands[0].command["labels"][0], "harness");
+    assert_eq!(
+        decision.commands[0].command["activity"],
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY
+    );
+    assert_eq!(
+        decision.commands[0].command["issues"][0]["labels"][0],
+        "harness"
+    );
     DecisionValidator::repo_backlog()
         .validate(
             &instance,
@@ -1482,6 +1489,237 @@ fn runtime_completion_reducer_dispatches_repo_backlog_issue_signals() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("repo backlog scan dispatch should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_dispatches_repo_backlog_sprint_plan() {
+    let instance = repo_backlog_instance("planning_batch").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::enqueue_activity(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "repo-backlog:owner/repo:plan",
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "Selected two issues for sprint dispatch.",
+    )
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({
+            "issue_number": 42,
+            "issue_url": "https://github.com/owner/repo/issues/42",
+            "labels": ["harness"],
+            "depends_on": []
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({
+            "issue": "43",
+            "issue_url": "https://github.com/owner/repo/issues/43",
+            "labels": ["harness"],
+            "depends_on": [42]
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("sprint plan should start selected issue workflows");
+
+    assert_eq!(decision.decision, "start_issue_workflows_from_sprint_plan");
+    assert_eq!(decision.next_state, "dispatching");
+    assert_eq!(decision.commands.len(), 2);
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(decision.commands[0].command["auto_submit"], true);
+    assert_eq!(decision.commands[0].command["labels"][0], "harness");
+    assert_eq!(decision.commands[1].command["depends_on"][0], 42);
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("repo backlog sprint dispatch should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_uses_scan_candidates_for_sprint_plan_artifact() {
+    let instance = repo_backlog_instance("planning_batch").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "repo-backlog:owner/repo:plan",
+        json!({
+            "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "issues": [{
+                "issue_number": 44,
+                "issue_url": "https://github.com/owner/repo/issues/44",
+                "labels": ["runtime"],
+                "title": "Move sprint planning into runtime"
+            }]
+        }),
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "Returned a sprint plan artifact.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "sprint_plan",
+        json!({
+            "tasks": [{ "issue": 44, "depends_on": [42] }],
+            "skip": []
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("sprint plan artifact should start selected issue workflows");
+
+    assert_eq!(decision.decision, "start_issue_workflows_from_sprint_plan");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command["issue_url"],
+        "https://github.com/owner/repo/issues/44"
+    );
+    assert_eq!(
+        decision.commands[0].command["title"],
+        "Move sprint planning into runtime"
+    );
+    assert_eq!(decision.commands[0].command["labels"][0], "runtime");
+    assert_eq!(decision.commands[0].command["depends_on"][0], 42);
+}
+
+#[test]
+fn runtime_completion_reducer_uses_scan_candidates_for_sprint_task_signal() {
+    let instance = repo_backlog_instance("planning_batch").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "repo-backlog:owner/repo:plan",
+        json!({
+            "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "issues": [{
+                "issue_number": 45,
+                "issue_url": "https://github.com/owner/repo/issues/45",
+                "labels": ["runtime"],
+                "title": "Dispatch sprint tasks"
+            }]
+        }),
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "Selected a sprint task signal.",
+    )
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({
+            "issue": 45,
+            "depends_on": [44]
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("sprint task signal should start selected issue workflow");
+
+    assert_eq!(decision.decision, "start_issue_workflows_from_sprint_plan");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command["issue_url"],
+        "https://github.com/owner/repo/issues/45"
+    );
+    assert_eq!(
+        decision.commands[0].command["title"],
+        "Dispatch sprint tasks"
+    );
+    assert_eq!(decision.commands[0].command["labels"][0], "runtime");
+    assert_eq!(decision.commands[0].command["depends_on"][0], 44);
+}
+
+#[test]
+fn runtime_completion_reducer_idles_repo_backlog_after_empty_sprint_plan() {
+    let instance = repo_backlog_instance("planning_batch");
+    let command = WorkflowCommand::enqueue_activity(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "repo-backlog:owner/repo:plan",
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "No sprint tasks were selected.",
+    )
+    .with_signal(ActivitySignal::new(
+        "NoSprintTaskSelected",
+        json!({"repo": "owner/repo"}),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("empty sprint plan should idle workflow");
+
+    assert_eq!(decision.decision, "finish_repo_sprint_plan");
+    assert_eq!(decision.next_state, "idle");
+    assert!(decision.commands.is_empty());
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("repo backlog sprint idle completion should validate");
 }
 
 #[test]

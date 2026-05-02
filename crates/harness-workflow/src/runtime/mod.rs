@@ -53,6 +53,7 @@ pub use repo_backlog::{
     repo_backlog_workflow_id, MergedPrDecisionInput, OpenIssueDecisionInput,
     RepoBacklogDecisionOutput, RepoBacklogPollDecisionInput, RepoBacklogWorkflowAction,
     StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
+    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 pub use store::WorkflowRuntimeStore;
 pub use submission::{

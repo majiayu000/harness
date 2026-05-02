@@ -4,10 +4,12 @@ use super::model::{
 
 pub const REPO_BACKLOG_DEFINITION_ID: &str = "repo_backlog";
 pub const REPO_BACKLOG_POLL_ACTIVITY: &str = "poll_repo_backlog";
+pub const REPO_BACKLOG_SPRINT_PLAN_ACTIVITY: &str = "plan_repo_sprint";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoBacklogWorkflowAction {
     PollBacklog,
+    PlanSprint,
     StartIssueWorkflow,
     MarkBoundIssueDone,
     RequestRecovery,
