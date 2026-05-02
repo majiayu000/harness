@@ -14,7 +14,13 @@ function makeWrapper() {
   return Wrapper;
 }
 
-type TaskStub = { id: string; status: string; turn?: number; project?: null };
+type TaskStub = {
+  id: string;
+  status: string;
+  turn?: number;
+  project?: null;
+  workflow?: { id?: string | null; definition_id?: string | null } | null;
+};
 
 function mockFetch(tasks: TaskStub[]) {
   const overview = { projects: [], runtimes: [], kpi: { active_tasks: 0 } };
@@ -71,6 +77,29 @@ describe("useWorktrees – active-status filtering", () => {
     const { result } = renderHook(() => useWorktrees(), { wrapper: makeWrapper() });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
     expect(result.current.cards).toHaveLength(0);
+  });
+
+  it("carries runtime workflow ids for runtime-backed tasks", async () => {
+    mockFetch([
+      {
+        id: "runtime-task-1",
+        status: "implementing",
+        turn: 1,
+        project: null,
+        workflow: { id: "runtime-workflow-1", definition_id: "quality_gate" },
+      },
+      {
+        id: "legacy-task-1",
+        status: "implementing",
+        turn: 1,
+        project: null,
+        workflow: { id: "legacy-workflow-1", definition_id: null },
+      },
+    ]);
+    const { result } = renderHook(() => useWorktrees(), { wrapper: makeWrapper() });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.cards[0].runtimeWorkflowId).toBe("runtime-workflow-1");
+    expect(result.current.cards[1].runtimeWorkflowId).toBeNull();
   });
 });
 

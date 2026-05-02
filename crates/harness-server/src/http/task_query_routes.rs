@@ -216,8 +216,7 @@ fn runtime_workflow_task_summary(
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
-        workflow: (task_kind == TaskKind::Issue)
-            .then(|| TaskWorkflowSummary::from_runtime(&workflow)),
+        workflow: Some(TaskWorkflowSummary::from_runtime_workflow(&workflow)),
         scheduler,
     }
 }
