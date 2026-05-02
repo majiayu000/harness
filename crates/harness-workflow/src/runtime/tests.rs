@@ -10,15 +10,17 @@ use super::{
     build_issue_submission_decision, build_merged_pr_decision,
     build_open_issue_without_workflow_decision, build_plan_issue_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
-    build_quality_gate_run_decision, build_repo_backlog_poll_decision,
-    build_stale_active_workflow_decision, reduce_runtime_job_completed, CommandDispatchOutcome,
-    InMemoryWorkflowBus, IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction,
-    MergedPrDecisionInput, OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
+    build_prompt_submission_decision, build_quality_gate_run_decision,
+    build_repo_backlog_poll_decision, build_stale_active_workflow_decision,
+    reduce_runtime_job_completed, CommandDispatchOutcome, InMemoryWorkflowBus,
+    IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction, MergedPrDecisionInput,
+    OpenIssueDecisionInput, PlanIssueDecisionInput, PlanIssueWorkflowAction,
     PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
-    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, QualityGateDecisionInput,
-    QualityGateWorkflowAction, RepoBacklogPollDecisionInput, RepoBacklogWorkflowAction,
-    RuntimeCommandDispatcher, RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker,
-    StaleWorkflowDecisionInput, WorkflowRuntimeStore, PR_FEEDBACK_DEFINITION_ID,
+    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PromptSubmissionDecisionInput,
+    QualityGateDecisionInput, QualityGateWorkflowAction, RepoBacklogPollDecisionInput,
+    RepoBacklogWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
+    RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowRuntimeStore,
+    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
     PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
     REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
@@ -55,6 +57,15 @@ fn quality_gate_instance(state: &str) -> WorkflowInstance {
         1,
         state,
         WorkflowSubject::new("quality_gate", "issue:123"),
+    )
+}
+
+fn prompt_task_instance(state: &str) -> WorkflowInstance {
+    WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        state,
+        WorkflowSubject::new("prompt", "task-123"),
     )
 }
 
@@ -173,6 +184,68 @@ fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("blocked issue submission should validate without dispatching");
+}
+
+#[test]
+fn prompt_submission_decision_starts_runtime_implementation() {
+    let instance = prompt_task_instance("submitted");
+    let output = build_prompt_submission_decision(
+        &instance,
+        PromptSubmissionDecisionInput {
+            task_id: "task-prompt-1",
+            prompt: "Fix the flaky login test.",
+            source: None,
+            external_id: Some("manual-prompt-1"),
+            depends_on: &[],
+            dependencies_blocked: false,
+        },
+    );
+
+    assert_eq!(output.decision.decision, "submit_prompt");
+    assert_eq!(output.decision.next_state, "implementing");
+    assert_eq!(output.decision.commands.len(), 1);
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some(PROMPT_TASK_IMPLEMENT_ACTIVITY)
+    );
+    assert_eq!(
+        output.decision.commands[0].command["prompt"],
+        "Fix the flaky login test."
+    );
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("prompt submission decision should validate");
+}
+
+#[test]
+fn prompt_submission_decision_waits_for_dependencies_without_runtime_command() {
+    let depends_on = vec!["task-upstream".to_string()];
+    let instance = prompt_task_instance("submitted");
+    let output = build_prompt_submission_decision(
+        &instance,
+        PromptSubmissionDecisionInput {
+            task_id: "task-prompt-2",
+            prompt: "Refactor the settings panel.",
+            source: None,
+            external_id: None,
+            depends_on: &depends_on,
+            dependencies_blocked: true,
+        },
+    );
+
+    assert_eq!(output.decision.next_state, "awaiting_dependencies");
+    assert!(output.decision.commands.is_empty());
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("blocked prompt submission should validate without dispatching");
 }
 
 #[test]
@@ -542,6 +615,45 @@ fn runtime_completion_reducer_returns_none_for_unmapped_success() {
     assert!(reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
         .is_none());
+}
+
+#[test]
+fn runtime_completion_reducer_finishes_prompt_task_after_implementation() {
+    let instance = prompt_task_instance("implementing");
+    let result = ActivityResult::succeeded(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "Prompt implementation completed.",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("prompt implementation completion should produce a decision");
+
+    assert_eq!(decision.decision, "finish_prompt_task");
+    assert_eq!(decision.next_state, "done");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkDone
+    );
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("prompt completion decision should validate");
 }
 
 #[test]

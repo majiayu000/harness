@@ -6,6 +6,7 @@ use super::pr_feedback::{
     build_pr_feedback_decision, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
+use super::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
 use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
 use super::repo_backlog::{
     REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
@@ -138,14 +139,33 @@ fn reduce_success(
             "quality_passed",
             "quality gate activity completed successfully",
         ),
+        (PROMPT_TASK_DEFINITION_ID, "implementing", PROMPT_TASK_IMPLEMENT_ACTIVITY) => (
+            "done",
+            "finish_prompt_task",
+            "prompt implementation activity completed successfully",
+        ),
         _ => return None,
     };
 
-    Some(
+    let mut workflow_decision =
         WorkflowDecision::new(&instance.id, &instance.state, decision, next_state, reason)
-            .with_evidence(runtime_completion_evidence(event, result))
-            .high_confidence(),
-    )
+            .with_evidence(runtime_completion_evidence(event, result));
+    if instance.definition_id == PROMPT_TASK_DEFINITION_ID
+        && instance.state == "implementing"
+        && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
+        && next_state == "done"
+    {
+        workflow_decision = workflow_decision.with_command(WorkflowCommand::new(
+            WorkflowCommandType::MarkDone,
+            format!("prompt-task:{}:done", instance.id),
+            json!({
+                "activity": result.activity,
+                "workflow_id": instance.id,
+            }),
+        ));
+    }
+
+    Some(workflow_decision.high_confidence())
 }
 
 fn workflow_decision_from_activity_result(
@@ -1191,6 +1211,7 @@ fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool 
             REPO_BACKLOG_DEFINITION_ID,
             "dispatching" | "reconciling" | "planning_batch"
         ) | (PR_FEEDBACK_DEFINITION_ID, "inspecting")
+            | (PROMPT_TASK_DEFINITION_ID, "implementing")
             | (QUALITY_GATE_DEFINITION_ID, "checking")
     )
 }

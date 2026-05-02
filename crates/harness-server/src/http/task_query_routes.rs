@@ -29,6 +29,7 @@ struct FullTaskResponse {
 struct RuntimeTaskResponse {
     id: String,
     task_id: String,
+    task_kind: TaskKind,
     status: String,
     execution_path: &'static str,
     workflow_id: String,
@@ -97,8 +98,8 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
                     };
                 }
             }
-            if let Err(e) = append_runtime_issue_summaries(&state, &mut summaries).await {
-                tracing::error!("list_tasks: failed to append runtime issue summaries: {e}");
+            if let Err(e) = append_runtime_submission_summaries(&state, &mut summaries).await {
+                tracing::error!("list_tasks: failed to append runtime submission summaries: {e}");
             }
             Json(summaries).into_response()
         }
@@ -113,18 +114,37 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-async fn append_runtime_issue_summaries(
+async fn append_runtime_submission_summaries(
     state: &AppState,
     summaries: &mut Vec<TaskSummary>,
 ) -> anyhow::Result<()> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(());
     };
+    append_runtime_definition_summaries(
+        store,
+        summaries,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        TaskKind::Issue,
+    )
+    .await?;
+    append_runtime_definition_summaries(
+        store,
+        summaries,
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+        TaskKind::Prompt,
+    )
+    .await
+}
+
+async fn append_runtime_definition_summaries(
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    summaries: &mut Vec<TaskSummary>,
+    definition_id: &str,
+    task_kind: TaskKind,
+) -> anyhow::Result<()> {
     let workflows = store
-        .list_instances_by_definition(
-            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-            None,
-        )
+        .list_instances_by_definition(definition_id, None)
         .await?;
     let mut listed_ids: HashSet<String> = summaries
         .iter()
@@ -139,14 +159,15 @@ async fn append_runtime_issue_summaries(
         if !listed_ids.insert(task_id.as_str().to_string()) {
             continue;
         }
-        summaries.push(runtime_issue_task_summary(workflow, task_id));
+        summaries.push(runtime_workflow_task_summary(workflow, task_id, task_kind));
     }
     Ok(())
 }
 
-fn runtime_issue_task_summary(
+fn runtime_workflow_task_summary(
     workflow: harness_workflow::runtime::WorkflowInstance,
     task_id: harness_core::types::TaskId,
+    task_kind: TaskKind,
 ) -> TaskSummary {
     let status = runtime_workflow_state_to_task_status(&workflow.state);
     let scheduler = runtime_workflow_scheduler_state(&status);
@@ -154,9 +175,23 @@ fn runtime_issue_task_summary(
         .data
         .get("issue_number")
         .and_then(|value| value.as_u64());
+    let external_id = match task_kind {
+        TaskKind::Issue => issue.map(|issue_number| format!("issue:{issue_number}")),
+        TaskKind::Prompt => runtime_string_field(&workflow.data, "external_id"),
+        _ => None,
+    };
+    let description = match task_kind {
+        TaskKind::Issue => Some(
+            issue
+                .map(|issue_number| format!("issue #{issue_number}"))
+                .unwrap_or_else(|| workflow.subject.subject_key.clone()),
+        ),
+        TaskKind::Prompt => runtime_string_field(&workflow.data, "prompt"),
+        _ => Some(workflow.subject.subject_key.clone()),
+    };
     TaskSummary {
         id: task_id,
-        task_kind: TaskKind::Issue,
+        task_kind,
         status: status.clone(),
         failure_kind: status.is_failure().then_some(TaskFailureKind::Task),
         turn: 0,
@@ -164,13 +199,9 @@ fn runtime_issue_task_summary(
         error: runtime_string_field(&workflow.data, "failure_reason"),
         source: runtime_string_field(&workflow.data, "source"),
         parent_id: None,
-        external_id: issue.map(|issue_number| format!("issue:{issue_number}")),
+        external_id,
         repo: runtime_string_field(&workflow.data, "repo"),
-        description: Some(
-            issue
-                .map(|issue_number| format!("issue #{issue_number}"))
-                .unwrap_or_else(|| workflow.subject.subject_key.clone()),
-        ),
+        description,
         created_at: Some(workflow.created_at.to_rfc3339()),
         phase: runtime_workflow_state_to_task_phase(&workflow.state),
         depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
@@ -292,22 +323,33 @@ async fn runtime_task_response_by_handle(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(None);
     };
-    let Some(workflow) =
-        crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id).await?
-    else {
+    let Some(workflow) = store.get_instance_by_task_id(task_id.as_str()).await? else {
         return Ok(None);
     };
     let issue = workflow
         .data
         .get("issue_number")
         .and_then(|value| value.as_u64());
+    let Some(task_kind) = (match workflow.definition_id.as_str() {
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID => Some(TaskKind::Issue),
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID => Some(TaskKind::Prompt),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let external_id = match task_kind {
+        TaskKind::Issue => issue.map(|issue_number| format!("issue:{issue_number}")),
+        TaskKind::Prompt => runtime_string_field(&workflow.data, "external_id"),
+        _ => None,
+    };
     Ok(Some(RuntimeTaskResponse {
         id: task_id.as_str().to_string(),
         task_id: task_id.as_str().to_string(),
+        task_kind,
         status: workflow.state.clone(),
         execution_path: "workflow_runtime",
         workflow_id: workflow.id.clone(),
-        external_id: issue.map(|issue_number| format!("issue:{issue_number}")),
+        external_id,
         repo: workflow
             .data
             .get("repo")

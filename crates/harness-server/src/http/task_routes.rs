@@ -68,24 +68,24 @@ pub(crate) async fn task_response_details(
     task_id: &task_runner::TaskId,
     is_issue_submission: bool,
 ) -> Result<TaskResponseDetails, EnqueueTaskError> {
-    if !is_issue_submission {
-        return Ok(TaskResponseDetails {
-            status: "queued".to_string(),
-            execution_path: "task_runner",
-        });
-    }
-
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        if let Some(workflow) =
-            crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id)
-                .await
-                .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
+        if let Some(workflow) = store
+            .get_instance_by_task_id(task_id.as_str())
+            .await
+            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
         {
             return Ok(TaskResponseDetails {
                 status: workflow.state,
                 execution_path: "workflow_runtime",
             });
         }
+    }
+
+    if !is_issue_submission {
+        return Ok(TaskResponseDetails {
+            status: "queued".to_string(),
+            execution_path: "task_runner",
+        });
     }
 
     if state

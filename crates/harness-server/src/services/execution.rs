@@ -145,11 +145,17 @@ struct PreparedRuntimeIssueSubmission {
     project_id: String,
 }
 
+struct PreparedRuntimePromptSubmission {
+    req: CreateTaskRequest,
+    project_id: String,
+}
+
 const WORKFLOW_FEEDBACK_SOURCE: &str = "workflow_feedback";
 
 enum PreparedEnqueueResult {
     Existing(TaskId),
     RuntimeIssueSubmission(Box<PreparedRuntimeIssueSubmission>),
+    RuntimePromptSubmission(Box<PreparedRuntimePromptSubmission>),
     Ready(Box<PreparedEnqueue>),
 }
 
@@ -373,6 +379,13 @@ impl DefaultExecutionService {
         workflow_runtime_loops_enabled(project_root)
     }
 
+    fn runtime_prompt_submission_enabled(
+        &self,
+        project_root: &Path,
+    ) -> Result<bool, EnqueueTaskError> {
+        workflow_runtime_loops_enabled(project_root)
+    }
+
     fn queue_for(&self, domain: QueueDomain) -> Arc<TaskQueue> {
         match domain {
             QueueDomain::Primary => self.task_queue.clone(),
@@ -550,6 +563,36 @@ impl DefaultExecutionService {
         Ok(crate::workflow_runtime_submission::runtime_issue_task_handle(&instance))
     }
 
+    async fn check_runtime_prompt_duplicate(
+        &self,
+        project_id: &str,
+        req: &CreateTaskRequest,
+    ) -> Result<Option<TaskId>, EnqueueTaskError> {
+        let Some(external_id) = req.external_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(store) = self.workflow_runtime_store.as_ref() else {
+            return Ok(None);
+        };
+        let probe_task_id = TaskId::from_str(external_id);
+        let workflow_id = crate::workflow_runtime_submission::prompt_workflow_id(
+            project_id,
+            Some(external_id),
+            &probe_task_id,
+        );
+        let Some(instance) = store
+            .get_instance(&workflow_id)
+            .await
+            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if instance.is_terminal() {
+            return Ok(None);
+        }
+        Ok(crate::workflow_runtime_submission::runtime_issue_task_handle(&instance))
+    }
+
     async fn track_pr_workflow(&self, project_id: &str, req: &CreateTaskRequest, task_id: &TaskId) {
         if let Some(pr_number) = req.pr {
             if let Some(workflows) = self.issue_workflow_store.as_ref() {
@@ -638,6 +681,68 @@ impl DefaultExecutionService {
         Ok(task_id)
     }
 
+    async fn submit_prompt_to_workflow_runtime(
+        &self,
+        prepared: PreparedRuntimePromptSubmission,
+    ) -> Result<TaskId, EnqueueTaskError> {
+        let Some(store) = self.workflow_runtime_store.as_deref() else {
+            return Err(EnqueueTaskError::Internal(
+                "workflow runtime store is required for prompt submissions".to_string(),
+            ));
+        };
+        let Some(prompt) = prepared.req.prompt.as_deref() else {
+            return Err(EnqueueTaskError::BadRequest(
+                "prompt submission requires a prompt".to_string(),
+            ));
+        };
+        let dependencies_blocked = self.dependencies_blocked(&prepared.req).await?;
+
+        let task_id = TaskId::new();
+        let project_root = prepared
+            .req
+            .project
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(&prepared.project_id));
+        let record = crate::workflow_runtime_submission::record_prompt_submission(
+            store,
+            crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
+                project_root,
+                task_id: &task_id,
+                prompt,
+                depends_on: &prepared.req.depends_on,
+                dependencies_blocked,
+                source: prepared.req.source.as_deref(),
+                external_id: prepared.req.external_id.as_deref(),
+            },
+        )
+        .await
+        .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
+
+        if !record.accepted {
+            return Err(EnqueueTaskError::BadRequest(format!(
+                "workflow runtime rejected prompt submission for workflow {}: {}",
+                record.workflow_id,
+                record
+                    .rejection_reason
+                    .as_deref()
+                    .unwrap_or("decision rejected")
+            )));
+        }
+        if record.command_ids.is_empty() && !dependencies_blocked {
+            return Err(EnqueueTaskError::Internal(format!(
+                "workflow runtime accepted prompt submission for workflow {} without commands",
+                record.workflow_id
+            )));
+        }
+        tracing::info!(
+            workflow_id = %record.workflow_id,
+            task_id = %task_id.0,
+            command_count = record.command_ids.len(),
+            "execution service: accepted prompt submission into workflow runtime"
+        );
+        Ok(task_id)
+    }
+
     async fn prepare_enqueue(
         &self,
         mut req: CreateTaskRequest,
@@ -686,6 +791,22 @@ impl DefaultExecutionService {
             }
             return Ok(PreparedEnqueueResult::RuntimeIssueSubmission(Box::new(
                 PreparedRuntimeIssueSubmission { req, project_id },
+            )));
+        }
+
+        if req.task_kind() == task_runner::TaskKind::Prompt
+            && req.prompt.is_some()
+            && self.workflow_runtime_store.is_some()
+            && self.runtime_prompt_submission_enabled(&canonical)?
+        {
+            if let Some(existing_id) = self
+                .check_runtime_prompt_duplicate(&project_id, &req)
+                .await?
+            {
+                return Ok(PreparedEnqueueResult::Existing(existing_id));
+            }
+            return Ok(PreparedEnqueueResult::RuntimePromptSubmission(Box::new(
+                PreparedRuntimePromptSubmission { req, project_id },
             )));
         }
 
@@ -751,6 +872,9 @@ impl ExecutionService for DefaultExecutionService {
             PreparedEnqueueResult::RuntimeIssueSubmission(prepared) => {
                 return self.submit_issue_to_workflow_runtime(*prepared).await;
             }
+            PreparedEnqueueResult::RuntimePromptSubmission(prepared) => {
+                return self.submit_prompt_to_workflow_runtime(*prepared).await;
+            }
             PreparedEnqueueResult::Ready(prepared) => *prepared,
         };
 
@@ -808,6 +932,9 @@ impl ExecutionService for DefaultExecutionService {
             PreparedEnqueueResult::Existing(task_id) => return Ok(task_id),
             PreparedEnqueueResult::RuntimeIssueSubmission(prepared) => {
                 return self.submit_issue_to_workflow_runtime(*prepared).await;
+            }
+            PreparedEnqueueResult::RuntimePromptSubmission(prepared) => {
+                return self.submit_prompt_to_workflow_runtime(*prepared).await;
             }
             PreparedEnqueueResult::Ready(prepared) => *prepared,
         };
@@ -1247,6 +1374,126 @@ mod tests {
             "preserve caller guidance"
         );
         assert_eq!(runtime_store.pending_commands(10).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_prompt_submission_uses_workflow_runtime_without_task_runner(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let task_store = store.clone();
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
+        let req = CreateTaskRequest {
+            prompt: Some("fix the prompt-only bug".to_string()),
+            project: Some(project_root.clone()),
+            source: Some("dashboard".to_string()),
+            external_id: Some("manual:prompt:1".to_string()),
+            ..Default::default()
+        };
+
+        let task_id = svc.enqueue_background(req).await?;
+        assert!(
+            task_store.get_with_db_fallback(&task_id).await?.is_none(),
+            "workflow runtime prompt submissions must not register legacy task rows"
+        );
+
+        let canonical_project_root = project_root.canonicalize()?;
+        let workflow_id = crate::workflow_runtime_submission::prompt_workflow_id(
+            &canonical_project_root.to_string_lossy(),
+            Some("manual:prompt:1"),
+            &task_id,
+        );
+        let instance = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("runtime workflow should be recorded");
+        assert_eq!(instance.definition_id, "prompt_task");
+        assert_eq!(instance.state, "implementing");
+        assert_eq!(instance.data["task_id"], task_id.0);
+        assert_eq!(instance.data["prompt"], "fix the prompt-only bug");
+        assert_eq!(instance.data["source"], "dashboard");
+        assert_eq!(instance.data["external_id"], "manual:prompt:1");
+        assert_eq!(instance.data["execution_path"], "workflow_runtime");
+        let commands = runtime_store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, "pending");
+        assert_eq!(
+            commands[0].command.activity_name(),
+            Some("implement_prompt")
+        );
+        assert_eq!(
+            commands[0].command.command["prompt"],
+            "fix the prompt-only bug"
+        );
+        assert_eq!(runtime_store.pending_commands(10).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_prompt_submission_preserves_runtime_dependencies(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let dep_id = TaskId::from_str("dep-prompt-runtime");
+        let dep = crate::task_runner::TaskState::new(dep_id.clone());
+        store.insert(&dep).await;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
+        let req = CreateTaskRequest {
+            prompt: Some("wait for dependency before prompt implementation".to_string()),
+            project: Some(project_root.clone()),
+            external_id: Some("manual:prompt:blocked".to_string()),
+            depends_on: vec![dep_id],
+            ..Default::default()
+        };
+
+        let task_id = svc.enqueue_background(req).await?;
+        let canonical_project_root = project_root.canonicalize()?;
+        let workflow_id = crate::workflow_runtime_submission::prompt_workflow_id(
+            &canonical_project_root.to_string_lossy(),
+            Some("manual:prompt:blocked"),
+            &task_id,
+        );
+        let instance = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("runtime workflow should be recorded");
+
+        assert_eq!(instance.state, "awaiting_dependencies");
+        assert_eq!(instance.data["task_id"], task_id.0);
+        assert_eq!(
+            instance.data["depends_on"],
+            serde_json::json!(["dep-prompt-runtime"])
+        );
+        assert!(runtime_store.commands_for(&workflow_id).await?.is_empty());
         Ok(())
     }
 

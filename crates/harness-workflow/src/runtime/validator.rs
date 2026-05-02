@@ -295,6 +295,32 @@ impl TransitionAllowlist {
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
     }
+
+    pub fn prompt_task_defaults() -> Self {
+        use WorkflowCommandType::{
+            EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
+            RequestOperatorAttention, Wait,
+        };
+
+        Self::default()
+            .allow("submitted", "awaiting_dependencies", [Wait])
+            .allow("failed", "awaiting_dependencies", [Wait])
+            .allow("cancelled", "awaiting_dependencies", [Wait])
+            .allow("awaiting_dependencies", "awaiting_dependencies", [Wait])
+            .allow(
+                "awaiting_dependencies",
+                "implementing",
+                [EnqueueActivity, Wait],
+            )
+            .allow("submitted", "implementing", [EnqueueActivity, Wait])
+            .allow("failed", "implementing", [EnqueueActivity, Wait])
+            .allow("cancelled", "implementing", [EnqueueActivity, Wait])
+            .allow("implementing", "implementing", [EnqueueActivity, Wait])
+            .allow("implementing", "done", [MarkDone])
+            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
+            .allow_from_any("failed", [MarkFailed])
+            .allow_from_any("cancelled", [MarkCancelled])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +438,10 @@ impl DecisionValidator {
 
     pub fn pr_feedback() -> Self {
         Self::new(TransitionAllowlist::pr_feedback_defaults())
+    }
+
+    pub fn prompt_task() -> Self {
+        Self::new(TransitionAllowlist::prompt_task_defaults())
     }
 
     pub fn validate(

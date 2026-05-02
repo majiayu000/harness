@@ -14,6 +14,7 @@ use harness_workflow::runtime::{
     WorkflowSubject, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
     QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
     QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
+    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1060,6 +1061,7 @@ fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionVali
         "github_issue_pr" => Some(DecisionValidator::github_issue_pr()),
         QUALITY_GATE_DEFINITION_ID => Some(DecisionValidator::quality_gate()),
         PR_FEEDBACK_DEFINITION_ID => Some(DecisionValidator::pr_feedback()),
+        PROMPT_TASK_DEFINITION_ID => Some(DecisionValidator::prompt_task()),
         "repo_backlog" => Some(DecisionValidator::repo_backlog()),
         _ => None,
     }
@@ -1155,6 +1157,16 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             },
             "follow_up_event": "PrDetected binds PR metadata and advances the issue workflow."
         }),
+        (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
+            "on_succeeded": {
+                "reducer_next_state": "done",
+                "required_summary": "Include changed files, validation commands, and remaining blockers."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
         ("repo_backlog", "start_child_workflow") => json!({
             "on_succeeded": {
                 "reducer_next_state": "idle",
@@ -1204,6 +1216,16 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 "pull_request": {
                     "required_when": "A PR was created or reused by the activity.",
                     "fields": ["pr_number", "pr_url"]
+                }
+            }
+        }),
+        (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
+            "must_include": ["changed files", "validation commands", "remaining blockers"],
+            "must_not_include": ["workflow table mutations", "unverified merge claims"],
+            "artifacts": {
+                "validation_report": {
+                    "optional": true,
+                    "fields": ["commands", "passed", "failed", "blocked"]
                 }
             }
         }),

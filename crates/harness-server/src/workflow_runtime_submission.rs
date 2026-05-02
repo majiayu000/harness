@@ -1,15 +1,26 @@
 use crate::task_runner::{TaskId, TaskStatus, TaskStore};
 use harness_workflow::runtime::{
-    build_issue_submission_decision, DecisionValidator, IssueSubmissionDecisionInput,
-    ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
-    WorkflowSubject,
+    build_issue_submission_decision, build_prompt_submission_decision, DecisionValidator,
+    IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, ValidationContext,
+    WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
 
 const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
 const EXECUTION_PATH_WORKFLOW_RUNTIME: &str = "workflow_runtime";
+
+pub(crate) struct PromptSubmissionRuntimeContext<'a> {
+    pub project_root: &'a Path,
+    pub task_id: &'a TaskId,
+    pub prompt: &'a str,
+    pub depends_on: &'a [TaskId],
+    pub dependencies_blocked: bool,
+    pub source: Option<&'a str>,
+    pub external_id: Option<&'a str>,
+}
 
 pub(crate) struct IssueSubmissionRuntimeContext<'a> {
     pub project_root: &'a Path,
@@ -39,6 +50,13 @@ pub(crate) async fn record_issue_submission(
     ctx: IssueSubmissionRuntimeContext<'_>,
 ) -> anyhow::Result<IssueSubmissionRuntimeRecord> {
     persist_issue_submission(store, &ctx).await
+}
+
+pub(crate) async fn record_prompt_submission(
+    store: &WorkflowRuntimeStore,
+    ctx: PromptSubmissionRuntimeContext<'_>,
+) -> anyhow::Result<IssueSubmissionRuntimeRecord> {
+    persist_prompt_submission(store, &ctx).await
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +158,58 @@ pub(crate) async fn release_ready_issue_dependencies(
     Ok(summary)
 }
 
+pub(crate) async fn release_ready_prompt_dependencies(
+    store: &WorkflowRuntimeStore,
+    tasks: &TaskStore,
+    limit: i64,
+) -> anyhow::Result<IssueDependencyReleaseSummary> {
+    let instances = store
+        .list_instances_by_state(PROMPT_TASK_DEFINITION_ID, "awaiting_dependencies", limit)
+        .await?;
+    let mut summary = IssueDependencyReleaseSummary::default();
+    for instance in instances {
+        let depends_on = match task_ids_from_data(&instance.data, "depends_on") {
+            Ok(depends_on) => depends_on,
+            Err(error) => {
+                tracing::warn!(
+                    workflow_id = %instance.id,
+                    "workflow runtime dependency release skipped malformed prompt data: {error}"
+                );
+                summary.skipped += 1;
+                store.touch_instance(&instance.id).await?;
+                continue;
+            }
+        };
+        let mut all_done = true;
+        let mut terminal_failure: Option<(TaskId, &'static str)> = None;
+        for dep_id in &depends_on {
+            match resolve_issue_dependency_status(Some(store), tasks, dep_id).await? {
+                IssueDependencyStatus::Done => {}
+                IssueDependencyStatus::Failed => {
+                    terminal_failure = Some((dep_id.clone(), "failed"));
+                    break;
+                }
+                IssueDependencyStatus::Cancelled => {
+                    terminal_failure = Some((dep_id.clone(), "cancelled"));
+                    break;
+                }
+                IssueDependencyStatus::Waiting => all_done = false,
+            }
+        }
+        if let Some((dep_id, label)) = terminal_failure {
+            fail_prompt_for_dependency(store, instance, &dep_id, label).await?;
+            summary.failed += 1;
+        } else if all_done {
+            release_prompt_after_dependencies(store, instance, &depends_on).await?;
+            summary.released += 1;
+        } else {
+            store.touch_instance(&instance.id).await?;
+            summary.waiting += 1;
+        }
+    }
+    Ok(summary)
+}
+
 pub(crate) async fn runtime_issue_by_task_id(
     store: &WorkflowRuntimeStore,
     task_id: &TaskId,
@@ -165,10 +235,31 @@ pub(crate) async fn cancel_issue_submission_by_task_id(
     if instance.is_terminal() {
         return Ok(Some(instance));
     }
+    let is_prompt = instance.definition_id == PROMPT_TASK_DEFINITION_ID;
+    let event_type = if is_prompt {
+        "PromptSubmissionCancelled"
+    } else {
+        "IssueSubmissionCancelled"
+    };
+    let decision_name = if is_prompt {
+        "cancel_prompt_submission"
+    } else {
+        "cancel_issue_submission"
+    };
+    let reason = if is_prompt {
+        "operator cancelled the runtime prompt submission"
+    } else {
+        "operator cancelled the runtime issue submission"
+    };
+    let command_prefix = if is_prompt {
+        "prompt-submit"
+    } else {
+        "issue-submit"
+    };
     let event = store
         .append_event(
             &instance.id,
-            "IssueSubmissionCancelled",
+            event_type,
             "workflow_runtime_submission",
             json!({
                 "task_id": task_id.as_str(),
@@ -179,13 +270,13 @@ pub(crate) async fn cancel_issue_submission_by_task_id(
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
-        "cancel_issue_submission",
+        decision_name,
         "cancelled",
-        "operator cancelled the runtime issue submission",
+        reason,
     )
     .with_command(WorkflowCommand::new(
         WorkflowCommandType::MarkCancelled,
-        format!("issue-submit:{}:cancel", task_id.as_str()),
+        format!("{command_prefix}:{}:cancel", task_id.as_str()),
         json!({ "task_id": task_id.as_str() }),
     ))
     .high_confidence();
@@ -252,6 +343,47 @@ async fn persist_issue_submission(
     .await
 }
 
+async fn persist_prompt_submission(
+    store: &WorkflowRuntimeStore,
+    ctx: &PromptSubmissionRuntimeContext<'_>,
+) -> anyhow::Result<IssueSubmissionRuntimeRecord> {
+    let project_id = ctx.project_root.to_string_lossy().into_owned();
+    let workflow_id = prompt_workflow_id(&project_id, ctx.external_id, ctx.task_id);
+    upsert_prompt_task_definition(store).await?;
+    let (instance, new_instance) = match store.get_instance(&workflow_id).await? {
+        Some(instance) => (instance, false),
+        None => (
+            prompt_instance(
+                workflow_id,
+                project_id.clone(),
+                prompt_subject_key(ctx.external_id, ctx.task_id),
+            ),
+            true,
+        ),
+    };
+    let submitted_data = prompt_submission_data(ctx, &project_id, &instance.data);
+    let output = build_prompt_submission_decision(
+        &instance,
+        PromptSubmissionDecisionInput {
+            task_id: ctx.task_id.as_str(),
+            prompt: ctx.prompt,
+            source: ctx.source,
+            external_id: ctx.external_id,
+            depends_on: &depends_on_strings(ctx.depends_on),
+            dependencies_blocked: ctx.dependencies_blocked,
+        },
+    );
+    apply_prompt_decision(
+        store,
+        instance,
+        new_instance,
+        output.decision,
+        ctx,
+        submitted_data,
+    )
+    .await
+}
+
 async fn apply_decision(
     store: &WorkflowRuntimeStore,
     mut instance: WorkflowInstance,
@@ -284,6 +416,77 @@ async fn apply_decision(
                 "additional_prompt": ctx.additional_prompt,
                 "depends_on": depends_on_strings(ctx.depends_on),
                 "dependencies_blocked": ctx.dependencies_blocked,
+                "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
+            }),
+        )
+        .await?;
+    let record = match validation {
+        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id)),
+        Err(error) => {
+            let reason = error.to_string();
+            let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
+            store.record_decision(&record).await?;
+            return Ok(IssueSubmissionRuntimeRecord {
+                workflow_id: instance.id,
+                accepted: false,
+                decision_id: record.id,
+                command_ids: Vec::new(),
+                rejection_reason: Some(reason),
+            });
+        }
+    };
+    store.record_decision(&record).await?;
+    let mut command_ids = Vec::with_capacity(decision.commands.len());
+    for command in &decision.commands {
+        command_ids.push(
+            store
+                .enqueue_command(&instance.id, Some(&record.id), command)
+                .await?,
+        );
+    }
+    instance.state = decision.next_state.clone();
+    instance.version = instance.version.saturating_add(1);
+    instance.data = merge_last_decision(accepted_data, &decision.decision);
+    store.upsert_instance(&instance).await?;
+    Ok(IssueSubmissionRuntimeRecord {
+        workflow_id: instance.id,
+        accepted: true,
+        decision_id: record.id,
+        command_ids,
+        rejection_reason: None,
+    })
+}
+
+async fn apply_prompt_decision(
+    store: &WorkflowRuntimeStore,
+    mut instance: WorkflowInstance,
+    new_instance: bool,
+    decision: WorkflowDecision,
+    ctx: &PromptSubmissionRuntimeContext<'_>,
+    accepted_data: serde_json::Value,
+) -> anyhow::Result<IssueSubmissionRuntimeRecord> {
+    let validation_context = if instance.is_terminal() {
+        ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
+    } else {
+        ValidationContext::new("workflow-policy", chrono::Utc::now())
+    };
+    let validation =
+        DecisionValidator::prompt_task().validate(&instance, &decision, &validation_context);
+    if new_instance {
+        store.upsert_instance(&instance).await?;
+    }
+    let event = store
+        .append_event(
+            &instance.id,
+            "PromptSubmitted",
+            "workflow_runtime_submission",
+            json!({
+                "task_id": ctx.task_id.as_str(),
+                "prompt_chars": ctx.prompt.chars().count(),
+                "depends_on": depends_on_strings(ctx.depends_on),
+                "dependencies_blocked": ctx.dependencies_blocked,
+                "source": ctx.source,
+                "external_id": ctx.external_id,
                 "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
             }),
         )
@@ -414,6 +617,91 @@ async fn fail_issue_for_dependency(
     Ok(())
 }
 
+async fn release_prompt_after_dependencies(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+    depends_on: &[TaskId],
+) -> anyhow::Result<()> {
+    let fields = prompt_submission_fields(&instance)?;
+    let output = build_prompt_submission_decision(
+        &instance,
+        PromptSubmissionDecisionInput {
+            task_id: &fields.task_id,
+            prompt: &fields.prompt,
+            source: fields.source.as_deref(),
+            external_id: fields.external_id.as_deref(),
+            depends_on: &depends_on_strings(depends_on),
+            dependencies_blocked: false,
+        },
+    );
+    let event = store
+        .append_event(
+            &instance.id,
+            "PromptDependenciesSatisfied",
+            "workflow_runtime_submission",
+            json!({
+                "task_id": fields.task_id,
+                "depends_on": depends_on_strings(depends_on),
+                "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
+            }),
+        )
+        .await?;
+    let data = set_data_bool(instance.data.clone(), "dependencies_blocked", false);
+    commit_runtime_decision(store, instance, output.decision, event.id, Some(data)).await?;
+    Ok(())
+}
+
+async fn fail_prompt_for_dependency(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+    dependency_id: &TaskId,
+    dependency_status: &str,
+) -> anyhow::Result<()> {
+    let event = store
+        .append_event(
+            &instance.id,
+            "PromptDependencyFailed",
+            "workflow_runtime_submission",
+            json!({
+                "dependency_task_id": dependency_id.as_str(),
+                "dependency_status": dependency_status,
+                "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
+            }),
+        )
+        .await?;
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "dependency_failed",
+        "failed",
+        format!(
+            "dependency task {} {} before runtime prompt submission could start",
+            dependency_id.as_str(),
+            dependency_status
+        ),
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::MarkFailed,
+        format!("prompt-submit:{}:dependency-failed", dependency_id.as_str()),
+        json!({
+            "dependency_task_id": dependency_id.as_str(),
+            "dependency_status": dependency_status,
+        }),
+    ))
+    .high_confidence();
+    let data = set_data_string(
+        set_data_string(
+            instance.data.clone(),
+            "dependency_failure_task_id",
+            dependency_id.as_str(),
+        ),
+        "dependency_failure_status",
+        dependency_status,
+    );
+    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+    Ok(())
+}
+
 async fn commit_runtime_decision(
     store: &WorkflowRuntimeStore,
     mut instance: WorkflowInstance,
@@ -426,9 +714,8 @@ async fn commit_runtime_decision(
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())
     };
-    if let Err(error) =
-        DecisionValidator::github_issue_pr().validate(&instance, &decision, &validation_context)
-    {
+    let validator = decision_validator_for_instance(&instance)?;
+    if let Err(error) = validator.validate(&instance, &decision, &validation_context) {
         let reason = error.to_string();
         let record = WorkflowDecisionRecord::rejected(decision, Some(event_id), &reason);
         store.record_decision(&record).await?;
@@ -452,12 +739,32 @@ async fn commit_runtime_decision(
     Ok(instance)
 }
 
+fn decision_validator_for_instance(
+    instance: &WorkflowInstance,
+) -> anyhow::Result<DecisionValidator> {
+    match instance.definition_id.as_str() {
+        GITHUB_ISSUE_PR_DEFINITION_ID => Ok(DecisionValidator::github_issue_pr()),
+        PROMPT_TASK_DEFINITION_ID => Ok(DecisionValidator::prompt_task()),
+        other => anyhow::bail!("workflow definition `{other}` cannot be committed by submission"),
+    }
+}
+
 async fn upsert_github_issue_pr_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
     store
         .upsert_definition(&WorkflowDefinition::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
             "GitHub issue PR workflow",
+        ))
+        .await
+}
+
+async fn upsert_prompt_task_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
+    store
+        .upsert_definition(&WorkflowDefinition::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            "Prompt task workflow",
         ))
         .await
 }
@@ -482,6 +789,41 @@ fn issue_instance(
     }))
 }
 
+fn prompt_instance(
+    workflow_id: String,
+    project_id: String,
+    subject_key: String,
+) -> WorkflowInstance {
+    WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "submitted",
+        WorkflowSubject::new("prompt", subject_key),
+    )
+    .with_id(workflow_id)
+    .with_data(json!({
+        "project_id": project_id,
+    }))
+}
+
+pub(crate) fn prompt_workflow_id(
+    project_id: &str,
+    external_id: Option<&str>,
+    task_id: &TaskId,
+) -> String {
+    format!(
+        "{project_id}::prompt:{}",
+        prompt_subject_key(external_id, task_id)
+    )
+}
+
+fn prompt_subject_key(external_id: Option<&str>, task_id: &TaskId) -> String {
+    external_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| task_id.as_str())
+        .to_string()
+}
+
 fn issue_submission_data(
     ctx: &IssueSubmissionRuntimeContext<'_>,
     project_id: &str,
@@ -498,6 +840,26 @@ fn issue_submission_data(
             "labels": ctx.labels,
             "force_execute": ctx.force_execute,
             "additional_prompt": ctx.additional_prompt,
+            "depends_on": depends_on_strings(ctx.depends_on),
+            "dependencies_blocked": ctx.dependencies_blocked,
+            "source": ctx.source,
+            "external_id": ctx.external_id,
+        }),
+    )
+}
+
+fn prompt_submission_data(
+    ctx: &PromptSubmissionRuntimeContext<'_>,
+    project_id: &str,
+    existing_data: &serde_json::Value,
+) -> serde_json::Value {
+    crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        ctx.project_root,
+        json!({
+            "project_id": project_id,
+            "task_id": ctx.task_id.as_str(),
+            "task_ids": task_id_history(existing_data, ctx.task_id),
+            "prompt": ctx.prompt,
             "depends_on": depends_on_strings(ctx.depends_on),
             "dependencies_blocked": ctx.dependencies_blocked,
             "source": ctx.source,
@@ -543,6 +905,23 @@ fn issue_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<IssueS
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
         additional_prompt: optional_string_field(&instance.data, "additional_prompt"),
+    })
+}
+
+#[derive(Debug)]
+struct PromptSubmissionFields {
+    task_id: String,
+    prompt: String,
+    source: Option<String>,
+    external_id: Option<String>,
+}
+
+fn prompt_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<PromptSubmissionFields> {
+    Ok(PromptSubmissionFields {
+        task_id: string_field(&instance.data, "task_id")?,
+        prompt: string_field(&instance.data, "prompt")?,
+        source: optional_string_field(&instance.data, "source"),
+        external_id: optional_string_field(&instance.data, "external_id"),
     })
 }
 
@@ -716,6 +1095,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_submission_records_pending_runtime_implementation_command() -> anyhow::Result<()>
+    {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = open_runtime_store(dir.path()).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("prompt-task-1");
+
+        let result = record_prompt_submission(
+            &store,
+            PromptSubmissionRuntimeContext {
+                project_root: &project_root,
+                task_id: &task_id,
+                prompt: "fix the prompt-only issue",
+                depends_on: &[],
+                dependencies_blocked: false,
+                source: Some("dashboard"),
+                external_id: Some("manual:prompt:1"),
+            },
+        )
+        .await?;
+
+        assert!(result.accepted);
+        assert_eq!(result.command_ids.len(), 1);
+        assert!(result.rejection_reason.is_none());
+
+        let workflow_id = prompt_workflow_id(
+            &project_root.to_string_lossy(),
+            Some("manual:prompt:1"),
+            &task_id,
+        );
+        let instance = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("workflow should be persisted");
+        assert_eq!(instance.definition_id, PROMPT_TASK_DEFINITION_ID);
+        assert_eq!(instance.state, "implementing");
+        assert_eq!(instance.data["task_id"], "prompt-task-1");
+        assert_eq!(
+            instance.data["task_ids"],
+            serde_json::json!(["prompt-task-1"])
+        );
+        assert_eq!(instance.data["prompt"], "fix the prompt-only issue");
+        assert_eq!(instance.data["source"], "dashboard");
+        assert_eq!(instance.data["external_id"], "manual:prompt:1");
+        assert_eq!(instance.data["last_decision"], "submit_prompt");
+        assert_eq!(
+            instance.data["execution_path"],
+            EXECUTION_PATH_WORKFLOW_RUNTIME
+        );
+
+        let events = store.events_for(&workflow_id).await?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "PromptSubmitted"));
+
+        let commands = store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, "pending");
+        assert_eq!(
+            commands[0].command.activity_name(),
+            Some("implement_prompt")
+        );
+        assert_eq!(
+            commands[0].command.command["prompt"],
+            "fix the prompt-only issue"
+        );
+        assert_eq!(store.pending_commands(10).await?.len(), 1);
+        assert!(store
+            .runtime_jobs_for_command(&commands[0].id)
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn issue_submission_preserves_prior_task_handles_for_lookup() -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -851,6 +1310,74 @@ mod tests {
         let cancelled = cancel_issue_submission_by_task_id(&store, &task_id)
             .await?
             .expect("runtime issue submission should resolve by task id");
+        assert_eq!(cancelled.state, "cancelled");
+
+        let commands = store.commands_for(&result.workflow_id).await?;
+        let original_command = commands
+            .iter()
+            .find(|command| command.id == command_id)
+            .expect("original implementation command should remain visible");
+        assert_eq!(original_command.status, "cancelled");
+        let jobs = store.runtime_jobs_for_command(&command_id).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].status,
+            harness_workflow::runtime::RuntimeJobStatus::Cancelled
+        );
+        assert!(jobs[0].lease.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_prompt_submission_cancels_dispatched_runtime_jobs() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = open_runtime_store(dir.path()).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("runtime-prompt-handle-cancel");
+        let result = record_prompt_submission(
+            &store,
+            PromptSubmissionRuntimeContext {
+                project_root: &project_root,
+                task_id: &task_id,
+                prompt: "cancel this prompt runtime task",
+                depends_on: &[],
+                dependencies_blocked: false,
+                source: None,
+                external_id: None,
+            },
+        )
+        .await?;
+        let command_id = result
+            .command_ids
+            .first()
+            .expect("prompt submission should enqueue an implementation command")
+            .clone();
+        store
+            .enqueue_runtime_job_for_pending_command(
+                &command_id,
+                harness_workflow::runtime::RuntimeKind::CodexExec,
+                "default",
+                json!({ "task_id": task_id.as_str() }),
+                None,
+            )
+            .await?;
+        assert_eq!(
+            store
+                .get_command(&command_id)
+                .await?
+                .expect("command should exist")
+                .status,
+            "dispatched"
+        );
+
+        let cancelled = cancel_issue_submission_by_task_id(&store, &task_id)
+            .await?
+            .expect("runtime prompt submission should resolve by task id");
         assert_eq!(cancelled.state, "cancelled");
 
         let commands = store.commands_for(&result.workflow_id).await?;
@@ -1015,6 +1542,75 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
         assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prompt_submission_waits_for_dependencies_then_releases_runtime_command(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = open_runtime_store(dir.path()).await?;
+        let task_store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let dep_id = TaskId::from_str("prompt-dep-1");
+        let mut dep = crate::task_runner::TaskState::new(dep_id.clone());
+        dep.status = TaskStatus::Pending;
+        task_store.insert(&dep).await;
+
+        let task_id = TaskId::from_str("runtime-prompt-handle-1");
+        let result = record_prompt_submission(
+            &store,
+            PromptSubmissionRuntimeContext {
+                project_root: &project_root,
+                task_id: &task_id,
+                prompt: "wait until dependency is done",
+                depends_on: std::slice::from_ref(&dep_id),
+                dependencies_blocked: true,
+                source: None,
+                external_id: None,
+            },
+        )
+        .await?;
+
+        assert!(result.accepted);
+        assert!(result.command_ids.is_empty());
+        let workflow = store
+            .get_instance(&result.workflow_id)
+            .await?
+            .expect("workflow should be persisted");
+        assert_eq!(workflow.state, "awaiting_dependencies");
+        assert_eq!(
+            workflow.data["depends_on"],
+            serde_json::json!(["prompt-dep-1"])
+        );
+        assert!(store.commands_for(&result.workflow_id).await?.is_empty());
+
+        let waiting = release_ready_prompt_dependencies(&store, &task_store, 10).await?;
+        assert_eq!(waiting.waiting, 1);
+        assert_eq!(waiting.released, 0);
+
+        dep.status = TaskStatus::Done;
+        task_store.insert(&dep).await;
+        let released = release_ready_prompt_dependencies(&store, &task_store, 10).await?;
+        assert_eq!(released.released, 1);
+        let workflow = store
+            .get_instance(&result.workflow_id)
+            .await?
+            .expect("workflow should remain persisted");
+        assert_eq!(workflow.state, "implementing");
+        assert_eq!(workflow.data["dependencies_blocked"], false);
+        let commands = store.commands_for(&result.workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, "pending");
+        assert_eq!(
+            commands[0].command.activity_name(),
+            Some("implement_prompt")
+        );
         Ok(())
     }
 
