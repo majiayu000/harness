@@ -679,7 +679,7 @@ mod tests {
             .get_instance(&workflow_id)
             .await?
             .expect("workflow should be persisted");
-        assert_eq!(instance.state, "scheduled");
+        assert_eq!(instance.state, "implementing");
         assert_eq!(instance.data["task_id"], "task-1");
         assert_eq!(instance.data["task_ids"], serde_json::json!(["task-1"]));
         assert_eq!(
@@ -1009,7 +1009,7 @@ mod tests {
             .get_instance(&result.workflow_id)
             .await?
             .expect("workflow should remain persisted");
-        assert_eq!(workflow.state, "scheduled");
+        assert_eq!(workflow.state, "implementing");
         assert_eq!(workflow.data["dependencies_blocked"], false);
         let commands = store.commands_for(&result.workflow_id).await?;
         assert_eq!(commands.len(), 1);
@@ -1081,7 +1081,7 @@ mod tests {
             .get_instance(&blocked.workflow_id)
             .await?
             .expect("dependent workflow should remain persisted");
-        assert_eq!(workflow.state, "scheduled");
+        assert_eq!(workflow.state, "implementing");
         assert_eq!(store.commands_for(&blocked.workflow_id).await?.len(), 1);
         Ok(())
     }
@@ -1155,7 +1155,7 @@ mod tests {
             .get_instance(&ready.workflow_id)
             .await?
             .expect("ready workflow should remain persisted");
-        assert_eq!(workflow.state, "scheduled");
+        assert_eq!(workflow.state, "implementing");
         Ok(())
     }
 }

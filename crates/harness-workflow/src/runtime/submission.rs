@@ -30,7 +30,7 @@ pub fn build_issue_submission_decision(
     let next_state = if input.dependencies_blocked {
         "awaiting_dependencies"
     } else {
-        "scheduled"
+        "implementing"
     };
     let reason = if input.dependencies_blocked {
         "operator submitted the GitHub issue and it is waiting for dependencies"

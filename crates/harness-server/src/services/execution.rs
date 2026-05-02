@@ -366,8 +366,11 @@ impl DefaultExecutionService {
             .map_err(EnqueueTaskError::BadRequest)
     }
 
-    fn runtime_issue_submission_enabled(&self) -> Result<bool, EnqueueTaskError> {
-        workflow_runtime_loops_enabled(&self.server_config.server.project_root)
+    fn runtime_issue_submission_enabled(
+        &self,
+        project_root: &Path,
+    ) -> Result<bool, EnqueueTaskError> {
+        workflow_runtime_loops_enabled(project_root)
     }
 
     fn queue_for(&self, domain: QueueDomain) -> Arc<TaskQueue> {
@@ -659,7 +662,7 @@ impl DefaultExecutionService {
         self.check_allowed_roots(&canonical)?;
 
         let project_id = canonical.to_string_lossy().into_owned();
-        req.project = Some(canonical);
+        req.project = Some(canonical.clone());
 
         task_runner::fill_missing_repo_from_project(&mut req).await;
         Self::populate_external_id(&mut req);
@@ -673,7 +676,7 @@ impl DefaultExecutionService {
 
         if req.issue.is_some()
             && self.workflow_runtime_store.is_some()
-            && self.runtime_issue_submission_enabled()?
+            && self.runtime_issue_submission_enabled(&canonical)?
         {
             if let Some(existing_id) = self
                 .check_runtime_issue_duplicate(&project_id, &req)
@@ -1228,7 +1231,7 @@ mod tests {
             .get_instance(&workflow_id)
             .await?
             .expect("runtime workflow should be recorded");
-        assert_eq!(instance.state, "scheduled");
+        assert_eq!(instance.state, "implementing");
         assert_eq!(instance.data["task_id"], task_id.0);
         assert_eq!(
             instance.data["additional_prompt"],
@@ -1256,7 +1259,9 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let project_root = dir.path().join("project");
+        let server_root = dir.path().join("server-root");
         std::fs::create_dir(&project_root)?;
+        std::fs::create_dir(&server_root)?;
         std::fs::write(
             project_root.join("WORKFLOW.md"),
             "---\nruntime_dispatch:\n  enabled: false\nruntime_worker:\n  enabled: true\n---\n",
@@ -1272,7 +1277,7 @@ mod tests {
             .await?,
         );
         let mut config = HarnessConfig::default();
-        config.server.project_root = project_root.clone();
+        config.server.project_root = server_root;
         let svc =
             make_svc_with_workflow_runtime_agent_and_config(store, runtime_store.clone(), config)
                 .await;
@@ -1301,6 +1306,64 @@ mod tests {
             runtime_store.get_instance(&workflow_id).await?.is_none(),
             "disabled runtime loops must not create a pending runtime workflow"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_issue_submission_uses_request_project_runtime_policy(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        let server_root = dir.path().join("server-root");
+        std::fs::create_dir(&project_root)?;
+        std::fs::create_dir(&server_root)?;
+        std::fs::write(
+            server_root.join("WORKFLOW.md"),
+            "---\nruntime_dispatch:\n  enabled: false\nruntime_worker:\n  enabled: true\n---\n",
+        )?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let task_store = store.clone();
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let mut config = HarnessConfig::default();
+        config.server.project_root = server_root;
+        let svc =
+            make_svc_with_workflow_runtime_agent_and_config(store, runtime_store.clone(), config)
+                .await;
+        let req = CreateTaskRequest {
+            issue: Some(43),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            ..Default::default()
+        };
+
+        let task_id = svc.enqueue_background(req).await?;
+        assert!(
+            task_store.get_with_db_fallback(&task_id).await?.is_none(),
+            "enabled request project runtime loops should bypass the task runner path"
+        );
+        let canonical_project_root = project_root.canonicalize()?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &canonical_project_root.to_string_lossy(),
+            Some("owner/repo"),
+            43,
+        );
+        let instance = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("runtime workflow should be recorded for the request project");
+        assert_eq!(instance.state, "implementing");
+        assert_eq!(instance.data["task_id"], task_id.0);
         Ok(())
     }
 
@@ -1524,7 +1587,7 @@ mod tests {
             .get_instance(&dependent_workflow_id)
             .await?
             .expect("dependent workflow should be recorded");
-        assert_eq!(workflow.state, "scheduled");
+        assert_eq!(workflow.state, "implementing");
         assert_eq!(workflow.data["task_id"], dependent_id.0);
         assert_eq!(workflow.data["depends_on"], serde_json::json!([dep_handle]));
         assert_eq!(

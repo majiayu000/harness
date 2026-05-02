@@ -856,7 +856,7 @@ async fn assert_runtime_issue_submission(
         .get_instance(&workflow_id)
         .await?
         .expect("runtime workflow should be persisted");
-    assert_eq!(instance.state, "scheduled");
+    assert_eq!(instance.state, "implementing");
     assert_eq!(instance.data["task_id"], task_id.0);
     assert_eq!(instance.data["execution_path"], "workflow_runtime");
     let commands = store.commands_for(&workflow_id).await?;
@@ -875,7 +875,7 @@ async fn assert_runtime_issue_submission(
     assert_eq!(get_response.status(), StatusCode::OK);
     let runtime_task = response_json(get_response).await?;
     assert_eq!(runtime_task["task_id"], task_id.0);
-    assert_eq!(runtime_task["status"], "scheduled");
+    assert_eq!(runtime_task["status"], "implementing");
     assert_eq!(runtime_task["execution_path"], "workflow_runtime");
     assert_eq!(runtime_task["workflow_id"], workflow_id);
     Ok(())
@@ -1994,7 +1994,7 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "scheduled");
+    assert_eq!(json["status"], "implementing");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(state.core.tasks.count(), before_count);
     assert_runtime_issue_submission(
@@ -2357,7 +2357,7 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let resp = response_json(response).await?;
     assert!(resp["task_id"].is_string());
-    assert_eq!(resp["status"], "scheduled");
+    assert_eq!(resp["status"], "implementing");
     assert_eq!(resp["execution_path"], "workflow_runtime");
     let task_id = task_runner::TaskId::from_str(resp["task_id"].as_str().unwrap());
     assert!(state
@@ -2383,7 +2383,7 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
         .get_instance(&workflow_id)
         .await?
         .expect("runtime workflow should be persisted");
-    assert_eq!(instance.state, "scheduled");
+    assert_eq!(instance.state, "implementing");
     assert_eq!(instance.data["task_id"], task_id.0);
     assert_eq!(instance.data["execution_path"], "workflow_runtime");
     let commands = store.commands_for(&workflow_id).await?;
@@ -2452,7 +2452,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     let canonical_project_root = project_root.canonicalize()?;
 
     assert_eq!(runtime_task["task_kind"], "issue");
-    assert_eq!(runtime_task["status"], "pending");
+    assert_eq!(runtime_task["status"], "implementing");
     assert_eq!(runtime_task["external_id"], "issue:52");
     assert_eq!(runtime_task["repo"], "owner/repo");
     assert_eq!(runtime_task["description"], "issue #52");
@@ -2460,7 +2460,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         runtime_task["project"],
         canonical_project_root.to_string_lossy().as_ref()
     );
-    assert_eq!(runtime_task["scheduler"]["authority_state"], "queued");
+    assert_eq!(runtime_task["scheduler"]["authority_state"], "running");
     assert!(runtime_task.get("workflow").is_none());
     Ok(())
 }
@@ -3023,7 +3023,7 @@ async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow:
         .expect("batch response should be an array");
     assert_eq!(entries.len(), 2);
     for (entry, issue_number) in entries.iter().zip([42_u64, 43]) {
-        assert_eq!(entry["status"], "scheduled");
+        assert_eq!(entry["status"], "implementing");
         assert_eq!(entry["execution_path"], "workflow_runtime");
         assert_runtime_issue_submission(
             &state,
@@ -4040,7 +4040,7 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "scheduled");
+    assert_eq!(json["status"], "implementing");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(state.core.tasks.count(), before_count);
     assert_runtime_issue_submission(
@@ -4156,7 +4156,7 @@ async fn webhook_routes_runtime_issue_to_repo_specific_project_root() -> anyhow:
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "scheduled");
+    assert_eq!(json["status"], "implementing");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_runtime_issue_submission(
         &state,

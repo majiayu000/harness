@@ -70,7 +70,7 @@ fn project_issue_instance(project_id: &str, issue_number: u64, state: &str) -> W
 }
 
 #[test]
-fn issue_submission_decision_schedules_discovered_issue() {
+fn issue_submission_decision_starts_discovered_issue_implementation() {
     let labels = vec!["bug".to_string(), "p1".to_string()];
     let instance = issue_instance("discovered");
     let output = build_issue_submission_decision(
@@ -92,7 +92,7 @@ fn issue_submission_decision_schedules_discovered_issue() {
         IssueSubmissionWorkflowAction::RunImplementation
     );
     assert_eq!(output.decision.decision, "submit_issue");
-    assert_eq!(output.decision.next_state, "scheduled");
+    assert_eq!(output.decision.next_state, "implementing");
     assert_eq!(output.decision.commands.len(), 1);
     assert_eq!(
         output.decision.commands[0].activity_name(),
