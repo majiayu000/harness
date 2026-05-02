@@ -4,6 +4,7 @@ use harness_workflow::runtime::{
     DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, ValidationContext, WorkflowDecision, WorkflowDecisionRecord,
     WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    PR_FEEDBACK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -325,7 +326,24 @@ async fn has_active_pr_feedback_command(
                     record.command.activity_name(),
                     Some("sweep_pr_feedback" | "address_pr_feedback")
                 )
-        }))
+                || matches!(record.status.as_str(), "pending" | "dispatched")
+                    && record.command.command_type
+                        == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+                    && record
+                        .command
+                        .command
+                        .get("definition_id")
+                        .and_then(|value| value.as_str())
+                        == Some(PR_FEEDBACK_DEFINITION_ID)
+        })
+        || store
+            .list_instances_by_definition(PR_FEEDBACK_DEFINITION_ID, None)
+            .await?
+            .into_iter()
+            .any(|instance| {
+                instance.parent_workflow_id.as_deref() == Some(workflow_id)
+                    && matches!(instance.state.as_str(), "pending" | "inspecting")
+            }))
 }
 
 async fn upsert_github_issue_pr_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
@@ -580,8 +598,16 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
         assert_eq!(
-            commands[0].command.activity_name(),
-            Some("sweep_pr_feedback")
+            commands[0].command.command_type,
+            harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+        );
+        assert_eq!(
+            commands[0].command.command["definition_id"],
+            PR_FEEDBACK_DEFINITION_ID
+        );
+        assert_eq!(
+            commands[0].command.command["child_activity"],
+            harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY
         );
         assert_eq!(commands[0].command.command["pr_number"], 77);
 

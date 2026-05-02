@@ -18,9 +18,9 @@ use super::{
     PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, QualityGateDecisionInput,
     QualityGateWorkflowAction, RepoBacklogPollDecisionInput, RepoBacklogWorkflowAction,
     RuntimeCommandDispatcher, RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker,
-    StaleWorkflowDecisionInput, WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY,
-    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
-    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    StaleWorkflowDecisionInput, WorkflowRuntimeStore, PR_FEEDBACK_DEFINITION_ID,
+    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -400,7 +400,7 @@ fn pr_feedback_decision_addresses_blocking_feedback() {
 }
 
 #[test]
-fn pr_feedback_sweep_decision_enqueues_runtime_activity() {
+fn pr_feedback_sweep_decision_starts_child_workflow() {
     let instance = issue_instance("pr_open");
     let output = build_pr_feedback_sweep_decision(
         &instance,
@@ -420,11 +420,15 @@ fn pr_feedback_sweep_decision_enqueues_runtime_activity() {
     assert_eq!(output.decision.commands.len(), 1);
     assert_eq!(
         output.decision.commands[0].command_type,
-        WorkflowCommandType::EnqueueActivity
+        WorkflowCommandType::StartChildWorkflow
     );
     assert_eq!(
-        output.decision.commands[0].activity_name(),
-        Some("sweep_pr_feedback")
+        output.decision.commands[0].command["definition_id"],
+        PR_FEEDBACK_DEFINITION_ID
+    );
+    assert_eq!(
+        output.decision.commands[0].command["child_activity"],
+        PR_FEEDBACK_INSPECT_ACTIVITY
     );
     assert_eq!(output.decision.commands[0].command["pr_number"], 77);
     DecisionValidator::github_issue_pr()
@@ -754,6 +758,98 @@ fn runtime_completion_reducer_maps_pr_feedback_sweep_signal_to_address_command()
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("feedback sweep signal decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_maps_pr_feedback_child_signal_to_parent_decision() {
+    let instance = issue_instance("awaiting_feedback").with_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+    }));
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime child workflow found actionable PR feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "FeedbackFound",
+        json!({ "count": 2, "pr_number": 77 }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "child-command-1",
+        "runtime_job_id": "child-job-1",
+        "child_workflow_id": "pr-feedback-child-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("child feedback signal should reduce on parent issue workflow");
+
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("child feedback signal decision should validate on parent");
+}
+
+#[test]
+fn runtime_completion_reducer_updates_pr_feedback_child_from_inspection_signal() {
+    let instance = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "inspecting",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child-1");
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime child workflow found no actionable PR feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "NoFeedbackFound",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "child-command-1",
+        "runtime_job_id": "child-job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("child feedback inspection signal should reduce");
+
+    assert_eq!(decision.decision, "record_no_actionable_feedback");
+    assert_eq!(decision.next_state, "no_actionable_feedback");
+    assert!(decision.commands.is_empty());
+    DecisionValidator::pr_feedback()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("child feedback inspection decision should validate");
 }
 
 #[test]
@@ -2830,6 +2926,172 @@ async fn runtime_worker_keeps_repo_backlog_dispatching_until_child_starts_finish
 
     let commands = store.commands_for(&workflow.id).await?;
     assert!(commands.iter().all(|command| command.status == "completed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_propagates_pr_feedback_child_completion_to_parent() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let parent = issue_instance("awaiting_feedback")
+        .with_id("issue-parent")
+        .with_data(json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "runtime-task-77",
+        }));
+    store.upsert_instance(&parent).await?;
+    let child = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "inspecting",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child")
+    .with_parent(parent.id.clone());
+    store.upsert_instance(&child).await?;
+    let command =
+        WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
+    let command_id = store.enqueue_command(&child.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": PR_FEEDBACK_INSPECT_ACTIVITY }),
+        )
+        .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded(
+            PR_FEEDBACK_INSPECT_ACTIVITY,
+            "PR feedback child found actionable feedback.",
+        )
+        .with_signal(ActivitySignal::new(
+            "FeedbackFound",
+            json!({ "pr_number": 77, "count": 1 }),
+        )),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance(&child.id)
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "feedback_found");
+    let parent_after = store
+        .get_instance(&parent.id)
+        .await?
+        .expect("parent workflow should exist");
+    assert_eq!(parent_after.state, "addressing_feedback");
+    let parent_commands = store.commands_for(&parent.id).await?;
+    assert_eq!(parent_commands.len(), 1);
+    assert_eq!(
+        parent_commands[0].command.activity_name(),
+        Some("address_pr_feedback")
+    );
+    let parent_events = store.events_for(&parent.id).await?;
+    assert!(parent_events.iter().any(|event| {
+        event.event_type == "RuntimeJobCompleted"
+            && event.event["child_workflow_id"] == "pr-feedback-child"
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_does_not_propagate_retrying_pr_feedback_child() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let parent = issue_instance("awaiting_feedback")
+        .with_id("issue-parent-retry")
+        .with_data(json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "runtime-task-77",
+        }));
+    store.upsert_instance(&parent).await?;
+    let child = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "inspecting",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child-retry")
+    .with_parent(parent.id.clone())
+    .with_data(json!({
+        "runtime_retry_policy": {
+            "activity_retries": {
+                "inspect_pr_feedback": {
+                    "max_failed_activity_retries": 2,
+                    "retry_delay_secs": 1
+                }
+            }
+        }
+    }));
+    store.upsert_instance(&child).await?;
+    let command =
+        WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
+    let command_id = store.enqueue_command(&child.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": PR_FEEDBACK_INSPECT_ACTIVITY }),
+        )
+        .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::failed(
+            PR_FEEDBACK_INSPECT_ACTIVITY,
+            "PR feedback inspection hit a transient API error.",
+            "temporary GitHub API error",
+        )
+        .with_error_kind(ActivityErrorKind::Retryable),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance(&child.id)
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "inspecting");
+    let parent_after = store
+        .get_instance(&parent.id)
+        .await?
+        .expect("parent workflow should exist");
+    assert_eq!(parent_after.state, "awaiting_feedback");
+    let parent_events = store.events_for(&parent.id).await?;
+    assert!(
+        parent_events
+            .iter()
+            .all(|event| event.event_type != "RuntimeJobCompleted"),
+        "retrying child failure must not propagate to parent"
+    );
+    let child_commands = store.commands_for(&child.id).await?;
+    assert!(child_commands.iter().any(|record| {
+        record.status == "pending"
+            && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
+            && record.command.command["retry_attempt"] == 1
+    }));
     Ok(())
 }
 
