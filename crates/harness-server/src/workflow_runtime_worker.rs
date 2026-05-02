@@ -10,10 +10,10 @@ use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, ActivityArtifact, ActivityErrorKind, ActivityResult,
     ActivitySignal, DecisionValidator, PrFeedbackInspectDecisionInput, RuntimeJob,
     RuntimeJobExecutor, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker,
-    WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance, WorkflowSubject,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
-    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL,
+    WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance,
+    WorkflowSubject, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -575,10 +575,25 @@ impl ServerRuntimeJobExecutor {
                     }),
                 )
                 .await?;
+            let stable_inspect_dedupe_key = format!("pr-feedback-child:{}:inspect", child.id);
+            let existing_child_commands = store.commands_for(&child.id).await?;
+            let active_inspect_command = existing_child_commands
+                .iter()
+                .find(|record| is_active_pr_feedback_inspect_command(record));
+            let inspect_dedupe_key = match active_inspect_command {
+                Some(record) => record.command.dedupe_key.clone(),
+                None if existing_child_commands
+                    .iter()
+                    .any(is_pr_feedback_inspect_command) =>
+                {
+                    format!("{}:retry:{}", stable_inspect_dedupe_key, event.id)
+                }
+                None => stable_inspect_dedupe_key,
+            };
             let output = build_pr_feedback_inspect_decision(
                 &child,
                 PrFeedbackInspectDecisionInput {
-                    dedupe_key: &format!("pr-feedback-child:{}:inspect", child.id),
+                    dedupe_key: &inspect_dedupe_key,
                     pr_number,
                     pr_url,
                     issue_number,
@@ -615,11 +630,19 @@ impl ServerRuntimeJobExecutor {
             store.record_decision(&record).await?;
             let mut command_ids = Vec::new();
             for command in &output.decision.commands {
-                command_ids.push(
-                    store
-                        .enqueue_command(&child.id, Some(&record.id), command)
-                        .await?,
-                );
+                let command_id = store
+                    .enqueue_command(&child.id, Some(&record.id), command)
+                    .await?;
+                let command_record = store
+                    .get_command(&command_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("workflow command `{command_id}` not found"))?;
+                if !is_active_pr_feedback_inspect_command(&command_record) {
+                    anyhow::bail!(
+                        "pr_feedback child inspect command `{command_id}` was not queued for dispatch"
+                    );
+                }
+                command_ids.push(command_id);
             }
             child.state = output.decision.next_state;
             child.version = child.version.saturating_add(1);
@@ -811,6 +834,15 @@ impl ServerRuntimeJobExecutor {
         }
         Ok(self.state.core.project_root.clone())
     }
+}
+
+fn is_active_pr_feedback_inspect_command(record: &WorkflowCommandRecord) -> bool {
+    matches!(record.status.as_str(), "pending" | "dispatched")
+        && is_pr_feedback_inspect_command(record)
+}
+
+fn is_pr_feedback_inspect_command(record: &WorkflowCommandRecord) -> bool {
+    record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
 }
 
 #[async_trait]

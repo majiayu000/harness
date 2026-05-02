@@ -164,6 +164,9 @@ impl<'a> RuntimeWorker<'a> {
         if child.definition_id != super::pr_feedback::PR_FEEDBACK_DEFINITION_ID {
             return Ok(());
         }
+        if !runtime_event_result_succeeded(event) {
+            return Ok(());
+        }
         if matches!(child.state.as_str(), "pending" | "inspecting") {
             return Ok(());
         }
@@ -267,6 +270,15 @@ impl<'a> RuntimeWorker<'a> {
     }
 }
 
+fn runtime_event_result_succeeded(event: &super::model::WorkflowEvent) -> bool {
+    event
+        .event
+        .get("activity_result")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ActivityResult>(value).ok())
+        .is_some_and(|result| result.status == ActivityStatus::Succeeded)
+}
+
 fn merge_child_completion_payload(
     event: &super::model::WorkflowEvent,
     child_workflow_id: &str,
@@ -277,6 +289,19 @@ fn merge_child_completion_payload(
             "child_workflow_id".to_string(),
             serde_json::json!(child_workflow_id),
         );
+        if let Some(artifacts) = object
+            .get_mut("activity_result")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|activity_result| activity_result.get_mut("artifacts"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            artifacts.retain(|artifact| {
+                artifact
+                    .get("artifact_type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("workflow_decision")
+            });
+        }
     }
     payload
 }

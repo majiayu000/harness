@@ -634,6 +634,7 @@ fn structured_decision_validates(
     let validator = match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
         QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
+        PR_FEEDBACK_DEFINITION_ID => DecisionValidator::pr_feedback(),
         REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
         _ => return true,
     };

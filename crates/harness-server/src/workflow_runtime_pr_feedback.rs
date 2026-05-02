@@ -4,7 +4,7 @@ use harness_workflow::runtime::{
     DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, ValidationContext, WorkflowDecision, WorkflowDecisionRecord,
     WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    PR_FEEDBACK_DEFINITION_ID,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -316,34 +316,59 @@ async fn has_active_pr_feedback_command(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
 ) -> anyhow::Result<bool> {
+    let parent_has_active_command =
+        store
+            .commands_for(workflow_id)
+            .await?
+            .into_iter()
+            .any(|record| {
+                matches!(record.status.as_str(), "pending" | "dispatched")
+                    && matches!(
+                        record.command.activity_name(),
+                        Some("sweep_pr_feedback" | "address_pr_feedback")
+                    )
+                    || matches!(record.status.as_str(), "pending" | "dispatched")
+                        && record.command.command_type
+                            == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+                        && record
+                            .command
+                            .command
+                            .get("definition_id")
+                            .and_then(|value| value.as_str())
+                            == Some(PR_FEEDBACK_DEFINITION_ID)
+            });
+    if parent_has_active_command {
+        return Ok(true);
+    }
+
+    for instance in store
+        .list_instances_by_definition(PR_FEEDBACK_DEFINITION_ID, None)
+        .await?
+        .into_iter()
+        .filter(|instance| instance.parent_workflow_id.as_deref() == Some(workflow_id))
+    {
+        if matches!(instance.state.as_str(), "pending" | "inspecting")
+            && has_active_child_pr_feedback_command(store, &instance.id).await?
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+async fn has_active_child_pr_feedback_command(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
     Ok(store
         .commands_for(workflow_id)
         .await?
         .into_iter()
         .any(|record| {
             matches!(record.status.as_str(), "pending" | "dispatched")
-                && matches!(
-                    record.command.activity_name(),
-                    Some("sweep_pr_feedback" | "address_pr_feedback")
-                )
-                || matches!(record.status.as_str(), "pending" | "dispatched")
-                    && record.command.command_type
-                        == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
-                    && record
-                        .command
-                        .command
-                        .get("definition_id")
-                        .and_then(|value| value.as_str())
-                        == Some(PR_FEEDBACK_DEFINITION_ID)
-        })
-        || store
-            .list_instances_by_definition(PR_FEEDBACK_DEFINITION_ID, None)
-            .await?
-            .into_iter()
-            .any(|instance| {
-                instance.parent_workflow_id.as_deref() == Some(workflow_id)
-                    && matches!(instance.state.as_str(), "pending" | "inspecting")
-            }))
+                && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
+        }))
 }
 
 async fn upsert_github_issue_pr_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
@@ -619,6 +644,146 @@ mod tests {
             }
         );
         assert_eq!(store.commands_for(&workflow_id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_inspecting_child_does_not_block_next_feedback_sweep() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let parent = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "awaiting_feedback",
+        );
+        store.upsert_instance(&parent).await?;
+        let child = WorkflowInstance::new(
+            PR_FEEDBACK_DEFINITION_ID,
+            1,
+            "inspecting",
+            WorkflowSubject::new("pr", "pr:77"),
+        )
+        .with_id("pr-feedback-child-completed")
+        .with_parent(workflow_id.clone());
+        store.upsert_instance(&child).await?;
+
+        assert!(
+            !has_active_pr_feedback_command(&store, &workflow_id).await?,
+            "an inspecting child with no active command should not suppress future sweeps"
+        );
+
+        let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            PR_FEEDBACK_INSPECT_ACTIVITY,
+            "inspect-pr-feedback-77",
+        );
+        store.enqueue_command(&child.id, None, &command).await?;
+
+        assert!(
+            has_active_pr_feedback_command(&store, &workflow_id).await?,
+            "an inspecting child with a pending command should still suppress duplicate sweeps"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphan_pending_child_does_not_block_next_feedback_sweep() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let parent = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "awaiting_feedback",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 123,
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "task-1",
+        }));
+        store.upsert_instance(&parent).await?;
+        let child = WorkflowInstance::new(
+            PR_FEEDBACK_DEFINITION_ID,
+            1,
+            "pending",
+            WorkflowSubject::new("pr", "pr:77"),
+        )
+        .with_id("pr-feedback-child-orphan")
+        .with_parent(workflow_id.clone());
+        store.upsert_instance(&child).await?;
+
+        assert!(
+            !has_active_pr_feedback_command(&store, &workflow_id).await?,
+            "a pending child without an active inspection command should not suppress future sweeps"
+        );
+
+        let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            PR_FEEDBACK_INSPECT_ACTIVITY,
+            "inspect-pr-feedback-77",
+        );
+        let child_command_id = store
+            .enqueue_command(&child.id, None, &child_command)
+            .await?;
+
+        assert!(
+            has_active_pr_feedback_command(&store, &workflow_id).await?,
+            "a pending child with an active inspection command should still suppress duplicate sweeps"
+        );
+
+        store
+            .mark_command_status(&child_command_id, "completed")
+            .await?;
+        assert!(
+            !has_active_pr_feedback_command(&store, &workflow_id).await?,
+            "a pending child with no active inspection command should stop suppressing sweeps"
+        );
+
+        let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
+        assert_eq!(
+            outcome,
+            PrFeedbackSweepRequestOutcome::Requested {
+                workflow_id: workflow_id.clone()
+            }
+        );
         Ok(())
     }
 }
