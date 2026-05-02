@@ -67,6 +67,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(get_workflow_runtime_tree),
         )
         .route(
+            "/api/workflows/runtime/merge",
+            post(task_mutation_routes::merge_workflow_runtime),
+        )
+        .route(
             "/api/runtime-hosts",
             get(crate::handlers::runtime_hosts::list_runtime_hosts),
         )

@@ -3365,7 +3365,145 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         canonical_project_root.to_string_lossy().as_ref()
     );
     assert_eq!(runtime_task["scheduler"]["authority_state"], "running");
-    assert!(runtime_task.get("workflow").is_none());
+    assert!(runtime_task["workflow"]["id"]
+        .as_str()
+        .is_some_and(|id| id.ends_with("::repo:owner/repo::issue:52")));
+    assert_eq!(runtime_task["workflow"]["definition_id"], "github_issue_pr");
+    assert_eq!(runtime_task["workflow"]["state"], "implementing");
+    assert_eq!(runtime_task["workflow"]["issue_number"], 52);
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:53"),
+    )
+    .with_id("runtime-ready-53")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 53,
+        "pr_number": 125,
+        "pr_url": "https://github.com/owner/repo/pull/125",
+        "task_id": "runtime-ready-task",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let app = Router::new()
+        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/runtime-ready-task/merge")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "merge_approved");
+    assert_eq!(body["execution_path"], "workflow_runtime");
+    let updated = store
+        .get_instance("runtime-ready-53")
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "done");
+    assert_eq!(updated.data["last_decision"], "approve_merge");
+    assert_eq!(updated.data["merge_approved_task_id"], "runtime-ready-task");
+    let events = store.events_for("runtime-ready-53").await?;
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "MergeApproved"));
+    let decisions = store.decisions_for("runtime-ready-53").await?;
+    assert!(decisions
+        .iter()
+        .any(|record| record.accepted && record.decision.decision == "approve_merge"));
+    let commands = store.commands_for("runtime-ready-53").await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.command_type,
+        harness_workflow::runtime::WorkflowCommandType::MarkDone
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:54"),
+    )
+    .with_id("runtime-ready-54")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 54,
+        "pr_number": 126,
+        "pr_url": "https://github.com/owner/repo/pull/126",
+        "task_id": "runtime-ready-task-54",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/merge",
+            post(task_mutation_routes::merge_workflow_runtime),
+        )
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/merge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "workflow_id": "runtime-ready-54" }).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response_json(response).await?;
+    assert_eq!(body["workflow_id"], "runtime-ready-54");
+    let updated = store
+        .get_instance("runtime-ready-54")
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "done");
     Ok(())
 }
 

@@ -170,6 +170,31 @@ describe("<Active>", () => {
     expect(screen.queryByTestId("task-slideover")).not.toBeInTheDocument();
   });
 
+  it("uses the workflow runtime merge endpoint for runtime issue workflows", async () => {
+    const ready = {
+      ...makeTask("runtime-task", "harness", "waiting"),
+      pr_url: "https://github.com/owner/repo/pull/124",
+      workflow: {
+        id: "runtime-workflow-124",
+        definition_id: "github_issue_pr",
+        state: "ready_to_merge",
+        pr_number: 124,
+      },
+    };
+    mockUseTasks.mockReturnValue({ data: [ready], isLoading: false, isError: false });
+
+    wrap(<Active projectFilter="harness" />);
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith("/api/workflows/runtime/merge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow_id: "runtime-workflow-124" }),
+      });
+    });
+  });
+
   it("groups planner and review lifecycle statuses outside implementing", () => {
     mockUseTasks.mockReturnValue({
       data: [

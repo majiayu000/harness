@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::state::AppState;
 use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskKind, TaskPhase, TaskSchedulerState, TaskStatus,
-    TaskSummary,
+    TaskSummary, TaskWorkflowSummary,
 };
 
 /// Response type for `GET /tasks/{id}` — `TaskState` fields plus the optional workflow summary
@@ -90,10 +90,12 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
                     summary.workflow = match (by_issue, by_pr) {
                         (Some(issue), _) => workflows_by_issue
                             .get(&(project_id.to_owned(), summary.repo.clone(), issue))
-                            .cloned(),
+                            .cloned()
+                            .map(TaskWorkflowSummary::from),
                         (None, Some(pr)) => workflows_by_pr
                             .get(&(project_id.to_owned(), summary.repo.clone(), pr))
-                            .cloned(),
+                            .cloned()
+                            .map(TaskWorkflowSummary::from),
                         (None, None) => None,
                     };
                 }
@@ -213,7 +215,8 @@ fn runtime_workflow_task_summary(
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
-        workflow: None,
+        workflow: (task_kind == TaskKind::Issue)
+            .then(|| TaskWorkflowSummary::from_runtime_issue(&workflow)),
         scheduler,
     }
 }

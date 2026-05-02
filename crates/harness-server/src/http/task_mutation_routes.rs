@@ -1,8 +1,14 @@
 use super::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use harness_workflow::issue_lifecycle::IssueLifecycleState;
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkflowRuntimeMergeRequest {
+    pub workflow_id: String,
+}
 
 /// POST /tasks/{id}/merge — human-gate approval to transition a `ready_to_merge`
 /// workflow to `done`.
@@ -19,10 +25,7 @@ pub(super) async fn merge_task(
     let task = match state.core.tasks.get_with_db_fallback(&task_id).await {
         Ok(Some(t)) => t,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "task not found" })),
-            );
+            return merge_runtime_task_handle(&state, task_id.as_str()).await;
         }
         Err(e) => {
             tracing::error!("merge_task: DB lookup failed for {task_id:?}: {e}");
@@ -115,5 +118,111 @@ pub(super) async fn merge_task(
                 Json(json!({ "error": "failed to record merge approval" })),
             )
         }
+    }
+}
+
+pub(super) async fn merge_workflow_runtime(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WorkflowRuntimeMergeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "workflow runtime store unavailable" })),
+        );
+    };
+    match crate::workflow_runtime_pr_feedback::approve_runtime_merge_by_workflow_id(
+        store,
+        &request.workflow_id,
+    )
+    .await
+    {
+        Ok(outcome) => runtime_merge_response(outcome),
+        Err(error) => {
+            tracing::error!("merge_workflow_runtime: approval failed: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to approve workflow runtime merge" })),
+            )
+        }
+    }
+}
+
+async fn merge_runtime_task_handle(
+    state: &AppState,
+    task_id: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "task not found" })),
+        );
+    };
+    match crate::workflow_runtime_pr_feedback::approve_runtime_merge_by_task_id(store, task_id)
+        .await
+    {
+        Ok(crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "task not found" })),
+        ),
+        Ok(outcome) => runtime_merge_response(outcome),
+        Err(error) => {
+            tracing::error!("merge_task: runtime workflow approval failed: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to approve workflow runtime merge" })),
+            )
+        }
+    }
+}
+
+fn runtime_merge_response(
+    outcome: crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match outcome {
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::Approved {
+            workflow_id,
+        } => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "merge_approved",
+                "execution_path": "workflow_runtime",
+                "workflow_id": workflow_id,
+            })),
+        ),
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "workflow not found" })),
+        ),
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::NotCandidate {
+            definition_id,
+            ..
+        } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "workflow is not a GitHub issue PR workflow",
+                "definition_id": definition_id,
+            })),
+        ),
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::NotReady {
+            state,
+            ..
+        } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "workflow not in ready_to_merge state",
+                "state": state,
+            })),
+        ),
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::Rejected {
+            reason,
+            ..
+        } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "workflow runtime merge approval rejected",
+                "reason": reason,
+            })),
+        ),
     }
 }

@@ -98,6 +98,8 @@ Implemented now:
 
 Still intentionally not moved yet:
 
+- legacy issue-workflow feedback fallback still uses existing PR task routes when no runtime
+  workflow exists
 - non-runtime dashboard task actions still use existing task routes
 
 ## Non-Goals

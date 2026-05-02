@@ -331,7 +331,7 @@ pub struct TaskSummary {
     pub run_generation: u32,
     /// Issue workflow state summary, when this task belongs to an issue workflow.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
+    pub workflow: Option<TaskWorkflowSummary>,
     /// Canonical scheduler authority for ownership, recovery, and retry state.
     #[serde(default)]
     pub scheduler: TaskSchedulerState,
@@ -356,6 +356,75 @@ pub struct RecentFailureTask {
     pub error: Option<String>,
     #[serde(default)]
     pub failed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskWorkflowSummary {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_id: Option<String>,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_execute: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_concern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_fallback: Option<harness_workflow::issue_lifecycle::ReviewFallbackSnapshot>,
+}
+
+impl TaskWorkflowSummary {
+    pub fn from_runtime_issue(workflow: &harness_workflow::runtime::WorkflowInstance) -> Self {
+        Self {
+            id: workflow.id.clone(),
+            definition_id: Some(workflow.definition_id.clone()),
+            state: workflow.state.clone(),
+            project_id: string_data(&workflow.data, "project_id"),
+            issue_number: u64_data(&workflow.data, "issue_number"),
+            pr_number: u64_data(&workflow.data, "pr_number"),
+            force_execute: bool_data(&workflow.data, "force_execute"),
+            plan_concern: string_data(&workflow.data, "plan_concern"),
+            review_fallback: None,
+        }
+    }
+}
+
+impl From<harness_workflow::issue_lifecycle::IssueWorkflowInstance> for TaskWorkflowSummary {
+    fn from(workflow: harness_workflow::issue_lifecycle::IssueWorkflowInstance) -> Self {
+        Self {
+            id: workflow.id,
+            definition_id: None,
+            state: serde_json::to_value(workflow.state)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "unknown".to_string()),
+            project_id: Some(workflow.project_id),
+            issue_number: Some(workflow.issue_number),
+            pr_number: workflow.pr_number,
+            force_execute: Some(workflow.force_execute),
+            plan_concern: workflow.plan_concern,
+            review_fallback: workflow.review_fallback,
+        }
+    }
+}
+
+fn string_data(data: &serde_json::Value, field: &str) -> Option<String> {
+    data.get(field)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn u64_data(data: &serde_json::Value, field: &str) -> Option<u64> {
+    data.get(field).and_then(|value| value.as_u64())
+}
+
+fn bool_data(data: &serde_json::Value, field: &str) -> Option<bool> {
+    data.get(field).and_then(|value| value.as_bool())
 }
 
 impl TaskState {
