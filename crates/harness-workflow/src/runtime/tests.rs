@@ -756,6 +756,56 @@ fn runtime_completion_reducer_maps_pr_feedback_sweep_signal_to_address_command()
 }
 
 #[test]
+fn runtime_completion_reducer_prefers_blocking_pr_feedback_over_ready_signal() {
+    let instance = issue_instance("awaiting_feedback").with_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+    }));
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent emitted mixed PR feedback signals.",
+    )
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "ChecksFailed",
+        json!({ "pr_number": 77, "failed": 1 }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("mixed feedback sweep signals should reduce conservatively");
+
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("blocking feedback should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_returns_invalid_structured_workflow_decision_for_audit() {
     let instance = issue_instance("pr_open");
     let proposed_decision = WorkflowDecision::new(

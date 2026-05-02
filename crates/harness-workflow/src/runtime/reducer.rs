@@ -246,14 +246,14 @@ fn pr_feedback_sweep_decision_from_activity_result(
 }
 
 fn pr_feedback_outcome_from_signals(result: &ActivityResult) -> Option<PrFeedbackOutcome> {
-    if has_signal(result, "PrReadyToMerge") {
-        return Some(PrFeedbackOutcome::ReadyToMerge);
-    }
     if has_signal(result, "FeedbackFound")
         || has_signal(result, "ChangesRequested")
         || has_signal(result, "ChecksFailed")
     {
         return Some(PrFeedbackOutcome::BlockingFeedback);
+    }
+    if has_signal(result, "PrReadyToMerge") {
+        return Some(PrFeedbackOutcome::ReadyToMerge);
     }
     if has_signal(result, "NoFeedbackFound") {
         return Some(PrFeedbackOutcome::NoActionableFeedback);

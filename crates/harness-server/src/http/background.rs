@@ -682,7 +682,10 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
             &project_root,
             "workflow runtime PR feedback sweeper",
         );
-        if !workflow_cfg.pr_feedback.enabled {
+        if !workflow_cfg.pr_feedback.enabled
+            || !workflow_cfg.runtime_dispatch.enabled
+            || !workflow_cfg.runtime_worker.enabled
+        {
             tick.skipped += 1;
             continue;
         }
