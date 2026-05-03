@@ -1,6 +1,6 @@
 use crate::http::AppState;
 use crate::task_executor::turn_lifecycle::TurnLifecycleOptions;
-use crate::task_runner::{TaskFailureKind, TaskKind, TaskState, TaskStatus};
+use crate::task_runner::{TaskFailureKind, TaskId, TaskKind, TaskState, TaskStatus};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Duration;
@@ -403,7 +403,46 @@ impl ServerRuntimeJobExecutor {
             )
             .await?;
 
-        Ok(ActivityResult::succeeded(
+        let mut child_submission = None;
+        if command
+            .get("auto_submit")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let labels = string_vec(command, "labels");
+            let force_execute = force_execute_from_project_policy(project_id, &labels);
+            let task_id = TaskId::from_str(&format!(
+                "repo-backlog:{}:issue:{issue_number}",
+                repo.unwrap_or("<none>")
+            ));
+            let source = optional_string(command, "source").unwrap_or_else(|| "github".to_string());
+            let external_id =
+                optional_string(command, "external_id").unwrap_or_else(|| issue_number.to_string());
+            let depends_on: Vec<TaskId> = Vec::new();
+            let submission = crate::workflow_runtime_submission::record_issue_submission(
+                store,
+                crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+                    project_root: Path::new(project_id),
+                    repo,
+                    issue_number,
+                    task_id: &task_id,
+                    labels: &labels,
+                    force_execute,
+                    additional_prompt: None,
+                    depends_on: &depends_on,
+                    dependencies_blocked: false,
+                    source: Some(source.as_str()),
+                    external_id: Some(external_id.as_str()),
+                },
+            )
+            .await?;
+            child_submission = Some(submission);
+            if let Some(updated) = store.get_instance(&child.id).await? {
+                child = updated;
+            }
+        }
+
+        let mut result = ActivityResult::succeeded(
             activity_name(job),
             format!("Child workflow `{}` started.", child.id),
         )
@@ -415,7 +454,20 @@ impl ServerRuntimeJobExecutor {
                 "state": child.state,
                 "subject_key": child.subject.subject_key,
             }),
-        )))
+        ));
+        if let Some(submission) = child_submission {
+            result = result.with_artifact(ActivityArtifact::new(
+                "child_submission",
+                json!({
+                    "workflow_id": submission.workflow_id,
+                    "accepted": submission.accepted,
+                    "decision_id": submission.decision_id,
+                    "command_ids": submission.command_ids,
+                    "rejection_reason": submission.rejection_reason,
+                }),
+            ));
+        }
+        Ok(result)
     }
 
     async fn execute_mark_bound_issue_done(
@@ -837,6 +889,21 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "retry_policy": "runtime_retry_policy may retry this activity before failure."
             }
         }),
+        ("repo_backlog", "poll_repo_backlog") => json!({
+            "on_succeeded": {
+                "reducer_next_state": "dispatching_when_IssueDiscovered_signals_exist_else_idle",
+                "accepted_signals": ["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound"],
+                "required_summary": "Describe the GitHub issue query, existing workflow checks, and new issue workflow candidates."
+            },
+            "structured_decision": {
+                "optional": true,
+                "description": "A workflow_decision artifact may propose start_child_workflow commands, but IssueDiscovered signals are sufficient."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
         ("github_issue_pr", "implement_issue") => json!({
             "on_succeeded": {
                 "reducer_next_state": "unchanged_until_pr_detected",
@@ -917,6 +984,21 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 "FeedbackFound": "Use when actionable feedback, requested changes, or failed checks require a fix round.",
                 "NoFeedbackFound": "Use when no actionable feedback is present yet.",
                 "PrReadyToMerge": "Use only when review, checks, and mergeability are all ready."
+            }
+        }),
+        ("repo_backlog", "poll_repo_backlog") => json!({
+            "must_include": ["repo and label queried", "open issues inspected", "existing workflow checks", "new issue workflow candidates", "next workflow action"],
+            "must_not_include": ["repository code changes", "workflow table mutations", "server-side GitHub polling changes"],
+            "signals": {
+                "IssueDiscovered": "Use for each open GitHub issue that needs a child github_issue_pr workflow. Include issue_number, issue_url, repo, title, and labels when available.",
+                "IssueSkipped": "Use for open GitHub issues that already have a workflow, are PRs, or should not be started. Include issue_number and reason.",
+                "NoOpenIssueFound": "Use when the repo/label query found no candidate issues."
+            },
+            "artifacts": {
+                "workflow_decision": {
+                    "optional": true,
+                    "allowed_decisions": ["start_issue_workflows_from_scan", "finish_repo_backlog_scan"]
+                }
             }
         }),
         (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => json!({
@@ -1167,6 +1249,37 @@ fn required_string<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str>
         .ok_or_else(|| anyhow::anyhow!("start_child_workflow `{field}` is missing"))
 }
 
+fn optional_string(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn string_vec(value: &Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn force_execute_from_project_policy(project_id: &str, labels: &[String]) -> bool {
+    let workflow_cfg = harness_core::config::workflow::load_workflow_config(Path::new(project_id))
+        .unwrap_or_default();
+    labels
+        .iter()
+        .any(|label| label == &workflow_cfg.issue_workflow.force_execute_label)
+}
+
 fn required_data_string<'a>(
     workflow: &'a WorkflowInstance,
     field: &str,
@@ -1328,6 +1441,42 @@ mod tests {
             .expect("allowed transitions should be an array")
             .iter()
             .any(|transition| transition["next_state"] == "passed"));
+    }
+
+    #[test]
+    fn activity_result_schema_describes_repo_backlog_poll_contract() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "poll_repo_backlog"
+            }),
+        );
+        let workflow = WorkflowInstance::new(
+            "repo_backlog",
+            1,
+            "scanning",
+            WorkflowSubject::new("repo", "owner/repo"),
+        )
+        .with_id("repo-backlog-1");
+
+        let schema = activity_result_schema(&job, Some(&workflow));
+
+        assert_eq!(schema["workflow_definition"], "repo_backlog");
+        assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
+            "IssueDiscovered"
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["signals"]["IssueDiscovered"],
+            "Use for each open GitHub issue that needs a child github_issue_pr workflow. Include issue_number, issue_url, repo, title, and labels when available."
+        );
+        assert!(schema["workflow_decision_contract"]["allowed_transitions"]
+            .as_array()
+            .expect("allowed transitions should be an array")
+            .iter()
+            .any(|transition| transition["next_state"] == "dispatching"));
     }
 
     #[test]

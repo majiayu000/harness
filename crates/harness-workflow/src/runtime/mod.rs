@@ -49,9 +49,10 @@ pub use reducer::{
 };
 pub use repo_backlog::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,
-    build_stale_active_workflow_decision, repo_backlog_workflow_id, MergedPrDecisionInput,
-    OpenIssueDecisionInput, RepoBacklogDecisionOutput, RepoBacklogWorkflowAction,
-    StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID,
+    build_repo_backlog_poll_decision, build_stale_active_workflow_decision,
+    repo_backlog_workflow_id, MergedPrDecisionInput, OpenIssueDecisionInput,
+    RepoBacklogDecisionOutput, RepoBacklogPollDecisionInput, RepoBacklogWorkflowAction,
+    StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
 };
 pub use store::WorkflowRuntimeStore;
 pub use submission::{

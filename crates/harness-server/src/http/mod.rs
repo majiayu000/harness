@@ -181,6 +181,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // workflow command outbox rows instead of legacy PR tasks.
     background::spawn_runtime_pr_feedback_sweeper(&state);
 
+    // Periodically ask repo backlog workflows to scan GitHub through runtime
+    // jobs so GitHub intake becomes workflow-owned when the runtime is enabled.
+    background::spawn_runtime_repo_backlog_poller(&state);
+
     // Convert workflow command outbox rows into runtime jobs when the workflow
     // policy keeps the dispatcher enabled.
     background::spawn_runtime_command_dispatcher(&state);
@@ -223,6 +227,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         )),
         state.intake.feishu_intake.clone(),
         github_sources,
+        state.intake.legacy_github_fallback_enabled,
         state.core.server.config.server.github_token.clone(),
     )
     .start(state.clone());

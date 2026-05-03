@@ -6,6 +6,10 @@ pr_feedback:
   enabled: true
   sweep_interval_secs: 60
   claim_stale_after_secs: 300
+repo_backlog:
+  enabled: true
+  poll_interval_secs: 60
+  batch_limit: 128
 runtime_dispatch:
   enabled: true
   interval_secs: 30
@@ -45,6 +49,17 @@ Current externally configurable rules:
   - Maximum age for a `feedback_claimed` placeholder before the sweeper reclaims it
     after an interrupted enqueue path. This does not reclaim live
     `addressing_feedback` tasks with a real `active_task_id`.
+
+- `repo_backlog.enabled`
+  - Enables workflow-owned GitHub backlog polling. When the workflow runtime,
+    dispatcher, and worker are enabled, GitHub issue intake is delegated to the
+    `repo_backlog` workflow instead of the legacy server poller.
+
+- `repo_backlog.poll_interval_secs`
+  - Background interval for requesting repo backlog scan activities.
+
+- `repo_backlog.batch_limit`
+  - Maximum configured GitHub repos considered by the repo backlog poller per tick.
 
 - `runtime_dispatch.enabled`
   - Enables the workflow command outbox dispatcher. It is enabled by default

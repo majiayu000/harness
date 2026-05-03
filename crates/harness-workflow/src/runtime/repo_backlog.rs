@@ -1,12 +1,23 @@
-use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, WorkflowInstance};
+use super::model::{
+    WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
+};
 
 pub const REPO_BACKLOG_DEFINITION_ID: &str = "repo_backlog";
+pub const REPO_BACKLOG_POLL_ACTIVITY: &str = "poll_repo_backlog";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoBacklogWorkflowAction {
+    PollBacklog,
     StartIssueWorkflow,
     MarkBoundIssueDone,
     RequestRecovery,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RepoBacklogPollDecisionInput<'a> {
+    pub repo: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub dedupe_key: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +52,42 @@ pub struct RepoBacklogDecisionOutput {
 
 pub fn repo_backlog_workflow_id(project_id: &str, repo: Option<&str>) -> String {
     format!("{project_id}::repo:{}::backlog", repo.unwrap_or("<none>"))
+}
+
+pub fn build_repo_backlog_poll_decision(
+    instance: &WorkflowInstance,
+    input: RepoBacklogPollDecisionInput<'_>,
+) -> RepoBacklogDecisionOutput {
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "poll_repo_backlog",
+        "scanning",
+        "repo backlog polling should be executed by a runtime agent",
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        input.dedupe_key,
+        serde_json::json!({
+            "activity": REPO_BACKLOG_POLL_ACTIVITY,
+            "repo": input.repo,
+            "label": input.label,
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "repo_backlog_poll",
+        format!(
+            "repo={} label={}",
+            repo_key(input.repo),
+            input.label.unwrap_or("<none>")
+        ),
+    ))
+    .high_confidence();
+
+    RepoBacklogDecisionOutput {
+        action: RepoBacklogWorkflowAction::PollBacklog,
+        decision,
+    }
 }
 
 pub fn build_open_issue_without_workflow_decision(

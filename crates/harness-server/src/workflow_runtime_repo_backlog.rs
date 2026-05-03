@@ -1,10 +1,11 @@
 use harness_workflow::issue_lifecycle::IssueWorkflowStore;
 use harness_workflow::runtime::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,
-    build_stale_active_workflow_decision, repo_backlog_workflow_id, DecisionValidator,
-    MergedPrDecisionInput, OpenIssueDecisionInput, StaleWorkflowDecisionInput, ValidationContext,
-    WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject, REPO_BACKLOG_DEFINITION_ID,
+    build_repo_backlog_poll_decision, build_stale_active_workflow_decision,
+    repo_backlog_workflow_id, DecisionValidator, MergedPrDecisionInput, OpenIssueDecisionInput,
+    RepoBacklogPollDecisionInput, StaleWorkflowDecisionInput, ValidationContext, WorkflowDecision,
+    WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
+    WorkflowSubject, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -32,6 +33,39 @@ pub(crate) struct StaleWorkflowRuntimeContext<'a> {
     pub active_task_id: Option<&'a str>,
     pub observed_state: &'a str,
     pub reason: &'a str,
+}
+
+pub(crate) struct RepoBacklogPollRuntimeContext<'a> {
+    pub project_root: &'a Path,
+    pub repo: Option<&'a str>,
+    pub label: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoBacklogPollRequestOutcome {
+    Requested { workflow_id: String },
+    ActiveCommandExists { workflow_id: String },
+    NotCandidate { workflow_id: String, state: String },
+    Rejected { workflow_id: String, reason: String },
+}
+
+pub(crate) async fn request_repo_backlog_poll(
+    store: &WorkflowRuntimeStore,
+    ctx: RepoBacklogPollRuntimeContext<'_>,
+) -> anyhow::Result<RepoBacklogPollRequestOutcome> {
+    let instance = load_or_repo_backlog_instance(store, ctx.project_root, ctx.repo).await?;
+    if instance.state != "idle" {
+        return Ok(RepoBacklogPollRequestOutcome::NotCandidate {
+            workflow_id: instance.id,
+            state: instance.state,
+        });
+    }
+    if has_active_repo_backlog_poll_command(store, &instance.id).await? {
+        return Ok(RepoBacklogPollRequestOutcome::ActiveCommandExists {
+            workflow_id: instance.id,
+        });
+    }
+    persist_repo_backlog_poll_request(store, instance, &ctx).await
 }
 
 pub(crate) async fn record_open_issue_without_workflow(
@@ -100,6 +134,55 @@ pub(crate) async fn record_stale_active_workflow(
             "workflow runtime repo backlog recovery write failed: {error}"
         );
     }
+}
+
+async fn persist_repo_backlog_poll_request(
+    store: &WorkflowRuntimeStore,
+    mut instance: WorkflowInstance,
+    ctx: &RepoBacklogPollRuntimeContext<'_>,
+) -> anyhow::Result<RepoBacklogPollRequestOutcome> {
+    instance.data = merge_repo_data(
+        instance.data,
+        ctx.project_root,
+        ctx.repo,
+        json!({
+            "label": ctx.label,
+        }),
+    );
+    store.upsert_instance(&instance).await?;
+    let event = store
+        .append_event(
+            &instance.id,
+            "RepoBacklogPollRequested",
+            "workflow_runtime_repo_backlog",
+            json!({
+                "repo": ctx.repo,
+                "label": ctx.label,
+            }),
+        )
+        .await?;
+    let output = build_repo_backlog_poll_decision(
+        &instance,
+        RepoBacklogPollDecisionInput {
+            repo: ctx.repo,
+            label: ctx.label,
+            dedupe_key: &format!("repo-backlog-poll:{}:{}", instance.id, event.id),
+        },
+    );
+    let outcome =
+        apply_decision_with_outcome(store, instance, output.decision, Some(event.id)).await?;
+    Ok(match outcome {
+        ApplyDecisionOutcome::Accepted { workflow_id } => {
+            RepoBacklogPollRequestOutcome::Requested { workflow_id }
+        }
+        ApplyDecisionOutcome::Rejected {
+            workflow_id,
+            reason,
+        } => RepoBacklogPollRequestOutcome::Rejected {
+            workflow_id,
+            reason,
+        },
+    })
 }
 
 async fn persist_open_issue_without_workflow(
@@ -256,10 +339,26 @@ async fn load_or_repo_backlog_instance(
 
 async fn apply_decision(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     decision: WorkflowDecision,
     event_id: Option<String>,
 ) -> anyhow::Result<()> {
+    apply_decision_with_outcome(store, instance, decision, event_id)
+        .await
+        .map(|_| ())
+}
+
+enum ApplyDecisionOutcome {
+    Accepted { workflow_id: String },
+    Rejected { workflow_id: String, reason: String },
+}
+
+async fn apply_decision_with_outcome(
+    store: &WorkflowRuntimeStore,
+    mut instance: WorkflowInstance,
+    decision: WorkflowDecision,
+    event_id: Option<String>,
+) -> anyhow::Result<ApplyDecisionOutcome> {
     let validation = DecisionValidator::repo_backlog().validate(
         &instance,
         &decision,
@@ -271,7 +370,10 @@ async fn apply_decision(
             let reason = error.to_string();
             let record = WorkflowDecisionRecord::rejected(decision, event_id, &reason);
             store.record_decision(&record).await?;
-            return Ok(());
+            return Ok(ApplyDecisionOutcome::Rejected {
+                workflow_id: instance.id,
+                reason,
+            });
         }
     };
     store.record_decision(&record).await?;
@@ -283,7 +385,23 @@ async fn apply_decision(
     instance.state = decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
     instance.data = merge_last_decision(instance.data, &decision.decision);
-    store.upsert_instance(&instance).await
+    let workflow_id = instance.id.clone();
+    store.upsert_instance(&instance).await?;
+    Ok(ApplyDecisionOutcome::Accepted { workflow_id })
+}
+
+async fn has_active_repo_backlog_poll_command(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(store
+        .commands_for(workflow_id)
+        .await?
+        .into_iter()
+        .any(|record| {
+            matches!(record.status.as_str(), "pending" | "dispatched")
+                && record.command.activity_name() == Some(REPO_BACKLOG_POLL_ACTIVITY)
+        }))
 }
 
 async fn upsert_repo_backlog_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
@@ -369,6 +487,67 @@ mod tests {
         assert_eq!(
             store.events_for(&workflow_id).await?[0].event_type,
             "IssueDiscovered"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repo_backlog_poll_request_records_runtime_command() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = match open_runtime_store(dir.path()).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+
+        let outcome = request_repo_backlog_poll(
+            &store,
+            RepoBacklogPollRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                label: Some("harness"),
+            },
+        )
+        .await?;
+
+        let workflow_id =
+            repo_backlog_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"));
+        assert_eq!(
+            outcome,
+            RepoBacklogPollRequestOutcome::Requested {
+                workflow_id: workflow_id.clone()
+            }
+        );
+        let instance = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("repo backlog workflow instance should be persisted");
+        assert_eq!(instance.state, "scanning");
+        assert_eq!(instance.data["label"], "harness");
+        assert_eq!(instance.data["last_decision"], "poll_repo_backlog");
+        let commands = store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].command.activity_name(),
+            Some(REPO_BACKLOG_POLL_ACTIVITY)
+        );
+
+        let second = request_repo_backlog_poll(
+            &store,
+            RepoBacklogPollRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                label: Some("harness"),
+            },
+        )
+        .await?;
+        assert_eq!(
+            second,
+            RepoBacklogPollRequestOutcome::NotCandidate {
+                workflow_id,
+                state: "scanning".to_string()
+            }
         );
         Ok(())
     }
