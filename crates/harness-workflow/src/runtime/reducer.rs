@@ -175,12 +175,18 @@ fn repo_backlog_poll_decision_from_activity_result(
     let parent_repo = optional_data_string(instance, "repo");
     let discovered =
         issue_candidates_from_signals(result, "IssueDiscovered", parent_repo.as_deref());
+    let known_dependencies =
+        known_dependency_candidates_from_skipped_signals(result, parent_repo.as_deref());
 
     if discovered.is_empty() {
         return None;
     }
 
     let issue_payloads = discovered
+        .iter()
+        .map(RepoBacklogIssueCandidate::to_command_value)
+        .collect::<Vec<_>>();
+    let known_dependency_payloads = known_dependencies
         .iter()
         .map(RepoBacklogIssueCandidate::to_command_value)
         .collect::<Vec<_>>();
@@ -201,6 +207,7 @@ fn repo_backlog_poll_decision_from_activity_result(
             "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
             "repo": parent_repo,
             "issues": issue_payloads,
+            "known_dependencies": known_dependency_payloads,
         }),
     ))
     .with_evidence(runtime_completion_evidence(event, result));
@@ -230,11 +237,10 @@ fn repo_backlog_sprint_plan_decision_from_activity_result(
     }
 
     let parent_repo = optional_data_string(instance, "repo");
-    let selected = normalize_selected_sprint_dependencies(sprint_plan_selected_issues(
-        result,
-        event,
-        parent_repo.as_deref(),
-    ));
+    let selected = normalize_selected_sprint_dependencies(
+        sprint_plan_selected_issues(result, event, parent_repo.as_deref()),
+        &sprint_plan_known_dependency_inputs(event, parent_repo.as_deref()),
+    );
     if selected.is_empty() {
         return None;
     }
@@ -346,7 +352,9 @@ impl RepoBacklogIssueCandidate {
         if !labels.is_empty() {
             candidate.labels = labels;
         }
-        candidate.depends_on = u64_array_field(value, "depends_on");
+        if value.get("depends_on").is_some() {
+            candidate.depends_on = u64_array_field(value, "depends_on");
+        }
         Some(candidate)
     }
 
@@ -357,7 +365,22 @@ impl RepoBacklogIssueCandidate {
             "issue_url": self.issue_url,
             "title": self.title,
             "labels": self.labels,
+            "depends_on": self.depends_on,
         })
+    }
+
+    fn merge_from(&mut self, other: Self) {
+        if self.repo.is_none() {
+            self.repo = other.repo;
+        }
+        if self.issue_url.is_none() {
+            self.issue_url = other.issue_url;
+        }
+        if self.title.is_none() {
+            self.title = other.title;
+        }
+        append_missing_strings(&mut self.labels, other.labels);
+        append_missing_u64s(&mut self.depends_on, other.depends_on);
     }
 
     fn github_issue_evidence(&self) -> WorkflowEvidence {
@@ -385,6 +408,42 @@ fn issue_candidates_from_signals(
         .collect()
 }
 
+fn known_dependency_candidates_from_skipped_signals(
+    result: &ActivityResult,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    result
+        .signals
+        .iter()
+        .filter(|signal| signal.signal_type == "IssueSkipped")
+        .filter(|signal| skipped_issue_has_known_workflow(&signal.signal))
+        .filter_map(|signal| RepoBacklogIssueCandidate::from_value(&signal.signal, parent_repo))
+        .collect()
+}
+
+fn skipped_issue_has_known_workflow(value: &Value) -> bool {
+    value
+        .get("existing_workflow")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("has_workflow")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || value
+            .get("workflow_state")
+            .and_then(non_empty_json_string)
+            .is_some()
+        || value
+            .get("runtime_workflow_state")
+            .and_then(non_empty_json_string)
+            .is_some()
+        || value
+            .get("issue_workflow_state")
+            .and_then(non_empty_json_string)
+            .is_some()
+}
+
 fn sprint_plan_selected_issues(
     result: &ActivityResult,
     event: &WorkflowEvent,
@@ -399,6 +458,28 @@ fn sprint_plan_selected_issues(
         parent_repo,
     ));
     dedupe_issue_candidates(selected)
+}
+
+fn sprint_plan_known_dependency_inputs(
+    event: &WorkflowEvent,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    event_workflow_command(event)
+        .and_then(|command| {
+            command
+                .command
+                .get("known_dependencies")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|value| {
+                            RepoBacklogIssueCandidate::from_value(value, parent_repo)
+                        })
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
 }
 
 fn sprint_plan_candidate_inputs(
@@ -470,23 +551,28 @@ fn sprint_plan_selected_artifacts(
 fn dedupe_issue_candidates(
     candidates: Vec<RepoBacklogIssueCandidate>,
 ) -> Vec<RepoBacklogIssueCandidate> {
-    let mut seen = std::collections::BTreeSet::new();
-    candidates
-        .into_iter()
-        .filter(|candidate| {
-            let key = (
-                candidate.repo.clone().unwrap_or_default(),
-                candidate.issue_number,
-            );
-            seen.insert(key)
-        })
-        .collect()
+    let mut index_by_key = std::collections::BTreeMap::<(String, u64), usize>::new();
+    let mut merged = Vec::<RepoBacklogIssueCandidate>::new();
+    for candidate in candidates {
+        let key = (
+            candidate.repo.clone().unwrap_or_default(),
+            candidate.issue_number,
+        );
+        if let Some(index) = index_by_key.get(&key).copied() {
+            merged[index].merge_from(candidate);
+        } else {
+            index_by_key.insert(key, merged.len());
+            merged.push(candidate);
+        }
+    }
+    merged
 }
 
 fn normalize_selected_sprint_dependencies(
     mut candidates: Vec<RepoBacklogIssueCandidate>,
+    known_dependencies: &[RepoBacklogIssueCandidate],
 ) -> Vec<RepoBacklogIssueCandidate> {
-    let selected: std::collections::BTreeSet<_> = candidates
+    let mut valid_dependencies: std::collections::BTreeSet<_> = candidates
         .iter()
         .map(|candidate| {
             (
@@ -495,6 +581,12 @@ fn normalize_selected_sprint_dependencies(
             )
         })
         .collect();
+    valid_dependencies.extend(known_dependencies.iter().map(|candidate| {
+        (
+            candidate.repo.clone().unwrap_or_default(),
+            candidate.issue_number,
+        )
+    }));
 
     for candidate in &mut candidates {
         let repo = candidate.repo.clone().unwrap_or_default();
@@ -502,12 +594,28 @@ fn normalize_selected_sprint_dependencies(
         let issue_number = candidate.issue_number;
         candidate.depends_on.retain(|dependency| {
             *dependency != issue_number
-                && selected.contains(&(repo.clone(), *dependency))
+                && valid_dependencies.contains(&(repo.clone(), *dependency))
                 && seen.insert(*dependency)
         });
     }
 
     candidates
+}
+
+fn append_missing_strings(target: &mut Vec<String>, values: Vec<String>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+fn append_missing_u64s(target: &mut Vec<u64>, values: Vec<u64>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
 }
 
 fn structured_decision_validates(

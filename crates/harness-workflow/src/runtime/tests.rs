@@ -1443,6 +1443,15 @@ fn runtime_completion_reducer_dispatches_repo_backlog_issue_signals() {
         "Found one open issue without a runtime workflow.",
     )
     .with_signal(ActivitySignal::new(
+        "IssueSkipped",
+        json!({
+            "issue_number": 41,
+            "repo": "owner/repo",
+            "reason": "already has a runtime workflow",
+            "workflow_state": "implementing"
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
         "IssueDiscovered",
         json!({
             "issue_number": "42",
@@ -1481,6 +1490,10 @@ fn runtime_completion_reducer_dispatches_repo_backlog_issue_signals() {
     assert_eq!(
         decision.commands[0].command["issues"][0]["labels"][0],
         "harness"
+    );
+    assert_eq!(
+        decision.commands[0].command["known_dependencies"][0]["issue_number"],
+        41
     );
     DecisionValidator::repo_backlog()
         .validate(
@@ -1676,6 +1689,191 @@ fn runtime_completion_reducer_uses_scan_candidates_for_sprint_task_signal() {
     );
     assert_eq!(decision.commands[0].command["labels"][0], "runtime");
     assert_eq!(decision.commands[0].command["depends_on"], json!([]));
+}
+
+#[test]
+fn runtime_completion_reducer_preserves_candidate_dependencies_when_signal_omits_depends_on() {
+    let instance = repo_backlog_instance("planning_batch").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "repo-backlog:owner/repo:plan",
+        json!({
+            "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "issues": [
+                {
+                    "issue_number": 42,
+                    "issue_url": "https://github.com/owner/repo/issues/42",
+                    "labels": ["runtime"],
+                    "title": "Build base runtime"
+                },
+                {
+                    "issue_number": 43,
+                    "issue_url": "https://github.com/owner/repo/issues/43",
+                    "labels": ["runtime"],
+                    "title": "Build dependent runtime",
+                    "depends_on": [42]
+                }
+            ]
+        }),
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "Selected sprint tasks without repeating inherited dependencies.",
+    )
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({ "issue": 42 }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({ "issue": 43 }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("sprint task signals should start selected issue workflows");
+
+    let dependent = decision
+        .commands
+        .iter()
+        .find(|command| command.command["issue_number"] == json!(43))
+        .expect("dependent issue should be selected");
+    assert_eq!(dependent.command["depends_on"], json!([42]));
+}
+
+#[test]
+fn runtime_completion_reducer_merges_artifact_dependencies_when_signal_omits_depends_on() {
+    let instance = repo_backlog_instance("planning_batch").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "repo-backlog:owner/repo:plan",
+        json!({
+            "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "issues": [
+                {
+                    "issue_number": 42,
+                    "issue_url": "https://github.com/owner/repo/issues/42",
+                    "labels": ["runtime"],
+                    "title": "Build base runtime"
+                },
+                {
+                    "issue_number": 43,
+                    "issue_url": "https://github.com/owner/repo/issues/43",
+                    "labels": ["runtime"],
+                    "title": "Build dependent runtime"
+                }
+            ]
+        }),
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "Returned both selected signals and a sprint plan artifact.",
+    )
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({ "issue": 42 }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({ "issue": 43 }),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "sprint_plan",
+        json!({
+            "tasks": [{ "issue": 43, "depends_on": [42] }],
+            "skip": []
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("sprint plan should start selected issue workflows");
+
+    let dependent = decision
+        .commands
+        .iter()
+        .find(|command| command.command["issue_number"] == json!(43))
+        .expect("dependent issue should be selected");
+    assert_eq!(dependent.command["depends_on"], json!([42]));
+}
+
+#[test]
+fn runtime_completion_reducer_preserves_known_workflow_dependencies_outside_selection() {
+    let instance = repo_backlog_instance("planning_batch").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "repo-backlog:owner/repo:plan",
+        json!({
+            "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "issues": [{
+                "issue_number": 43,
+                "issue_url": "https://github.com/owner/repo/issues/43",
+                "labels": ["runtime"],
+                "title": "Build dependent runtime"
+            }],
+            "known_dependencies": [{
+                "issue_number": 42,
+                "repo": "owner/repo",
+                "workflow_state": "implementing"
+            }]
+        }),
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "Selected a task gated by an issue that already has a workflow.",
+    )
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({ "issue": 43, "depends_on": [42, 99] }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("sprint plan should start selected issue workflow");
+
+    assert_eq!(decision.commands[0].command["depends_on"], json!([42]));
 }
 
 #[test]

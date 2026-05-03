@@ -1006,7 +1006,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_not_include": ["repository code changes", "workflow table mutations", "server-side GitHub polling changes"],
             "signals": {
                 "IssueDiscovered": "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available.",
-                "IssueSkipped": "Use for open GitHub issues that already have a workflow, are PRs, or should not be started. Include issue_number and reason.",
+                "IssueSkipped": "Use for open GitHub issues that already have a workflow, are PRs, or should not be started. Include issue_number and reason. When an issue already has a workflow, include workflow_state.",
                 "NoOpenIssueFound": "Use when the repo/label query found no candidate issues."
             },
             "artifacts": {
