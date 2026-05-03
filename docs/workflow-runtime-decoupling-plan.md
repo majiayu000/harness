@@ -69,17 +69,36 @@ Implemented now:
 - issue `POST /tasks` submissions now write `github_issue_pr` workflow runtime state with
   `IssueSubmitted`, a validated `submit_issue` decision, and a pending `implement_issue`
   command that is dispatched to runtime jobs instead of the legacy task runner
+- prompt-only `POST /tasks` and batch task submissions now write `prompt_task` workflow runtime
+  state with `PromptSubmitted`, a validated `submit_prompt` decision, and a pending
+  `implement_prompt` command instead of registering legacy task runner rows
+- dashboard ready-to-merge issue cards can submit runtime merge approvals through the workflow
+  runtime API; the accepted `approve_merge` decision records `MergeApproved`, enqueues `mark_done`,
+  and moves the runtime workflow to `done`
 - runtime issue workflows with bound PRs now request `sweep_pr_feedback` through the workflow
   command outbox; runtime agents inspect GitHub and return structured `workflow_decision`
   artifacts or reducer-visible feedback signals
+- runtime issue workflows now start a `pr_feedback` child workflow for PR feedback inspection; the
+  child owns the `inspect_pr_feedback` runtime job and propagates structured results back to the
+  parent issue workflow
+- repo backlog polling now writes `RepoBacklogPollRequested`, a validated `poll_repo_backlog`
+  decision, and a pending runtime activity command; runtime agents inspect GitHub and return
+  `IssueDiscovered` signals or validated `workflow_decision` artifacts
+- repo backlog scans that discover candidate issues now transition to `planning_batch` and enqueue
+  a runtime-owned `plan_repo_sprint` activity before issue child workflows are started
+- runtime sprint plans return `SprintTaskSelected` signals or a `sprint_plan` artifact; the reducer
+  starts selected child workflows with dependency metadata instead of using the legacy sprint
+  planner task
+- when the workflow runtime, dispatcher, worker, and repo backlog policy are enabled, GitHub issue
+  intake is delegated to the `repo_backlog` workflow; the server no longer registers the legacy
+  GitHub poller fallback
+- when the workflow runtime, dispatcher, worker, and PR feedback policy are enabled, legacy
+  issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows and
+  request the runtime `pr_feedback` child workflow instead of registering a legacy `pr:N` task
 
 Still intentionally not moved yet:
 
-- repo backlog polling as the primary controller
-- prompt-only task submissions still use the existing task routes
-- legacy issue-workflow feedback fallback still uses existing PR task routes when no runtime
-  workflow exists
-- dashboard write actions still use existing task routes
+- non-runtime dashboard task actions still use existing task routes
 
 ## Non-Goals
 
@@ -240,6 +259,31 @@ Main outputs:
 - `QualityFailed`
 - `QualityBlocked`
 
+### `prompt_task`
+
+Purpose:
+
+- own a manually submitted prompt-only task
+- preserve prompt text, dependency metadata, source, and external correlation ids in workflow
+  runtime state
+- run implementation through runtime command dispatch instead of legacy task rows
+
+Main states:
+
+- `submitted`
+- `awaiting_dependencies`
+- `implementing`
+- `done`
+- `blocked`
+- `failed`
+- `cancelled`
+
+Main outputs:
+
+- `PromptSubmitted`
+- `PromptSubmissionCancelled`
+- `PromptImplemented`
+
 ## Data Model
 
 The durable bus uses Postgres tables:
@@ -386,10 +430,10 @@ Tests:
 
 ### Phase 3: PR Feedback Workflow
 
-Status: partially implemented.
+Status: implemented for runtime-owned feedback inspection.
 
-The current branch records PR feedback decisions into the workflow runtime while keeping the
-existing review loop as the execution path.
+The current branch records PR feedback decisions into the workflow runtime and routes runtime-owned
+feedback inspection through a dedicated child workflow.
 
 Implemented now:
 
@@ -398,33 +442,56 @@ Implemented now:
 - actionable review or validation failures record `FeedbackFound` / `address_pr_feedback`
 - approved reviews and graduated low-risk exits record `PrReadyToMerge` / `mark_ready_to_merge`
 - runtime `github_issue_pr` workflows with attached PRs are swept by a server background loop that
-  writes a validated `sweep_pr_feedback` decision and pending runtime command instead of enqueueing
-  a legacy `pr:N` task
-- `sweep_pr_feedback` runtime completions can advance the parent workflow through structured
+  writes a validated `sweep_pr_feedback` decision and starts a child `pr_feedback` workflow instead
+  of enqueueing a legacy `pr:N` task
+- legacy issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows
+  before requesting the same runtime `pr_feedback` child workflow when runtime feedback is enabled
+- child `pr_feedback` workflows enqueue `inspect_pr_feedback` runtime jobs with PR metadata
+- `inspect_pr_feedback` runtime completions update the child workflow and propagate the same
+  structured activity result to the parent issue workflow
+- propagated feedback completions can advance the parent workflow through structured
   `workflow_decision` artifacts or explicit feedback signals
 
 Still intentionally not moved yet:
 
 - legacy task-runner PR feedback still runs the existing review loop
-- `pr_feedback` is not yet a separate child workflow with its own runtime job
 
 Tests:
 
 - feedback report with blocking items moves parent workflow to `addressing_feedback`
 - no actionable feedback keeps parent workflow in `awaiting_feedback`
 - approved and checks-passed events can move parent workflow to `ready_to_merge`
-- runtime PR feedback sweep requests enqueue a `sweep_pr_feedback` command and suppress duplicate
-  active sweep commands
+- runtime PR feedback sweep requests start `pr_feedback` child workflows, enqueue
+  `inspect_pr_feedback`, and suppress duplicate active feedback inspection work
+- `inspect_pr_feedback` child completions update both child and parent workflow state
+- legacy issue-workflow feedback candidates can be adopted into runtime state and enqueue the
+  same runtime PR feedback child workflow
 
 ### Phase 4: Repo Backlog Workflow
 
-Status: partially implemented.
+Status: implemented for workflow-owned GitHub polling and runtime-owned sprint planning.
 
-The current branch records repo backlog decisions into the workflow runtime while keeping the
-existing intake poller, sprint planner, and reconciliation loop as the execution path.
+The current branch records repo backlog decisions into the workflow runtime. GitHub backlog poll
+requests are now workflow commands when runtime dispatch and workers are enabled. Candidate issues
+from a scan flow through a runtime-owned sprint planning activity before child issue workflows are
+started.
 
 Implemented now:
 
+- configured GitHub repos emit `RepoBacklogPollRequested` and a validated `poll_repo_backlog`
+  activity command instead of registering a legacy GitHub poller fallback when the runtime owns
+  repo backlog polling
+- runtime agents receive a `poll_repo_backlog` activity result contract and return
+  `IssueDiscovered`, `IssueSkipped`, or `NoOpenIssueFound` signals
+- `IssueDiscovered` signals from a successful repo backlog scan reduce to a validated
+  `plan_repo_sprint` activity command, so dependency planning runs as a workflow runtime job
+- `SprintTaskSelected` signals or a `sprint_plan` artifact from a successful runtime sprint plan
+  reduce to validated `start_child_workflow` commands; those child workflow commands auto-submit
+  the issue through the existing `submit_issue` decision so implementation continues through
+  runtime jobs
+- selected sprint dependencies are copied into child issue submissions so dependent issues wait in
+  `awaiting_dependencies` until the dependency release tick unblocks them
+- empty scans return the repo backlog workflow to `idle`
 - open GitHub issues without an existing issue workflow record `IssueDiscovered` and emit a
   validated `start_issue_workflow` child workflow command
 - externally merged PRs record `PrMerged`, emit `mark_bound_issue_done`, and update the bound
@@ -432,14 +499,16 @@ Implemented now:
 - startup recovery of stale active issue workflows records `RecoveryRequested` and emits
   `recover_issue_workflow`
 
-Still intentionally not moved yet:
-
-- GitHub polling still runs through the existing intake source implementations
-- sprint planning still uses the current task queue path
-- repo backlog polling still feeds workflow runtime decisions from existing server code
-
 Tests:
 
+- repo backlog poll decision starts runtime scan
+- runtime repo backlog poll tick enqueues a runtime command
+- runtime completion reducer turns `IssueDiscovered` signals into runtime sprint planning
+- runtime completion reducer dispatches `SprintTaskSelected` signals
+- runtime completion reducer idles after an empty repo backlog scan
+- runtime completion reducer idles after an empty runtime sprint plan
+- activity result schema describes the repo backlog poll contract
+- activity result schema describes the runtime sprint plan contract
 - open issue without workflow emits start command
 - merged PR updates the bound issue workflow
 - stale active workflow emits recovery event
@@ -461,12 +530,6 @@ Implemented now:
 - command outbox rows are automatically converted into runtime jobs by the server dispatch loop
 - server-owned runtime workers claim pending runtime jobs through registered agent runtimes
 
-Still intentionally not moved yet:
-
-- prompt-only submissions still use the current task executor
-- legacy issue-workflow feedback fallback still uses the current PR task executor when no runtime
-  workflow exists
-
 Tests:
 
 - runtime worker claims one job once
@@ -486,17 +549,26 @@ Implemented now:
 - each node includes events, decisions, command outbox rows, and runtime jobs
 - the dashboard active view shows a compact workflow runtime panel above the task kanban
 - rejected decisions display operator-readable reasons
+- runtime issue rows in `GET /tasks` expose a workflow summary so dashboard cards can group by
+  runtime workflow state
+- ready-to-merge runtime issue cards call `POST /api/workflows/runtime/merge`, which records a
+  validated `approve_merge` decision instead of relying on a legacy task row
+- non-terminal runtime issue and prompt workflows can be cancelled directly from the runtime tree;
+  the server records a validated cancellation decision and cancels unfinished commands/jobs
 
 Still intentionally not moved yet:
 
-- task cards and merge actions still use existing task endpoints
-- workflow runtime tree is read-only
+- non-runtime task cards still use existing task endpoints
 - command outbox rows are not yet the primary dispatch source for runtime jobs
 
 Tests:
 
 - workflow tree displays parent and child workflows
 - runtime jobs are visible under workflow activities
+- runtime issue rows expose workflow state in the task list
+- runtime dashboard merge approval records `MergeApproved`, `approve_merge`, and `mark_done`
+- runtime dashboard cancellation records a workflow runtime cancellation and refreshes the runtime
+  tree
 - rejected decisions show operator-readable reasons
 
 ### Phase 7: Command Outbox Dispatch
@@ -859,10 +931,10 @@ Tests:
 
 ### Phase 18: Workflow-First Task Submission
 
-Status: implemented for GitHub issue submissions.
+Status: implemented for GitHub issue and prompt-only submissions.
 
-Route operator GitHub issue submissions through the workflow runtime instead of the legacy task
-runner.
+Route operator GitHub issue submissions and prompt-only task submissions through the workflow
+runtime instead of the legacy task runner.
 
 Implemented now:
 
@@ -873,23 +945,48 @@ Implemented now:
 - the accepted decision writes an `implement_issue` command with task-scoped dedupe so explicit
   resubmissions create a new auditable workflow command
 - the command is left `pending` so the runtime dispatcher can materialize it into a runtime job
-- issue submission requires `WorkflowRuntimeStore`; missing runtime storage is a hard server error
-- issue submissions no longer register legacy task rows or call the legacy task runner
+- prompt-only `POST /tasks` submissions write a `PromptSubmitted` event to a `prompt_task`
+  workflow instance
+- prompt submission records a validated `submit_prompt` decision and an `implement_prompt` command
+  when dependencies are ready
+- prompt submissions with pending dependencies stay in `awaiting_dependencies` until the dependency
+  release tick records a new `submit_prompt` decision and enqueues `implement_prompt`
+- prompt runtime workflows are visible through `GET /tasks` and `GET /tasks/{id}` even though no
+  legacy task row exists
+- issue and prompt submissions require `WorkflowRuntimeStore`; missing runtime storage is a hard
+  server error for runtime-owned submissions
+- issue and prompt submissions no longer register legacy task rows or call the legacy task runner
+- legacy issue-workflow PR feedback candidates are routed to runtime feedback when runtime
+  feedback is enabled; the legacy PR task route remains only as the runtime-disabled fallback
+- issue and prompt submission responses include the runtime `workflow_id`, so dashboard actions can
+  address the workflow runtime API directly instead of treating the returned `task_id` as a legacy
+  task-row handle
+- the submit-success cancel action calls `POST /api/workflows/runtime/cancel` when the submission
+  response includes a runtime workflow handle
+- worktree cards carry runtime workflow handles from `GET /tasks` and cancel through
+  `POST /api/workflows/runtime/cancel` for runtime-backed issue and prompt submissions
 
 Still intentionally not moved yet:
 
-- prompt-only submissions remain task-runner native
-- legacy issue-workflow PR feedback remains on the existing PR feedback sweep/task path when no
-  runtime workflow exists
-- the `task_id` returned for issue submissions is now a workflow submission correlation id, not a
-  legacy task row id
+- the `task_id` returned for issue and prompt submissions remains a workflow submission correlation
+  id for stream/detail compatibility, not a legacy task row id
 
 Tests:
 
 - issue submission decisions validate in the workflow contract layer
 - failed issue workflows can be explicitly reopened by operator submission
-- server submission tracking records `IssueSubmitted`, scheduled state, and a pending
+- server submission tracking records `IssueSubmitted`, `implementing` state, and a pending
   `implement_issue` command without registering a legacy task row
+- prompt submission decisions validate in the workflow contract layer
+- prompt submission tracking records `PromptSubmitted`, `implementing` state, and a pending
+  `implement_prompt` command without registering a legacy task row
+- prompt submissions wait for dependencies and release to `implementing` once dependencies are done
+- task creation, task listing, task detail, and task batch APIs expose runtime prompt submissions
+  with `execution_path = workflow_runtime`
+- task creation and task batch APIs expose runtime `workflow_id`
+- submit-success cancellation uses the runtime workflow endpoint when `workflow_id` is available
+- runtime prompt task summaries expose workflow metadata for dashboard/worktree runtime actions
+- worktree cancellation uses the runtime workflow endpoint for runtime-backed cards
 
 ## Test Strategy
 
