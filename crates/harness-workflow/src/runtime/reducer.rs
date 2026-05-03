@@ -4,7 +4,9 @@ use super::model::{
 };
 use super::pr_feedback::{build_pr_feedback_decision, PrFeedbackDecisionInput, PrFeedbackOutcome};
 use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
-use super::repo_backlog::{REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY};
+use super::repo_backlog::{
+    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+};
 use super::validator::{DecisionValidator, ValidationContext};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
@@ -65,6 +67,12 @@ fn reduce_success(
         return Some(decision);
     }
 
+    if let Some(decision) =
+        repo_backlog_sprint_plan_decision_from_activity_result(instance, event, result)
+    {
+        return Some(decision);
+    }
+
     if repo_backlog_child_dispatch_still_active(instance, event) {
         return None;
     }
@@ -111,6 +119,11 @@ fn reduce_success(
             "idle",
             "finish_repo_backlog_scan",
             "repo backlog scan completed without new child workflow commands",
+        ),
+        (REPO_BACKLOG_DEFINITION_ID, "planning_batch", REPO_BACKLOG_SPRINT_PLAN_ACTIVITY) => (
+            "idle",
+            "finish_repo_sprint_plan",
+            "repo sprint planning completed without selected issue workflow commands",
         ),
         (QUALITY_GATE_DEFINITION_ID, "checking", QUALITY_GATE_ACTIVITY) => (
             "passed",
@@ -160,93 +173,449 @@ fn repo_backlog_poll_decision_from_activity_result(
     }
 
     let parent_repo = optional_data_string(instance, "repo");
-    let discovered = result
-        .signals
-        .iter()
-        .filter(|signal| signal.signal_type == "IssueDiscovered")
-        .filter_map(|signal| {
-            let issue_number = signal.signal.get("issue_number").and_then(json_value_u64)?;
-            let repo = signal
-                .signal
-                .get("repo")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned)
-                .or_else(|| parent_repo.clone());
-            let issue_url = signal
-                .signal
-                .get("issue_url")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned);
-            let title = signal
-                .signal
-                .get("title")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned);
-            let labels = signal
-                .signal
-                .get("labels")
-                .and_then(|value| value.as_array())
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str())
-                        .filter(|value| !value.trim().is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            Some((issue_number, repo, issue_url, title, labels))
-        })
-        .collect::<Vec<_>>();
+    let discovered =
+        issue_candidates_from_signals(result, "IssueDiscovered", parent_repo.as_deref());
+    let known_dependencies =
+        known_dependency_candidates_from_skipped_signals(result, parent_repo.as_deref());
 
     if discovered.is_empty() {
+        return None;
+    }
+
+    let issue_payloads = discovered
+        .iter()
+        .map(RepoBacklogIssueCandidate::to_command_value)
+        .collect::<Vec<_>>();
+    let known_dependency_payloads = known_dependencies
+        .iter()
+        .map(RepoBacklogIssueCandidate::to_command_value)
+        .collect::<Vec<_>>();
+    let mut decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "plan_repo_sprint_from_scan",
+        "planning_batch",
+        format!(
+            "repo backlog scan discovered {} open issue(s); runtime sprint planning must select dispatch order",
+            discovered.len()
+        ),
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        format!("runtime-completion:{}:plan-repo-sprint", event.id),
+        json!({
+            "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "repo": parent_repo,
+            "issues": issue_payloads,
+            "known_dependencies": known_dependency_payloads,
+        }),
+    ))
+    .with_evidence(runtime_completion_evidence(event, result));
+
+    for candidate in discovered {
+        decision = decision.with_evidence(candidate.github_issue_evidence());
+    }
+
+    Some(decision.high_confidence())
+}
+
+fn repo_backlog_sprint_plan_decision_from_activity_result(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        REPO_BACKLOG_DEFINITION_ID,
+        "planning_batch",
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    ) {
+        return None;
+    }
+
+    let parent_repo = optional_data_string(instance, "repo");
+    let selected = normalize_selected_sprint_dependencies(
+        sprint_plan_selected_issues(result, event, parent_repo.as_deref()),
+        &sprint_plan_known_dependency_inputs(event, parent_repo.as_deref()),
+    );
+    if selected.is_empty() {
         return None;
     }
 
     let mut decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
-        "start_issue_workflows_from_scan",
+        "start_issue_workflows_from_sprint_plan",
         "dispatching",
         format!(
-            "repo backlog scan discovered {} open issue(s) without runtime workflows",
-            discovered.len()
+            "runtime sprint planner selected {} issue workflow(s) for dispatch",
+            selected.len()
         ),
     )
     .with_evidence(runtime_completion_evidence(event, result));
 
-    for (issue_number, repo, issue_url, title, labels) in discovered {
-        let repo_key = repo.as_deref().unwrap_or("<none>");
+    for candidate in selected {
+        let issue_number = candidate.issue_number;
+        let repo_key = candidate.repo.as_deref().unwrap_or("<none>");
         decision = decision
             .with_command(WorkflowCommand::new(
                 WorkflowCommandType::StartChildWorkflow,
-                format!("repo-backlog-scan:{repo_key}:issue:{issue_number}:start"),
+                format!("repo-sprint-plan:{repo_key}:issue:{issue_number}:start"),
                 json!({
                     "definition_id": "github_issue_pr",
                     "subject_key": format!("issue:{issue_number}"),
-                    "repo": repo,
+                    "repo": candidate.repo,
                     "issue_number": issue_number,
-                    "issue_url": issue_url.clone(),
-                    "title": title,
-                    "labels": labels,
+                    "issue_url": candidate.issue_url,
+                    "title": candidate.title,
+                    "labels": candidate.labels,
+                    "depends_on": candidate.depends_on,
                     "source": "github",
                     "external_id": issue_number.to_string(),
                     "auto_submit": true,
                 }),
             ))
-            .with_evidence(WorkflowEvidence::new(
-                "github_issue",
-                match issue_url {
-                    Some(url) => format!("repo={repo_key} issue={issue_number} url={url}"),
-                    None => format!("repo={repo_key} issue={issue_number}"),
-                },
-            ));
+            .with_evidence(candidate.github_issue_evidence());
     }
 
     Some(decision.high_confidence())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoBacklogIssueCandidate {
+    issue_number: u64,
+    repo: Option<String>,
+    issue_url: Option<String>,
+    title: Option<String>,
+    labels: Vec<String>,
+    depends_on: Vec<u64>,
+}
+
+impl RepoBacklogIssueCandidate {
+    fn from_value(value: &Value, parent_repo: Option<&str>) -> Option<Self> {
+        let issue_number = value
+            .get("issue_number")
+            .or_else(|| value.get("issue"))
+            .and_then(json_value_u64)?;
+        let repo = value
+            .get("repo")
+            .and_then(non_empty_json_string)
+            .or_else(|| parent_repo.map(ToOwned::to_owned));
+        let issue_url = value.get("issue_url").and_then(non_empty_json_string);
+        let title = value.get("title").and_then(non_empty_json_string);
+        let labels = string_array_field(value, "labels");
+        let depends_on = u64_array_field(value, "depends_on");
+        Some(Self {
+            issue_number,
+            repo,
+            issue_url,
+            title,
+            labels,
+            depends_on,
+        })
+    }
+
+    fn from_sprint_task(
+        value: &Value,
+        candidates: &[Self],
+        parent_repo: Option<&str>,
+    ) -> Option<Self> {
+        let issue_number = value
+            .get("issue_number")
+            .or_else(|| value.get("issue"))
+            .and_then(json_value_u64)?;
+        let mut candidate = candidates
+            .iter()
+            .find(|candidate| candidate.issue_number == issue_number)
+            .cloned()
+            .unwrap_or(Self {
+                issue_number,
+                repo: parent_repo.map(ToOwned::to_owned),
+                issue_url: None,
+                title: None,
+                labels: Vec::new(),
+                depends_on: Vec::new(),
+            });
+        if let Some(repo) = value.get("repo").and_then(non_empty_json_string) {
+            candidate.repo = Some(repo);
+        }
+        if let Some(issue_url) = value.get("issue_url").and_then(non_empty_json_string) {
+            candidate.issue_url = Some(issue_url);
+        }
+        if let Some(title) = value.get("title").and_then(non_empty_json_string) {
+            candidate.title = Some(title);
+        }
+        let labels = string_array_field(value, "labels");
+        if !labels.is_empty() {
+            candidate.labels = labels;
+        }
+        if value.get("depends_on").is_some() {
+            candidate.depends_on = u64_array_field(value, "depends_on");
+        }
+        Some(candidate)
+    }
+
+    fn to_command_value(&self) -> Value {
+        json!({
+            "issue_number": self.issue_number,
+            "repo": self.repo,
+            "issue_url": self.issue_url,
+            "title": self.title,
+            "labels": self.labels,
+            "depends_on": self.depends_on,
+        })
+    }
+
+    fn merge_from(&mut self, other: Self) {
+        if self.repo.is_none() {
+            self.repo = other.repo;
+        }
+        if self.issue_url.is_none() {
+            self.issue_url = other.issue_url;
+        }
+        if self.title.is_none() {
+            self.title = other.title;
+        }
+        append_missing_strings(&mut self.labels, other.labels);
+        append_missing_u64s(&mut self.depends_on, other.depends_on);
+    }
+
+    fn github_issue_evidence(&self) -> WorkflowEvidence {
+        let repo_key = self.repo.as_deref().unwrap_or("<none>");
+        WorkflowEvidence::new(
+            "github_issue",
+            match self.issue_url.as_deref() {
+                Some(url) => format!("repo={repo_key} issue={} url={url}", self.issue_number),
+                None => format!("repo={repo_key} issue={}", self.issue_number),
+            },
+        )
+    }
+}
+
+fn issue_candidates_from_signals(
+    result: &ActivityResult,
+    signal_type: &str,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    result
+        .signals
+        .iter()
+        .filter(|signal| signal.signal_type == signal_type)
+        .filter_map(|signal| RepoBacklogIssueCandidate::from_value(&signal.signal, parent_repo))
+        .collect()
+}
+
+fn known_dependency_candidates_from_skipped_signals(
+    result: &ActivityResult,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    result
+        .signals
+        .iter()
+        .filter(|signal| signal.signal_type == "IssueSkipped")
+        .filter(|signal| skipped_issue_has_known_workflow(&signal.signal))
+        .filter_map(|signal| RepoBacklogIssueCandidate::from_value(&signal.signal, parent_repo))
+        .collect()
+}
+
+fn skipped_issue_has_known_workflow(value: &Value) -> bool {
+    value
+        .get("existing_workflow")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("has_workflow")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || value
+            .get("workflow_state")
+            .and_then(non_empty_json_string)
+            .is_some()
+        || value
+            .get("runtime_workflow_state")
+            .and_then(non_empty_json_string)
+            .is_some()
+        || value
+            .get("issue_workflow_state")
+            .and_then(non_empty_json_string)
+            .is_some()
+}
+
+fn sprint_plan_selected_issues(
+    result: &ActivityResult,
+    event: &WorkflowEvent,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    let mut scan_candidates = sprint_plan_candidate_inputs(event, parent_repo);
+    scan_candidates.extend(sprint_plan_candidate_artifacts(result, parent_repo));
+    let mut selected = sprint_plan_selected_signals(result, &scan_candidates, parent_repo);
+    selected.extend(sprint_plan_selected_artifacts(
+        result,
+        &scan_candidates,
+        parent_repo,
+    ));
+    dedupe_issue_candidates(selected)
+}
+
+fn sprint_plan_known_dependency_inputs(
+    event: &WorkflowEvent,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    event_workflow_command(event)
+        .and_then(|command| {
+            command
+                .command
+                .get("known_dependencies")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|value| {
+                            RepoBacklogIssueCandidate::from_value(value, parent_repo)
+                        })
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn sprint_plan_candidate_inputs(
+    event: &WorkflowEvent,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    event_workflow_command(event)
+        .and_then(|command| {
+            command
+                .command
+                .get("issues")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|value| {
+                            RepoBacklogIssueCandidate::from_value(value, parent_repo)
+                        })
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn sprint_plan_candidate_artifacts(
+    result: &ActivityResult,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "repo_backlog_candidates")
+        .flat_map(|artifact| array_items(&artifact.artifact, "issues"))
+        .filter_map(|value| RepoBacklogIssueCandidate::from_value(value, parent_repo))
+        .collect()
+}
+
+fn sprint_plan_selected_signals(
+    result: &ActivityResult,
+    candidates: &[RepoBacklogIssueCandidate],
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    result
+        .signals
+        .iter()
+        .filter(|signal| signal.signal_type == "SprintTaskSelected")
+        .filter_map(|signal| {
+            RepoBacklogIssueCandidate::from_sprint_task(&signal.signal, candidates, parent_repo)
+        })
+        .collect()
+}
+
+fn sprint_plan_selected_artifacts(
+    result: &ActivityResult,
+    candidates: &[RepoBacklogIssueCandidate],
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "sprint_plan")
+        .flat_map(|artifact| array_items(&artifact.artifact, "tasks"))
+        .filter_map(|value| {
+            RepoBacklogIssueCandidate::from_sprint_task(value, candidates, parent_repo)
+        })
+        .collect()
+}
+
+fn dedupe_issue_candidates(
+    candidates: Vec<RepoBacklogIssueCandidate>,
+) -> Vec<RepoBacklogIssueCandidate> {
+    let mut index_by_key = std::collections::BTreeMap::<(String, u64), usize>::new();
+    let mut merged = Vec::<RepoBacklogIssueCandidate>::new();
+    for candidate in candidates {
+        let key = (
+            candidate.repo.clone().unwrap_or_default(),
+            candidate.issue_number,
+        );
+        if let Some(index) = index_by_key.get(&key).copied() {
+            merged[index].merge_from(candidate);
+        } else {
+            index_by_key.insert(key, merged.len());
+            merged.push(candidate);
+        }
+    }
+    merged
+}
+
+fn normalize_selected_sprint_dependencies(
+    mut candidates: Vec<RepoBacklogIssueCandidate>,
+    known_dependencies: &[RepoBacklogIssueCandidate],
+) -> Vec<RepoBacklogIssueCandidate> {
+    let mut valid_dependencies: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.repo.clone().unwrap_or_default(),
+                candidate.issue_number,
+            )
+        })
+        .collect();
+    valid_dependencies.extend(known_dependencies.iter().map(|candidate| {
+        (
+            candidate.repo.clone().unwrap_or_default(),
+            candidate.issue_number,
+        )
+    }));
+
+    for candidate in &mut candidates {
+        let repo = candidate.repo.clone().unwrap_or_default();
+        let mut seen = std::collections::BTreeSet::new();
+        let issue_number = candidate.issue_number;
+        candidate.depends_on.retain(|dependency| {
+            *dependency != issue_number
+                && valid_dependencies.contains(&(repo.clone(), *dependency))
+                && seen.insert(*dependency)
+        });
+    }
+
+    candidates
+}
+
+fn append_missing_strings(target: &mut Vec<String>, values: Vec<String>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+fn append_missing_u64s(target: &mut Vec<u64>, values: Vec<u64>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
 }
 
 fn structured_decision_validates(
@@ -435,6 +804,42 @@ fn json_value_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
+}
+
+fn non_empty_json_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn string_array_field(value: &Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(non_empty_json_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn u64_array_field(value: &Value, field: &str) -> Vec<u64> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(json_value_u64).collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+fn array_items<'a>(value: &'a Value, field: &str) -> Vec<&'a Value> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
 }
 
 fn runtime_blocked_decision(
@@ -727,8 +1132,10 @@ fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool 
         (
             GITHUB_ISSUE_PR_DEFINITION_ID,
             "implementing" | "awaiting_feedback" | "addressing_feedback"
-        ) | (REPO_BACKLOG_DEFINITION_ID, "dispatching" | "reconciling")
-            | (QUALITY_GATE_DEFINITION_ID, "checking")
+        ) | (
+            REPO_BACKLOG_DEFINITION_ID,
+            "dispatching" | "reconciling" | "planning_batch"
+        ) | (QUALITY_GATE_DEFINITION_ID, "checking")
     )
 }
 

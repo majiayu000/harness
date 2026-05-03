@@ -418,7 +418,7 @@ impl ServerRuntimeJobExecutor {
             let source = optional_string(command, "source").unwrap_or_else(|| "github".to_string());
             let external_id =
                 optional_string(command, "external_id").unwrap_or_else(|| issue_number.to_string());
-            let depends_on: Vec<TaskId> = Vec::new();
+            let depends_on = dependency_task_ids_from_command(command, repo);
             let submission = crate::workflow_runtime_submission::record_issue_submission(
                 store,
                 crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
@@ -430,7 +430,7 @@ impl ServerRuntimeJobExecutor {
                     force_execute,
                     additional_prompt: None,
                     depends_on: &depends_on,
-                    dependencies_blocked: false,
+                    dependencies_blocked: !depends_on.is_empty(),
                     source: Some(source.as_str()),
                     external_id: Some(external_id.as_str()),
                 },
@@ -891,13 +891,28 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("repo_backlog", "poll_repo_backlog") => json!({
             "on_succeeded": {
-                "reducer_next_state": "dispatching_when_IssueDiscovered_signals_exist_else_idle",
+                "reducer_next_state": "planning_batch_when_IssueDiscovered_signals_exist_else_idle",
                 "accepted_signals": ["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound"],
                 "required_summary": "Describe the GitHub issue query, existing workflow checks, and new issue workflow candidates."
             },
             "structured_decision": {
                 "optional": true,
-                "description": "A workflow_decision artifact may propose start_child_workflow commands, but IssueDiscovered signals are sufficient."
+                "description": "A workflow_decision artifact may propose a plan_repo_sprint activity command, but IssueDiscovered signals are sufficient."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
+        ("repo_backlog", "plan_repo_sprint") => json!({
+            "on_succeeded": {
+                "reducer_next_state": "dispatching_when_SprintTaskSelected_signals_exist_else_idle",
+                "accepted_signals": ["SprintTaskSelected", "IssueSkipped", "NoSprintTaskSelected"],
+                "required_summary": "Describe dependency planning, skipped issues, and selected issue workflow dispatch order."
+            },
+            "structured_decision": {
+                "optional": true,
+                "description": "A workflow_decision artifact may propose start_child_workflow commands, but SprintTaskSelected signals are sufficient."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -990,14 +1005,34 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_include": ["repo and label queried", "open issues inspected", "existing workflow checks", "new issue workflow candidates", "next workflow action"],
             "must_not_include": ["repository code changes", "workflow table mutations", "server-side GitHub polling changes"],
             "signals": {
-                "IssueDiscovered": "Use for each open GitHub issue that needs a child github_issue_pr workflow. Include issue_number, issue_url, repo, title, and labels when available.",
-                "IssueSkipped": "Use for open GitHub issues that already have a workflow, are PRs, or should not be started. Include issue_number and reason.",
+                "IssueDiscovered": "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available.",
+                "IssueSkipped": "Use for open GitHub issues that already have a workflow, are PRs, or should not be started. Include issue_number and reason. When an issue already has a workflow, include workflow_state.",
                 "NoOpenIssueFound": "Use when the repo/label query found no candidate issues."
             },
             "artifacts": {
                 "workflow_decision": {
                     "optional": true,
-                    "allowed_decisions": ["start_issue_workflows_from_scan", "finish_repo_backlog_scan"]
+                    "allowed_decisions": ["plan_repo_sprint_from_scan", "finish_repo_backlog_scan"]
+                }
+            }
+        }),
+        ("repo_backlog", "plan_repo_sprint") => json!({
+            "must_include": ["issues considered", "dependency reasoning", "selected tasks", "skipped issues", "next workflow action"],
+            "must_not_include": ["repository code changes", "workflow table mutations", "server-side task queue changes"],
+            "signals": {
+                "SprintTaskSelected": "Use once for each issue selected for execution. Include issue_number, issue_url, repo, labels, and depends_on as issue numbers.",
+                "IssueSkipped": "Use for discovered issues intentionally skipped by planning. Include issue_number and reason.",
+                "NoSprintTaskSelected": "Use when no issue should be dispatched from this sprint plan."
+            },
+            "artifacts": {
+                "sprint_plan": {
+                    "optional": true,
+                    "fields": ["tasks", "skip"],
+                    "task_fields": ["issue", "depends_on"]
+                },
+                "workflow_decision": {
+                    "optional": true,
+                    "allowed_decisions": ["start_issue_workflows_from_sprint_plan", "finish_repo_sprint_plan"]
                 }
             }
         }),
@@ -1272,6 +1307,35 @@ fn string_vec(value: &Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn dependency_task_ids_from_command(command: &Value, repo: Option<&str>) -> Vec<TaskId> {
+    command
+        .get("depends_on")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| dependency_task_id(value, repo))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn dependency_task_id(value: &Value, repo: Option<&str>) -> Option<TaskId> {
+    if let Some(issue_number) = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
+    {
+        return Some(TaskId::from_str(&format!(
+            "repo-backlog:{}:issue:{issue_number}",
+            repo.unwrap_or("<none>")
+        )));
+    }
+    value
+        .as_str()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(TaskId::from_str)
+}
+
 fn force_execute_from_project_policy(project_id: &str, labels: &[String]) -> bool {
     let workflow_cfg = harness_core::config::workflow::load_workflow_config(Path::new(project_id))
         .unwrap_or_default();
@@ -1404,6 +1468,27 @@ mod tests {
     }
 
     #[test]
+    fn dependency_task_ids_from_command_maps_issue_numbers_to_repo_handles() {
+        let command = json!({
+            "depends_on": [42, "43", "explicit-task-id"]
+        });
+
+        let dependencies = dependency_task_ids_from_command(&command, Some("owner/repo"));
+
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|task_id| task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "repo-backlog:owner/repo:issue:42",
+                "repo-backlog:owner/repo:issue:43",
+                "explicit-task-id"
+            ]
+        );
+    }
+
+    #[test]
     fn activity_result_schema_describes_quality_gate_contract() {
         let job = RuntimeJob::pending(
             "command-1",
@@ -1470,7 +1555,43 @@ mod tests {
         );
         assert_eq!(
             schema["agent_summary_contract"]["signals"]["IssueDiscovered"],
-            "Use for each open GitHub issue that needs a child github_issue_pr workflow. Include issue_number, issue_url, repo, title, and labels when available."
+            "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available."
+        );
+        assert!(schema["workflow_decision_contract"]["allowed_transitions"]
+            .as_array()
+            .expect("allowed transitions should be an array")
+            .iter()
+            .any(|transition| transition["next_state"] == "planning_batch"));
+    }
+
+    #[test]
+    fn activity_result_schema_describes_repo_sprint_plan_contract() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": harness_workflow::runtime::REPO_BACKLOG_SPRINT_PLAN_ACTIVITY
+            }),
+        );
+        let workflow = WorkflowInstance::new(
+            "repo_backlog",
+            1,
+            "planning_batch",
+            WorkflowSubject::new("repo", "owner/repo"),
+        )
+        .with_id("repo-backlog-1");
+
+        let schema = activity_result_schema(&job, Some(&workflow));
+
+        assert_eq!(schema["workflow_definition"], "repo_backlog");
+        assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
+            "SprintTaskSelected"
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["signals"]["SprintTaskSelected"],
+            "Use once for each issue selected for execution. Include issue_number, issue_url, repo, labels, and depends_on as issue numbers."
         );
         assert!(schema["workflow_decision_contract"]["allowed_transitions"]
             .as_array()
