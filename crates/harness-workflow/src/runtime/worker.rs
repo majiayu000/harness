@@ -1,5 +1,6 @@
 use super::model::{
     ActivityResult, ActivityStatus, RuntimeJob, RuntimeProfile, WorkflowCommandRecord,
+    WorkflowCommandType,
 };
 use super::reducer::reduce_runtime_job_completed;
 use super::store::WorkflowRuntimeStore;
@@ -106,6 +107,13 @@ impl<'a> RuntimeWorker<'a> {
         self.store
             .mark_command_status(&command.id, command_status_for_activity(result.status))
             .await?;
+        let active_start_child_workflow_commands =
+            if command.command.command_type == WorkflowCommandType::StartChildWorkflow {
+                self.active_start_child_workflow_commands(&command.workflow_id)
+                    .await?
+            } else {
+                0
+            };
         let event = self
             .store
             .append_event(
@@ -117,6 +125,7 @@ impl<'a> RuntimeWorker<'a> {
                     "command": command.command,
                     "runtime_job_id": job.id,
                     "runtime_job_status": job.status,
+                    "active_start_child_workflow_commands": active_start_child_workflow_commands,
                     "activity_result": result,
                 }),
             )
@@ -124,6 +133,22 @@ impl<'a> RuntimeWorker<'a> {
         self.apply_runtime_completion_reducer(&command.workflow_id, &event)
             .await?;
         Ok(())
+    }
+
+    async fn active_start_child_workflow_commands(
+        &self,
+        workflow_id: &str,
+    ) -> anyhow::Result<usize> {
+        Ok(self
+            .store
+            .commands_for(workflow_id)
+            .await?
+            .into_iter()
+            .filter(|record| {
+                record.command.command_type == WorkflowCommandType::StartChildWorkflow
+                    && matches!(record.status.as_str(), "pending" | "dispatched")
+            })
+            .count())
     }
 
     async fn apply_runtime_completion_reducer(

@@ -65,6 +65,10 @@ fn reduce_success(
         return Some(decision);
     }
 
+    if repo_backlog_child_dispatch_still_active(instance, event) {
+        return None;
+    }
+
     if let Some(decision) = structured_decision {
         return Some(decision);
     }
@@ -263,6 +267,21 @@ fn structured_decision_validates(
             &ValidationContext::new(event.source.as_str(), Utc::now()),
         )
         .is_ok()
+}
+
+fn repo_backlog_child_dispatch_still_active(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+) -> bool {
+    instance.definition_id == REPO_BACKLOG_DEFINITION_ID
+        && instance.state == "dispatching"
+        && event_command_type(event) == Some("start_child_workflow")
+        && event
+            .event
+            .get("active_start_child_workflow_commands")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            > 0
 }
 
 fn bind_pr_from_activity_result(

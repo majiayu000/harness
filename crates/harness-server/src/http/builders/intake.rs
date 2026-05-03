@@ -251,14 +251,16 @@ fn runtime_repo_backlog_owns_github_polling(
         .filter(|path| !path.trim().is_empty())
         .map(expand_home_path)
         .unwrap_or_else(|| fallback_project_root.to_path_buf());
-    let workflow_cfg = harness_core::config::workflow::load_workflow_config(&project_root)
-        .unwrap_or_else(|error| {
+    let workflow_cfg = match harness_core::config::workflow::load_workflow_config(&project_root) {
+        Ok(config) => config,
+        Err(error) => {
             tracing::warn!(
                 project_root = %project_root.display(),
-                "intake: failed to load WORKFLOW.md for runtime repo backlog handoff, using default config: {error}"
+                "intake: failed to load WORKFLOW.md for runtime repo backlog handoff; runtime ownership disabled: {error}"
             );
-            harness_core::config::workflow::WorkflowConfig::default()
-        });
+            return false;
+        }
+    };
     workflow_cfg.repo_backlog.enabled
         && workflow_cfg.runtime_dispatch.enabled
         && workflow_cfg.runtime_worker.enabled
@@ -523,6 +525,34 @@ mod tests {
             !bundle.legacy_github_fallback_enabled,
             "configured GitHub intake should not fall back to legacy server polling"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_repo_backlog_ownership_disabled_when_workflow_config_unreadable(
+    ) -> anyhow::Result<()> {
+        if harness_core::db::resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let (_, _, _, registry) = make_minimal_bundles(dir.path()).await;
+        if registry.workflow_runtime_store.is_none() {
+            return Ok(());
+        }
+        let unreadable_root = dir.path().join("not-a-directory");
+        std::fs::write(&unreadable_root, "not a directory")?;
+        let repo_config = harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            project_root: Some(unreadable_root.to_string_lossy().into_owned()),
+        };
+
+        assert!(!runtime_repo_backlog_owns_github_polling(
+            dir.path(),
+            &repo_config,
+            &registry
+        ));
+        Ok(())
     }
 
     #[test]

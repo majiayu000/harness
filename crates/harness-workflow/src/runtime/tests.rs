@@ -1337,6 +1337,7 @@ fn runtime_completion_reducer_idles_repo_backlog_after_dispatch() {
         "command_id": "command-1",
         "command": command,
         "runtime_job_id": "job-1",
+        "active_start_child_workflow_commands": 0,
         "activity_result": result,
     }));
 
@@ -1354,6 +1355,37 @@ fn runtime_completion_reducer_idles_repo_backlog_after_dispatch() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("repo backlog dispatch completion should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_keeps_repo_backlog_dispatching_until_child_dispatch_drains() {
+    let instance = repo_backlog_instance("dispatching");
+    let command = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:123",
+        "repo-backlog:owner/repo:issue:123:start",
+    );
+    let result = ActivityResult::succeeded("workflow_activity", "Child workflow started.");
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "active_start_child_workflow_commands": 1,
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event).expect("event should parse");
+
+    assert!(
+        decision.is_none(),
+        "repo backlog should stay dispatching until every child-start command is terminal"
+    );
 }
 
 #[test]
@@ -2284,6 +2316,84 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
     assert!(decisions
         .iter()
         .any(|record| record.decision.decision == "resume_implementation_after_replan"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_keeps_repo_backlog_dispatching_until_child_starts_finish(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = repo_backlog_instance("dispatching");
+    store.upsert_instance(&workflow).await?;
+    let first_command = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:123",
+        "repo-backlog:owner/repo:issue:123:start",
+    );
+    let first_command_id = store
+        .enqueue_command(&workflow.id, None, &first_command)
+        .await?;
+    let second_command = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:124",
+        "repo-backlog:owner/repo:issue:124:start",
+    );
+    let second_command_id = store
+        .enqueue_command(&workflow.id, None, &second_command)
+        .await?;
+    for command_id in [&first_command_id, &second_command_id] {
+        store
+            .enqueue_runtime_job_for_pending_command(
+                command_id,
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({ "activity": "start_child_workflow" }),
+                None,
+            )
+            .await?;
+    }
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded("workflow_activity", "Child workflow started."),
+    };
+
+    worker
+        .run_once(&executor)
+        .await?
+        .expect("first child dispatch job should complete");
+    let first_update = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(first_update.state, "dispatching");
+    let first_completion = store
+        .events_for(&workflow.id)
+        .await?
+        .into_iter()
+        .find(|event| event.event_type == "RuntimeJobCompleted")
+        .expect("first completion event should exist");
+    assert_eq!(
+        first_completion.event["active_start_child_workflow_commands"],
+        1
+    );
+
+    worker
+        .run_once(&executor)
+        .await?
+        .expect("second child dispatch job should complete");
+    let final_update = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(final_update.state, "idle");
+
+    let commands = store.commands_for(&workflow.id).await?;
+    assert!(commands.iter().all(|command| command.status == "completed"));
     Ok(())
 }
 
