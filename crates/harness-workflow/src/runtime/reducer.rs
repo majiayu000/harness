@@ -2,7 +2,10 @@ use super::model::{
     ActivityErrorKind, ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType,
     WorkflowDecision, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
-use super::pr_feedback::{build_pr_feedback_decision, PrFeedbackDecisionInput, PrFeedbackOutcome};
+use super::pr_feedback::{
+    build_pr_feedback_decision, PrFeedbackDecisionInput, PrFeedbackOutcome,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+};
 use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
 use super::repo_backlog::{
     REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
@@ -58,6 +61,11 @@ fn reduce_success(
     }
 
     if let Some(decision) = pr_feedback_sweep_decision_from_activity_result(instance, event, result)
+    {
+        return Some(decision);
+    }
+
+    if let Some(decision) = pr_feedback_child_decision_from_activity_result(instance, event, result)
     {
         return Some(decision);
     }
@@ -626,6 +634,7 @@ fn structured_decision_validates(
     let validator = match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
         QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
+        PR_FEEDBACK_DEFINITION_ID => DecisionValidator::pr_feedback(),
         REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
         _ => return true,
     };
@@ -712,7 +721,10 @@ fn pr_feedback_sweep_decision_from_activity_result(
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
     if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
-        || result.activity != "sweep_pr_feedback"
+        || !matches!(
+            result.activity.as_str(),
+            "sweep_pr_feedback" | PR_FEEDBACK_INSPECT_ACTIVITY
+        )
     {
         return None;
     }
@@ -747,6 +759,49 @@ fn pr_feedback_sweep_decision_from_activity_result(
         )
         .decision
         .with_evidence(runtime_completion_evidence(event, result)),
+    )
+}
+
+fn pr_feedback_child_decision_from_activity_result(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        PR_FEEDBACK_DEFINITION_ID,
+        "inspecting",
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+    ) {
+        return None;
+    }
+
+    let outcome = pr_feedback_outcome_from_signals(result)?;
+    let (next_state, decision, reason) = match outcome {
+        PrFeedbackOutcome::BlockingFeedback => (
+            "feedback_found",
+            "record_feedback_found",
+            "PR feedback inspection found actionable feedback.",
+        ),
+        PrFeedbackOutcome::NoActionableFeedback => (
+            "no_actionable_feedback",
+            "record_no_actionable_feedback",
+            "PR feedback inspection found no actionable feedback.",
+        ),
+        PrFeedbackOutcome::ReadyToMerge => (
+            "ready_to_merge",
+            "record_ready_to_merge",
+            "PR feedback inspection found the PR ready to merge.",
+        ),
+    };
+
+    Some(
+        WorkflowDecision::new(&instance.id, &instance.state, decision, next_state, reason)
+            .with_evidence(runtime_completion_evidence(event, result))
+            .high_confidence(),
     )
 }
 
@@ -1135,7 +1190,8 @@ fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool 
         ) | (
             REPO_BACKLOG_DEFINITION_ID,
             "dispatching" | "reconciling" | "planning_batch"
-        ) | (QUALITY_GATE_DEFINITION_ID, "checking")
+        ) | (PR_FEEDBACK_DEFINITION_ID, "inspecting")
+            | (QUALITY_GATE_DEFINITION_ID, "checking")
     )
 }
 

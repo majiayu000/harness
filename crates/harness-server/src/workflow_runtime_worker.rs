@@ -7,11 +7,13 @@ use chrono::Duration;
 use harness_core::config::agents::SandboxMode;
 use harness_core::types::{AgentId, Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, DecisionValidator,
-    RuntimeJob, RuntimeJobExecutor, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker,
-    WorkflowDefinition, WorkflowInstance, WorkflowSubject, QUALITY_BLOCKED_SIGNAL,
-    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL,
+    build_pr_feedback_inspect_decision, ActivityArtifact, ActivityErrorKind, ActivityResult,
+    ActivitySignal, DecisionValidator, PrFeedbackInspectDecisionInput, RuntimeJob,
+    RuntimeJobExecutor, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker,
+    WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance,
+    WorkflowSubject, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -342,6 +344,11 @@ impl ServerRuntimeJobExecutor {
             .ok_or_else(|| anyhow::anyhow!("start_child_workflow command payload is missing"))?;
         let definition_id = required_string(command, "definition_id")?;
         let subject_key = required_string(command, "subject_key")?;
+        if definition_id == PR_FEEDBACK_DEFINITION_ID {
+            return self
+                .execute_start_pr_feedback_child_workflow(job, parent, command, subject_key)
+                .await;
+        }
         if definition_id != "github_issue_pr" {
             anyhow::bail!("start_child_workflow definition `{definition_id}` is not supported yet");
         }
@@ -468,6 +475,202 @@ impl ServerRuntimeJobExecutor {
             ));
         }
         Ok(result)
+    }
+
+    async fn execute_start_pr_feedback_child_workflow(
+        &self,
+        job: &RuntimeJob,
+        parent: Option<&WorkflowInstance>,
+        command: &Value,
+        subject_key: &str,
+    ) -> anyhow::Result<ActivityResult> {
+        let Some(store) = self.state.core.workflow_runtime_store.as_ref() else {
+            anyhow::bail!("workflow runtime store is unavailable");
+        };
+        let parent = parent
+            .ok_or_else(|| anyhow::anyhow!("pr_feedback child workflow requires a parent"))?;
+        let pr_number = parse_pr_subject_key(subject_key)
+            .or_else(|| command.get("pr_number").and_then(Value::as_u64))
+            .ok_or_else(|| anyhow::anyhow!("pr_feedback child workflow pr_number is missing"))?;
+        let project_id = parent
+            .data
+            .get("project_id")
+            .and_then(Value::as_str)
+            .or_else(|| job.input.get("project_id").and_then(Value::as_str))
+            .ok_or_else(|| anyhow::anyhow!("pr_feedback child workflow project_id is missing"))?;
+        let repo = command
+            .get("repo")
+            .and_then(Value::as_str)
+            .or_else(|| parent.data.get("repo").and_then(Value::as_str));
+        let pr_url = command
+            .get("pr_url")
+            .and_then(Value::as_str)
+            .or_else(|| parent.data.get("pr_url").and_then(Value::as_str));
+        let issue_number = command
+            .get("issue_number")
+            .and_then(Value::as_u64)
+            .or_else(|| parent.data.get("issue_number").and_then(Value::as_u64));
+        let child_id = format!("{}::pr-feedback:{}", parent.id, job.command_id);
+        store
+            .upsert_definition(&WorkflowDefinition::new(
+                PR_FEEDBACK_DEFINITION_ID,
+                1,
+                "PR feedback workflow",
+            ))
+            .await?;
+        let mut child = match store.get_instance(&child_id).await? {
+            Some(instance) => instance,
+            None => WorkflowInstance::new(
+                PR_FEEDBACK_DEFINITION_ID,
+                1,
+                "pending",
+                WorkflowSubject::new("pr", subject_key),
+            )
+            .with_id(child_id.clone()),
+        };
+        if child.parent_workflow_id.is_none() {
+            child.parent_workflow_id = Some(parent.id.clone());
+        }
+        child.data = merge_pr_feedback_child_data(
+            child.data,
+            PrFeedbackChildData {
+                project_id,
+                repo,
+                issue_number,
+                pr_number,
+                pr_url,
+                parent_workflow_id: parent.id.as_str(),
+                runtime_job_id: job.id.as_str(),
+                command_id: job.command_id.as_str(),
+            },
+        );
+        store.upsert_instance(&child).await?;
+        store
+            .append_event(
+                &child.id,
+                "ChildWorkflowStarted",
+                "workflow_runtime_worker",
+                json!({
+                    "parent_workflow_id": parent.id.as_str(),
+                    "runtime_job_id": job.id.as_str(),
+                    "command_id": job.command_id.as_str(),
+                    "definition_id": PR_FEEDBACK_DEFINITION_ID,
+                    "subject_key": subject_key,
+                }),
+            )
+            .await?;
+
+        let child_command_ids = if child.state == "pending" {
+            let event = store
+                .append_event(
+                    &child.id,
+                    "PrFeedbackInspectionRequested",
+                    "workflow_runtime_worker",
+                    json!({
+                        "parent_workflow_id": parent.id.as_str(),
+                        "pr_number": pr_number,
+                        "pr_url": pr_url,
+                        "issue_number": issue_number,
+                        "repo": repo,
+                    }),
+                )
+                .await?;
+            let stable_inspect_dedupe_key = format!("pr-feedback-child:{}:inspect", child.id);
+            let existing_child_commands = store.commands_for(&child.id).await?;
+            let active_inspect_command = existing_child_commands
+                .iter()
+                .find(|record| is_active_pr_feedback_inspect_command(record));
+            let inspect_dedupe_key = match active_inspect_command {
+                Some(record) => record.command.dedupe_key.clone(),
+                None if existing_child_commands
+                    .iter()
+                    .any(is_pr_feedback_inspect_command) =>
+                {
+                    format!("{}:retry:{}", stable_inspect_dedupe_key, event.id)
+                }
+                None => stable_inspect_dedupe_key,
+            };
+            let output = build_pr_feedback_inspect_decision(
+                &child,
+                PrFeedbackInspectDecisionInput {
+                    dedupe_key: &inspect_dedupe_key,
+                    pr_number,
+                    pr_url,
+                    issue_number,
+                    repo,
+                    parent_workflow_id: Some(parent.id.as_str()),
+                    summary: "PR feedback child workflow requested runtime inspection.",
+                },
+            );
+            let validation = DecisionValidator::pr_feedback().validate(
+                &child,
+                &output.decision,
+                &harness_workflow::runtime::ValidationContext::new(
+                    "workflow_runtime_worker",
+                    chrono::Utc::now(),
+                ),
+            );
+            let record = match validation {
+                Ok(()) => WorkflowDecisionRecord::accepted(output.decision.clone(), Some(event.id)),
+                Err(error) => {
+                    let record = WorkflowDecisionRecord::rejected(
+                        output.decision,
+                        Some(event.id),
+                        error.to_string(),
+                    );
+                    store.record_decision(&record).await?;
+                    return Ok(ActivityResult::failed(
+                        activity_name(job),
+                        "PR feedback child workflow inspection request was rejected.",
+                        error.to_string(),
+                    )
+                    .with_error_kind(ActivityErrorKind::Configuration));
+                }
+            };
+            store.record_decision(&record).await?;
+            let mut command_ids = Vec::new();
+            for command in &output.decision.commands {
+                let command_id = store
+                    .enqueue_command(&child.id, Some(&record.id), command)
+                    .await?;
+                let command_record = store
+                    .get_command(&command_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("workflow command `{command_id}` not found"))?;
+                if !is_active_pr_feedback_inspect_command(&command_record) {
+                    anyhow::bail!(
+                        "pr_feedback child inspect command `{command_id}` was not queued for dispatch"
+                    );
+                }
+                command_ids.push(command_id);
+            }
+            child.state = output.decision.next_state;
+            child.version = child.version.saturating_add(1);
+            store.upsert_instance(&child).await?;
+            command_ids
+        } else {
+            Vec::new()
+        };
+
+        Ok(ActivityResult::succeeded(
+            activity_name(job),
+            format!("PR feedback child workflow `{}` started.", child.id),
+        )
+        .with_artifact(ActivityArtifact::new(
+            "child_workflow",
+            json!({
+                "workflow_id": child.id,
+                "definition_id": child.definition_id,
+                "state": child.state,
+                "subject_key": child.subject.subject_key,
+            }),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            "child_commands",
+            json!({
+                "command_ids": child_command_ids,
+            }),
+        )))
     }
 
     async fn execute_mark_bound_issue_done(
@@ -631,6 +834,15 @@ impl ServerRuntimeJobExecutor {
         }
         Ok(self.state.core.project_root.clone())
     }
+}
+
+fn is_active_pr_feedback_inspect_command(record: &WorkflowCommandRecord) -> bool {
+    matches!(record.status.as_str(), "pending" | "dispatched")
+        && is_pr_feedback_inspect_command(record)
+}
+
+fn is_pr_feedback_inspect_command(record: &WorkflowCommandRecord) -> bool {
+    record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
 }
 
 #[async_trait]
@@ -847,6 +1059,7 @@ fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionVali
     match definition_id {
         "github_issue_pr" => Some(DecisionValidator::github_issue_pr()),
         QUALITY_GATE_DEFINITION_ID => Some(DecisionValidator::quality_gate()),
+        PR_FEEDBACK_DEFINITION_ID => Some(DecisionValidator::pr_feedback()),
         "repo_backlog" => Some(DecisionValidator::repo_backlog()),
         _ => None,
     }
@@ -874,7 +1087,8 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "retry_policy": "runtime_retry_policy may retry this activity before failure."
             }
         }),
-        ("github_issue_pr", "sweep_pr_feedback") => json!({
+        ("github_issue_pr", "sweep_pr_feedback")
+        | ("github_issue_pr", PR_FEEDBACK_INSPECT_ACTIVITY) => json!({
             "on_succeeded": {
                 "reducer_next_state": "derived_from_structured_decision_or_signals",
                 "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
@@ -883,6 +1097,21 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "structured_decision": {
                 "preferred": true,
                 "description": "Return a workflow_decision artifact for address_pr_feedback, wait_for_pr_feedback, or mark_ready_to_merge."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
+        (PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY) => json!({
+            "on_succeeded": {
+                "reducer_next_state": "feedback_found_or_no_actionable_feedback_or_ready_to_merge_from_signals",
+                "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
+                "parent_propagation": "The same activity result is propagated to the parent github_issue_pr workflow."
+            },
+            "structured_decision": {
+                "optional": true,
+                "description": "A workflow_decision artifact may update the pr_feedback child workflow, but signals are sufficient."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -986,7 +1215,9 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_include": ["review feedback addressed", "changed files", "validation commands"],
             "must_not_include": ["claiming review approval without a fresh review signal"],
         }),
-        ("github_issue_pr", "sweep_pr_feedback") => json!({
+        ("github_issue_pr", "sweep_pr_feedback")
+        | ("github_issue_pr", PR_FEEDBACK_INSPECT_ACTIVITY)
+        | (PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY) => json!({
             "must_include": ["PR comments reviewed", "review states", "check status", "mergeability", "next workflow action"],
             "must_not_include": ["repository code changes", "workflow table mutations", "unverified approval claims"],
             "artifacts": {
@@ -1381,6 +1612,14 @@ fn parse_issue_subject_key(subject_key: &str) -> anyhow::Result<u64> {
         .with_context(|| format!("start_child_workflow subject_key `{subject_key}` is invalid"))
 }
 
+fn parse_pr_subject_key(subject_key: &str) -> Option<u64> {
+    subject_key
+        .strip_prefix("pr:")
+        .unwrap_or(subject_key)
+        .parse::<u64>()
+        .ok()
+}
+
 fn merge_child_issue_data(
     mut data: Value,
     project_id: &str,
@@ -1403,6 +1642,40 @@ fn merge_child_issue_data(
         object.insert("started_by_command_id".to_string(), json!(command_id));
     }
     crate::workflow_runtime_policy::merge_runtime_retry_policy(Path::new(project_id), data)
+}
+
+struct PrFeedbackChildData<'a> {
+    project_id: &'a str,
+    repo: Option<&'a str>,
+    issue_number: Option<u64>,
+    pr_number: u64,
+    pr_url: Option<&'a str>,
+    parent_workflow_id: &'a str,
+    runtime_job_id: &'a str,
+    command_id: &'a str,
+}
+
+fn merge_pr_feedback_child_data(mut data: Value, input: PrFeedbackChildData<'_>) -> Value {
+    if !data.is_object() {
+        data = json!({});
+    }
+    if let Some(object) = data.as_object_mut() {
+        object.insert("project_id".to_string(), json!(input.project_id));
+        object.insert("repo".to_string(), json!(input.repo));
+        object.insert("issue_number".to_string(), json!(input.issue_number));
+        object.insert("pr_number".to_string(), json!(input.pr_number));
+        object.insert("pr_url".to_string(), json!(input.pr_url));
+        object.insert(
+            "parent_workflow_id".to_string(),
+            json!(input.parent_workflow_id),
+        );
+        object.insert(
+            "started_by_runtime_job_id".to_string(),
+            json!(input.runtime_job_id),
+        );
+        object.insert("started_by_command_id".to_string(), json!(input.command_id));
+    }
+    crate::workflow_runtime_policy::merge_runtime_retry_policy(Path::new(input.project_id), data)
 }
 
 fn merge_json_object(target: &mut Value, update: Value) {
@@ -1598,6 +1871,46 @@ mod tests {
             .expect("allowed transitions should be an array")
             .iter()
             .any(|transition| transition["next_state"] == "dispatching"));
+    }
+
+    #[test]
+    fn activity_result_schema_describes_pr_feedback_child_contract() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": PR_FEEDBACK_INSPECT_ACTIVITY
+            }),
+        );
+        let workflow = WorkflowInstance::new(
+            PR_FEEDBACK_DEFINITION_ID,
+            1,
+            "inspecting",
+            WorkflowSubject::new("pr", "pr:77"),
+        )
+        .with_id("pr-feedback-1");
+
+        let schema = activity_result_schema(&job, Some(&workflow));
+
+        assert_eq!(schema["workflow_definition"], PR_FEEDBACK_DEFINITION_ID);
+        assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
+            "FeedbackFound"
+        );
+        assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["parent_propagation"],
+            "The same activity result is propagated to the parent github_issue_pr workflow."
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["signals"]["PrReadyToMerge"],
+            "Use only when review, checks, and mergeability are all ready."
+        );
+        assert!(schema["workflow_decision_contract"]["allowed_transitions"]
+            .as_array()
+            .expect("allowed transitions should be an array")
+            .iter()
+            .any(|transition| transition["next_state"] == "feedback_found"));
     }
 
     #[test]

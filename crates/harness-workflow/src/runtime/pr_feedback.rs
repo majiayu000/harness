@@ -1,9 +1,13 @@
 use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, WorkflowInstance};
 
+pub const PR_FEEDBACK_DEFINITION_ID: &str = "pr_feedback";
+pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrFeedbackWorkflowAction {
     BindPr,
     SweepFeedback,
+    InspectFeedback,
     AddressFeedback,
     AwaitFeedback,
     ReadyToMerge,
@@ -39,6 +43,17 @@ pub struct PrFeedbackSweepDecisionInput<'a> {
     pub pr_url: Option<&'a str>,
     pub issue_number: Option<u64>,
     pub repo: Option<&'a str>,
+    pub summary: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrFeedbackInspectDecisionInput<'a> {
+    pub dedupe_key: &'a str,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
+    pub issue_number: Option<u64>,
+    pub repo: Option<&'a str>,
+    pub parent_workflow_id: Option<&'a str>,
     pub summary: &'a str,
 }
 
@@ -144,10 +159,12 @@ pub fn build_pr_feedback_sweep_decision(
         input.summary,
     )
     .with_command(WorkflowCommand::new(
-        super::model::WorkflowCommandType::EnqueueActivity,
+        super::model::WorkflowCommandType::StartChildWorkflow,
         input.dedupe_key,
         serde_json::json!({
-            "activity": "sweep_pr_feedback",
+            "definition_id": PR_FEEDBACK_DEFINITION_ID,
+            "subject_key": format!("pr:{}", input.pr_number),
+            "child_activity": PR_FEEDBACK_INSPECT_ACTIVITY,
             "pr_number": input.pr_number,
             "pr_url": input.pr_url,
             "issue_number": input.issue_number,
@@ -166,12 +183,65 @@ pub fn build_pr_feedback_sweep_decision(
     }
 }
 
+pub fn build_pr_feedback_inspect_decision(
+    instance: &WorkflowInstance,
+    input: PrFeedbackInspectDecisionInput<'_>,
+) -> PrFeedbackDecisionOutput {
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "inspect_pr_feedback",
+        "inspecting",
+        input.summary,
+    )
+    .with_command(WorkflowCommand::new(
+        super::model::WorkflowCommandType::EnqueueActivity,
+        input.dedupe_key,
+        serde_json::json!({
+            "activity": PR_FEEDBACK_INSPECT_ACTIVITY,
+            "pr_number": input.pr_number,
+            "pr_url": input.pr_url,
+            "issue_number": input.issue_number,
+            "repo": input.repo,
+            "parent_workflow_id": input.parent_workflow_id,
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "pr_feedback_child",
+        feedback_inspect_summary(input),
+    ))
+    .high_confidence();
+
+    PrFeedbackDecisionOutput {
+        action: PrFeedbackWorkflowAction::InspectFeedback,
+        decision,
+    }
+}
+
 fn feedback_evidence(input: PrFeedbackDecisionInput<'_>) -> WorkflowEvidence {
     let summary = match input.pr_url {
         Some(pr_url) => format!("pr={} url={} {}", input.pr_number, pr_url, input.summary),
         None => format!("pr={} {}", input.pr_number, input.summary),
     };
     WorkflowEvidence::new("pr_feedback", summary)
+}
+
+fn feedback_inspect_summary(input: PrFeedbackInspectDecisionInput<'_>) -> String {
+    let mut parts = vec![format!("pr={}", input.pr_number)];
+    if let Some(pr_url) = input.pr_url {
+        parts.push(format!("url={pr_url}"));
+    }
+    if let Some(issue_number) = input.issue_number {
+        parts.push(format!("issue={issue_number}"));
+    }
+    if let Some(repo) = input.repo {
+        parts.push(format!("repo={repo}"));
+    }
+    if let Some(parent_workflow_id) = input.parent_workflow_id {
+        parts.push(format!("parent={parent_workflow_id}"));
+    }
+    parts.push(input.summary.to_string());
+    parts.join(" ")
 }
 
 fn feedback_sweep_summary(input: PrFeedbackSweepDecisionInput<'_>) -> String {

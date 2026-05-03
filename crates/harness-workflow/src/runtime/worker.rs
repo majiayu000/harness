@@ -132,6 +132,8 @@ impl<'a> RuntimeWorker<'a> {
             .await?;
         self.apply_runtime_completion_reducer(&command.workflow_id, &event)
             .await?;
+        self.propagate_pr_feedback_child_completion(&command.workflow_id, &event)
+            .await?;
         Ok(())
     }
 
@@ -151,6 +153,39 @@ impl<'a> RuntimeWorker<'a> {
             .count())
     }
 
+    async fn propagate_pr_feedback_child_completion(
+        &self,
+        workflow_id: &str,
+        event: &super::model::WorkflowEvent,
+    ) -> anyhow::Result<()> {
+        let Some(child) = self.store.get_instance(workflow_id).await? else {
+            return Ok(());
+        };
+        if child.definition_id != super::pr_feedback::PR_FEEDBACK_DEFINITION_ID {
+            return Ok(());
+        }
+        if !runtime_event_result_succeeded(event) {
+            return Ok(());
+        }
+        if matches!(child.state.as_str(), "pending" | "inspecting") {
+            return Ok(());
+        }
+        let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {
+            return Ok(());
+        };
+        let parent_event = self
+            .store
+            .append_event(
+                parent_workflow_id,
+                "RuntimeJobCompleted",
+                &self.owner,
+                merge_child_completion_payload(event, &child.id),
+            )
+            .await?;
+        self.apply_runtime_completion_reducer(parent_workflow_id, &parent_event)
+            .await
+    }
+
     async fn apply_runtime_completion_reducer(
         &self,
         workflow_id: &str,
@@ -166,6 +201,7 @@ impl<'a> RuntimeWorker<'a> {
         let validator = match instance.definition_id.as_str() {
             super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
             super::quality_gate::QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
+            super::pr_feedback::PR_FEEDBACK_DEFINITION_ID => DecisionValidator::pr_feedback(),
             super::repo_backlog::REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
             _ => return Ok(()),
         };
@@ -232,6 +268,42 @@ impl<'a> RuntimeWorker<'a> {
             max_turns,
         )))
     }
+}
+
+fn runtime_event_result_succeeded(event: &super::model::WorkflowEvent) -> bool {
+    event
+        .event
+        .get("activity_result")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ActivityResult>(value).ok())
+        .is_some_and(|result| result.status == ActivityStatus::Succeeded)
+}
+
+fn merge_child_completion_payload(
+    event: &super::model::WorkflowEvent,
+    child_workflow_id: &str,
+) -> serde_json::Value {
+    let mut payload = event.event.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "child_workflow_id".to_string(),
+            serde_json::json!(child_workflow_id),
+        );
+        if let Some(artifacts) = object
+            .get_mut("activity_result")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|activity_result| activity_result.get_mut("artifacts"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            artifacts.retain(|artifact| {
+                artifact
+                    .get("artifact_type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("workflow_decision")
+            });
+        }
+    }
+    payload
 }
 
 fn command_status_for_activity(status: ActivityStatus) -> &'static str {
