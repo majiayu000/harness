@@ -379,7 +379,7 @@ pub struct TaskWorkflowSummary {
 }
 
 impl TaskWorkflowSummary {
-    pub fn from_runtime_issue(workflow: &harness_workflow::runtime::WorkflowInstance) -> Self {
+    pub fn from_runtime(workflow: &harness_workflow::runtime::WorkflowInstance) -> Self {
         Self {
             id: workflow.id.clone(),
             definition_id: Some(workflow.definition_id.clone()),

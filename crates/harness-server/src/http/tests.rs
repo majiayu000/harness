@@ -3186,6 +3186,14 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
     assert_eq!(detail["status"], "implementing");
     assert_eq!(detail["execution_path"], "workflow_runtime");
     assert_eq!(detail["workflow_id"], workflow_id);
+    assert_eq!(detail["workflow"]["id"], workflow_id);
+    assert_eq!(detail["workflow"]["definition_id"], "prompt_task");
+    assert_eq!(detail["workflow"]["state"], "implementing");
+    assert_eq!(
+        detail["workflow"]["project_id"],
+        canonical_project_root.to_string_lossy().as_ref()
+    );
+    assert!(detail["workflow"].get("data").is_none());
     Ok(())
 }
 
@@ -4981,6 +4989,7 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
     state.core.tasks.insert(&planner_task).await;
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -5129,6 +5138,7 @@ async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Resul
         .with_state(state);
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -5162,6 +5172,7 @@ async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
     let state = make_test_state_with_issue_workflows(dir.path()).await?;
     let app = Router::new()
         .route("/tasks", get(list_tasks))
+        .route("/tasks/{id}", get(get_task))
         .with_state(state.clone());
 
     let task = task_runner::TaskState {
@@ -5236,6 +5247,7 @@ async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
         .await?;
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -5249,6 +5261,20 @@ async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
     assert_eq!(task["workflow"]["review_fallback"]["tier"], "c");
     assert_eq!(task["workflow"]["review_fallback"]["trigger"], "silence");
     assert_eq!(task["workflow"]["review_fallback"]["active_bot"], "codex");
+
+    let detail_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{}", task["id"].as_str().expect("task id")))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail_body = axum::body::to_bytes(detail_response.into_body(), usize::MAX).await?;
+    let detail: serde_json::Value = serde_json::from_slice(&detail_body)?;
+    assert_eq!(detail["workflow"]["state"], "ready_to_merge");
+    assert_eq!(detail["workflow"]["review_fallback"]["tier"], "c");
+    assert!(detail["workflow"].get("events").is_none());
     Ok(())
 }
 
