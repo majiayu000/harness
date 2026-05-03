@@ -461,9 +461,8 @@ Tests:
 - feedback report with blocking items moves parent workflow to `addressing_feedback`
 - no actionable feedback keeps parent workflow in `awaiting_feedback`
 - approved and checks-passed events can move parent workflow to `ready_to_merge`
-- runtime PR feedback sweep requests start `pr_feedback` child workflows and suppress duplicate
-  active feedback inspection work
-- runtime PR feedback sweep starts a child `pr_feedback` workflow and enqueues `inspect_pr_feedback`
+- runtime PR feedback sweep requests start `pr_feedback` child workflows, enqueue
+  `inspect_pr_feedback`, and suppress duplicate active feedback inspection work
 - `inspect_pr_feedback` child completions update both child and parent workflow state
 - legacy issue-workflow feedback candidates can be adopted into runtime state and enqueue the
   same runtime PR feedback child workflow
@@ -499,11 +498,6 @@ Implemented now:
   issue workflow to `done`
 - startup recovery of stale active issue workflows records `RecoveryRequested` and emits
   `recover_issue_workflow`
-
-Still intentionally not moved yet:
-
-- server-side GitHub issue polling does not run when workflow runtime repo backlog polling is
-  disabled or unavailable; operators must enable the runtime instead of relying on legacy fallback
 
 Tests:
 
@@ -981,7 +975,7 @@ Tests:
 
 - issue submission decisions validate in the workflow contract layer
 - failed issue workflows can be explicitly reopened by operator submission
-- server submission tracking records `IssueSubmitted`, scheduled state, and a pending
+- server submission tracking records `IssueSubmitted`, `implementing` state, and a pending
   `implement_issue` command without registering a legacy task row
 - prompt submission decisions validate in the workflow contract layer
 - prompt submission tracking records `PromptSubmitted`, `implementing` state, and a pending
