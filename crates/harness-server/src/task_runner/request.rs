@@ -74,6 +74,11 @@ pub struct CreateTaskRequest {
     /// Task IDs that must complete (Done) before this task starts.
     #[serde(default)]
     pub depends_on: Vec<TaskId>,
+    /// Internal ordering dependencies for batch conflict serialization.
+    /// Unlike `depends_on`, these only require the upstream task to become
+    /// terminal before this task starts.
+    #[serde(skip)]
+    pub serialization_depends_on: Vec<TaskId>,
     /// Scheduling priority: 0 = normal (default), 1 = high, 2 = critical.
     /// Higher values are served first when multiple tasks are waiting for a slot.
     #[serde(default)]
@@ -258,6 +263,7 @@ impl Default for CreateTaskRequest {
             labels: Vec::new(),
             parent_task_id: None,
             depends_on: Vec::new(),
+            serialization_depends_on: Vec::new(),
             priority: 0,
             system_input: None,
         }

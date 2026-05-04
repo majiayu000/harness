@@ -342,7 +342,7 @@ async fn has_active_pr_feedback_command(
     }
 
     for instance in store
-        .list_instances_by_definition(PR_FEEDBACK_DEFINITION_ID, None)
+        .list_instances_by_definition(PR_FEEDBACK_DEFINITION_ID, None, None)
         .await?
         .into_iter()
         .filter(|instance| instance.parent_workflow_id.as_deref() == Some(workflow_id))

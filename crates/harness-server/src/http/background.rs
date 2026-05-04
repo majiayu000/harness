@@ -488,6 +488,12 @@ pub(super) async fn run_runtime_command_dispatch_tick(
         batch_limit,
     )
     .await?;
+    let prompt_release = crate::workflow_runtime_submission::release_ready_prompt_dependencies(
+        store,
+        &state.core.tasks,
+        batch_limit,
+    )
+    .await?;
     if release.released > 0 || release.failed > 0 || release.skipped > 0 {
         tracing::info!(
             released = release.released,
@@ -495,6 +501,15 @@ pub(super) async fn run_runtime_command_dispatch_tick(
             waiting = release.waiting,
             skipped = release.skipped,
             "workflow runtime dependency release tick complete"
+        );
+    }
+    if prompt_release.released > 0 || prompt_release.failed > 0 || prompt_release.skipped > 0 {
+        tracing::info!(
+            released = prompt_release.released,
+            failed = prompt_release.failed,
+            waiting = prompt_release.waiting,
+            skipped = prompt_release.skipped,
+            "workflow runtime prompt dependency release tick complete"
         );
     }
     let fallback_profile_selector = runtime_profiles.into();
@@ -815,6 +830,7 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
     let workflows = store
         .list_instances_by_definition(
             harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            None,
             None,
         )
         .await?;

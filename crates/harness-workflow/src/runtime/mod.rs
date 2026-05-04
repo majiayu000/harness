@@ -9,6 +9,7 @@ pub mod dispatcher;
 pub mod model;
 pub mod plan_issue;
 pub mod pr_feedback;
+pub mod prompt_task;
 pub mod quality_gate;
 pub mod reducer;
 pub mod repo_backlog;
@@ -39,6 +40,11 @@ pub use pr_feedback::{
     PrFeedbackDecisionOutput, PrFeedbackInspectDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PR_FEEDBACK_DEFINITION_ID,
     PR_FEEDBACK_INSPECT_ACTIVITY,
+};
+pub use prompt_task::{
+    build_prompt_submission_decision, PromptSubmissionDecisionInput,
+    PromptSubmissionDecisionOutput, PromptTaskWorkflowAction, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 pub use quality_gate::{
     build_quality_gate_run_decision, quality_gate_workflow_id, QualityGateDecisionInput,

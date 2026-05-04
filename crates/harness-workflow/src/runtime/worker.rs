@@ -202,6 +202,7 @@ impl<'a> RuntimeWorker<'a> {
             super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
             super::quality_gate::QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
             super::pr_feedback::PR_FEEDBACK_DEFINITION_ID => DecisionValidator::pr_feedback(),
+            super::prompt_task::PROMPT_TASK_DEFINITION_ID => DecisionValidator::prompt_task(),
             super::repo_backlog::REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
             _ => return Ok(()),
         };

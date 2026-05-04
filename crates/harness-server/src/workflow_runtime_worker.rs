@@ -8,10 +8,11 @@ use harness_core::config::agents::SandboxMode;
 use harness_core::types::{AgentId, Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, ActivityArtifact, ActivityErrorKind, ActivityResult,
-    ActivitySignal, DecisionValidator, PrFeedbackInspectDecisionInput, RuntimeJob,
+    ActivitySignal, ActivityStatus, DecisionValidator, PrFeedbackInspectDecisionInput, RuntimeJob,
     RuntimeJobExecutor, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeWorker,
     WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance,
-    WorkflowSubject, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
     QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
     QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
 };
@@ -73,17 +74,17 @@ pub(crate) async fn run_runtime_job_worker_tick(
     let executor = ServerRuntimeJobExecutor::new(state.clone());
     let completed = worker.run_once(&executor).await?;
     if let Some(job) = completed.as_ref() {
-        if let Err(error) = notify_runtime_issue_terminal(state, job).await {
+        if let Err(error) = notify_runtime_submission_terminal(state, job).await {
             tracing::warn!(
                 runtime_job_id = %job.id,
-                "workflow runtime issue completion notification failed: {error}"
+                "workflow runtime completion notification failed: {error}"
             );
         }
     }
     Ok(RuntimeJobWorkerTick::from_completed_job(completed))
 }
 
-pub(crate) async fn notify_runtime_issue_terminal(
+pub(crate) async fn notify_runtime_submission_terminal(
     state: &AppState,
     job: &RuntimeJob,
 ) -> anyhow::Result<bool> {
@@ -91,52 +92,67 @@ pub(crate) async fn notify_runtime_issue_terminal(
         return Ok(false);
     };
     let result = runtime_job_activity_result(job);
-    notify_runtime_issue_terminal_workflow(state, workflow_id, result.as_ref()).await
+    notify_runtime_submission_terminal_workflow(state, workflow_id, result.as_ref()).await
 }
 
-pub(crate) async fn notify_runtime_issue_terminal_workflow(
+pub(crate) async fn notify_runtime_submission_terminal_workflow(
     state: &AppState,
     workflow_id: &str,
     result: Option<&ActivityResult>,
 ) -> anyhow::Result<bool> {
-    let Some(callback) = state.intake.completion_callback.as_ref() else {
-        return Ok(false);
-    };
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(false);
     };
     let Some(instance) = store.get_instance(workflow_id).await? else {
         return Ok(false);
     };
-    let Some(task) = runtime_issue_completion_task(&instance, result) else {
+    crate::workflow_runtime_submission::remove_terminal_prompt_submission_prompt(&instance);
+    let Some(callback) = state.intake.completion_callback.as_ref() else {
+        return Ok(false);
+    };
+    let Some(task) = runtime_submission_completion_task(&instance, result) else {
         return Ok(false);
     };
     callback(task).await;
     Ok(true)
 }
 
-fn runtime_issue_completion_task(
+fn runtime_submission_completion_task(
     instance: &WorkflowInstance,
     result: Option<&ActivityResult>,
 ) -> Option<TaskState> {
-    if instance.definition_id != "github_issue_pr" || !instance.is_terminal() {
+    if !instance.is_terminal() {
         return None;
     }
+    let task_kind = match instance.definition_id.as_str() {
+        GITHUB_ISSUE_PR_DEFINITION_ID => TaskKind::Issue,
+        PROMPT_TASK_DEFINITION_ID => TaskKind::Prompt,
+        _ => return None,
+    };
     let source = optional_data_string(instance, "source")?;
     let external_id = optional_data_string(instance, "external_id")?;
     let task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(instance)?;
     let status = task_status_for_runtime_state(&instance.state)?;
     let mut task = TaskState::new(task_id);
-    task.task_kind = TaskKind::Issue;
+    task.task_kind = task_kind;
     task.status = status.clone();
     task.failure_kind = runtime_failure_kind(&status, result);
     task.source = Some(source);
     task.external_id = Some(external_id);
     task.repo = optional_data_string(instance, "repo");
-    task.issue = optional_data_u64(instance, "issue_number");
+    task.issue = if task_kind == TaskKind::Issue {
+        optional_data_u64(instance, "issue_number")
+    } else {
+        None
+    };
     task.project_root = optional_data_string(instance, "project_id").map(PathBuf::from);
     task.pr_url = optional_data_string(instance, "last_pr_url");
-    task.description = task.issue.map(|issue| format!("issue #{issue}"));
+    task.description = match task_kind {
+        TaskKind::Issue => task.issue.map(|issue| format!("issue #{issue}")),
+        TaskKind::Prompt => optional_data_string(instance, "prompt_summary")
+            .or_else(|| Some("prompt task".to_string())),
+        _ => None,
+    };
     task.error = runtime_completion_error(&status, result);
     Some(task)
 }
@@ -222,12 +238,16 @@ impl ServerRuntimeJobExecutor {
         let runtime_profile = runtime_profile_for_job(&job)?;
         let sandbox_mode = runtime_profile_sandbox_mode(&runtime_profile)?;
         let approval_policy = runtime_profile_approval_policy(&runtime_profile, job.runtime_kind)?;
+        let prompt_task_request = prompt_task_request_for_job(&job)?;
+        if let PromptTaskRequest::PayloadUnavailable { prompt_ref } = &prompt_task_request {
+            return Ok(prompt_payload_unavailable_result(&job, prompt_ref));
+        }
         let prompt_packet =
             build_runtime_prompt_packet(&job, workflow.as_ref(), &project_root, &runtime_profile);
         let prompt_packet_digest = prompt_packet_digest(&prompt_packet);
         self.record_prompt_packet_prepared(&job, &prompt_packet, &prompt_packet_digest)
             .await?;
-        let prompt = build_runtime_job_prompt(&prompt_packet);
+        let prompt = build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
         let thread_id = self
             .state
             .core
@@ -939,7 +959,7 @@ fn build_runtime_prompt_packet(
     })
 }
 
-fn build_runtime_job_prompt(prompt_packet: &Value) -> String {
+fn build_runtime_job_prompt(prompt_packet: &Value, prompt_task_request: Option<&str>) -> String {
     let prompt_packet_json = pretty_json(prompt_packet);
     let activity = prompt_packet
         .get("runtime_job")
@@ -961,7 +981,7 @@ fn build_runtime_job_prompt(prompt_packet: &Value) -> String {
         .and_then(|runtime_job| runtime_job.get("id"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    format!(
+    let mut prompt = format!(
         "You are executing a Harness workflow runtime job.\n\n\
          Runtime contract:\n\
          - Treat the workflow database as the source of orchestration state, but do not edit workflow tables directly.\n\
@@ -976,7 +996,13 @@ fn build_runtime_job_prompt(prompt_packet: &Value) -> String {
          Runtime profile: {runtime_profile}\n\
          Activity: {activity}\n\n\
          Prompt packet:\n{prompt_packet_json}\n",
-    )
+    );
+    if let Some(prompt_task_request) = prompt_task_request {
+        prompt.push_str("\nPrompt task request:\n");
+        prompt.push_str(prompt_task_request);
+        prompt.push('\n');
+    }
+    prompt
 }
 
 fn activity_result_schema(job: &RuntimeJob, workflow: Option<&WorkflowInstance>) -> Value {
@@ -1060,6 +1086,7 @@ fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionVali
         "github_issue_pr" => Some(DecisionValidator::github_issue_pr()),
         QUALITY_GATE_DEFINITION_ID => Some(DecisionValidator::quality_gate()),
         PR_FEEDBACK_DEFINITION_ID => Some(DecisionValidator::pr_feedback()),
+        PROMPT_TASK_DEFINITION_ID => Some(DecisionValidator::prompt_task()),
         "repo_backlog" => Some(DecisionValidator::repo_backlog()),
         _ => None,
     }
@@ -1155,6 +1182,16 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             },
             "follow_up_event": "PrDetected binds PR metadata and advances the issue workflow."
         }),
+        (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
+            "on_succeeded": {
+                "reducer_next_state": "done",
+                "required_summary": "Include changed files, validation commands, and remaining blockers."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
         ("repo_backlog", "start_child_workflow") => json!({
             "on_succeeded": {
                 "reducer_next_state": "idle",
@@ -1204,6 +1241,16 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 "pull_request": {
                     "required_when": "A PR was created or reused by the activity.",
                     "fields": ["pr_number", "pr_url"]
+                }
+            }
+        }),
+        (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
+            "must_include": ["changed files", "validation commands", "remaining blockers"],
+            "must_not_include": ["workflow table mutations", "unverified merge claims"],
+            "artifacts": {
+                "validation_report": {
+                    "optional": true,
+                    "fields": ["commands", "passed", "failed", "blocked"]
                 }
             }
         }),
@@ -1500,6 +1547,68 @@ fn activity_name(job: &RuntimeJob) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptTaskRequest {
+    NotPromptActivity,
+    Ready(String),
+    PayloadUnavailable { prompt_ref: String },
+}
+
+impl PromptTaskRequest {
+    fn prompt_text(&self) -> Option<&str> {
+        match self {
+            Self::Ready(prompt) => Some(prompt.as_str()),
+            Self::NotPromptActivity | Self::PayloadUnavailable { .. } => None,
+        }
+    }
+}
+
+fn prompt_task_request_for_job(job: &RuntimeJob) -> anyhow::Result<PromptTaskRequest> {
+    if activity_name(job) != PROMPT_TASK_IMPLEMENT_ACTIVITY {
+        return Ok(PromptTaskRequest::NotPromptActivity);
+    }
+    let Some(prompt_ref) = job
+        .input
+        .get("command")
+        .and_then(|command| command.get("prompt_ref"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        anyhow::bail!("runtime prompt task command is missing prompt_ref");
+    };
+    Ok(
+        match crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref) {
+            Some(prompt) => PromptTaskRequest::Ready(prompt),
+            None => PromptTaskRequest::PayloadUnavailable {
+                prompt_ref: prompt_ref.to_string(),
+            },
+        },
+    )
+}
+
+fn prompt_payload_unavailable_result(job: &RuntimeJob, prompt_ref: &str) -> ActivityResult {
+    let activity = activity_name(job);
+    let error = format!(
+        "Runtime prompt payload `{prompt_ref}` is unavailable because prompt text is only held in the current Harness process."
+    );
+    ActivityResult {
+        activity,
+        status: ActivityStatus::Blocked,
+        summary: "Runtime prompt task is blocked until the prompt is resubmitted.".to_string(),
+        artifacts: vec![ActivityArtifact::new(
+            "prompt_payload_unavailable",
+            json!({
+                "prompt_ref": prompt_ref,
+                "recovery": "Resubmit the prompt task so Harness can rebuild the runtime prompt payload."
+            }),
+        )],
+        signals: Vec::new(),
+        validation: Vec::new(),
+        error: Some(error),
+        error_kind: Some(ActivityErrorKind::Configuration),
+    }
+}
+
 fn is_builtin_lifecycle_activity(job: &RuntimeJob) -> bool {
     matches!(
         activity_name(job).as_str(),
@@ -1738,6 +1847,45 @@ mod tests {
         );
 
         assert_eq!(activity_name(&job), "start_child_workflow");
+    }
+
+    #[test]
+    fn prompt_task_request_blocks_when_cached_payload_is_unavailable() -> anyhow::Result<()> {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "command": {
+                    "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                    "prompt_ref": "prompt-submission:cache-miss-test"
+                }
+            }),
+        );
+
+        let request = prompt_task_request_for_job(&job)?;
+        assert_eq!(
+            request,
+            PromptTaskRequest::PayloadUnavailable {
+                prompt_ref: "prompt-submission:cache-miss-test".to_string()
+            }
+        );
+
+        let result = prompt_payload_unavailable_result(&job, "prompt-submission:cache-miss-test");
+        assert_eq!(result.status, ActivityStatus::Blocked);
+        assert_eq!(result.activity, PROMPT_TASK_IMPLEMENT_ACTIVITY);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("only held in the current Harness process"));
+        assert_eq!(
+            result.artifacts[0].artifact_type,
+            "prompt_payload_unavailable"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2146,7 +2294,7 @@ mod profile_tests {
     use super::*;
 
     #[test]
-    fn runtime_issue_completion_task_preserves_intake_identity() {
+    fn runtime_submission_completion_task_preserves_issue_intake_identity() {
         let instance = WorkflowInstance::new(
             "github_issue_pr",
             1,
@@ -2163,7 +2311,7 @@ mod profile_tests {
         }));
         let result = ActivityResult::cancelled("implement_issue", "Runtime job was cancelled.");
 
-        let task = runtime_issue_completion_task(&instance, Some(&result))
+        let task = runtime_submission_completion_task(&instance, Some(&result))
             .expect("terminal runtime issue should map to an intake task");
 
         assert_eq!(task.id.as_str(), "runtime-task-42");
@@ -2176,7 +2324,36 @@ mod profile_tests {
     }
 
     #[test]
-    fn runtime_issue_completion_task_marks_retryable_failures_as_transient() {
+    fn runtime_submission_completion_task_preserves_prompt_intake_identity() {
+        let instance = WorkflowInstance::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            "done",
+            WorkflowSubject::new("prompt", "manual:prompt:42"),
+        )
+        .with_data(json!({
+            "task_id": "runtime-prompt-42",
+            "project_id": "/tmp/project",
+            "prompt_summary": "prompt task",
+            "source": "dashboard",
+            "external_id": "manual:prompt:42",
+        }));
+        let result = ActivityResult::succeeded("implement_prompt", "Prompt task completed.");
+
+        let task = runtime_submission_completion_task(&instance, Some(&result))
+            .expect("terminal runtime prompt should map to an intake task");
+
+        assert_eq!(task.id.as_str(), "runtime-prompt-42");
+        assert_eq!(task.task_kind, TaskKind::Prompt);
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.source.as_deref(), Some("dashboard"));
+        assert_eq!(task.external_id.as_deref(), Some("manual:prompt:42"));
+        assert_eq!(task.issue, None);
+        assert_eq!(task.description.as_deref(), Some("prompt task"));
+    }
+
+    #[test]
+    fn runtime_submission_completion_task_marks_retryable_failures_as_transient() {
         let instance = WorkflowInstance::new(
             "github_issue_pr",
             1,
@@ -2198,7 +2375,7 @@ mod profile_tests {
         )
         .with_error_kind(ActivityErrorKind::ExternalDependency);
 
-        let task = runtime_issue_completion_task(&instance, Some(&result))
+        let task = runtime_submission_completion_task(&instance, Some(&result))
             .expect("terminal runtime issue should map to an intake task");
 
         assert_eq!(task.status, TaskStatus::Failed);
