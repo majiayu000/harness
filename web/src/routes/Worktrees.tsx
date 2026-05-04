@@ -46,7 +46,7 @@ function openStream(taskId: string): void {
 
 interface CardProps {
   card: WorktreeCard;
-  onCancel: (taskId: string) => void;
+  onCancel: (card: WorktreeCard) => void;
   cancelling: boolean;
 }
 
@@ -123,10 +123,10 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
         <button
           type="button"
           disabled={cancelling}
-          onClick={() => onCancel(card.taskId)}
+          onClick={() => onCancel(card)}
           className="ml-auto font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {cancelling ? "Cancelling…" : "Cancel"}
+          {cancelling ? "Cancelling..." : "Cancel"}
         </button>
       </div>
     </div>
@@ -141,18 +141,37 @@ export function Worktrees() {
   const [cancelling, setCancelling] = React.useState<Set<string>>(new Set());
   const [cancelError, setCancelError] = React.useState<string | null>(null);
 
-  const handleCancel = async (taskId: string) => {
+  const handleCancel = async (card: WorktreeCard) => {
+    const cancelKey = card.runtimeWorkflowId ?? card.taskId;
+    const refreshRuntimeTree = !!card.runtimeWorkflowId;
     setCancelError(null);
-    setCancelling((prev) => new Set(prev).add(taskId));
+    setCancelling((prev) => new Set(prev).add(cancelKey));
     try {
-      await apiFetch(`/tasks/${taskId}/cancel`, { method: "POST" });
-      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      if (card.runtimeWorkflowId) {
+        await apiFetch("/api/workflows/runtime/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workflow_id: card.runtimeWorkflowId }),
+        });
+      } else {
+        await apiFetch(`/tasks/${card.taskId}/cancel`, { method: "POST" });
+      }
     } catch (err) {
       setCancelError(err instanceof Error ? err.message : "Cancel failed");
     } finally {
+      const refreshes = [queryClient.invalidateQueries({ queryKey: ["tasks"] })];
+      if (refreshRuntimeTree) {
+        refreshes.push(queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] }));
+      }
+      const refreshResults = await Promise.allSettled(refreshes);
+      for (const result of refreshResults) {
+        if (result.status === "rejected") {
+          console.error("Failed to refresh worktree data after cancellation", result.reason);
+        }
+      }
       setCancelling((prev) => {
         const next = new Set(prev);
-        next.delete(taskId);
+        next.delete(cancelKey);
         return next;
       });
     }
@@ -206,7 +225,10 @@ export function Worktrees() {
               </div>
             )}
             {cancelError && (
-              <div className="mb-4 px-3 py-2 border border-danger/40 text-danger font-mono text-[12px] rounded-[3px] bg-danger/5">
+              <div
+                role="alert"
+                className="mb-4 px-3 py-2 border border-danger/40 text-danger font-mono text-[12px] rounded-[3px] bg-danger/5"
+              >
                 {cancelError}
               </div>
             )}
@@ -221,7 +243,7 @@ export function Worktrees() {
                     key={card.taskId}
                     card={card}
                     onCancel={handleCancel}
-                    cancelling={cancelling.has(card.taskId)}
+                    cancelling={cancelling.has(card.runtimeWorkflowId ?? card.taskId)}
                   />
                 ))}
               </div>

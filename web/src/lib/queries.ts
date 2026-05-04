@@ -158,6 +158,7 @@ export function useCancelWorkflowRuntime() {
 
 export interface WorktreeCard {
   taskId: string;
+  runtimeWorkflowId: string | null;
   pathShort: string;
   branch: string;
   status: string;
@@ -209,6 +210,7 @@ export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; err
 
     return {
       taskId: task.id,
+      runtimeWorkflowId: task.workflow?.definition_id ? (task.workflow.id ?? null) : null,
       pathShort,
       branch: "—",
       status: task.status,

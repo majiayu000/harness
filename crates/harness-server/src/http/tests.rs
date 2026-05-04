@@ -3668,7 +3668,9 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
         canonical_project_root.to_string_lossy().as_ref()
     );
     assert_eq!(runtime_task["scheduler"]["authority_state"], "running");
-    assert!(runtime_task.get("workflow").is_none());
+    assert_eq!(runtime_task["workflow"]["id"], created["workflow_id"]);
+    assert_eq!(runtime_task["workflow"]["definition_id"], "prompt_task");
+    assert_eq!(runtime_task["workflow"]["state"], "implementing");
     Ok(())
 }
 
