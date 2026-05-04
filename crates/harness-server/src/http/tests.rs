@@ -5168,6 +5168,10 @@ async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Resul
 
 #[tokio::test]
 async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let state = make_test_state_with_issue_workflows(dir.path()).await?;
     let app = Router::new()
