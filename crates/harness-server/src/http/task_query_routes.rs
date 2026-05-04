@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::state::AppState;
 use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskKind, TaskPhase, TaskSchedulerState, TaskStatus,
-    TaskSummary,
+    TaskSummary, TaskWorkflowSummary,
 };
 
 /// Response type for `GET /tasks/{id}` — `TaskState` fields plus the optional workflow summary
@@ -22,7 +22,7 @@ struct FullTaskResponse {
     #[serde(flatten)]
     inner: crate::task_runner::TaskState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    workflow: Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance>,
+    workflow: Option<TaskWorkflowSummary>,
 }
 
 #[derive(Serialize)]
@@ -41,7 +41,8 @@ struct RuntimeTaskResponse {
     project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     issue: Option<u64>,
-    workflow: harness_workflow::runtime::WorkflowInstance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow: Option<TaskWorkflowSummary>,
 }
 
 pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
@@ -90,10 +91,12 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
                     summary.workflow = match (by_issue, by_pr) {
                         (Some(issue), _) => workflows_by_issue
                             .get(&(project_id.to_owned(), summary.repo.clone(), issue))
-                            .cloned(),
+                            .cloned()
+                            .map(TaskWorkflowSummary::from),
                         (None, Some(pr)) => workflows_by_pr
                             .get(&(project_id.to_owned(), summary.repo.clone(), pr))
-                            .cloned(),
+                            .cloned()
+                            .map(TaskWorkflowSummary::from),
                         (None, None) => None,
                     };
                 }
@@ -213,7 +216,8 @@ fn runtime_workflow_task_summary(
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
-        workflow: None,
+        workflow: (task_kind == TaskKind::Issue)
+            .then(|| TaskWorkflowSummary::from_runtime(&workflow)),
         scheduler,
     }
 }
@@ -364,7 +368,7 @@ async fn runtime_task_response_by_handle(
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned),
         issue,
-        workflow,
+        workflow: Some(TaskWorkflowSummary::from_runtime(&workflow)),
     }))
 }
 
@@ -373,7 +377,7 @@ async fn runtime_task_response_by_handle(
 async fn enrich_task_workflow(
     state: &AppState,
     task: &crate::task_runner::TaskState,
-) -> Option<harness_workflow::issue_lifecycle::IssueWorkflowInstance> {
+) -> Option<TaskWorkflowSummary> {
     let workflow_store = state.core.issue_workflow_store.as_ref()?;
     let project_id = task.project_root.as_ref()?.to_string_lossy().into_owned();
 
@@ -400,14 +404,16 @@ async fn enrich_task_workflow(
             .unwrap_or_else(|e| {
                 tracing::warn!("get_task: workflow lookup by issue failed: {e}");
                 None
-            }),
+            })
+            .map(TaskWorkflowSummary::from),
         (None, Some(pr)) => workflow_store
             .get_by_pr(&project_id, task.repo.as_deref(), pr)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("get_task: workflow lookup by PR failed: {e}");
                 None
-            }),
+            })
+            .map(TaskWorkflowSummary::from),
         (None, None) => None,
     }
 }

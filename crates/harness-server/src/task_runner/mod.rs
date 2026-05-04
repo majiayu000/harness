@@ -25,7 +25,7 @@ pub use spawn::{
 };
 pub use state::{
     RecentFailureTask, RoundResult, SchedulerAuthorityState, SchedulerOwner, SchedulerOwnerKind,
-    TaskSchedulerState, TaskState, TaskSummary,
+    TaskSchedulerState, TaskState, TaskSummary, TaskWorkflowSummary,
 };
 pub use store::{mutate_and_persist, update_status, TaskStore};
 pub use types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};

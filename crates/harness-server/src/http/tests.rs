@@ -3186,6 +3186,14 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
     assert_eq!(detail["status"], "implementing");
     assert_eq!(detail["execution_path"], "workflow_runtime");
     assert_eq!(detail["workflow_id"], workflow_id);
+    assert_eq!(detail["workflow"]["id"], workflow_id);
+    assert_eq!(detail["workflow"]["definition_id"], "prompt_task");
+    assert_eq!(detail["workflow"]["state"], "implementing");
+    assert_eq!(
+        detail["workflow"]["project_id"],
+        canonical_project_root.to_string_lossy().as_ref()
+    );
+    assert!(detail["workflow"].get("data").is_none());
     Ok(())
 }
 
@@ -3365,7 +3373,145 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         canonical_project_root.to_string_lossy().as_ref()
     );
     assert_eq!(runtime_task["scheduler"]["authority_state"], "running");
-    assert!(runtime_task.get("workflow").is_none());
+    assert!(runtime_task["workflow"]["id"]
+        .as_str()
+        .is_some_and(|id| id.ends_with("::repo:owner/repo::issue:52")));
+    assert_eq!(runtime_task["workflow"]["definition_id"], "github_issue_pr");
+    assert_eq!(runtime_task["workflow"]["state"], "implementing");
+    assert_eq!(runtime_task["workflow"]["issue_number"], 52);
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:53"),
+    )
+    .with_id("runtime-ready-53")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 53,
+        "pr_number": 125,
+        "pr_url": "https://github.com/owner/repo/pull/125",
+        "task_id": "runtime-ready-task",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let app = Router::new()
+        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks/runtime-ready-task/merge")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "merge_approved");
+    assert_eq!(body["execution_path"], "workflow_runtime");
+    let updated = store
+        .get_instance("runtime-ready-53")
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "done");
+    assert_eq!(updated.data["last_decision"], "approve_merge");
+    assert_eq!(updated.data["merge_approved_task_id"], "runtime-ready-task");
+    let events = store.events_for("runtime-ready-53").await?;
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "MergeApproved"));
+    let decisions = store.decisions_for("runtime-ready-53").await?;
+    assert!(decisions
+        .iter()
+        .any(|record| record.accepted && record.decision.decision == "approve_merge"));
+    let commands = store.commands_for("runtime-ready-53").await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.command_type,
+        harness_workflow::runtime::WorkflowCommandType::MarkDone
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:54"),
+    )
+    .with_id("runtime-ready-54")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 54,
+        "pr_number": 126,
+        "pr_url": "https://github.com/owner/repo/pull/126",
+        "task_id": "runtime-ready-task-54",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/merge",
+            post(task_mutation_routes::merge_workflow_runtime),
+        )
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/merge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "workflow_id": "runtime-ready-54" }).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response_json(response).await?;
+    assert_eq!(body["workflow_id"], "runtime-ready-54");
+    let updated = store
+        .get_instance("runtime-ready-54")
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "done");
     Ok(())
 }
 
@@ -4843,6 +4989,7 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
     state.core.tasks.insert(&planner_task).await;
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -4991,6 +5138,7 @@ async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Resul
         .with_state(state);
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -5020,10 +5168,15 @@ async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Resul
 
 #[tokio::test]
 async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let state = make_test_state_with_issue_workflows(dir.path()).await?;
     let app = Router::new()
         .route("/tasks", get(list_tasks))
+        .route("/tasks/{id}", get(get_task))
         .with_state(state.clone());
 
     let task = task_runner::TaskState {
@@ -5098,6 +5251,7 @@ async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
         .await?;
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -5111,6 +5265,20 @@ async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
     assert_eq!(task["workflow"]["review_fallback"]["tier"], "c");
     assert_eq!(task["workflow"]["review_fallback"]["trigger"], "silence");
     assert_eq!(task["workflow"]["review_fallback"]["active_bot"], "codex");
+
+    let detail_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{}", task["id"].as_str().expect("task id")))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail_body = axum::body::to_bytes(detail_response.into_body(), usize::MAX).await?;
+    let detail: serde_json::Value = serde_json::from_slice(&detail_body)?;
+    assert_eq!(detail["workflow"]["state"], "ready_to_merge");
+    assert_eq!(detail["workflow"]["review_fallback"]["tier"], "c");
+    assert!(detail["workflow"].get("events").is_none());
     Ok(())
 }
 

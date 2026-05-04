@@ -133,6 +133,11 @@ function runtimeJobLabel(command: WorkflowRuntimeCommandNode): string {
   return `${command.runtime_jobs.length} jobs - ${job.status}${notBefore}${latestEvent}${promptDigest}`;
 }
 
+function runtimeMergeWorkflowId(workflow?: WorkflowSummary | null): string | null {
+  if (workflow?.definition_id === "github_issue_pr" && workflow.id) return workflow.id;
+  return null;
+}
+
 function rejectedDecisions(decisions: WorkflowRuntimeDecisionRecord[]) {
   return decisions.filter((decision) => !decision.accepted);
 }
@@ -268,7 +273,7 @@ function TaskCard({
   task: Task;
   workflow?: WorkflowSummary | null;
   onClick: () => void;
-  onMerge?: (taskId: string) => void;
+  onMerge?: (taskId: string, workflow?: WorkflowSummary | null) => void;
   merging?: boolean;
 }) {
   const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
@@ -337,7 +342,7 @@ function TaskCard({
           disabled={merging}
           onClick={(e) => {
             e.stopPropagation();
-            onMerge(task.id);
+            onMerge(task.id, workflow);
           }}
           className="mt-2 w-full border border-line bg-bg-1 px-2 py-1 font-mono text-[10px] text-ink-2 hover:border-line-3 hover:text-ink transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -359,11 +364,21 @@ export function Active({ projectFilter }: Props) {
   const { data: dashboard } = useDashboard();
   const queryClient = useQueryClient();
 
-  const handleMerge = async (taskId: string) => {
+  const handleMerge = async (taskId: string, workflow?: WorkflowSummary | null) => {
     setMerging((prev) => new Set(prev).add(taskId));
     try {
-      await apiFetch(`/tasks/${taskId}/merge`, { method: "POST" });
+      const runtimeWorkflowId = runtimeMergeWorkflowId(workflow);
+      if (runtimeWorkflowId) {
+        await apiFetch("/api/workflows/runtime/merge", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workflow_id: runtimeWorkflowId }),
+        });
+      } else {
+        await apiFetch(`/tasks/${taskId}/merge`, { method: "POST" });
+      }
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] });
     } finally {
       setMerging((prev) => {
         const next = new Set(prev);

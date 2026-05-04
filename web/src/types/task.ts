@@ -44,7 +44,10 @@ export function isTerminal(status: string): boolean {
 }
 
 export interface WorkflowSummary {
+  id?: string | null;
+  definition_id?: string | null;
   state: string;
+  project_id?: string | null;
   issue_number?: number | null;
   pr_number?: number | null;
   force_execute?: boolean;

@@ -3,7 +3,7 @@ use harness_workflow::runtime::{
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
     DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, ValidationContext, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
@@ -35,6 +35,26 @@ pub(crate) enum PrFeedbackSweepRequestOutcome {
     NotCandidate { workflow_id: String, state: String },
     ActiveCommandExists { workflow_id: String },
     Rejected { workflow_id: String, reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeMergeApprovalOutcome {
+    Approved {
+        workflow_id: String,
+    },
+    NotFound,
+    NotCandidate {
+        workflow_id: String,
+        definition_id: String,
+    },
+    NotReady {
+        workflow_id: String,
+        state: String,
+    },
+    Rejected {
+        workflow_id: String,
+        reason: String,
+    },
 }
 
 pub(crate) async fn record_pr_detected(
@@ -95,6 +115,26 @@ pub(crate) async fn request_pr_feedback_sweep(
         });
     }
     persist_pr_feedback_sweep_request(store, instance).await
+}
+
+pub(crate) async fn approve_runtime_merge_by_task_id(
+    store: &WorkflowRuntimeStore,
+    task_id: &str,
+) -> anyhow::Result<RuntimeMergeApprovalOutcome> {
+    let Some(instance) = store.get_instance_by_task_id(task_id).await? else {
+        return Ok(RuntimeMergeApprovalOutcome::NotFound);
+    };
+    approve_runtime_merge(store, instance, Some(task_id)).await
+}
+
+pub(crate) async fn approve_runtime_merge_by_workflow_id(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<RuntimeMergeApprovalOutcome> {
+    let Some(instance) = store.get_instance(workflow_id).await? else {
+        return Ok(RuntimeMergeApprovalOutcome::NotFound);
+    };
+    approve_runtime_merge(store, instance, None).await
 }
 
 async fn persist_pr_detected(
@@ -279,6 +319,91 @@ async fn persist_pr_feedback(
     apply_decision(store, instance, output.decision, Some(event.id)).await
 }
 
+async fn approve_runtime_merge(
+    store: &WorkflowRuntimeStore,
+    mut instance: WorkflowInstance,
+    task_id: Option<&str>,
+) -> anyhow::Result<RuntimeMergeApprovalOutcome> {
+    if instance.definition_id != harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID {
+        return Ok(RuntimeMergeApprovalOutcome::NotCandidate {
+            workflow_id: instance.id,
+            definition_id: instance.definition_id,
+        });
+    }
+    if instance.state != "ready_to_merge" {
+        return Ok(RuntimeMergeApprovalOutcome::NotReady {
+            workflow_id: instance.id,
+            state: instance.state,
+        });
+    }
+
+    let event = store
+        .append_event(
+            &instance.id,
+            "MergeApproved",
+            "workflow_runtime_dashboard",
+            json!({
+                "task_id": task_id,
+                "issue_number": instance.data.get("issue_number").and_then(|value| value.as_u64()),
+                "repo": optional_string_field(&instance.data, "repo"),
+                "pr_number": instance.data.get("pr_number").and_then(|value| value.as_u64()),
+                "pr_url": optional_string_field(&instance.data, "pr_url"),
+            }),
+        )
+        .await?;
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "approve_merge",
+        "done",
+        "operator approved the ready-to-merge workflow",
+    )
+    .with_command(harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::MarkDone,
+        format!("merge-approved:{}:{}", instance.id, event.id),
+        json!({
+            "workflow_id": instance.id,
+            "task_id": task_id,
+            "approved_by": "dashboard",
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "operator_approval",
+        "dashboard merge approval for ready-to-merge workflow",
+    ))
+    .high_confidence();
+    let validator = DecisionValidator::github_issue_pr();
+    let validation = validator.validate(
+        &instance,
+        &decision,
+        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
+    );
+    let record = match validation {
+        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id)),
+        Err(error) => {
+            let reason = error.to_string();
+            let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
+            store.record_decision(&record).await?;
+            return Ok(RuntimeMergeApprovalOutcome::Rejected {
+                workflow_id: instance.id,
+                reason,
+            });
+        }
+    };
+    store.record_decision(&record).await?;
+    for command in &decision.commands {
+        store
+            .enqueue_command(&instance.id, Some(&record.id), command)
+            .await?;
+    }
+    instance.state = decision.next_state.clone();
+    instance.version = instance.version.saturating_add(1);
+    instance.data = merge_runtime_merge_data(instance.data, &decision.decision, task_id);
+    let workflow_id = instance.id.clone();
+    store.upsert_instance(&instance).await?;
+    Ok(RuntimeMergeApprovalOutcome::Approved { workflow_id })
+}
+
 async fn apply_decision(
     store: &WorkflowRuntimeStore,
     mut instance: WorkflowInstance,
@@ -422,6 +547,21 @@ fn issue_instance(
 fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_json::Value {
     if let Some(object) = data.as_object_mut() {
         object.insert("last_decision".to_string(), json!(decision));
+    }
+    data
+}
+
+fn merge_runtime_merge_data(
+    mut data: serde_json::Value,
+    decision: &str,
+    task_id: Option<&str>,
+) -> serde_json::Value {
+    if let Some(object) = data.as_object_mut() {
+        object.insert("last_decision".to_string(), json!(decision));
+        object.insert("merge_approved_at".to_string(), json!(chrono::Utc::now()));
+        if let Some(task_id) = task_id {
+            object.insert("merge_approved_task_id".to_string(), json!(task_id));
+        }
     }
     data
 }
