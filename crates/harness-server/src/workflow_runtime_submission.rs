@@ -10,6 +10,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fmt,
     path::Path,
     sync::{Mutex, OnceLock},
 };
@@ -327,17 +328,76 @@ pub(crate) fn runtime_issue_task_handle(instance: &WorkflowInstance) -> Option<T
         .map(|task_id| TaskId::from_str(&task_id))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum RuntimeSubmissionCancelOutcome {
+    Cancelled(WorkflowInstance),
+    AlreadyTerminal(WorkflowInstance),
+    NotFound,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeSubmissionCancelError {
+    UnsupportedDefinition { definition_id: String },
+    Store(anyhow::Error),
+}
+
+impl fmt::Display for RuntimeSubmissionCancelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedDefinition { definition_id } => write!(
+                formatter,
+                "workflow definition `{definition_id}` cannot be cancelled as a runtime submission"
+            ),
+            Self::Store(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeSubmissionCancelError {}
+
+impl From<anyhow::Error> for RuntimeSubmissionCancelError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Store(error)
+    }
+}
+
 pub(crate) async fn cancel_issue_submission_by_task_id(
     store: &WorkflowRuntimeStore,
     task_id: &TaskId,
-) -> anyhow::Result<Option<WorkflowInstance>> {
+) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
     let Some(instance) = store.get_instance_by_task_id(task_id.as_str()).await? else {
-        return Ok(None);
+        return Ok(RuntimeSubmissionCancelOutcome::NotFound);
     };
+    cancel_submission_instance(store, instance, task_id.as_str()).await
+}
+
+pub(crate) async fn cancel_submission_by_workflow_id(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
+    let Some(instance) = store.get_instance(workflow_id).await? else {
+        return Ok(RuntimeSubmissionCancelOutcome::NotFound);
+    };
+    let correlation_id = runtime_issue_task_handle(&instance)
+        .map(|task_id| task_id.0)
+        .unwrap_or_else(|| format!("workflow:{workflow_id}"));
+    cancel_submission_instance(store, instance, &correlation_id).await
+}
+
+async fn cancel_submission_instance(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+    correlation_id: &str,
+) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
     if instance.is_terminal() {
-        return Ok(Some(instance));
+        return Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(instance));
     }
     let is_prompt = instance.definition_id == PROMPT_TASK_DEFINITION_ID;
+    if !is_prompt && instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
+        return Err(RuntimeSubmissionCancelError::UnsupportedDefinition {
+            definition_id: instance.definition_id,
+        });
+    }
     let event_type = if is_prompt {
         "PromptSubmissionCancelled"
     } else {
@@ -364,7 +424,7 @@ pub(crate) async fn cancel_issue_submission_by_task_id(
             event_type,
             "workflow_runtime_submission",
             json!({
-                "task_id": task_id.as_str(),
+                "task_id": correlation_id,
                 "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
             }),
         )
@@ -378,8 +438,8 @@ pub(crate) async fn cancel_issue_submission_by_task_id(
     )
     .with_command(WorkflowCommand::new(
         WorkflowCommandType::MarkCancelled,
-        format!("{command_prefix}:{}:cancel", task_id.as_str()),
-        json!({ "task_id": task_id.as_str() }),
+        format!("{command_prefix}:{correlation_id}:cancel"),
+        json!({ "task_id": correlation_id }),
     ))
     .high_confidence();
     let mut cancelled = commit_runtime_decision(store, instance, decision, event.id, None).await?;
@@ -389,8 +449,8 @@ pub(crate) async fn cancel_issue_submission_by_task_id(
             store
                 .cancel_command_and_unfinished_runtime_jobs(
                     &command.id,
-                    "cancel_issue_submission",
-                    "Runtime issue submission was cancelled before execution.",
+                    decision_name,
+                    "Runtime submission was cancelled before execution.",
                 )
                 .await?;
         }
@@ -402,7 +462,7 @@ pub(crate) async fn cancel_issue_submission_by_task_id(
             optional_string_field(&cancelled.data, "prompt_ref").as_deref(),
         );
     }
-    Ok(Some(cancelled))
+    Ok(RuntimeSubmissionCancelOutcome::Cancelled(cancelled))
 }
 
 async fn persist_issue_submission(
@@ -1199,6 +1259,16 @@ mod tests {
         WorkflowRuntimeStore::open_with_database_url(dir, Some(&database_url)).await
     }
 
+    fn expect_cancelled(
+        outcome: RuntimeSubmissionCancelOutcome,
+        context: &str,
+    ) -> WorkflowInstance {
+        match outcome {
+            RuntimeSubmissionCancelOutcome::Cancelled(workflow) => workflow,
+            other => panic!("{context}: expected cancelled workflow, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn issue_submission_records_pending_runtime_implementation_command() -> anyhow::Result<()>
     {
@@ -1591,9 +1661,10 @@ mod tests {
             "dispatched"
         );
 
-        let cancelled = cancel_issue_submission_by_task_id(&store, &task_id)
-            .await?
-            .expect("runtime issue submission should resolve by task id");
+        let cancelled = expect_cancelled(
+            cancel_issue_submission_by_task_id(&store, &task_id).await?,
+            "runtime issue submission should resolve by task id",
+        );
         assert_eq!(cancelled.state, "cancelled");
 
         let commands = store.commands_for(&result.workflow_id).await?;
@@ -1609,6 +1680,50 @@ mod tests {
             harness_workflow::runtime::RuntimeJobStatus::Cancelled
         );
         assert!(jobs[0].lease.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_issue_submission_by_workflow_id_uses_stable_runtime_handle(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = open_runtime_store(dir.path()).await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("runtime-handle-cancel-by-workflow");
+        let result = record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 43,
+                task_id: &task_id,
+                labels: &[],
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+                source: None,
+                external_id: None,
+            },
+        )
+        .await?;
+
+        let cancelled = expect_cancelled(
+            cancel_submission_by_workflow_id(&store, &result.workflow_id).await?,
+            "runtime issue submission should resolve by workflow id",
+        );
+        assert_eq!(cancelled.state, "cancelled");
+        assert_eq!(cancelled.data["cancelled"], true);
+        assert_eq!(cancelled.data["last_decision"], "cancel_issue_submission");
+        let events = store.events_for(&result.workflow_id).await?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "IssueSubmissionCancelled"));
         Ok(())
     }
 
@@ -1660,9 +1775,10 @@ mod tests {
             "dispatched"
         );
 
-        let cancelled = cancel_issue_submission_by_task_id(&store, &task_id)
-            .await?
-            .expect("runtime prompt submission should resolve by task id");
+        let cancelled = expect_cancelled(
+            cancel_issue_submission_by_task_id(&store, &task_id).await?,
+            "runtime prompt submission should resolve by task id",
+        );
         assert_eq!(cancelled.state, "cancelled");
 
         let commands = store.commands_for(&result.workflow_id).await?;

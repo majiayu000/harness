@@ -71,6 +71,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(task_mutation_routes::merge_workflow_runtime),
         )
         .route(
+            "/api/workflows/runtime/cancel",
+            post(task_mutation_routes::cancel_workflow_runtime),
+        )
+        .route(
             "/api/runtime-hosts",
             get(crate::handlers::runtime_hosts::list_runtime_hosts),
         )

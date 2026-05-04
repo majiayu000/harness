@@ -3516,6 +3516,89 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let task_id = harness_core::types::TaskId::from_str("runtime-cancel-task-55");
+    let submission = crate::workflow_runtime_submission::record_issue_submission(
+        store,
+        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 55,
+            task_id: &task_id,
+            labels: &[],
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/cancel",
+            post(task_mutation_routes::cancel_workflow_runtime),
+        )
+        .with_state(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/cancel")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "workflow_id": submission.workflow_id }).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "cancelled");
+    assert_eq!(body["execution_path"], "workflow_runtime");
+    let updated = store
+        .get_instance(&submission.workflow_id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "cancelled");
+    assert_eq!(updated.data["last_decision"], "cancel_issue_submission");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/cancel")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "workflow_id": submission.workflow_id }).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "workflow already terminal");
+    assert_eq!(body["state"], "cancelled");
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
