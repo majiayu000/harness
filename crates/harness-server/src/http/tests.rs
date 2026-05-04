@@ -833,7 +833,7 @@ async fn assert_runtime_issue_submission(
     repo: Option<&str>,
     issue_number: u64,
     task_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let task_id = task_runner::TaskId::from_str(task_id);
     assert!(
         state
@@ -881,7 +881,7 @@ async fn assert_runtime_issue_submission(
     assert_eq!(runtime_task["status"], "implementing");
     assert_eq!(runtime_task["execution_path"], "workflow_runtime");
     assert_eq!(runtime_task["workflow_id"], workflow_id);
-    Ok(())
+    Ok(workflow_id)
 }
 
 fn webhook_signature(secret: &str, payload: &[u8]) -> String {
@@ -3140,6 +3140,7 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
         Some("manual:prompt:http"),
         &task_id,
     );
+    assert_eq!(resp["workflow_id"], workflow_id);
     let instance = store
         .get_instance(&workflow_id)
         .await?
@@ -3291,6 +3292,7 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
         Some("owner/repo"),
         42,
     );
+    assert_eq!(resp["workflow_id"], workflow_id);
     let instance = store
         .get_instance(&workflow_id)
         .await?
@@ -4230,7 +4232,7 @@ async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow:
     for (entry, issue_number) in entries.iter().zip([42_u64, 43]) {
         assert_eq!(entry["status"], "implementing");
         assert_eq!(entry["execution_path"], "workflow_runtime");
-        assert_runtime_issue_submission(
+        let workflow_id = assert_runtime_issue_submission(
             &state,
             &project_root,
             None,
@@ -4240,6 +4242,7 @@ async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow:
                 .expect("task id should be present"),
         )
         .await?;
+        assert_eq!(entry["workflow_id"], workflow_id);
     }
     assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
@@ -4364,6 +4367,7 @@ async fn create_tasks_batch_with_prompts_returns_runtime_submissions() -> anyhow
             .get_instance_by_task_id(task_id.as_str())
             .await?
             .expect("runtime prompt submission should be persisted");
+        assert_eq!(entry["workflow_id"], instance.id);
         assert_eq!(instance.definition_id, "prompt_task");
         assert_eq!(instance.state, "implementing");
         assert!(instance.data.get("prompt").is_none());

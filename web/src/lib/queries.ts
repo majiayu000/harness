@@ -140,6 +140,22 @@ export function useCancelTask() {
   });
 }
 
+export function useCancelWorkflowRuntime() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (workflowId: string) =>
+      apiFetch("/api/workflows/runtime/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow_id: workflowId }),
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] });
+    },
+  });
+}
+
 export interface WorktreeCard {
   taskId: string;
   pathShort: string;

@@ -91,4 +91,6 @@ export type CreateTaskPayload =
 export interface CreateTaskResponse {
   task_id: string;
   status: string;
+  execution_path?: string;
+  workflow_id?: string | null;
 }
