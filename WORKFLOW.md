@@ -33,6 +33,7 @@ runtime_dispatch:
   batch_limit: 25
   runtime_kind: codex_jsonrpc
   runtime_profile: codex-default
+  approval_policy: never
 runtime_worker:
   enabled: true
   interval_secs: 5
