@@ -2,6 +2,82 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowDocument {
+    #[serde(default)]
+    pub config: WorkflowConfig,
+    #[serde(default)]
+    pub prompt_template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowIdentityPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default = "default_workflow_version")]
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowSourcePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub active_labels: Vec<String>,
+    #[serde(default)]
+    pub ignore_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowBasePolicy {
+    #[serde(default = "default_base_remote")]
+    pub remote: String,
+    #[serde(default = "default_base_branch")]
+    pub branch: String,
+    #[serde(default = "default_true")]
+    pub require_remote_head: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowWorkspacePolicy {
+    #[serde(default = "default_workspace_strategy")]
+    pub strategy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    #[serde(default = "default_workspace_branch_prefix")]
+    pub branch_prefix: String,
+    #[serde(default)]
+    pub reuse_existing_workspace: bool,
+    #[serde(default = "default_workspace_cleanup")]
+    pub cleanup: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowHooksPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_create: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_remove: Option<String>,
+    #[serde(default = "default_hook_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowActivityPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub validation: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueWorkflowPolicy {
     #[serde(default = "default_force_execute_label")]
@@ -134,6 +210,16 @@ pub struct RuntimeActivityRetryPolicy {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowConfig {
     #[serde(default)]
+    pub workflow: WorkflowIdentityPolicy,
+    #[serde(default)]
+    pub source: WorkflowSourcePolicy,
+    #[serde(default)]
+    pub base: WorkflowBasePolicy,
+    #[serde(default)]
+    pub workspace: WorkflowWorkspacePolicy,
+    #[serde(default)]
+    pub hooks: WorkflowHooksPolicy,
+    #[serde(default)]
     pub issue_workflow: IssueWorkflowPolicy,
     #[serde(default)]
     pub repo_backlog: RepoBacklogPolicy,
@@ -147,6 +233,8 @@ pub struct WorkflowConfig {
     pub runtime_retry_policy: RuntimeRetryPolicy,
     #[serde(default)]
     pub storage: WorkflowStoragePolicy,
+    #[serde(default)]
+    pub activities: BTreeMap<String, WorkflowActivityPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +313,77 @@ impl Default for WorkflowStoragePolicy {
     }
 }
 
+impl Default for WorkflowIdentityPolicy {
+    fn default() -> Self {
+        Self {
+            id: None,
+            version: default_workflow_version(),
+        }
+    }
+}
+
+impl Default for WorkflowBasePolicy {
+    fn default() -> Self {
+        Self {
+            remote: default_base_remote(),
+            branch: default_base_branch(),
+            require_remote_head: true,
+        }
+    }
+}
+
+impl Default for WorkflowWorkspacePolicy {
+    fn default() -> Self {
+        Self {
+            strategy: default_workspace_strategy(),
+            root: None,
+            branch_prefix: default_workspace_branch_prefix(),
+            reuse_existing_workspace: false,
+            cleanup: default_workspace_cleanup(),
+        }
+    }
+}
+
+impl Default for WorkflowHooksPolicy {
+    fn default() -> Self {
+        Self {
+            after_create: None,
+            before_run: None,
+            after_run: None,
+            before_remove: None,
+            timeout_secs: default_hook_timeout_secs(),
+        }
+    }
+}
+
+fn default_workflow_version() -> u32 {
+    1
+}
+
+fn default_base_remote() -> String {
+    "origin".to_string()
+}
+
+fn default_base_branch() -> String {
+    "main".to_string()
+}
+
+fn default_workspace_strategy() -> String {
+    "worktree".to_string()
+}
+
+fn default_workspace_branch_prefix() -> String {
+    "harness/".to_string()
+}
+
+fn default_workspace_cleanup() -> String {
+    "on_terminal".to_string()
+}
+
+fn default_hook_timeout_secs() -> u64 {
+    60
+}
+
 fn default_force_execute_label() -> String {
     "force-execute".to_string()
 }
@@ -286,32 +445,50 @@ fn default_true() -> bool {
 /// Only the YAML front matter is parsed. Missing files or missing front matter
 /// fall back to defaults.
 pub fn load_workflow_config(project_root: &Path) -> anyhow::Result<WorkflowConfig> {
+    load_workflow_document(project_root).map(|document| document.config)
+}
+
+/// Load the workflow policy and prompt template from `{project_root}/WORKFLOW.md`.
+///
+/// Missing files fall back to defaults with an empty prompt template. Files
+/// without front matter use default config and treat the whole body as the
+/// repository workflow prompt template.
+pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDocument> {
     let path = project_root.join("WORKFLOW.md");
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WorkflowConfig::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkflowDocument::default());
+        }
         Err(e) => return Err(e.into()),
     };
 
-    let Some(front_matter) = extract_front_matter(&contents) else {
-        return Ok(WorkflowConfig::default());
+    let (front_matter, prompt_template) = split_front_matter_and_body(&contents);
+    let config = match front_matter {
+        None => WorkflowConfig::default(),
+        Some(front_matter) if front_matter.trim().is_empty() => WorkflowConfig::default(),
+        Some(front_matter) => serde_yaml::from_str(front_matter).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse workflow front matter at {}: {e}",
+                path.display()
+            )
+        })?,
     };
-    if front_matter.trim().is_empty() {
-        return Ok(WorkflowConfig::default());
-    }
 
-    serde_yaml::from_str(front_matter).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to parse workflow front matter at {}: {e}",
-            path.display()
-        )
+    Ok(WorkflowDocument {
+        config,
+        prompt_template: prompt_template.trim().to_string(),
+        source_path: Some(path.display().to_string()),
     })
 }
 
-fn extract_front_matter(contents: &str) -> Option<&str> {
+fn split_front_matter_and_body(contents: &str) -> (Option<&str>, &str) {
     let rest = contents
         .strip_prefix("---\r\n")
-        .or_else(|| contents.strip_prefix("---\n"))?;
+        .or_else(|| contents.strip_prefix("---\n"));
+    let Some(rest) = rest else {
+        return (None, contents);
+    };
 
     let mut search_start = 0;
     while let Some(relative_idx) = rest[search_start..].find("---") {
@@ -322,16 +499,19 @@ fn extract_front_matter(contents: &str) -> Option<&str> {
             after.starts_with("\r\n") || after.starts_with('\n') || after.is_empty();
         if at_line_start && delimiter_ends_line {
             let front_matter = &rest[..idx];
-            return Some(
-                front_matter
-                    .strip_suffix("\r\n")
-                    .or_else(|| front_matter.strip_suffix('\n'))
-                    .unwrap_or(front_matter),
-            );
+            let front_matter = front_matter
+                .strip_suffix("\r\n")
+                .or_else(|| front_matter.strip_suffix('\n'))
+                .unwrap_or(front_matter);
+            let body = after
+                .strip_prefix("\r\n")
+                .or_else(|| after.strip_prefix('\n'))
+                .unwrap_or(after);
+            return (Some(front_matter), body);
         }
         search_start = idx + 3;
     }
-    None
+    (None, contents)
 }
 
 #[cfg(test)]
@@ -342,6 +522,25 @@ mod tests {
     fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let cfg = load_workflow_config(dir.path())?;
+        assert_eq!(cfg.workflow.version, 1);
+        assert_eq!(cfg.workflow.id, None);
+        assert_eq!(cfg.source.kind, None);
+        assert_eq!(cfg.source.repo, None);
+        assert!(cfg.source.active_labels.is_empty());
+        assert!(cfg.source.ignore_labels.is_empty());
+        assert_eq!(cfg.base.remote, "origin");
+        assert_eq!(cfg.base.branch, "main");
+        assert!(cfg.base.require_remote_head);
+        assert_eq!(cfg.workspace.strategy, "worktree");
+        assert_eq!(cfg.workspace.root, None);
+        assert_eq!(cfg.workspace.branch_prefix, "harness/");
+        assert!(!cfg.workspace.reuse_existing_workspace);
+        assert_eq!(cfg.workspace.cleanup, "on_terminal");
+        assert_eq!(cfg.hooks.after_create, None);
+        assert_eq!(cfg.hooks.before_run, None);
+        assert_eq!(cfg.hooks.after_run, None);
+        assert_eq!(cfg.hooks.before_remove, None);
+        assert_eq!(cfg.hooks.timeout_secs, 60);
         assert_eq!(cfg.issue_workflow.force_execute_label, "force-execute");
         assert!(cfg.pr_feedback.enabled);
         assert_eq!(cfg.pr_feedback.sweep_interval_secs, 60);
@@ -371,6 +570,7 @@ mod tests {
         assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
         assert_eq!(cfg.storage.schema_namespace, "workflow");
         assert!(!cfg.issue_workflow.require_human_gate_before_merge);
+        assert!(cfg.activities.is_empty());
         Ok(())
     }
 
@@ -380,6 +580,32 @@ mod tests {
         std::fs::write(
             dir.path().join("WORKFLOW.md"),
             r#"---
+workflow:
+  id: github_issue_pr
+  version: 2
+source:
+  kind: github
+  repo: owner/repo
+  active_labels:
+    - ready
+  ignore_labels:
+    - wontfix
+base:
+  remote: upstream
+  branch: trunk
+  require_remote_head: false
+workspace:
+  strategy: worktree
+  root: /tmp/harness-workspaces
+  branch_prefix: task/
+  reuse_existing_workspace: true
+  cleanup: never
+hooks:
+  after_create: echo after-create
+  before_run: echo before-run
+  after_run: echo after-run
+  before_remove: echo before-remove
+  timeout_secs: 9
 issue_workflow:
   force_execute_label: do-not-second-guess
   auto_replan_on_plan_issue: false
@@ -441,6 +667,11 @@ runtime_retry_policy:
       max_retry_delay_secs: 60
 storage:
   schema_namespace: orchestration
+activities:
+  implement_issue:
+    prompt: issue-default
+    validation:
+      - cargo check
 ---
 
 Body
@@ -448,6 +679,31 @@ Body
         )?;
 
         let cfg = load_workflow_config(dir.path())?;
+        assert_eq!(cfg.workflow.id.as_deref(), Some("github_issue_pr"));
+        assert_eq!(cfg.workflow.version, 2);
+        assert_eq!(cfg.source.kind.as_deref(), Some("github"));
+        assert_eq!(cfg.source.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(cfg.source.active_labels, vec!["ready"]);
+        assert_eq!(cfg.source.ignore_labels, vec!["wontfix"]);
+        assert_eq!(cfg.base.remote, "upstream");
+        assert_eq!(cfg.base.branch, "trunk");
+        assert!(!cfg.base.require_remote_head);
+        assert_eq!(cfg.workspace.strategy, "worktree");
+        assert_eq!(
+            cfg.workspace.root.as_deref(),
+            Some("/tmp/harness-workspaces")
+        );
+        assert_eq!(cfg.workspace.branch_prefix, "task/");
+        assert!(cfg.workspace.reuse_existing_workspace);
+        assert_eq!(cfg.workspace.cleanup, "never");
+        assert_eq!(cfg.hooks.after_create.as_deref(), Some("echo after-create"));
+        assert_eq!(cfg.hooks.before_run.as_deref(), Some("echo before-run"));
+        assert_eq!(cfg.hooks.after_run.as_deref(), Some("echo after-run"));
+        assert_eq!(
+            cfg.hooks.before_remove.as_deref(),
+            Some("echo before-remove")
+        );
+        assert_eq!(cfg.hooks.timeout_secs, 9);
         assert_eq!(
             cfg.issue_workflow.force_execute_label,
             "do-not-second-guess"
@@ -559,6 +815,41 @@ Body
             Some(60)
         );
         assert_eq!(cfg.storage.schema_namespace, "orchestration");
+        let activity = cfg
+            .activities
+            .get("implement_issue")
+            .expect("activity should parse");
+        assert_eq!(activity.prompt.as_deref(), Some("issue-default"));
+        assert_eq!(activity.validation, vec!["cargo check"]);
+        Ok(())
+    }
+
+    #[test]
+    fn load_workflow_document_reads_prompt_template_body() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            "---\nworkflow:\n  id: prompt-test\n---\nUse issue {{ issue.number }}.\n",
+        )?;
+
+        let document = load_workflow_document(dir.path())?;
+        assert_eq!(document.config.workflow.id.as_deref(), Some("prompt-test"));
+        assert_eq!(document.prompt_template, "Use issue {{ issue.number }}.");
+        assert!(document
+            .source_path
+            .as_deref()
+            .is_some_and(|path| { path.ends_with("WORKFLOW.md") }));
+        Ok(())
+    }
+
+    #[test]
+    fn load_workflow_document_uses_body_as_prompt_without_front_matter() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("WORKFLOW.md"), "Plain prompt\n")?;
+
+        let document = load_workflow_document(dir.path())?;
+        assert_eq!(document.config.base.branch, "main");
+        assert_eq!(document.prompt_template, "Plain prompt");
         Ok(())
     }
 

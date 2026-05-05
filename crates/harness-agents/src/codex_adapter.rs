@@ -43,6 +43,21 @@ impl AdapterState {
         self.next_id += 1;
         id
     }
+
+    fn child_ready(&self) -> bool {
+        self.child.is_some() && self.stdin.is_some() && self.stdout_lines.is_some()
+    }
+
+    async fn reset_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        self.stdin = None;
+        self.stdout_lines = None;
+        self.thread_id = None;
+        self.active_turn_id = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,8 +161,14 @@ impl CodexAdapter {
         req: &TurnRequest,
         state: &mut AdapterState,
     ) -> harness_core::error::Result<()> {
-        if state.child.is_some() {
+        if state.child_ready() {
             return Ok(());
+        }
+        if state.child.is_some() {
+            tracing::warn!(
+                "codex app-server state is incomplete; restarting before starting a new turn"
+            );
+            state.reset_child().await;
         }
 
         let mut cmd = tokio::process::Command::new(&self.cli_path);
@@ -937,5 +958,27 @@ mod tests {
         adapter.clear_active_turn_id().await;
 
         assert_eq!(adapter.state.lock().await.active_turn_id, None);
+    }
+
+    #[tokio::test]
+    async fn adapter_state_reports_incomplete_child_when_stdout_reader_is_missing() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sleep process should spawn");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let stdin = child.stdin.take().expect("stdin should be piped");
+        let mut state = AdapterState::new();
+        state.child = Some(child);
+        state.stdin = Some(stdin);
+        state.stdout_lines = Some(BufReader::new(stdout).lines());
+
+        assert!(state.child_ready());
+        state.stdout_lines = None;
+        assert!(!state.child_ready());
+
+        state.reset_child().await;
     }
 }

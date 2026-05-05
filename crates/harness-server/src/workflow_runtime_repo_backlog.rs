@@ -54,7 +54,7 @@ pub(crate) async fn request_repo_backlog_poll(
     ctx: RepoBacklogPollRuntimeContext<'_>,
 ) -> anyhow::Result<RepoBacklogPollRequestOutcome> {
     let instance = load_or_repo_backlog_instance(store, ctx.project_root, ctx.repo).await?;
-    if instance.state != "idle" {
+    if !repo_backlog_poll_candidate_state(&instance.state) {
         return Ok(RepoBacklogPollRequestOutcome::NotCandidate {
             workflow_id: instance.id,
             state: instance.state,
@@ -66,6 +66,10 @@ pub(crate) async fn request_repo_backlog_poll(
         });
     }
     persist_repo_backlog_poll_request(store, instance, &ctx).await
+}
+
+fn repo_backlog_poll_candidate_state(state: &str) -> bool {
+    matches!(state, "idle" | "failed")
 }
 
 pub(crate) async fn record_open_issue_without_workflow(
@@ -359,11 +363,9 @@ async fn apply_decision_with_outcome(
     decision: WorkflowDecision,
     event_id: Option<String>,
 ) -> anyhow::Result<ApplyDecisionOutcome> {
-    let validation = DecisionValidator::repo_backlog().validate(
-        &instance,
-        &decision,
-        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
-    );
+    let validation_context = repo_backlog_validation_context(&instance, &decision);
+    let validation =
+        DecisionValidator::repo_backlog().validate(&instance, &decision, &validation_context);
     let record = match validation {
         Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), event_id),
         Err(error) => {
@@ -388,6 +390,20 @@ async fn apply_decision_with_outcome(
     let workflow_id = instance.id.clone();
     store.upsert_instance(&instance).await?;
     Ok(ApplyDecisionOutcome::Accepted { workflow_id })
+}
+
+fn repo_backlog_validation_context(
+    instance: &WorkflowInstance,
+    decision: &WorkflowDecision,
+) -> ValidationContext {
+    let context = ValidationContext::new("workflow-policy", chrono::Utc::now());
+    if instance.state == "failed"
+        && decision.decision == "poll_repo_backlog"
+        && decision.next_state == "scanning"
+    {
+        return context.allow_terminal_reopen();
+    }
+    context
 }
 
 async fn has_active_repo_backlog_poll_command(
@@ -545,10 +561,39 @@ mod tests {
         assert_eq!(
             second,
             RepoBacklogPollRequestOutcome::NotCandidate {
-                workflow_id,
+                workflow_id: workflow_id.clone(),
                 state: "scanning".to_string()
             }
         );
+        store.mark_command_status(&commands[0].id, "failed").await?;
+        let mut failed_instance = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("repo backlog workflow instance should still exist");
+        failed_instance.state = "failed".to_string();
+        store.upsert_instance(&failed_instance).await?;
+
+        let retry = request_repo_backlog_poll(
+            &store,
+            RepoBacklogPollRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                label: Some("harness"),
+            },
+        )
+        .await?;
+        assert_eq!(
+            retry,
+            RepoBacklogPollRequestOutcome::Requested {
+                workflow_id: workflow_id.clone()
+            }
+        );
+        let retry_instance = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("repo backlog workflow instance should still be persisted");
+        assert_eq!(retry_instance.state, "scanning");
+        assert_eq!(store.commands_for(&workflow_id).await?.len(), 2);
         Ok(())
     }
 
