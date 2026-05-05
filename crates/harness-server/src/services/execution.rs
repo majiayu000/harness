@@ -16,6 +16,7 @@ use harness_skills::store::SkillStore;
 use harness_workflow::issue_lifecycle::{
     is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
 };
+use harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
@@ -150,12 +151,18 @@ struct PreparedRuntimePromptSubmission {
     project_id: String,
 }
 
+struct PreparedRuntimePrFeedbackSubmission {
+    req: CreateTaskRequest,
+    project_id: String,
+}
+
 const WORKFLOW_FEEDBACK_SOURCE: &str = "workflow_feedback";
 
 enum PreparedEnqueueResult {
     Existing(TaskId),
     RuntimeIssueSubmission(Box<PreparedRuntimeIssueSubmission>),
     RuntimePromptSubmission(Box<PreparedRuntimePromptSubmission>),
+    RuntimePrFeedbackSubmission(Box<PreparedRuntimePrFeedbackSubmission>),
     Ready(Box<PreparedEnqueue>),
 }
 
@@ -383,6 +390,10 @@ impl DefaultExecutionService {
         &self,
         project_root: &Path,
     ) -> Result<bool, EnqueueTaskError> {
+        workflow_runtime_loops_enabled(project_root)
+    }
+
+    fn runtime_pr_feedback_enabled(&self, project_root: &Path) -> Result<bool, EnqueueTaskError> {
         workflow_runtime_loops_enabled(project_root)
     }
 
@@ -777,6 +788,84 @@ impl DefaultExecutionService {
         Ok(task_id)
     }
 
+    async fn submit_pr_feedback_to_workflow_runtime(
+        &self,
+        prepared: PreparedRuntimePrFeedbackSubmission,
+    ) -> Result<TaskId, EnqueueTaskError> {
+        let Some(store) = self.workflow_runtime_store.as_deref() else {
+            return Err(EnqueueTaskError::Internal(
+                "workflow runtime store is required for PR feedback submissions".to_string(),
+            ));
+        };
+        let Some(pr_number) = prepared.req.pr else {
+            return Err(EnqueueTaskError::BadRequest(
+                "PR feedback submission requires a PR number".to_string(),
+            ));
+        };
+
+        let instance = self
+            .find_runtime_issue_workflow_by_pr(store, &prepared.project_id, prepared.req.repo.as_deref(), pr_number)
+            .await?
+            .ok_or_else(|| {
+                EnqueueTaskError::BadRequest(format!(
+                    "PR feedback submission for pr:{pr_number} requires an existing runtime issue workflow with a bound PR"
+                ))
+            })?;
+
+        match crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &instance.id)
+            .await
+            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
+        {
+            crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
+                task_id,
+                ..
+            }
+            | crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                task_id,
+                ..
+            } => Ok(TaskId::from_str(&task_id)),
+            crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::NotCandidate {
+                workflow_id,
+                state,
+            } => Err(EnqueueTaskError::BadRequest(format!(
+                "workflow runtime rejected PR feedback submission for workflow {workflow_id}: state {state} is not eligible for feedback sweep"
+            ))),
+            crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Rejected {
+                workflow_id,
+                reason,
+            } => Err(EnqueueTaskError::BadRequest(format!(
+                "workflow runtime rejected PR feedback submission for workflow {workflow_id}: {reason}"
+            ))),
+        }
+    }
+
+    async fn find_runtime_issue_workflow_by_pr(
+        &self,
+        store: &harness_workflow::runtime::WorkflowRuntimeStore,
+        project_id: &str,
+        repo: Option<&str>,
+        pr_number: u64,
+    ) -> Result<Option<harness_workflow::runtime::WorkflowInstance>, EnqueueTaskError> {
+        let instances = store
+            .list_instances_by_definition(GITHUB_ISSUE_PR_DEFINITION_ID, Some(project_id), None)
+            .await
+            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
+        Ok(instances.into_iter().find(|instance| {
+            let matches_pr = instance
+                .data
+                .get("pr_number")
+                .and_then(|value| value.as_u64())
+                == Some(pr_number);
+            let matches_repo = match repo {
+                Some(repo) => {
+                    instance.data.get("repo").and_then(|value| value.as_str()) == Some(repo)
+                }
+                None => true,
+            };
+            matches_pr && matches_repo
+        }))
+    }
+
     async fn prepare_enqueue(
         &self,
         mut req: CreateTaskRequest,
@@ -813,10 +902,17 @@ impl DefaultExecutionService {
             return Ok(PreparedEnqueueResult::Existing(existing_id));
         }
 
-        if req.issue.is_some()
-            && self.workflow_runtime_store.is_some()
-            && self.runtime_issue_submission_enabled(&canonical)?
-        {
+        if req.issue.is_some() {
+            if self.workflow_runtime_store.is_none() {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime store is required for GitHub issue submissions".to_string(),
+                ));
+            }
+            if !self.runtime_issue_submission_enabled(&canonical)? {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime dispatch and worker must be enabled for GitHub issue submissions".to_string(),
+                ));
+            }
             if let Some(existing_id) = self
                 .check_runtime_issue_duplicate(&project_id, &req)
                 .await?
@@ -828,11 +924,34 @@ impl DefaultExecutionService {
             )));
         }
 
-        if req.task_kind() == task_runner::TaskKind::Prompt
-            && req.prompt.is_some()
-            && self.workflow_runtime_store.is_some()
-            && self.runtime_prompt_submission_enabled(&canonical)?
-        {
+        if req.pr.is_some() {
+            if self.workflow_runtime_store.is_none() {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime store is required for PR feedback submissions".to_string(),
+                ));
+            }
+            if !self.runtime_pr_feedback_enabled(&canonical)? {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime dispatch and worker must be enabled for PR feedback submissions".to_string(),
+                ));
+            }
+            return Ok(PreparedEnqueueResult::RuntimePrFeedbackSubmission(
+                Box::new(PreparedRuntimePrFeedbackSubmission { req, project_id }),
+            ));
+        }
+
+        if req.task_kind() == task_runner::TaskKind::Prompt && req.prompt.is_some() {
+            if self.workflow_runtime_store.is_none() {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime store is required for prompt submissions".to_string(),
+                ));
+            }
+            if !self.runtime_prompt_submission_enabled(&canonical)? {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime dispatch and worker must be enabled for prompt submissions"
+                        .to_string(),
+                ));
+            }
             if let Some(existing_id) = self
                 .check_runtime_prompt_duplicate(&project_id, &req)
                 .await?
@@ -915,6 +1034,9 @@ impl ExecutionService for DefaultExecutionService {
             PreparedEnqueueResult::RuntimePromptSubmission(prepared) => {
                 return self.submit_prompt_to_workflow_runtime(*prepared).await;
             }
+            PreparedEnqueueResult::RuntimePrFeedbackSubmission(prepared) => {
+                return self.submit_pr_feedback_to_workflow_runtime(*prepared).await;
+            }
             PreparedEnqueueResult::Ready(prepared) => *prepared,
         };
 
@@ -975,6 +1097,9 @@ impl ExecutionService for DefaultExecutionService {
             }
             PreparedEnqueueResult::RuntimePromptSubmission(prepared) => {
                 return self.submit_prompt_to_workflow_runtime(*prepared).await;
+            }
+            PreparedEnqueueResult::RuntimePrFeedbackSubmission(prepared) => {
+                return self.submit_pr_feedback_to_workflow_runtime(*prepared).await;
             }
             PreparedEnqueueResult::Ready(prepared) => *prepared,
         };
@@ -1338,7 +1463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_background_issue_submission_falls_back_without_runtime_store(
+    async fn enqueue_background_issue_submission_requires_workflow_runtime_store(
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let project_root = dir.path().join("project");
@@ -1353,21 +1478,16 @@ mod tests {
             ..Default::default()
         };
 
-        let task_id = svc.enqueue_background(req).await?;
-        let task = task_store
-            .get_with_db_fallback(&task_id)
-            .await?
-            .expect("issue submission should fall back to a task runner row");
-        let canonical_project_root = project_root.canonicalize()?;
+        let error = svc
+            .enqueue_background(req)
+            .await
+            .expect_err("issue submission should fail closed without workflow runtime");
 
-        assert_eq!(task.id, task_id);
-        assert_eq!(task.task_kind, task_runner::TaskKind::Issue);
-        assert_eq!(task.external_id.as_deref(), Some("issue:42"));
-        assert_eq!(task.repo.as_deref(), Some("owner/repo"));
-        assert_eq!(
-            task.project_root.as_deref(),
-            Some(canonical_project_root.as_path())
+        assert!(
+            matches!(error, EnqueueTaskError::Internal(ref message) if message.contains("workflow runtime store is required for GitHub issue submissions")),
+            "unexpected error: {error}"
         );
+        assert!(task_store.list_all().is_empty());
         Ok(())
     }
 
@@ -1511,6 +1631,117 @@ mod tests {
         assert!(commands[0].command.command.get("prompt").is_none());
         assert_eq!(commands[0].command.command["prompt_ref"], prompt_ref);
         assert_eq!(runtime_store.pending_commands(10).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_pr_feedback_uses_bound_workflow_runtime_without_task_runner(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let canonical_project_root = project_root.canonicalize()?;
+        let project_id = canonical_project_root.to_string_lossy().into_owned();
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let task_store = store.clone();
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let workflow_id =
+            harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 42);
+        let instance = harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "pr_open",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_id(workflow_id.clone())
+        .with_data(serde_json::json!({
+            "project_id": project_id,
+            "repo": "owner/repo",
+            "issue_number": 42,
+            "task_id": "runtime-issue-task",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "execution_path": "workflow_runtime"
+        }));
+        runtime_store.upsert_instance(&instance).await?;
+        let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
+        let req = CreateTaskRequest {
+            pr: Some(77),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root),
+            ..Default::default()
+        };
+
+        let task_id = svc.enqueue_background(req).await?;
+
+        assert_eq!(task_id.as_str(), "runtime-issue-task");
+        assert!(
+            task_store.get_with_db_fallback(&task_id).await?.is_none(),
+            "workflow runtime PR feedback submissions must not register legacy PR task rows"
+        );
+        let updated = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("bound issue workflow should still exist");
+        assert_eq!(updated.state, "awaiting_feedback");
+        let commands = runtime_store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, "pending");
+        assert_eq!(
+            commands[0].command.command["definition_id"],
+            harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID
+        );
+        assert_eq!(runtime_store.pending_commands(10).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_pr_feedback_requires_bound_runtime_workflow() -> anyhow::Result<()>
+    {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let store = TaskStore::open(&dir.path().join("t.db")).await?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let svc = make_svc_with_workflow_runtime(store, runtime_store).await;
+        let req = CreateTaskRequest {
+            pr: Some(77),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root),
+            ..Default::default()
+        };
+
+        let error = svc
+            .enqueue_background(req)
+            .await
+            .expect_err("unbound PR feedback submissions should fail closed");
+
+        assert!(
+            matches!(error, EnqueueTaskError::BadRequest(ref message) if message.contains("requires an existing runtime issue workflow with a bound PR")),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 

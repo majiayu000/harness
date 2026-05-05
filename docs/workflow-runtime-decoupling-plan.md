@@ -89,12 +89,14 @@ Implemented now:
 - runtime sprint plans return `SprintTaskSelected` signals or a `sprint_plan` artifact; the reducer
   starts selected child workflows with dependency metadata instead of using the legacy sprint
   planner task
-- when the workflow runtime, dispatcher, worker, and repo backlog policy are enabled, GitHub issue
-  intake is delegated to the `repo_backlog` workflow; the server no longer registers the legacy
-  GitHub poller fallback
-- when the workflow runtime, dispatcher, worker, and PR feedback policy are enabled, legacy
-  issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows and
-  request the runtime `pr_feedback` child workflow instead of registering a legacy `pr:N` task
+- GitHub issue intake is delegated to the `repo_backlog` workflow; the server no longer registers
+  a legacy GitHub poller fallback
+- legacy issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows
+  and request the runtime `pr_feedback` child workflow instead of registering a legacy `pr:N` task
+- direct `pr:N` submissions require an existing runtime issue workflow with a bound PR and request
+  the runtime feedback sweep instead of creating an independent legacy PR task
+- missing workflow runtime storage or disabled runtime dispatch/worker policy is a hard error for
+  runtime-owned issue, prompt, GitHub intake, and PR feedback paths
 
 Still intentionally not moved yet:
 
@@ -445,16 +447,14 @@ Implemented now:
   writes a validated `sweep_pr_feedback` decision and starts a child `pr_feedback` workflow instead
   of enqueueing a legacy `pr:N` task
 - legacy issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows
-  before requesting the same runtime `pr_feedback` child workflow when runtime feedback is enabled
+  before requesting the same runtime `pr_feedback` child workflow
+- runtime feedback storage, dispatch, and worker policy are required; the sweeper marks the project
+  degraded instead of falling back to an independent PR task
 - child `pr_feedback` workflows enqueue `inspect_pr_feedback` runtime jobs with PR metadata
 - `inspect_pr_feedback` runtime completions update the child workflow and propagate the same
   structured activity result to the parent issue workflow
 - propagated feedback completions can advance the parent workflow through structured
   `workflow_decision` artifacts or explicit feedback signals
-
-Still intentionally not moved yet:
-
-- legacy task-runner PR feedback still runs the existing review loop
 
 Tests:
 
@@ -479,8 +479,7 @@ started.
 Implemented now:
 
 - configured GitHub repos emit `RepoBacklogPollRequested` and a validated `poll_repo_backlog`
-  activity command instead of registering a legacy GitHub poller fallback when the runtime owns
-  repo backlog polling
+  activity command instead of registering a legacy GitHub poller fallback
 - runtime agents receive a `poll_repo_backlog` activity result contract and return
   `IssueDiscovered`, `IssueSkipped`, or `NoOpenIssueFound` signals
 - `IssueDiscovered` signals from a successful repo backlog scan reduce to a validated
@@ -559,7 +558,6 @@ Implemented now:
 Still intentionally not moved yet:
 
 - non-runtime task cards still use existing task endpoints
-- command outbox rows are not yet the primary dispatch source for runtime jobs
 
 Tests:
 
@@ -587,8 +585,6 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- the server does not spawn the dispatcher in a background loop
-- runtime profile selection is a single default profile, not workflow-specific policy
 - command lease/claiming is not yet a multi-dispatcher concurrency protocol
 
 Tests:
@@ -612,8 +608,6 @@ Implemented now:
 
 Still intentionally not moved yet:
 
-- no server-owned runtime worker loop consumes the jobs
-- runtime profile selection is not yet workflow-specific
 - command claiming is still single-dispatcher safe but not a distributed lease protocol
 
 Tests:
@@ -956,8 +950,11 @@ Implemented now:
 - issue and prompt submissions require `WorkflowRuntimeStore`; missing runtime storage is a hard
   server error for runtime-owned submissions
 - issue and prompt submissions no longer register legacy task rows or call the legacy task runner
-- legacy issue-workflow PR feedback candidates are routed to runtime feedback when runtime
-  feedback is enabled; the legacy PR task route remains only as the runtime-disabled fallback
+- legacy issue-workflow PR feedback candidates are routed to runtime feedback; the legacy PR task
+  fallback is removed
+- direct PR submissions are accepted only when the PR is already bound to a runtime issue workflow;
+  the submission requests the runtime `pr_feedback` child workflow instead of creating a standalone
+  `pr:N` lifecycle
 - issue and prompt submission responses include the runtime `workflow_id`, so dashboard actions can
   address the workflow runtime API directly instead of treating the returned `task_id` as a legacy
   task-row handle
@@ -987,6 +984,8 @@ Tests:
 - submit-success cancellation uses the runtime workflow endpoint when `workflow_id` is available
 - runtime prompt task summaries expose workflow metadata for dashboard/worktree runtime actions
 - worktree cancellation uses the runtime workflow endpoint for runtime-backed cards
+- PR feedback submissions fail closed when workflow runtime storage, dispatch, or worker policy is
+  unavailable
 
 ## Test Strategy
 

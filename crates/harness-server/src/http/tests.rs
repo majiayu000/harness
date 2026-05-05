@@ -366,7 +366,6 @@ async fn make_test_state_with_project_root(
         intake: crate::http::IntakeServices {
             feishu_intake,
             github_pollers: vec![],
-            legacy_github_fallback_enabled: true,
             completion_callback: None,
         },
         project_svc,
@@ -448,7 +447,6 @@ async fn make_test_state_with_issue_workflows(
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],
-            legacy_github_fallback_enabled: true,
             completion_callback: None,
         },
         project_svc: state.project_svc.clone(),
@@ -567,7 +565,6 @@ async fn make_test_state_with_workflow_runtime_config_and_registry(
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],
-            legacy_github_fallback_enabled: true,
             completion_callback: None,
         },
         project_svc: state.project_svc.clone(),
@@ -3199,8 +3196,7 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
 }
 
 #[tokio::test]
-async fn create_task_with_issue_reports_task_runner_fallback_without_runtime_store(
-) -> anyhow::Result<()> {
+async fn create_task_with_issue_requires_workflow_runtime_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     init_fake_git_repo(dir.path())?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
@@ -3222,12 +3218,14 @@ async fn create_task_with_issue_reports_task_runner_fallback_without_runtime_sto
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let resp = response_json(response).await?;
-    assert!(resp["task_id"].is_string());
-    assert_eq!(resp["status"], "queued");
-    assert_eq!(resp["execution_path"], "task_runner");
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    assert!(
+        resp["error"].as_str().is_some_and(|error| error
+            .contains("workflow runtime store is required for GitHub issue submissions")),
+        "unexpected response: {resp}"
+    );
+    assert_eq!(state.core.tasks.count(), before_count);
 
     Ok(())
 }
@@ -4489,8 +4487,7 @@ async fn create_tasks_batch_with_conflicting_runtime_prompts_adds_dependencies(
 }
 
 #[tokio::test]
-async fn create_tasks_batch_with_issues_reports_task_runner_fallback_without_runtime_store(
-) -> anyhow::Result<()> {
+async fn create_tasks_batch_with_issues_requires_workflow_runtime_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     init_fake_git_repo(dir.path())?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
@@ -4518,11 +4515,13 @@ async fn create_tasks_batch_with_issues_reports_task_runner_fallback_without_run
         .expect("batch response should be an array");
     assert_eq!(entries.len(), 2);
     for entry in entries {
-        assert_eq!(entry["status"], "queued");
-        assert_eq!(entry["execution_path"], "task_runner");
-        assert!(entry["task_id"].is_string());
+        assert!(
+            entry["error"].as_str().is_some_and(|error| error
+                .contains("workflow runtime store is required for GitHub issue submissions")),
+            "unexpected entry: {entry}"
+        );
     }
-    assert_eq!(state.core.tasks.count(), before_count + 2);
+    assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
 }
 
@@ -5525,8 +5524,7 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
 }
 
 #[tokio::test]
-async fn webhook_issues_opened_reports_task_runner_fallback_without_runtime_store(
-) -> anyhow::Result<()> {
+async fn webhook_issues_opened_requires_workflow_runtime_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     init_fake_git_repo(dir.path())?;
     let secret = "secret";
@@ -5565,12 +5563,14 @@ async fn webhook_issues_opened_reports_task_runner_fallback_without_runtime_stor
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "accepted");
-    assert_eq!(json["execution_path"], "task_runner");
-    assert_eq!(state.core.tasks.count(), before_count + 1);
-    assert!(json["task_id"].is_string());
+    assert!(
+        json["error"].as_str().is_some_and(|error| error
+            .contains("workflow runtime store is required for GitHub issue submissions")),
+        "unexpected response: {json}"
+    );
+    assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
 }
 

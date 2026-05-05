@@ -1335,157 +1335,79 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                     std::path::PathBuf::from(&workflow.project_id)
                 };
 
-                if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-                    let project_workflow_cfg = load_runtime_workflow_config_or_default(
-                        &project_path,
-                        "workflow feedback sweeper",
-                    );
-                    if runtime_pr_feedback_enabled(&project_workflow_cfg) {
-                        match crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep_for_legacy_issue_workflow(
-                            store,
-                            &workflow,
+                let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+                    incomplete_projects.insert(project_key.clone());
+                    let reason = "workflow runtime store is required for PR feedback sweeps";
+                    let _ = issue_workflows
+                        .release_feedback_claim(
+                            &workflow.project_id,
+                            workflow.repo.as_deref(),
+                            pr_number,
+                            reason,
                         )
-                        .await
-                        {
-                            Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
-                                workflow_id,
-                                task_id,
-                            })
-                            | Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::ActiveCommandExists {
-                                workflow_id,
-                                task_id,
-                            }) => {
-                                if let Err(e) = issue_workflows
-                                    .bind_feedback_task_if_claimed(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &task_id,
-                                    )
-                                    .await
-                                {
-                                    incomplete_projects.insert(project_key.clone());
-                                    tracing::warn!(
-                                        project_id = %workflow.project_id,
-                                        pr = pr_number,
-                                        workflow_id = %workflow_id,
-                                        task_id = %task_id,
-                                        "workflow feedback sweep: failed to bind runtime task handle: {e}"
-                                    );
-                                    continue;
-                                }
-                                tracing::info!(
-                                    project_id = %workflow.project_id,
-                                    pr = pr_number,
-                                    workflow_id = %workflow_id,
-                                    "workflow feedback sweep: runtime PR feedback requested"
-                                );
-                                continue;
-                            }
-                            Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::NotCandidate {
-                                workflow_id,
-                                state: runtime_state,
-                            }) => {
-                                incomplete_projects.insert(project_key.clone());
-                                let _ = issue_workflows
-                                    .release_feedback_claim(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &format!(
-                                            "runtime PR feedback skipped non-candidate workflow state {runtime_state}"
-                                        ),
-                                    )
-                                    .await;
-                                tracing::warn!(
-                                    project_id = %workflow.project_id,
-                                    pr = pr_number,
-                                    workflow_id = %workflow_id,
-                                    runtime_state = %runtime_state,
-                                    "workflow feedback sweep: runtime PR feedback skipped non-candidate workflow"
-                                );
-                                continue;
-                            }
-                            Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Rejected {
-                                workflow_id,
-                                reason,
-                            }) => {
-                                incomplete_projects.insert(project_key.clone());
-                                let _ = issue_workflows
-                                    .release_feedback_claim(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &format!("runtime PR feedback rejected: {reason}"),
-                                    )
-                                    .await;
-                                tracing::warn!(
-                                    project_id = %workflow.project_id,
-                                    pr = pr_number,
-                                    workflow_id = %workflow_id,
-                                    "workflow feedback sweep: runtime PR feedback rejected: {reason}"
-                                );
-                                if let Some(project_store) = state.core.project_workflow_store.as_ref() {
-                                    let _ = project_store
-                                        .record_degraded(
-                                            &workflow.project_id,
-                                            workflow.repo.as_deref(),
-                                            &format!(
-                                                "runtime feedback sweep rejected for pr:{pr_number}: {reason}"
-                                            ),
-                                        )
-                                        .await;
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                incomplete_projects.insert(project_key.clone());
-                                let _ = issue_workflows
-                                    .release_feedback_claim(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &format!("runtime PR feedback request failed: {e}"),
-                                    )
-                                    .await;
-                                tracing::warn!(
-                                    project_id = %workflow.project_id,
-                                    pr = pr_number,
-                                    "workflow feedback sweep: runtime PR feedback request failed: {e}"
-                                );
-                                if let Some(project_store) = state.core.project_workflow_store.as_ref() {
-                                    let _ = project_store
-                                        .record_degraded(
-                                            &workflow.project_id,
-                                            workflow.repo.as_deref(),
-                                            &format!(
-                                                "runtime feedback sweep failed for pr:{pr_number}: {e}"
-                                            ),
-                                        )
-                                        .await;
-                                }
-                                continue;
-                            }
-                        }
+                        .await;
+                    tracing::warn!(
+                        project_id = %workflow.project_id,
+                        pr = pr_number,
+                        "workflow feedback sweep: {reason}"
+                    );
+                    if let Some(project_store) = state.core.project_workflow_store.as_ref() {
+                        let _ = project_store
+                            .record_degraded(&workflow.project_id, workflow.repo.as_deref(), reason)
+                            .await;
                     }
-                }
-
-                let req = crate::task_runner::CreateTaskRequest {
-                    pr: Some(pr_number),
-                    project: Some(project_path),
-                    repo: workflow.repo.clone(),
-                    source: Some("workflow_feedback".to_string()),
-                    ..Default::default()
+                    continue;
                 };
 
-                match task_routes::enqueue_task_background(state.clone(), req, None).await {
-                    Ok(task_id) => {
+                let project_workflow_cfg = load_runtime_workflow_config_or_default(
+                    &project_path,
+                    "workflow feedback sweeper",
+                );
+                if !runtime_pr_feedback_enabled(&project_workflow_cfg) {
+                    incomplete_projects.insert(project_key.clone());
+                    let reason =
+                        "workflow runtime dispatch and worker must be enabled for PR feedback sweeps";
+                    let _ = issue_workflows
+                        .release_feedback_claim(
+                            &workflow.project_id,
+                            workflow.repo.as_deref(),
+                            pr_number,
+                            reason,
+                        )
+                        .await;
+                    tracing::warn!(
+                        project_id = %workflow.project_id,
+                        pr = pr_number,
+                        "workflow feedback sweep: {reason}"
+                    );
+                    if let Some(project_store) = state.core.project_workflow_store.as_ref() {
+                        let _ = project_store
+                            .record_degraded(&workflow.project_id, workflow.repo.as_deref(), reason)
+                            .await;
+                    }
+                    continue;
+                }
+
+                match crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep_for_legacy_issue_workflow(
+                    store,
+                    &workflow,
+                )
+                .await
+                {
+                    Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
+                        workflow_id,
+                        task_id,
+                    })
+                    | Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                        workflow_id,
+                        task_id,
+                    }) => {
                         if let Err(e) = issue_workflows
                             .bind_feedback_task_if_claimed(
                                 &workflow.project_id,
                                 workflow.repo.as_deref(),
                                 pr_number,
-                                &task_id.0,
+                                &task_id,
                             )
                             .await
                         {
@@ -1493,20 +1415,22 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                             tracing::warn!(
                                 project_id = %workflow.project_id,
                                 pr = pr_number,
-                                task_id = %task_id.0,
-                                "workflow feedback sweep: failed to bind real task id: {e}"
+                                workflow_id = %workflow_id,
+                                task_id = %task_id,
+                                "workflow feedback sweep: failed to bind runtime task handle: {e}"
                             );
                             continue;
                         }
                         tracing::info!(
                             project_id = %workflow.project_id,
                             pr = pr_number,
-                            task_id = %task_id.0,
-                            "workflow feedback sweep: PR task enqueued"
+                            workflow_id = %workflow_id,
+                            "workflow feedback sweep: runtime PR feedback requested"
                         );
                     }
-                    Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow {
-                        retry_after_secs,
+                    Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::NotCandidate {
+                        workflow_id,
+                        state: runtime_state,
                     }) => {
                         incomplete_projects.insert(project_key.clone());
                         let _ = issue_workflows
@@ -1515,17 +1439,44 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                                 workflow.repo.as_deref(),
                                 pr_number,
                                 &format!(
-                                    "feedback sweep deferred by maintenance window; retry after {retry_after_secs}s"
+                                    "runtime PR feedback skipped non-candidate workflow state {runtime_state}"
                                 ),
                             )
                             .await;
+                        tracing::warn!(
+                            project_id = %workflow.project_id,
+                            pr = pr_number,
+                            workflow_id = %workflow_id,
+                            runtime_state = %runtime_state,
+                            "workflow feedback sweep: runtime PR feedback skipped non-candidate workflow"
+                        );
+                    }
+                    Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Rejected {
+                        workflow_id,
+                        reason,
+                    }) => {
+                        incomplete_projects.insert(project_key.clone());
+                        let _ = issue_workflows
+                            .release_feedback_claim(
+                                &workflow.project_id,
+                                workflow.repo.as_deref(),
+                                pr_number,
+                                &format!("runtime PR feedback rejected: {reason}"),
+                            )
+                            .await;
+                        tracing::warn!(
+                            project_id = %workflow.project_id,
+                            pr = pr_number,
+                            workflow_id = %workflow_id,
+                            "workflow feedback sweep: runtime PR feedback rejected: {reason}"
+                        );
                         if let Some(project_store) = state.core.project_workflow_store.as_ref() {
                             let _ = project_store
-                                .record_paused(
+                                .record_degraded(
                                     &workflow.project_id,
                                     workflow.repo.as_deref(),
                                     &format!(
-                                        "feedback sweep paused by maintenance window; retry after {retry_after_secs}s"
+                                        "runtime feedback sweep rejected for pr:{pr_number}: {reason}"
                                     ),
                                 )
                                 .await;
@@ -1538,13 +1489,13 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                                 &workflow.project_id,
                                 workflow.repo.as_deref(),
                                 pr_number,
-                                &format!("feedback sweep enqueue failed: {e}"),
+                                &format!("runtime PR feedback request failed: {e}"),
                             )
                             .await;
                         tracing::warn!(
                             project_id = %workflow.project_id,
                             pr = pr_number,
-                            "workflow feedback sweep: failed to enqueue PR task: {e}"
+                            "workflow feedback sweep: runtime PR feedback request failed: {e}"
                         );
                         if let Some(project_store) = state.core.project_workflow_store.as_ref() {
                             let _ = project_store
@@ -1552,7 +1503,7 @@ pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
                                     &workflow.project_id,
                                     workflow.repo.as_deref(),
                                     &format!(
-                                        "feedback sweep enqueue failed for pr:{pr_number}: {e}"
+                                        "runtime feedback sweep failed for pr:{pr_number}: {e}"
                                     ),
                                 )
                                 .await;

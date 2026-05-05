@@ -222,13 +222,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     let github_sources = state.intake.github_pollers.clone();
     crate::intake::build_orchestrator(
         &state.core.server.config.intake,
-        Some(&init::expand_tilde(
-            &state.core.server.config.server.data_dir,
-        )),
         state.intake.feishu_intake.clone(),
         github_sources,
-        state.intake.legacy_github_fallback_enabled,
-        state.core.server.config.server.github_token.clone(),
     )
     .start(state.clone());
 
