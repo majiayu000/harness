@@ -91,8 +91,8 @@ Implemented now:
   planner task
 - GitHub issue intake is delegated to the `repo_backlog` workflow; the server no longer registers
   a legacy GitHub poller fallback
-- legacy issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows
-  and request the runtime `pr_feedback` child workflow instead of registering a legacy `pr:N` task
+- legacy issue-workflow feedback candidates are no longer swept or adopted; only runtime
+  `github_issue_pr` workflows can request the runtime `pr_feedback` child workflow
 - direct `pr:N` submissions require an existing runtime issue workflow with a bound PR and request
   the runtime feedback sweep instead of creating an independent legacy PR task
 - missing workflow runtime storage or disabled runtime dispatch/worker policy is a hard error for
@@ -446,8 +446,8 @@ Implemented now:
 - runtime `github_issue_pr` workflows with attached PRs are swept by a server background loop that
   writes a validated `sweep_pr_feedback` decision and starts a child `pr_feedback` workflow instead
   of enqueueing a legacy `pr:N` task
-- legacy issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows
-  before requesting the same runtime `pr_feedback` child workflow
+- legacy issue-workflow feedback candidates are no longer adopted; runtime `github_issue_pr`
+  workflows are the authoritative source for PR feedback sweeps
 - runtime feedback storage, dispatch, and worker policy are required; the sweeper marks the project
   degraded instead of falling back to an independent PR task
 - child `pr_feedback` workflows enqueue `inspect_pr_feedback` runtime jobs with PR metadata
@@ -464,8 +464,8 @@ Tests:
 - runtime PR feedback sweep requests start `pr_feedback` child workflows, enqueue
   `inspect_pr_feedback`, and suppress duplicate active feedback inspection work
 - `inspect_pr_feedback` child completions update both child and parent workflow state
-- legacy issue-workflow feedback candidates can be adopted into runtime state and enqueue the
-  same runtime PR feedback child workflow
+- legacy issue-workflow feedback sweeper is removed, so stale legacy candidates do not create
+  runtime commands
 
 ### Phase 4: Repo Backlog Workflow
 
@@ -950,8 +950,8 @@ Implemented now:
 - issue and prompt submissions require `WorkflowRuntimeStore`; missing runtime storage is a hard
   server error for runtime-owned submissions
 - issue and prompt submissions no longer register legacy task rows or call the legacy task runner
-- legacy issue-workflow PR feedback candidates are routed to runtime feedback; the legacy PR task
-  fallback is removed
+- legacy issue-workflow PR feedback candidates are no longer routed or adopted; the legacy PR task
+  fallback and legacy issue-workflow sweeper are removed
 - direct PR submissions are accepted only when the PR is already bound to a runtime issue workflow;
   the submission requests the runtime `pr_feedback` child workflow instead of creating a standalone
   `pr:N` lifecycle

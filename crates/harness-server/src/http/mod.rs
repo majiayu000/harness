@@ -173,12 +173,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Re-dispatch leftover pending tasks that crashed before their first checkpoint.
     background::spawn_orphan_pending_recovery(&state).await;
 
-    // Periodically sweep issue workflows with attached PRs and automatically
-    // enqueue `pr:N` tasks so PR feedback is handled without manual resubmission.
-    background::spawn_issue_workflow_feedback_sweeper(&state);
-
     // Periodically sweep runtime issue workflows with attached PRs and emit
-    // workflow command outbox rows instead of legacy PR tasks.
+    // workflow command outbox rows.
     background::spawn_runtime_pr_feedback_sweeper(&state);
 
     // Periodically ask repo backlog workflows to scan GitHub through runtime

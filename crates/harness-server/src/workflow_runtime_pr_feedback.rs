@@ -1,7 +1,4 @@
 use crate::task_runner::TaskId;
-use harness_workflow::issue_lifecycle::{
-    is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
-};
 use harness_workflow::runtime::{
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
     DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
@@ -60,15 +57,6 @@ fn runtime_task_id_from_instance(instance: &WorkflowInstance) -> String {
         .filter(|task_id| !task_id.trim().is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("runtime:{}", instance.id))
-}
-
-fn runtime_task_id_for_legacy_issue_workflow(workflow: &IssueWorkflowInstance) -> String {
-    workflow
-        .active_task_id
-        .as_deref()
-        .filter(|task_id| !is_feedback_claim_placeholder(task_id))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("runtime:{}", workflow.id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,53 +139,6 @@ pub(crate) async fn request_pr_feedback_sweep(
         });
     }
     persist_pr_feedback_sweep_request(store, instance).await
-}
-
-pub(crate) async fn request_pr_feedback_sweep_for_legacy_issue_workflow(
-    store: &WorkflowRuntimeStore,
-    workflow: &IssueWorkflowInstance,
-) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
-    if store.get_instance(&workflow.id).await?.is_some() {
-        return request_pr_feedback_sweep(store, &workflow.id).await;
-    }
-
-    let Some(state) = runtime_state_for_legacy_feedback_candidate(workflow.state) else {
-        return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
-            workflow_id: workflow.id.clone(),
-            state: legacy_issue_state_label(workflow.state),
-        });
-    };
-    let Some(pr_number) = workflow.pr_number else {
-        return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
-            workflow_id: workflow.id.clone(),
-            state: "missing_pr_number".to_string(),
-        });
-    };
-
-    upsert_github_issue_pr_definition(store).await?;
-    let task_id = runtime_task_id_for_legacy_issue_workflow(workflow);
-    let instance = issue_instance(
-        workflow.id.clone(),
-        workflow.project_id.clone(),
-        workflow.repo.clone(),
-        workflow.issue_number,
-        state,
-    )
-    .with_data(crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        Path::new(&workflow.project_id),
-        json!({
-            "project_id": workflow.project_id,
-            "repo": workflow.repo,
-            "issue_number": workflow.issue_number,
-            "task_id": task_id,
-            "pr_number": pr_number,
-            "pr_url": workflow.pr_url,
-            "execution_path": "workflow_runtime",
-            "legacy_issue_workflow_state": legacy_issue_state_label(workflow.state),
-        }),
-    ));
-    store.upsert_instance(&instance).await?;
-    request_pr_feedback_sweep(store, &workflow.id).await
 }
 
 pub(crate) async fn approve_runtime_merge_by_task_id(
@@ -630,41 +571,6 @@ fn issue_instance(
     ))
 }
 
-fn runtime_state_for_legacy_feedback_candidate(state: IssueLifecycleState) -> Option<&'static str> {
-    match state {
-        IssueLifecycleState::PrOpen => Some("pr_open"),
-        IssueLifecycleState::AwaitingFeedback
-        | IssueLifecycleState::FeedbackClaimed
-        | IssueLifecycleState::AddressingFeedback => Some("awaiting_feedback"),
-        IssueLifecycleState::Discovered
-        | IssueLifecycleState::Scheduled
-        | IssueLifecycleState::Implementing
-        | IssueLifecycleState::ReadyToMerge
-        | IssueLifecycleState::Blocked
-        | IssueLifecycleState::Done
-        | IssueLifecycleState::Failed
-        | IssueLifecycleState::Cancelled => None,
-    }
-}
-
-fn legacy_issue_state_label(state: IssueLifecycleState) -> String {
-    match state {
-        IssueLifecycleState::Discovered => "discovered",
-        IssueLifecycleState::Scheduled => "scheduled",
-        IssueLifecycleState::Implementing => "implementing",
-        IssueLifecycleState::PrOpen => "pr_open",
-        IssueLifecycleState::AwaitingFeedback => "awaiting_feedback",
-        IssueLifecycleState::FeedbackClaimed => "feedback_claimed",
-        IssueLifecycleState::AddressingFeedback => "addressing_feedback",
-        IssueLifecycleState::ReadyToMerge => "ready_to_merge",
-        IssueLifecycleState::Blocked => "blocked",
-        IssueLifecycleState::Done => "done",
-        IssueLifecycleState::Failed => "failed",
-        IssueLifecycleState::Cancelled => "cancelled",
-    }
-    .to_string()
-}
-
 fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_json::Value {
     if let Some(object) = data.as_object_mut() {
         object.insert("last_decision".to_string(), json!(decision));
@@ -1048,131 +954,6 @@ mod tests {
                 task_id: "task-1".to_string(),
             }
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn legacy_issue_workflow_feedback_candidate_is_adopted_into_runtime() -> anyhow::Result<()>
-    {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let mut legacy = IssueWorkflowInstance::new(
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-        );
-        legacy.state = IssueLifecycleState::FeedbackClaimed;
-        legacy.active_task_id = Some("claim:legacy-workflow-123".to_string());
-        legacy.pr_number = Some(77);
-        legacy.pr_url = Some("https://github.com/owner/repo/pull/77".to_string());
-        let expected_task_id = format!("runtime:{}", legacy.id);
-
-        let outcome = request_pr_feedback_sweep_for_legacy_issue_workflow(&store, &legacy).await?;
-        assert_eq!(
-            outcome,
-            PrFeedbackSweepRequestOutcome::Requested {
-                workflow_id: legacy.id.clone(),
-                task_id: expected_task_id.clone(),
-            }
-        );
-        let instance = store
-            .get_instance(&legacy.id)
-            .await?
-            .expect("legacy issue workflow should be adopted");
-        assert_eq!(instance.definition_id, "github_issue_pr");
-        assert_eq!(instance.state, "awaiting_feedback");
-        assert_eq!(
-            instance.data["project_id"].as_str(),
-            Some(project_root.to_string_lossy().as_ref())
-        );
-        assert_eq!(instance.data["repo"], "owner/repo");
-        assert_eq!(instance.data["issue_number"], 123);
-        assert_eq!(instance.data["pr_number"], 77);
-        assert_eq!(
-            instance.data["pr_url"],
-            "https://github.com/owner/repo/pull/77"
-        );
-        assert_eq!(instance.data["task_id"], expected_task_id);
-        assert_eq!(instance.data["execution_path"], "workflow_runtime");
-        assert_eq!(
-            instance.data["legacy_issue_workflow_state"],
-            "feedback_claimed"
-        );
-        let commands = store.commands_for(&legacy.id).await?;
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0].command.command["definition_id"],
-            PR_FEEDBACK_DEFINITION_ID
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn legacy_issue_workflow_feedback_candidate_reuses_existing_runtime_task_id(
-    ) -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let mut legacy = IssueWorkflowInstance::new(
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-        );
-        legacy.state = IssueLifecycleState::FeedbackClaimed;
-        legacy.pr_number = Some(77);
-        legacy.pr_url = Some("https://github.com/owner/repo/pull/77".to_string());
-        upsert_github_issue_pr_definition(&store).await?;
-        let instance = issue_instance(
-            legacy.id.clone(),
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-            "awaiting_feedback",
-        )
-        .with_data(json!({
-            "project_id": project_root.to_string_lossy(),
-            "repo": "owner/repo",
-            "issue_number": 123,
-            "pr_number": 77,
-            "pr_url": "https://github.com/owner/repo/pull/77",
-            "task_id": "runtime-existing-task",
-        }));
-        store.upsert_instance(&instance).await?;
-
-        let outcome = request_pr_feedback_sweep_for_legacy_issue_workflow(&store, &legacy).await?;
-        assert_eq!(
-            outcome,
-            PrFeedbackSweepRequestOutcome::Requested {
-                workflow_id: legacy.id.clone(),
-                task_id: "runtime-existing-task".to_string(),
-            }
-        );
-        let updated = store
-            .get_instance(&legacy.id)
-            .await?
-            .expect("runtime workflow should still exist");
-        assert_eq!(updated.data["task_id"], "runtime-existing-task");
         Ok(())
     }
 }
