@@ -154,6 +154,27 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_workflow_commands_dispatch_claim
               ON workflow_commands (status, dispatch_lease_expires_at, created_at)",
     },
+    Migration {
+        version: 7,
+        description: "index runtime issue workflow PR lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_pr
+              ON workflow_instances (
+                  definition_id,
+                  (data->'data'->>'project_id'),
+                  (data->'data'->>'pr_number'),
+                  updated_at DESC
+              )
+              WHERE data->'data'->>'pr_number' IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_repo_pr
+              ON workflow_instances (
+                  definition_id,
+                  (data->'data'->>'project_id'),
+                  (data->'data'->>'repo'),
+                  (data->'data'->>'pr_number'),
+                  updated_at DESC
+              )
+              WHERE data->'data'->>'pr_number' IS NOT NULL",
+    },
 ];
 
 pub struct WorkflowRuntimeStore {
@@ -323,6 +344,34 @@ impl WorkflowRuntimeStore {
              LIMIT 1",
         )
         .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(data,)| serde_json::from_str(&data))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn get_instance_by_pr(
+        &self,
+        definition_id: &str,
+        project_id: &str,
+        repo: Option<&str>,
+        pr_number: u64,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
+        let pr_number = pr_number.to_string();
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND data->'data'->>'project_id' = $2
+               AND ($3::text IS NULL OR data->'data'->>'repo' = $3)
+               AND data->'data'->>'pr_number' = $4
+             ORDER BY updated_at DESC
+             LIMIT 1",
+        )
+        .bind(definition_id)
+        .bind(project_id)
+        .bind(repo)
+        .bind(pr_number)
         .fetch_optional(&self.pool)
         .await?;
         row.map(|(data,)| serde_json::from_str(&data))

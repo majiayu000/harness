@@ -2926,6 +2926,73 @@ async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let matching = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        WorkflowSubject::new("issue", "issue:77"),
+    )
+    .with_id("project-a::owner/repo::issue:77")
+    .with_data(json!({
+        "project_id": "project-a",
+        "repo": "owner/repo",
+        "issue_number": 77,
+        "pr_number": 880,
+    }));
+    let wrong_repo = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        WorkflowSubject::new("issue", "issue:78"),
+    )
+    .with_id("project-a::owner/other::issue:78")
+    .with_data(json!({
+        "project_id": "project-a",
+        "repo": "owner/other",
+        "issue_number": 78,
+        "pr_number": 880,
+    }));
+    let wrong_project = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        WorkflowSubject::new("issue", "issue:79"),
+    )
+    .with_id("project-b::owner/repo::issue:79")
+    .with_data(json!({
+        "project_id": "project-b",
+        "repo": "owner/repo",
+        "issue_number": 79,
+        "pr_number": 880,
+    }));
+    store.upsert_instance(&matching).await?;
+    store.upsert_instance(&wrong_repo).await?;
+    store.upsert_instance(&wrong_project).await?;
+
+    let found = store
+        .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
+        .await?
+        .expect("matching runtime issue workflow should be found");
+    assert_eq!(found.id, matching.id);
+    assert!(store
+        .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 881)
+        .await?
+        .is_none());
+    assert!(store
+        .get_instance_by_pr("github_issue_pr", "project-b", Some("owner/other"), 880)
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_worker_skips_runtime_jobs_before_not_before() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

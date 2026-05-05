@@ -846,24 +846,10 @@ impl DefaultExecutionService {
         repo: Option<&str>,
         pr_number: u64,
     ) -> Result<Option<harness_workflow::runtime::WorkflowInstance>, EnqueueTaskError> {
-        let instances = store
-            .list_instances_by_definition(GITHUB_ISSUE_PR_DEFINITION_ID, Some(project_id), None)
+        store
+            .get_instance_by_pr(GITHUB_ISSUE_PR_DEFINITION_ID, project_id, repo, pr_number)
             .await
-            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
-        Ok(instances.into_iter().find(|instance| {
-            let matches_pr = instance
-                .data
-                .get("pr_number")
-                .and_then(|value| value.as_u64())
-                == Some(pr_number);
-            let matches_repo = match repo {
-                Some(repo) => {
-                    instance.data.get("repo").and_then(|value| value.as_str()) == Some(repo)
-                }
-                None => true,
-            };
-            matches_pr && matches_repo
-        }))
+            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))
     }
 
     async fn prepare_enqueue(
