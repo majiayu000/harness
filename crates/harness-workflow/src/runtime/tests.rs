@@ -4082,6 +4082,57 @@ async fn runtime_store_pending_command_enqueue_is_idempotent_across_concurrent_c
 }
 
 #[tokio::test]
+async fn runtime_store_claims_pending_commands_with_dispatch_lease() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "replanning");
+    store.upsert_instance(&instance).await?;
+    let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-lease");
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+
+    let claimed = store
+        .claim_pending_commands("dispatcher-a", Utc::now() + Duration::seconds(60), 10)
+        .await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, command_id);
+    assert_eq!(claimed[0].status, "dispatching");
+    assert_eq!(claimed[0].dispatch_owner.as_deref(), Some("dispatcher-a"));
+    assert!(claimed[0].dispatch_lease_expires_at.is_some());
+    assert!(store.pending_commands(10).await?.is_empty());
+
+    let concurrent = store
+        .claim_pending_commands("dispatcher-b", Utc::now() + Duration::seconds(60), 10)
+        .await?;
+    assert!(
+        concurrent.is_empty(),
+        "an unexpired dispatch lease must hide the command from other dispatchers"
+    );
+
+    let stale_command =
+        WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-stale-lease");
+    let stale_command_id = store
+        .enqueue_command(&instance.id, None, &stale_command)
+        .await?;
+    let stale_claim = store
+        .claim_pending_commands("stale-dispatcher", Utc::now() - Duration::seconds(1), 10)
+        .await?;
+    assert_eq!(stale_claim.len(), 1);
+    assert_eq!(stale_claim[0].id, stale_command_id);
+
+    let reclaimed = store
+        .claim_pending_commands("dispatcher-c", Utc::now() + Duration::seconds(60), 10)
+        .await?;
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].id, stale_command_id);
+    assert_eq!(reclaimed[0].dispatch_owner.as_deref(), Some("dispatcher-c"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_command_dispatcher_prefers_workflow_activity_profile() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

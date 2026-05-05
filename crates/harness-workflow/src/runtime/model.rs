@@ -308,6 +308,10 @@ pub struct WorkflowCommandRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_id: Option<String>,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_lease_expires_at: Option<DateTime<Utc>>,
     pub command: WorkflowCommand,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

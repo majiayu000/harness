@@ -144,6 +144,16 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_task_ids
               ON workflow_instances USING GIN ((data->'data'->'task_ids'))",
     },
+    Migration {
+        version: 6,
+        description: "add workflow command dispatch leases",
+        sql: "ALTER TABLE workflow_commands
+              ADD COLUMN IF NOT EXISTS dispatch_owner TEXT;
+              ALTER TABLE workflow_commands
+              ADD COLUMN IF NOT EXISTS dispatch_lease_expires_at TIMESTAMPTZ;
+              CREATE INDEX IF NOT EXISTS idx_workflow_commands_dispatch_claim
+              ON workflow_commands (status, dispatch_lease_expires_at, created_at)",
+    },
 ];
 
 pub struct WorkflowRuntimeStore {
@@ -155,6 +165,8 @@ type WorkflowCommandRecordRow = (
     String,
     Option<String>,
     String,
+    Option<String>,
+    Option<DateTime<Utc>>,
     String,
     DateTime<Utc>,
     DateTime<Utc>,
@@ -165,6 +177,32 @@ pub enum RuntimeJobEnqueueOutcome {
     Enqueued(RuntimeJob),
     AlreadyExists(RuntimeJob),
     CommandNotPending { status: String },
+}
+
+fn workflow_command_record_from_row(
+    (
+        id,
+        workflow_id,
+        decision_id,
+        status,
+        dispatch_owner,
+        dispatch_lease_expires_at,
+        data,
+        created_at,
+        updated_at,
+    ): WorkflowCommandRecordRow,
+) -> anyhow::Result<WorkflowCommandRecord> {
+    Ok(WorkflowCommandRecord {
+        id,
+        workflow_id,
+        decision_id,
+        status,
+        dispatch_owner,
+        dispatch_lease_expires_at,
+        command: serde_json::from_str(&data)?,
+        created_at,
+        updated_at,
+    })
 }
 
 impl WorkflowRuntimeStore {
@@ -545,7 +583,8 @@ impl WorkflowRuntimeStore {
         workflow_id: &str,
     ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
-            "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
+            "SELECT id, workflow_id, decision_id, status, dispatch_owner,
+                    dispatch_lease_expires_at, data::text, created_at, updated_at
                  FROM workflow_commands
                  WHERE workflow_id = $1
                  ORDER BY created_at ASC",
@@ -554,19 +593,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(
-                |(id, workflow_id, decision_id, status, data, created_at, updated_at)| {
-                    Ok(WorkflowCommandRecord {
-                        id,
-                        workflow_id,
-                        decision_id,
-                        status,
-                        command: serde_json::from_str(&data)?,
-                        created_at,
-                        updated_at,
-                    })
-                },
-            )
+            .map(workflow_command_record_from_row)
             .collect()
     }
 
@@ -578,7 +605,8 @@ impl WorkflowRuntimeStore {
             return Ok(BTreeMap::new());
         }
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
-            "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
+            "SELECT id, workflow_id, decision_id, status, dispatch_owner,
+                    dispatch_lease_expires_at, data::text, created_at, updated_at
              FROM workflow_commands
              WHERE workflow_id = ANY($1::text[])
              ORDER BY workflow_id ASC, created_at ASC",
@@ -587,19 +615,12 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         let mut by_workflow = BTreeMap::new();
-        for (id, workflow_id, decision_id, status, data, created_at, updated_at) in rows {
+        for row in rows {
+            let record = workflow_command_record_from_row(row)?;
             by_workflow
-                .entry(workflow_id.clone())
+                .entry(record.workflow_id.clone())
                 .or_insert_with(Vec::new)
-                .push(WorkflowCommandRecord {
-                    id,
-                    workflow_id,
-                    decision_id,
-                    status,
-                    command: serde_json::from_str(&data)?,
-                    created_at,
-                    updated_at,
-                });
+                .push(record);
         }
         Ok(by_workflow)
     }
@@ -609,33 +630,22 @@ impl WorkflowRuntimeStore {
         command_id: &str,
     ) -> anyhow::Result<Option<WorkflowCommandRecord>> {
         let row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
-            "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
+            "SELECT id, workflow_id, decision_id, status, dispatch_owner,
+                    dispatch_lease_expires_at, data::text, created_at, updated_at
              FROM workflow_commands
              WHERE id = $1",
         )
         .bind(command_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(
-            |(id, workflow_id, decision_id, status, data, created_at, updated_at)| {
-                Ok(WorkflowCommandRecord {
-                    id,
-                    workflow_id,
-                    decision_id,
-                    status,
-                    command: serde_json::from_str(&data)?,
-                    created_at,
-                    updated_at,
-                })
-            },
-        )
-        .transpose()
+        row.map(workflow_command_record_from_row).transpose()
     }
 
     pub async fn pending_commands(&self, limit: i64) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
         let limit = limit.clamp(1, 500);
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
-            "SELECT id, workflow_id, decision_id, status, data::text, created_at, updated_at
+            "SELECT id, workflow_id, decision_id, status, dispatch_owner,
+                    dispatch_lease_expires_at, data::text, created_at, updated_at
              FROM workflow_commands
              WHERE status = 'pending'
              ORDER BY created_at ASC
@@ -645,26 +655,62 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(
-                |(id, workflow_id, decision_id, status, data, created_at, updated_at)| {
-                    Ok(WorkflowCommandRecord {
-                        id,
-                        workflow_id,
-                        decision_id,
-                        status,
-                        command: serde_json::from_str(&data)?,
-                        created_at,
-                        updated_at,
-                    })
-                },
-            )
+            .map(workflow_command_record_from_row)
             .collect()
+    }
+
+    pub async fn claim_pending_commands(
+        &self,
+        owner: &str,
+        expires_at: DateTime<Utc>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
+            "WITH candidates AS (
+                 SELECT id
+                 FROM workflow_commands
+                 WHERE status = 'pending'
+                    OR (
+                        status = 'dispatching'
+                        AND COALESCE(dispatch_lease_expires_at, '-infinity'::timestamptz)
+                            <= CURRENT_TIMESTAMP
+                    )
+                 ORDER BY created_at ASC
+                 LIMIT $3
+                 FOR UPDATE SKIP LOCKED
+             )
+             UPDATE workflow_commands AS command
+             SET status = 'dispatching',
+                 dispatch_owner = $1,
+                 dispatch_lease_expires_at = $2,
+                 updated_at = CURRENT_TIMESTAMP
+             FROM candidates
+             WHERE command.id = candidates.id
+             RETURNING command.id, command.workflow_id, command.decision_id, command.status,
+                       command.dispatch_owner, command.dispatch_lease_expires_at,
+                       command.data::text, command.created_at, command.updated_at",
+        )
+        .bind(owner)
+        .bind(expires_at)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut records: Vec<_> = rows
+            .into_iter()
+            .map(workflow_command_record_from_row)
+            .collect::<anyhow::Result<_>>()?;
+        records.sort_by_key(|record| record.created_at);
+        Ok(records)
     }
 
     pub async fn mark_command_status(&self, command_id: &str, status: &str) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE workflow_commands
-             SET status = $1, updated_at = CURRENT_TIMESTAMP
+             SET status = $1,
+                 dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
              WHERE id = $2",
         )
         .bind(status)
@@ -681,7 +727,10 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE workflow_commands
-             SET status = $1, updated_at = CURRENT_TIMESTAMP
+             SET status = $1,
+                 dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
              WHERE id = $2 AND status = 'pending'",
         )
         .bind(status)
@@ -746,22 +795,70 @@ impl WorkflowRuntimeStore {
         input: Value,
         not_before: Option<DateTime<Utc>>,
     ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
+        self.enqueue_runtime_job_for_command(
+            command_id,
+            None,
+            runtime_kind,
+            runtime_profile,
+            input,
+            not_before,
+        )
+        .await
+    }
+
+    pub async fn enqueue_runtime_job_for_claimed_command(
+        &self,
+        command_id: &str,
+        dispatch_owner: &str,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: Value,
+        not_before: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
+        self.enqueue_runtime_job_for_command(
+            command_id,
+            Some(dispatch_owner),
+            runtime_kind,
+            runtime_profile,
+            input,
+            not_before,
+        )
+        .await
+    }
+
+    async fn enqueue_runtime_job_for_command(
+        &self,
+        command_id: &str,
+        dispatch_owner: Option<&str>,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: Value,
+        not_before: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
         let mut job = RuntimeJob::pending(command_id, runtime_kind, runtime_profile, input);
         job.not_before = not_before;
         let data = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         let runtime_kind = enum_str(&job.runtime_kind)?;
         let mut tx = self.pool.begin().await?;
-        let command_row: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM workflow_commands WHERE id = $1 FOR UPDATE")
-                .bind(command_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((command_status,)) = command_row else {
+        let command_row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, dispatch_owner FROM workflow_commands WHERE id = $1 FOR UPDATE",
+        )
+        .bind(command_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((command_status, command_dispatch_owner)) = command_row else {
             anyhow::bail!("workflow command not found: {command_id}");
         };
 
-        if command_status != "pending" {
+        let eligible = match dispatch_owner {
+            Some(owner) => {
+                command_status == "dispatching" && command_dispatch_owner.as_deref() == Some(owner)
+            }
+            None => command_status == "pending",
+        };
+
+        if !eligible {
             let existing = runtime_job_for_command_tx(&mut tx, command_id).await?;
             tx.commit().await?;
             return Ok(match existing {
@@ -775,7 +872,10 @@ impl WorkflowRuntimeStore {
         if let Some(existing) = runtime_job_for_command_tx(&mut tx, command_id).await? {
             sqlx::query(
                 "UPDATE workflow_commands
-                 SET status = 'dispatched', updated_at = CURRENT_TIMESTAMP
+                 SET status = 'dispatched',
+                     dispatch_owner = NULL,
+                     dispatch_lease_expires_at = NULL,
+                     updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1",
             )
             .bind(command_id)
@@ -801,7 +901,10 @@ impl WorkflowRuntimeStore {
         .await?;
         sqlx::query(
             "UPDATE workflow_commands
-             SET status = 'dispatched', updated_at = CURRENT_TIMESTAMP
+             SET status = 'dispatched',
+                 dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
              WHERE id = $1",
         )
         .bind(command_id)

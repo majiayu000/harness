@@ -515,7 +515,7 @@ Tests:
 
 ### Phase 5: Runtime Worker Abstraction
 
-Status: partially implemented.
+Status: implemented.
 
 The current branch adds the generic worker boundary while leaving the existing Codex and Claude task
 execution paths in place.
@@ -582,19 +582,20 @@ Implemented now:
 - commands that require runtime execution enqueue `runtime_jobs`
 - non-runtime commands are marked `skipped` so they do not stay pending forever
 - repeated dispatch is idempotent when a runtime job already exists for the command
-
-Still intentionally not moved yet:
-
-- command lease/claiming is not yet a multi-dispatcher concurrency protocol
+- command outbox dispatch uses durable dispatcher ownership and lease expiry so multiple server
+  dispatch loops can claim commands without materializing duplicate runtime jobs
+- expired dispatch leases can be reclaimed by another dispatcher
 
 Tests:
 
 - activity commands enqueue runtime jobs with prompt input context
 - non-runtime commands are skipped without creating jobs
+- command claim leases hide active dispatch work from other dispatchers and allow stale work to be
+  reclaimed
 
 ### Phase 8: Server Dispatch Loop
 
-Status: partially implemented.
+Status: implemented.
 
 Run the command outbox dispatcher from the server as a policy-controlled background loop.
 
@@ -605,10 +606,8 @@ Implemented now:
   is available
 - the loop is enabled by default and can be disabled explicitly in `WORKFLOW.md`
 - each tick converts pending command rows into runtime jobs using the configured runtime profile
-
-Still intentionally not moved yet:
-
-- command claiming is still single-dispatcher safe but not a distributed lease protocol
+- each dispatch tick first claims command rows with a durable dispatch lease before materializing
+  runtime jobs, so concurrent loops use the same database protocol
 
 Tests:
 
