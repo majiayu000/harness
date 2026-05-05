@@ -1936,7 +1936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_background_issue_submission_falls_back_when_runtime_loops_disabled(
+    async fn enqueue_background_issue_submission_rejects_when_runtime_loops_disabled(
     ) -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -1952,7 +1952,6 @@ mod tests {
             "---\nruntime_dispatch:\n  enabled: false\nruntime_worker:\n  enabled: true\n---\n",
         )?;
         let store = TaskStore::open(&dir.path().join("t.db")).await?;
-        let task_store = store.clone();
         let database_url = crate::test_helpers::test_database_url()?;
         let runtime_store = Arc::new(
             harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
@@ -1973,11 +1972,10 @@ mod tests {
             ..Default::default()
         };
 
-        let task_id = svc.enqueue_background(req).await?;
-        let task = task_store
-            .get_with_db_fallback(&task_id)
-            .await?
-            .expect("disabled runtime loops should use the task runner path");
+        let error = svc
+            .enqueue_background(req)
+            .await
+            .expect_err("disabled runtime loops should reject issue submissions");
         let canonical_project_root = project_root.canonicalize()?;
         let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
             &canonical_project_root.to_string_lossy(),
@@ -1985,8 +1983,12 @@ mod tests {
             42,
         );
 
-        assert_eq!(task.task_kind, task_runner::TaskKind::Issue);
-        assert_eq!(task.external_id.as_deref(), Some("issue:42"));
+        assert!(
+            error.to_string().contains(
+                "workflow runtime dispatch and worker must be enabled for GitHub issue submissions"
+            ),
+            "unexpected error: {error}"
+        );
         assert!(
             runtime_store.get_instance(&workflow_id).await?.is_none(),
             "disabled runtime loops must not create a pending runtime workflow"

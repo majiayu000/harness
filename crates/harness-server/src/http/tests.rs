@@ -11,10 +11,9 @@ use harness_core::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 use tower::ServiceExt;
 
 struct CapturingAgent {
@@ -50,33 +49,17 @@ impl RuntimeStreamAgent {
 }
 
 struct BlockingAgent {
-    started: AtomicUsize,
-    started_notify: Notify,
     release_permits: Semaphore,
 }
 
 impl BlockingAgent {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            started: AtomicUsize::new(0),
-            started_notify: Notify::new(),
             release_permits: Semaphore::new(0),
         })
     }
 
-    async fn wait_for_started(&self, expected: usize) {
-        while self.started.load(Ordering::SeqCst) < expected {
-            self.started_notify.notified().await;
-        }
-    }
-
-    fn release_runs(&self, count: usize) {
-        self.release_permits.add_permits(count);
-    }
-
     async fn wait_until_released(&self) {
-        self.started.fetch_add(1, Ordering::SeqCst);
-        self.started_notify.notify_waiters();
         let permit = self
             .release_permits
             .acquire()
@@ -607,21 +590,6 @@ async fn make_test_state_with_agent(
     build_test_state_with_agent(dir, dir, config).await
 }
 
-async fn make_test_state_with_agent_and_repo(
-    dir: &std::path::Path,
-    webhook_secret: Option<&str>,
-    repo: &str,
-) -> anyhow::Result<(Arc<AppState>, Arc<CapturingAgent>)> {
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.server.github_webhook_secret = webhook_secret.map(ToString::to_string);
-    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
-        enabled: true,
-        repo: repo.to_string(),
-        ..Default::default()
-    });
-    build_test_state_with_agent(dir, dir, config).await
-}
-
 async fn make_test_state_with_agent_and_config(
     dir: &std::path::Path,
     project_root: &std::path::Path,
@@ -641,19 +609,6 @@ async fn build_test_state_with_agent(
 
     let state = make_test_state_with_project_root(dir, project_root, config, registry).await?;
     Ok((state, capturing))
-}
-
-async fn make_test_state_with_blocking_agent_and_config(
-    dir: &std::path::Path,
-    project_root: &std::path::Path,
-    config: harness_core::config::HarnessConfig,
-) -> anyhow::Result<(Arc<AppState>, Arc<BlockingAgent>)> {
-    let blocking = BlockingAgent::new();
-    let mut registry = harness_agents::registry::AgentRegistry::new("test");
-    registry.register("test", blocking.clone());
-
-    let state = make_test_state_with_project_root(dir, project_root, config, registry).await?;
-    Ok((state, blocking))
 }
 
 fn init_fake_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
@@ -777,53 +732,6 @@ async fn response_json(response: axum::response::Response) -> anyhow::Result<ser
     Ok(serde_json::from_slice(&body)?)
 }
 
-async fn wait_for_task_statuses(
-    state: &Arc<AppState>,
-    task_ids: &[String],
-    expected: task_runner::TaskStatus,
-) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let mut all_match = true;
-        for task_id in task_ids {
-            let task = state
-                .core
-                .tasks
-                .get_with_db_fallback(&harness_core::types::TaskId(task_id.clone()))
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("task {task_id} not found"))?;
-            if task.status != expected {
-                all_match = false;
-                break;
-            }
-        }
-        if all_match {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("tasks did not all reach status {expected:?} before timeout");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-async fn wait_for_task_project_root(
-    state: &Arc<AppState>,
-    task_id: &str,
-) -> anyhow::Result<std::path::PathBuf> {
-    let task_id = harness_core::types::TaskId(task_id.to_string());
-    for _ in 0..200 {
-        if let Some(task) = state.core.tasks.get_with_db_fallback(&task_id).await? {
-            if let Some(project_root) = task.project_root {
-                return Ok(project_root);
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    anyhow::bail!("task {task_id} did not resolve a project root")
-}
-
 async fn assert_runtime_issue_submission(
     state: &Arc<AppState>,
     project_root: &std::path::Path,
@@ -879,6 +787,120 @@ async fn assert_runtime_issue_submission(
     assert_eq!(runtime_task["execution_path"], "workflow_runtime");
     assert_eq!(runtime_task["workflow_id"], workflow_id);
     Ok(workflow_id)
+}
+
+async fn seed_bound_runtime_pr_workflow(
+    state: &Arc<AppState>,
+    project_root: &std::path::Path,
+    repo: &str,
+    issue_number: u64,
+    pr_number: u64,
+) -> anyhow::Result<(String, String)> {
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let canonical_project_root = project_root.canonicalize()?;
+    let project_id = canonical_project_root.to_string_lossy().into_owned();
+    let workflow_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some(repo), issue_number);
+    let task_id = format!("runtime-issue-{issue_number}");
+    let instance = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "pr_open",
+        harness_workflow::runtime::WorkflowSubject::new("issue", format!("issue:{issue_number}")),
+    )
+    .with_id(workflow_id.clone())
+    .with_data(serde_json::json!({
+        "project_id": project_id,
+        "repo": repo,
+        "issue_number": issue_number,
+        "task_id": task_id.clone(),
+        "task_ids": [task_id.clone()],
+        "pr_number": pr_number,
+        "pr_url": format!("https://github.com/{repo}/pull/{pr_number}"),
+        "execution_path": "workflow_runtime"
+    }));
+    store.upsert_instance(&instance).await?;
+    Ok((workflow_id, task_id))
+}
+
+async fn assert_runtime_pr_feedback_requested(
+    state: &Arc<AppState>,
+    workflow_id: &str,
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let instance = store
+        .get_instance(workflow_id)
+        .await?
+        .expect("runtime workflow should exist");
+    assert_eq!(instance.state, "awaiting_feedback");
+    assert_eq!(instance.data["task_id"], task_id);
+    let commands = store.commands_for(workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "pending");
+    assert_eq!(
+        commands[0].command.command["definition_id"],
+        harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID
+    );
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
+            .await?
+            .is_none(),
+        "workflow runtime PR feedback must not register legacy task rows"
+    );
+    Ok(())
+}
+
+async fn assert_runtime_prompt_submission(
+    state: &Arc<AppState>,
+    project_root: &std::path::Path,
+    task_id: &str,
+) -> anyhow::Result<String> {
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
+            .await?
+            .is_none(),
+        "workflow runtime prompt submissions must not register legacy task rows"
+    );
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let instance = store
+        .get_instance_by_task_id(task_id)
+        .await?
+        .expect("runtime prompt workflow should be persisted");
+    assert_eq!(instance.definition_id, "prompt_task");
+    assert_eq!(instance.state, "implementing");
+    assert_eq!(instance.data["task_id"], task_id);
+    assert_eq!(instance.data["execution_path"], "workflow_runtime");
+    assert_eq!(
+        instance.data["project_id"],
+        project_root.canonicalize()?.to_string_lossy().as_ref()
+    );
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "pending");
+    assert_eq!(
+        commands[0].command.activity_name(),
+        Some("implement_prompt")
+    );
+    Ok(instance.id)
 }
 
 fn webhook_signature(secret: &str, payload: &[u8]) -> String {
@@ -1663,6 +1685,10 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["allowed_error_kinds"][1],
+        "timeout"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["allowed_error_kinds"][2],
         "fatal"
     );
     assert_eq!(
@@ -2825,11 +2851,29 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
+async fn webhook_review_on_pr_requests_runtime_pr_feedback() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) =
-        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "majiayu000/harness".to_string(),
+        ..Default::default()
+    });
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let (workflow_id, runtime_task_id) =
+        seed_bound_runtime_pr_workflow(&state, dir.path(), "majiayu000/harness", 42, 42).await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -2855,16 +2899,37 @@ async fn webhook_review_on_pr_creates_pr_review_task() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "awaiting_feedback");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    assert_eq!(json["task_id"], runtime_task_id);
+    assert_eq!(state.core.tasks.count(), before_count);
+    assert_runtime_pr_feedback_requested(&state, &workflow_id, &runtime_task_id).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn webhook_fix_ci_on_pr_creates_fix_ci_task() -> anyhow::Result<()> {
+async fn webhook_fix_ci_on_pr_creates_runtime_prompt_submission() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) =
-        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "majiayu000/harness").await?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "majiayu000/harness".to_string(),
+        ..Default::default()
+    });
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -2897,7 +2962,12 @@ async fn webhook_fix_ci_on_pr_creates_fix_ci_task() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
+    assert_eq!(state.core.tasks.count(), before_count);
+    assert_runtime_prompt_submission(&state, dir.path(), runtime_task_id).await?;
     Ok(())
 }
 
@@ -3076,7 +3146,7 @@ async fn webhook_body_limit_rejects_large_payload() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
+async fn create_task_with_prompt_requires_workflow_runtime_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
     let before_count = state.core.tasks.count();
@@ -3093,11 +3163,15 @@ async fn create_task_with_prompt_returns_accepted() -> anyhow::Result<()> {
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let resp = response_json(response).await?;
-    assert!(resp["task_id"].is_string());
-    assert_eq!(resp["status"], "queued");
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    assert!(
+        resp["error"].as_str().is_some_and(
+            |error| error.contains("workflow runtime store is required for prompt submissions")
+        ),
+        "unexpected response: {resp}"
+    );
+    assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
 }
 
@@ -3802,10 +3876,25 @@ async fn get_task_returns_not_found_for_missing_id() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
 
-    let create_body = serde_json::json!({ "prompt": "add tests" });
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+
+    let create_body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "prompt": "add tests",
+    });
     let create_resp = task_app(state.clone())
         .oneshot(
             Request::builder()
@@ -3821,10 +3910,9 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
     let task_id = create_json["task_id"]
         .as_str()
         .expect("task_id should be string");
-    assert_eq!(create_json["status"], "queued");
+    assert_eq!(create_json["status"], "implementing");
+    assert_eq!(create_json["execution_path"], "workflow_runtime");
 
-    // GET the task — the route accepts immediately, while execution becomes
-    // observable through the task record.
     let get_resp = task_app(state)
         .oneshot(
             Request::builder()
@@ -3838,380 +3926,9 @@ async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
     let get_body = get_resp.into_body().collect().await?.to_bytes();
     let task_json: serde_json::Value = serde_json::from_slice(&get_body)?;
     assert_eq!(task_json["id"], task_id);
-    assert!(task_json["scheduler"]["authority_state"].is_string());
-    assert!(task_json["scheduler"]["run_generation"].is_number());
-    Ok(())
-}
-
-#[tokio::test]
-async fn create_task_returns_quickly_when_capacity_saturated() -> anyhow::Result<()> {
-    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
-    let dir = crate::test_helpers::tempdir_in_home("queued-task-saturation-")?;
-    let project_dir = dir.path().join("repo");
-    std::fs::create_dir_all(&project_dir)?;
-    init_fake_git_repo(&project_dir)?;
-
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.concurrency.max_concurrent_tasks = 1;
-    config.concurrency.max_queue_size = 32;
-    let project = project_dir.display().to_string();
-
-    let (state, blocking_agent) =
-        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
-
-    let first_response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": project.clone(),
-                        "prompt": "hold the only execution slot"
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    assert_eq!(first_response.status(), StatusCode::ACCEPTED);
-    let first_json = response_json(first_response).await?;
-    let first_task_id = first_json["task_id"]
-        .as_str()
-        .expect("task_id should be present")
-        .to_string();
-
-    blocking_agent.wait_for_started(1).await;
-
-    let started_at = tokio::time::Instant::now();
-    let saturated_response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": project.clone(),
-                        "prompt": "queued behind the blocking task"
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    let elapsed = started_at.elapsed();
-
-    assert_eq!(saturated_response.status(), StatusCode::ACCEPTED);
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "saturated POST /tasks should return quickly, took {elapsed:?}"
-    );
-    let queued_json = response_json(saturated_response).await?;
-    assert_eq!(queued_json["status"], "queued");
-
-    let queued_task_id = queued_json["task_id"]
-        .as_str()
-        .expect("task_id should be present")
-        .to_string();
-    wait_for_task_statuses(
-        &state,
-        std::slice::from_ref(&queued_task_id),
-        task_runner::TaskStatus::Pending,
-    )
-    .await?;
-
-    blocking_agent.release_runs(2);
-    wait_for_task_statuses(
-        &state,
-        &[first_task_id, queued_task_id],
-        task_runner::TaskStatus::Done,
-    )
-    .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn create_task_repeated_submits_stay_pending_and_distinct_when_saturated(
-) -> anyhow::Result<()> {
-    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
-    let dir = crate::test_helpers::tempdir_in_home("queued-task-repeated-")?;
-    let project_dir = dir.path().join("repo");
-    std::fs::create_dir_all(&project_dir)?;
-    init_fake_git_repo(&project_dir)?;
-
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.concurrency.max_concurrent_tasks = 1;
-    config.concurrency.max_queue_size = 32;
-    let project = project_dir.display().to_string();
-
-    let (state, blocking_agent) =
-        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
-
-    let blocker_response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": project.clone(),
-                        "prompt": "occupy execution"
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    assert_eq!(blocker_response.status(), StatusCode::ACCEPTED);
-    let blocker_json = response_json(blocker_response).await?;
-    let blocker_task_id = blocker_json["task_id"]
-        .as_str()
-        .expect("task_id should be present")
-        .to_string();
-
-    blocking_agent.wait_for_started(1).await;
-
-    let mut queued_task_ids = Vec::new();
-    for index in 0..10 {
-        let started_at = tokio::time::Instant::now();
-        let response = task_app(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/tasks")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "project": project.clone(),
-                            "prompt": format!("queued task {index}")
-                        })
-                        .to_string(),
-                    ))?,
-            )
-            .await?;
-        let elapsed = started_at.elapsed();
-
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "queued submit {index} should return quickly, took {elapsed:?}"
-        );
-
-        let json = response_json(response).await?;
-        assert_eq!(json["status"], "queued");
-        queued_task_ids.push(
-            json["task_id"]
-                .as_str()
-                .expect("task_id should be present")
-                .to_string(),
-        );
-    }
-
-    let unique_ids: std::collections::HashSet<_> = queued_task_ids.iter().cloned().collect();
-    assert_eq!(unique_ids.len(), queued_task_ids.len());
-
-    wait_for_task_statuses(&state, &queued_task_ids, task_runner::TaskStatus::Pending).await?;
-
-    for task_id in &queued_task_ids {
-        let get_resp = task_app(state.clone())
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/tasks/{task_id}"))
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(get_resp.status(), StatusCode::OK);
-        let task_json = response_json(get_resp).await?;
-        assert_eq!(task_json["id"], task_id.as_str());
-        assert_eq!(task_json["status"], "pending");
-    }
-
-    blocking_agent.release_runs(1 + queued_task_ids.len());
-    let mut all_task_ids = vec![blocker_task_id];
-    all_task_ids.extend(queued_task_ids);
-    wait_for_task_statuses(&state, &all_task_ids, task_runner::TaskStatus::Done).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn create_task_deduplicates_external_id_while_queued_under_saturation() -> anyhow::Result<()>
-{
-    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
-    let dir = crate::test_helpers::tempdir_in_home("queued-task-dedup-")?;
-    let project_dir = dir.path().join("repo");
-    std::fs::create_dir_all(&project_dir)?;
-    init_fake_git_repo(&project_dir)?;
-
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.concurrency.max_concurrent_tasks = 1;
-    config.concurrency.max_queue_size = 32;
-    let project = project_dir.display().to_string();
-
-    let (state, blocking_agent) =
-        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
-
-    let blocker_response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": project.clone(),
-                        "prompt": "occupy execution"
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    assert_eq!(blocker_response.status(), StatusCode::ACCEPTED);
-    let blocker_json = response_json(blocker_response).await?;
-    let blocker_task_id = blocker_json["task_id"]
-        .as_str()
-        .expect("task_id should be present")
-        .to_string();
-
-    blocking_agent.wait_for_started(1).await;
-
-    let issue_body = serde_json::json!({
-        "project": project.clone(),
-        "external_id": "issue:42",
-        "prompt": "fix issue 42"
-    })
-    .to_string();
-    let first_issue_response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(issue_body.clone()))?,
-        )
-        .await?;
-    assert_eq!(first_issue_response.status(), StatusCode::ACCEPTED);
-    let first_issue_json = response_json(first_issue_response).await?;
-    let first_issue_task_id = first_issue_json["task_id"]
-        .as_str()
-        .expect("task_id should be present")
-        .to_string();
-
-    wait_for_task_statuses(
-        &state,
-        std::slice::from_ref(&first_issue_task_id),
-        task_runner::TaskStatus::Pending,
-    )
-    .await?;
-
-    let duplicate_issue_response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(issue_body))?,
-        )
-        .await?;
-    assert_eq!(duplicate_issue_response.status(), StatusCode::ACCEPTED);
-    let duplicate_issue_json = response_json(duplicate_issue_response).await?;
-    assert_eq!(duplicate_issue_json["status"], "queued");
-    assert_eq!(
-        duplicate_issue_json["task_id"].as_str(),
-        Some(first_issue_task_id.as_str())
-    );
-
-    blocking_agent.release_runs(2);
-    wait_for_task_statuses(
-        &state,
-        &[blocker_task_id, first_issue_task_id],
-        task_runner::TaskStatus::Done,
-    )
-    .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn create_tasks_batch_remains_queued_under_saturation() -> anyhow::Result<()> {
-    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
-    let dir = crate::test_helpers::tempdir_in_home("queued-task-batch-")?;
-    let project_dir = dir.path().join("repo");
-    std::fs::create_dir_all(&project_dir)?;
-    init_fake_git_repo(&project_dir)?;
-
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.concurrency.max_concurrent_tasks = 1;
-    config.concurrency.max_queue_size = 32;
-    let project = project_dir.display().to_string();
-
-    let (state, blocking_agent) =
-        make_test_state_with_blocking_agent_and_config(dir.path(), &project_dir, config).await?;
-
-    let blocker_response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": project.clone(),
-                        "prompt": "occupy execution"
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    assert_eq!(blocker_response.status(), StatusCode::ACCEPTED);
-    let blocker_json = response_json(blocker_response).await?;
-    let blocker_task_id = blocker_json["task_id"]
-        .as_str()
-        .expect("task_id should be present")
-        .to_string();
-
-    blocking_agent.wait_for_started(1).await;
-
-    let response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks/batch")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": project.clone(),
-                        "tasks": [
-                            { "description": "batch task 1" },
-                            { "description": "batch task 2" }
-                        ]
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-    let batch_json = response_json(response).await?;
-    let entries = batch_json
-        .as_array()
-        .expect("batch response should be an array");
-    assert_eq!(entries.len(), 2);
-
-    let queued_task_ids: Vec<String> = entries
-        .iter()
-        .map(|entry| {
-            assert_eq!(entry["status"], "queued");
-            entry["task_id"]
-                .as_str()
-                .expect("task_id should be present")
-                .to_string()
-        })
-        .collect();
-    wait_for_task_statuses(&state, &queued_task_ids, task_runner::TaskStatus::Pending).await?;
-
-    blocking_agent.release_runs(1 + queued_task_ids.len());
-    let mut all_task_ids = vec![blocker_task_id];
-    all_task_ids.extend(queued_task_ids);
-    wait_for_task_statuses(&state, &all_task_ids, task_runner::TaskStatus::Done).await?;
+    assert_eq!(task_json["status"], "implementing");
+    assert_eq!(task_json["execution_path"], "workflow_runtime");
+    assert_eq!(task_json["workflow"]["definition_id"], "prompt_task");
     Ok(())
 }
 
@@ -4270,60 +3987,6 @@ async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow:
         assert_eq!(entry["workflow_id"], workflow_id);
     }
     assert_eq!(state.core.tasks.count(), before_count);
-    Ok(())
-}
-
-#[tokio::test]
-async fn create_tasks_batch_with_legacy_conflicts_does_not_add_dependencies() -> anyhow::Result<()>
-{
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    init_fake_git_repo(dir.path())?;
-    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
-    let response = task_app(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks/batch")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": dir.path().display().to_string(),
-                        "tasks": [
-                            { "description": "update src/lib.rs first" },
-                            { "description": "update src/lib.rs second" }
-                        ]
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let batch_json = response_json(response).await?;
-    let entries = batch_json
-        .as_array()
-        .expect("batch response should be an array");
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0]["serialized"], true);
-    assert_eq!(entries[1]["serialized"], true);
-    for entry in entries {
-        let task_id = task_runner::TaskId::from_str(
-            entry["task_id"]
-                .as_str()
-                .expect("task id should be present"),
-        );
-        let task = state
-            .core
-            .tasks
-            .get_with_db_fallback(&task_id)
-            .await?
-            .expect("legacy task should be persisted");
-        assert!(task.depends_on.is_empty());
-    }
     Ok(())
 }
 
@@ -5665,7 +5328,11 @@ async fn webhook_routes_runtime_issue_to_repo_specific_project_root() -> anyhow:
 }
 
 #[tokio::test]
-async fn webhook_routes_prompt_tasks_to_repo_specific_project_root() -> anyhow::Result<()> {
+async fn webhook_routes_runtime_prompt_to_repo_specific_project_root() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
     let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let repo_a_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-a-")?;
     let repo_b_dir = crate::test_helpers::tempdir_in_home("webhook-prompt-b-")?;
@@ -5682,8 +5349,14 @@ async fn webhook_routes_prompt_tasks_to_repo_specific_project_root() -> anyhow::
         ..Default::default()
     });
 
-    let (state, _agent) =
-        make_test_state_with_agent_and_config(repo_a_dir.path(), repo_a_dir.path(), config).await?;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        repo_a_dir.path(),
+        repo_a_dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -5716,12 +5389,11 @@ async fn webhook_routes_prompt_tasks_to_repo_specific_project_root() -> anyhow::
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    let task_root = wait_for_task_project_root(
-        &state,
-        json["task_id"].as_str().expect("task id should be present"),
-    )
-    .await?;
-    assert_eq!(task_root.canonicalize()?, repo_b_dir.path().canonicalize()?);
+    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
+    assert_eq!(state.core.tasks.count(), before_count);
+    assert_runtime_prompt_submission(&state, repo_b_dir.path(), runtime_task_id).await?;
     Ok(())
 }
 
@@ -5784,11 +5456,28 @@ async fn webhook_ignores_issue_tasks_when_repo_is_unmapped() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn webhook_pull_request_review_changes_requested_creates_task() -> anyhow::Result<()> {
+async fn webhook_pull_request_review_changes_requested_creates_runtime_prompt_submission(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let secret = "secret";
-    let (state, _agent) =
-        make_test_state_with_agent_and_repo(dir.path(), Some(secret), "org/repo").await?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some(secret.to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "org/repo".to_string(),
+        ..Default::default()
+    });
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
     let before_count = state.core.tasks.count();
     let app = webhook_app(state.clone());
 
@@ -5821,7 +5510,12 @@ async fn webhook_pull_request_review_changes_requested_creates_task() -> anyhow:
         .await?;
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(state.core.tasks.count(), before_count + 1);
+    let json = response_json(response).await?;
+    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["execution_path"], "workflow_runtime");
+    let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
+    assert_eq!(state.core.tasks.count(), before_count);
+    assert_runtime_prompt_submission(&state, dir.path(), runtime_task_id).await?;
     Ok(())
 }
 
@@ -5851,184 +5545,6 @@ async fn webhook_ping_event_returns_accepted_without_creating_task() -> anyhow::
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(state.core.tasks.count(), before_count);
-    Ok(())
-}
-
-/// Agent stub that records invocations via an atomic flag.
-/// Records in both `execute` and `execute_stream` since the task executor
-/// calls `execute_stream` (via `run_agent_streaming`).
-struct DispatchCapturingAgent {
-    agent_name: &'static str,
-    was_invoked: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl DispatchCapturingAgent {
-    fn new(name: &'static str) -> (Arc<Self>, Arc<std::sync::atomic::AtomicBool>) {
-        let was_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let agent = Arc::new(Self {
-            agent_name: name,
-            was_invoked: was_invoked.clone(),
-        });
-        (agent, was_invoked)
-    }
-}
-
-#[async_trait]
-impl CodeAgent for DispatchCapturingAgent {
-    fn name(&self) -> &str {
-        self.agent_name
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![]
-    }
-
-    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
-        self.was_invoked
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(AgentResponse {
-            output: String::new(),
-            stderr: String::new(),
-            items: vec![],
-            token_usage: TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                cost_usd: 0.0,
-            },
-            model: self.agent_name.to_string(),
-            exit_code: Some(0),
-        })
-    }
-
-    async fn execute_stream(
-        &self,
-        _req: AgentRequest,
-        _tx: tokio::sync::mpsc::Sender<StreamItem>,
-    ) -> harness_core::error::Result<()> {
-        self.was_invoked
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-/// Build a test AppState with a "test" (default) and a "claude" DispatchCapturingAgent.
-/// Returns the state and atomic flags for each agent so tests can detect which was invoked.
-async fn make_test_state_with_dispatch_agents(
-    dir: &std::path::Path,
-) -> anyhow::Result<(
-    Arc<AppState>,
-    Arc<std::sync::atomic::AtomicBool>,
-    Arc<std::sync::atomic::AtomicBool>,
-)> {
-    let (default_agent, default_invoked) = DispatchCapturingAgent::new("test");
-    let (claude_agent, claude_invoked) = DispatchCapturingAgent::new("claude");
-    let mut registry = harness_agents::registry::AgentRegistry::new("test");
-    registry.set_complexity_preferences(vec!["claude".to_string()]);
-    registry.register("test", default_agent);
-    registry.register("claude", claude_agent);
-    let state = make_test_state_with(
-        dir,
-        harness_core::config::HarnessConfig::default(),
-        registry,
-    )
-    .await?;
-    Ok((state, default_invoked, claude_invoked))
-}
-
-/// Poll (with 5 s deadline) until `flag` is set; panic with `msg` on timeout.
-async fn wait_for_invocation(flag: &std::sync::atomic::AtomicBool, msg: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if flag.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("{msg}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-#[tokio::test]
-async fn dispatch_complex_prompt_selects_claude_agent() -> anyhow::Result<()> {
-    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
-    let dir = crate::test_helpers::tempdir_in_home("dispatch-complex-")?;
-    let (state, default_invoked, claude_invoked) =
-        make_test_state_with_dispatch_agents(dir.path()).await?;
-    let app = task_app(state);
-
-    // 6 distinct file references → Complex complexity → registry.dispatch() selects "claude"
-    let body = serde_json::json!({
-        "prompt": "Refactor src/a.rs src/b.rs src/c.rs src/d.rs src/e.rs src/f.rs",
-        "project": dir.path(),
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-    wait_for_invocation(
-        &claude_invoked,
-        "claude agent was not invoked within 500ms for complex task",
-    )
-    .await;
-
-    assert!(
-        claude_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "claude agent should have been invoked for complex task"
-    );
-    assert!(
-        !default_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "default agent should not have been invoked for complex task"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn dispatch_simple_prompt_selects_default_agent() -> anyhow::Result<()> {
-    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
-    let dir = crate::test_helpers::tempdir_in_home("dispatch-simple-")?;
-    let (state, default_invoked, claude_invoked) =
-        make_test_state_with_dispatch_agents(dir.path()).await?;
-    let app = task_app(state);
-
-    // Simple prompt: no file references → Simple complexity → default "test" agent
-    let body = serde_json::json!({
-        "prompt": "Fix the login bug",
-        "project": dir.path(),
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-    wait_for_invocation(
-        &default_invoked,
-        "default agent was not invoked within 500ms for simple task",
-    )
-    .await;
-
-    assert!(
-        default_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "default agent should have been invoked for simple task"
-    );
-    assert!(
-        !claude_invoked.load(std::sync::atomic::Ordering::SeqCst),
-        "claude agent should not have been invoked for simple task"
-    );
     Ok(())
 }
 
