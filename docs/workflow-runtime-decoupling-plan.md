@@ -571,7 +571,7 @@ Tests:
 
 ### Phase 7: Command Outbox Dispatch
 
-Status: partially implemented.
+Status: implemented.
 
 Convert accepted workflow commands into durable runtime jobs without making the existing task runner
 depend on the new path yet.
@@ -737,7 +737,7 @@ Tests:
 
 ### Phase 12: Workflow Runtime Profile Selection
 
-Status: partially implemented.
+Status: implemented.
 
 Route runtime command dispatch through a workflow-aware profile selector instead of a single global
 runtime profile.
@@ -757,11 +757,9 @@ Implemented now:
 - selection precedence is workflow/activity pair, global activity, workflow, then configured default
   runtime profile
 - server background dispatch builds the same profile selector from project workflow config
-
-Still intentionally not moved yet:
-
-- profile definitions are still lightweight config entries, not durable workflow definition
-  artifacts
+- server background dispatch persists a project-scoped `runtime_profile_manifest` workflow
+  definition artifact with source path, content hash, resolved default profile, overrides, and
+  precedence metadata before dispatching runtime jobs
 
 Tests:
 
@@ -772,6 +770,8 @@ Tests:
   `start_child_workflow` activity key
 - server dispatch config conversion preserves default, workflow override, activity override, and
   workflow/activity override behavior
+- server dispatch tick persists the runtime profile manifest definition before materializing runtime
+  jobs
 
 ### Phase 13: Runtime Profile Metadata Application
 

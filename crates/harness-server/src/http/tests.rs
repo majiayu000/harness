@@ -1156,6 +1156,31 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
     let jobs = store.runtime_jobs_for_command(&command_id).await?;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].runtime_profile, "codex-high");
+    let workflow_cfg = harness_core::config::workflow::load_workflow_config(&project_root)?;
+    let expected_profile_manifest = super::background::runtime_profile_manifest_definition(
+        &project_root,
+        &workflow_cfg.runtime_dispatch,
+    )?;
+    let persisted_profile_manifest = store
+        .get_definition(
+            &expected_profile_manifest.id,
+            expected_profile_manifest.version,
+        )
+        .await?
+        .expect("runtime profile manifest definition should be persisted");
+    assert_eq!(
+        persisted_profile_manifest.metadata["default_profile"]["name"],
+        "codex-high"
+    );
+    assert_eq!(
+        persisted_profile_manifest.source_path,
+        Some(
+            project_root
+                .join("WORKFLOW.md")
+                .to_string_lossy()
+                .into_owned()
+        )
+    );
     assert_eq!(
         store.commands_for(&workflow.id).await?[0].status,
         "dispatched"

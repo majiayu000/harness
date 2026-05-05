@@ -250,6 +250,24 @@ impl WorkflowRuntimeStore {
         Ok(())
     }
 
+    pub async fn get_definition(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> anyhow::Result<Option<WorkflowDefinition>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_definitions
+             WHERE id = $1 AND version = $2",
+        )
+        .bind(id)
+        .bind(version as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(data,)| serde_json::from_str(&data))
+            .transpose()
+            .map_err(Into::into)
+    }
+
     pub async fn upsert_instance(&self, instance: &WorkflowInstance) -> anyhow::Result<()> {
         let data = to_jsonb_string(instance)?;
         sqlx::query(

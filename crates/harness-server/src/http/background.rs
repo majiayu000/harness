@@ -8,8 +8,10 @@ use harness_workflow::issue_lifecycle::{
 };
 use harness_workflow::runtime::{
     CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
-    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowInstance, WorkflowRuntimeStore,
+    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowDefinition, WorkflowInstance,
+    WorkflowRuntimeStore,
 };
+use sha2::{Digest, Sha256};
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     let (issue_from_external_id, pr_from_external_id) = task
@@ -589,6 +591,7 @@ async fn runtime_dispatch_profile_selector_for_command(
         );
         return Ok(None);
     }
+    persist_runtime_profile_manifest(store, &project_root, &workflow_cfg.runtime_dispatch).await?;
     Ok(Some(runtime_dispatch_profile_selector(
         &workflow_cfg.runtime_dispatch,
     )))
@@ -976,9 +979,18 @@ fn runtime_dispatch_profile(
     profile
 }
 
-fn runtime_dispatch_profile_selector(
+#[derive(Clone)]
+struct ResolvedRuntimeDispatchProfiles {
+    default_profile: RuntimeProfile,
+    workflow_profiles: std::collections::BTreeMap<String, RuntimeProfile>,
+    activity_profiles: std::collections::BTreeMap<String, RuntimeProfile>,
+    workflow_activity_profiles:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, RuntimeProfile>>,
+}
+
+fn resolve_runtime_dispatch_profiles(
     policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
-) -> RuntimeProfileSelector {
+) -> ResolvedRuntimeDispatchProfiles {
     let default_profile = runtime_dispatch_profile(policy);
     let workflow_profiles = policy
         .workflow_profiles
@@ -1000,13 +1012,7 @@ fn runtime_dispatch_profile_selector(
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut selector = RuntimeProfileSelector::new(default_profile.clone());
-    for (definition_id, profile) in &workflow_profiles {
-        selector = selector.with_workflow_profile(definition_id.clone(), profile.clone());
-    }
-    for (activity, profile) in &activity_profiles {
-        selector = selector.with_activity_profile(activity.clone(), profile.clone());
-    }
+    let mut workflow_activity_profiles = std::collections::BTreeMap::new();
     for (definition_id, activity_overrides) in &policy.workflow_activity_profiles {
         for (activity, override_policy) in activity_overrides {
             let base_profile = activity_profiles
@@ -1014,14 +1020,88 @@ fn runtime_dispatch_profile_selector(
                 .or_else(|| workflow_profiles.get(definition_id))
                 .unwrap_or(&default_profile);
             let profile = apply_runtime_dispatch_profile_override(base_profile, override_policy);
+            workflow_activity_profiles
+                .entry(definition_id.clone())
+                .or_insert_with(std::collections::BTreeMap::new)
+                .insert(activity.clone(), profile);
+        }
+    }
+    ResolvedRuntimeDispatchProfiles {
+        default_profile,
+        workflow_profiles,
+        activity_profiles,
+        workflow_activity_profiles,
+    }
+}
+
+fn runtime_dispatch_profile_selector(
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> RuntimeProfileSelector {
+    let resolved = resolve_runtime_dispatch_profiles(policy);
+    let default_profile = resolved.default_profile;
+    let mut selector = RuntimeProfileSelector::new(default_profile);
+    for (definition_id, profile) in &resolved.workflow_profiles {
+        selector = selector.with_workflow_profile(definition_id.clone(), profile.clone());
+    }
+    for (activity, profile) in &resolved.activity_profiles {
+        selector = selector.with_activity_profile(activity.clone(), profile.clone());
+    }
+    for (definition_id, activity_profiles) in &resolved.workflow_activity_profiles {
+        for (activity, profile) in activity_profiles {
             selector = selector.with_workflow_activity_profile(
                 definition_id.clone(),
                 activity.clone(),
-                profile,
+                profile.clone(),
             );
         }
     }
     selector
+}
+
+async fn persist_runtime_profile_manifest(
+    store: &WorkflowRuntimeStore,
+    project_root: &Path,
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> anyhow::Result<()> {
+    let definition = runtime_profile_manifest_definition(project_root, policy)?;
+    store.upsert_definition(&definition).await
+}
+
+pub(super) fn runtime_profile_manifest_definition(
+    project_root: &Path,
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> anyhow::Result<WorkflowDefinition> {
+    let resolved = resolve_runtime_dispatch_profiles(policy);
+    let metadata = serde_json::json!({
+        "artifact_type": "runtime_profile_manifest",
+        "project_root": project_root.to_string_lossy(),
+        "selection_precedence": [
+            "workflow_activity_profiles",
+            "activity_profiles",
+            "workflow_profiles",
+            "default_profile"
+        ],
+        "default_profile": resolved.default_profile,
+        "workflow_profiles": resolved.workflow_profiles,
+        "activity_profiles": resolved.activity_profiles,
+        "workflow_activity_profiles": resolved.workflow_activity_profiles,
+    });
+    let metadata_json = serde_json::to_string(&metadata)?;
+    let definition_digest = Sha256::digest(metadata_json.as_bytes());
+    let project_digest = Sha256::digest(project_root.to_string_lossy().as_bytes());
+    Ok(WorkflowDefinition::new(
+        format!("runtime_profiles:{project_digest:x}"),
+        1,
+        "Runtime Profile Manifest",
+    )
+    .with_source_path(
+        project_root
+            .join("WORKFLOW.md")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .with_definition_hash(format!("{definition_digest:x}"))
+    .with_metadata(metadata))
 }
 
 fn apply_runtime_dispatch_profile_override(
@@ -2241,6 +2321,59 @@ mod tests {
         assert_eq!(default_profile.name, "claude-default");
         assert_eq!(default_profile.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(default_profile.timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn runtime_profile_manifest_definition_records_resolved_profiles() -> anyhow::Result<()> {
+        let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: "codex_jsonrpc".to_string(),
+            runtime_profile: "codex-default".to_string(),
+            model: Some("gpt-default".to_string()),
+            timeout_secs: Some(600),
+            ..Default::default()
+        };
+        policy.workflow_activity_profiles.insert(
+            "github_issue_pr".to_string(),
+            std::collections::BTreeMap::from([(
+                "replan_issue".to_string(),
+                harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                    runtime_profile: Some("codex-issue-replan".to_string()),
+                    model: Some("gpt-replan".to_string()),
+                    timeout_secs: Some(120),
+                    ..Default::default()
+                },
+            )]),
+        );
+
+        let project_root = std::path::Path::new("/tmp/harness-runtime-profile-project");
+        let definition = runtime_profile_manifest_definition(project_root, &policy)?;
+
+        assert!(definition.id.starts_with("runtime_profiles:"));
+        assert_eq!(definition.name, "Runtime Profile Manifest");
+        assert_eq!(
+            definition.source_path.as_deref(),
+            Some("/tmp/harness-runtime-profile-project/WORKFLOW.md")
+        );
+        assert_eq!(
+            definition.metadata["artifact_type"],
+            "runtime_profile_manifest"
+        );
+        assert_eq!(
+            definition.metadata["default_profile"]["name"],
+            "codex-default"
+        );
+        assert_eq!(
+            definition.metadata["workflow_activity_profiles"]["github_issue_pr"]["replan_issue"]
+                ["name"],
+            "codex-issue-replan"
+        );
+        assert_eq!(
+            definition.metadata["workflow_activity_profiles"]["github_issue_pr"]["replan_issue"]
+                ["model"],
+            "gpt-replan"
+        );
+        assert!(!definition.definition_hash.is_empty());
+        Ok(())
     }
 
     #[test]
