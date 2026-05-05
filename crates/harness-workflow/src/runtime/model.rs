@@ -625,6 +625,7 @@ pub enum ActivityStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ActivityErrorKind {
     Retryable,
+    Timeout,
     Fatal,
     Configuration,
     ExternalDependency,

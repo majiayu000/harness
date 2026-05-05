@@ -1218,6 +1218,51 @@ fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
 }
 
 #[test]
+fn runtime_completion_reducer_retries_timeout_activity_failure_when_policy_allows() {
+    let instance = issue_instance("implementing").with_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 1
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "implement-timeout-1");
+    let result = ActivityResult::failed(
+        "implement_issue",
+        "Implementation timed out.",
+        "Agent turn timed out after 30s",
+    )
+    .with_error_kind(ActivityErrorKind::Timeout);
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-timeout-1",
+        "command": command,
+        "runtime_job_id": "job-timeout-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("timeout activity should produce a retry decision");
+
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(
+        decision.commands[0].command["previous_error_kind"],
+        "timeout"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("timeout retry decision should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_does_not_retry_fatal_activity_failure() {
     let instance = issue_instance("implementing").with_data(json!({
         "runtime_retry_policy": {

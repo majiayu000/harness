@@ -667,6 +667,8 @@ Implemented now:
   GitHub issue PR and repo backlog activities
 - activity result schemas expose `error_kind`, allowing agents to mark fatal or configuration
   failures as non-retryable
+- timeout failures are represented as `error_kind = timeout` so runtime completion and retry policy
+  can distinguish lifecycle timeouts from generic agent failures
 
 Still intentionally not moved yet:
 
@@ -710,6 +712,8 @@ Implemented now:
   retry metadata
 - failed activity results can carry `error_kind`; `fatal` and `configuration` failures bypass retry
   policy and fail the workflow immediately
+- failed timeout activity results carry `error_kind = timeout`, preserve that taxonomy in retry
+  commands, and can retry under the workflow retry budget
 - unknown successful activity/state pairs are preserved as completion events without unsafe state
   changes
 
@@ -717,8 +721,8 @@ Still intentionally not moved yet:
 
 - implementation completion does not infer PR state from free-form agent text; only structured
   `pull_request` artifacts drive this reducer path
-- retry policy does not yet model provider-specific or runtime-specific error taxonomies beyond the
-  portable activity error kinds
+- retry policy does not yet model provider-specific quota, billing, or rate-limit taxonomies beyond
+  the portable activity error kinds
 
 Tests:
 
@@ -733,6 +737,8 @@ Tests:
 - reducer adds cooldown metadata to retry commands when retry delay policy is configured
 - reducer preserves `StartChildWorkflow` command type when retrying failed child workflow dispatch
 - reducer skips retries for non-retryable `fatal` and `configuration` activity errors
+- reducer treats timeout activity failures as retryable and preserves the timeout taxonomy in retry
+  command metadata
 - runtime worker applies the reducer, records decisions, and updates workflow state
 
 ### Phase 12: Workflow Runtime Profile Selection
@@ -775,7 +781,7 @@ Tests:
 
 ### Phase 13: Runtime Profile Metadata Application
 
-Status: partially implemented.
+Status: implemented.
 
 Carry runtime profile metadata beyond profile names and apply safe fields during server-owned
 runtime execution.
@@ -816,15 +822,15 @@ Implemented now:
 - deadline expiry marks the agent turn failed with a timeout-specific error item
 - runtime worker completion converts the failed turn into a failed `ActivityResult`
 - runtime job output records the timeout reason as structured activity error data
-
-Still intentionally not moved yet:
-
-- timeout policy is per runtime job, not a workflow-level retry or reducer budget
-- non-Codex approval policy still requires request/runtime contract work
+- runtime worker completion classifies lifecycle timeout errors as `ActivityErrorKind::Timeout`
+- timeout activity failures flow through the same workflow retry reducer budget as other retryable
+  runtime failures
 
 Tests:
 
 - runtime worker fails a blocked registered agent when profile `timeout_secs` expires
+- runtime worker classifies timeout turn failures with `error_kind = timeout`
+- runtime reducer retries timeout activity failures when retry policy allows it
 
 ### Phase 15: Runtime Profile Execution Metadata
 
@@ -881,7 +887,6 @@ Still intentionally not moved yet:
 
 - `max_turns` is not a multi-turn conversation budget inside a single runtime job because runtime
   jobs currently execute one lifecycle turn
-- timeout policy is still per runtime job, not a workflow-level retry or reducer budget
 - `approval_policy` is only applied to Codex runtime profiles
 
 Tests:
