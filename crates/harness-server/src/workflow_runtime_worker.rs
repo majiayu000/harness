@@ -15,7 +15,8 @@ use harness_workflow::runtime::{
     WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
     PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
     QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
-    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID,
+    REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -219,7 +220,13 @@ struct PreparedRuntimeWorkspace {
     after_run_hook: Option<String>,
     before_remove_hook: Option<String>,
     hook_timeout_secs: u64,
-    cleanup: String,
+    finish_action: RuntimeWorkspaceFinishAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeWorkspaceFinishAction {
+    Remove,
+    Release,
 }
 
 impl ServerRuntimeJobExecutor {
@@ -943,7 +950,7 @@ impl ServerRuntimeJobExecutor {
                     after_run_hook: workflow_document.config.hooks.after_run.clone(),
                     before_remove_hook: None,
                     hook_timeout_secs: workflow_document.config.hooks.timeout_secs,
-                    cleanup: workflow_document.config.workspace.cleanup.clone(),
+                    finish_action: RuntimeWorkspaceFinishAction::Release,
                 });
             }
             strategy => anyhow::bail!("unsupported workflow workspace strategy: {strategy}"),
@@ -952,16 +959,17 @@ impl ServerRuntimeJobExecutor {
         let Some(workspace_mgr) = self.state.concurrency.workspace_mgr.as_ref() else {
             anyhow::bail!("workflow runtime workspace manager is unavailable");
         };
-        let task_id = TaskId::from_str(&format!("runtime-job-{}", job.id));
+        let task_id = stable_runtime_workspace_task_id(job, workflow);
         let external_id = workflow.map(|workflow| workflow.subject.subject_key.as_str());
         let repo = workflow
             .and_then(|workflow| workflow.data.get("repo"))
             .and_then(Value::as_str)
             .or_else(|| job.input.get("repo").and_then(Value::as_str))
             .or(workflow_document.config.source.repo.as_deref());
+        let reuse_existing_workspace = workflow_document.config.workspace.reuse_existing_workspace;
         let options = crate::workspace::WorkspaceCreateOptions {
             require_remote_head: workflow_document.config.base.require_remote_head,
-            reuse_existing_workspace: workflow_document.config.workspace.reuse_existing_workspace,
+            reuse_existing_workspace,
             after_create_hook: workflow_document.config.hooks.after_create.clone(),
             hook_timeout_secs: Some(workflow_document.config.hooks.timeout_secs),
             branch_prefix: workflow_document.config.workspace.branch_prefix.clone(),
@@ -1022,7 +1030,12 @@ impl ServerRuntimeJobExecutor {
             after_run_hook: workflow_document.config.hooks.after_run.clone(),
             before_remove_hook: workflow_document.config.hooks.before_remove.clone(),
             hook_timeout_secs: workflow_document.config.hooks.timeout_secs,
-            cleanup: workflow_document.config.workspace.cleanup.clone(),
+            finish_action: runtime_workspace_finish_action(
+                &workflow_document.config.workspace.cleanup,
+                reuse_existing_workspace,
+                job,
+                workflow,
+            ),
         })
     }
 
@@ -1048,7 +1061,7 @@ impl ServerRuntimeJobExecutor {
         let Some(workspace_mgr) = self.state.concurrency.workspace_mgr.as_ref() else {
             return hook_result;
         };
-        if workspace.cleanup == "after_run" {
+        if workspace.finish_action == RuntimeWorkspaceFinishAction::Remove {
             if let Some(hook) = workspace.before_remove_hook.as_deref() {
                 if let Err(error) = run_workflow_hook(
                     "before_remove",
@@ -1077,6 +1090,78 @@ fn validate_workspace_cleanup_policy(cleanup: &str) -> anyhow::Result<()> {
         "after_run" | "on_terminal" => Ok(()),
         cleanup => anyhow::bail!("unsupported workflow workspace cleanup policy: {cleanup}"),
     }
+}
+
+fn runtime_workspace_finish_action(
+    cleanup: &str,
+    reuse_existing_workspace: bool,
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> RuntimeWorkspaceFinishAction {
+    if cleanup == "after_run"
+        || !reuse_existing_workspace
+        || runtime_workspace_activity_is_ephemeral(&activity_name(job), workflow)
+    {
+        RuntimeWorkspaceFinishAction::Remove
+    } else {
+        RuntimeWorkspaceFinishAction::Release
+    }
+}
+
+fn runtime_workspace_activity_is_ephemeral(
+    activity: &str,
+    workflow: Option<&WorkflowInstance>,
+) -> bool {
+    let Some(workflow) = workflow else {
+        return false;
+    };
+    matches!(
+        (workflow.definition_id.as_str(), activity),
+        (REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY)
+            | (
+                REPO_BACKLOG_DEFINITION_ID,
+                REPO_BACKLOG_SPRINT_PLAN_ACTIVITY
+            )
+            | (PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY)
+            | (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY)
+    )
+}
+
+fn stable_runtime_workspace_task_id(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> TaskId {
+    if let Some(workflow) = workflow {
+        let definition = sanitize_workspace_id_component(&workflow.definition_id);
+        return TaskId::from_str(&format!(
+            "runtime-wf-{definition}-{}",
+            stable_hash_8(&workflow.id)
+        ));
+    }
+    TaskId::from_str(&format!("runtime-job-{}", stable_hash_8(&job.id)))
+}
+
+fn sanitize_workspace_id_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    sanitized.trim_matches('-').to_string()
+}
+
+fn stable_hash_8(value: &str) -> String {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in value.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    format!("{hash:08x}")
 }
 
 async fn run_workflow_hook(
@@ -2172,6 +2257,100 @@ mod tests {
                 "repo-backlog:owner/repo:issue:43",
                 "explicit-task-id"
             ]
+        );
+    }
+
+    #[test]
+    fn stable_runtime_workspace_task_id_reuses_workflow_identity_across_jobs() {
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:124"),
+        )
+        .with_id("/repo/root::repo:owner/repo::issue:124");
+        let first_job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        );
+        let second_job = RuntimeJob::pending(
+            "command-2",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "inspect_pr_feedback" }),
+        );
+
+        let first = stable_runtime_workspace_task_id(&first_job, Some(&workflow));
+        let second = stable_runtime_workspace_task_id(&second_job, Some(&workflow));
+
+        assert_eq!(first, second);
+        assert!(first.as_str().starts_with("runtime-wf-github-issue-pr-"));
+        assert!(first
+            .as_str()
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'));
+    }
+
+    #[test]
+    fn runtime_workspace_finish_action_preserves_reusable_issue_workspaces() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        );
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:124"),
+        )
+        .with_id("issue-124");
+
+        assert_eq!(
+            runtime_workspace_finish_action("on_terminal", true, &job, Some(&workflow)),
+            RuntimeWorkspaceFinishAction::Release
+        );
+    }
+
+    #[test]
+    fn runtime_workspace_finish_action_removes_ephemeral_or_non_reused_workspaces() {
+        let backlog_job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
+        );
+        let backlog = WorkflowInstance::new(
+            REPO_BACKLOG_DEFINITION_ID,
+            1,
+            "scanning",
+            WorkflowSubject::new("repo", "owner/repo"),
+        )
+        .with_id("repo-backlog-owner-repo");
+        assert_eq!(
+            runtime_workspace_finish_action("on_terminal", true, &backlog_job, Some(&backlog)),
+            RuntimeWorkspaceFinishAction::Remove
+        );
+
+        let issue_job = RuntimeJob::pending(
+            "command-2",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        );
+        let issue = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:124"),
+        )
+        .with_id("issue-124");
+        assert_eq!(
+            runtime_workspace_finish_action("on_terminal", false, &issue_job, Some(&issue)),
+            RuntimeWorkspaceFinishAction::Remove
         );
     }
 

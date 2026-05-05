@@ -12,7 +12,7 @@ base:
 workspace:
   strategy: worktree
   branch_prefix: harness/
-  reuse_existing_workspace: false
+  reuse_existing_workspace: true
   cleanup: on_terminal
 hooks:
   timeout_secs: 60
