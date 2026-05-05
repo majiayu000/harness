@@ -513,7 +513,14 @@ pub(super) async fn run_runtime_command_dispatch_tick(
         );
     }
     let fallback_profile_selector = runtime_profiles.into();
-    let commands = store.pending_commands(batch_limit).await?;
+    let dispatch_owner = format!("server-runtime-dispatcher:{}", uuid::Uuid::new_v4());
+    let commands = store
+        .claim_pending_commands(
+            &dispatch_owner,
+            chrono::Utc::now() + chrono::Duration::seconds(30),
+            batch_limit,
+        )
+        .await?;
     let mut outcomes = Vec::with_capacity(commands.len());
     for command in commands {
         outcomes.push(
@@ -522,6 +529,7 @@ pub(super) async fn run_runtime_command_dispatch_tick(
                 store,
                 command,
                 fallback_profile_selector.clone(),
+                &dispatch_owner,
             )
             .await?,
         );
@@ -534,9 +542,11 @@ async fn dispatch_runtime_command_with_project_policy(
     store: &WorkflowRuntimeStore,
     command: WorkflowCommandRecord,
     fallback_profile_selector: RuntimeProfileSelector,
+    dispatch_owner: &str,
 ) -> anyhow::Result<CommandDispatchOutcome> {
     if !command.command.requires_runtime_job() {
         return RuntimeCommandDispatcher::with_profile_selector(store, fallback_profile_selector)
+            .with_dispatcher_id(dispatch_owner)
             .dispatch_command(command)
             .await;
     }
@@ -545,18 +555,14 @@ async fn dispatch_runtime_command_with_project_policy(
         runtime_dispatch_profile_selector_for_command(state, store, &command).await?
     else {
         let command_id = command.id.clone();
-        let skipped = store
-            .mark_pending_command_status(&command_id, "skipped")
-            .await?;
-        let reason = if skipped {
-            "workflow runtime dispatch or worker is disabled for the command project".to_string()
-        } else {
-            "command status changed before workflow runtime policy dispatch".to_string()
-        };
+        store.mark_command_status(&command_id, "skipped").await?;
+        let reason =
+            "workflow runtime dispatch or worker is disabled for the command project".to_string();
         return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
     };
 
     RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
+        .with_dispatcher_id(dispatch_owner)
         .dispatch_command(command)
         .await
 }
