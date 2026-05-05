@@ -289,7 +289,6 @@ mod tests {
             intake: crate::http::IntakeServices {
                 feishu_intake: None,
                 github_pollers: vec![],
-                legacy_github_fallback_enabled: true,
                 completion_callback: None,
             },
             project_svc,

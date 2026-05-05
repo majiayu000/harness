@@ -332,7 +332,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         intake: IntakeServices {
             feishu_intake: intake.feishu_intake,
             github_pollers: intake.github_pollers.into_iter().map(|(_, p)| p).collect(),
-            legacy_github_fallback_enabled: intake.legacy_github_fallback_enabled,
             completion_callback: intake.completion_callback,
         },
         project_svc: services.project_svc,

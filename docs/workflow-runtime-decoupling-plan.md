@@ -89,12 +89,14 @@ Implemented now:
 - runtime sprint plans return `SprintTaskSelected` signals or a `sprint_plan` artifact; the reducer
   starts selected child workflows with dependency metadata instead of using the legacy sprint
   planner task
-- when the workflow runtime, dispatcher, worker, and repo backlog policy are enabled, GitHub issue
-  intake is delegated to the `repo_backlog` workflow; the server no longer registers the legacy
-  GitHub poller fallback
-- when the workflow runtime, dispatcher, worker, and PR feedback policy are enabled, legacy
-  issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows and
-  request the runtime `pr_feedback` child workflow instead of registering a legacy `pr:N` task
+- GitHub issue intake is delegated to the `repo_backlog` workflow; the server no longer registers
+  a legacy GitHub poller fallback
+- legacy issue-workflow feedback candidates are no longer swept or adopted; only runtime
+  `github_issue_pr` workflows can request the runtime `pr_feedback` child workflow
+- direct `pr:N` submissions require an existing runtime issue workflow with a bound PR and request
+  the runtime feedback sweep instead of creating an independent legacy PR task
+- missing workflow runtime storage or disabled runtime dispatch/worker policy is a hard error for
+  runtime-owned issue, prompt, GitHub intake, and PR feedback paths
 
 Still intentionally not moved yet:
 
@@ -444,17 +446,15 @@ Implemented now:
 - runtime `github_issue_pr` workflows with attached PRs are swept by a server background loop that
   writes a validated `sweep_pr_feedback` decision and starts a child `pr_feedback` workflow instead
   of enqueueing a legacy `pr:N` task
-- legacy issue-workflow feedback candidates are adopted into `github_issue_pr` runtime workflows
-  before requesting the same runtime `pr_feedback` child workflow when runtime feedback is enabled
+- legacy issue-workflow feedback candidates are no longer adopted; runtime `github_issue_pr`
+  workflows are the authoritative source for PR feedback sweeps
+- runtime feedback storage, dispatch, and worker policy are required; the sweeper marks the project
+  degraded instead of falling back to an independent PR task
 - child `pr_feedback` workflows enqueue `inspect_pr_feedback` runtime jobs with PR metadata
 - `inspect_pr_feedback` runtime completions update the child workflow and propagate the same
   structured activity result to the parent issue workflow
 - propagated feedback completions can advance the parent workflow through structured
   `workflow_decision` artifacts or explicit feedback signals
-
-Still intentionally not moved yet:
-
-- legacy task-runner PR feedback still runs the existing review loop
 
 Tests:
 
@@ -464,8 +464,8 @@ Tests:
 - runtime PR feedback sweep requests start `pr_feedback` child workflows, enqueue
   `inspect_pr_feedback`, and suppress duplicate active feedback inspection work
 - `inspect_pr_feedback` child completions update both child and parent workflow state
-- legacy issue-workflow feedback candidates can be adopted into runtime state and enqueue the
-  same runtime PR feedback child workflow
+- legacy issue-workflow feedback sweeper is removed, so stale legacy candidates do not create
+  runtime commands
 
 ### Phase 4: Repo Backlog Workflow
 
@@ -479,8 +479,7 @@ started.
 Implemented now:
 
 - configured GitHub repos emit `RepoBacklogPollRequested` and a validated `poll_repo_backlog`
-  activity command instead of registering a legacy GitHub poller fallback when the runtime owns
-  repo backlog polling
+  activity command instead of registering a legacy GitHub poller fallback
 - runtime agents receive a `poll_repo_backlog` activity result contract and return
   `IssueDiscovered`, `IssueSkipped`, or `NoOpenIssueFound` signals
 - `IssueDiscovered` signals from a successful repo backlog scan reduce to a validated
@@ -516,7 +515,7 @@ Tests:
 
 ### Phase 5: Runtime Worker Abstraction
 
-Status: partially implemented.
+Status: implemented.
 
 The current branch adds the generic worker boundary while leaving the existing Codex and Claude task
 execution paths in place.
@@ -559,7 +558,6 @@ Implemented now:
 Still intentionally not moved yet:
 
 - non-runtime task cards still use existing task endpoints
-- command outbox rows are not yet the primary dispatch source for runtime jobs
 
 Tests:
 
@@ -573,7 +571,7 @@ Tests:
 
 ### Phase 7: Command Outbox Dispatch
 
-Status: partially implemented.
+Status: implemented.
 
 Convert accepted workflow commands into durable runtime jobs without making the existing task runner
 depend on the new path yet.
@@ -584,21 +582,20 @@ Implemented now:
 - commands that require runtime execution enqueue `runtime_jobs`
 - non-runtime commands are marked `skipped` so they do not stay pending forever
 - repeated dispatch is idempotent when a runtime job already exists for the command
-
-Still intentionally not moved yet:
-
-- the server does not spawn the dispatcher in a background loop
-- runtime profile selection is a single default profile, not workflow-specific policy
-- command lease/claiming is not yet a multi-dispatcher concurrency protocol
+- command outbox dispatch uses durable dispatcher ownership and lease expiry so multiple server
+  dispatch loops can claim commands without materializing duplicate runtime jobs
+- expired dispatch leases can be reclaimed by another dispatcher
 
 Tests:
 
 - activity commands enqueue runtime jobs with prompt input context
 - non-runtime commands are skipped without creating jobs
+- command claim leases hide active dispatch work from other dispatchers and allow stale work to be
+  reclaimed
 
 ### Phase 8: Server Dispatch Loop
 
-Status: partially implemented.
+Status: implemented.
 
 Run the command outbox dispatcher from the server as a policy-controlled background loop.
 
@@ -609,12 +606,8 @@ Implemented now:
   is available
 - the loop is enabled by default and can be disabled explicitly in `WORKFLOW.md`
 - each tick converts pending command rows into runtime jobs using the configured runtime profile
-
-Still intentionally not moved yet:
-
-- no server-owned runtime worker loop consumes the jobs
-- runtime profile selection is not yet workflow-specific
-- command claiming is still single-dispatcher safe but not a distributed lease protocol
+- each dispatch tick first claims command rows with a durable dispatch lease before materializing
+  runtime jobs, so concurrent loops use the same database protocol
 
 Tests:
 
@@ -674,6 +667,8 @@ Implemented now:
   GitHub issue PR and repo backlog activities
 - activity result schemas expose `error_kind`, allowing agents to mark fatal or configuration
   failures as non-retryable
+- timeout failures are represented as `error_kind = timeout` so runtime completion and retry policy
+  can distinguish lifecycle timeouts from generic agent failures
 
 Still intentionally not moved yet:
 
@@ -717,6 +712,8 @@ Implemented now:
   retry metadata
 - failed activity results can carry `error_kind`; `fatal` and `configuration` failures bypass retry
   policy and fail the workflow immediately
+- failed timeout activity results carry `error_kind = timeout`, preserve that taxonomy in retry
+  commands, and can retry under the workflow retry budget
 - unknown successful activity/state pairs are preserved as completion events without unsafe state
   changes
 
@@ -724,8 +721,8 @@ Still intentionally not moved yet:
 
 - implementation completion does not infer PR state from free-form agent text; only structured
   `pull_request` artifacts drive this reducer path
-- retry policy does not yet model provider-specific or runtime-specific error taxonomies beyond the
-  portable activity error kinds
+- retry policy does not yet model provider-specific quota, billing, or rate-limit taxonomies beyond
+  the portable activity error kinds
 
 Tests:
 
@@ -740,11 +737,13 @@ Tests:
 - reducer adds cooldown metadata to retry commands when retry delay policy is configured
 - reducer preserves `StartChildWorkflow` command type when retrying failed child workflow dispatch
 - reducer skips retries for non-retryable `fatal` and `configuration` activity errors
+- reducer treats timeout activity failures as retryable and preserves the timeout taxonomy in retry
+  command metadata
 - runtime worker applies the reducer, records decisions, and updates workflow state
 
 ### Phase 12: Workflow Runtime Profile Selection
 
-Status: partially implemented.
+Status: implemented.
 
 Route runtime command dispatch through a workflow-aware profile selector instead of a single global
 runtime profile.
@@ -764,11 +763,9 @@ Implemented now:
 - selection precedence is workflow/activity pair, global activity, workflow, then configured default
   runtime profile
 - server background dispatch builds the same profile selector from project workflow config
-
-Still intentionally not moved yet:
-
-- profile definitions are still lightweight config entries, not durable workflow definition
-  artifacts
+- server background dispatch persists a project-scoped `runtime_profile_manifest` workflow
+  definition artifact with source path, content hash, resolved default profile, overrides, and
+  precedence metadata before dispatching runtime jobs
 
 Tests:
 
@@ -779,10 +776,12 @@ Tests:
   `start_child_workflow` activity key
 - server dispatch config conversion preserves default, workflow override, activity override, and
   workflow/activity override behavior
+- server dispatch tick persists the runtime profile manifest definition before materializing runtime
+  jobs
 
 ### Phase 13: Runtime Profile Metadata Application
 
-Status: partially implemented.
+Status: implemented.
 
 Carry runtime profile metadata beyond profile names and apply safe fields during server-owned
 runtime execution.
@@ -823,15 +822,15 @@ Implemented now:
 - deadline expiry marks the agent turn failed with a timeout-specific error item
 - runtime worker completion converts the failed turn into a failed `ActivityResult`
 - runtime job output records the timeout reason as structured activity error data
-
-Still intentionally not moved yet:
-
-- timeout policy is per runtime job, not a workflow-level retry or reducer budget
-- non-Codex approval policy still requires request/runtime contract work
+- runtime worker completion classifies lifecycle timeout errors as `ActivityErrorKind::Timeout`
+- timeout activity failures flow through the same workflow retry reducer budget as other retryable
+  runtime failures
 
 Tests:
 
 - runtime worker fails a blocked registered agent when profile `timeout_secs` expires
+- runtime worker classifies timeout turn failures with `error_kind = timeout`
+- runtime reducer retries timeout activity failures when retry policy allows it
 
 ### Phase 15: Runtime Profile Execution Metadata
 
@@ -888,7 +887,6 @@ Still intentionally not moved yet:
 
 - `max_turns` is not a multi-turn conversation budget inside a single runtime job because runtime
   jobs currently execute one lifecycle turn
-- timeout policy is still per runtime job, not a workflow-level retry or reducer budget
 - `approval_policy` is only applied to Codex runtime profiles
 
 Tests:
@@ -956,8 +954,11 @@ Implemented now:
 - issue and prompt submissions require `WorkflowRuntimeStore`; missing runtime storage is a hard
   server error for runtime-owned submissions
 - issue and prompt submissions no longer register legacy task rows or call the legacy task runner
-- legacy issue-workflow PR feedback candidates are routed to runtime feedback when runtime
-  feedback is enabled; the legacy PR task route remains only as the runtime-disabled fallback
+- legacy issue-workflow PR feedback candidates are no longer routed or adopted; the legacy PR task
+  fallback and legacy issue-workflow sweeper are removed
+- direct PR submissions are accepted only when the PR is already bound to a runtime issue workflow;
+  the submission requests the runtime `pr_feedback` child workflow instead of creating a standalone
+  `pr:N` lifecycle
 - issue and prompt submission responses include the runtime `workflow_id`, so dashboard actions can
   address the workflow runtime API directly instead of treating the returned `task_id` as a legacy
   task-row handle
@@ -987,6 +988,8 @@ Tests:
 - submit-success cancellation uses the runtime workflow endpoint when `workflow_id` is available
 - runtime prompt task summaries expose workflow metadata for dashboard/worktree runtime actions
 - worktree cancellation uses the runtime workflow endpoint for runtime-backed cards
+- PR feedback submissions fail closed when workflow runtime storage, dispatch, or worker policy is
+  unavailable
 
 ## Test Strategy
 

@@ -4,12 +4,14 @@ use std::sync::Arc;
 use super::{state::AppState, task_routes};
 use crate::task_runner;
 use harness_workflow::issue_lifecycle::{
-    is_feedback_claim_placeholder, workflow_id, IssueLifecycleState, IssueWorkflowInstance,
+    is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
 };
 use harness_workflow::runtime::{
     CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
-    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowInstance, WorkflowRuntimeStore,
+    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowDefinition, WorkflowInstance,
+    WorkflowRuntimeStore,
 };
+use sha2::{Digest, Sha256};
 
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     let (issue_from_external_id, pr_from_external_id) = task
@@ -513,7 +515,14 @@ pub(super) async fn run_runtime_command_dispatch_tick(
         );
     }
     let fallback_profile_selector = runtime_profiles.into();
-    let commands = store.pending_commands(batch_limit).await?;
+    let dispatch_owner = format!("server-runtime-dispatcher:{}", uuid::Uuid::new_v4());
+    let commands = store
+        .claim_pending_commands(
+            &dispatch_owner,
+            chrono::Utc::now() + chrono::Duration::seconds(30),
+            batch_limit,
+        )
+        .await?;
     let mut outcomes = Vec::with_capacity(commands.len());
     for command in commands {
         outcomes.push(
@@ -522,6 +531,7 @@ pub(super) async fn run_runtime_command_dispatch_tick(
                 store,
                 command,
                 fallback_profile_selector.clone(),
+                &dispatch_owner,
             )
             .await?,
         );
@@ -534,9 +544,11 @@ async fn dispatch_runtime_command_with_project_policy(
     store: &WorkflowRuntimeStore,
     command: WorkflowCommandRecord,
     fallback_profile_selector: RuntimeProfileSelector,
+    dispatch_owner: &str,
 ) -> anyhow::Result<CommandDispatchOutcome> {
     if !command.command.requires_runtime_job() {
         return RuntimeCommandDispatcher::with_profile_selector(store, fallback_profile_selector)
+            .with_dispatcher_id(dispatch_owner)
             .dispatch_command(command)
             .await;
     }
@@ -545,18 +557,14 @@ async fn dispatch_runtime_command_with_project_policy(
         runtime_dispatch_profile_selector_for_command(state, store, &command).await?
     else {
         let command_id = command.id.clone();
-        let skipped = store
-            .mark_pending_command_status(&command_id, "skipped")
-            .await?;
-        let reason = if skipped {
-            "workflow runtime dispatch or worker is disabled for the command project".to_string()
-        } else {
-            "command status changed before workflow runtime policy dispatch".to_string()
-        };
+        store.mark_command_status(&command_id, "skipped").await?;
+        let reason =
+            "workflow runtime dispatch or worker is disabled for the command project".to_string();
         return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
     };
 
     RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
+        .with_dispatcher_id(dispatch_owner)
         .dispatch_command(command)
         .await
 }
@@ -583,6 +591,7 @@ async fn runtime_dispatch_profile_selector_for_command(
         );
         return Ok(None);
     }
+    persist_runtime_profile_manifest(store, &project_root, &workflow_cfg.runtime_dispatch).await?;
     Ok(Some(runtime_dispatch_profile_selector(
         &workflow_cfg.runtime_dispatch,
     )))
@@ -970,9 +979,18 @@ fn runtime_dispatch_profile(
     profile
 }
 
-fn runtime_dispatch_profile_selector(
+#[derive(Clone)]
+struct ResolvedRuntimeDispatchProfiles {
+    default_profile: RuntimeProfile,
+    workflow_profiles: std::collections::BTreeMap<String, RuntimeProfile>,
+    activity_profiles: std::collections::BTreeMap<String, RuntimeProfile>,
+    workflow_activity_profiles:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, RuntimeProfile>>,
+}
+
+fn resolve_runtime_dispatch_profiles(
     policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
-) -> RuntimeProfileSelector {
+) -> ResolvedRuntimeDispatchProfiles {
     let default_profile = runtime_dispatch_profile(policy);
     let workflow_profiles = policy
         .workflow_profiles
@@ -994,13 +1012,7 @@ fn runtime_dispatch_profile_selector(
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut selector = RuntimeProfileSelector::new(default_profile.clone());
-    for (definition_id, profile) in &workflow_profiles {
-        selector = selector.with_workflow_profile(definition_id.clone(), profile.clone());
-    }
-    for (activity, profile) in &activity_profiles {
-        selector = selector.with_activity_profile(activity.clone(), profile.clone());
-    }
+    let mut workflow_activity_profiles = std::collections::BTreeMap::new();
     for (definition_id, activity_overrides) in &policy.workflow_activity_profiles {
         for (activity, override_policy) in activity_overrides {
             let base_profile = activity_profiles
@@ -1008,14 +1020,88 @@ fn runtime_dispatch_profile_selector(
                 .or_else(|| workflow_profiles.get(definition_id))
                 .unwrap_or(&default_profile);
             let profile = apply_runtime_dispatch_profile_override(base_profile, override_policy);
+            workflow_activity_profiles
+                .entry(definition_id.clone())
+                .or_insert_with(std::collections::BTreeMap::new)
+                .insert(activity.clone(), profile);
+        }
+    }
+    ResolvedRuntimeDispatchProfiles {
+        default_profile,
+        workflow_profiles,
+        activity_profiles,
+        workflow_activity_profiles,
+    }
+}
+
+fn runtime_dispatch_profile_selector(
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> RuntimeProfileSelector {
+    let resolved = resolve_runtime_dispatch_profiles(policy);
+    let default_profile = resolved.default_profile;
+    let mut selector = RuntimeProfileSelector::new(default_profile);
+    for (definition_id, profile) in &resolved.workflow_profiles {
+        selector = selector.with_workflow_profile(definition_id.clone(), profile.clone());
+    }
+    for (activity, profile) in &resolved.activity_profiles {
+        selector = selector.with_activity_profile(activity.clone(), profile.clone());
+    }
+    for (definition_id, activity_profiles) in &resolved.workflow_activity_profiles {
+        for (activity, profile) in activity_profiles {
             selector = selector.with_workflow_activity_profile(
                 definition_id.clone(),
                 activity.clone(),
-                profile,
+                profile.clone(),
             );
         }
     }
     selector
+}
+
+async fn persist_runtime_profile_manifest(
+    store: &WorkflowRuntimeStore,
+    project_root: &Path,
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> anyhow::Result<()> {
+    let definition = runtime_profile_manifest_definition(project_root, policy)?;
+    store.upsert_definition(&definition).await
+}
+
+pub(super) fn runtime_profile_manifest_definition(
+    project_root: &Path,
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> anyhow::Result<WorkflowDefinition> {
+    let resolved = resolve_runtime_dispatch_profiles(policy);
+    let metadata = serde_json::json!({
+        "artifact_type": "runtime_profile_manifest",
+        "project_root": project_root.to_string_lossy(),
+        "selection_precedence": [
+            "workflow_activity_profiles",
+            "activity_profiles",
+            "workflow_profiles",
+            "default_profile"
+        ],
+        "default_profile": resolved.default_profile,
+        "workflow_profiles": resolved.workflow_profiles,
+        "activity_profiles": resolved.activity_profiles,
+        "workflow_activity_profiles": resolved.workflow_activity_profiles,
+    });
+    let metadata_json = serde_json::to_string(&metadata)?;
+    let definition_digest = Sha256::digest(metadata_json.as_bytes());
+    let project_digest = Sha256::digest(project_root.to_string_lossy().as_bytes());
+    Ok(WorkflowDefinition::new(
+        format!("runtime_profiles:{project_digest:x}"),
+        1,
+        "Runtime Profile Manifest",
+    )
+    .with_source_path(
+        project_root
+            .join("WORKFLOW.md")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .with_definition_hash(format!("{definition_digest:x}"))
+    .with_metadata(metadata))
 }
 
 fn apply_runtime_dispatch_profile_override(
@@ -1188,405 +1274,6 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
             tokio::time::sleep(interval).await;
         }
     });
-}
-
-/// Spawn a background sweeper that turns `pr_open` / `awaiting_feedback`
-/// issue workflows into PR feedback work.
-///
-/// Runtime-enabled projects are adopted into the workflow runtime and inspected
-/// through the PR feedback child workflow. Runtime-disabled projects still reuse
-/// the existing PR review loop instead of adding another GitHub API
-/// interpretation layer in the server.
-pub(super) fn spawn_issue_workflow_feedback_sweeper(state: &Arc<AppState>) {
-    if state.core.issue_workflow_store.is_none() {
-        tracing::debug!("workflow feedback sweeper disabled: issue workflow store unavailable");
-        return;
-    }
-
-    let weak_state = Arc::downgrade(state);
-    tokio::spawn(async move {
-        let mut warned_unresolvable: std::collections::HashSet<(String, Option<String>)> =
-            std::collections::HashSet::new();
-        loop {
-            let state = match weak_state.upgrade() {
-                Some(s) => s,
-                None => break,
-            };
-            let workflow_cfg =
-                harness_core::config::workflow::load_workflow_config(&state.core.project_root)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "workflow feedback sweeper: failed to load WORKFLOW.md, using default config: {e}"
-                        );
-                        harness_core::config::workflow::WorkflowConfig::default()
-                    });
-            let interval =
-                std::time::Duration::from_secs(workflow_cfg.pr_feedback.sweep_interval_secs);
-            tokio::time::sleep(interval).await;
-
-            if !workflow_cfg.pr_feedback.enabled {
-                tracing::debug!("workflow feedback sweeper: disabled by WORKFLOW.md");
-                continue;
-            }
-
-            let Some(issue_workflows) = state.core.issue_workflow_store.as_ref() else {
-                continue;
-            };
-
-            let stale_before = chrono::Utc::now()
-                - chrono::Duration::seconds(workflow_cfg.pr_feedback.claim_stale_after_secs as i64);
-            let candidates = match issue_workflows
-                .claim_feedback_candidates(128, stale_before)
-                .await
-            {
-                Ok(candidates) => candidates,
-                Err(e) => {
-                    tracing::warn!("workflow feedback sweep: failed to claim candidates: {e}");
-                    continue;
-                }
-            };
-            if candidates.is_empty() {
-                continue;
-            }
-
-            let mut touched_projects = std::collections::HashSet::new();
-            let mut incomplete_projects = std::collections::HashSet::new();
-            for mut workflow in candidates {
-                let Some(pr_number) = workflow.pr_number else {
-                    continue;
-                };
-                let project_key = (workflow.project_id.clone(), workflow.repo.clone());
-                if touched_projects.insert(project_key.clone()) {
-                    if let Some(project_store) = state.core.project_workflow_store.as_ref() {
-                        if let Err(e) = project_store
-                            .record_feedback_sweep_started(
-                                &workflow.project_id,
-                                workflow.repo.as_deref(),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                project_id = %workflow.project_id,
-                                "workflow feedback sweep: failed to mark project sweep start: {e}"
-                            );
-                        }
-                    }
-                }
-
-                // Short-circuit if path is healthy (avoids a registry DB query on every tick).
-                let project_path = if tokio::fs::metadata(&workflow.project_id).await.is_ok() {
-                    warned_unresolvable.remove(&project_key);
-                    std::path::PathBuf::from(&workflow.project_id)
-                } else if let Some(registry) = state.core.project_registry.as_deref() {
-                    match registry.resolve_path(&workflow.project_id).await {
-                        Ok(None) | Err(_) => {
-                            if warned_unresolvable.insert(project_key.clone()) {
-                                tracing::warn!(
-                                    project_id = %workflow.project_id,
-                                    "sweeper: project path unresolvable, skipping"
-                                );
-                            }
-                            incomplete_projects.insert(project_key.clone());
-                            let _ = issue_workflows
-                                .release_feedback_claim(
-                                    &workflow.project_id,
-                                    workflow.repo.as_deref(),
-                                    pr_number,
-                                    "sweeper: project path unresolvable",
-                                )
-                                .await;
-                            continue;
-                        }
-                        Ok(Some(resolved))
-                            if resolved.as_path() != std::path::Path::new(&workflow.project_id) =>
-                        {
-                            if let Err(e) = issue_workflows
-                                .repair_project_id(&workflow.id, &resolved.to_string_lossy())
-                                .await
-                            {
-                                tracing::error!(
-                                    workflow_id = %workflow.id,
-                                    error = %e,
-                                    "sweeper: failed to repair project_id"
-                                );
-                                let _ = issue_workflows
-                                    .release_feedback_claim(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &format!("sweeper: failed to repair project_id: {e}"),
-                                    )
-                                    .await;
-                                continue;
-                            }
-                            let new_project_id = resolved.to_string_lossy().into_owned();
-                            workflow.id = workflow_id(
-                                &new_project_id,
-                                workflow.repo.as_deref(),
-                                workflow.issue_number,
-                            );
-                            workflow.project_id = new_project_id;
-                            warned_unresolvable.remove(&project_key);
-                            resolved
-                        }
-                        Ok(Some(resolved)) => resolved,
-                    }
-                } else {
-                    std::path::PathBuf::from(&workflow.project_id)
-                };
-
-                if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-                    let project_workflow_cfg = load_runtime_workflow_config_or_default(
-                        &project_path,
-                        "workflow feedback sweeper",
-                    );
-                    if runtime_pr_feedback_enabled(&project_workflow_cfg) {
-                        match crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep_for_legacy_issue_workflow(
-                            store,
-                            &workflow,
-                        )
-                        .await
-                        {
-                            Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
-                                workflow_id,
-                                task_id,
-                            })
-                            | Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::ActiveCommandExists {
-                                workflow_id,
-                                task_id,
-                            }) => {
-                                if let Err(e) = issue_workflows
-                                    .bind_feedback_task_if_claimed(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &task_id,
-                                    )
-                                    .await
-                                {
-                                    incomplete_projects.insert(project_key.clone());
-                                    tracing::warn!(
-                                        project_id = %workflow.project_id,
-                                        pr = pr_number,
-                                        workflow_id = %workflow_id,
-                                        task_id = %task_id,
-                                        "workflow feedback sweep: failed to bind runtime task handle: {e}"
-                                    );
-                                    continue;
-                                }
-                                tracing::info!(
-                                    project_id = %workflow.project_id,
-                                    pr = pr_number,
-                                    workflow_id = %workflow_id,
-                                    "workflow feedback sweep: runtime PR feedback requested"
-                                );
-                                continue;
-                            }
-                            Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::NotCandidate {
-                                workflow_id,
-                                state: runtime_state,
-                            }) => {
-                                incomplete_projects.insert(project_key.clone());
-                                let _ = issue_workflows
-                                    .release_feedback_claim(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &format!(
-                                            "runtime PR feedback skipped non-candidate workflow state {runtime_state}"
-                                        ),
-                                    )
-                                    .await;
-                                tracing::warn!(
-                                    project_id = %workflow.project_id,
-                                    pr = pr_number,
-                                    workflow_id = %workflow_id,
-                                    runtime_state = %runtime_state,
-                                    "workflow feedback sweep: runtime PR feedback skipped non-candidate workflow"
-                                );
-                                continue;
-                            }
-                            Ok(crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Rejected {
-                                workflow_id,
-                                reason,
-                            }) => {
-                                incomplete_projects.insert(project_key.clone());
-                                let _ = issue_workflows
-                                    .release_feedback_claim(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &format!("runtime PR feedback rejected: {reason}"),
-                                    )
-                                    .await;
-                                tracing::warn!(
-                                    project_id = %workflow.project_id,
-                                    pr = pr_number,
-                                    workflow_id = %workflow_id,
-                                    "workflow feedback sweep: runtime PR feedback rejected: {reason}"
-                                );
-                                if let Some(project_store) = state.core.project_workflow_store.as_ref() {
-                                    let _ = project_store
-                                        .record_degraded(
-                                            &workflow.project_id,
-                                            workflow.repo.as_deref(),
-                                            &format!(
-                                                "runtime feedback sweep rejected for pr:{pr_number}: {reason}"
-                                            ),
-                                        )
-                                        .await;
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                incomplete_projects.insert(project_key.clone());
-                                let _ = issue_workflows
-                                    .release_feedback_claim(
-                                        &workflow.project_id,
-                                        workflow.repo.as_deref(),
-                                        pr_number,
-                                        &format!("runtime PR feedback request failed: {e}"),
-                                    )
-                                    .await;
-                                tracing::warn!(
-                                    project_id = %workflow.project_id,
-                                    pr = pr_number,
-                                    "workflow feedback sweep: runtime PR feedback request failed: {e}"
-                                );
-                                if let Some(project_store) = state.core.project_workflow_store.as_ref() {
-                                    let _ = project_store
-                                        .record_degraded(
-                                            &workflow.project_id,
-                                            workflow.repo.as_deref(),
-                                            &format!(
-                                                "runtime feedback sweep failed for pr:{pr_number}: {e}"
-                                            ),
-                                        )
-                                        .await;
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                let req = crate::task_runner::CreateTaskRequest {
-                    pr: Some(pr_number),
-                    project: Some(project_path),
-                    repo: workflow.repo.clone(),
-                    source: Some("workflow_feedback".to_string()),
-                    ..Default::default()
-                };
-
-                match task_routes::enqueue_task_background(state.clone(), req, None).await {
-                    Ok(task_id) => {
-                        if let Err(e) = issue_workflows
-                            .bind_feedback_task_if_claimed(
-                                &workflow.project_id,
-                                workflow.repo.as_deref(),
-                                pr_number,
-                                &task_id.0,
-                            )
-                            .await
-                        {
-                            incomplete_projects.insert(project_key.clone());
-                            tracing::warn!(
-                                project_id = %workflow.project_id,
-                                pr = pr_number,
-                                task_id = %task_id.0,
-                                "workflow feedback sweep: failed to bind real task id: {e}"
-                            );
-                            continue;
-                        }
-                        tracing::info!(
-                            project_id = %workflow.project_id,
-                            pr = pr_number,
-                            task_id = %task_id.0,
-                            "workflow feedback sweep: PR task enqueued"
-                        );
-                    }
-                    Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow {
-                        retry_after_secs,
-                    }) => {
-                        incomplete_projects.insert(project_key.clone());
-                        let _ = issue_workflows
-                            .release_feedback_claim(
-                                &workflow.project_id,
-                                workflow.repo.as_deref(),
-                                pr_number,
-                                &format!(
-                                    "feedback sweep deferred by maintenance window; retry after {retry_after_secs}s"
-                                ),
-                            )
-                            .await;
-                        if let Some(project_store) = state.core.project_workflow_store.as_ref() {
-                            let _ = project_store
-                                .record_paused(
-                                    &workflow.project_id,
-                                    workflow.repo.as_deref(),
-                                    &format!(
-                                        "feedback sweep paused by maintenance window; retry after {retry_after_secs}s"
-                                    ),
-                                )
-                                .await;
-                        }
-                    }
-                    Err(e) => {
-                        incomplete_projects.insert(project_key.clone());
-                        let _ = issue_workflows
-                            .release_feedback_claim(
-                                &workflow.project_id,
-                                workflow.repo.as_deref(),
-                                pr_number,
-                                &format!("feedback sweep enqueue failed: {e}"),
-                            )
-                            .await;
-                        tracing::warn!(
-                            project_id = %workflow.project_id,
-                            pr = pr_number,
-                            "workflow feedback sweep: failed to enqueue PR task: {e}"
-                        );
-                        if let Some(project_store) = state.core.project_workflow_store.as_ref() {
-                            let _ = project_store
-                                .record_degraded(
-                                    &workflow.project_id,
-                                    workflow.repo.as_deref(),
-                                    &format!(
-                                        "feedback sweep enqueue failed for pr:{pr_number}: {e}"
-                                    ),
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }
-
-            if let Some(project_store) = state.core.project_workflow_store.as_ref() {
-                for (project_id, repo) in touched_projects {
-                    if incomplete_projects.contains(&(project_id.clone(), repo.clone())) {
-                        continue;
-                    }
-                    if let Err(e) = project_store
-                        .record_feedback_sweep_completed(&project_id, repo.as_deref())
-                        .await
-                    {
-                        tracing::warn!(
-                            project_id = %project_id,
-                            "workflow feedback sweep: failed to mark project sweep completion: {e}"
-                        );
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn runtime_pr_feedback_enabled(
-    workflow_cfg: &harness_core::config::workflow::WorkflowConfig,
-) -> bool {
-    workflow_cfg.pr_feedback.enabled
-        && workflow_cfg.runtime_dispatch.enabled
-        && workflow_cfg.runtime_worker.enabled
 }
 
 /// Re-dispatch tasks that were recovered to pending after server restart.
@@ -2634,6 +2321,59 @@ mod tests {
         assert_eq!(default_profile.name, "claude-default");
         assert_eq!(default_profile.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(default_profile.timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn runtime_profile_manifest_definition_records_resolved_profiles() -> anyhow::Result<()> {
+        let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: "codex_jsonrpc".to_string(),
+            runtime_profile: "codex-default".to_string(),
+            model: Some("gpt-default".to_string()),
+            timeout_secs: Some(600),
+            ..Default::default()
+        };
+        policy.workflow_activity_profiles.insert(
+            "github_issue_pr".to_string(),
+            std::collections::BTreeMap::from([(
+                "replan_issue".to_string(),
+                harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                    runtime_profile: Some("codex-issue-replan".to_string()),
+                    model: Some("gpt-replan".to_string()),
+                    timeout_secs: Some(120),
+                    ..Default::default()
+                },
+            )]),
+        );
+
+        let project_root = std::path::Path::new("/tmp/harness-runtime-profile-project");
+        let definition = runtime_profile_manifest_definition(project_root, &policy)?;
+
+        assert!(definition.id.starts_with("runtime_profiles:"));
+        assert_eq!(definition.name, "Runtime Profile Manifest");
+        assert_eq!(
+            definition.source_path.as_deref(),
+            Some("/tmp/harness-runtime-profile-project/WORKFLOW.md")
+        );
+        assert_eq!(
+            definition.metadata["artifact_type"],
+            "runtime_profile_manifest"
+        );
+        assert_eq!(
+            definition.metadata["default_profile"]["name"],
+            "codex-default"
+        );
+        assert_eq!(
+            definition.metadata["workflow_activity_profiles"]["github_issue_pr"]["replan_issue"]
+                ["name"],
+            "codex-issue-replan"
+        );
+        assert_eq!(
+            definition.metadata["workflow_activity_profiles"]["github_issue_pr"]["replan_issue"]
+                ["model"],
+            "gpt-replan"
+        );
+        assert!(!definition.definition_hash.is_empty());
+        Ok(())
     }
 
     #[test]

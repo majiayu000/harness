@@ -12,6 +12,8 @@ pub struct WorkflowDefinition {
     pub source_path: Option<String>,
     pub definition_hash: String,
     pub active: bool,
+    #[serde(default, skip_serializing_if = "is_empty_json_object")]
+    pub metadata: Value,
 }
 
 impl WorkflowDefinition {
@@ -23,8 +25,28 @@ impl WorkflowDefinition {
             source_path: None,
             definition_hash: String::new(),
             active: true,
+            metadata: Value::Object(Default::default()),
         }
     }
+
+    pub fn with_source_path(mut self, source_path: impl Into<String>) -> Self {
+        self.source_path = Some(source_path.into());
+        self
+    }
+
+    pub fn with_definition_hash(mut self, definition_hash: impl Into<String>) -> Self {
+        self.definition_hash = definition_hash.into();
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+fn is_empty_json_object(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| object.is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,6 +330,10 @@ pub struct WorkflowCommandRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_id: Option<String>,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_lease_expires_at: Option<DateTime<Utc>>,
     pub command: WorkflowCommand,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -599,6 +625,7 @@ pub enum ActivityStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ActivityErrorKind {
     Retryable,
+    Timeout,
     Fatal,
     Configuration,
     ExternalDependency,

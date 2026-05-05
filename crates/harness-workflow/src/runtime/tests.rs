@@ -1218,6 +1218,51 @@ fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
 }
 
 #[test]
+fn runtime_completion_reducer_retries_timeout_activity_failure_when_policy_allows() {
+    let instance = issue_instance("implementing").with_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 1
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "implement-timeout-1");
+    let result = ActivityResult::failed(
+        "implement_issue",
+        "Implementation timed out.",
+        "Agent turn timed out after 30s",
+    )
+    .with_error_kind(ActivityErrorKind::Timeout);
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-timeout-1",
+        "command": command,
+        "runtime_job_id": "job-timeout-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("timeout activity should produce a retry decision");
+
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(
+        decision.commands[0].command["previous_error_kind"],
+        "timeout"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("timeout retry decision should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_does_not_retry_fatal_activity_failure() {
     let instance = issue_instance("implementing").with_data(json!({
         "runtime_retry_policy": {
@@ -2881,6 +2926,73 @@ async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let matching = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        WorkflowSubject::new("issue", "issue:77"),
+    )
+    .with_id("project-a::owner/repo::issue:77")
+    .with_data(json!({
+        "project_id": "project-a",
+        "repo": "owner/repo",
+        "issue_number": 77,
+        "pr_number": 880,
+    }));
+    let wrong_repo = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        WorkflowSubject::new("issue", "issue:78"),
+    )
+    .with_id("project-a::owner/other::issue:78")
+    .with_data(json!({
+        "project_id": "project-a",
+        "repo": "owner/other",
+        "issue_number": 78,
+        "pr_number": 880,
+    }));
+    let wrong_project = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        WorkflowSubject::new("issue", "issue:79"),
+    )
+    .with_id("project-b::owner/repo::issue:79")
+    .with_data(json!({
+        "project_id": "project-b",
+        "repo": "owner/repo",
+        "issue_number": 79,
+        "pr_number": 880,
+    }));
+    store.upsert_instance(&matching).await?;
+    store.upsert_instance(&wrong_repo).await?;
+    store.upsert_instance(&wrong_project).await?;
+
+    let found = store
+        .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
+        .await?
+        .expect("matching runtime issue workflow should be found");
+    assert_eq!(found.id, matching.id);
+    assert!(store
+        .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 881)
+        .await?
+        .is_none());
+    assert!(store
+        .get_instance_by_pr("github_issue_pr", "project-b", Some("owner/other"), 880)
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_worker_skips_runtime_jobs_before_not_before() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -4078,6 +4190,57 @@ async fn runtime_store_pending_command_enqueue_is_idempotent_across_concurrent_c
         store.commands_for(&instance.id).await?[0].status,
         "dispatched"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_store_claims_pending_commands_with_dispatch_lease() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "replanning");
+    store.upsert_instance(&instance).await?;
+    let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-lease");
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+
+    let claimed = store
+        .claim_pending_commands("dispatcher-a", Utc::now() + Duration::seconds(60), 10)
+        .await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, command_id);
+    assert_eq!(claimed[0].status, "dispatching");
+    assert_eq!(claimed[0].dispatch_owner.as_deref(), Some("dispatcher-a"));
+    assert!(claimed[0].dispatch_lease_expires_at.is_some());
+    assert!(store.pending_commands(10).await?.is_empty());
+
+    let concurrent = store
+        .claim_pending_commands("dispatcher-b", Utc::now() + Duration::seconds(60), 10)
+        .await?;
+    assert!(
+        concurrent.is_empty(),
+        "an unexpired dispatch lease must hide the command from other dispatchers"
+    );
+
+    let stale_command =
+        WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-stale-lease");
+    let stale_command_id = store
+        .enqueue_command(&instance.id, None, &stale_command)
+        .await?;
+    let stale_claim = store
+        .claim_pending_commands("stale-dispatcher", Utc::now() - Duration::seconds(1), 10)
+        .await?;
+    assert_eq!(stale_claim.len(), 1);
+    assert_eq!(stale_claim[0].id, stale_command_id);
+
+    let reclaimed = store
+        .claim_pending_commands("dispatcher-c", Utc::now() + Duration::seconds(60), 10)
+        .await?;
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].id, stale_command_id);
+    assert_eq!(reclaimed[0].dispatch_owner.as_deref(), Some("dispatcher-c"));
     Ok(())
 }
 

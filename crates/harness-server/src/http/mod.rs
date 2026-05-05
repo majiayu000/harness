@@ -173,12 +173,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Re-dispatch leftover pending tasks that crashed before their first checkpoint.
     background::spawn_orphan_pending_recovery(&state).await;
 
-    // Periodically sweep issue workflows with attached PRs and automatically
-    // enqueue `pr:N` tasks so PR feedback is handled without manual resubmission.
-    background::spawn_issue_workflow_feedback_sweeper(&state);
-
     // Periodically sweep runtime issue workflows with attached PRs and emit
-    // workflow command outbox rows instead of legacy PR tasks.
+    // workflow command outbox rows.
     background::spawn_runtime_pr_feedback_sweeper(&state);
 
     // Periodically ask repo backlog workflows to scan GitHub through runtime
@@ -222,13 +218,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     let github_sources = state.intake.github_pollers.clone();
     crate::intake::build_orchestrator(
         &state.core.server.config.intake,
-        Some(&init::expand_tilde(
-            &state.core.server.config.server.data_dir,
-        )),
         state.intake.feishu_intake.clone(),
         github_sources,
-        state.intake.legacy_github_fallback_enabled,
-        state.core.server.config.server.github_token.clone(),
     )
     .start(state.clone());
 

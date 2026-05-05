@@ -13,7 +13,6 @@ pub(crate) struct IntakeBundle {
     /// GitHub pollers keyed as `"github:{owner/repo}"` for per-repo routing.
     /// The same `Arc` instances are shared with the completion callback.
     pub github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)>,
-    pub legacy_github_fallback_enabled: bool,
     pub completion_callback: Option<task_runner::CompletionCallback>,
 }
 
@@ -89,7 +88,6 @@ pub(crate) async fn build_intake(
     // legacy GitHub poller; repo backlog scans are requested through runtime
     // commands and executed by agents.
     let github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = Vec::new();
-    let mut legacy_github_fallback_enabled = true;
     if let Some(cfg) = server
         .config
         .intake
@@ -97,7 +95,6 @@ pub(crate) async fn build_intake(
         .as_ref()
         .filter(|cfg| cfg.enabled)
     {
-        legacy_github_fallback_enabled = false;
         for repo_cfg in cfg.effective_repos() {
             if runtime_repo_backlog_owns_github_polling(project_root, &repo_cfg, registry) {
                 tracing::info!(
@@ -232,7 +229,6 @@ pub(crate) async fn build_intake(
         review_task_queue,
         feishu_intake,
         github_pollers,
-        legacy_github_fallback_enabled,
         completion_callback,
     })
 }
@@ -522,8 +518,8 @@ mod tests {
             "configured GitHub intake should not register legacy pollers"
         );
         assert!(
-            !bundle.legacy_github_fallback_enabled,
-            "configured GitHub intake should not fall back to legacy server polling"
+            bundle.completion_callback.is_some(),
+            "quality trigger should still provide a completion callback without legacy GitHub polling"
         );
     }
 

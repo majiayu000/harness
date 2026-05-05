@@ -1,9 +1,10 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
 use super::store::{RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 const COMMAND_STATUS_SKIPPED: &str = "skipped";
 
@@ -103,6 +104,8 @@ pub struct RuntimeCommandDispatcher<'a> {
     store: &'a WorkflowRuntimeStore,
     profile_selector: RuntimeProfileSelector,
     batch_limit: i64,
+    dispatcher_id: String,
+    lease_duration: Duration,
 }
 
 impl<'a> RuntimeCommandDispatcher<'a> {
@@ -118,6 +121,8 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             store,
             profile_selector,
             batch_limit: 25,
+            dispatcher_id: format!("dispatcher:{}", Uuid::new_v4()),
+            lease_duration: Duration::seconds(30),
         }
     }
 
@@ -126,15 +131,38 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         self
     }
 
+    pub fn with_dispatcher_id(mut self, dispatcher_id: impl Into<String>) -> Self {
+        self.dispatcher_id = dispatcher_id.into();
+        self
+    }
+
+    pub fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.lease_duration = lease_duration.max(Duration::seconds(1));
+        self
+    }
+
     pub async fn dispatch_once(&self) -> anyhow::Result<Option<CommandDispatchOutcome>> {
-        let Some(command) = self.store.pending_commands(1).await?.into_iter().next() else {
+        let Some(command) = self
+            .store
+            .claim_pending_commands(&self.dispatcher_id, Utc::now() + self.lease_duration, 1)
+            .await?
+            .into_iter()
+            .next()
+        else {
             return Ok(None);
         };
         self.dispatch_command(command).await.map(Some)
     }
 
     pub async fn dispatch_pending(&self) -> anyhow::Result<Vec<CommandDispatchOutcome>> {
-        let commands = self.store.pending_commands(self.batch_limit).await?;
+        let commands = self
+            .store
+            .claim_pending_commands(
+                &self.dispatcher_id,
+                Utc::now() + self.lease_duration,
+                self.batch_limit,
+            )
+            .await?;
         let mut outcomes = Vec::with_capacity(commands.len());
         for command in commands {
             outcomes.push(self.dispatch_command(command).await?);
@@ -161,8 +189,9 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         let not_before = retry_not_before_for_command(&command)?;
         match self
             .store
-            .enqueue_runtime_job_for_pending_command(
+            .enqueue_runtime_job_for_claimed_command(
                 &command.id,
+                &self.dispatcher_id,
                 runtime_profile.kind,
                 &runtime_profile.name,
                 json!({

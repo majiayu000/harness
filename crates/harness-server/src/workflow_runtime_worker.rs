@@ -180,9 +180,11 @@ fn runtime_failure_kind(
         return None;
     }
     match result.and_then(|result| result.error_kind) {
-        Some(ActivityErrorKind::Retryable | ActivityErrorKind::ExternalDependency) => {
-            Some(TaskFailureKind::WorkspaceLifecycle)
-        }
+        Some(
+            ActivityErrorKind::Retryable
+            | ActivityErrorKind::Timeout
+            | ActivityErrorKind::ExternalDependency,
+        ) => Some(TaskFailureKind::WorkspaceLifecycle),
         _ => Some(TaskFailureKind::Task),
     }
 }
@@ -1021,7 +1023,7 @@ fn activity_result_schema(job: &RuntimeJob, workflow: Option<&WorkflowInstance>)
         "required_fields": ["activity", "status", "summary"],
         "optional_fields": ["artifacts", "signals", "validation", "error", "error_kind"],
         "allowed_statuses": ["succeeded", "failed", "blocked", "cancelled"],
-        "allowed_error_kinds": ["retryable", "fatal", "configuration", "external_dependency", "unknown"],
+        "allowed_error_kinds": ["retryable", "timeout", "fatal", "configuration", "external_dependency", "unknown"],
         "optional_artifacts": {
             "workflow_decision": {
                 "description": "A proposed WorkflowDecision. Harness validates it before applying any transition or command.",
@@ -1427,11 +1429,14 @@ fn activity_result_from_turn(
             }
         },
         TurnStatus::Cancelled => ActivityResult::cancelled(activity, summary),
-        TurnStatus::Failed | TurnStatus::Running => ActivityResult::failed(
-            activity,
-            summary,
-            last_error(items).unwrap_or_else(|| "agent turn failed".to_string()),
-        ),
+        TurnStatus::Failed | TurnStatus::Running => {
+            let error = last_error(items).unwrap_or_else(|| "agent turn failed".to_string());
+            let mut result = ActivityResult::failed(activity, summary, error.clone());
+            if turn_error_is_timeout(&error) {
+                result = result.with_error_kind(ActivityErrorKind::Timeout);
+            }
+            result
+        }
     };
     result
         .with_artifact(workflow_prompt_artifact(prompt_packet_digest))
@@ -1451,6 +1456,11 @@ fn activity_result_from_turn(
                 "runtime_job_id": job.id.as_str(),
             }),
         ))
+}
+
+fn turn_error_is_timeout(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("timed out") || normalized.contains("timeout reached")
 }
 
 enum StructuredActivityResult {
@@ -2244,6 +2254,44 @@ Final result:
             .artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "runtime_turn"));
+    }
+
+    #[test]
+    fn activity_result_from_turn_classifies_timeout_error_kind() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue"
+            }),
+        );
+        let items = vec![Item::Error {
+            code: 1,
+            message: "Agent turn timed out after 30s".to_string(),
+        }];
+
+        let result = activity_result_from_turn(
+            &job,
+            &TurnStatus::Failed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "codex",
+            Path::new("/project"),
+            "digest-1",
+        );
+
+        assert_eq!(result.activity, "implement_issue");
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Timeout));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Agent turn timed out after 30s")
+        );
     }
 }
 

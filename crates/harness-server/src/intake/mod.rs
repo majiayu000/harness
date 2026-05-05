@@ -1241,11 +1241,8 @@ fn transient_retry_delay(base: Duration, max: Duration, attempt: u32) -> Duratio
 /// state rather than a detached clone.
 pub fn build_orchestrator(
     config: &harness_core::config::intake::IntakeConfig,
-    data_dir: Option<&std::path::Path>,
     feishu_intake: Option<Arc<feishu::FeishuIntake>>,
     github_sources: Vec<Arc<dyn IntakeSource>>,
-    allow_github_fallback: bool,
-    github_token: Option<String>,
 ) -> IntakeOrchestrator {
     let mut sources: Vec<Arc<dyn IntakeSource>> = Vec::new();
     let mut poll_interval = Duration::from_secs(30);
@@ -1265,25 +1262,12 @@ pub fn build_orchestrator(
                     .retry_backoff_max_secs
                     .max(gh_config.retry_backoff_base_secs),
             );
-            if github_sources.is_empty() && allow_github_fallback {
-                // Fallback: build fresh pollers when no shared instances are supplied
-                // (e.g. during testing or when called without pre-built sources).
-                for repo_cfg in gh_config.effective_repos() {
-                    tracing::info!(
-                        repo = %repo_cfg.repo,
-                        label = %repo_cfg.label,
-                        "intake: GitHub Issues poller registered (fallback)"
-                    );
-                    let poller = github_issues::GitHubIssuesPoller::new_with_token(
-                        &repo_cfg,
-                        data_dir,
-                        github_token.clone(),
-                    );
-                    sources.push(Arc::new(poller));
-                }
-            } else {
-                sources.extend(github_sources);
+            if github_sources.is_empty() {
+                tracing::info!(
+                    "intake: GitHub issue polling is workflow-runtime owned; no legacy pollers registered"
+                );
             }
+            sources.extend(github_sources);
         }
     }
 
@@ -1912,7 +1896,7 @@ mod tests {
     #[test]
     fn build_orchestrator_with_no_config_returns_empty_orchestrator() {
         let config = harness_core::config::intake::IntakeConfig::default();
-        let orchestrator = build_orchestrator(&config, None, None, vec![], true, None);
+        let orchestrator = build_orchestrator(&config, None, vec![]);
         assert!(orchestrator.sources.is_empty());
     }
 
@@ -1924,12 +1908,12 @@ mod tests {
             repo: "owner/repo".to_string(),
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None, None, vec![], true, None);
+        let orchestrator = build_orchestrator(&config, None, vec![]);
         assert!(orchestrator.sources.is_empty());
     }
 
     #[test]
-    fn build_orchestrator_with_enabled_github_registers_source() {
+    fn build_orchestrator_with_enabled_github_uses_workflow_runtime_sources_only() {
         let mut config = harness_core::config::intake::IntakeConfig::default();
         config.github = Some(harness_core::config::intake::GitHubIntakeConfig {
             enabled: true,
@@ -1941,9 +1925,11 @@ mod tests {
             retry_backoff_max_secs: 90,
             ..Default::default()
         });
-        let orchestrator = build_orchestrator(&config, None, None, vec![], true, None);
-        assert_eq!(orchestrator.sources.len(), 1);
-        assert_eq!(orchestrator.sources[0].name(), "github");
+        let orchestrator = build_orchestrator(&config, None, vec![]);
+        assert!(
+            orchestrator.sources.is_empty(),
+            "GitHub intake is workflow-runtime owned and should not create legacy pollers"
+        );
         assert_eq!(orchestrator.poll_interval, Duration::from_secs(60));
         assert_eq!(orchestrator.sprint_timeout, Duration::from_secs(7200));
         assert_eq!(orchestrator.retry_backoff_base, Duration::from_secs(10));
@@ -1951,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn build_orchestrator_with_disabled_github_fallback_registers_no_source() {
+    fn build_orchestrator_with_enabled_github_registers_shared_sources() {
         let mut config = harness_core::config::intake::IntakeConfig::default();
         config.github = Some(harness_core::config::intake::GitHubIntakeConfig {
             enabled: true,
@@ -1959,10 +1945,23 @@ mod tests {
             label: "harness".to_string(),
             ..Default::default()
         });
+        let source = Arc::new(github_issues::GitHubIssuesPoller::new_with_token(
+            config
+                .github
+                .as_ref()
+                .unwrap()
+                .effective_repos()
+                .first()
+                .unwrap(),
+            None,
+            None,
+        ));
+        let source: Arc<dyn IntakeSource> = source;
 
-        let orchestrator = build_orchestrator(&config, None, None, vec![], false, None);
+        let orchestrator = build_orchestrator(&config, None, vec![source]);
 
-        assert!(orchestrator.sources.is_empty());
+        assert_eq!(orchestrator.sources.len(), 1);
+        assert_eq!(orchestrator.sources[0].name(), "github");
     }
 
     #[test]
@@ -1977,7 +1976,7 @@ mod tests {
             default_repo: None,
         });
 
-        let orchestrator = build_orchestrator(&config, None, None, vec![], true, None);
+        let orchestrator = build_orchestrator(&config, None, vec![]);
         assert!(orchestrator.sources.is_empty());
     }
 }
