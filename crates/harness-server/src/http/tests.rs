@@ -1583,6 +1583,10 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     let dir = tempfile::tempdir()?;
     let project_root = dir.path().join("project");
     std::fs::create_dir_all(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nworkspace:\n  strategy: source\n---\n",
+    )?;
     let agent = RuntimeStreamAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", agent.clone());
@@ -2535,6 +2539,10 @@ async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<
     let dir = tempfile::tempdir()?;
     let project_root = dir.path().join("project");
     std::fs::create_dir_all(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nworkspace:\n  strategy: source\n---\n",
+    )?;
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", BlockingAgent::new());
     let state =

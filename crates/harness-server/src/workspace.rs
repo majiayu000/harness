@@ -51,6 +51,27 @@ pub(crate) struct ActiveWorkspace {
     pub(crate) run_generation: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceCreateOptions {
+    pub(crate) require_remote_head: bool,
+    pub(crate) reuse_existing_workspace: bool,
+    pub(crate) after_create_hook: Option<String>,
+    pub(crate) hook_timeout_secs: Option<u64>,
+    pub(crate) branch_prefix: String,
+}
+
+impl Default for WorkspaceCreateOptions {
+    fn default() -> Self {
+        Self {
+            require_remote_head: true,
+            reuse_existing_workspace: true,
+            after_create_hook: None,
+            hook_timeout_secs: None,
+            branch_prefix: "harness/".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct WorkspaceOwnerRecord {
     task_id: String,
@@ -238,6 +259,30 @@ impl WorkspaceManager {
         external_id: Option<&str>,
         repo: Option<&str>,
     ) -> Result<WorkspaceLease, WorkspaceLifecycleError> {
+        self.create_workspace_with_options(
+            task_id,
+            source_repo,
+            remote,
+            base_branch,
+            run_generation,
+            external_id,
+            repo,
+            WorkspaceCreateOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn create_workspace_with_options(
+        &self,
+        task_id: &TaskId,
+        source_repo: &Path,
+        remote: &str,
+        base_branch: &str,
+        run_generation: u32,
+        external_id: Option<&str>,
+        repo: Option<&str>,
+        options: WorkspaceCreateOptions,
+    ) -> Result<WorkspaceLease, WorkspaceLifecycleError> {
         let workspace_key = derive_workspace_key(task_id, external_id, repo, Some(source_repo));
         // Validate inputs to prevent unexpected git behavior.
         if !is_valid_branch_name(base_branch) {
@@ -355,10 +400,12 @@ impl WorkspaceManager {
                 });
             }
 
-            if owner_record.as_ref().is_some_and(|record| {
-                owner_record_matches_workspace(record, task_id, &workspace_key, run_generation)
-                    && record.owner_session == owner_session
-            }) {
+            if options.reuse_existing_workspace
+                && owner_record.as_ref().is_some_and(|record| {
+                    owner_record_matches_workspace(record, task_id, &workspace_key, run_generation)
+                        && record.owner_session == owner_session
+                })
+            {
                 let owner_record = WorkspaceOwnerRecord {
                     task_id: task_id.0.clone(),
                     run_generation,
@@ -426,16 +473,38 @@ impl WorkspaceManager {
 
         if !fetch_output.status.success() {
             let stderr = String::from_utf8_lossy(&fetch_output.stderr);
-            tracing::warn!(
-                "git fetch {remote} {base_branch} failed (continuing with local): {}",
-                stderr.trim()
-            );
+            if options.require_remote_head {
+                self.remove_active_workspace(task_id);
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: Some(owner_session.clone()),
+                    message: format!(
+                        "git fetch {remote} {base_branch} failed for task {}: {}",
+                        task_id.0,
+                        stderr.trim()
+                    ),
+                });
+            } else {
+                tracing::warn!(
+                    "git fetch {remote} {base_branch} failed (continuing with local): {}",
+                    stderr.trim()
+                );
+            }
         }
 
         // Create git worktree based on remote/base_branch (latest upstream).
-        // Falls back to local base_branch if fetch failed above.
+        // Falls back to local base_branch only when strict remote-head
+        // admission is disabled.
         let remote_ref = format!("{remote}/{base_branch}");
-        let branch = format!("harness/{}", task_id.0);
+        let branch = format!("{}{}", options.branch_prefix, task_id.0);
+        if !is_valid_branch_name(&branch) {
+            self.remove_active_workspace(task_id);
+            return Err(WorkspaceLifecycleError::CreateFailed {
+                workspace_path: workspace_path.clone(),
+                workspace_owner: Some(owner_session.clone()),
+                message: format!("invalid workspace branch: {branch:?}"),
+            });
+        }
         let output = match git_command()
             .args([
                 "-C",
@@ -462,6 +531,19 @@ impl WorkspaceManager {
         };
 
         if !output.status.success() {
+            if options.require_remote_head {
+                self.remove_active_workspace(task_id);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    workspace_path: workspace_path.clone(),
+                    workspace_owner: Some(owner_session.clone()),
+                    message: format!(
+                        "git worktree add from {remote_ref} failed for task {}: {}",
+                        task_id.0,
+                        stderr.trim()
+                    ),
+                });
+            }
             // Fallback: try local base_branch (useful for repos without remotes, e.g. tests).
             let fallback = match git_command()
                 .args([
@@ -527,8 +609,14 @@ impl WorkspaceManager {
         }
 
         // Run after_create_hook if set. Fatal on failure: cleanup partial worktree.
-        if let Some(hook) = &self.config.after_create_hook {
-            let timeout_secs = self.config.hook_timeout_secs;
+        let after_create_hook = options
+            .after_create_hook
+            .as_deref()
+            .or(self.config.after_create_hook.as_deref());
+        if let Some(hook) = after_create_hook {
+            let timeout_secs = options
+                .hook_timeout_secs
+                .unwrap_or(self.config.hook_timeout_secs);
             let hook_error = match timeout(
                 Duration::from_secs(timeout_secs),
                 run_hook(hook, &workspace_path),
@@ -1124,7 +1212,7 @@ fn repo_slug_from_workspace_key(key: &str) -> Option<String> {
 
 /// Returns true when the git worktree at `path` is currently on `branch`.
 /// Used to distinguish crash-recovery (same task's worktree) from a true collision.
-async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
+pub(crate) async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
     crate::post_validator::validate_command_safety(script).map_err(|e| anyhow::anyhow!("{e}"))?;
     let output = tokio::process::Command::new("sh")
         .arg("-c")
@@ -1468,6 +1556,14 @@ mod tests {
             "--allow-empty",
             "-m",
             "init",
+        ]);
+        run(&[
+            "-C",
+            &dir.to_string_lossy(),
+            "remote",
+            "add",
+            "origin",
+            &dir.to_string_lossy(),
         ]);
     }
 
@@ -1907,6 +2003,115 @@ mod tests {
             .await
             .expect("create");
         assert!(ws_path.workspace_path.is_dir());
+
+        mgr.remove_workspace(&task_id).await.expect("remove");
+    }
+
+    #[tokio::test]
+    async fn create_workspace_requires_remote_head_by_default() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+        run_git(&[
+            "-C",
+            &source.path().to_string_lossy(),
+            "remote",
+            "remove",
+            "origin",
+        ]);
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("missing-remote-head".to_string());
+
+        let err = mgr
+            .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
+            .await
+            .expect_err("missing remote head should fail admission");
+        assert!(
+            err.to_string().contains("git fetch origin"),
+            "error should report the failed remote fetch: {err}"
+        );
+        assert!(mgr.get_workspace(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_workspace_can_opt_into_local_base_fallback() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+        run_git(&[
+            "-C",
+            &source.path().to_string_lossy(),
+            "remote",
+            "remove",
+            "origin",
+        ]);
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("local-base-fallback".to_string());
+
+        let lease = mgr
+            .create_workspace_with_options(
+                &task_id,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                None,
+                None,
+                WorkspaceCreateOptions {
+                    require_remote_head: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("explicit local fallback should be allowed");
+        assert!(lease.workspace_path.is_dir());
+
+        mgr.remove_workspace(&task_id).await.expect("remove");
+    }
+
+    #[tokio::test]
+    async fn create_workspace_uses_custom_branch_prefix() {
+        let source = tempfile::tempdir().expect("tempdir");
+        init_git_repo(source.path());
+        let branch = current_branch(source.path());
+
+        let workspaces = tempfile::tempdir().expect("tempdir");
+        let config = WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mgr = WorkspaceManager::new(config).expect("new");
+        let task_id = harness_core::types::TaskId("custom-prefix".to_string());
+
+        let lease = mgr
+            .create_workspace_with_options(
+                &task_id,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                None,
+                None,
+                WorkspaceCreateOptions {
+                    branch_prefix: "task/".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("workspace should be created with custom branch prefix");
+        assert_eq!(current_branch(&lease.workspace_path), "task/custom-prefix");
 
         mgr.remove_workspace(&task_id).await.expect("remove");
     }
