@@ -1381,6 +1381,54 @@ fn activity_result_schema(job: &RuntimeJob, workflow: Option<&WorkflowInstance>)
         "transition_contract": transition_contract,
         "workflow_decision_contract": decision_contract,
         "agent_summary_contract": summary_contract,
+        "wire_format_example": {
+            "activity": activity,
+            "status": "succeeded",
+            "summary": "Concise description of what the activity did.",
+            "artifacts": [
+                {
+                    "artifact_type": "workflow_decision",
+                    "artifact": {
+                        "workflow_id": "...",
+                        "observed_state": "...",
+                        "decision": "...",
+                        "next_state": "...",
+                        "reason": "...",
+                        "confidence": "high",
+                        "commands": [
+                            {
+                                "command_type": "enqueue_activity",
+                                "dedupe_key": "<unique stable string for this command>",
+                                "command": {
+                                    "activity": "<next activity name>",
+                                    "note": "All activity-specific payload (repo, issue_number, signals, etc.) goes INSIDE this nested `command` Value. The outer object MUST have exactly the three fields: command_type, dedupe_key, command."
+                                }
+                            }
+                        ]
+                    }
+                }
+            ],
+            "signals": [
+                {
+                    "signal_type": "<one of accepted_signals from transition_contract>",
+                    "signal": {
+                        "issue_number": 123,
+                        "issue_url": "https://example/issues/123",
+                        "note": "Per-signal payload goes inside the `signal` object. Do NOT use `kind` as the discriminator; the wire format is `signal_type` + `signal`."
+                    }
+                }
+            ],
+            "validation": [
+                {"command": "cargo test", "status": "passed"}
+            ],
+            "_format_rules": [
+                "`artifacts` MUST be a JSON array of {artifact_type, artifact} objects. Never emit it as a map keyed by artifact name.",
+                "`signals` MUST be a JSON array of {signal_type, signal} objects. Never use `kind` or any other discriminator name.",
+                "`validation` MUST be a JSON array of {command, status} objects. Never emit it as a map.",
+                "Inside a `workflow_decision` artifact, the next-step activity MUST be expressed as `commands: [{command_type, dedupe_key, command}]` (plural array). Never use a singular `command` field at the artifact level — that field is silently ignored, leaving the workflow stuck in the new state with no follow-up activity enqueued.",
+                "Omit `artifacts`, `signals`, or `validation` entirely if there is nothing to report — empty arrays or missing fields are both fine."
+            ]
+        },
     })
 }
 
@@ -1764,14 +1812,42 @@ fn activity_result_from_turn(
     let result = match status {
         TurnStatus::Completed => match structured_activity_result(items, &activity) {
             StructuredActivityResult::Parsed(result) => result,
-            StructuredActivityResult::Missing => ActivityResult::succeeded(activity, summary),
+            StructuredActivityResult::Missing => {
+                tracing::warn!(
+                    runtime_job_id = %job.id,
+                    activity = %activity,
+                    agent = %agent_name,
+                    "activity completed without harness-activity-result fenced block; \
+                     marking failed to prevent silent state-machine no-progress loops"
+                );
+                ActivityResult::failed(
+                    activity,
+                    summary,
+                    "agent emitted no harness-activity-result fenced JSON block",
+                )
+                .with_error_kind(ActivityErrorKind::Configuration)
+            }
             StructuredActivityResult::Invalid(error) => {
+                tracing::warn!(
+                    runtime_job_id = %job.id,
+                    activity = %activity,
+                    agent = %agent_name,
+                    "activity result block invalid: {error}"
+                );
                 ActivityResult::failed(activity, "Structured activity result was invalid.", error)
             }
         },
         TurnStatus::Cancelled => ActivityResult::cancelled(activity, summary),
         TurnStatus::Failed | TurnStatus::Running => {
             let error = last_error(items).unwrap_or_else(|| "agent turn failed".to_string());
+            tracing::warn!(
+                runtime_job_id = %job.id,
+                activity = %activity,
+                agent = %agent_name,
+                turn_status = ?status,
+                items = items.len(),
+                "runtime turn failed: {error}"
+            );
             let mut result = ActivityResult::failed(activity, summary, error.clone());
             if turn_error_is_timeout(&error) {
                 result = result.with_error_kind(ActivityErrorKind::Timeout);
@@ -2542,6 +2618,57 @@ mod tests {
         let prompt = build_runtime_job_prompt(&packet, None);
         assert!(prompt.contains("Repository workflow prompt template:"));
         assert!(prompt.contains("Follow the repository workflow prompt."));
+    }
+
+    #[test]
+    fn activity_result_from_turn_fails_when_no_fenced_block_present() {
+        // P0-1: a completed agent turn that emits no `harness-activity-result`
+        // fenced block must NOT be silently treated as success. Returning
+        // succeeded here historically caused state-machine no-progress loops
+        // for `repo_backlog` workflows (claude returns prose, reducer falls
+        // back to `finish_repo_backlog_scan`, state cycles back to idle, next
+        // tick re-dispatches, ad infinitum).
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::ClaudeCode,
+            "claude-default",
+            json!({
+                "activity": "poll_repo_backlog"
+            }),
+        );
+        let items = vec![Item::AgentReasoning {
+            content: "I scanned the repo and saw no new issues. Done.".to_string(),
+        }];
+
+        let result = activity_result_from_turn(
+            &job,
+            &TurnStatus::Completed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "claude",
+            Path::new("/project"),
+            "digest-1",
+        );
+
+        assert_eq!(result.activity, "poll_repo_backlog");
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed,
+            "missing structured result MUST surface as failed"
+        );
+        assert_eq!(
+            result.error_kind,
+            Some(harness_workflow::runtime::ActivityErrorKind::Configuration),
+            "missing structured result is a configuration-class failure (prompt or agent contract issue)"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("harness-activity-result")),
+            "error message MUST mention the missing block so operators can diagnose"
+        );
     }
 
     #[test]
