@@ -178,11 +178,7 @@ fn runtime_workflow_task_summary(
         .data
         .get("issue_number")
         .and_then(|value| value.as_u64());
-    let external_id = match task_kind {
-        TaskKind::Issue => issue.map(|issue_number| format!("issue:{issue_number}")),
-        TaskKind::Prompt => runtime_string_field(&workflow.data, "external_id"),
-        _ => None,
-    };
+    let external_id = runtime_external_id(task_kind, &workflow.data, issue);
     let description = match task_kind {
         TaskKind::Issue => Some(
             issue
@@ -268,6 +264,22 @@ fn runtime_string_field(data: &serde_json::Value, field: &str) -> Option<String>
         .map(ToOwned::to_owned)
 }
 
+/// Render the `external_id` shown for a runtime-backed task in dashboard
+/// responses. Pulled out of two identical match blocks in
+/// [`runtime_workflow_task_summary`] and [`runtime_task_response_by_handle`]
+/// so that adding a new `TaskKind` variant only edits one place.
+fn runtime_external_id(
+    task_kind: TaskKind,
+    workflow_data: &serde_json::Value,
+    issue: Option<u64>,
+) -> Option<String> {
+    match task_kind {
+        TaskKind::Issue => issue.map(|issue_number| format!("issue:{issue_number}")),
+        TaskKind::Prompt => runtime_string_field(workflow_data, "external_id"),
+        TaskKind::Pr | TaskKind::Review | TaskKind::Planner => None,
+    }
+}
+
 fn runtime_task_id_array(
     data: &serde_json::Value,
     field: &str,
@@ -343,11 +355,7 @@ async fn runtime_task_response_by_handle(
     }) else {
         return Ok(None);
     };
-    let external_id = match task_kind {
-        TaskKind::Issue => issue.map(|issue_number| format!("issue:{issue_number}")),
-        TaskKind::Prompt => runtime_string_field(&workflow.data, "external_id"),
-        _ => None,
-    };
+    let external_id = runtime_external_id(task_kind, &workflow.data, issue);
     Ok(Some(RuntimeTaskResponse {
         id: task_id.as_str().to_string(),
         task_id: task_id.as_str().to_string(),

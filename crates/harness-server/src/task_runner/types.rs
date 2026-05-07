@@ -88,6 +88,33 @@ impl TaskKind {
         }
     }
 
+    /// Stable, user-facing reason string emitted when a task of this kind is
+    /// found with no persisted external identifier during orphan recovery.
+    /// Centralised here so that adding a new variant forces an explicit
+    /// orphan-reason decision in one place rather than ten.
+    pub fn orphan_recovery_failure_reason(&self) -> &'static str {
+        match self {
+            Self::Issue => "orphaned issue task: issue number not persisted",
+            Self::Pr => "orphaned PR task: PR number not persisted",
+            Self::Prompt => "orphaned prompt-only task: prompt not persisted",
+            Self::Review => "orphaned review task: prompt not persisted",
+            Self::Planner => "orphaned planner task: prompt not persisted",
+        }
+    }
+
+    /// Short human-readable label used as the persisted task description when
+    /// the request carries a prompt but no structured issue / PR identifier.
+    /// `None` for kinds that never receive a freeform prompt-only submission;
+    /// today every kind does, but the option leaves room for future variants
+    /// that should reject prompt-only intake.
+    pub fn prompt_task_label(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Review => "periodic review",
+            Self::Planner => "sprint planner",
+            Self::Issue | Self::Pr | Self::Prompt => "prompt task",
+        })
+    }
+
     pub fn requires_pr_url(&self) -> bool {
         matches!(self, Self::Issue | Self::Pr)
     }
