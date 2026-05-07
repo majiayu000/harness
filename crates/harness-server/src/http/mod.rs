@@ -181,6 +181,14 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // jobs so GitHub intake becomes workflow-owned when the runtime is enabled.
     background::spawn_runtime_repo_backlog_poller(&state);
 
+    // Defensive recovery loop: reset repo_backlog workflows that have been
+    // sitting in non-candidate middle states (scanning / planning_batch /
+    // dispatching / reconciling) for longer than 30 minutes back to `idle`,
+    // so the poller above can re-claim them. Without this, a single dropped
+    // reducer transition (claude empty output, server restart mid-dispatch,
+    // wire-format drift) leaves a repo's intake stuck for hours.
+    crate::stale_workflow_recovery::spawn_stale_workflow_recovery(&state);
+
     // Convert workflow command outbox rows into runtime jobs when the workflow
     // policy keeps the dispatcher enabled.
     background::spawn_runtime_command_dispatcher(&state);
