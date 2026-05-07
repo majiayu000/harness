@@ -343,6 +343,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_project_entry_rejects_reserved_default_name_after_trim() {
+        // Trimming runs before the reserved-name check, so a user cannot
+        // bypass the `default` reservation by padding with whitespace.
+        let err = parse_project_entry("  default  =/tmp/repo")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn parse_project_entry_rejects_empty_path() {
         let err = parse_project_entry("repo-a=").unwrap_err().to_string();
         assert!(
