@@ -156,12 +156,24 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        // Probe the runtime-job activity name from the prompt so the fenced
+        // result block reports the correct `activity`. The activity is the
+        // top `Activity:` line in the prompt packet header. Falling back to
+        // "implement_issue" keeps the existing tests stable when no header
+        // is found.
+        let activity = req
+            .prompt
+            .lines()
+            .find_map(|line| line.strip_prefix("Activity: ").map(str::trim))
+            .unwrap_or("implement_issue")
+            .to_string();
         self.prompts.lock().await.push(req.prompt);
+        let fenced = format!(
+            "runtime done\n\n```harness-activity-result\n{{\"activity\":\"{activity}\",\"status\":\"succeeded\",\"summary\":\"runtime done\"}}\n```"
+        );
         let _ = tx
             .send(StreamItem::ItemCompleted {
-                item: Item::AgentReasoning {
-                    content: "runtime done".to_string(),
-                },
+                item: Item::AgentReasoning { content: fenced },
             })
             .await;
         let _ = tx.send(StreamItem::Done).await;
