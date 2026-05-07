@@ -31,8 +31,8 @@ runtime_dispatch:
   enabled: true
   interval_secs: 30
   batch_limit: 25
-  runtime_kind: codex_jsonrpc
-  runtime_profile: codex-default
+  runtime_kind: claude_code
+  runtime_profile: claude-default
   approval_policy: never
 runtime_worker:
   enabled: true
