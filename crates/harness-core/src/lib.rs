@@ -14,6 +14,7 @@ pub mod shell_safety;
 mod test_support;
 pub mod tool_isolation;
 pub mod types;
+pub mod validation;
 
 pub use config::misc::OtelExporter;
 pub use types::{
