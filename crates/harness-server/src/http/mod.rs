@@ -1,6 +1,8 @@
 use crate::server::HarnessServer;
+use harness_core::config::shutdown::ShutdownConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 // Items re-exported into test scope via `use super::*` in tests.rs.
 #[cfg(test)]
@@ -28,6 +30,8 @@ pub(crate) mod task_mutation_routes;
 pub(crate) mod task_query_routes;
 pub(crate) mod task_routes;
 
+#[cfg(test)]
+mod shutdown_test;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -239,20 +243,69 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let ws_shutdown_tx = state.notifications.ws_shutdown_tx.clone();
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            tracing::info!("server shutting down: closing WebSocket connections");
-            ws_shutdown_tx.send(()).ok();
-        })
-        .await;
+    let shutdown_cfg = state.core.server.config.server.shutdown.clone();
+    let hard_deadline = Duration::from_secs(
+        shutdown_cfg
+            .drain_timeout_secs
+            .saturating_add(shutdown_cfg.force_grace_secs),
+    );
+    let serve_future = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let reason = staged_shutdown_signal(shutdown_cfg).await;
+        tracing::info!(?reason, "shutdown: graceful phase ending");
+        ws_shutdown_tx.send(()).ok();
+    });
+
+    let serve_result = match tokio::time::timeout(hard_deadline, serve_future).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                hard_deadline_secs = hard_deadline.as_secs(),
+                "shutdown: hard timeout exceeded — process::exit(1)"
+            );
+            state.observability.events.shutdown().await;
+            std::process::exit(1);
+        }
+    };
     tracing::info!("server shutting down");
     state.observability.events.shutdown().await;
     serve_result?;
     Ok(())
 }
 
-async fn shutdown_signal() {
+/// Reason a graceful shutdown ended. Surfaced for observability and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownReason {
+    /// Drain deadline expired before all in-flight work finished.
+    DrainTimeout,
+    /// User pressed Ctrl+C (or sent SIGTERM) a second time during drain.
+    UserForced,
+}
+
+/// Staged drain-then-force shutdown driver.
+///
+/// Phase 1 — wait for the first signal (Ctrl+C / SIGTERM) and log a drain
+/// notice within milliseconds.
+/// Phase 2 — race the drain deadline against a second signal. The first to
+/// fire decides the [`ShutdownReason`].
+async fn staged_shutdown_signal(cfg: ShutdownConfig) -> ShutdownReason {
+    wait_first_termination_signal().await;
+    tracing::info!(
+        drain_deadline_secs = cfg.drain_timeout_secs,
+        progress_log_secs = cfg.progress_log_secs,
+        "shutdown: draining; press Ctrl+C again to force"
+    );
+    drain_or_force(
+        cfg.drain_timeout_secs,
+        cfg.progress_log_secs,
+        wait_second_termination_signal(),
+    )
+    .await
+}
+
+/// Wait for the first SIGINT/SIGTERM. Errors installing the handlers are
+/// logged but do not abort the drain — we still want orderly shutdown when
+/// only one signal source is available.
+async fn wait_first_termination_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::error!("failed to install Ctrl+C handler: {e}");
@@ -275,6 +328,74 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("received Ctrl+C"),
         _ = terminate => tracing::info!("received SIGTERM"),
+    }
+}
+
+/// Wait for a second SIGINT/SIGTERM after the first one has already been
+/// consumed. Re-installs fresh handlers so a follow-up Ctrl+C is observed.
+async fn wait_second_termination_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("failed to re-install Ctrl+C handler: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("failed to re-install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::warn!("shutdown: second Ctrl+C — forcing"),
+        _ = terminate => tracing::warn!("shutdown: second SIGTERM — forcing"),
+    }
+}
+
+/// Run the drain phase: emit progress logs every `progress_log_secs`,
+/// stop when either the drain deadline expires or the user-force future
+/// resolves.
+async fn drain_or_force<F>(
+    drain_timeout_secs: u64,
+    progress_log_secs: u64,
+    user_force: F,
+) -> ShutdownReason
+where
+    F: std::future::Future<Output = ()>,
+{
+    let drain_deadline = tokio::time::sleep(Duration::from_secs(drain_timeout_secs));
+    let progress_interval = Duration::from_secs(progress_log_secs.max(1)); // never spin at 0s
+    let mut progress = tokio::time::interval(progress_interval);
+    // Skip the immediate first tick so the user does not see a duplicate
+    // log right after the "draining" line above.
+    progress.tick().await;
+
+    tokio::pin!(drain_deadline);
+    tokio::pin!(user_force);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut user_force => return ShutdownReason::UserForced,
+            _ = &mut drain_deadline => return ShutdownReason::DrainTimeout,
+            _ = progress.tick() => {
+                tracing::info!(
+                    drain_timeout_secs,
+                    "shutdown: still draining"
+                );
+            }
+        }
     }
 }
 
