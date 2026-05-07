@@ -4340,6 +4340,8 @@ async fn get_task_hides_internal_system_input_metadata() -> anyhow::Result<()> {
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     let task_id = task.id.to_string();
 
@@ -4822,6 +4824,8 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     let planner_task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -4852,6 +4856,8 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     state.core.tasks.insert(&review_task).await;
     state.core.tasks.insert(&planner_task).await;
@@ -4965,6 +4971,8 @@ async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Resul
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     let pr_task = task_runner::TaskState {
         id: task_runner::TaskId::new(),
@@ -4995,6 +5003,8 @@ async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Resul
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     let issue_task_id = issue_task.id.0.clone();
     let pr_task_id = pr_task.id.0.clone();
@@ -5076,6 +5086,8 @@ async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     state.core.tasks.insert(&task).await;
     let workflows = state
@@ -5798,6 +5810,8 @@ async fn orphan_issue_task_is_redispatched_using_existing_task_row() -> anyhow::
         plan_output: None,
         request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -5851,6 +5865,8 @@ async fn orphan_pr_task_is_redispatched_using_existing_task_row() -> anyhow::Res
         plan_output: None,
         request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -5905,6 +5921,8 @@ async fn orphan_issue_task_is_redispatched_when_external_id_is_noncanonical() ->
         plan_output: None,
         request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -5958,6 +5976,8 @@ async fn orphan_pr_task_is_redispatched_when_external_id_is_noncanonical() -> an
         plan_output: None,
         request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -6015,6 +6035,8 @@ async fn orphan_issue_task_with_prompt_context_fails_when_identifier_is_missing(
         plan_output: None,
         request_settings: Some(settings),
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -6066,6 +6088,8 @@ async fn orphan_prompt_only_task_fails_closed_when_prompt_was_not_persisted() ->
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -6117,6 +6141,8 @@ async fn orphan_prompt_only_task_waits_for_runtime_host_lease_to_expire_before_f
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",
@@ -6176,6 +6202,8 @@ async fn orphan_recovery_excludes_pr_checkpoint_and_non_pending_rows() -> anyhow
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let orphan_id = orphan.id.clone();
     state.core.tasks.insert(&orphan).await;
@@ -6209,6 +6237,8 @@ async fn orphan_recovery_excludes_pr_checkpoint_and_non_pending_rows() -> anyhow
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let with_pr_id = with_pr.id.clone();
     state.core.tasks.insert(&with_pr).await;
@@ -6242,6 +6272,8 @@ async fn orphan_recovery_excludes_pr_checkpoint_and_non_pending_rows() -> anyhow
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let with_checkpoint_id = with_checkpoint.id.clone();
     state.core.tasks.insert(&with_checkpoint).await;
@@ -6280,6 +6312,8 @@ async fn orphan_recovery_excludes_pr_checkpoint_and_non_pending_rows() -> anyhow
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let failed_id = failed.id.clone();
     state.core.tasks.insert(&failed).await;
@@ -6351,6 +6385,8 @@ async fn pr_recovery_marks_task_failed_when_pr_url_unparseable() -> anyhow::Resu
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -6425,6 +6461,8 @@ async fn pr_recovery_redispatches_prompt_tasks_with_pr_urls() -> anyhow::Result<
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -6499,6 +6537,8 @@ async fn checkpoint_recovery_marks_prompt_task_failed() -> anyhow::Result<()> {
         plan_output: None,
         request_settings: None,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -6596,6 +6636,8 @@ async fn get_task_exposes_workspace_lifecycle_metadata() -> anyhow::Result<()> {
         request_settings: None,
         task_kind: task_runner::TaskKind::Issue,
         scheduler: task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -6655,6 +6697,8 @@ async fn pr_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow::Result<
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",
@@ -6725,6 +6769,8 @@ async fn checkpoint_recovery_waits_for_runtime_host_lease_to_expire() -> anyhow:
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",

@@ -79,7 +79,7 @@ pub(super) struct RecoveryRow {
 /// When adding a field to `TaskRow`, add the column here once and all queries
 /// pick it up automatically.  The `task_row_columns_match_struct` test below
 /// will fail if this list drifts from the struct definition.
-pub(super) const TASK_ROW_COLUMNS: &str = "id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, workspace_path, workspace_owner, run_generation, priority, phase, description, request_settings, scheduler_state";
+pub(super) const TASK_ROW_COLUMNS: &str = "id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, external_id, parent_id, created_at, updated_at, repo, depends_on, project, workspace_path, workspace_owner, run_generation, priority, phase, description, request_settings, scheduler_state, version";
 
 #[derive(sqlx::FromRow)]
 pub(super) struct TaskRow {
@@ -107,6 +107,7 @@ pub(super) struct TaskRow {
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
     pub(super) scheduler_state: String,
+    pub(super) version: i32,
 }
 
 /// Combined row for the pending-tasks-with-checkpoint JOIN query.
@@ -136,6 +137,7 @@ pub(super) struct PendingCheckpointRow {
     pub(super) description: Option<String>,
     pub(super) request_settings: Option<String>,
     pub(super) scheduler_state: String,
+    pub(super) version: i32,
     // Checkpoint columns (aliased)
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
@@ -217,6 +219,7 @@ impl TaskRow {
             description,
             request_settings,
             scheduler_state,
+            version,
         } = self;
 
         let decoded_request_settings: Option<crate::task_runner::PersistedRequestSettings> =
@@ -286,6 +289,7 @@ impl TaskRow {
             repo,
             request_settings: decoded_request_settings,
             scheduler: decoded_scheduler,
+            version,
         })
     }
 }

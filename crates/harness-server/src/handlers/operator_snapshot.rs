@@ -326,6 +326,8 @@ mod tests {
             plan_output: None,
             request_settings: None,
             scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+            version: 0,
         };
         let stalled_json = stalled_task_json(&stalled_task);
 
@@ -460,6 +462,8 @@ mod tests {
                 plan_output: None,
                 request_settings: None,
                 scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+                version: 0,
             };
             task.status = crate::task_runner::TaskStatus::Failed;
             state.core.tasks.insert(&task).await;
@@ -521,6 +525,8 @@ mod tests {
             plan_output: None,
             request_settings: None,
             scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+            version: 0,
         };
         state.core.tasks.insert(&task).await;
 
@@ -586,6 +592,8 @@ mod tests {
             plan_output: None,
             request_settings: None,
             scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+            version: 0,
         };
         state.core.tasks.insert(&task).await;
 

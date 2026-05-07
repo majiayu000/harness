@@ -1,5 +1,6 @@
 mod migrations;
 mod queries_aux;
+mod queries_recovery;
 mod queries_tasks;
 mod types;
 

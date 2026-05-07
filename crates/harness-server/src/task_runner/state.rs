@@ -279,6 +279,11 @@ pub struct TaskState {
     /// Canonical scheduler authority for ownership, recovery, and retry state.
     #[serde(default)]
     pub scheduler: TaskSchedulerState,
+    /// Optimistic-locking version. Loaded from the DB on read and supplied as
+    /// a precondition on every `UPDATE tasks` so concurrent writers cannot
+    /// overwrite each other silently. Always 0 for newly-constructed states.
+    #[serde(default)]
+    pub version: i32,
 }
 
 /// Lightweight task summary returned by the list endpoint (excludes `rounds` history).
@@ -472,6 +477,7 @@ impl TaskState {
             repo: None,
             request_settings: None,
             scheduler: TaskSchedulerState::queued(),
+            version: 0,
         }
     }
 

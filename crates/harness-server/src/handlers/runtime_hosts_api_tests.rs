@@ -120,6 +120,8 @@ async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
@@ -221,6 +223,8 @@ async fn deregister_releases_scheduler_owned_pending_tasks() -> anyhow::Result<(
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",
@@ -307,6 +311,8 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_b = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
@@ -337,6 +343,8 @@ async fn claim_endpoint_honors_project_filter() -> anyhow::Result<()> {
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let task_b_id = task_b.id.clone();
 
@@ -421,6 +429,8 @@ async fn claim_endpoint_skips_scheduler_owned_pending_tasks() -> anyhow::Result<
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     scheduler_owned.scheduler.claim_scheduler("local-scheduler");
     let scheduler_owned_id = scheduler_owned.id.clone();
@@ -454,6 +464,8 @@ async fn claim_endpoint_skips_scheduler_owned_pending_tasks() -> anyhow::Result<
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     let claimable_id = claimable.id.clone();
 
@@ -558,6 +570,8 @@ async fn claim_endpoint_rejects_out_of_range_lease_secs() -> anyhow::Result<()> 
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     state.core.tasks.insert(&task).await;
     let app = runtime_hosts_app(state);
@@ -632,6 +646,8 @@ async fn claim_endpoint_rejects_overflowing_lease_ttl() -> anyhow::Result<()> {
         plan_output: None,
         request_settings: None,
         scheduler: crate::task_runner::TaskSchedulerState::queued(),
+
+        version: 0,
     };
     state.core.tasks.insert(&task).await;
     let app = runtime_hosts_app(state);
@@ -707,6 +723,8 @@ async fn deregister_keeps_host_registered_when_claim_release_fails() -> anyhow::
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
+
+        version: 0,
     };
     task.scheduler.claim_runtime_host(
         "host-a",

@@ -509,6 +509,9 @@ impl TaskStore {
             }
             return Err(e);
         }
+        if let Some(mut entry) = self.cache.get_mut(id) {
+            entry.value_mut().version = entry.value().version.saturating_add(1);
+        }
         Ok(Some(crate::runtime_hosts::TaskClaimResult {
             task_id: id.clone(),
             lease_expires_at: expires_at.to_rfc3339(),
@@ -550,6 +553,9 @@ impl TaskStore {
                 rollback.scheduler = original_scheduler;
             }
             return Err(e);
+        }
+        if let Some(mut entry) = self.cache.get_mut(id) {
+            entry.value_mut().version = entry.value().version.saturating_add(1);
         }
         Ok(true)
     }
@@ -1057,6 +1063,13 @@ impl TaskStore {
         };
         if let Some(state) = snapshot {
             self.db.update(&state).await?;
+            // The DB increments `version` atomically inside the UPDATE; mirror
+            // that increment into the in-memory cache so the next persist()
+            // sends a matching expected version instead of tripping the
+            // optimistic-lock guard immediately on the second write.
+            if let Some(mut entry) = self.cache.get_mut(id) {
+                entry.value_mut().version = entry.value().version.saturating_add(1);
+            }
 
             // Persist a checkpoint to the DB so that recover_in_progress() can
             // restore the task if the server is killed mid-flight. Only written
