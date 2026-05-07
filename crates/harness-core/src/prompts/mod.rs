@@ -2,7 +2,11 @@
 
 pub mod context;
 pub mod contract;
+pub mod cross_review;
+pub mod gc_signal;
+pub mod intake;
 pub mod issue;
+pub mod learn;
 pub mod parsing;
 pub mod pr;
 pub mod review;

@@ -467,37 +467,19 @@ fn resolve_for_boundary_check(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn build_prompt(signal: &Signal, project: &Project) -> String {
+    use harness_core::prompts::gc_signal;
+    let project_name = project.name.as_str();
+    // `Signal::details` is a `serde_json::Value`; rendering it via `Display`
+    // preserves the JSON shape that the original inline `format!("{}", ...)`
+    // produced (e.g. quoted string variants).
+    let details = signal.details.to_string();
     match signal.signal_type {
-        SignalType::RepeatedWarn => format!(
-            "Analyze repeated warnings in project {} and generate a guard script to detect this pattern.\nDetails: {}",
-            project.name,
-            signal.details
-        ),
-        SignalType::ChronicBlock => format!(
-            "Analyze chronic block events in project {} and suggest rule improvements to reduce false blocks.\nDetails: {}",
-            project.name,
-            signal.details
-        ),
-        SignalType::HotFiles => format!(
-            "Analyze frequently edited files in project {} and create a SKILL.md with editing strategies.\nDetails: {}",
-            project.name,
-            signal.details
-        ),
-        SignalType::SlowSessions => format!(
-            "Analyze slow operations in project {} and create a performance optimization SKILL.md.\nDetails: {}",
-            project.name,
-            signal.details
-        ),
-        SignalType::WarnEscalation => format!(
-            "Warning trends are escalating in project {}. Suggest rule upgrades (warn → block).\nDetails: {}",
-            project.name,
-            signal.details
-        ),
-        SignalType::LinterViolations => format!(
-            "Code scan found violations in project {}. Generate a guard script to detect and prevent these.\nDetails: {}",
-            project.name,
-            signal.details
-        ),
+        SignalType::RepeatedWarn => gc_signal::repeated_warn(project_name, &details),
+        SignalType::ChronicBlock => gc_signal::chronic_block(project_name, &details),
+        SignalType::HotFiles => gc_signal::hot_files(project_name, &details),
+        SignalType::SlowSessions => gc_signal::slow_sessions(project_name, &details),
+        SignalType::WarnEscalation => gc_signal::warn_escalation(project_name, &details),
+        SignalType::LinterViolations => gc_signal::linter_violations(project_name, &details),
     }
 }
 
