@@ -1329,8 +1329,31 @@ pub async fn update_status(
     status: TaskStatus,
     turn: u32,
 ) -> anyhow::Result<()> {
+    // Terminal-state preservation: once a task has reached Done, Failed, or
+    // Cancelled, refuse to transition it to any other status. This prevents
+    // late-running execution paths (e.g. a task that was cancelled while
+    // waiting for a queue permit) from resurrecting a terminal task to
+    // Triaging / Implementing / Reviewing or overwriting one terminal state
+    // with another. Issue #1046.
+    if let Some(existing) = store.get(task_id) {
+        if existing.status.is_terminal() && existing.status != status {
+            tracing::warn!(
+                task_id = %task_id.0,
+                current = existing.status.as_ref(),
+                attempted = status.as_ref(),
+                "refusing to overwrite terminal task status"
+            );
+            return Ok(());
+        }
+    }
     let status_str = status.as_ref().to_string();
     mutate_and_persist(store, task_id, |s| {
+        // Re-check inside the mutation closure: another writer may have
+        // marked the task terminal between the snapshot above and the
+        // exclusive cache lock acquired by `mutate_and_persist`.
+        if s.status.is_terminal() && s.status != status {
+            return;
+        }
         s.status = status.clone();
         s.turn = turn;
         match status {
@@ -2079,6 +2102,54 @@ mod tests {
         )
         .await
         .map_err(|_| anyhow::anyhow!("rate limit must be cleared after its deadline passes"))?;
+        Ok(())
+    }
+
+    /// Regression for issue #1046: once a task is Cancelled, a late
+    /// `update_status` from an execution path that started before
+    /// cancellation must not resurrect it back to a non-terminal status
+    /// nor overwrite it with a different terminal status.
+    #[tokio::test]
+    async fn update_status_does_not_overwrite_cancelled_terminal() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("cancelled-task".to_string());
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::Cancelled;
+        task.scheduler.mark_terminal(&TaskStatus::Cancelled);
+        store.insert(&task).await;
+
+        // A late execution path tries to mark the task Implementing.
+        update_status(&store, &task_id, TaskStatus::Implementing, 0).await?;
+        let after = store.get(&task_id).expect("task in cache");
+        assert_eq!(after.status, TaskStatus::Cancelled, "must remain Cancelled");
+
+        // Reviewing must also be refused.
+        update_status(&store, &task_id, TaskStatus::Reviewing, 1).await?;
+        let after = store.get(&task_id).expect("task in cache");
+        assert_eq!(after.status, TaskStatus::Cancelled);
+
+        // Cross-terminal overwrites (Cancelled -> Done) must also be refused.
+        update_status(&store, &task_id, TaskStatus::Done, 2).await?;
+        let after = store.get(&task_id).expect("task in cache");
+        assert_eq!(after.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+
+    /// Idempotent: writing the same terminal status is a no-op (no error).
+    #[tokio::test]
+    async fn update_status_idempotent_on_same_terminal() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("done-task".to_string());
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::Done;
+        task.scheduler.mark_terminal(&TaskStatus::Done);
+        store.insert(&task).await;
+
+        update_status(&store, &task_id, TaskStatus::Done, 5).await?;
+        let after = store.get(&task_id).expect("task in cache");
+        assert_eq!(after.status, TaskStatus::Done);
         Ok(())
     }
 }
