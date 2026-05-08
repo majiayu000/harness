@@ -7,7 +7,9 @@ Use when a `git rebase` against the base branch surfaces one or more conflicts t
 
 ## Input
 - PR number, head branch, and base branch (resolved via `gh pr view`).
-- Path to an isolated worktree, e.g. `/tmp/harness-rebase-<pr>`.
+- Path to the isolated worktree provided by the caller. Direct `pr:N`
+  review-prep prompts usually use `/tmp/harness-pr-{pr}`; standalone rebase
+  tasks may provide a different path. Use the provided path verbatim.
 - Read access to the GitHub repo (for divergence stats and commit fingerprints).
 
 ## Procedure
@@ -138,17 +140,46 @@ git push --force-with-lease "$HEAD_REPO_URL" HEAD:"$BRANCH"
 Report the new commit count (`git log --oneline origin/$BASE..HEAD | wc -l`) and the new base SHA (`git rev-parse origin/$BASE`).
 
 ## Output Format
-End the run with one terminal token on its own line:
 
-- `REBASE_PUSHED` — rebase or cherry-pick fallback succeeded, verify passed, force-push completed.
+This skill targets the implement-turn pre-PR review-prep contract that
+`harness_core::prompts::parse_pr_review_prep_outcome` consumes. The parser
+accepts exactly three terminal tokens; any other token starting with
+`REBASE_` (including a bare `REBASE_CONFLICT` without `paths=...`) is
+rejected and the run is treated as malformed, losing the structured report
+you wrote above. Emit one — and only one — of these tokens on its own
+final line:
+
+- `REBASE_PUSHED` — rebase or cherry-pick fallback succeeded, verify passed,
+  force-push completed.
 - `REBASE_SKIPPED` — branch was already up to date with base; nothing to do.
-- `REBASE_CONFLICT` — escalation report emitted; manual review required.
-- `REBASE_VERIFY_FAILED` — rebase resolved but build/test sanity check failed; report attached.
+- `REBASE_CONFLICT paths=path1,path2` — manual handling required. The
+  `paths=` suffix is mandatory; list every file that holds an unresolved
+  conflict or that the verification step flagged. The previous lines of
+  output MUST contain the structured report described above so downstream
+  automation can plan a next step without re-running the rebase.
 
-When emitting `REBASE_CONFLICT` or `REBASE_VERIFY_FAILED`, the *previous* lines of output MUST contain the structured report described above so the orchestrator can plan a next step without re-running the rebase.
+### Verification failures
+
+A failed step-5 build/test check is also reported as
+`REBASE_CONFLICT paths=...` (with the files modified during the rebase, or
+the files implicated by the failing tests). The accompanying structured
+report sets `"classification": "verify_failed"` so the orchestrator can
+distinguish a verify-failed escalation from a true textual conflict; the
+terminal token stays inside the parser-accepted set so the report is
+preserved instead of being discarded as malformed output.
+
+### Out of scope: resumed conflict-gate prompts
+
+If you are resolving the resumed conflict gate (the prompt that asks "is
+this PR clean to merge?"), use that gate's own contract — `CLEAN_PR`,
+`REBASE_PUSHED`, or `MANUAL_RESOLUTION_REQUIRED` — emitted by
+`task_executor::conflict_resolver::parse_conflict_check_output`. Do not
+mix the two contracts in one run.
 
 ## Constraints
-- Never run `git checkout` or `git stash` in the main repository working tree — use `/tmp/harness-rebase-<pr>` worktree only.
+- Never run `git checkout` or `git stash` in the main repository working tree.
+  Use the caller-provided isolated worktree only, and do not switch to or create
+  a different hard-coded path.
 - Never push without `--force-with-lease`.
 - Never silently drop a commit. Every `--skip` decision must be logged with the dropped SHA, subject, and the rule (stray vs duplicate) that classified it.
 - Never claim success without running step 5 verification in this session.

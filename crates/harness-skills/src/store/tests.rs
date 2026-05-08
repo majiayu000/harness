@@ -689,3 +689,66 @@ fn rebase_pr_playbook_covers_cherry_pick_fallback() {
         "playbook must include a cherry-pick-onto-fresh-main fallback"
     );
 }
+
+/// Regression for #1078: the skill must prescribe terminal tokens that the
+/// server's `parse_pr_review_prep_outcome` parser actually accepts. The parser
+/// rejects bare `REBASE_CONFLICT` (without the mandatory `paths=...` suffix)
+/// and any other `REBASE_*` token. If the skill prescribes
+/// `REBASE_VERIFY_FAILED` or bare `REBASE_CONFLICT`, an agent following the
+/// playbook produces output the server discards as malformed, losing the
+/// structured report.
+#[test]
+fn rebase_pr_terminal_tokens_match_parser_contract() {
+    let skill = rebase_pr_skill();
+    let body = skill.content.as_str();
+
+    // The three accepted tokens must all be documented.
+    assert!(
+        body.contains("REBASE_PUSHED"),
+        "skill must document REBASE_PUSHED — the parser-accepted success token"
+    );
+    assert!(
+        body.contains("REBASE_SKIPPED"),
+        "skill must document REBASE_SKIPPED — the parser-accepted no-op token"
+    );
+    assert!(
+        body.contains("REBASE_CONFLICT paths="),
+        "skill must prescribe REBASE_CONFLICT with the mandatory paths= suffix; \
+         the parser rejects bare REBASE_CONFLICT and the report is lost"
+    );
+
+    // Tokens the parser rejects must not appear as prescribed terminal tokens.
+    // (Substring match is a deliberate over-approximation — even a stray
+    // mention can mislead an agent following the playbook.)
+    assert!(
+        !body.contains("REBASE_VERIFY_FAILED"),
+        "skill must not prescribe REBASE_VERIFY_FAILED — the parser rejects \
+         it, so the structured report is discarded; verify-failed should be \
+         emitted as REBASE_CONFLICT paths=... with classification=verify_failed \
+        in the structured report"
+    );
+}
+
+/// Regression for #1078: direct PR review-prep prompts provide their own
+/// isolated worktree path, usually `/tmp/harness-pr-{pr}`. The skill must not
+/// contradict that caller contract by sending the agent to a different
+/// hard-coded path.
+#[test]
+fn rebase_pr_worktree_path_uses_caller_provided_contract() {
+    let skill = rebase_pr_skill();
+    let body = skill.content.as_str();
+
+    assert!(
+        body.contains("caller-provided isolated worktree"),
+        "skill must tell agents to use the worktree path supplied by the caller"
+    );
+    assert!(
+        body.contains("/tmp/harness-pr-{pr}"),
+        "skill should document the direct PR review-prep worktree shape"
+    );
+    assert!(
+        !body.contains("/tmp/harness-rebase"),
+        "skill must not hard-code a second worktree path that conflicts with \
+         the PR review-prep prompt"
+    );
+}
