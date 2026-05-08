@@ -68,6 +68,7 @@ pub(super) struct RecoveryRow {
     pub(super) turn: i64,
     pub(super) task_pr_url: Option<String>,
     pub(super) scheduler_state: String,
+    pub(super) version: i32,
     pub(super) triage_output: Option<String>,
     pub(super) plan_output: Option<String>,
     pub(super) ck_pr_url: Option<String>,

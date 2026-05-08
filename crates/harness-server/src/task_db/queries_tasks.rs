@@ -268,32 +268,60 @@ impl TaskDb {
         Ok(row)
     }
 
-    /// Update only the `status` column without touching `updated_at`.
+    /// Update only the `status` column without touching `updated_at`. Still
+    /// bumps `version` so that any concurrent reader-then-writer using
+    /// optimistic locking observes this write and refuses to overwrite it.
     pub(crate) async fn update_status_only(
         &self,
         id: &str,
         status: &str,
         scheduler_state: &str,
+        expected_version: i32,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE tasks SET status = $1, scheduler_state = $2 WHERE id = $3")
-            .bind(status)
-            .bind(scheduler_state)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE tasks SET status = $1, scheduler_state = $2, version = version + 1 \
+             WHERE id = $3 AND version = $4",
+        )
+        .bind(status)
+        .bind(scheduler_state)
+        .bind(id)
+        .bind(expected_version)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow::anyhow!(
+                "optimistic-lock conflict updating task status {} (expected version {}); reload before retrying",
+                id,
+                expected_version
+            ));
+        }
         Ok(())
     }
 
     /// Back-fill `external_id` on a task that was created without one.
-    pub async fn update_external_id(&self, id: &str, external_id: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE tasks SET external_id = $1, updated_at = CURRENT_TIMESTAMP \
-             WHERE id = $2 AND external_id IS NULL",
+    pub async fn update_external_id(
+        &self,
+        id: &str,
+        external_id: &str,
+        expected_version: i32,
+    ) -> anyhow::Result<()> {
+        let result = sqlx::query(
+            "UPDATE tasks SET external_id = $1, updated_at = CURRENT_TIMESTAMP, \
+             version = version + 1 \
+             WHERE id = $2 AND external_id IS NULL AND version = $3",
         )
         .bind(external_id)
         .bind(id)
+        .bind(expected_version)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow::anyhow!(
+                "optimistic-lock conflict updating task external_id {} (expected version {}); reload before retrying",
+                id,
+                expected_version
+            ));
+        }
         Ok(())
     }
 
@@ -302,15 +330,25 @@ impl TaskDb {
         &self,
         id: &str,
         external_id: &str,
+        expected_version: i32,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE tasks SET external_id = $1, updated_at = CURRENT_TIMESTAMP \
-             WHERE id = $2 AND source = 'auto-fix'",
+        let result = sqlx::query(
+            "UPDATE tasks SET external_id = $1, updated_at = CURRENT_TIMESTAMP, \
+             version = version + 1 \
+             WHERE id = $2 AND source = 'auto-fix' AND version = $3",
         )
         .bind(external_id)
         .bind(id)
+        .bind(expected_version)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow::anyhow!(
+                "optimistic-lock conflict overwriting auto-fix task external_id {} (expected version {}); reload before retrying",
+                id,
+                expected_version
+            ));
+        }
         Ok(())
     }
 
@@ -402,6 +440,15 @@ impl TaskDb {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|(s,)| s))
+    }
+
+    /// Return the current optimistic-locking version of a single task.
+    pub(crate) async fn get_version_only(&self, id: &str) -> anyhow::Result<Option<i32>> {
+        let row: Option<(i32,)> = sqlx::query_as("SELECT version FROM tasks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(version,)| version))
     }
 
     /// Return `true` if a task row with the given ID exists in the database.

@@ -1036,12 +1036,27 @@ impl TaskStore {
         id: &TaskId,
         external_id: &str,
     ) -> anyhow::Result<()> {
+        let lock = self
+            .persist_locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let expected_version = match self.cache.get(id) {
+            Some(entry) => entry.version,
+            None => match self.db.get_version_only(id.as_str()).await? {
+                Some(version) => version,
+                None => return Ok(()),
+            },
+        };
         self.db
-            .overwrite_external_id_auto_fix(id.as_str(), external_id)
+            .overwrite_external_id_auto_fix(id.as_str(), external_id, expected_version)
             .await?;
         if let Some(mut entry) = self.cache.get_mut(id) {
             if entry.source.as_deref() == Some("auto-fix") {
                 entry.external_id = Some(external_id.to_string());
+                entry.version = entry.version.saturating_add(1);
             }
         }
         Ok(())
@@ -1101,23 +1116,56 @@ impl TaskStore {
         id: &TaskId,
         status: TaskStatus,
     ) -> anyhow::Result<()> {
+        let lock = self
+            .persist_locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         let mut scheduler_json = None;
+        let mut expected_version = None;
+        let mut rollback_state = None;
         if let Some(mut entry) = self.cache.get_mut(id) {
+            rollback_state = Some((entry.status.clone(), entry.scheduler.clone()));
             entry.value_mut().status = status.clone();
             entry.value_mut().reconcile_scheduler_with_status();
             scheduler_json = Some(serde_json::to_string(&entry.value().scheduler)?);
+            expected_version = Some(entry.value().version);
         }
+        let expected_version = match expected_version {
+            Some(version) => version,
+            None => match self.db.get_version_only(id.as_str()).await? {
+                Some(version) => version,
+                None => return Ok(()),
+            },
+        };
         let default_scheduler_json =
             serde_json::to_string(&crate::task_runner::TaskSchedulerState::queued())?;
-        self.db
+        if let Err(e) = self
+            .db
             .update_status_only(
                 id.0.as_str(),
                 status.as_ref(),
                 scheduler_json
                     .as_deref()
                     .unwrap_or(default_scheduler_json.as_str()),
+                expected_version,
             )
             .await
+        {
+            if let Some((original_status, original_scheduler)) = rollback_state {
+                if let Some(mut entry) = self.cache.get_mut(id) {
+                    entry.value_mut().status = original_status;
+                    entry.value_mut().scheduler = original_scheduler;
+                }
+            }
+            return Err(e);
+        }
+        if let Some(mut entry) = self.cache.get_mut(id) {
+            entry.value_mut().version = entry.value().version.saturating_add(1);
+        }
+        Ok(())
     }
 
     /// Validate recovered pending tasks by checking their GitHub PR state via `gh`.
@@ -1871,6 +1919,66 @@ mod tests {
         let key = root.to_string_lossy().into_owned();
         assert_eq!(counts.by_project[&key].done, 1);
         assert_eq!(counts.by_project[&key].failed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_status_preserve_staleness_mirrors_version_in_cache_and_db(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("restore-version".to_string());
+        let task = TaskState::new(task_id.clone());
+        store.insert(&task).await;
+
+        store
+            .restore_status_preserve_staleness(&task_id, TaskStatus::Failed)
+            .await?;
+
+        let cached = store
+            .get(&task_id)
+            .expect("task should remain cached after status restore");
+        assert_eq!(cached.status, TaskStatus::Failed);
+        assert_eq!(cached.version, 1);
+
+        let persisted = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .expect("task should remain persisted after status restore");
+        assert_eq!(persisted.status, TaskStatus::Failed);
+        assert_eq!(persisted.version, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overwrite_external_id_auto_fix_mirrors_version_in_cache_and_db() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = harness_core::types::TaskId("auto-fix-version".to_string());
+        let mut task = TaskState::new(task_id.clone());
+        task.source = Some("auto-fix".to_string());
+        task.external_id = Some("old-external-id".to_string());
+        store.insert(&task).await;
+
+        store
+            .overwrite_external_id_auto_fix(&task_id, "new-external-id")
+            .await?;
+
+        let cached = store
+            .get(&task_id)
+            .expect("task should remain cached after external_id overwrite");
+        assert_eq!(cached.external_id.as_deref(), Some("new-external-id"));
+        assert_eq!(cached.version, 1);
+
+        let persisted = store
+            .db
+            .get(task_id.as_str())
+            .await?
+            .expect("task should remain persisted after external_id overwrite");
+        assert_eq!(persisted.external_id.as_deref(), Some("new-external-id"));
+        assert_eq!(persisted.version, 1);
         Ok(())
     }
 

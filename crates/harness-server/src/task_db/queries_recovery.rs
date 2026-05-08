@@ -19,13 +19,16 @@ impl TaskDb {
         terminal_status: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(status) = terminal_status {
-            let scheduler_state_row: Option<(String,)> =
-                sqlx::query_as("SELECT scheduler_state FROM tasks WHERE id = $1")
+            let scheduler_state_row: Option<(String, i32)> =
+                sqlx::query_as("SELECT scheduler_state, version FROM tasks WHERE id = $1")
                     .bind(task_id)
                     .fetch_optional(&self.pool)
                     .await?;
-            let mut scheduler = scheduler_state_row
-                .and_then(|(value,)| {
+            let Some((scheduler_state, expected_version)) = scheduler_state_row else {
+                return Ok(());
+            };
+            let mut scheduler = Some(scheduler_state)
+                .and_then(|value| {
                     serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&value).ok()
                 })
                 .unwrap_or_default();
@@ -34,28 +37,42 @@ impl TaskDb {
             }
             let scheduler_json = serde_json::to_string(&scheduler)?;
             let resumable = TaskStatus::resumable_statuses();
-            let placeholders = Self::numbered_placeholders(5, resumable.len());
+            let placeholders = Self::numbered_placeholders(6, resumable.len());
             let sql = format!(
                 "UPDATE tasks SET status = $1, pr_url = COALESCE($2, pr_url), \
-                 scheduler_state = $3, updated_at = CURRENT_TIMESTAMP \
-                 WHERE id = $4 AND status IN ({})",
+                 scheduler_state = $3, updated_at = CURRENT_TIMESTAMP, \
+                 version = version + 1 \
+                 WHERE id = $4 AND version = $5 AND status IN ({})",
                 placeholders
             );
             let query = sqlx::query(&sql)
                 .bind(status)
                 .bind(pr_url)
                 .bind(&scheduler_json)
-                .bind(task_id);
+                .bind(task_id)
+                .bind(expected_version);
             let query = resumable
                 .iter()
                 .fold(query, |q, resumable| q.bind(*resumable));
             query.execute(&self.pool).await?;
         } else if let Some(url) = pr_url {
-            sqlx::query("UPDATE tasks SET pr_url = $1 WHERE id = $2 AND pr_url IS NULL")
-                .bind(url)
-                .bind(task_id)
-                .execute(&self.pool)
-                .await?;
+            let version_row: Option<(i32,)> =
+                sqlx::query_as("SELECT version FROM tasks WHERE id = $1 AND pr_url IS NULL")
+                    .bind(task_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            let Some((expected_version,)) = version_row else {
+                return Ok(());
+            };
+            sqlx::query(
+                "UPDATE tasks SET pr_url = $1, version = version + 1 \
+                 WHERE id = $2 AND pr_url IS NULL AND version = $3",
+            )
+            .bind(url)
+            .bind(task_id)
+            .bind(expected_version)
+            .execute(&self.pool)
+            .await?;
         }
         Ok(())
     }
@@ -66,7 +83,7 @@ impl TaskDb {
             let resumable = TaskStatus::resumable_statuses();
             let placeholders = Self::numbered_placeholders(1, resumable.len());
             let sql = format!(
-                "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url, t.scheduler_state, \
+                "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url, t.scheduler_state, t.version, \
                         c.triage_output, c.plan_output, c.pr_url AS ck_pr_url \
                  FROM tasks t \
                  LEFT JOIN task_checkpoints c ON t.id = c.task_id \
@@ -130,11 +147,13 @@ impl TaskDb {
                 if needs_pr_url_writeback {
                     sqlx::query(
                         "UPDATE tasks SET status = 'pending', error = NULL, pr_url = $1, \
-                         scheduler_state = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3",
+                         scheduler_state = $2, updated_at = CURRENT_TIMESTAMP, \
+                         version = version + 1 WHERE id = $3 AND version = $4",
                     )
                     .bind(effective_pr_url)
                     .bind(&scheduler_json)
                     .bind(&row.id)
+                    .bind(row.version)
                     .execute(&self.pool)
                     .await?;
                     tracing::info!(
@@ -146,10 +165,12 @@ impl TaskDb {
                 } else {
                     sqlx::query(
                         "UPDATE tasks SET status = 'pending', error = NULL, \
-                         scheduler_state = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                         scheduler_state = $1, updated_at = CURRENT_TIMESTAMP, \
+                         version = version + 1 WHERE id = $2 AND version = $3",
                     )
                     .bind(&scheduler_json)
                     .bind(&row.id)
+                    .bind(row.version)
                     .execute(&self.pool)
                     .await?;
                 }
@@ -171,25 +192,27 @@ impl TaskDb {
                 let scheduler_json = serde_json::to_string(&scheduler)?;
                 sqlx::query(
                     "UPDATE tasks SET status = 'failed', error = $1, \
-                     scheduler_state = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3",
+                     scheduler_state = $2, updated_at = CURRENT_TIMESTAMP, \
+                     version = version + 1 WHERE id = $3 AND version = $4",
                 )
                 .bind(&err)
                 .bind(&scheduler_json)
                 .bind(&row.id)
+                .bind(row.version)
                 .execute(&self.pool)
                 .await?;
                 result.failed += 1;
             }
         }
 
-        let transient_failed_rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
-            "SELECT id, error, scheduler_state FROM tasks \
+        let transient_failed_rows: Vec<(String, Option<String>, String, i32)> = sqlx::query_as(
+            "SELECT id, error, scheduler_state, version FROM tasks \
              WHERE status = 'pending' \
                AND error LIKE 'retrying after transient failure%'",
         )
         .fetch_all(&self.pool)
         .await?;
-        for (id, error, scheduler_state) in &transient_failed_rows {
+        for (id, error, scheduler_state, expected_version) in &transient_failed_rows {
             let mut scheduler =
                 serde_json::from_str::<crate::task_runner::TaskSchedulerState>(scheduler_state)
                     .unwrap_or_default();
@@ -201,11 +224,12 @@ impl TaskDb {
             );
             sqlx::query(
                 "UPDATE tasks SET status = 'failed', error = $1, scheduler_state = $2, \
-                 updated_at = CURRENT_TIMESTAMP WHERE id = $3",
+                 updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE id = $3 AND version = $4",
             )
             .bind(err)
             .bind(&scheduler_json)
             .bind(id)
+            .bind(expected_version)
             .execute(&self.pool)
             .await?;
         }
