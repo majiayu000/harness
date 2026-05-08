@@ -1347,10 +1347,14 @@ pub async fn update_status(
         }
     }
     let status_str = status.as_ref().to_string();
+    // Track whether the inner closure actually applied the status change.
+    // When the inner re-check refuses (race: another writer marked terminal
+    // between the snapshot above and the exclusive cache lock), `mutate_and_persist`
+    // still persists the row but the durable status does not change. The
+    // StatusChanged event must reflect that — logging it for a status that was
+    // never written would put the event log out of sync with the durable row.
+    let applied = std::sync::atomic::AtomicBool::new(false);
     mutate_and_persist(store, task_id, |s| {
-        // Re-check inside the mutation closure: another writer may have
-        // marked the task terminal between the snapshot above and the
-        // exclusive cache lock acquired by `mutate_and_persist`.
         if s.status.is_terminal() && s.status != status {
             return;
         }
@@ -1376,14 +1380,23 @@ pub async fn update_status(
                 }
             }
         }
+        applied.store(true, std::sync::atomic::Ordering::Relaxed);
     })
     .await?;
-    store.log_event(crate::event_replay::TaskEvent::StatusChanged {
-        task_id: task_id.0.clone(),
-        ts: crate::event_replay::now_ts(),
-        status: status_str,
-        turn,
-    });
+    if applied.load(std::sync::atomic::Ordering::Relaxed) {
+        store.log_event(crate::event_replay::TaskEvent::StatusChanged {
+            task_id: task_id.0.clone(),
+            ts: crate::event_replay::now_ts(),
+            status: status_str,
+            turn,
+        });
+    } else {
+        tracing::debug!(
+            task_id = %task_id.0,
+            attempted = status_str,
+            "update_status skipped: inner guard refused (terminal-state preservation); not logging StatusChanged"
+        );
+    }
     Ok(())
 }
 

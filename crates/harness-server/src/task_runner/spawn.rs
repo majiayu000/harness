@@ -229,6 +229,10 @@ fn should_remove_workspace_after_task(state: Option<&TaskState>, auto_cleanup: b
     auto_cleanup && !is_issue_pr_task_state(state)
 }
 
+fn should_abort_after_abort_handle_registration(state: &TaskState, handle_finished: bool) -> bool {
+    state.status.is_terminal() && !handle_finished
+}
+
 pub async fn resolve_canonical_project(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let raw = resolve_project_root_with(project, detect_main_worktree).await?;
     // Best-effort canonicalize: if the path doesn't exist yet (e.g. in tests
@@ -950,6 +954,25 @@ where
     // cancel endpoint can abort the task's Tokio future (which also kills the
     // child process via kill_on_drop(true)).
     store_for_abort.store_abort_handle(&id_for_abort, handle.abort_handle());
+
+    // Race fix: a cancel request that landed between the queue-side terminal-state
+    // gate (services/execution.rs) and `store_abort_handle` above would have
+    // persisted Cancelled but found no abort handle, so its `abort_task` was a
+    // no-op. Now that the handle is registered, re-read the status; if any writer
+    // has already moved the task to a terminal state and the future is still
+    // running, abort the just-spawned future before it can invoke the agent.
+    // handle.abort() is idempotent so a concurrent abort_task call from the
+    // cancel route is safe.
+    if let Some(state) = store_for_abort.get(&id_for_abort) {
+        if should_abort_after_abort_handle_registration(&state, handle.is_finished()) {
+            tracing::info!(
+                task_id = %id_for_abort.0,
+                status = state.status.as_ref(),
+                "aborting freshly-spawned task: status reached terminal between queue gate and abort-handle registration"
+            );
+            handle.abort();
+        }
+    }
 
     tokio::spawn(async move {
         match handle.await {

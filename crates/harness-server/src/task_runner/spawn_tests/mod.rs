@@ -67,6 +67,27 @@ fn workspace_cleanup_removes_done_prompt_when_auto_cleanup_enabled() {
     assert!(should_remove_workspace_after_task(Some(&state), true));
 }
 
+#[test]
+fn abort_after_handle_registration_only_targets_live_terminal_tasks() {
+    let mut cancelled = TaskState::new(tid("cancelled"));
+    cancelled.status = TaskStatus::Cancelled;
+    assert!(
+        should_abort_after_abort_handle_registration(&cancelled, false),
+        "a terminal task with a live handle must be aborted"
+    );
+    assert!(
+        !should_abort_after_abort_handle_registration(&cancelled, true),
+        "a task that already finished itself must not be aborted again"
+    );
+
+    let mut implementing = TaskState::new(tid("implementing"));
+    implementing.status = TaskStatus::Implementing;
+    assert!(
+        !should_abort_after_abort_handle_registration(&implementing, false),
+        "non-terminal tasks must keep running"
+    );
+}
+
 /// Verify that a local u32 counter correctly tracks waiting rounds without any store query.
 /// Task execution is sequential within a single tokio task, so a plain local counter suffices.
 #[test]
