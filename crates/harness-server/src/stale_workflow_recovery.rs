@@ -95,6 +95,22 @@ pub async fn run_stale_workflow_recovery_tick(
             let stuck_secs = (Utc::now() - instance.updated_at).num_seconds();
             instance.state = RECOVERY_TARGET_STATE.to_string();
             instance.version = instance.version.saturating_add(1);
+            // Bump the JSON-baked updated_at so subsequent recovery ticks see a
+            // fresh timestamp and do not re-reset this same instance on every
+            // tick. The Postgres column updated_at is independently bumped by
+            // upsert_instance via CURRENT_TIMESTAMP, but list_instances_by_state
+            // returns instances deserialised from the data jsonb and the JSON
+            // copy of updated_at is what subsequent ticks compare against.
+            //
+            // Without this bump the recovery tick thrashes: after the first
+            // reset the column moves forward to NOW() but the data jsonb still
+            // carries a stale (often pre-reset) updated_at, so 10 minutes
+            // later the next tick re-reads the stale JSON timestamp, decides
+            // the workflow is still stale, and resets again. Observed in
+            // production: 8 workflows reset twice in 10 minutes after server
+            // restart, despite having transitioned through scanning legitimately
+            // in between.
+            instance.updated_at = Utc::now();
             match store.upsert_instance(&instance).await {
                 Ok(()) => {
                     tracing::warn!(
@@ -237,6 +253,68 @@ mod tests {
         // The seeded states are not in STUCK_STATES, so none should have been
         // scanned (the SQL filter excludes them). recovered MUST be 0.
         assert_eq!(tick.recovered, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_tick_does_not_re_reset_workflow_on_subsequent_tick() {
+        // Regression: previously the tick used the JSON-baked updated_at on
+        // each iteration, which never advanced after upsert_instance because
+        // upsert_instance bumped the Postgres column via CURRENT_TIMESTAMP
+        // but did NOT mutate the deserialized struct's updated_at field.
+        // Result: the same workflow was reset on every 10-minute tick.
+        //
+        // The fix bumps `instance.updated_at = Utc::now()` before each upsert
+        // in the recovery path so the JSON timestamp stays in lock-step with
+        // the column. Verified here: with a 5-minute threshold, a workflow
+        // that was just recovered should not be re-recovered on an
+        // immediately-following tick.
+        let Some(store) = open_recovery_test_store().await else {
+            return;
+        };
+        let id = "test::stale-recovery::no-thrash";
+        let mut seed = stuck_instance(id, "dispatching");
+        // Force the seed instance to look stale (JSON updated_at = 1h ago)
+        // so the first tick will resolve it.
+        seed.updated_at = Utc::now() - chrono::Duration::hours(1);
+        store.upsert_instance(&seed).await.unwrap();
+
+        // First tick with 5-min threshold: 1h-old instance is stale, must reset.
+        let first = run_stale_workflow_recovery_tick(&store, 300).await.unwrap();
+        assert!(
+            first.recovered >= 1,
+            "first tick should reset stuck workflow"
+        );
+
+        let post_first = store.get_instance(id).await.unwrap().unwrap();
+        assert_eq!(post_first.state, "idle");
+
+        // Simulate the workflow transitioning back to a stuck state via the
+        // reducer path that historically does NOT bump the JSON updated_at.
+        // The recovery fix means post_first.updated_at is now ~"first-tick
+        // now"; a reducer that copies that value forward writes a JSON
+        // timestamp that is well within the 5-minute window.
+        let mut transitioned = post_first.clone();
+        transitioned.state = "dispatching".to_string();
+        transitioned.version = transitioned.version.saturating_add(1);
+        // Intentionally do NOT touch transitioned.updated_at — mimics the
+        // upstream reducer behavior we observed in production.
+        store.upsert_instance(&transitioned).await.unwrap();
+
+        // Second tick with the same 5-min threshold MUST NOT reset, because
+        // the workflow's JSON updated_at is now "fresh" relative to the
+        // 5-minute cutoff.
+        let second = run_stale_workflow_recovery_tick(&store, 300).await.unwrap();
+        assert_eq!(
+            second.recovered, 0,
+            "second tick must not re-reset a workflow whose JSON updated_at \
+             was just bumped by the first tick"
+        );
+
+        let post_second = store.get_instance(id).await.unwrap().unwrap();
+        assert_eq!(
+            post_second.state, "dispatching",
+            "transitioned-back state must be preserved by second tick"
+        );
     }
 
     #[tokio::test]
