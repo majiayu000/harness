@@ -1,5 +1,4 @@
 use crate::server::HarnessServer;
-use harness_core::config::shutdown::ShutdownConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -244,32 +243,107 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let ws_shutdown_tx = state.notifications.ws_shutdown_tx.clone();
     let shutdown_cfg = state.core.server.config.server.shutdown.clone();
-    let hard_deadline = Duration::from_secs(
-        shutdown_cfg
-            .drain_timeout_secs
-            .saturating_add(shutdown_cfg.force_grace_secs),
-    );
-    let serve_future = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let reason = staged_shutdown_signal(shutdown_cfg).await;
-        tracing::info!(?reason, "shutdown: graceful phase ending");
-        ws_shutdown_tx.send(()).ok();
+
+    // Fan the first SIGINT/SIGTERM out to two consumers:
+    //   (a) the with_graceful_shutdown future, so Axum stops accepting new
+    //       connections the instant the signal lands (P1 fix);
+    //   (b) the force-watcher task, so the hard-deadline timer starts at
+    //       signal time, not at server startup (P0 fix).
+    // A watch channel lets a single signal handler notify both consumers
+    // without racing on which side runs first.
+    let (first_signal_tx, first_signal_rx_serve) = tokio::sync::watch::channel(false);
+    let first_signal_rx_force = first_signal_tx.subscribe();
+    tokio::spawn(async move {
+        wait_first_termination_signal().await;
+        let _ = first_signal_tx.send(true);
     });
 
-    let serve_result = match tokio::time::timeout(hard_deadline, serve_future).await {
-        Ok(result) => result,
-        Err(_) => {
-            tracing::error!(
-                hard_deadline_secs = hard_deadline.as_secs(),
-                "shutdown: hard timeout exceeded — process::exit(1)"
-            );
-            state.observability.events.shutdown().await;
-            std::process::exit(1);
-        }
-    };
+    let serve_future = axum::serve(listener, app).with_graceful_shutdown(
+        axum_graceful_shutdown_signal(first_signal_rx_serve, shutdown_cfg.clone()),
+    );
+
+    let force_watcher_cfg = shutdown_cfg.clone();
+    let force_watcher_events = state.observability.events.clone();
+    let force_watcher_ws_tx = ws_shutdown_tx.clone();
+    let force_watcher = tokio::spawn(async move {
+        let Some(reason) = wait_for_first_signal_then_drain_or_force(
+            first_signal_rx_force,
+            force_watcher_cfg.clone(),
+            wait_second_termination_signal(),
+        )
+        .await
+        else {
+            return;
+        };
+        tracing::info!(
+            ?reason,
+            "shutdown: drain phase ended, force-closing long-lived connections"
+        );
+        force_watcher_ws_tx.send(()).ok();
+
+        // Phase 3: hard deadline. If the serve future has not resolved within
+        // the force-grace window, exit forcefully.
+        tokio::time::sleep(Duration::from_secs(force_watcher_cfg.force_grace_secs)).await;
+        tracing::error!(
+            force_grace_secs = force_watcher_cfg.force_grace_secs,
+            "shutdown: force grace exceeded — process::exit(1)"
+        );
+        force_watcher_events.shutdown().await;
+        std::process::exit(1);
+    });
+
+    let serve_result = serve_future.await;
     tracing::info!("server shutting down");
     state.observability.events.shutdown().await;
+    force_watcher.abort();
     serve_result?;
     Ok(())
+}
+
+async fn await_first_shutdown_signal(mut signal_rx: tokio::sync::watch::Receiver<bool>) -> bool {
+    loop {
+        if *signal_rx.borrow_and_update() {
+            return true;
+        }
+        if signal_rx.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
+async fn axum_graceful_shutdown_signal(
+    signal_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_cfg: harness_core::config::shutdown::ShutdownConfig,
+) {
+    if !await_first_shutdown_signal(signal_rx).await {
+        return;
+    }
+    tracing::info!(
+        drain_deadline_secs = shutdown_cfg.drain_timeout_secs,
+        progress_log_secs = shutdown_cfg.progress_log_secs,
+        "shutdown: draining; press Ctrl+C again to force"
+    );
+}
+
+async fn wait_for_first_signal_then_drain_or_force<F>(
+    signal_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_cfg: harness_core::config::shutdown::ShutdownConfig,
+    user_force: F,
+) -> Option<ShutdownReason>
+where
+    F: std::future::Future<Output = ()>,
+{
+    if !await_first_shutdown_signal(signal_rx).await {
+        return None;
+    }
+    Some(
+        drain_or_force(
+            shutdown_cfg.drain_timeout_secs,
+            shutdown_cfg.progress_log_secs,
+            user_force,
+        )
+        .await,
+    )
 }
 
 /// Reason a graceful shutdown ended. Surfaced for observability and tests.
@@ -279,27 +353,6 @@ pub(crate) enum ShutdownReason {
     DrainTimeout,
     /// User pressed Ctrl+C (or sent SIGTERM) a second time during drain.
     UserForced,
-}
-
-/// Staged drain-then-force shutdown driver.
-///
-/// Phase 1 — wait for the first signal (Ctrl+C / SIGTERM) and log a drain
-/// notice within milliseconds.
-/// Phase 2 — race the drain deadline against a second signal. The first to
-/// fire decides the [`ShutdownReason`].
-async fn staged_shutdown_signal(cfg: ShutdownConfig) -> ShutdownReason {
-    wait_first_termination_signal().await;
-    tracing::info!(
-        drain_deadline_secs = cfg.drain_timeout_secs,
-        progress_log_secs = cfg.progress_log_secs,
-        "shutdown: draining; press Ctrl+C again to force"
-    );
-    drain_or_force(
-        cfg.drain_timeout_secs,
-        cfg.progress_log_secs,
-        wait_second_termination_signal(),
-    )
-    .await
 }
 
 /// Wait for the first SIGINT/SIGTERM. Errors installing the handlers are
