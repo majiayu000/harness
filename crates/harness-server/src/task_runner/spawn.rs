@@ -1136,5 +1136,5 @@ pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>
 }
 
 #[cfg(test)]
-#[path = "spawn_tests.rs"]
+#[path = "spawn_tests/mod.rs"]
 mod tests;
