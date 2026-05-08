@@ -1,0 +1,880 @@
+use super::*;
+
+fn harness_config_toml(data_dir: &str, workspace_section: &str) -> String {
+    format!(
+        r#"
+        [server]
+        transport = "http"
+        http_addr = "127.0.0.1:9800"
+        data_dir = "{data_dir}"
+        project_root = "/tmp/project"
+
+        [agents]
+        default_agent = "claude"
+        [agents.claude]
+        cli_path = "claude"
+        default_model = "sonnet"
+        [agents.codex]
+        cli_path = "codex"
+        [agents.anthropic_api]
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+
+        [gc]
+        max_drafts_per_run = 5
+        budget_per_signal_usd = 0.5
+        total_budget_usd = 5.0
+        [gc.signal_thresholds]
+        repeated_warn_min = 10
+        chronic_block_min = 5
+        hot_file_edits_min = 20
+        slow_op_threshold_ms = 5000
+        slow_op_count_min = 10
+        escalation_ratio = 1.5
+        violation_min = 5
+
+        [rules]
+        discovery_paths = []
+
+        [observe]
+        session_renewal_secs = 1800
+        log_retention_days = 90
+
+        [otel]
+
+        {workspace_section}
+        "#
+    )
+}
+
+fn with_env_vars<const N: usize, F>(vars: [(&str, Option<&str>); N], f: F)
+where
+    F: FnOnce(),
+{
+    let _guard = crate::test_support::process_env_lock();
+    temp_env::with_vars(vars, f);
+}
+
+#[test]
+fn agent_review_config_defaults() {
+    let config = AgentReviewConfig::default();
+    assert!(!config.enabled);
+    assert!(config.reviewer_agent.is_empty());
+    assert_eq!(config.max_rounds, 3);
+    assert_eq!(config.review_bot_command, "/gemini review");
+    assert!(config.review_bot_auto_trigger);
+    assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+    assert_eq!(config.silence_rounds_threshold, 3);
+    assert_eq!(config.silence_min_minutes_after_commit, 30);
+}
+
+#[test]
+fn agent_review_config_deserializes_from_toml() {
+    let toml_str = r#"
+        enabled = true
+        reviewer_agent = "codex"
+        max_rounds = 5
+    "#;
+    let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
+    assert!(config.enabled);
+    assert_eq!(config.reviewer_agent, "codex");
+    assert_eq!(config.max_rounds, 5);
+    assert_eq!(config.review_bot_command, "/gemini review");
+    assert!(config.review_bot_auto_trigger);
+    assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+    assert_eq!(config.silence_rounds_threshold, 3);
+    assert_eq!(config.silence_min_minutes_after_commit, 30);
+}
+
+#[test]
+fn agent_review_config_deserializes_with_defaults() {
+    let toml_str = r#"
+        enabled = true
+    "#;
+    let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
+    assert!(config.enabled);
+    assert!(config.reviewer_agent.is_empty());
+    assert_eq!(config.max_rounds, 3);
+    assert_eq!(config.review_bot_command, "/gemini review");
+    assert!(config.review_bot_auto_trigger);
+    assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+    assert_eq!(config.silence_rounds_threshold, 3);
+    assert_eq!(config.silence_min_minutes_after_commit, 30);
+}
+
+#[test]
+fn agent_review_config_deserializes_bot_settings() {
+    let toml_str = r#"
+        enabled = true
+        review_bot_command = "/reviewbot run"
+        review_bot_auto_trigger = false
+        fallback_chain = ["gemini", "codex"]
+        silence_rounds_threshold = 4
+        silence_min_minutes_after_commit = 45
+    "#;
+    let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
+    assert!(config.enabled);
+    assert_eq!(config.review_bot_command, "/reviewbot run");
+    assert!(!config.review_bot_auto_trigger);
+    assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+    assert_eq!(config.silence_rounds_threshold, 4);
+    assert_eq!(config.silence_min_minutes_after_commit, 45);
+}
+
+#[test]
+fn agents_config_includes_review() {
+    let toml_str = r#"
+        default_agent = "claude"
+        [claude]
+        cli_path = "claude"
+        default_model = "sonnet"
+        [codex]
+        cli_path = "codex"
+        [anthropic_api]
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+        [review]
+        enabled = true
+        reviewer_agent = "codex"
+        max_rounds = 2
+    "#;
+    let config: AgentsConfig = toml::from_str(toml_str).unwrap();
+    assert!(config.review.enabled);
+    assert_eq!(config.review.reviewer_agent, "codex");
+    assert_eq!(config.review.max_rounds, 2);
+    assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
+}
+
+#[test]
+fn anthropic_api_config_deserializes_configured_max_tokens() {
+    let toml_str = r#"
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+        max_tokens = 8192
+    "#;
+    let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.max_tokens, 8192);
+}
+
+#[test]
+fn approval_policy_defaults_to_auto_edit() {
+    let config = AgentsConfig::default();
+    assert_eq!(config.approval_policy, ApprovalPolicy::AutoEdit);
+}
+
+#[test]
+fn sandbox_mode_defaults_to_danger_full_access() {
+    let config = AgentsConfig::default();
+    assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
+}
+
+#[test]
+fn approval_policy_deserializes_from_toml() {
+    let toml_str = r#"
+        default_agent = "claude"
+        approval_policy = "full_auto"
+        [claude]
+        cli_path = "claude"
+        default_model = "sonnet"
+        [codex]
+        cli_path = "codex"
+        [anthropic_api]
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+    "#;
+    let config: AgentsConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.approval_policy, ApprovalPolicy::FullAuto);
+}
+
+#[test]
+fn sandbox_mode_deserializes_from_toml() {
+    let toml_str = r#"
+        default_agent = "claude"
+        sandbox_mode = "danger-full-access"
+        [claude]
+        cli_path = "claude"
+        default_model = "sonnet"
+        [codex]
+        cli_path = "codex"
+        [anthropic_api]
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+    "#;
+    let config: AgentsConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.sandbox_mode, SandboxMode::DangerFullAccess);
+}
+
+#[test]
+fn anthropic_api_config_defaults_max_tokens_when_missing() {
+    let toml_str = r#"
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+    "#;
+    let config: AnthropicApiConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.max_tokens, 4096);
+}
+
+#[test]
+fn codex_cloud_config_defaults() {
+    let config = CodexCloudConfig::default();
+    assert!(!config.enabled);
+    assert_eq!(config.cache_ttl_hours, 12);
+    assert!(config.setup_commands.is_empty());
+    assert!(config.setup_secret_env.is_empty());
+}
+
+#[test]
+fn codex_agent_config_deserializes_cloud_block() {
+    let toml_str = r#"
+        cli_path = "codex"
+        [cloud]
+        enabled = true
+        cache_ttl_hours = 6
+        setup_commands = ["npm ci", "cargo fetch"]
+        setup_secret_env = ["NPM_TOKEN"]
+    "#;
+    let config: CodexAgentConfig = toml::from_str(toml_str).unwrap();
+    assert!(config.cloud.enabled);
+    assert_eq!(config.cloud.cache_ttl_hours, 6);
+    assert_eq!(
+        config.cloud.setup_commands,
+        vec!["npm ci".to_string(), "cargo fetch".to_string()]
+    );
+    assert_eq!(config.cloud.setup_secret_env, vec!["NPM_TOKEN".to_string()]);
+}
+
+#[test]
+fn rules_config_defaults_do_not_autoload_requirements() {
+    let rules = RulesConfig::default();
+    assert!(rules.exec_policy_paths.is_empty());
+    assert_eq!(rules.requirements_path, None);
+}
+
+#[test]
+fn rules_config_deserializes_when_new_fields_are_missing() {
+    let toml_str = r#"
+        discovery_paths = []
+    "#;
+    let rules: RulesConfig = toml::from_str(toml_str).unwrap();
+    assert!(rules.exec_policy_paths.is_empty());
+    assert_eq!(rules.requirements_path, None);
+}
+
+#[test]
+fn otel_config_defaults_to_disabled_exporter() {
+    let config = OtelConfig::default();
+    assert_eq!(config.exporter, OtelExporter::Disabled);
+    assert!(config.endpoint.is_none());
+    assert!(!config.log_user_prompt);
+    assert_eq!(config.environment, "development");
+}
+
+#[test]
+fn harness_config_deserializes_otel_section() {
+    let toml_str = r#"
+        [server]
+        transport = "stdio"
+        http_addr = "127.0.0.1:9800"
+        data_dir = "."
+        project_root = "."
+
+        [agents]
+        default_agent = "claude"
+        [agents.claude]
+        cli_path = "claude"
+        default_model = "sonnet"
+        [agents.codex]
+        cli_path = "codex"
+        [agents.anthropic_api]
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+
+        [gc]
+        max_drafts_per_run = 5
+        budget_per_signal_usd = 0.5
+        total_budget_usd = 5.0
+        [gc.signal_thresholds]
+        repeated_warn_min = 10
+        chronic_block_min = 5
+        hot_file_edits_min = 20
+        slow_op_threshold_ms = 5000
+        slow_op_count_min = 10
+        escalation_ratio = 1.5
+        violation_min = 5
+
+        [rules]
+        discovery_paths = []
+
+        [observe]
+        session_renewal_secs = 1800
+        log_retention_days = 90
+
+        [otel]
+        environment = "staging"
+        exporter = "otlp-http"
+        endpoint = "http://collector:4318"
+        log_user_prompt = true
+    "#;
+
+    let config: HarnessConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.otel.environment, "staging");
+    assert_eq!(config.otel.exporter, OtelExporter::OtlpHttp);
+    assert_eq!(
+        config.otel.endpoint.as_deref(),
+        Some("http://collector:4318")
+    );
+    assert!(config.otel.log_user_prompt);
+}
+
+#[test]
+fn server_config_webhook_secret_defaults_to_none() {
+    let config = ServerConfig::default();
+    assert!(config.github_webhook_secret.is_none());
+}
+
+#[test]
+fn server_config_deserializes_webhook_secret() {
+    let toml_str = r#"
+        transport = "http"
+        http_addr = "127.0.0.1:9800"
+        data_dir = "/tmp/harness"
+        project_root = "."
+        github_webhook_secret = "super-secret"
+    "#;
+    let config: ServerConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(
+        config.github_webhook_secret.as_deref(),
+        Some("super-secret")
+    );
+}
+
+#[derive(Deserialize)]
+struct TransportWrapper {
+    t: Transport,
+}
+
+#[test]
+fn transport_deserializes_all_variants() {
+    let parse = |s: &str| -> Transport {
+        toml::from_str::<TransportWrapper>(&format!("t = \"{s}\""))
+            .unwrap_or_else(|e| panic!("failed to parse transport `{s}`: {e}"))
+            .t
+    };
+    assert_eq!(parse("stdio"), Transport::Stdio);
+    assert_eq!(parse("http"), Transport::Http);
+    assert_eq!(parse("web_socket"), Transport::WebSocket);
+}
+
+#[test]
+fn transport_rejects_unknown_variant() {
+    let result = toml::from_str::<TransportWrapper>(r#"t = "grpc""#);
+    assert!(result.is_err());
+}
+
+#[test]
+fn gc_config_defaults_are_consistent() {
+    let config = GcConfig::default();
+    assert_eq!(config.max_drafts_per_run, 5);
+    assert_eq!(config.adopt_wait_secs, 120);
+    assert_eq!(config.adopt_max_rounds, 3);
+    assert_eq!(config.adopt_turn_timeout_secs, 600);
+    assert!(config.budget_per_signal_usd > 0.0);
+    assert!(config.total_budget_usd >= config.budget_per_signal_usd);
+}
+
+#[test]
+fn gc_config_deserializes_from_toml() {
+    let toml_str = r#"
+        max_drafts_per_run = 10
+        budget_per_signal_usd = 1.0
+        total_budget_usd = 20.0
+        adopt_wait_secs = 60
+        adopt_max_rounds = 5
+        adopt_turn_timeout_secs = 300
+
+        [signal_thresholds]
+        repeated_warn_min = 20
+        chronic_block_min = 10
+        hot_file_edits_min = 30
+        slow_op_threshold_ms = 3000
+        slow_op_count_min = 5
+        escalation_ratio = 2.0
+        violation_min = 3
+    "#;
+    let config: GcConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.max_drafts_per_run, 10);
+    assert_eq!(config.adopt_wait_secs, 60);
+    assert_eq!(config.signal_thresholds.repeated_warn_min, 20);
+    assert_eq!(config.signal_thresholds.escalation_ratio, 2.0);
+}
+
+#[test]
+fn signal_thresholds_defaults_are_consistent() {
+    let thresholds = SignalThresholdsConfig::default();
+    assert_eq!(thresholds.repeated_warn_min, 10);
+    assert_eq!(thresholds.chronic_block_min, 5);
+    assert_eq!(thresholds.hot_file_edits_min, 20);
+    assert_eq!(thresholds.slow_op_threshold_ms, 5000);
+    assert_eq!(thresholds.slow_op_count_min, 10);
+    assert_eq!(thresholds.violation_min, 5);
+    assert!(thresholds.escalation_ratio > 1.0);
+}
+
+#[test]
+fn harness_config_default_roundtrip() {
+    let config = HarnessConfig::default();
+    assert_eq!(config.agents.default_agent, "auto");
+    assert!(config.agents.complexity_preferred_agents.is_empty());
+    assert_eq!(config.server.transport, Transport::Http);
+    assert!(!config.agents.review.enabled);
+    assert_eq!(config.otel.exporter, OtelExporter::Disabled);
+    assert_eq!(config.gc.max_drafts_per_run, 5);
+    assert!(!config.review.enabled);
+    assert!(!config.review.run_on_startup);
+    assert_eq!(config.review.interval_hours, 24);
+    assert!(config.review.interval_secs.is_none());
+    assert_eq!(config.review.timeout_secs, 900);
+    assert_eq!(config.review.max_concurrent_tasks, 2);
+    assert!(config.review.agent.is_none());
+}
+
+#[test]
+fn review_config_defaults() {
+    let config = ReviewConfig::default();
+    assert!(!config.enabled);
+    assert!(!config.run_on_startup);
+    assert_eq!(config.interval_hours, 24);
+    assert!(config.interval_secs.is_none());
+    assert_eq!(config.timeout_secs, 900);
+    assert_eq!(config.max_concurrent_tasks, 2);
+    assert!(config.agent.is_none());
+}
+
+#[test]
+fn review_config_deserializes_from_toml() {
+    let toml_str = r#"
+        enabled = true
+        run_on_startup = true
+        interval_hours = 48
+        interval_secs = 600
+        agent = "claude"
+        timeout_secs = 1200
+        max_concurrent_tasks = 3
+    "#;
+    let config: ReviewConfig = toml::from_str(toml_str).unwrap();
+    assert!(config.enabled);
+    assert!(config.run_on_startup);
+    assert_eq!(config.interval_hours, 48);
+    assert_eq!(config.interval_secs, Some(600));
+    assert_eq!(config.agent.as_deref(), Some("claude"));
+    assert_eq!(config.timeout_secs, 1200);
+    assert_eq!(config.max_concurrent_tasks, 3);
+}
+
+#[test]
+fn review_config_deserializes_with_defaults() {
+    let config: ReviewConfig = toml::from_str("enabled = true").unwrap();
+    assert!(config.enabled);
+    assert!(!config.run_on_startup);
+    assert_eq!(config.interval_hours, 24);
+    assert!(config.interval_secs.is_none());
+    assert!(config.agent.is_none());
+    assert_eq!(config.timeout_secs, 900);
+    assert_eq!(config.max_concurrent_tasks, 2);
+}
+
+#[test]
+fn harness_config_includes_review() {
+    let config = HarnessConfig::default();
+    assert!(!config.review.enabled);
+}
+
+#[test]
+fn retry_scheduler_config_defaults() {
+    let config = RetrySchedulerConfig::default();
+    assert!(!config.enabled);
+    assert_eq!(config.interval_secs, 300);
+    assert_eq!(config.stale_threshold_mins, 60);
+    assert_eq!(config.cooldown_mins, 120);
+    assert_eq!(config.max_retries, 3);
+}
+
+#[test]
+fn retry_scheduler_config_deserializes_from_toml() {
+    let toml_str = r#"
+        enabled = true
+        interval_secs = 600
+        stale_threshold_mins = 30
+        cooldown_mins = 60
+        max_retries = 5
+    "#;
+    let config: RetrySchedulerConfig = toml::from_str(toml_str).unwrap();
+    assert!(config.enabled);
+    assert_eq!(config.interval_secs, 600);
+    assert_eq!(config.stale_threshold_mins, 30);
+    assert_eq!(config.cooldown_mins, 60);
+    assert_eq!(config.max_retries, 5);
+}
+
+#[test]
+fn harness_config_includes_retry_scheduler() {
+    let config = HarnessConfig::default();
+    assert!(!config.retry_scheduler.enabled);
+    assert_eq!(config.retry_scheduler.interval_secs, 300);
+}
+
+#[test]
+fn projects_config_deserializes_from_toml() {
+    let toml_str = r#"
+        [[projects]]
+        name = "harness"
+        root = "/tmp/harness"
+        default = true
+
+        [[projects]]
+        name = "litellm"
+        root = "/tmp/litellm-rs"
+        max_concurrent = 2
+        default_agent = "claude"
+    "#;
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(default)]
+        projects: Vec<ProjectEntry>,
+    }
+    let w: Wrapper = toml::from_str(toml_str).unwrap();
+    assert_eq!(w.projects.len(), 2);
+    assert_eq!(w.projects[0].name, "harness");
+    assert!(w.projects[0].default);
+    assert!(w.projects[0].max_concurrent.is_none());
+    assert_eq!(w.projects[1].name, "litellm");
+    assert!(!w.projects[1].default);
+    assert_eq!(w.projects[1].max_concurrent, Some(2));
+    assert_eq!(w.projects[1].default_agent.as_deref(), Some("claude"));
+}
+
+#[test]
+fn harness_config_projects_defaults_to_empty() {
+    let config = HarnessConfig::default();
+    assert!(config.projects.is_empty());
+}
+
+#[test]
+fn invalid_toml_returns_parse_error() {
+    let result = toml::from_str::<HarnessConfig>("not valid toml {{{}}}");
+    assert!(result.is_err());
+}
+
+#[test]
+fn rebase_relative_paths_resolves_against_base() {
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = PathBuf::from("data");
+    config.server.project_root = PathBuf::from("repo");
+    config.server.allowed_project_roots = vec![PathBuf::from("allowed")];
+    config.projects = vec![ProjectEntry {
+        name: "p".into(),
+        root: PathBuf::from("projects/p"),
+        default: false,
+        default_agent: None,
+        max_concurrent: None,
+    }];
+
+    config.rebase_relative_paths(std::path::Path::new("/etc/harness"));
+
+    assert_eq!(config.server.data_dir, PathBuf::from("/etc/harness/data"));
+    assert_eq!(
+        config.server.project_root,
+        PathBuf::from("/etc/harness/repo")
+    );
+    assert_eq!(
+        config.server.allowed_project_roots,
+        vec![PathBuf::from("/etc/harness/allowed")]
+    );
+    assert_eq!(
+        config.projects[0].root,
+        PathBuf::from("/etc/harness/projects/p")
+    );
+}
+
+#[test]
+fn rebase_relative_paths_leaves_absolute_paths_unchanged() {
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = PathBuf::from("/absolute/data");
+    config.server.project_root = PathBuf::from("/absolute/repo");
+
+    config.rebase_relative_paths(std::path::Path::new("/etc/harness"));
+
+    assert_eq!(config.server.data_dir, PathBuf::from("/absolute/data"));
+    assert_eq!(config.server.project_root, PathBuf::from("/absolute/repo"));
+}
+
+#[test]
+fn github_intake_config_defaults() {
+    let config = GitHubIntakeConfig::default();
+    assert!(!config.enabled);
+    assert!(config.repo.is_empty());
+    assert_eq!(config.label, "harness");
+    assert_eq!(config.poll_interval_secs, 30);
+    assert_eq!(config.sprint_timeout_secs, 3 * 60 * 60);
+    assert_eq!(config.retry_backoff_base_secs, 15);
+    assert_eq!(config.retry_backoff_max_secs, 120);
+}
+
+#[test]
+fn github_intake_config_deserializes_from_toml() {
+    let toml_str = r#"
+        enabled = true
+        repo = "owner/repo"
+        label = "autofix"
+        poll_interval_secs = 60
+        sprint_timeout_secs = 7200
+        retry_backoff_base_secs = 10
+        retry_backoff_max_secs = 90
+    "#;
+    let config: GitHubIntakeConfig = toml::from_str(toml_str).unwrap();
+    assert!(config.enabled);
+    assert_eq!(config.repo, "owner/repo");
+    assert_eq!(config.label, "autofix");
+    assert_eq!(config.poll_interval_secs, 60);
+    assert_eq!(config.sprint_timeout_secs, 7200);
+    assert_eq!(config.retry_backoff_base_secs, 10);
+    assert_eq!(config.retry_backoff_max_secs, 90);
+}
+
+#[test]
+fn intake_config_defaults_to_no_github() {
+    let config = IntakeConfig::default();
+    assert!(config.github.is_none());
+}
+
+#[test]
+fn harness_config_includes_intake() {
+    let config = HarnessConfig::default();
+    assert!(config.intake.github.is_none());
+}
+
+#[test]
+fn workspace_config_defaults() {
+    let config = WorkspaceConfig::default();
+    assert!(config.after_create_hook.is_none());
+    assert!(config.before_remove_hook.is_none());
+    assert_eq!(config.hook_timeout_secs, 60);
+    assert!(config.auto_cleanup);
+}
+
+#[test]
+fn workspace_config_deserializes_from_toml() {
+    let toml_str = r#"
+        after_create_hook = "npm install"
+        before_remove_hook = "echo cleanup"
+        hook_timeout_secs = 30
+        auto_cleanup = false
+    "#;
+    let config: WorkspaceConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.after_create_hook.as_deref(), Some("npm install"));
+    assert_eq!(config.before_remove_hook.as_deref(), Some("echo cleanup"));
+    assert_eq!(config.hook_timeout_secs, 30);
+    assert!(!config.auto_cleanup);
+}
+
+#[test]
+fn derived_workspace_root_tracks_custom_data_dir_when_default() {
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = PathBuf::from("/tmp/harness-two");
+    config.apply_derived_defaults();
+    assert_eq!(
+        config.workspace.root,
+        PathBuf::from("/tmp/harness-two/workspaces")
+    );
+}
+
+#[test]
+fn harness_config_workspace_root_defaults_to_server_data_dir_when_omitted() {
+    let config: HarnessConfig = toml::from_str(&harness_config_toml("/tmp/harness2", "")).unwrap();
+
+    assert_eq!(
+        config.workspace.root,
+        PathBuf::from("/tmp/harness2/workspaces")
+    );
+}
+
+#[test]
+fn derived_workspace_root_preserves_explicit_workspace_root() {
+    let mut config = HarnessConfig::default();
+    config.server.data_dir = PathBuf::from("/tmp/harness-two");
+    config.workspace.root = PathBuf::from("/tmp/shared-harness-workspaces");
+    config.apply_derived_defaults();
+    assert_eq!(
+        config.workspace.root,
+        PathBuf::from("/tmp/shared-harness-workspaces")
+    );
+}
+
+#[test]
+fn derived_workspace_root_preserves_explicit_legacy_workspace_root() {
+    let legacy_root = WorkspaceConfig::default().root;
+    let toml_str = format!(
+        r#"
+        root = "{}"
+    "#,
+        legacy_root.display()
+    );
+    let mut config = HarnessConfig {
+        server: ServerConfig {
+            data_dir: PathBuf::from("/tmp/harness-two"),
+            ..ServerConfig::default()
+        },
+        workspace: toml::from_str(&toml_str).unwrap(),
+        ..HarnessConfig::default()
+    };
+    config.apply_derived_defaults();
+    assert_eq!(config.workspace.root, legacy_root);
+}
+
+#[test]
+fn derived_workspace_root_tracks_custom_data_dir_when_toml_root_is_absent() {
+    let toml_str = r#"
+        auto_cleanup = false
+    "#;
+    let mut config = HarnessConfig {
+        server: ServerConfig {
+            data_dir: PathBuf::from("/tmp/harness-two"),
+            ..ServerConfig::default()
+        },
+        workspace: toml::from_str(toml_str).unwrap(),
+        ..HarnessConfig::default()
+    };
+    config.apply_derived_defaults();
+    assert_eq!(
+        config.workspace.root,
+        PathBuf::from("/tmp/harness-two/workspaces")
+    );
+    assert!(!config.workspace.auto_cleanup);
+}
+
+#[test]
+fn harness_config_preserves_explicit_workspace_root() {
+    let config: HarnessConfig = toml::from_str(&harness_config_toml(
+        "/tmp/harness2",
+        r#"
+        [workspace]
+        root = "/tmp/custom-workspaces"
+        "#,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        config.workspace.root,
+        PathBuf::from("/tmp/custom-workspaces")
+    );
+}
+
+#[test]
+fn env_data_dir_override_updates_implicit_workspace_root() {
+    with_env_vars([("HARNESS_DATA_DIR", Some("/tmp/env-harness2"))], || {
+        let mut config: HarnessConfig =
+            toml::from_str(&harness_config_toml("/tmp/harness2", "")).unwrap();
+
+        config.apply_env_overrides().unwrap();
+
+        assert_eq!(config.server.data_dir, PathBuf::from("/tmp/env-harness2"));
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/env-harness2/workspaces")
+        );
+    });
+}
+
+#[test]
+fn env_data_dir_override_preserves_explicit_workspace_root() {
+    with_env_vars([("HARNESS_DATA_DIR", Some("/tmp/env-harness2"))], || {
+        let mut config: HarnessConfig = toml::from_str(&harness_config_toml(
+            "/tmp/harness2",
+            r#"
+            [workspace]
+            root = "/tmp/custom-workspaces"
+            "#,
+        ))
+        .unwrap();
+
+        config.apply_env_overrides().unwrap();
+
+        assert_eq!(config.server.data_dir, PathBuf::from("/tmp/env-harness2"));
+        assert_eq!(
+            config.workspace.root,
+            PathBuf::from("/tmp/custom-workspaces")
+        );
+    });
+}
+
+#[test]
+fn harness_config_includes_workspace() {
+    let config = HarnessConfig::default();
+    assert!(config.workspace.auto_cleanup);
+    assert_eq!(config.workspace.hook_timeout_secs, 60);
+}
+
+#[test]
+fn otel_exporter_grpc_variant_deserializes() {
+    let toml_str = r#"
+        environment = "production"
+        exporter = "otlp-grpc"
+        endpoint = "http://otel-collector:4317"
+    "#;
+    let config: OtelConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.exporter, OtelExporter::OtlpGrpc);
+    assert_eq!(
+        config.endpoint.as_deref(),
+        Some("http://otel-collector:4317")
+    );
+}
+
+#[test]
+fn agent_review_config_review_bot_command_default() {
+    let config = AgentReviewConfig::default();
+    assert_eq!(config.review_bot_command, "/gemini review");
+    assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
+}
+
+#[test]
+fn server_config_notification_defaults() {
+    let config = ServerConfig::default();
+    assert_eq!(config.notification_broadcast_capacity, 256);
+    assert_eq!(config.notification_lag_log_every, 1);
+}
+
+#[test]
+fn validation_config_defaults() {
+    let config = ValidationConfig::default();
+    assert!(config.pre_commit.is_empty());
+    assert!(config.pre_push.is_empty());
+    assert_eq!(config.timeout_secs, 120);
+    assert_eq!(config.max_retries, 2);
+}
+
+#[test]
+fn validation_config_deserializes_from_toml() {
+    let toml_str = r#"
+        pre_commit = ["cargo fmt --all -- --check", "cargo check"]
+        pre_push = ["cargo test"]
+        timeout_secs = 60
+        max_retries = 3
+    "#;
+    let config: ValidationConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.pre_commit.len(), 2);
+    assert_eq!(config.pre_push, vec!["cargo test"]);
+    assert_eq!(config.timeout_secs, 60);
+    assert_eq!(config.max_retries, 3);
+}
+
+#[test]
+fn validation_config_deserializes_with_defaults() {
+    let toml_str = r#"
+        pre_commit = ["ruff check ."]
+    "#;
+    let config: ValidationConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.pre_commit, vec!["ruff check ."]);
+    assert!(config.pre_push.is_empty());
+    assert_eq!(config.timeout_secs, 120);
+    assert_eq!(config.max_retries, 2);
+}
