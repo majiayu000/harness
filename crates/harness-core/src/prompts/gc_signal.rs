@@ -56,9 +56,11 @@ pub fn linter_violations(project_name: &str, details: &str) -> String {
 mod tests {
     use super::*;
 
+    type SignalRenderer = fn(&str, &str) -> String;
+
     #[test]
     fn each_prompt_includes_project_name_and_details() {
-        let cases: &[(&str, fn(&str, &str) -> String)] = &[
+        let cases: &[(&str, SignalRenderer)] = &[
             ("guard script", repeated_warn),
             ("rule improvements", chronic_block),
             ("SKILL.md", hot_files),
