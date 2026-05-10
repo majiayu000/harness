@@ -1,4 +1,4 @@
-use crate::codex::{parse_codex_item, parse_codex_token_usage};
+use crate::codex::{parse_codex_error_item_message, parse_codex_item, parse_codex_token_usage};
 use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
 use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
@@ -565,8 +565,17 @@ fn parse_app_server_agent_event(
             .unwrap_or(ParsedCodexMessage::Ignore),
         "item/completed" => params
             .get("item")
-            .and_then(parse_codex_item)
-            .map(|item| ParsedCodexMessage::Event(AgentEvent::ItemCompletedPayload { item }))
+            .map(|item| {
+                if let Some(message) = parse_codex_error_item_message(item) {
+                    ParsedCodexMessage::Event(AgentEvent::Error { message })
+                } else {
+                    parse_codex_item(item)
+                        .map(|item| {
+                            ParsedCodexMessage::Event(AgentEvent::ItemCompletedPayload { item })
+                        })
+                        .unwrap_or(ParsedCodexMessage::Ignore)
+                }
+            })
             .unwrap_or(ParsedCodexMessage::Ignore),
         "thread/tokenUsage/updated" => params
             .get("tokenUsage")
@@ -732,6 +741,18 @@ mod tests {
                 item: Item::AgentReasoning {
                     content: "done".into()
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn parse_item_completed_error_notification() {
+        let line = r#"{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"item-2","type":"error","message":"bad config"}}}"#;
+        let message = parse_codex_message(line).unwrap();
+        assert_eq!(
+            message,
+            ParsedCodexMessage::Event(AgentEvent::Error {
+                message: "bad config".into()
             })
         );
     }
