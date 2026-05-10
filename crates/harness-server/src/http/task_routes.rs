@@ -22,17 +22,6 @@ pub(crate) async fn enqueue_task(
     state.execution_svc.enqueue(req).await
 }
 
-pub(crate) async fn enqueue_task_in_domain(
-    state: &Arc<AppState>,
-    req: task_runner::CreateTaskRequest,
-    queue_domain: QueueDomain,
-) -> Result<task_runner::TaskId, EnqueueTaskError> {
-    state
-        .execution_svc
-        .enqueue_in_domain(req, queue_domain)
-        .await
-}
-
 pub(crate) async fn enqueue_task_background(
     state: Arc<AppState>,
     req: task_runner::CreateTaskRequest,
