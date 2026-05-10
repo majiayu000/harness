@@ -1020,13 +1020,18 @@ async fn runtime_default_agent_name_for_project(
     state: &Arc<AppState>,
     project_root: &Path,
 ) -> anyhow::Result<Option<String>> {
-    let project_cfg = harness_core::config::project::load_project_config(project_root)
-        .with_context(|| {
-            format!(
-                "failed to load project config at {}",
-                project_root.display()
-            )
-        })?;
+    let project_root_for_config = project_root.to_path_buf();
+    let project_cfg = tokio::task::spawn_blocking(move || {
+        harness_core::config::project::load_project_config(&project_root_for_config)
+    })
+    .await
+    .context("failed to join project config load task")?
+    .with_context(|| {
+        format!(
+            "failed to load project config at {}",
+            project_root.display()
+        )
+    })?;
     if let Some(agent_name) = project_cfg
         .agent
         .as_ref()
@@ -1038,8 +1043,8 @@ async fn runtime_default_agent_name_for_project(
     }
 
     if let Some(registry) = state.core.project_registry.as_deref() {
-        let canonical_root = project_root
-            .canonicalize()
+        let canonical_root = tokio::fs::canonicalize(project_root)
+            .await
             .unwrap_or_else(|_| project_root.to_path_buf());
         if let Some(project) = registry.get_by_root(&canonical_root).await? {
             if let Some(agent_name) = project
@@ -1153,7 +1158,7 @@ fn resolve_runtime_dispatch_profiles(
         .map(|(definition_id, override_policy)| {
             (
                 definition_id.clone(),
-                apply_runtime_dispatch_profile_override(&default_profile, override_policy),
+                apply_runtime_dispatch_profile_override(config, &default_profile, override_policy),
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -1163,7 +1168,7 @@ fn resolve_runtime_dispatch_profiles(
         .map(|(activity, override_policy)| {
             (
                 activity.clone(),
-                apply_runtime_dispatch_profile_override(&default_profile, override_policy),
+                apply_runtime_dispatch_profile_override(config, &default_profile, override_policy),
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -1174,7 +1179,8 @@ fn resolve_runtime_dispatch_profiles(
                 .get(activity)
                 .or_else(|| workflow_profiles.get(definition_id))
                 .unwrap_or(&default_profile);
-            let profile = apply_runtime_dispatch_profile_override(base_profile, override_policy);
+            let profile =
+                apply_runtime_dispatch_profile_override(config, base_profile, override_policy);
             workflow_activity_profiles
                 .entry(definition_id.clone())
                 .or_insert_with(std::collections::BTreeMap::new)
@@ -1267,33 +1273,42 @@ pub(super) fn runtime_profile_manifest_definition(
 }
 
 fn apply_runtime_dispatch_profile_override(
+    config: &harness_core::config::HarnessConfig,
     default_profile: &RuntimeProfile,
     override_policy: &harness_core::config::workflow::RuntimeDispatchProfileOverride,
 ) -> RuntimeProfile {
-    let kind = override_policy
+    let runtime_kind_profile = override_policy
         .runtime_kind
         .as_deref()
         .and_then(runtime_kind_from_config)
-        .unwrap_or(default_profile.kind);
+        .map(|kind| {
+            if kind == default_profile.kind {
+                default_profile.clone()
+            } else {
+                runtime_profile_from_kind(config, kind)
+            }
+        })
+        .unwrap_or_else(|| default_profile.clone());
+    let kind = runtime_kind_profile.kind;
     let profile_name = override_policy
         .runtime_profile
         .clone()
-        .unwrap_or_else(|| default_profile.name.clone());
+        .unwrap_or_else(|| runtime_kind_profile.name.clone());
     let mut profile = RuntimeProfile::new(profile_name, kind);
     profile.model = override_policy
         .model
         .clone()
-        .or_else(|| default_profile.model.clone());
+        .or_else(|| runtime_kind_profile.model.clone());
     profile.reasoning_effort = override_policy
         .reasoning_effort
         .clone()
-        .or_else(|| default_profile.reasoning_effort.clone());
+        .or_else(|| runtime_kind_profile.reasoning_effort.clone());
     profile.sandbox = override_policy
         .sandbox
         .clone()
         .or_else(|| default_profile.sandbox.clone());
     profile.approval_policy =
-        runtime_dispatch_approval_policy(default_profile, override_policy, kind);
+        runtime_dispatch_approval_policy(&runtime_kind_profile, override_policy, kind);
     profile.max_turns = override_policy.max_turns.or(default_profile.max_turns);
     profile.timeout_secs = override_policy
         .timeout_secs
@@ -2475,6 +2490,36 @@ mod tests {
         assert_eq!(profile.name, "claude-default");
         assert_eq!(profile.model.as_deref(), Some("sonnet-explicit"));
         assert_eq!(profile.reasoning_effort, None);
+    }
+
+    #[test]
+    fn runtime_dispatch_profile_override_kind_uses_matching_provider_config() {
+        let mut config = harness_core::config::HarnessConfig::default();
+        config.agents.codex.default_model = "gpt-5.5".to_string();
+        config.agents.codex.reasoning_effort = "xhigh".to_string();
+        config.agents.claude.default_model = "sonnet-override".to_string();
+        let inherited_profile = runtime_profile_from_agent(&config, "codex").unwrap();
+        let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: Some("codex_jsonrpc".to_string()),
+            timeout_secs: Some(3600),
+            ..Default::default()
+        };
+        policy.workflow_profiles.insert(
+            "claude_review".to_string(),
+            harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: Some("claude_code".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let selector =
+            runtime_dispatch_profile_selector(&config, &policy, &inherited_profile).unwrap();
+        let profile = selector.select_for_workflow(Some("claude_review"));
+        assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(profile.name, "claude-default");
+        assert_eq!(profile.model.as_deref(), Some("sonnet-override"));
+        assert_eq!(profile.reasoning_effort, None);
+        assert_eq!(profile.timeout_secs, Some(3600));
     }
 
     #[test]

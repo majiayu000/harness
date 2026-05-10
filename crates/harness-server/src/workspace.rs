@@ -394,13 +394,14 @@ impl WorkspaceManager {
 
         let git_ops_guard = self.git_ops.lock().await;
         let mut decision = WorkspaceAcquireDecision::CreatedFresh;
-        let workspace_registered = if workspace_path.exists() {
-            true
+        let workspace_path_exists = workspace_path.exists();
+        let missing_path_registered_worktree = if workspace_path_exists {
+            false
         } else {
             is_registered_worktree(source_repo, &workspace_path).await
         };
 
-        if workspace_path.exists() || workspace_registered {
+        if workspace_path_exists || missing_path_registered_worktree {
             let owner_record = read_owner_record(&workspace_path);
             if owner_record.as_ref().is_some_and(|record| {
                 owner_record_matches_workspace(record, task_id, &workspace_key, run_generation)
@@ -451,7 +452,13 @@ impl WorkspaceManager {
                 });
             }
 
-            if let Err(err) = cleanup_workspace_path(source_repo, &workspace_path).await {
+            if let Err(err) = cleanup_workspace_path_with_registration(
+                source_repo,
+                &workspace_path,
+                missing_path_registered_worktree.then_some(true),
+            )
+            .await
+            {
                 self.remove_active_workspace(task_id);
                 return Err(WorkspaceLifecycleError::ReconcileFailed {
                     workspace_path: workspace_path.clone(),
@@ -1050,7 +1057,7 @@ impl WorkspaceManager {
             }
         };
 
-        let _git_ops = self.git_ops.lock().await;
+        let mut orphan_paths = Vec::new();
         for entry in read_dir.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -1086,6 +1093,17 @@ impl WorkspaceManager {
             if self.active.iter().any(|e| e.workspace_path == path) {
                 continue;
             }
+            orphan_paths.push(path);
+        }
+
+        for path in orphan_paths {
+            if self.active.iter().any(|e| e.workspace_path == path) {
+                continue;
+            }
+            let _git_ops = self.git_ops.lock().await;
+            if self.active.iter().any(|e| e.workspace_path == path) {
+                continue;
+            }
             tracing::info!(
                 "cleanup_orphan_worktrees: removing orphan worktree {:?}",
                 path
@@ -1096,6 +1114,7 @@ impl WorkspaceManager {
         }
 
         // Prune stale worktree metadata so git no longer tracks removed directories.
+        let _git_ops = self.git_ops.lock().await;
         if let Err(e) = git_command()
             .args(["-C", &source_repo.to_string_lossy(), "worktree", "prune"])
             .output()
@@ -1349,7 +1368,18 @@ async fn remove_worktree(source_repo: &Path, workspace_path: &Path) -> anyhow::R
 }
 
 async fn cleanup_workspace_path(source_repo: &Path, workspace_path: &Path) -> anyhow::Result<()> {
-    let worktree_registered = is_registered_worktree(source_repo, workspace_path).await;
+    cleanup_workspace_path_with_registration(source_repo, workspace_path, None).await
+}
+
+async fn cleanup_workspace_path_with_registration(
+    source_repo: &Path,
+    workspace_path: &Path,
+    known_worktree_registered: Option<bool>,
+) -> anyhow::Result<()> {
+    let worktree_registered = match known_worktree_registered {
+        Some(registered) => registered,
+        None => is_registered_worktree(source_repo, workspace_path).await,
+    };
     if worktree_registered {
         match remove_worktree(source_repo, workspace_path).await {
             Ok(()) => {}
