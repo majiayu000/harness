@@ -158,6 +158,22 @@ pub(crate) fn parse_codex_item(item: &Value) -> Option<Item> {
     }
 }
 
+pub(crate) fn parse_codex_error_item_message(item: &Value) -> Option<String> {
+    if json_str_field(item, &["type"])? != "error" {
+        return None;
+    }
+
+    Some(
+        json_str_field(item, &["message"])
+            .or_else(|| {
+                item.get("error")
+                    .and_then(|error| json_str_field(error, &["message"]))
+            })
+            .unwrap_or("unknown error")
+            .to_string(),
+    )
+}
+
 pub(crate) fn parse_codex_token_usage(usage: &Value) -> Option<TokenUsage> {
     let input_tokens = usage
         .get("input_tokens")
@@ -210,6 +226,9 @@ fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecEvent> {
             .or(Some(ParsedCodexExecEvent::Ignore)),
         "item.started" | "item.completed" => {
             let item_value = value.get("item")?;
+            if let Some(message) = parse_codex_error_item_message(item_value) {
+                return Some(ParsedCodexExecEvent::Error { message });
+            }
             let item_id = json_str_field(item_value, &["id"])?.to_string();
             let item = parse_codex_item(item_value)?;
             if event_type == "item.started" {

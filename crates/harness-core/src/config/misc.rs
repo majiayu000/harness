@@ -115,7 +115,7 @@ pub struct ConcurrencyConfig {
     /// Maximum number of tasks waiting for a slot. Excess tasks are rejected. Default: 32.
     #[serde(default = "default_max_queue_size")]
     pub max_queue_size: usize,
-    /// Seconds of silence from the agent stream before declaring a stall. Default: 300.
+    /// Seconds of silence from the agent stream before declaring a stall. Default: 3600.
     #[serde(default = "default_stall_timeout_secs")]
     pub stall_timeout_secs: u64,
     /// Per-project concurrency limits.
@@ -167,7 +167,7 @@ fn default_max_queue_size() -> usize {
 }
 
 fn default_stall_timeout_secs() -> u64 {
-    300
+    3600
 }
 
 fn default_loop_jaccard_threshold() -> f64 {

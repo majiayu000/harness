@@ -33,8 +33,8 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert!(cfg.runtime_dispatch.enabled);
     assert_eq!(cfg.runtime_dispatch.interval_secs, 30);
     assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
-    assert_eq!(cfg.runtime_dispatch.runtime_kind, "claude_code");
-    assert_eq!(cfg.runtime_dispatch.runtime_profile, "claude-default");
+    assert_eq!(cfg.runtime_dispatch.runtime_kind, None);
+    assert_eq!(cfg.runtime_dispatch.runtime_profile, None);
     assert_eq!(cfg.runtime_dispatch.model, None);
     assert_eq!(cfg.runtime_dispatch.reasoning_effort, None);
     assert_eq!(cfg.runtime_dispatch.sandbox, None);
@@ -47,7 +47,7 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert!(cfg.runtime_worker.enabled);
     assert_eq!(cfg.runtime_worker.interval_secs, 5);
     assert_eq!(cfg.runtime_worker.concurrency, 1);
-    assert_eq!(cfg.runtime_worker.lease_ttl_secs, 900);
+    assert_eq!(cfg.runtime_worker.lease_ttl_secs, 3900);
     assert!(cfg.runtime_retry_policy.is_empty());
     assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
     assert_eq!(cfg.storage.schema_namespace, "workflow");
@@ -104,10 +104,10 @@ runtime_dispatch:
   enabled: true
   interval_secs: 5
   batch_limit: 7
-  runtime_kind: claude_code
-  runtime_profile: claude-default
-  model: claude-sonnet-4-6
-  reasoning_effort: medium
+  runtime_kind: codex_jsonrpc
+  runtime_profile: codex-gpt-5.5-xhigh
+  model: gpt-5.5
+  reasoning_effort: xhigh
   sandbox: workspace-write
   approval_policy: on-request
   max_turns: 4
@@ -201,15 +201,18 @@ Body
     assert!(cfg.runtime_dispatch.enabled);
     assert_eq!(cfg.runtime_dispatch.interval_secs, 5);
     assert_eq!(cfg.runtime_dispatch.batch_limit, 7);
-    assert_eq!(cfg.runtime_dispatch.runtime_kind, "claude_code");
-    assert_eq!(cfg.runtime_dispatch.runtime_profile, "claude-default");
     assert_eq!(
-        cfg.runtime_dispatch.model.as_deref(),
-        Some("claude-sonnet-4-6")
+        cfg.runtime_dispatch.runtime_kind.as_deref(),
+        Some("codex_jsonrpc")
     );
     assert_eq!(
+        cfg.runtime_dispatch.runtime_profile.as_deref(),
+        Some("codex-gpt-5.5-xhigh")
+    );
+    assert_eq!(cfg.runtime_dispatch.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(
         cfg.runtime_dispatch.reasoning_effort.as_deref(),
-        Some("medium")
+        Some("xhigh")
     );
     assert_eq!(
         cfg.runtime_dispatch.sandbox.as_deref(),

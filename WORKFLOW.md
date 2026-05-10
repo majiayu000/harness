@@ -31,14 +31,12 @@ runtime_dispatch:
   enabled: true
   interval_secs: 30
   batch_limit: 25
-  runtime_kind: claude_code
-  runtime_profile: claude-default
   approval_policy: never
 runtime_worker:
   enabled: true
   interval_secs: 5
-  concurrency: 1
-  lease_ttl_secs: 900
+  concurrency: 6
+  lease_ttl_secs: 3900
 runtime_retry_policy:
   activity_retries: {}
 storage:

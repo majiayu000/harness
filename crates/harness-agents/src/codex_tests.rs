@@ -158,6 +158,27 @@ fn parse_exec_warning_and_error() {
 }
 
 #[test]
+fn parse_exec_item_completed_error() {
+    let line =
+        r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"bad config"}}"#;
+    let event = parse_codex_exec_event_line(line).expect("event should parse");
+
+    assert!(matches!(
+        event,
+        ParsedCodexExecEvent::Error { ref message } if message == "bad config"
+    ));
+}
+
+#[test]
+fn parse_exec_output_surfaces_item_completed_error() {
+    let stdout =
+        r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"bad config"}}"#;
+    let parsed = parse_codex_exec_output(stdout).expect("stdout should parse");
+
+    assert_eq!(parsed.structured_error.as_deref(), Some("bad config"));
+}
+
+#[test]
 fn parse_exec_turn_completed_usage() {
     let line = r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":3,"reasoning_output_tokens":2}}"#;
     let event = parse_codex_exec_event_line(line).expect("event should parse");

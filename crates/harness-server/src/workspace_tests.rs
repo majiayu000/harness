@@ -773,6 +773,43 @@ async fn create_workspace_reconciles_stale_directory() {
 }
 
 #[tokio::test]
+async fn create_workspace_reconciles_missing_registered_worktree() {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let task_id = harness_core::types::TaskId("missing-registered-task".to_string());
+    let first_mgr = WorkspaceManager::new(config.clone()).expect("first manager");
+    let first = first_mgr
+        .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
+        .await
+        .expect("create initial workspace");
+    std::fs::remove_dir_all(&first.workspace_path).expect("remove worktree directory");
+    assert!(
+        is_registered_worktree(source.path(), &first.workspace_path).await,
+        "removed workspace path should still be registered in git metadata"
+    );
+
+    let second_mgr = WorkspaceManager::new(config).expect("second manager");
+    let recreated = second_mgr
+        .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
+        .await
+        .expect("missing registered worktree should be pruned and recreated");
+
+    assert_eq!(recreated.decision, WorkspaceAcquireDecision::RecreatedStale);
+    assert!(recreated.workspace_path.exists());
+    assert!(
+        is_registered_worktree(source.path(), &recreated.workspace_path).await,
+        "recreated workspace should be registered as a live worktree"
+    );
+}
+
+#[tokio::test]
 async fn create_workspace_blocks_live_foreign_owner() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());

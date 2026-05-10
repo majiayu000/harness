@@ -943,11 +943,11 @@ fn transient_error_detection() {
     assert!(is_transient_error("HTTP 429 Too Many Requests"));
     assert!(is_transient_error("502 Bad Gateway"));
     assert!(is_transient_error(
-        "Agent stream stalled: no output for 300s"
+        "Agent stream stalled: no output for 3600s"
     ));
     assert!(is_transient_error("connection reset by peer"));
     assert!(is_transient_error(
-        "stream idle timeout after 300s: zombie connection terminated"
+        "stream idle timeout after 3600s: zombie connection terminated"
     ));
     assert!(is_transient_error(
         "claude exited with exit status: 1: stderr=[] stdout_tail=[You've hit your limit · resets 3pm (Asia/Shanghai)\n]"
