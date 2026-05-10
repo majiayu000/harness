@@ -1191,9 +1191,15 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].runtime_profile, "codex-high");
     let workflow_cfg = harness_core::config::workflow::load_workflow_config(&project_root)?;
+    let inherited_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-high",
+        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+    );
     let expected_profile_manifest = super::background::runtime_profile_manifest_definition(
         &project_root,
+        &state.core.server.config,
         &workflow_cfg.runtime_dispatch,
+        &inherited_profile,
     )?;
     let persisted_profile_manifest = store
         .get_definition(

@@ -119,10 +119,10 @@ pub struct RuntimeDispatchPolicy {
     pub interval_secs: u64,
     #[serde(default = "default_runtime_dispatch_batch_limit")]
     pub batch_limit: u32,
-    #[serde(default = "default_runtime_dispatch_kind")]
-    pub runtime_kind: String,
-    #[serde(default = "default_runtime_dispatch_profile")]
-    pub runtime_profile: String,
+    #[serde(default)]
+    pub runtime_kind: Option<String>,
+    #[serde(default)]
+    pub runtime_profile: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -279,8 +279,8 @@ impl Default for RuntimeDispatchPolicy {
             enabled: true,
             interval_secs: default_runtime_dispatch_interval_secs(),
             batch_limit: default_runtime_dispatch_batch_limit(),
-            runtime_kind: default_runtime_dispatch_kind(),
-            runtime_profile: default_runtime_dispatch_profile(),
+            runtime_kind: None,
+            runtime_profile: None,
             model: None,
             reasoning_effort: None,
             sandbox: None,
@@ -412,14 +412,6 @@ fn default_runtime_dispatch_batch_limit() -> u32 {
     25
 }
 
-fn default_runtime_dispatch_kind() -> String {
-    "claude_code".to_string()
-}
-
-fn default_runtime_dispatch_profile() -> String {
-    "claude-default".to_string()
-}
-
 fn default_runtime_worker_interval_secs() -> u64 {
     5
 }
@@ -429,7 +421,7 @@ fn default_runtime_worker_concurrency() -> u32 {
 }
 
 fn default_runtime_worker_lease_ttl_secs() -> u64 {
-    900
+    3900
 }
 
 fn default_workflow_schema_namespace() -> String {

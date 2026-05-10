@@ -6,7 +6,7 @@ fn config(max_concurrent: usize, max_queue: usize) -> ConcurrencyConfig {
     ConcurrencyConfig {
         max_concurrent_tasks: max_concurrent,
         max_queue_size: max_queue,
-        stall_timeout_secs: 300,
+        stall_timeout_secs: 3600,
         per_project: Default::default(),
         ..ConcurrencyConfig::default()
     }
@@ -122,7 +122,7 @@ async fn per_project_limit_enforced() {
     let cfg = ConcurrencyConfig {
         max_concurrent_tasks: 4,
         max_queue_size: 16,
-        stall_timeout_secs: 300,
+        stall_timeout_secs: 3600,
         per_project,
         ..ConcurrencyConfig::default()
     };
@@ -153,7 +153,7 @@ async fn project_cannot_starve_another() {
     let cfg = ConcurrencyConfig {
         max_concurrent_tasks: 2,
         max_queue_size: 16,
-        stall_timeout_secs: 300,
+        stall_timeout_secs: 3600,
         per_project,
         ..ConcurrencyConfig::default()
     };
@@ -191,7 +191,7 @@ async fn project_stats_reflect_running_and_queued() {
     let cfg2 = ConcurrencyConfig {
         max_concurrent_tasks: 4,
         max_queue_size: 16,
-        stall_timeout_secs: 300,
+        stall_timeout_secs: 3600,
         per_project,
         ..ConcurrencyConfig::default()
     };
@@ -317,7 +317,7 @@ async fn cancelled_project_wait_does_not_leak_queued_count() {
     let cfg = ConcurrencyConfig {
         max_concurrent_tasks: 4,
         max_queue_size: 16,
-        stall_timeout_secs: 300,
+        stall_timeout_secs: 3600,
         per_project,
         ..ConcurrencyConfig::default()
     };
@@ -355,7 +355,7 @@ async fn cancelled_global_wait_releases_project_permit() {
     let cfg = ConcurrencyConfig {
         max_concurrent_tasks: 1,
         max_queue_size: 16,
-        stall_timeout_secs: 300,
+        stall_timeout_secs: 3600,
         per_project,
         ..ConcurrencyConfig::default()
     };
@@ -404,7 +404,7 @@ async fn project_permit_not_leaked_on_mid_send_cancellation() {
     let cfg = ConcurrencyConfig {
         max_concurrent_tasks: 4,
         max_queue_size: 16,
-        stall_timeout_secs: 300,
+        stall_timeout_secs: 3600,
         per_project,
         ..ConcurrencyConfig::default()
     };
@@ -444,7 +444,7 @@ async fn global_permit_not_leaked_on_mid_send_cancellation() {
     let cfg = ConcurrencyConfig {
         max_concurrent_tasks: 1,
         max_queue_size: 16,
-        stall_timeout_secs: 300,
+        stall_timeout_secs: 3600,
         per_project,
         ..ConcurrencyConfig::default()
     };

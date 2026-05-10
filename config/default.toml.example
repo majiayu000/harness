@@ -25,10 +25,15 @@ database_url = "postgres://harness:harness@localhost:5432/harness"
 data_dir = "/home/yourname/.local/share/harness"
 project_root = "."
 
+[concurrency]
+# High-reasoning agent runs can stay silent for several minutes while thinking.
+# Increase this when using gpt-5.5/xhigh for background workflow runtime jobs.
+# stall_timeout_secs = 3600
+
 [agents]
-default_agent = "auto"
+default_agent = "codex"
 # Optional: preferred routing order for complex/critical tasks.
-# complexity_preferred_agents = ["codex", "claude"]
+complexity_preferred_agents = ["codex"]
 sandbox_mode = "danger-full-access"
 
 [agents.claude]
@@ -37,6 +42,8 @@ default_model = "sonnet"
 
 [agents.codex]
 cli_path = "codex"
+default_model = "gpt-5.5"
+reasoning_effort = "xhigh"
 
 [agents.anthropic_api]
 base_url = "https://api.anthropic.com"
@@ -93,7 +100,7 @@ enabled = false
 # [intake.github]
 # enabled = true
 # poll_interval_secs = 300
-# planner_agent = "claude"
+# planner_agent = "codex"
 # sprint_timeout_secs = 10800
 # retry_backoff_base_secs = 15
 # retry_backoff_max_secs = 120

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
 use crate::task_runner;
+use anyhow::Context;
 use harness_workflow::issue_lifecycle::{
     is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
 };
@@ -553,8 +554,13 @@ async fn dispatch_runtime_command_with_project_policy(
             .await;
     }
 
-    let Some(profile_selector) =
-        runtime_dispatch_profile_selector_for_command(state, store, &command).await?
+    let Some(profile_selector) = runtime_dispatch_profile_selector_for_command(
+        state,
+        store,
+        &command,
+        &fallback_profile_selector,
+    )
+    .await?
     else {
         let command_id = command.id.clone();
         store.mark_command_status(&command_id, "skipped").await?;
@@ -573,6 +579,7 @@ async fn runtime_dispatch_profile_selector_for_command(
     state: &Arc<AppState>,
     store: &WorkflowRuntimeStore,
     command: &WorkflowCommandRecord,
+    fallback_profile_selector: &RuntimeProfileSelector,
 ) -> anyhow::Result<Option<RuntimeProfileSelector>> {
     let project_root =
         runtime_command_project_root(store, command, &state.core.project_root).await?;
@@ -591,10 +598,25 @@ async fn runtime_dispatch_profile_selector_for_command(
         );
         return Ok(None);
     }
-    persist_runtime_profile_manifest(store, &project_root, &workflow_cfg.runtime_dispatch).await?;
-    Ok(Some(runtime_dispatch_profile_selector(
+    let inherited_profile = runtime_default_profile_for_project(
+        state,
+        &project_root,
+        Some(fallback_profile_selector.select(None, None)),
+    )
+    .await?;
+    persist_runtime_profile_manifest(
+        store,
+        &project_root,
+        &state.core.server.config,
         &workflow_cfg.runtime_dispatch,
-    )))
+        &inherited_profile,
+    )
+    .await?;
+    Ok(Some(runtime_dispatch_profile_selector(
+        &state.core.server.config,
+        &workflow_cfg.runtime_dispatch,
+        &inherited_profile,
+    )?))
 }
 
 async fn runtime_command_project_root(
@@ -957,26 +979,157 @@ fn runtime_kind_from_config(value: &str) -> Option<RuntimeKind> {
     }
 }
 
-fn runtime_dispatch_profile(
-    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+fn runtime_profile_from_kind(
+    config: &harness_core::config::HarnessConfig,
+    kind: RuntimeKind,
 ) -> RuntimeProfile {
-    let kind = runtime_kind_from_config(&policy.runtime_kind).unwrap_or_else(|| {
+    match kind {
+        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => {
+            let mut profile = RuntimeProfile::new("codex-default", kind);
+            profile.model = Some(config.agents.codex.default_model.clone());
+            profile.reasoning_effort = Some(config.agents.codex.reasoning_effort.clone());
+            profile
+        }
+        RuntimeKind::ClaudeCode => {
+            let mut profile = RuntimeProfile::new("claude-default", kind);
+            profile.model = Some(config.agents.claude.default_model.clone());
+            profile
+        }
+        RuntimeKind::AnthropicApi => {
+            let mut profile = RuntimeProfile::new("anthropic-api-default", kind);
+            profile.model = Some(config.agents.anthropic_api.default_model.clone());
+            profile
+        }
+        RuntimeKind::RemoteHost => RuntimeProfile::new("remote-host-default", kind),
+    }
+}
+
+fn runtime_profile_from_agent(
+    config: &harness_core::config::HarnessConfig,
+    agent_name: &str,
+) -> Option<RuntimeProfile> {
+    match agent_name {
+        "codex" => Some(runtime_profile_from_kind(config, RuntimeKind::CodexJsonrpc)),
+        "claude" => Some(runtime_profile_from_kind(config, RuntimeKind::ClaudeCode)),
+        "anthropic-api" => Some(runtime_profile_from_kind(config, RuntimeKind::AnthropicApi)),
+        _ => None,
+    }
+}
+
+async fn runtime_default_agent_name_for_project(
+    state: &Arc<AppState>,
+    project_root: &Path,
+) -> anyhow::Result<Option<String>> {
+    let project_cfg = harness_core::config::project::load_project_config(project_root)
+        .with_context(|| {
+            format!(
+                "failed to load project config at {}",
+                project_root.display()
+            )
+        })?;
+    if let Some(agent_name) = project_cfg
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.default.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("auto"))
+    {
+        return Ok(Some(agent_name.to_string()));
+    }
+
+    if let Some(registry) = state.core.project_registry.as_deref() {
+        let canonical_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+        if let Some(project) = registry.get_by_root(&canonical_root).await? {
+            if let Some(agent_name) = project
+                .default_agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("auto"))
+            {
+                return Ok(Some(agent_name.to_string()));
+            }
+        }
+    }
+
+    Ok(state
+        .core
+        .server
+        .agent_registry
+        .resolved_default_agent_name()
+        .map(str::to_string))
+}
+
+async fn runtime_default_profile_for_project(
+    state: &Arc<AppState>,
+    project_root: &Path,
+    fallback_profile: Option<&RuntimeProfile>,
+) -> anyhow::Result<RuntimeProfile> {
+    let agent_name = runtime_default_agent_name_for_project(state, project_root).await?;
+    if let Some(agent_name) = agent_name.as_deref() {
+        if let Some(profile) = runtime_profile_from_agent(&state.core.server.config, agent_name) {
+            return Ok(profile);
+        }
         tracing::warn!(
-            runtime_kind = policy.runtime_kind,
-            "workflow runtime command dispatcher: unknown runtime_kind, falling back to codex_jsonrpc"
+            agent = agent_name,
+            project_root = %project_root.display(),
+            "workflow runtime cannot derive a runtime profile from the project default agent; falling back to dispatcher profile"
         );
-        RuntimeKind::CodexJsonrpc
-    });
-    let mut profile = RuntimeProfile::new(policy.runtime_profile.clone(), kind);
-    profile.model = policy.model.clone();
-    profile.reasoning_effort = policy.reasoning_effort.clone();
-    profile.sandbox = policy.sandbox.clone();
+    }
+
+    fallback_profile.cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "workflow runtime cannot derive a runtime profile for {}; set runtime_dispatch.runtime_kind or configure a supported default agent",
+            project_root.display()
+        )
+    })
+}
+
+fn runtime_dispatch_profile(
+    config: &harness_core::config::HarnessConfig,
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+    inherited_profile: &RuntimeProfile,
+) -> anyhow::Result<RuntimeProfile> {
+    let base_profile = match policy.runtime_kind.as_deref() {
+        Some(value) => match runtime_kind_from_config(value) {
+            Some(kind) => runtime_profile_from_kind(config, kind),
+            None => {
+                tracing::warn!(
+                    runtime_kind = value,
+                    "workflow runtime command dispatcher: unknown runtime_kind, inheriting the configured default runtime profile"
+                );
+                inherited_profile.clone()
+            }
+        },
+        None => inherited_profile.clone(),
+    };
+    let kind = base_profile.kind;
+    let profile_name = policy
+        .runtime_profile
+        .clone()
+        .unwrap_or_else(|| base_profile.name.clone());
+    let mut profile = RuntimeProfile::new(profile_name, kind);
+    profile.model = policy.model.clone().or_else(|| base_profile.model.clone());
+    profile.reasoning_effort = policy
+        .reasoning_effort
+        .clone()
+        .or_else(|| base_profile.reasoning_effort.clone());
+    profile.sandbox = policy
+        .sandbox
+        .clone()
+        .or_else(|| base_profile.sandbox.clone());
     profile.approval_policy = runtime_kind_supports_approval_policy(kind)
-        .then(|| policy.approval_policy.clone())
+        .then(|| {
+            policy
+                .approval_policy
+                .clone()
+                .or_else(|| base_profile.approval_policy.clone())
+        })
         .flatten();
-    profile.max_turns = policy.max_turns;
-    profile.timeout_secs = policy.timeout_secs;
-    profile
+    profile.max_turns = policy.max_turns.or(base_profile.max_turns);
+    profile.timeout_secs = policy.timeout_secs.or(base_profile.timeout_secs);
+    Ok(profile)
 }
 
 #[derive(Clone)]
@@ -989,9 +1142,11 @@ struct ResolvedRuntimeDispatchProfiles {
 }
 
 fn resolve_runtime_dispatch_profiles(
+    config: &harness_core::config::HarnessConfig,
     policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
-) -> ResolvedRuntimeDispatchProfiles {
-    let default_profile = runtime_dispatch_profile(policy);
+    inherited_profile: &RuntimeProfile,
+) -> anyhow::Result<ResolvedRuntimeDispatchProfiles> {
+    let default_profile = runtime_dispatch_profile(config, policy, inherited_profile)?;
     let workflow_profiles = policy
         .workflow_profiles
         .iter()
@@ -1026,18 +1181,20 @@ fn resolve_runtime_dispatch_profiles(
                 .insert(activity.clone(), profile);
         }
     }
-    ResolvedRuntimeDispatchProfiles {
+    Ok(ResolvedRuntimeDispatchProfiles {
         default_profile,
         workflow_profiles,
         activity_profiles,
         workflow_activity_profiles,
-    }
+    })
 }
 
 fn runtime_dispatch_profile_selector(
+    config: &harness_core::config::HarnessConfig,
     policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
-) -> RuntimeProfileSelector {
-    let resolved = resolve_runtime_dispatch_profiles(policy);
+    inherited_profile: &RuntimeProfile,
+) -> anyhow::Result<RuntimeProfileSelector> {
+    let resolved = resolve_runtime_dispatch_profiles(config, policy, inherited_profile)?;
     let default_profile = resolved.default_profile;
     let mut selector = RuntimeProfileSelector::new(default_profile);
     for (definition_id, profile) in &resolved.workflow_profiles {
@@ -1055,23 +1212,28 @@ fn runtime_dispatch_profile_selector(
             );
         }
     }
-    selector
+    Ok(selector)
 }
 
 async fn persist_runtime_profile_manifest(
     store: &WorkflowRuntimeStore,
     project_root: &Path,
+    config: &harness_core::config::HarnessConfig,
     policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+    inherited_profile: &RuntimeProfile,
 ) -> anyhow::Result<()> {
-    let definition = runtime_profile_manifest_definition(project_root, policy)?;
+    let definition =
+        runtime_profile_manifest_definition(project_root, config, policy, inherited_profile)?;
     store.upsert_definition(&definition).await
 }
 
 pub(super) fn runtime_profile_manifest_definition(
     project_root: &Path,
+    config: &harness_core::config::HarnessConfig,
     policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+    inherited_profile: &RuntimeProfile,
 ) -> anyhow::Result<WorkflowDefinition> {
-    let resolved = resolve_runtime_dispatch_profiles(policy);
+    let resolved = resolve_runtime_dispatch_profiles(config, policy, inherited_profile)?;
     let metadata = serde_json::json!({
         "artifact_type": "runtime_profile_manifest",
         "project_root": project_root.to_string_lossy(),
@@ -1177,7 +1339,36 @@ pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
             );
             let policy = workflow_cfg.runtime_dispatch;
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
-            let profile_selector = runtime_dispatch_profile_selector(&policy);
+            let inherited_profile = match runtime_default_profile_for_project(
+                &state,
+                &state.core.project_root,
+                None,
+            )
+            .await
+            {
+                Ok(profile) => profile,
+                Err(error) => {
+                    tracing::warn!(
+                            "workflow runtime command dispatcher could not resolve default runtime profile: {error}"
+                        );
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+            };
+            let profile_selector = match runtime_dispatch_profile_selector(
+                &state.core.server.config,
+                &policy,
+                &inherited_profile,
+            ) {
+                Ok(selector) => selector,
+                Err(error) => {
+                    tracing::warn!(
+                        "workflow runtime command dispatcher could not build runtime profile selector: {error}"
+                    );
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+            };
             match run_runtime_command_dispatch_tick(
                 &state,
                 profile_selector,
@@ -2247,10 +2438,52 @@ mod tests {
     const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[test]
+    fn runtime_dispatch_profile_selector_inherits_configured_agent_profile_when_unset() {
+        let mut config = harness_core::config::HarnessConfig::default();
+        config.agents.codex.default_model = "gpt-5.5".to_string();
+        config.agents.codex.reasoning_effort = "xhigh".to_string();
+        let inherited_profile = runtime_profile_from_agent(&config, "codex").unwrap();
+        let policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            approval_policy: Some("never".to_string()),
+            ..Default::default()
+        };
+
+        let selector =
+            runtime_dispatch_profile_selector(&config, &policy, &inherited_profile).unwrap();
+        let profile = selector.select_for_workflow(Some("github_issue_pr"));
+        assert_eq!(profile.kind, RuntimeKind::CodexJsonrpc);
+        assert_eq!(profile.name, "codex-default");
+        assert_eq!(profile.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(profile.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(profile.approval_policy.as_deref(), Some("never"));
+    }
+
+    #[test]
+    fn runtime_dispatch_profile_explicit_kind_uses_matching_provider_config() {
+        let mut config = harness_core::config::HarnessConfig::default();
+        config.agents.codex.default_model = "gpt-5.5".to_string();
+        config.agents.codex.reasoning_effort = "xhigh".to_string();
+        config.agents.claude.default_model = "sonnet-explicit".to_string();
+        let inherited_profile = runtime_profile_from_agent(&config, "codex").unwrap();
+        let policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: Some("claude_code".to_string()),
+            ..Default::default()
+        };
+
+        let profile = runtime_dispatch_profile(&config, &policy, &inherited_profile).unwrap();
+        assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(profile.name, "claude-default");
+        assert_eq!(profile.model.as_deref(), Some("sonnet-explicit"));
+        assert_eq!(profile.reasoning_effort, None);
+    }
+
+    #[test]
     fn runtime_dispatch_profile_selector_applies_workflow_overrides() {
+        let config = harness_core::config::HarnessConfig::default();
+        let inherited_profile = RuntimeProfile::new("inherited-default", RuntimeKind::CodexJsonrpc);
         let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
-            runtime_kind: "claude_code".to_string(),
-            runtime_profile: "claude-default".to_string(),
+            runtime_kind: Some("claude_code".to_string()),
+            runtime_profile: Some("claude-default".to_string()),
             model: Some("claude-sonnet-4-6".to_string()),
             timeout_secs: Some(600),
             ..Default::default()
@@ -2295,7 +2528,8 @@ mod tests {
             )]),
         );
 
-        let selector = runtime_dispatch_profile_selector(&policy);
+        let selector =
+            runtime_dispatch_profile_selector(&config, &policy, &inherited_profile).unwrap();
         let issue_profile = selector.select_for_workflow(Some("github_issue_pr"));
         assert_eq!(issue_profile.kind, RuntimeKind::CodexExec);
         assert_eq!(issue_profile.name, "codex-high");
@@ -2325,9 +2559,11 @@ mod tests {
 
     #[test]
     fn runtime_profile_manifest_definition_records_resolved_profiles() -> anyhow::Result<()> {
+        let config = harness_core::config::HarnessConfig::default();
+        let inherited_profile = RuntimeProfile::new("inherited-default", RuntimeKind::CodexJsonrpc);
         let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
-            runtime_kind: "codex_jsonrpc".to_string(),
-            runtime_profile: "codex-default".to_string(),
+            runtime_kind: Some("codex_jsonrpc".to_string()),
+            runtime_profile: Some("codex-default".to_string()),
             model: Some("gpt-default".to_string()),
             timeout_secs: Some(600),
             ..Default::default()
@@ -2346,7 +2582,12 @@ mod tests {
         );
 
         let project_root = std::path::Path::new("/tmp/harness-runtime-profile-project");
-        let definition = runtime_profile_manifest_definition(project_root, &policy)?;
+        let definition = runtime_profile_manifest_definition(
+            project_root,
+            &config,
+            &policy,
+            &inherited_profile,
+        )?;
 
         assert!(definition.id.starts_with("runtime_profiles:"));
         assert_eq!(definition.name, "Runtime Profile Manifest");
@@ -2378,9 +2619,11 @@ mod tests {
 
     #[test]
     fn runtime_dispatch_profile_selector_drops_codex_approval_for_non_codex_override() {
+        let config = harness_core::config::HarnessConfig::default();
+        let inherited_profile = RuntimeProfile::new("inherited-default", RuntimeKind::CodexJsonrpc);
         let mut policy = harness_core::config::workflow::RuntimeDispatchPolicy {
-            runtime_kind: "codex_jsonrpc".to_string(),
-            runtime_profile: "codex-default".to_string(),
+            runtime_kind: Some("codex_jsonrpc".to_string()),
+            runtime_profile: Some("codex-default".to_string()),
             approval_policy: Some("on-request".to_string()),
             ..Default::default()
         };
@@ -2401,7 +2644,8 @@ mod tests {
             },
         );
 
-        let selector = runtime_dispatch_profile_selector(&policy);
+        let selector =
+            runtime_dispatch_profile_selector(&config, &policy, &inherited_profile).unwrap();
         let claude_profile = selector.select_for_workflow(Some("claude_review"));
         assert_eq!(claude_profile.kind, RuntimeKind::ClaudeCode);
         assert_eq!(claude_profile.name, "claude-review");
@@ -2415,14 +2659,16 @@ mod tests {
 
     #[test]
     fn runtime_dispatch_profile_drops_codex_approval_for_non_codex_default() {
+        let config = harness_core::config::HarnessConfig::default();
+        let inherited_profile = RuntimeProfile::new("inherited-default", RuntimeKind::CodexJsonrpc);
         let policy = harness_core::config::workflow::RuntimeDispatchPolicy {
-            runtime_kind: "claude_code".to_string(),
-            runtime_profile: "claude-default".to_string(),
+            runtime_kind: Some("claude_code".to_string()),
+            runtime_profile: Some("claude-default".to_string()),
             approval_policy: Some("on-request".to_string()),
             ..Default::default()
         };
 
-        let profile = runtime_dispatch_profile(&policy);
+        let profile = runtime_dispatch_profile(&config, &policy, &inherited_profile).unwrap();
         assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
         assert_eq!(profile.name, "claude-default");
         assert_eq!(profile.approval_policy, None);
