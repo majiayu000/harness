@@ -19,5 +19,4 @@ services:
 
 volumes:
   harness_pg_data:
-    external: true
     name: harness_pg_data
