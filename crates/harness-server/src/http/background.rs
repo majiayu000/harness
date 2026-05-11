@@ -9,8 +9,8 @@ use harness_workflow::issue_lifecycle::{
 };
 use harness_workflow::runtime::{
     CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
-    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowDefinition, WorkflowInstance,
-    WorkflowRuntimeStore,
+    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowCommandType, WorkflowDefinition,
+    WorkflowInstance, WorkflowRuntimeStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -867,7 +867,7 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
         .await?;
     let mut tick = RuntimePrFeedbackSweepTick::default();
     let mut considered_candidates = 0usize;
-    for workflow in workflows {
+    for mut workflow in workflows {
         if !matches!(workflow.state.as_str(), "pr_open" | "awaiting_feedback") {
             continue;
         }
@@ -877,8 +877,13 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
             .and_then(serde_json::Value::as_u64)
             .is_none()
         {
-            tick.skipped += 1;
-            continue;
+            match recover_runtime_pr_binding_from_bind_pr_command(store, workflow).await? {
+                Some(recovered) => workflow = recovered,
+                None => {
+                    tick.skipped += 1;
+                    continue;
+                }
+            }
         }
         let Some(project_root) = workflow_project_root(&workflow) else {
             tick.skipped += 1;
@@ -927,6 +932,56 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
         }
     }
     Ok(tick)
+}
+
+async fn recover_runtime_pr_binding_from_bind_pr_command(
+    store: &WorkflowRuntimeStore,
+    mut workflow: WorkflowInstance,
+) -> anyhow::Result<Option<WorkflowInstance>> {
+    let commands = store.commands_for(&workflow.id).await?;
+    let Some(command) = commands
+        .into_iter()
+        .rev()
+        .find(|record| record.command.command_type == WorkflowCommandType::BindPr)
+    else {
+        return Ok(None);
+    };
+    let Some(pr_number) = command
+        .command
+        .command
+        .get("pr_number")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return Ok(None);
+    };
+    let Some(pr_url) = command
+        .command
+        .command
+        .get("pr_url")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+
+    if !workflow.data.is_object() {
+        workflow.data = serde_json::json!({});
+    }
+    let data = workflow
+        .data
+        .as_object_mut()
+        .context("workflow runtime instance data is not an object")?;
+    data.insert("pr_number".to_string(), serde_json::json!(pr_number));
+    data.insert("pr_url".to_string(), serde_json::json!(pr_url));
+    workflow.version = workflow.version.saturating_add(1);
+    store.upsert_instance(&workflow).await?;
+    tracing::info!(
+        workflow_id = %workflow.id,
+        pr_number,
+        pr_url,
+        command_id = %command.id,
+        "workflow runtime PR feedback sweeper recovered missing PR binding"
+    );
+    Ok(Some(workflow))
 }
 
 pub(super) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) {

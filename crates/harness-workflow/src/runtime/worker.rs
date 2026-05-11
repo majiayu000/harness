@@ -1,6 +1,6 @@
 use super::model::{
-    ActivityResult, ActivityStatus, RuntimeJob, RuntimeProfile, WorkflowCommandRecord,
-    WorkflowCommandType,
+    ActivityResult, ActivityStatus, RuntimeJob, RuntimeProfile, WorkflowCommand,
+    WorkflowCommandRecord, WorkflowCommandType, WorkflowInstance,
 };
 use super::reducer::reduce_runtime_job_completed;
 use super::store::WorkflowRuntimeStore;
@@ -8,7 +8,9 @@ use super::validator::{DecisionValidator, ValidationContext};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use serde_json::json;
+use serde_json::{json, Value};
+
+const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
 
 #[async_trait]
 pub trait RuntimeJobExecutor: Send + Sync {
@@ -229,9 +231,21 @@ impl<'a> RuntimeWorker<'a> {
 
         self.store.record_decision(&record).await?;
         for command in &decision.commands {
-            self.store
-                .enqueue_command(&instance.id, Some(&record.id), command)
-                .await?;
+            if command.requires_runtime_job() {
+                self.store
+                    .enqueue_command(&instance.id, Some(&record.id), command)
+                    .await?;
+            } else {
+                self.store
+                    .enqueue_command_with_status(
+                        &instance.id,
+                        Some(&record.id),
+                        command,
+                        COMMAND_STATUS_HANDLED_INLINE,
+                    )
+                    .await?;
+                apply_inline_command_side_effect(&mut instance, command)?;
+            }
         }
         instance.state = decision.next_state.clone();
         instance.version = instance.version.saturating_add(1);
@@ -305,6 +319,36 @@ fn merge_child_completion_payload(
         }
     }
     payload
+}
+
+fn apply_inline_command_side_effect(
+    instance: &mut WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<()> {
+    if command.command_type != WorkflowCommandType::BindPr {
+        return Ok(());
+    }
+    let pr_number = command
+        .command
+        .get("pr_number")
+        .and_then(Value::as_u64)
+        .context("bind_pr command missing pr_number")?;
+    let pr_url = command
+        .command
+        .get("pr_url")
+        .and_then(Value::as_str)
+        .context("bind_pr command missing pr_url")?;
+
+    if !instance.data.is_object() {
+        instance.data = json!({});
+    }
+    let data = instance
+        .data
+        .as_object_mut()
+        .context("workflow instance data is not an object")?;
+    data.insert("pr_number".to_string(), json!(pr_number));
+    data.insert("pr_url".to_string(), json!(pr_url));
+    Ok(())
 }
 
 fn command_status_for_activity(status: ActivityStatus) -> &'static str {

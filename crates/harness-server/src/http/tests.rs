@@ -1294,6 +1294,72 @@ async fn runtime_pr_feedback_sweep_tick_enqueues_runtime_command() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-feedback-recovery");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:230"),
+    )
+    .with_id("issue-230")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 230,
+        "task_id": "runtime-task-230",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let bind_pr = harness_workflow::runtime::WorkflowCommand::bind_pr(
+        80,
+        "https://github.com/owner/repo/pull/80",
+        "issue-230-bind-pr-80",
+    );
+    store
+        .enqueue_command_with_status(&workflow.id, None, &bind_pr, "skipped")
+        .await?;
+
+    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;
+
+    assert_eq!(tick.requested, 1);
+    assert_eq!(tick.skipped, 0);
+    let updated = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "awaiting_feedback");
+    assert_eq!(updated.data["pr_number"], 80);
+    assert_eq!(
+        updated.data["pr_url"],
+        "https://github.com/owner/repo/pull/80"
+    );
+    let commands = store.commands_for(&workflow.id).await?;
+    assert_eq!(commands.len(), 2);
+    assert_eq!(
+        commands[1].command.command_type,
+        harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_repo_backlog_poll_tick_enqueues_runtime_command() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
