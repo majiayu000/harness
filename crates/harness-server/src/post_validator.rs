@@ -3,8 +3,11 @@ use harness_core::agent::{AgentRequest, AgentResponse};
 use harness_core::config::misc::ValidationConfig;
 use harness_core::interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor};
 use harness_core::prompts;
+use harness_core::validation::{
+    ShellValidationExecutor, ValidationExecutor, ValidationOutcomeKind, ValidationRequest,
+};
 use std::path::Path;
-use tokio::process::Command;
+use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
 /// Runs project-specific validation commands after each agent turn.
@@ -19,6 +22,10 @@ pub struct PostExecutionValidator {
     /// Deprecated test-only field retained for struct literal compatibility.
     gh_bin: String,
     github_token: Option<String>,
+    /// Executor for shell validation commands. Defaults to
+    /// [`ShellValidationExecutor`]; tests substitute via
+    /// [`PostExecutionValidator::with_executor`].
+    validation_executor: Arc<dyn ValidationExecutor>,
 }
 
 /// Classify a command string into a human-readable error prefix.
@@ -100,7 +107,17 @@ impl PostExecutionValidator {
             config,
             gh_bin: "gh".to_string(),
             github_token,
+            validation_executor: Arc::new(ShellValidationExecutor),
         }
+    }
+
+    /// Substitute the [`ValidationExecutor`] used to run shell validation
+    /// commands. Intended for tests that want to assert how the validator
+    /// reacts to specific outcomes (timeout, non-zero exit, captured stderr)
+    /// without spawning real processes.
+    pub fn with_executor(mut self, executor: Arc<dyn ValidationExecutor>) -> Self {
+        self.validation_executor = executor;
+        self
     }
 
     /// Verify that a PR URL exists through the GitHub REST API.
@@ -181,40 +198,46 @@ impl PostExecutionValidator {
         Err(last_err)
     }
 
-    /// Run a shell command via `sh -c` to support pipes, quotes, and complex expressions.
+    /// Run a shell command via the configured [`ValidationExecutor`].
     ///
-    /// Uses `kill_on_drop(true)` so that if the timeout fires and the future is dropped,
-    /// the child process is killed rather than left running as an orphan.
-    async fn run_command(cmd_str: &str, project: &Path, timeout_secs: u64) -> Result<(), String> {
+    /// Returns `Ok(())` for empty commands and for any successful exit;
+    /// returns a `String` error containing stdout/stderr (or the spawn /
+    /// timeout reason) on failure. Error messages preserve the previous
+    /// inline-spawn wording so log greps continue to work.
+    async fn run_command(
+        &self,
+        cmd_str: &str,
+        project: &Path,
+        timeout_secs: u64,
+    ) -> Result<(), String> {
         if cmd_str.trim().is_empty() {
             return Ok(());
         }
 
-        let child = match Command::new("sh")
-            .args(["-c", cmd_str])
-            .current_dir(project)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return Err(format!("Command `{cmd_str}` failed to spawn: {e}")),
-        };
+        let outcome = self
+            .validation_executor
+            .run(ValidationRequest {
+                command: cmd_str,
+                cwd: project,
+                env: &[],
+                timeout: Duration::from_secs(timeout_secs),
+            })
+            .await;
 
-        let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
-
-        match result {
-            Ok(Ok(output)) if output.status.success() => Ok(()),
-            Ok(Ok(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let code = output.status.code().unwrap_or(-1);
-                Err(format!(
-                    "Command `{cmd_str}` failed (exit {code})\nstdout: {stdout}\nstderr: {stderr}"
-                ))
+        match outcome.kind {
+            ValidationOutcomeKind::Success => Ok(()),
+            ValidationOutcomeKind::NonZeroExit { code } => Err(format!(
+                "Command `{cmd_str}` failed (exit {code})\nstdout: {stdout}\nstderr: {stderr}",
+                stdout = outcome.stdout,
+                stderr = outcome.stderr,
+            )),
+            ValidationOutcomeKind::SpawnFailed { reason } => {
+                Err(format!("Command `{cmd_str}` failed to spawn: {reason}"))
             }
-            Ok(Err(e)) => Err(format!("Command `{cmd_str}` failed to wait: {e}")),
-            Err(_) => Err(format!(
+            ValidationOutcomeKind::WaitFailed { reason } => {
+                Err(format!("Command `{cmd_str}` failed to wait: {reason}"))
+            }
+            ValidationOutcomeKind::TimedOut => Err(format!(
                 "Command `{cmd_str}` timed out after {timeout_secs}s"
             )),
         }
@@ -269,7 +292,10 @@ impl TurnInterceptor for PostExecutionValidator {
         // Run pre_commit commands (format, compile, lint).
         for cmd in &pre_commit {
             tracing::info!(cmd = %cmd, "post_validator: pre_commit");
-            match Self::run_command(cmd, project, self.config.timeout_secs).await {
+            match self
+                .run_command(cmd, project, self.config.timeout_secs)
+                .await
+            {
                 Ok(()) => tracing::debug!(cmd = %cmd, "post_validator: passed"),
                 Err(e) => {
                     tracing::warn!(cmd = %cmd, error = %e, "post_validator: failed");
@@ -282,7 +308,10 @@ impl TurnInterceptor for PostExecutionValidator {
         if errors.is_empty() {
             for cmd in &pre_push {
                 tracing::info!(cmd = %cmd, "post_validator: pre_push");
-                match Self::run_command(cmd, project, self.config.timeout_secs).await {
+                match self
+                    .run_command(cmd, project, self.config.timeout_secs)
+                    .await
+                {
                     Ok(()) => tracing::debug!(cmd = %cmd, "post_validator: passed"),
                     Err(e) => {
                         tracing::warn!(cmd = %cmd, error = %e, "post_validator: failed");
