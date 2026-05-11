@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use super::state::AppState;
 use crate::task_runner::{
-    SchedulerAuthorityState, TaskFailureKind, TaskKind, TaskPhase, TaskSchedulerState, TaskStatus,
-    TaskSummary, TaskWorkflowSummary,
+    SchedulerAuthorityState, TaskFailureKind, TaskKind, TaskPhase, TaskSchedulerState, TaskState,
+    TaskStatus, TaskSummary, TaskWorkflowSummary,
 };
+use harness_core::proof_of_work::{CiStatus, ProofOfWork, QualitySignal, ReviewOutcome};
 
 /// Response type for `GET /tasks/{id}` — `TaskState` fields plus the optional workflow summary
 /// that requires a separate workflow-store lookup (not persisted on `TaskState` itself).
@@ -462,6 +463,118 @@ pub(crate) async fn get_task_artifacts(
     }
 }
 
+/// Derive a [`ProofOfWork`] summary from a [`TaskState`].
+///
+/// Uses only `TaskState` fields already populated by the review loop, so the
+/// derivation is a pure function and stays cheap to call from HTTP handlers.
+///
+/// CI status policy:
+/// - `Passed` requires both terminal `Done` status and an approving review,
+///   because the LGTM gate is what runs the project's test command.
+/// - `Failed` covers explicit `Failed` status and review rounds that recorded
+///   a `quota_exhausted` / `billing_failed` / `upstream_failure` / `timeout`
+///   result.
+/// - Everything else (cancelled, no review evidence) reports `Unknown`.
+pub(crate) fn proof_from_state(task: &TaskState) -> ProofOfWork {
+    let mut review_rounds: u32 = 0;
+    let mut last_review_result: Option<&str> = None;
+    let mut saw_review_failure = false;
+
+    for round in &task.rounds {
+        if !matches!(round.action.as_str(), "review" | "agent_review") {
+            continue;
+        }
+        review_rounds = review_rounds.saturating_add(1);
+        last_review_result = Some(round.result.as_str());
+        if matches!(
+            round.result.as_str(),
+            "quota_exhausted" | "billing_failed" | "upstream_failure" | "timeout" | "failed"
+        ) {
+            saw_review_failure = true;
+        }
+    }
+
+    let review_outcome = match last_review_result {
+        Some("lgtm") | Some("approved") => ReviewOutcome::Approved,
+        Some("needs_fix") | Some("fixed") => ReviewOutcome::ChangesRequested,
+        Some(result) if result.ends_with(" issues") => ReviewOutcome::ChangesRequested,
+        Some(_) => ReviewOutcome::Skipped,
+        None => ReviewOutcome::Skipped,
+    };
+
+    let ci_status =
+        if matches!(task.status, TaskStatus::Done) && review_outcome == ReviewOutcome::Approved {
+            CiStatus::Passed
+        } else if matches!(task.status, TaskStatus::Failed) || saw_review_failure {
+            CiStatus::Failed
+        } else {
+            CiStatus::Unknown
+        };
+
+    let mut signals = Vec::new();
+    signals.push(QualitySignal {
+        name: "turns".to_string(),
+        value: task.turn.to_string(),
+    });
+    if let Some(error) = task.error.as_deref().filter(|s| !s.is_empty()) {
+        signals.push(QualitySignal {
+            name: "error".to_string(),
+            value: error.to_string(),
+        });
+    }
+
+    ProofOfWork {
+        task_id: task.id.0.clone(),
+        status: task.status.as_ref().to_string(),
+        pr_url: task.pr_url.clone(),
+        ci_status,
+        review_outcome,
+        review_rounds,
+        quality_signals: signals,
+    }
+}
+
+/// GET /tasks/{id}/proof — machine-readable proof-of-work summary for a
+/// completed task.
+///
+/// Returns 404 for unknown task IDs, 422 while the task is still in flight,
+/// and 200 with a JSON [`ProofOfWork`] for terminal tasks (Done / Failed /
+/// Cancelled). See `harness-core::proof_of_work` for the wire format.
+pub(crate) async fn get_task_proof(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let task_id = harness_core::types::TaskId(id);
+    match state.core.tasks.get_with_db_fallback(&task_id).await {
+        Ok(Some(task)) => {
+            if !task.status.is_terminal() {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "error": "task is not in a terminal state",
+                        "status": task.status.as_ref(),
+                    })),
+                )
+                    .into_response();
+            }
+            Json(proof_from_state(&task)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "task not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("get_task_proof: database error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// GET /tasks/{id}/prompts — all persisted redacted prompts for a task.
 pub(crate) async fn get_task_prompts(
     State(state): State<Arc<AppState>>,
@@ -498,3 +611,7 @@ pub(crate) async fn get_task_prompts(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "task_query_routes_tests.rs"]
+mod tests;

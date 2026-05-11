@@ -48,7 +48,9 @@ pub(crate) use misc_routes::{
     intake_status, password_reset, project_queue_stats,
 };
 pub(crate) use sse_routes::stream_task_sse;
-pub(crate) use task_query_routes::{get_task, get_task_artifacts, get_task_prompts, list_tasks};
+pub(crate) use task_query_routes::{
+    get_task, get_task_artifacts, get_task_prompts, get_task_proof, list_tasks,
+};
 
 /// Resolve the reviewer agent for independent agent review.
 ///
