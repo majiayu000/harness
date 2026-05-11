@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 pub use crate::freshness::FreshnessClass;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillGovernanceStatus {
@@ -548,22 +551,7 @@ impl SkillStore {
     }
 
     pub fn load_builtin(&mut self) {
-        let builtins = [
-            ("interview", include_str!("../../../skills/interview.md")),
-            ("exec-plan", include_str!("../../../skills/exec-plan.md")),
-            ("preflight", include_str!("../../../skills/preflight.md")),
-            ("check", include_str!("../../../skills/check.md")),
-            ("build-fix", include_str!("../../../skills/build-fix.md")),
-            ("review", include_str!("../../../skills/review.md")),
-            (
-                "cross-review",
-                include_str!("../../../skills/cross-review.md"),
-            ),
-            ("learn", include_str!("../../../skills/learn.md")),
-            ("gc", include_str!("../../../skills/gc.md")),
-            ("stats", include_str!("../../../skills/stats.md")),
-        ];
-        for (name, content) in builtins {
+        for &(name, content) in crate::builtin::BUILTIN_SKILLS {
             if self.get_by_name(name).is_none() {
                 let usage = if let Some(dir) = &self.persist_dir {
                     self.skill_dirs.insert(name.to_string(), dir.clone());
@@ -751,7 +739,3 @@ fn location_priority(loc: SkillLocation) -> u8 {
         SkillLocation::System => 1,
     }
 }
-
-#[cfg(test)]
-#[path = "store_tests.rs"]
-mod tests;
