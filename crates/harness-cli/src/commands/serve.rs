@@ -5,10 +5,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Parse a `name=path` string into `(name, PathBuf)`.
+///
+/// Surrounding whitespace is trimmed from both the name and the path so that
+/// shell-quoted values like `--project " repo = /tmp/repo "` still parse
+/// cleanly. Splitting uses `split_once('=')`, so paths that legitimately
+/// contain `=` (rare but allowed on POSIX filesystems) are preserved verbatim
+/// after the first `=`.
 fn parse_project_entry(s: &str) -> Result<(String, PathBuf)> {
     let (name, path) = s
         .split_once('=')
         .ok_or_else(|| anyhow::anyhow!("--project must be in NAME=PATH format, got: {s:?}"))?;
+    let name = name.trim();
+    let path = path.trim();
     if name.is_empty() {
         anyhow::bail!("--project name cannot be empty in: {s:?}");
     }
@@ -273,9 +281,94 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::startup_default_project_for_root;
+    use super::{parse_project_entry, startup_default_project_for_root};
     use harness_core::config::ProjectEntry;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn parse_project_entry_accepts_name_equals_path() {
+        let (name, path) = parse_project_entry("repo-a=/tmp/repo-a").expect("parses");
+        assert_eq!(name, "repo-a");
+        assert_eq!(path, PathBuf::from("/tmp/repo-a"));
+    }
+
+    #[test]
+    fn parse_project_entry_trims_surrounding_whitespace() {
+        let (name, path) = parse_project_entry("  repo-a  =  /tmp/repo-a  ").expect("parses");
+        assert_eq!(name, "repo-a");
+        assert_eq!(path, PathBuf::from("/tmp/repo-a"));
+    }
+
+    #[test]
+    fn parse_project_entry_preserves_equals_inside_path() {
+        // `split_once('=')` only splits on the first `=`, so paths that
+        // legitimately contain `=` are passed through unchanged.
+        let (name, path) = parse_project_entry("repo=/tmp/odd=name").expect("parses");
+        assert_eq!(name, "repo");
+        assert_eq!(path, PathBuf::from("/tmp/odd=name"));
+    }
+
+    #[test]
+    fn parse_project_entry_rejects_missing_equals() {
+        let err = parse_project_entry("repo-a").unwrap_err().to_string();
+        assert!(err.contains("NAME=PATH"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_project_entry_rejects_empty_name() {
+        let err = parse_project_entry("=/tmp/repo").unwrap_err().to_string();
+        assert!(
+            err.contains("name cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_project_entry_rejects_whitespace_only_name() {
+        let err = parse_project_entry("   =/tmp/repo")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("name cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_project_entry_rejects_reserved_default_name() {
+        let err = parse_project_entry("default=/tmp/repo")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_project_entry_rejects_reserved_default_name_after_trim() {
+        // Trimming runs before the reserved-name check, so a user cannot
+        // bypass the `default` reservation by padding with whitespace.
+        let err = parse_project_entry("  default  =/tmp/repo")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_project_entry_rejects_empty_path() {
+        let err = parse_project_entry("repo-a=").unwrap_err().to_string();
+        assert!(
+            err.contains("path cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_project_entry_rejects_whitespace_only_path() {
+        let err = parse_project_entry("repo-a=   ").unwrap_err().to_string();
+        assert!(
+            err.contains("path cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn startup_default_project_ignores_metadata_after_project_root_override() {
