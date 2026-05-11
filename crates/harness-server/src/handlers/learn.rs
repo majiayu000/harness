@@ -245,33 +245,11 @@ async fn collect_adopted_draft_contents(
 }
 
 fn build_learn_rules_prompt(draft_contents: &[String]) -> String {
-    let joined = draft_contents.join("\n\n---\n\n");
-    let safe_content = harness_core::prompts::wrap_external_data(&joined);
-    format!(
-        "Analyze the following adopted remediation drafts and extract reusable guard rules.\n\
-         {safe_content}\n\n\
-         For each distinct rule pattern you identify, output a block in this exact format:\n\
-         ## RULE_ID: Short title\n\
-         severity: high\n\
-         Description of the rule and why it matters.\n\n\
-         Use severity values: critical, high, medium, or low.\n\
-         Use RULE_IDs like LEARN-001, LEARN-002, etc.\n\
-         Output only rule blocks, no other text."
-    )
+    harness_core::prompts::learn::rules_extraction_prompt(draft_contents)
 }
 
 fn build_learn_skills_prompt(draft_contents: &[String]) -> String {
-    let joined = draft_contents.join("\n\n---\n\n");
-    let safe_content = harness_core::prompts::wrap_external_data(&joined);
-    format!(
-        "Analyze the following adopted remediation drafts and extract reusable skills.\n\
-         {safe_content}\n\n\
-         For each reusable skill or pattern you identify, output a block in this exact format:\n\
-         === skill: kebab-case-name ===\n\
-         # Skill Title\n\
-         Description and usage instructions.\n\n\
-         Output only skill blocks, no other text."
-    )
+    harness_core::prompts::learn::skills_extraction_prompt(draft_contents)
 }
 
 /// Parse `## RULE_ID: Title` blocks from agent output into Rule structs.

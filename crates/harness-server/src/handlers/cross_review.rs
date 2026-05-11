@@ -69,11 +69,7 @@ pub async fn run_cross_review(
     allowed_tools: Option<Vec<String>>,
 ) -> Result<CrossReviewResult, String> {
     let safe_target = harness_core::prompts::wrap_external_data(&target);
-    let primary_prompt = format!(
-        "Review the following target for issues:\n{safe_target}\n\n\
-         List each issue on its own line prefixed with \"ISSUE: \".\n\
-         If no issues are found, output: LGTM"
-    );
+    let primary_prompt = harness_core::prompts::cross_review::primary_review_prompt(&safe_target);
 
     let primary_resp = primary
         .execute(AgentRequest {
@@ -124,14 +120,8 @@ pub async fn run_cross_review(
             format!("\n\nOutstanding issues from previous round:\n{items}")
         };
 
-        let challenge_prompt = format!(
-            "You are a challenger reviewer. Given this primary code review:\n{safe_primary}\n\n\
-             For each ISSUE listed, classify it on its own line:\n\
-             CONFIRMED: <issue>  — the issue is a real problem\n\
-             FALSE-POSITIVE: <issue>  — the issue is wrong or not applicable\n\
-             Also list any issues the primary review missed as:\n\
-             MISSED: <new issue>{outstanding}"
-        );
+        let challenge_prompt =
+            harness_core::prompts::cross_review::challenger_prompt(&safe_primary, &outstanding);
 
         let resp = challenger
             .execute(AgentRequest {

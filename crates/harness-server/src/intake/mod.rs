@@ -1300,19 +1300,14 @@ pub fn build_orchestrator(
 }
 
 pub(crate) fn build_prompt_from_issue(issue: &IncomingIssue) -> String {
-    format!(
-        "You are working on {source} issue {id}: {title}\n\n\
-         URL: {url}\n\n\
-         Description:\n{desc}\n\n\
-         Instructions:\n\
-         1. This is an unattended session. Do not ask humans for help.\n\
-         2. Implement changes, run validation, create PR, push.\n\
-         3. Only stop for true blockers (missing auth/permissions).",
-        source = issue.source,
-        id = issue.identifier,
-        title = issue.title,
-        url = issue.url.as_deref().unwrap_or("N/A"),
-        desc = issue.description.as_deref().unwrap_or("No description."),
+    harness_core::prompts::intake::from_incoming_issue(
+        &harness_core::prompts::intake::IncomingIssueView {
+            source: &issue.source,
+            identifier: &issue.identifier,
+            title: &issue.title,
+            url: issue.url.as_deref(),
+            description: issue.description.as_deref(),
+        },
     )
 }
 
