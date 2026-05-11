@@ -20,6 +20,11 @@ fn async_env_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+fn async_cwd_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 struct ScopedEnvVar {
     key: String,
     original: Option<String>,
@@ -1218,19 +1223,26 @@ async fn reconcile_startup_continues_after_workspace_cleanup_failure() {
     );
 }
 
-struct CwdGuard(PathBuf);
+struct CwdGuard {
+    original: PathBuf,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
 
 impl CwdGuard {
-    fn switch_to(path: &Path) -> anyhow::Result<Self> {
+    async fn switch_to(path: &Path) -> anyhow::Result<Self> {
+        let guard = async_cwd_lock().lock().await;
         let original = std::env::current_dir()?;
         std::env::set_current_dir(path)?;
-        Ok(Self(original))
+        Ok(Self {
+            original,
+            _guard: guard,
+        })
     }
 }
 
 impl Drop for CwdGuard {
     fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.0);
+        let _ = std::env::set_current_dir(&self.original);
     }
 }
 
@@ -1239,7 +1251,9 @@ async fn is_registered_worktree_matches_relative_workspace_paths() {
     let _guard = async_env_lock().lock().await;
 
     let sandbox = tempfile::tempdir().expect("tempdir");
-    let _cwd_guard = CwdGuard::switch_to(sandbox.path()).expect("switch cwd");
+    let _cwd_guard = CwdGuard::switch_to(sandbox.path())
+        .await
+        .expect("switch cwd");
 
     let source = sandbox.path().join("source");
     std::fs::create_dir_all(&source).expect("create source");
