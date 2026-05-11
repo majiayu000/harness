@@ -1,7 +1,7 @@
 use super::model::{
     ActivityResult, RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, WorkflowCommand,
-    WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent,
-    WorkflowInstance,
+    WorkflowCommandRecord, WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition,
+    WorkflowEvent, WorkflowInstance,
 };
 use chrono::{DateTime, Utc};
 use harness_core::db::{Migration, PgStoreContext};
@@ -327,6 +327,138 @@ impl WorkflowRuntimeStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn apply_decision_transition(
+        &self,
+        expected_state: &str,
+        event_type: &str,
+        source: &str,
+        payload: Value,
+        decision: &WorkflowDecision,
+        final_instance: &WorkflowInstance,
+        command_status: &str,
+    ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
+                .bind(&final_instance.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            return Ok(None);
+        };
+        let current: WorkflowInstance = serde_json::from_str(&data)?;
+        if current.is_terminal() || current.state != expected_state {
+            return Ok(None);
+        }
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("workflow_events:{}", final_instance.id))
+            .execute(&mut *tx)
+            .await?;
+        let (next_sequence,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
+        )
+        .bind(&final_instance.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let event =
+            WorkflowEvent::new(&final_instance.id, next_sequence as u64, event_type, source)
+                .with_payload(payload);
+        let event_data = to_jsonb_string(&event)?;
+        sqlx::query(
+            "INSERT INTO workflow_events
+                (id, workflow_id, sequence, event_type, source, data)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+        )
+        .bind(&event.id)
+        .bind(&event.workflow_id)
+        .bind(event.sequence as i64)
+        .bind(&event.event_type)
+        .bind(&event.source)
+        .bind(&event_data)
+        .execute(&mut *tx)
+        .await?;
+
+        let record = WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id));
+        let decision_data = to_jsonb_string(&record)?;
+        sqlx::query(
+            "INSERT INTO workflow_decisions
+                (id, workflow_id, event_id, accepted, data, rejection_reason)
+             VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+             ON CONFLICT (id) DO UPDATE SET
+                accepted = EXCLUDED.accepted,
+                data = EXCLUDED.data,
+                rejection_reason = EXCLUDED.rejection_reason",
+        )
+        .bind(&record.id)
+        .bind(&record.workflow_id)
+        .bind(&record.event_id)
+        .bind(record.accepted)
+        .bind(&decision_data)
+        .bind(&record.rejection_reason)
+        .execute(&mut *tx)
+        .await?;
+
+        for command in &decision.commands {
+            let command_data = to_jsonb_string(command)?;
+            let command_type = enum_str(&command.command_type)?;
+            sqlx::query(
+                "INSERT INTO workflow_commands
+                    (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                 ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
+                    status = CASE
+                        WHEN workflow_commands.status = 'pending' THEN EXCLUDED.status
+                        ELSE workflow_commands.status
+                    END,
+                    updated_at = CASE
+                        WHEN workflow_commands.status = 'pending'
+                             AND workflow_commands.status <> EXCLUDED.status
+                        THEN CURRENT_TIMESTAMP
+                        ELSE workflow_commands.updated_at
+                    END",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&final_instance.id)
+            .bind(&record.id)
+            .bind(&command_type)
+            .bind(&command.dedupe_key)
+            .bind(command_status)
+            .bind(&command_data)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let instance_data = to_jsonb_string(final_instance)?;
+        sqlx::query(
+            "INSERT INTO workflow_instances
+                (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+             ON CONFLICT (id) DO UPDATE SET
+                definition_id = EXCLUDED.definition_id,
+                state = EXCLUDED.state,
+                subject_type = EXCLUDED.subject_type,
+                subject_key = EXCLUDED.subject_key,
+                parent_workflow_id = EXCLUDED.parent_workflow_id,
+                data = EXCLUDED.data,
+                version = EXCLUDED.version,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&final_instance.id)
+        .bind(&final_instance.definition_id)
+        .bind(&final_instance.state)
+        .bind(&final_instance.subject.subject_type)
+        .bind(&final_instance.subject.subject_key)
+        .bind(&final_instance.parent_workflow_id)
+        .bind(&instance_data)
+        .bind(final_instance.version as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(record))
     }
 
     pub async fn get_instance(

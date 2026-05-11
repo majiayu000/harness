@@ -4,8 +4,7 @@ use harness_core::config::misc::ReconciliationConfig;
 use harness_workflow::issue_lifecycle::IssueWorkflowStore;
 use harness_workflow::runtime::{
     DecisionValidator, ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionRecord, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
-    GITHUB_ISSUE_PR_DEFINITION_ID,
+    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -556,21 +555,14 @@ async fn apply_runtime_workflow_transition(
         "cancelled" => "PrClosed",
         _ => "ExternalPrStateObserved",
     };
-    let event = runtime_store
-        .append_event(
-            &instance.id,
-            event_type,
-            "reconciliation",
-            json!({
-                "repo": candidate.repo.as_deref(),
-                "issue_number": candidate.issue_number,
-                "pr_number": candidate.pr_number,
-                "pr_url": candidate.pr_url.as_deref(),
-                "target_state": target_state,
-                "reason": reason,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "repo": candidate.repo.as_deref(),
+        "issue_number": candidate.issue_number,
+        "pr_number": candidate.pr_number,
+        "pr_url": candidate.pr_url.as_deref(),
+        "target_state": target_state,
+        "reason": reason,
+    });
     let command_type = match target_state {
         "done" => WorkflowCommandType::MarkDone,
         "cancelled" => WorkflowCommandType::MarkCancelled,
@@ -590,7 +582,10 @@ async fn apply_runtime_workflow_transition(
     )
     .with_command(WorkflowCommand::new(
         command_type,
-        format!("runtime-reconcile:{}:{}", instance.id, event.id),
+        format!(
+            "runtime-reconcile:{}:{}:{}",
+            instance.id, target_state, candidate.pr_number
+        ),
         json!({
             "workflow_id": instance.id,
             "repo": candidate.repo.as_deref(),
@@ -606,25 +601,19 @@ async fn apply_runtime_workflow_transition(
     ))
     .high_confidence();
     let validator = DecisionValidator::github_issue_pr();
-    let validation = validator.validate(
+    if let Err(error) = validator.validate(
         &instance,
         &decision,
         &ValidationContext::new("reconciliation", chrono::Utc::now()),
-    );
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone())),
-        Err(error) => {
-            let reason = error.to_string();
-            let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
-            runtime_store.record_decision(&record).await?;
-            return Ok(false);
-        }
-    };
-    runtime_store.record_decision(&record).await?;
-    for command in &decision.commands {
-        runtime_store
-            .enqueue_command_with_status(&instance.id, Some(&record.id), command, "completed")
-            .await?;
+    ) {
+        let reason = error.to_string();
+        tracing::warn!(
+            workflow_id = %candidate.workflow_id,
+            pr = candidate.pr_number,
+            repo = candidate.repo.as_deref(),
+            "workflow runtime reconciliation decision rejected: {reason}"
+        );
+        return Ok(false);
     }
 
     instance.state = decision.next_state.clone();
@@ -636,7 +625,20 @@ async fn apply_runtime_workflow_transition(
         reason,
         candidate,
     );
-    runtime_store.upsert_instance(&instance).await?;
+    let Some(_record) = runtime_store
+        .apply_decision_transition(
+            candidate.state.as_str(),
+            event_type,
+            "reconciliation",
+            event_payload,
+            &decision,
+            &instance,
+            "completed",
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
     record_runtime_issue_side_effects(
         runtime_store,
         issue_workflows,
