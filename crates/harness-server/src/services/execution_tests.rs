@@ -1084,9 +1084,9 @@ async fn enqueue_background_issue_submission_accepts_completed_runtime_dependenc
 // ── helpers ──────────────────────────────────────────────────────────────
 
 async fn make_event_store_noop() -> Arc<harness_observe::event_store::EventStore> {
-    let dir = tempfile::tempdir().unwrap();
+    let path = tempfile::tempdir().unwrap().keep();
     Arc::new(
-        harness_observe::event_store::EventStore::new(dir.path())
+        harness_observe::event_store::EventStore::new(&path)
             .await
             .unwrap(),
     )
