@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use super::dirs::dirs_data_dir;
+use super::shutdown::ShutdownConfig;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -81,6 +82,9 @@ pub struct ServerConfig {
     /// when not configured.
     #[serde(default)]
     pub github_token: Option<String>,
+    /// Staged HTTP shutdown configuration (drain, force, hard-exit deadlines).
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
 }
 
 impl ServerConfig {
@@ -207,6 +211,7 @@ impl fmt::Debug for ServerConfig {
             password_reset_rate_limit_per_hour,
             constitution_enabled,
             github_token,
+            shutdown,
         } = self;
         f.debug_struct("ServerConfig")
             .field("transport", transport)
@@ -243,6 +248,7 @@ impl fmt::Debug for ServerConfig {
             )
             .field("constitution_enabled", constitution_enabled)
             .field("github_token", &github_token.as_ref().map(|_| "[REDACTED]"))
+            .field("shutdown", shutdown)
             .finish()
     }
 }
@@ -269,6 +275,7 @@ impl Default for ServerConfig {
             password_reset_rate_limit_per_hour: default_password_reset_rate_limit_per_hour(),
             constitution_enabled: true,
             github_token: None,
+            shutdown: ShutdownConfig::default(),
         }
     }
 }
