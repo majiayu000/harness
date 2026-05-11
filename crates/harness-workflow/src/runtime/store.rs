@@ -181,6 +181,16 @@ pub struct WorkflowRuntimeStore {
     pool: PgPool,
 }
 
+pub struct WorkflowDecisionTransition<'a> {
+    pub expected_state: &'a str,
+    pub event_type: &'a str,
+    pub source: &'a str,
+    pub payload: Value,
+    pub decision: &'a WorkflowDecision,
+    pub final_instance: &'a WorkflowInstance,
+    pub command_status: &'a str,
+}
+
 type WorkflowCommandRecordRow = (
     String,
     String,
@@ -331,14 +341,10 @@ impl WorkflowRuntimeStore {
 
     pub async fn apply_decision_transition(
         &self,
-        expected_state: &str,
-        event_type: &str,
-        source: &str,
-        payload: Value,
-        decision: &WorkflowDecision,
-        final_instance: &WorkflowInstance,
-        command_status: &str,
+        transition: WorkflowDecisionTransition<'_>,
     ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+        let final_instance = transition.final_instance;
+        let decision = transition.decision;
         let mut tx = self.pool.begin().await?;
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
@@ -349,7 +355,7 @@ impl WorkflowRuntimeStore {
             return Ok(None);
         };
         let current: WorkflowInstance = serde_json::from_str(&data)?;
-        if current.is_terminal() || current.state != expected_state {
+        if current.is_terminal() || current.state != transition.expected_state {
             return Ok(None);
         }
 
@@ -363,9 +369,13 @@ impl WorkflowRuntimeStore {
         .bind(&final_instance.id)
         .fetch_one(&mut *tx)
         .await?;
-        let event =
-            WorkflowEvent::new(&final_instance.id, next_sequence as u64, event_type, source)
-                .with_payload(payload);
+        let event = WorkflowEvent::new(
+            &final_instance.id,
+            next_sequence as u64,
+            transition.event_type,
+            transition.source,
+        )
+        .with_payload(transition.payload);
         let event_data = to_jsonb_string(&event)?;
         sqlx::query(
             "INSERT INTO workflow_events
@@ -425,7 +435,7 @@ impl WorkflowRuntimeStore {
             .bind(&record.id)
             .bind(&command_type)
             .bind(&command.dedupe_key)
-            .bind(command_status)
+            .bind(transition.command_status)
             .bind(&command_data)
             .execute(&mut *tx)
             .await?;

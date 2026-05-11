@@ -4,7 +4,8 @@ use harness_core::config::misc::ReconciliationConfig;
 use harness_workflow::issue_lifecycle::IssueWorkflowStore;
 use harness_workflow::runtime::{
     DecisionValidator, ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
+    WorkflowDecisionTransition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
+    GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -626,15 +627,15 @@ async fn apply_runtime_workflow_transition(
         candidate,
     );
     let Some(_record) = runtime_store
-        .apply_decision_transition(
-            candidate.state.as_str(),
+        .apply_decision_transition(WorkflowDecisionTransition {
+            expected_state: candidate.state.as_str(),
             event_type,
-            "reconciliation",
-            event_payload,
-            &decision,
-            &instance,
-            "completed",
-        )
+            source: "reconciliation",
+            payload: event_payload,
+            decision: &decision,
+            final_instance: &instance,
+            command_status: "completed",
+        })
         .await?
     else {
         return Ok(false);
