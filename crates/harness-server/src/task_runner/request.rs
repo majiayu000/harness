@@ -281,11 +281,7 @@ pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<S
         return Some(format!("PR #{n}"));
     }
     if req.prompt.is_some() {
-        return Some(match task_kind {
-            TaskKind::Review => "periodic review".to_string(),
-            TaskKind::Planner => "sprint planner".to_string(),
-            TaskKind::Issue | TaskKind::Pr | TaskKind::Prompt => "prompt task".to_string(),
-        });
+        return task_kind.prompt_task_label().map(str::to_string);
     }
     None
 }

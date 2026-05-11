@@ -139,13 +139,7 @@ fn task_allows_prompt_orphan_recovery(task: &task_runner::TaskState) -> bool {
 }
 
 fn orphan_recovery_failure_reason(task: &task_runner::TaskState) -> &'static str {
-    match task.task_kind {
-        task_runner::TaskKind::Issue => "orphaned issue task: issue number not persisted",
-        task_runner::TaskKind::Pr => "orphaned PR task: PR number not persisted",
-        task_runner::TaskKind::Prompt => "orphaned prompt-only task: prompt not persisted",
-        task_runner::TaskKind::Review => "orphaned review task: prompt not persisted",
-        task_runner::TaskKind::Planner => "orphaned planner task: prompt not persisted",
-    }
+    task.task_kind.orphan_recovery_failure_reason()
 }
 
 pub(super) fn recovery_queue_domain(task_kind: task_runner::TaskKind) -> task_routes::QueueDomain {
