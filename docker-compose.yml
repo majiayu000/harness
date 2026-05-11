@@ -1,12 +1,14 @@
 services:
   postgres:
+    container_name: harness-postgres
     image: postgres:16
     environment:
       POSTGRES_DB: harness
       POSTGRES_USER: harness
       POSTGRES_PASSWORD: harness
+    command: ["postgres", "-c", "max_connections=300"]
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - harness_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -17,3 +19,4 @@ services:
 
 volumes:
   harness_pg_data:
+    name: harness_pg_data

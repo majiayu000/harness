@@ -1264,6 +1264,7 @@ dependencies = [
  "harness-rules",
  "harness-server",
  "harness-skills",
+ "harness-workflow",
  "libc",
  "serde",
  "serde_json",

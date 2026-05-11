@@ -3174,6 +3174,73 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
 }
 
 #[tokio::test]
+async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = project_issue_instance("/project-a", 123, "implementing").with_data(json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 123,
+        "task_id": "task-123",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        )
+        .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded("implement_issue", "Implementation completed.")
+            .with_artifact(ActivityArtifact::new(
+                "pull_request",
+                json!({
+                    "pr_number": 77,
+                    "pr_url": "https://github.com/owner/repo/pull/77",
+                }),
+            )),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+    assert_eq!(completed.id, job.id);
+
+    let reloaded = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(reloaded.state, "pr_open");
+    assert_eq!(reloaded.data["project_id"], "/project-a");
+    assert_eq!(reloaded.data["issue_number"], 123);
+    assert_eq!(reloaded.data["pr_number"], 77);
+    assert_eq!(
+        reloaded.data["pr_url"],
+        "https://github.com/owner/repo/pull/77"
+    );
+
+    let commands = store.commands_for(&workflow.id).await?;
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].status, "completed");
+    assert_eq!(
+        commands[1].command.command_type,
+        WorkflowCommandType::BindPr
+    );
+    assert_ne!(commands[1].status, "pending");
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_worker_keeps_repo_backlog_dispatching_until_child_starts_finish(
 ) -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
