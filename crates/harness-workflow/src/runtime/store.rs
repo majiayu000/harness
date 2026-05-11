@@ -242,6 +242,17 @@ impl WorkflowRuntimeStore {
         Ok(Self { pool })
     }
 
+    pub async fn open_with_database_url_and_schema(
+        configured_database_url: Option<&str>,
+        schema: &str,
+    ) -> anyhow::Result<Self> {
+        let context = PgStoreContext::from_schema(schema, configured_database_url)?;
+        let pool = context
+            .open_migrated_pool(WORKFLOW_RUNTIME_MIGRATIONS)
+            .await?;
+        Ok(Self { pool })
+    }
+
     pub async fn open_with_context(
         context: &PgStoreContext,
         setup_pool: &PgPool,

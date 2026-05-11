@@ -24,8 +24,10 @@ pub async fn handle(
         .reconciliation
         .max_gh_calls_per_minute;
 
-    let report = crate::reconciliation::run_once_with_token(
+    let report = crate::reconciliation::run_once_with_runtime_token(
         &state.core.tasks,
+        state.core.workflow_runtime_store.as_deref(),
+        state.core.issue_workflow_store.as_deref(),
         max_calls,
         params.dry_run,
         state.core.server.config.server.github_token.as_deref(),

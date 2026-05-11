@@ -1,8 +1,15 @@
 use crate::http::AppState;
 use crate::task_runner::{mutate_and_persist, TaskId, TaskStatus, TaskStore};
 use harness_core::config::misc::ReconciliationConfig;
+use harness_workflow::issue_lifecycle::IssueWorkflowStore;
+use harness_workflow::runtime::{
+    DecisionValidator, ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
+    WorkflowDecisionRecord, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
+    GITHUB_ISSUE_PR_DEFINITION_ID,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +28,17 @@ struct Candidate {
     pr_num_from_ext: Option<u64>,
 }
 
+/// A workflow-runtime issue PR workflow that has a bound GitHub PR.
+struct RuntimeWorkflowCandidate {
+    workflow_id: String,
+    state: String,
+    repo: Option<String>,
+    project_root: Option<PathBuf>,
+    issue_number: Option<u64>,
+    pr_number: u64,
+    pr_url: Option<String>,
+}
+
 /// A single resolved transition produced by `run_once`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationTransition {
@@ -32,12 +50,28 @@ pub struct ReconciliationTransition {
     pub applied: bool,
 }
 
+/// A workflow-runtime transition produced by reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowReconciliationTransition {
+    pub workflow_id: String,
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+    pub applied: bool,
+    pub repo: Option<String>,
+    pub issue_number: Option<u64>,
+    pub pr_number: u64,
+    pub pr_url: Option<String>,
+}
+
 /// Summary returned by `run_once` and serialised in the HTTP handler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationReport {
     pub candidates: usize,
     pub skipped_terminal: usize,
     pub transitions: Vec<ReconciliationTransition>,
+    #[serde(default)]
+    pub workflow_transitions: Vec<WorkflowReconciliationTransition>,
 }
 
 /// External GitHub state observed for one candidate.
@@ -138,6 +172,58 @@ fn collect_candidates(store: &TaskStore) -> (Vec<Candidate>, usize) {
         }
     }
     (candidates, skipped_terminal)
+}
+
+fn runtime_candidate_from_instance(
+    instance: &WorkflowInstance,
+) -> Option<RuntimeWorkflowCandidate> {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || instance.is_terminal() {
+        return None;
+    }
+    let pr_number = instance
+        .data
+        .get("pr_number")
+        .and_then(serde_json::Value::as_u64)?;
+    Some(RuntimeWorkflowCandidate {
+        workflow_id: instance.id.clone(),
+        state: instance.state.clone(),
+        repo: optional_json_string(&instance.data, "repo"),
+        project_root: optional_json_string(&instance.data, "project_id").map(PathBuf::from),
+        issue_number: instance
+            .data
+            .get("issue_number")
+            .and_then(serde_json::Value::as_u64),
+        pr_number,
+        pr_url: optional_json_string(&instance.data, "pr_url"),
+    })
+}
+
+async fn collect_runtime_candidates(
+    store: &WorkflowRuntimeStore,
+) -> anyhow::Result<(Vec<RuntimeWorkflowCandidate>, usize)> {
+    let mut candidates = Vec::new();
+    let mut skipped_terminal = 0usize;
+    for instance in store
+        .list_instances_by_definition(GITHUB_ISSUE_PR_DEFINITION_ID, None, None)
+        .await?
+    {
+        if instance.is_terminal() {
+            skipped_terminal += 1;
+            continue;
+        }
+        if let Some(candidate) = runtime_candidate_from_instance(&instance) {
+            candidates.push(candidate);
+        }
+    }
+    Ok((candidates, skipped_terminal))
+}
+
+fn optional_json_string(data: &serde_json::Value, key: &str) -> Option<String> {
+    data.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub(crate) fn parse_external_id(eid: Option<&str>) -> (Option<u64>, Option<u64>) {
@@ -260,10 +346,32 @@ pub async fn run_once_with_token(
     dry_run: bool,
     github_token: Option<&str>,
 ) -> ReconciliationReport {
+    run_once_with_runtime_token(
+        store,
+        None,
+        None,
+        max_gh_calls_per_minute,
+        dry_run,
+        github_token,
+    )
+    .await
+}
+
+pub async fn run_once_with_runtime_token(
+    store: &Arc<TaskStore>,
+    runtime_store: Option<&WorkflowRuntimeStore>,
+    issue_workflows: Option<&IssueWorkflowStore>,
+    max_gh_calls_per_minute: u32,
+    dry_run: bool,
+    github_token: Option<&str>,
+) -> ReconciliationReport {
     let (candidates, skipped_terminal) = collect_candidates(store);
     let mut rate = RateLimiter::new(max_gh_calls_per_minute);
     let mut repo_slug_cache = HashMap::new();
     let mut transitions = Vec::new();
+    let mut workflow_transitions = Vec::new();
+    let mut runtime_candidate_count = 0usize;
+    let mut runtime_skipped_terminal = 0usize;
 
     for candidate in &candidates {
         let gh_state =
@@ -301,11 +409,34 @@ pub async fn run_once_with_token(
         });
     }
 
-    let total_candidates = candidates.len() + skipped_terminal;
+    if let Some(runtime_store) = runtime_store {
+        match run_runtime_workflow_reconciliation_once(
+            runtime_store,
+            issue_workflows,
+            &mut rate,
+            dry_run,
+            github_token,
+        )
+        .await
+        {
+            Ok((candidate_count, skipped, transitions)) => {
+                runtime_candidate_count = candidate_count;
+                runtime_skipped_terminal = skipped;
+                workflow_transitions = transitions;
+            }
+            Err(error) => {
+                tracing::warn!("workflow runtime reconciliation failed: {error}");
+            }
+        }
+    }
+
+    let total_candidates =
+        candidates.len() + runtime_candidate_count + skipped_terminal + runtime_skipped_terminal;
     ReconciliationReport {
         candidates: total_candidates,
-        skipped_terminal,
+        skipped_terminal: skipped_terminal + runtime_skipped_terminal,
         transitions,
+        workflow_transitions,
     }
 }
 
@@ -317,6 +448,301 @@ fn transition_for_github_state(gh_state: GitHubState) -> Option<(TaskStatus, &'s
             Some((TaskStatus::Cancelled, "reconciled: issue closed before PR"))
         }
         GitHubState::Open | GitHubState::Unknown => None,
+    }
+}
+
+fn runtime_transition_for_github_state(
+    gh_state: GitHubState,
+) -> Option<(&'static str, &'static str)> {
+    match gh_state {
+        GitHubState::PrMerged => Some(("done", "reconciled: PR merged externally")),
+        GitHubState::PrClosed => Some(("cancelled", "reconciled: PR closed externally")),
+        GitHubState::IssueClosed | GitHubState::Open | GitHubState::Unknown => None,
+    }
+}
+
+async fn run_runtime_workflow_reconciliation_once(
+    runtime_store: &WorkflowRuntimeStore,
+    issue_workflows: Option<&IssueWorkflowStore>,
+    rate: &mut RateLimiter,
+    dry_run: bool,
+    github_token: Option<&str>,
+) -> anyhow::Result<(usize, usize, Vec<WorkflowReconciliationTransition>)> {
+    let (candidates, skipped_terminal) = collect_runtime_candidates(runtime_store).await?;
+    let mut transitions = Vec::new();
+
+    for candidate in &candidates {
+        let gh_state = resolve_runtime_github_state(candidate, rate, github_token).await;
+        let Some((target_state, reason)) = runtime_transition_for_github_state(gh_state) else {
+            continue;
+        };
+        let applied = if dry_run {
+            false
+        } else {
+            match apply_runtime_workflow_transition(
+                runtime_store,
+                issue_workflows,
+                candidate,
+                target_state,
+                reason,
+            )
+            .await
+            {
+                Ok(applied) => applied,
+                Err(error) => {
+                    tracing::warn!(
+                        workflow_id = %candidate.workflow_id,
+                        pr = candidate.pr_number,
+                        repo = candidate.repo.as_deref(),
+                        "workflow runtime reconciliation transition failed: {error}"
+                    );
+                    false
+                }
+            }
+        };
+        transitions.push(WorkflowReconciliationTransition {
+            workflow_id: candidate.workflow_id.clone(),
+            from: candidate.state.clone(),
+            to: target_state.to_string(),
+            reason: reason.to_string(),
+            applied,
+            repo: candidate.repo.clone(),
+            issue_number: candidate.issue_number,
+            pr_number: candidate.pr_number,
+            pr_url: candidate.pr_url.clone(),
+        });
+    }
+
+    Ok((candidates.len(), skipped_terminal, transitions))
+}
+
+async fn resolve_runtime_github_state(
+    candidate: &RuntimeWorkflowCandidate,
+    rate: &mut RateLimiter,
+    github_token: Option<&str>,
+) -> GitHubState {
+    if let Some(pr_url) = candidate.pr_url.as_deref() {
+        rate.acquire().await;
+        return fetch_pr_state_by_url(pr_url, github_token).await;
+    }
+    if let Some(repo) = candidate.repo.as_deref() {
+        rate.acquire().await;
+        return fetch_pr_state_by_slug_with_token(repo, candidate.pr_number, github_token).await;
+    }
+    tracing::debug!(
+        workflow_id = %candidate.workflow_id,
+        pr = candidate.pr_number,
+        "workflow runtime GitHub state check skipped because repository slug is unavailable"
+    );
+    GitHubState::Unknown
+}
+
+async fn apply_runtime_workflow_transition(
+    runtime_store: &WorkflowRuntimeStore,
+    issue_workflows: Option<&IssueWorkflowStore>,
+    candidate: &RuntimeWorkflowCandidate,
+    target_state: &str,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let Some(mut instance) = runtime_store.get_instance(&candidate.workflow_id).await? else {
+        return Ok(false);
+    };
+    if instance.is_terminal() || instance.state != candidate.state {
+        return Ok(false);
+    }
+
+    let event_type = match target_state {
+        "done" => "PrMerged",
+        "cancelled" => "PrClosed",
+        _ => "ExternalPrStateObserved",
+    };
+    let event = runtime_store
+        .append_event(
+            &instance.id,
+            event_type,
+            "reconciliation",
+            json!({
+                "repo": candidate.repo.as_deref(),
+                "issue_number": candidate.issue_number,
+                "pr_number": candidate.pr_number,
+                "pr_url": candidate.pr_url.as_deref(),
+                "target_state": target_state,
+                "reason": reason,
+            }),
+        )
+        .await?;
+    let command_type = match target_state {
+        "done" => WorkflowCommandType::MarkDone,
+        "cancelled" => WorkflowCommandType::MarkCancelled,
+        _ => WorkflowCommandType::Wait,
+    };
+    let decision_name = match target_state {
+        "done" => "reconcile_pr_merged",
+        "cancelled" => "reconcile_pr_closed",
+        _ => "reconcile_pr_state",
+    };
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        decision_name,
+        target_state,
+        reason,
+    )
+    .with_command(WorkflowCommand::new(
+        command_type,
+        format!("runtime-reconcile:{}:{}", instance.id, event.id),
+        json!({
+            "workflow_id": instance.id,
+            "repo": candidate.repo.as_deref(),
+            "issue_number": candidate.issue_number,
+            "pr_number": candidate.pr_number,
+            "pr_url": candidate.pr_url.as_deref(),
+            "reason": reason,
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "github_pr",
+        runtime_pr_evidence_summary(candidate),
+    ))
+    .high_confidence();
+    let validator = DecisionValidator::github_issue_pr();
+    let validation = validator.validate(
+        &instance,
+        &decision,
+        &ValidationContext::new("reconciliation", chrono::Utc::now()),
+    );
+    let record = match validation {
+        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone())),
+        Err(error) => {
+            let reason = error.to_string();
+            let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
+            runtime_store.record_decision(&record).await?;
+            return Ok(false);
+        }
+    };
+    runtime_store.record_decision(&record).await?;
+    for command in &decision.commands {
+        runtime_store
+            .enqueue_command_with_status(&instance.id, Some(&record.id), command, "completed")
+            .await?;
+    }
+
+    instance.state = decision.next_state.clone();
+    instance.version = instance.version.saturating_add(1);
+    instance.data = merge_runtime_reconciliation_data(
+        instance.data,
+        decision_name,
+        target_state,
+        reason,
+        candidate,
+    );
+    runtime_store.upsert_instance(&instance).await?;
+    record_runtime_issue_side_effects(
+        runtime_store,
+        issue_workflows,
+        candidate,
+        target_state,
+        reason,
+    )
+    .await;
+    tracing::info!(
+        workflow_id = %candidate.workflow_id,
+        from = %candidate.state,
+        to = target_state,
+        pr = candidate.pr_number,
+        repo = candidate.repo.as_deref(),
+        "workflow runtime reconciliation: applying transition"
+    );
+    Ok(true)
+}
+
+fn runtime_pr_evidence_summary(candidate: &RuntimeWorkflowCandidate) -> String {
+    let repo = candidate.repo.as_deref().unwrap_or("<unknown>");
+    let issue = candidate
+        .issue_number
+        .map(|issue_number| issue_number.to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let url = candidate.pr_url.as_deref().unwrap_or("<unknown>");
+    format!(
+        "repo={repo} issue={issue} pr={} url={url}",
+        candidate.pr_number
+    )
+}
+
+fn merge_runtime_reconciliation_data(
+    mut data: serde_json::Value,
+    decision: &str,
+    target_state: &str,
+    reason: &str,
+    candidate: &RuntimeWorkflowCandidate,
+) -> serde_json::Value {
+    if let Some(object) = data.as_object_mut() {
+        object.insert("last_decision".to_string(), json!(decision));
+        object.insert("reconciled_at".to_string(), json!(chrono::Utc::now()));
+        object.insert("reconciliation_reason".to_string(), json!(reason));
+        object.insert("external_pr_state".to_string(), json!(target_state));
+        object.insert("pr_number".to_string(), json!(candidate.pr_number));
+        if let Some(pr_url) = candidate.pr_url.as_deref() {
+            object.insert("pr_url".to_string(), json!(pr_url));
+        }
+        if let Some(repo) = candidate.repo.as_deref() {
+            object.insert("repo".to_string(), json!(repo));
+        }
+        if let Some(issue_number) = candidate.issue_number {
+            object.insert("issue_number".to_string(), json!(issue_number));
+        }
+    }
+    data
+}
+
+async fn record_runtime_issue_side_effects(
+    runtime_store: &WorkflowRuntimeStore,
+    issue_workflows: Option<&IssueWorkflowStore>,
+    candidate: &RuntimeWorkflowCandidate,
+    target_state: &str,
+    reason: &str,
+) {
+    let Some(project_root) = candidate.project_root.as_deref() else {
+        return;
+    };
+    if target_state == "done" {
+        crate::workflow_runtime_repo_backlog::record_merged_pr(
+            Some(runtime_store),
+            issue_workflows,
+            crate::workflow_runtime_repo_backlog::MergedPrRuntimeContext {
+                project_root,
+                repo: candidate.repo.as_deref(),
+                issue_number: candidate.issue_number,
+                pr_number: candidate.pr_number,
+                pr_url: candidate.pr_url.as_deref(),
+                detail: reason,
+            },
+        )
+        .await;
+        return;
+    }
+
+    if target_state == "cancelled" {
+        if let Some(issue_workflows) = issue_workflows {
+            let project_id = project_root.to_string_lossy();
+            if let Err(error) = issue_workflows
+                .record_terminal_for_pr(
+                    &project_id,
+                    candidate.repo.as_deref(),
+                    candidate.pr_number,
+                    false,
+                    true,
+                    Some(reason),
+                )
+                .await
+            {
+                tracing::warn!(
+                    pr = candidate.pr_number,
+                    repo = candidate.repo.as_deref(),
+                    "issue workflow closed PR update failed: {error}"
+                );
+            }
+        }
     }
 }
 
@@ -435,8 +861,10 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
     sleep(Duration::from_secs(15)).await;
 
     loop {
-        let report = run_once_with_token(
+        let report = run_once_with_runtime_token(
             &state.core.tasks,
+            state.core.workflow_runtime_store.as_deref(),
+            state.core.issue_workflow_store.as_deref(),
             config.max_gh_calls_per_minute,
             false,
             state.core.server.config.server.github_token.as_deref(),
@@ -464,6 +892,7 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
             candidates = report.candidates,
             skipped_terminal = report.skipped_terminal,
             transitions = report.transitions.len(),
+            workflow_transitions = report.workflow_transitions.len(),
             "reconciliation: tick complete"
         );
         sleep(interval).await;
@@ -816,6 +1245,256 @@ mod tests {
         assert_eq!(transition_for_github_state(GitHubState::Open), None);
     }
 
+    #[test]
+    fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
+        let active = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "pr_open",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_id("workflow-1")
+        .with_data(json!({
+            "project_id": "/tmp/project",
+            "repo": "owner/repo",
+            "issue_number": 42,
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+        }));
+        let candidate = runtime_candidate_from_instance(&active).expect("candidate");
+        assert_eq!(candidate.workflow_id, "workflow-1");
+        assert_eq!(candidate.pr_number, 77);
+        assert_eq!(candidate.repo.as_deref(), Some("owner/repo"));
+
+        let terminal = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "done",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_data(json!({ "pr_number": 77 }));
+        assert!(runtime_candidate_from_instance(&terminal).is_none());
+
+        let missing_pr = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "pr_open",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
+        );
+        assert!(runtime_candidate_from_instance(&missing_pr).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> {
+        let _env_guard = async_env_lock().lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let api_base = github_state_server(vec![(
+            "/repos/owner/repo/pulls/77",
+            r#"{"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
+        )])
+        .await;
+        let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+        let dir = tempfile::tempdir()?;
+        let task_store = match TaskStore::open(&dir.path().join("tasks.db")).await {
+            Ok(store) => store,
+            Err(err) if crate::test_helpers::is_pool_timeout(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let runtime_store = match WorkflowRuntimeStore::open_with_database_url(
+            &dir.path().join("runtime"),
+            Some(&database_url),
+        )
+        .await
+        {
+            Ok(store) => store,
+            Err(err) if crate::test_helpers::is_pool_timeout(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let issue_store = match IssueWorkflowStore::open_with_database_url(
+            &dir.path().join("issue"),
+            Some(&database_url),
+        )
+        .await
+        {
+            Ok(store) => store,
+            Err(err) if crate::test_helpers::is_pool_timeout(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let project_id = project_root.to_string_lossy();
+        issue_store
+            .record_issue_scheduled(&project_id, Some("owner/repo"), 42, "task-1", &[], false)
+            .await?;
+        issue_store
+            .record_pr_detected(
+                &project_id,
+                Some("owner/repo"),
+                42,
+                "task-1",
+                77,
+                "https://github.com/owner/repo/pull/77",
+            )
+            .await?;
+        let workflow_id =
+            harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 42);
+        let instance = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "pr_open",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_id(&workflow_id)
+        .with_data(json!({
+            "project_id": project_id.as_ref(),
+            "repo": "owner/repo",
+            "issue_number": 42,
+            "task_id": "task-1",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+        }));
+        runtime_store.upsert_instance(&instance).await?;
+
+        let report = run_once_with_runtime_token(
+            &task_store,
+            Some(&runtime_store),
+            Some(&issue_store),
+            20,
+            false,
+            None,
+        )
+        .await;
+
+        assert_eq!(report.workflow_transitions.len(), 1);
+        assert_eq!(report.workflow_transitions[0].from, "pr_open");
+        assert_eq!(report.workflow_transitions[0].to, "done");
+        assert!(report.workflow_transitions[0].applied);
+        let updated = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("workflow should remain persisted");
+        assert_eq!(updated.state, "done");
+        assert_eq!(updated.data["last_decision"], "reconcile_pr_merged");
+        let issue_workflow = issue_store
+            .get_by_issue(&project_id, Some("owner/repo"), 42)
+            .await?
+            .expect("issue workflow should exist");
+        assert_eq!(
+            issue_workflow.state,
+            harness_workflow::issue_lifecycle::IssueLifecycleState::Done
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> {
+        let _env_guard = async_env_lock().lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let api_base = github_state_server(vec![(
+            "/repos/owner/repo/pulls/88",
+            r#"{"state":"closed","merged_at":null}"#,
+        )])
+        .await;
+        let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+        let dir = tempfile::tempdir()?;
+        let task_store = match TaskStore::open(&dir.path().join("tasks.db")).await {
+            Ok(store) => store,
+            Err(err) if crate::test_helpers::is_pool_timeout(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let runtime_store = match WorkflowRuntimeStore::open_with_database_url(
+            &dir.path().join("runtime"),
+            Some(&database_url),
+        )
+        .await
+        {
+            Ok(store) => store,
+            Err(err) if crate::test_helpers::is_pool_timeout(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let issue_store = match IssueWorkflowStore::open_with_database_url(
+            &dir.path().join("issue"),
+            Some(&database_url),
+        )
+        .await
+        {
+            Ok(store) => store,
+            Err(err) if crate::test_helpers::is_pool_timeout(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let project_id = project_root.to_string_lossy();
+        issue_store
+            .record_issue_scheduled(&project_id, Some("owner/repo"), 43, "task-2", &[], false)
+            .await?;
+        issue_store
+            .record_pr_detected(
+                &project_id,
+                Some("owner/repo"),
+                43,
+                "task-2",
+                88,
+                "https://github.com/owner/repo/pull/88",
+            )
+            .await?;
+        let workflow_id =
+            harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 43);
+        let instance = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "awaiting_feedback",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:43"),
+        )
+        .with_id(&workflow_id)
+        .with_data(json!({
+            "project_id": project_id.as_ref(),
+            "repo": "owner/repo",
+            "issue_number": 43,
+            "task_id": "task-2",
+            "pr_number": 88,
+            "pr_url": "https://github.com/owner/repo/pull/88",
+        }));
+        runtime_store.upsert_instance(&instance).await?;
+
+        let report = run_once_with_runtime_token(
+            &task_store,
+            Some(&runtime_store),
+            Some(&issue_store),
+            20,
+            false,
+            None,
+        )
+        .await;
+
+        assert_eq!(report.workflow_transitions.len(), 1);
+        assert_eq!(report.workflow_transitions[0].to, "cancelled");
+        assert!(report.workflow_transitions[0].applied);
+        let updated = runtime_store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("workflow should remain persisted");
+        assert_eq!(updated.state, "cancelled");
+        assert_eq!(updated.data["last_decision"], "reconcile_pr_closed");
+        let issue_workflow = issue_store
+            .get_by_issue(&project_id, Some("owner/repo"), 43)
+            .await?
+            .expect("issue workflow should exist");
+        assert_eq!(
+            issue_workflow.state,
+            harness_workflow::issue_lifecycle::IssueLifecycleState::Cancelled
+        );
+        Ok(())
+    }
+
     // Reconciliation payload guard: ReconciliationReport and
     // ReconciliationTransition are serialised over HTTP.  They must never
     // contain a UUID workspace path.
@@ -830,6 +1509,17 @@ mod tests {
                 to: "done".to_string(),
                 reason: "PR merged".to_string(),
                 applied: true,
+            }],
+            workflow_transitions: vec![WorkflowReconciliationTransition {
+                workflow_id: "project::repo:owner/repo::issue:42".to_string(),
+                from: "pr_open".to_string(),
+                to: "done".to_string(),
+                reason: "PR merged".to_string(),
+                applied: true,
+                repo: Some("owner/repo".to_string()),
+                issue_number: Some(42),
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77".to_string()),
             }],
         };
         let json =

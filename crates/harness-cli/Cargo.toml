@@ -11,6 +11,7 @@ path = "src/main.rs"
 harness-core = { workspace = true }
 harness-protocol = { workspace = true }
 harness-server = { workspace = true }
+harness-workflow = { workspace = true }
 harness-agents = { workspace = true }
 harness-gc = { workspace = true }
 harness-rules = { workspace = true }

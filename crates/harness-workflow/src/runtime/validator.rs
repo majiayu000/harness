@@ -172,6 +172,7 @@ impl TransitionAllowlist {
                 "ready_to_merge",
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
+            .allow("pr_open", "done", [MarkDone])
             .allow(
                 "awaiting_feedback",
                 "awaiting_feedback",
@@ -202,6 +203,8 @@ impl TransitionAllowlist {
                 "ready_to_merge",
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
+            .allow("awaiting_feedback", "done", [MarkDone])
+            .allow("addressing_feedback", "done", [MarkDone])
             .allow("ready_to_merge", "ready_to_merge", [Wait])
             .allow("ready_to_merge", "done", [MarkDone])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
