@@ -105,7 +105,7 @@ pub(super) fn build_runtime_job_prompt(
          - Use the prompt packet activity_result_schema to shape your final summary.\n\
          - When returning structured activity output, put a JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.\n\
          - The structured result activity field must match this runtime job activity exactly.\n\
-         - Return a concise final summary with changed files, validation commands, and remaining blockers.\n\n\
+         - Return a concise final summary appropriate to the activity. Include changed files and validation commands only when repository code changes were requested; for discovery and planning activities, report inspected inputs, emitted signals, and remaining blockers.\n\n\
          Project root: {project_root}\n\
          Runtime job id: {job_id}\n\
          Runtime profile: {runtime_profile}\n\
@@ -325,11 +325,13 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "planning_batch_when_IssueDiscovered_signals_exist_else_idle",
                 "accepted_signals": ["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound"],
+                "success_requires": "At least one accepted signal. Empty signals are invalid even when status is succeeded.",
+                "empty_success_allowed": false,
                 "required_summary": "Describe the GitHub issue query, existing workflow checks, and new issue workflow candidates."
             },
             "structured_decision": {
                 "optional": true,
-                "description": "A workflow_decision artifact may propose a plan_repo_sprint activity command, but IssueDiscovered signals are sufficient."
+                "description": "Prefer signals. Only emit workflow_decision when you can include every required command; a transition to planning_batch without an enqueue_activity command is invalid."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -340,11 +342,14 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "dispatching_when_SprintTaskSelected_signals_exist_else_idle",
                 "accepted_signals": ["SprintTaskSelected", "IssueSkipped", "NoSprintTaskSelected"],
+                "accepted_artifacts": ["sprint_plan"],
+                "success_requires": "At least one accepted signal or a sprint_plan artifact. Empty signals and no sprint_plan artifact are invalid even when status is succeeded.",
+                "empty_success_allowed": false,
                 "required_summary": "Describe dependency planning, skipped issues, and selected issue workflow dispatch order."
             },
             "structured_decision": {
                 "optional": true,
-                "description": "A workflow_decision artifact may propose start_child_workflow commands, but SprintTaskSelected signals are sufficient."
+                "description": "Prefer signals. Only emit workflow_decision when you can include every required command; a transition to dispatching without start_child_workflow commands is invalid."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -458,6 +463,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
         ("repo_backlog", "poll_repo_backlog") => json!({
             "must_include": ["repo and label queried", "open issues inspected", "existing workflow checks", "new issue workflow candidates", "next workflow action"],
             "must_not_include": ["repository code changes", "workflow table mutations", "server-side GitHub polling changes"],
+            "success_rule": "A succeeded result MUST emit IssueDiscovered, IssueSkipped, or NoOpenIssueFound. Do not return succeeded with empty signals.",
             "signals": {
                 "IssueDiscovered": "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available.",
                 "IssueSkipped": "Use for open GitHub issues that already have a workflow, are PRs, or should not be started. Include issue_number and reason. When an issue already has a workflow, include workflow_state.",
@@ -473,6 +479,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
         ("repo_backlog", "plan_repo_sprint") => json!({
             "must_include": ["issues considered", "dependency reasoning", "selected tasks", "skipped issues", "next workflow action"],
             "must_not_include": ["repository code changes", "workflow table mutations", "server-side task queue changes"],
+            "success_rule": "A succeeded result MUST emit SprintTaskSelected, IssueSkipped, NoSprintTaskSelected, or a sprint_plan artifact. Do not return succeeded with empty signals and no sprint_plan artifact.",
             "signals": {
                 "SprintTaskSelected": "Use once for each issue selected for execution. Include issue_number, issue_url, repo, labels, and depends_on as issue numbers.",
                 "IssueSkipped": "Use for discovered issues intentionally skipped by planning. Include issue_number and reason.",
@@ -608,8 +615,16 @@ mod tests {
             "IssueDiscovered"
         );
         assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["empty_success_allowed"],
+            false
+        );
+        assert_eq!(
             schema["agent_summary_contract"]["signals"]["IssueDiscovered"],
             "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available."
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["success_rule"],
+            "A succeeded result MUST emit IssueDiscovered, IssueSkipped, or NoOpenIssueFound. Do not return succeeded with empty signals."
         );
         assert!(schema["workflow_decision_contract"]["allowed_transitions"]
             .as_array()
@@ -644,8 +659,20 @@ mod tests {
             "SprintTaskSelected"
         );
         assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["empty_success_allowed"],
+            false
+        );
+        assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][0],
+            "sprint_plan"
+        );
+        assert_eq!(
             schema["agent_summary_contract"]["signals"]["SprintTaskSelected"],
             "Use once for each issue selected for execution. Include issue_number, issue_url, repo, labels, and depends_on as issue numbers."
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["success_rule"],
+            "A succeeded result MUST emit SprintTaskSelected, IssueSkipped, NoSprintTaskSelected, or a sprint_plan artifact. Do not return succeeded with empty signals and no sprint_plan artifact."
         );
         assert!(schema["workflow_decision_contract"]["allowed_transitions"]
             .as_array()

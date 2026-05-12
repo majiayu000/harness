@@ -86,8 +86,24 @@ fn reduce_success(
         return None;
     }
 
-    if let Some(decision) = structured_decision {
+    if let Some(decision) =
+        repo_backlog_invalid_success_decision(instance, event, result, structured_decision.as_ref())
+    {
         return Some(decision);
+    }
+
+    if let Some(decision) = structured_decision.as_ref() {
+        let reason = format!(
+            "runtime activity `{}` emitted workflow_decision `{}` for workflow `{}` in state `{}`, but the decision to `{}` did not validate and no domain fallback was available",
+            result.activity,
+            decision.decision,
+            instance.definition_id,
+            instance.state,
+            decision.next_state
+        );
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, &reason,
+        ));
     }
 
     let (next_state, decision, reason) = match (
@@ -667,6 +683,197 @@ fn structured_decision_validates(
         .is_ok()
 }
 
+fn repo_backlog_invalid_success_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    structured_decision: Option<&WorkflowDecision>,
+) -> Option<WorkflowDecision> {
+    match (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) {
+        (REPO_BACKLOG_DEFINITION_ID, "scanning", REPO_BACKLOG_POLL_ACTIVITY) => {
+            let issue_discovered_count = signal_count(result, "IssueDiscovered");
+            let valid_issue_discovered_count =
+                issue_candidates_from_signals(result, "IssueDiscovered", None).len();
+            if issue_discovered_count > 0 && valid_issue_discovered_count == 0 {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo backlog poll emitted IssueDiscovered signals, but none contained a valid issue_number",
+                ));
+            }
+            if !has_any_signal(
+                result,
+                &["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound"],
+            ) {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo backlog poll succeeded without IssueDiscovered, IssueSkipped, or NoOpenIssueFound signals",
+                ));
+            }
+            if structured_decision.is_some() {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo backlog poll emitted a workflow_decision artifact that did not validate and no valid domain fallback was available",
+                ));
+            }
+            None
+        }
+        (REPO_BACKLOG_DEFINITION_ID, "planning_batch", REPO_BACKLOG_SPRINT_PLAN_ACTIVITY) => {
+            let sprint_task_selected_count = signal_count(result, "SprintTaskSelected");
+            let sprint_plan_task_count = sprint_plan_task_count(result);
+            let has_valid_noop_sprint_plan_artifact = has_valid_noop_sprint_plan_artifact(result);
+            if (sprint_task_selected_count > 0 || sprint_plan_task_count > 0)
+                && sprint_plan_selected_issues(result, event, None).is_empty()
+            {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo sprint plan emitted selected task output, but no selected issue had a valid issue_number",
+                ));
+            }
+            if !has_any_signal(
+                result,
+                &["SprintTaskSelected", "IssueSkipped", "NoSprintTaskSelected"],
+            ) && !has_valid_noop_sprint_plan_artifact
+            {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo sprint plan succeeded without SprintTaskSelected, IssueSkipped, NoSprintTaskSelected, or a valid no-op sprint_plan artifact",
+                ));
+            }
+            if structured_decision.is_some() {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo sprint plan emitted a workflow_decision artifact that did not validate and no valid domain fallback was available",
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn invalid_agent_output_blocked_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    reason: &str,
+) -> WorkflowDecision {
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "block_invalid_agent_output",
+        "blocked",
+        reason,
+    )
+    .with_command(WorkflowCommand::mark_blocked(
+        reason,
+        format!("runtime-completion:{}:invalid-output:block", event.id),
+    ))
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::RequestOperatorAttention,
+        format!("runtime-completion:{}:invalid-output:operator", event.id),
+        json!({
+            "reason": reason,
+            "activity": result.activity,
+            "runtime_job_id": event_field_string(event, "runtime_job_id"),
+        }),
+    ))
+    .with_evidence(runtime_completion_evidence(event, result))
+    .high_confidence()
+}
+
+fn signal_count(result: &ActivityResult, signal_type: &str) -> usize {
+    result
+        .signals
+        .iter()
+        .filter(|signal| signal.signal_type == signal_type)
+        .count()
+}
+
+fn has_any_signal(result: &ActivityResult, signal_types: &[&str]) -> bool {
+    result
+        .signals
+        .iter()
+        .any(|signal| signal_types.contains(&signal.signal_type.as_str()))
+}
+
+fn sprint_plan_task_count(result: &ActivityResult) -> usize {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "sprint_plan")
+        .map(|artifact| array_items(&artifact.artifact, "tasks").len())
+        .sum()
+}
+
+fn has_valid_noop_sprint_plan_artifact(result: &ActivityResult) -> bool {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "sprint_plan")
+        .any(|artifact| valid_noop_sprint_plan_artifact(&artifact.artifact))
+}
+
+fn valid_noop_sprint_plan_artifact(value: &Value) -> bool {
+    let Some(tasks) = value.get("tasks").and_then(Value::as_array) else {
+        return false;
+    };
+    tasks.is_empty() && (has_valid_skip_evidence(value) || has_explicit_noop_evidence(value))
+}
+
+fn has_valid_skip_evidence(value: &Value) -> bool {
+    value
+        .get("skip")
+        .or_else(|| value.get("skipped"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(valid_sprint_plan_skip_evidence))
+}
+
+fn valid_sprint_plan_skip_evidence(value: &Value) -> bool {
+    let has_issue = value
+        .get("issue")
+        .or_else(|| value.get("issue_number"))
+        .and_then(json_value_u64)
+        .is_some_and(|issue_number| issue_number > 0);
+    let has_reason = value
+        .get("reason")
+        .or_else(|| value.get("note"))
+        .and_then(non_empty_json_string)
+        .is_some();
+    has_issue && has_reason
+}
+
+fn has_explicit_noop_evidence(value: &Value) -> bool {
+    let has_noop_flag = value
+        .get("no_task_selected")
+        .or_else(|| value.get("no_tasks_selected"))
+        .or_else(|| value.get("no_sprint_task_selected"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_reason = value
+        .get("reason")
+        .or_else(|| value.get("summary"))
+        .or_else(|| value.get("note"))
+        .and_then(non_empty_json_string)
+        .is_some();
+    has_noop_flag && has_reason
+}
+
 fn repo_backlog_child_dispatch_still_active(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
@@ -1209,7 +1416,7 @@ fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool 
             "implementing" | "awaiting_feedback" | "addressing_feedback"
         ) | (
             REPO_BACKLOG_DEFINITION_ID,
-            "dispatching" | "reconciling" | "planning_batch"
+            "scanning" | "dispatching" | "reconciling" | "planning_batch"
         ) | (PR_FEEDBACK_DEFINITION_ID, "inspecting")
             | (PROMPT_TASK_DEFINITION_ID, "implementing")
             | (QUALITY_GATE_DEFINITION_ID, "checking")

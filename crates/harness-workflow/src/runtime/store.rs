@@ -1259,20 +1259,33 @@ impl WorkflowRuntimeStore {
         Ok(by_job)
     }
 
-    pub async fn complete_runtime_job(
+    pub async fn complete_runtime_job_if_owned(
         &self,
         runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
         result: &ActivityResult,
-    ) -> anyhow::Result<RuntimeJob> {
+    ) -> anyhow::Result<Option<RuntimeJob>> {
+        let mut tx = self.pool.begin().await?;
         let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1")
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(runtime_job_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
         let Some((data,)) = row else {
             anyhow::bail!("runtime job not found: {runtime_job_id}");
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let is_current_lease = job.status == RuntimeJobStatus::Running
+            && job
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.owner == owner && lease.expires_at == lease_expires_at);
+        if !is_current_lease {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
         job.complete(result)?;
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
@@ -1285,9 +1298,10 @@ impl WorkflowRuntimeStore {
         .bind(job.not_before)
         .bind(&updated)
         .bind(runtime_job_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(job)
+        tx.commit().await?;
+        Ok(Some(job))
     }
 
     pub async fn get_runtime_job(

@@ -51,6 +51,7 @@ pub(super) fn activity_result_from_turn(
                     "activity result block invalid: {error}"
                 );
                 ActivityResult::failed(activity, "Structured activity result was invalid.", error)
+                    .with_error_kind(ActivityErrorKind::Configuration)
             }
         },
         TurnStatus::Cancelled => ActivityResult::cancelled(activity, summary),
@@ -359,6 +360,7 @@ Final result:
             result.error.as_deref(),
             Some("activity result block reported activity `replan_issue`, expected `implement_issue`")
         );
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
         assert!(!result
             .artifacts
             .iter()
@@ -416,6 +418,7 @@ Final result:
             .error
             .as_deref()
             .is_some_and(|error| error.starts_with("activity result block is invalid JSON:")));
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
         assert!(!result
             .artifacts
             .iter()

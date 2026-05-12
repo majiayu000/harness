@@ -225,7 +225,6 @@ impl TransitionAllowlist {
                 [StartChildWorkflow, EnqueueActivity, Wait],
             )
             .allow("idle", "scanning", [EnqueueActivity, Wait])
-            .allow("failed", "scanning", [EnqueueActivity, Wait])
             .allow("scanning", "scanning", [EnqueueActivity, Wait])
             .allow("scanning", "planning_batch", [EnqueueActivity, Wait])
             .allow("planning_batch", "planning_batch", [EnqueueActivity, Wait])
@@ -646,6 +645,9 @@ fn required_command_for_transition(
 ) -> Option<WorkflowCommandType> {
     match (from_state, to_state) {
         (from_state, "pr_open") if from_state != "pr_open" => Some(WorkflowCommandType::BindPr),
+        ("idle", "scanning") => Some(WorkflowCommandType::EnqueueActivity),
+        ("scanning", "planning_batch") => Some(WorkflowCommandType::EnqueueActivity),
+        ("planning_batch", "dispatching") => Some(WorkflowCommandType::StartChildWorkflow),
         (_, "done") => Some(WorkflowCommandType::MarkDone),
         (_, "blocked") => Some(WorkflowCommandType::MarkBlocked),
         (_, "failed") => Some(WorkflowCommandType::MarkFailed),
