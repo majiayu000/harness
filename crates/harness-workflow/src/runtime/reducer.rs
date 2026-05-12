@@ -86,8 +86,24 @@ fn reduce_success(
         return None;
     }
 
-    if let Some(decision) = structured_decision {
+    if let Some(decision) =
+        repo_backlog_invalid_success_decision(instance, event, result, structured_decision.as_ref())
+    {
         return Some(decision);
+    }
+
+    if let Some(decision) = structured_decision.as_ref() {
+        let reason = format!(
+            "runtime activity `{}` emitted workflow_decision `{}` for workflow `{}` in state `{}`, but the decision to `{}` did not validate and no domain fallback was available",
+            result.activity,
+            decision.decision,
+            instance.definition_id,
+            instance.state,
+            decision.next_state
+        );
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, &reason,
+        ));
     }
 
     let (next_state, decision, reason) = match (
@@ -667,6 +683,147 @@ fn structured_decision_validates(
         .is_ok()
 }
 
+fn repo_backlog_invalid_success_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    structured_decision: Option<&WorkflowDecision>,
+) -> Option<WorkflowDecision> {
+    match (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) {
+        (REPO_BACKLOG_DEFINITION_ID, "scanning", REPO_BACKLOG_POLL_ACTIVITY) => {
+            let issue_discovered_count = signal_count(result, "IssueDiscovered");
+            let valid_issue_discovered_count =
+                issue_candidates_from_signals(result, "IssueDiscovered", None).len();
+            if issue_discovered_count > 0 && valid_issue_discovered_count == 0 {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo backlog poll emitted IssueDiscovered signals, but none contained a valid issue_number",
+                ));
+            }
+            if !has_any_signal(
+                result,
+                &["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound"],
+            ) {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo backlog poll succeeded without IssueDiscovered, IssueSkipped, or NoOpenIssueFound signals",
+                ));
+            }
+            if structured_decision.is_some() {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo backlog poll emitted a workflow_decision artifact that did not validate and no valid domain fallback was available",
+                ));
+            }
+            None
+        }
+        (REPO_BACKLOG_DEFINITION_ID, "planning_batch", REPO_BACKLOG_SPRINT_PLAN_ACTIVITY) => {
+            let sprint_task_selected_count = signal_count(result, "SprintTaskSelected");
+            let sprint_plan_task_count = sprint_plan_task_count(result);
+            let has_sprint_plan_artifact = result
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_type == "sprint_plan");
+            if (sprint_task_selected_count > 0 || sprint_plan_task_count > 0)
+                && sprint_plan_selected_issues(result, event, None).is_empty()
+            {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo sprint plan emitted selected task output, but no selected issue had a valid issue_number",
+                ));
+            }
+            if !has_any_signal(
+                result,
+                &["SprintTaskSelected", "IssueSkipped", "NoSprintTaskSelected"],
+            ) && !has_sprint_plan_artifact
+            {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo sprint plan succeeded without SprintTaskSelected, IssueSkipped, or NoSprintTaskSelected signals",
+                ));
+            }
+            if structured_decision.is_some() {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo sprint plan emitted a workflow_decision artifact that did not validate and no valid domain fallback was available",
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn invalid_agent_output_blocked_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    reason: &str,
+) -> WorkflowDecision {
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "block_invalid_agent_output",
+        "blocked",
+        reason,
+    )
+    .with_command(WorkflowCommand::mark_blocked(
+        reason,
+        format!("runtime-completion:{}:invalid-output:block", event.id),
+    ))
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::RequestOperatorAttention,
+        format!("runtime-completion:{}:invalid-output:operator", event.id),
+        json!({
+            "reason": reason,
+            "activity": result.activity,
+            "runtime_job_id": event_field_string(event, "runtime_job_id"),
+        }),
+    ))
+    .with_evidence(runtime_completion_evidence(event, result))
+    .high_confidence()
+}
+
+fn signal_count(result: &ActivityResult, signal_type: &str) -> usize {
+    result
+        .signals
+        .iter()
+        .filter(|signal| signal.signal_type == signal_type)
+        .count()
+}
+
+fn has_any_signal(result: &ActivityResult, signal_types: &[&str]) -> bool {
+    result
+        .signals
+        .iter()
+        .any(|signal| signal_types.contains(&signal.signal_type.as_str()))
+}
+
+fn sprint_plan_task_count(result: &ActivityResult) -> usize {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "sprint_plan")
+        .map(|artifact| array_items(&artifact.artifact, "tasks").len())
+        .sum()
+}
+
 fn repo_backlog_child_dispatch_still_active(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
@@ -1209,7 +1366,7 @@ fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool 
             "implementing" | "awaiting_feedback" | "addressing_feedback"
         ) | (
             REPO_BACKLOG_DEFINITION_ID,
-            "dispatching" | "reconciling" | "planning_batch"
+            "scanning" | "dispatching" | "reconciling" | "planning_batch"
         ) | (PR_FEEDBACK_DEFINITION_ID, "inspecting")
             | (PROMPT_TASK_DEFINITION_ID, "implementing")
             | (QUALITY_GATE_DEFINITION_ID, "checking")

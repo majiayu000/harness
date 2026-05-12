@@ -543,6 +543,10 @@ fn activity_result_from_turn_fails_mismatched_structured_activity() {
         result.error.as_deref(),
         Some("activity result block reported activity `replan_issue`, expected `implement_issue`")
     );
+    assert_eq!(
+        result.error_kind,
+        Some(harness_workflow::runtime::ActivityErrorKind::Configuration)
+    );
     assert!(!result
         .artifacts
         .iter()
@@ -603,6 +607,10 @@ Final result:
         .error
         .as_deref()
         .is_some_and(|error| error.starts_with("activity result block is invalid JSON:")));
+    assert_eq!(
+        result.error_kind,
+        Some(harness_workflow::runtime::ActivityErrorKind::Configuration)
+    );
     assert!(!result
         .artifacts
         .iter()

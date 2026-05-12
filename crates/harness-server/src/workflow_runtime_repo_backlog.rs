@@ -1,4 +1,3 @@
-use chrono::{DateTime, Duration, Utc};
 use harness_workflow::issue_lifecycle::IssueWorkflowStore;
 use harness_workflow::runtime::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,
@@ -11,8 +10,6 @@ use harness_workflow::runtime::{
 };
 use serde_json::json;
 use std::path::Path;
-
-const REPO_BACKLOG_FAILED_RETRY_BACKOFF: Duration = Duration::minutes(15);
 
 pub(crate) struct OpenIssueRuntimeContext<'a> {
     pub project_root: &'a Path,
@@ -70,18 +67,11 @@ pub(crate) async fn request_repo_backlog_poll(
             workflow_id: instance.id,
         });
     }
-    if instance.state == "failed" && repo_backlog_failed_retry_backoff_active(&commands, Utc::now())
-    {
-        return Ok(RepoBacklogPollRequestOutcome::NotCandidate {
-            workflow_id: instance.id,
-            state: instance.state,
-        });
-    }
     persist_repo_backlog_poll_request(store, instance, &ctx).await
 }
 
 fn repo_backlog_poll_candidate_state(state: &str) -> bool {
-    matches!(state, "idle" | "failed")
+    state == "idle"
 }
 
 pub(crate) async fn record_open_issue_without_workflow(
@@ -420,21 +410,6 @@ fn has_active_repo_backlog_poll_command(commands: &[WorkflowCommandRecord]) -> b
     })
 }
 
-fn repo_backlog_failed_retry_backoff_active(
-    commands: &[WorkflowCommandRecord],
-    now: DateTime<Utc>,
-) -> bool {
-    let Some(latest) = commands
-        .iter()
-        .filter(|record| is_repo_backlog_poll_command(record))
-        .max_by_key(|record| record.updated_at)
-    else {
-        return false;
-    };
-    latest.status == "failed"
-        && now.signed_duration_since(latest.updated_at) < REPO_BACKLOG_FAILED_RETRY_BACKOFF
-}
-
 fn is_repo_backlog_poll_command(record: &WorkflowCommandRecord) -> bool {
     record.command.activity_name() == Some(REPO_BACKLOG_POLL_ACTIVITY)
 }
@@ -478,6 +453,7 @@ fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use harness_core::db::resolve_database_url;
     use harness_workflow::issue_lifecycle::IssueLifecycleState;
     use harness_workflow::runtime::WorkflowCommand;
@@ -616,28 +592,6 @@ mod tests {
         assert_eq!(retry_instance.state, "failed");
         assert_eq!(store.commands_for(&workflow_id).await?.len(), 1);
         Ok(())
-    }
-
-    #[test]
-    fn repo_backlog_failed_retry_backoff_expires() {
-        let now = Utc::now();
-        let recent_failed = repo_backlog_poll_command_record(
-            "failed",
-            now - REPO_BACKLOG_FAILED_RETRY_BACKOFF + Duration::seconds(1),
-        );
-        assert!(repo_backlog_failed_retry_backoff_active(
-            &[recent_failed],
-            now
-        ));
-
-        let stale_failed = repo_backlog_poll_command_record(
-            "failed",
-            now - REPO_BACKLOG_FAILED_RETRY_BACKOFF - Duration::seconds(1),
-        );
-        assert!(!repo_backlog_failed_retry_backoff_active(
-            &[stale_failed],
-            now
-        ));
     }
 
     #[test]

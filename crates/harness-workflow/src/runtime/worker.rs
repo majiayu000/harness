@@ -93,7 +93,18 @@ impl<'a> RuntimeWorker<'a> {
                 serde_json::to_value(&result)?,
             )
             .await?;
-        let completed = self.store.complete_runtime_job(&job.id, &result).await?;
+        let Some(completed) = self
+            .store
+            .complete_runtime_job_if_owned(&job.id, &self.owner, lease_expires_at, &result)
+            .await?
+        else {
+            tracing::warn!(
+                runtime_job_id = %job.id,
+                owner = %self.owner,
+                "runtime job completion ignored because the worker no longer owns the lease"
+            );
+            return Ok(None);
+        };
         self.record_workflow_completion(&completed, &result).await?;
         Ok(Some(completed))
     }
