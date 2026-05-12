@@ -1259,37 +1259,6 @@ impl WorkflowRuntimeStore {
         Ok(by_job)
     }
 
-    pub async fn complete_runtime_job(
-        &self,
-        runtime_job_id: &str,
-        result: &ActivityResult,
-    ) -> anyhow::Result<RuntimeJob> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1")
-                .bind(runtime_job_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        let Some((data,)) = row else {
-            anyhow::bail!("runtime job not found: {runtime_job_id}");
-        };
-        let mut job: RuntimeJob = serde_json::from_str(&data)?;
-        job.complete(result)?;
-        let updated = to_jsonb_string(&job)?;
-        let status = enum_str(&job.status)?;
-        sqlx::query(
-            "UPDATE runtime_jobs
-             SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $4",
-        )
-        .bind(&status)
-        .bind(job.not_before)
-        .bind(&updated)
-        .bind(runtime_job_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(job)
-    }
-
     pub async fn complete_runtime_job_if_owned(
         &self,
         runtime_job_id: &str,

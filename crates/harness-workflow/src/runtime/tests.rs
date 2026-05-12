@@ -2383,6 +2383,53 @@ fn runtime_completion_reducer_idles_repo_backlog_after_empty_sprint_plan_artifac
 }
 
 #[test]
+fn runtime_completion_reducer_blocks_sprint_plan_artifact_without_noop_evidence() {
+    let cases = [
+        ("missing tasks", json!({})),
+        ("empty tasks without evidence", json!({ "tasks": [] })),
+    ];
+
+    for (case_name, artifact) in cases {
+        let instance = repo_backlog_instance("planning_batch");
+        let command = WorkflowCommand::enqueue_activity(
+            REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "repo-backlog:owner/repo:plan",
+        );
+        let result = ActivityResult::succeeded(
+            REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "No sprint tasks were selected.",
+        )
+        .with_artifact(ActivityArtifact::new("sprint_plan", artifact));
+        let event = WorkflowEvent::new(
+            &instance.id,
+            1,
+            super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+            "runtime-1",
+        )
+        .with_payload(json!({
+            "command_id": "command-1",
+            "command": command,
+            "runtime_job_id": "job-1",
+            "activity_result": result,
+        }));
+
+        let decision = reduce_runtime_job_completed(&instance, &event)
+            .expect("event should parse")
+            .unwrap_or_else(|| panic!("{case_name} should block invalid sprint plan output"));
+
+        assert_eq!(decision.decision, "block_invalid_agent_output");
+        assert_eq!(decision.next_state, "blocked");
+        DecisionValidator::repo_backlog()
+            .validate(
+                &instance,
+                &decision,
+                &ValidationContext::new("runtime-1", Utc::now()),
+            )
+            .expect("invalid sprint plan artifact should reduce to a valid blocked decision");
+    }
+}
+
+#[test]
 fn runtime_completion_reducer_idles_repo_backlog_after_empty_scan() {
     let instance = repo_backlog_instance("scanning");
     let command = WorkflowCommand::enqueue_activity(
@@ -4226,7 +4273,15 @@ async fn durable_store_persists_workflow_runtime_bus_contract() -> anyhow::Resul
 
     let result = ActivityResult::succeeded("replan_issue", "Replan completed.")
         .with_signal(ActivitySignal::new("ReplanCompleted", json!({})));
-    let completed = store.complete_runtime_job(&claimed.id, &result).await?;
+    let lease_expires_at = claimed
+        .lease
+        .as_ref()
+        .expect("lease should exist")
+        .expires_at;
+    let completed = store
+        .complete_runtime_job_if_owned(&claimed.id, "runtime-1", lease_expires_at, &result)
+        .await?
+        .expect("current owner completion should be accepted");
     assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
     assert_eq!(
         store

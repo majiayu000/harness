@@ -730,10 +730,7 @@ fn repo_backlog_invalid_success_decision(
         (REPO_BACKLOG_DEFINITION_ID, "planning_batch", REPO_BACKLOG_SPRINT_PLAN_ACTIVITY) => {
             let sprint_task_selected_count = signal_count(result, "SprintTaskSelected");
             let sprint_plan_task_count = sprint_plan_task_count(result);
-            let has_sprint_plan_artifact = result
-                .artifacts
-                .iter()
-                .any(|artifact| artifact.artifact_type == "sprint_plan");
+            let has_valid_noop_sprint_plan_artifact = has_valid_noop_sprint_plan_artifact(result);
             if (sprint_task_selected_count > 0 || sprint_plan_task_count > 0)
                 && sprint_plan_selected_issues(result, event, None).is_empty()
             {
@@ -747,13 +744,13 @@ fn repo_backlog_invalid_success_decision(
             if !has_any_signal(
                 result,
                 &["SprintTaskSelected", "IssueSkipped", "NoSprintTaskSelected"],
-            ) && !has_sprint_plan_artifact
+            ) && !has_valid_noop_sprint_plan_artifact
             {
                 return Some(invalid_agent_output_blocked_decision(
                     instance,
                     event,
                     result,
-                    "repo sprint plan succeeded without SprintTaskSelected, IssueSkipped, or NoSprintTaskSelected signals",
+                    "repo sprint plan succeeded without SprintTaskSelected, IssueSkipped, NoSprintTaskSelected, or a valid no-op sprint_plan artifact",
                 ));
             }
             if structured_decision.is_some() {
@@ -822,6 +819,59 @@ fn sprint_plan_task_count(result: &ActivityResult) -> usize {
         .filter(|artifact| artifact.artifact_type == "sprint_plan")
         .map(|artifact| array_items(&artifact.artifact, "tasks").len())
         .sum()
+}
+
+fn has_valid_noop_sprint_plan_artifact(result: &ActivityResult) -> bool {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "sprint_plan")
+        .any(|artifact| valid_noop_sprint_plan_artifact(&artifact.artifact))
+}
+
+fn valid_noop_sprint_plan_artifact(value: &Value) -> bool {
+    let Some(tasks) = value.get("tasks").and_then(Value::as_array) else {
+        return false;
+    };
+    tasks.is_empty() && (has_valid_skip_evidence(value) || has_explicit_noop_evidence(value))
+}
+
+fn has_valid_skip_evidence(value: &Value) -> bool {
+    value
+        .get("skip")
+        .or_else(|| value.get("skipped"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(valid_sprint_plan_skip_evidence))
+}
+
+fn valid_sprint_plan_skip_evidence(value: &Value) -> bool {
+    let has_issue = value
+        .get("issue")
+        .or_else(|| value.get("issue_number"))
+        .and_then(json_value_u64)
+        .is_some_and(|issue_number| issue_number > 0);
+    let has_reason = value
+        .get("reason")
+        .or_else(|| value.get("note"))
+        .and_then(non_empty_json_string)
+        .is_some();
+    has_issue && has_reason
+}
+
+fn has_explicit_noop_evidence(value: &Value) -> bool {
+    let has_noop_flag = value
+        .get("no_task_selected")
+        .or_else(|| value.get("no_tasks_selected"))
+        .or_else(|| value.get("no_sprint_task_selected"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_reason = value
+        .get("reason")
+        .or_else(|| value.get("summary"))
+        .or_else(|| value.get("note"))
+        .and_then(non_empty_json_string)
+        .is_some();
+    has_noop_flag && has_reason
 }
 
 fn repo_backlog_child_dispatch_still_active(
