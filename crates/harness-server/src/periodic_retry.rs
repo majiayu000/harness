@@ -486,6 +486,7 @@ mod tests {
             plan_output: None,
             request_settings: None,
             scheduler: crate::task_runner::TaskSchedulerState::queued(),
+            version: 0,
         }
     }
 

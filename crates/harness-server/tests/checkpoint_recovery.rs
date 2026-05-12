@@ -40,6 +40,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         repo: None,
         request_settings: None,
         scheduler: harness_server::task_runner::TaskSchedulerState::queued(),
+        version: 0,
     }
 }
 

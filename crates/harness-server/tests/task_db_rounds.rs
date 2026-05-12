@@ -36,6 +36,7 @@ fn make_task(id: &str) -> TaskState {
         repo: None,
         request_settings: None,
         scheduler: TaskSchedulerState::queued(),
+        version: 0,
     }
 }
 
