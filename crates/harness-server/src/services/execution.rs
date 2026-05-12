@@ -1129,6 +1129,26 @@ impl ExecutionService for DefaultExecutionService {
             };
             match task_queue.acquire(&project_id, req.priority).await {
                 Ok(permit) => {
+                    // Terminal-state gate: a task can be cancelled while waiting
+                    // for a permit. The cancel HTTP route persists Cancelled and
+                    // calls `abort_task`, but for queue-waiting tasks no abort
+                    // handle exists yet. Re-read state here and skip execution
+                    // if it has already reached a terminal status — dropping
+                    // `permit` releases the queue slot without resurrecting the
+                    // task to a non-terminal status.
+                    if let Some(state) = tasks.get(&task_id2) {
+                        if state.status.is_terminal() {
+                            tracing::info!(
+                                task_id = %task_id2.0,
+                                project = %project_id,
+                                status = state.status.as_ref(),
+                                "skipping execution: task reached terminal status before permit acquisition"
+                            );
+                            drop(permit);
+                            tasks.close_task_stream(&task_id2);
+                            return;
+                        }
+                    }
                     task_runner::spawn_preregistered_task(
                         task_id2,
                         tasks,
