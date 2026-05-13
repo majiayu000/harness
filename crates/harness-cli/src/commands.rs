@@ -10,6 +10,7 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 mod exec;
 mod reconcile;
 mod serve;
+mod status;
 
 const RUNTIME_LOG_PREFIX: &str = "harness-serve-";
 const RUNTIME_LOG_SUFFIX: &str = ".log";
@@ -124,6 +125,22 @@ pub enum Command {
 
     /// Display the current version
     Version,
+
+    /// Show live server health, queue, and workflow runtime status
+    Status {
+        /// Server base URL. Defaults to server.http_addr from config.
+        #[arg(long)]
+        url: Option<String>,
+        /// Filter runtime workflow tree to one project_id.
+        #[arg(long)]
+        project_id: Option<String>,
+        /// Maximum workflow rows requested from the runtime tree endpoint.
+        #[arg(long, default_value_t = 20)]
+        runtime_limit: i64,
+        /// Print raw combined JSON instead of a compact text summary.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Reconcile harness task state against GitHub PR/issue state
     Reconcile {
@@ -834,6 +851,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
+        Command::Status {
+            url,
+            project_id,
+            runtime_limit,
+            json,
+        } => {
+            status::run(&config, url, project_id, runtime_limit, json).await?;
+        }
+
         Command::Reconcile { dry_run, project } => {
             reconcile::run(dry_run, project, &config).await?;
         }
@@ -1091,6 +1117,36 @@ mod tests {
                 assert_eq!(port, Some(8080));
             }
             _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_status_with_filters() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "status",
+            "--url",
+            "127.0.0.1:9800",
+            "--project-id",
+            "/project-a",
+            "--runtime-limit",
+            "5",
+            "--json",
+        ])
+        .expect("status with filters should parse");
+        match cli.command {
+            Command::Status {
+                url,
+                project_id,
+                runtime_limit,
+                json,
+            } => {
+                assert_eq!(url.as_deref(), Some("127.0.0.1:9800"));
+                assert_eq!(project_id.as_deref(), Some("/project-a"));
+                assert_eq!(runtime_limit, 5);
+                assert!(json);
+            }
+            _ => panic!("expected Status command"),
         }
     }
 
