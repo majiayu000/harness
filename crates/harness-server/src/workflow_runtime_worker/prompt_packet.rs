@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+use super::activity_contract::activity_contract;
 use super::data_helpers::activity_name;
 
 pub(super) fn build_runtime_prompt_packet(
@@ -138,6 +139,7 @@ pub(super) fn activity_result_schema(
     let workflow_definition = workflow
         .map(|workflow| workflow.definition_id.as_str())
         .unwrap_or("unknown");
+    let activity_contract = activity_contract(workflow_definition, &activity);
     let transition_contract = activity_transition_contract(workflow_definition, &activity);
     let summary_contract = agent_summary_contract(workflow_definition, &activity);
     let decision_contract = workflow_decision_contract(workflow);
@@ -145,6 +147,7 @@ pub(super) fn activity_result_schema(
         "schema": "harness.runtime.activity_result.v1",
         "activity": activity,
         "workflow_definition": workflow_definition,
+        "activity_contract": activity_contract.to_prompt_value(),
         "result_type": "ActivityResult",
         "required_fields": ["activity", "status", "summary"],
         "optional_fields": ["artifacts", "signals", "validation", "error", "error_kind"],
@@ -582,6 +585,14 @@ mod tests {
             schema["agent_summary_contract"]["must_include"][0],
             "validation commands"
         );
+        assert_eq!(
+            schema["activity_contract"]["accepted_signals"][0],
+            QUALITY_PASSED_SIGNAL
+        );
+        assert_eq!(
+            schema["activity_contract"]["success_requires"],
+            "quality_gate_status_signal"
+        );
         assert!(schema["workflow_decision_contract"]["allowed_transitions"]
             .as_array()
             .expect("allowed transitions should be an array")
@@ -617,6 +628,14 @@ mod tests {
         assert_eq!(
             schema["transition_contract"]["on_succeeded"]["empty_success_allowed"],
             false
+        );
+        assert_eq!(
+            schema["activity_contract"]["success_requires"],
+            "at_least_one_accepted_signal"
+        );
+        assert_eq!(
+            schema["activity_contract"]["explicit_noop_signals"][0],
+            "NoOpenIssueFound"
         );
         assert_eq!(
             schema["agent_summary_contract"]["signals"]["IssueDiscovered"],
@@ -667,6 +686,14 @@ mod tests {
             "sprint_plan"
         );
         assert_eq!(
+            schema["activity_contract"]["success_requires"],
+            "at_least_one_accepted_signal_or_artifact"
+        );
+        assert_eq!(
+            schema["activity_contract"]["accepted_artifacts"][0],
+            "sprint_plan"
+        );
+        assert_eq!(
             schema["agent_summary_contract"]["signals"]["SprintTaskSelected"],
             "Use once for each issue selected for execution. Include issue_number, issue_url, repo, labels, and depends_on as issue numbers."
         );
@@ -709,6 +736,10 @@ mod tests {
         assert_eq!(
             schema["transition_contract"]["on_succeeded"]["parent_propagation"],
             "The same activity result is propagated to the parent github_issue_pr workflow."
+        );
+        assert_eq!(
+            schema["activity_contract"]["child_outcome_contract"],
+            "pr_feedback_outcome"
         );
         assert_eq!(
             schema["agent_summary_contract"]["signals"]["PrReadyToMerge"],

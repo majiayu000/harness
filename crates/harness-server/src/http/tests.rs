@@ -1066,7 +1066,7 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     let command_id = store
         .enqueue_command(&child.id, Some(&rejected.id), &command)
         .await?;
-    let not_before = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let not_before = chrono::Utc::now() - chrono::Duration::minutes(5);
     let runtime_job = store
         .enqueue_runtime_job_with_not_before(
             &command_id,
@@ -1093,6 +1093,42 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
             serde_json::json!({ "status": "succeeded" }),
         )
         .await?;
+    let lease_owner = "workflow-runtime-tree-test";
+    let lease_expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let claimed = store
+        .claim_next_runtime_job(lease_owner, lease_expires_at)
+        .await?
+        .expect("runtime job should be claimable");
+    assert_eq!(claimed.id, runtime_job.id);
+    let activity_result = harness_workflow::runtime::ActivityResult::succeeded(
+        "replan_issue",
+        "Runtime job completed.",
+    )
+    .with_artifact(harness_workflow::runtime::ActivityArtifact::new(
+        "activity_result_envelope",
+        serde_json::json!({
+            "schema": "harness.runtime.activity_result_envelope.v1",
+            "extraction_strategy": "json_fence_repair",
+            "outcome": "repaired_structured_output",
+            "raw_status": "completed",
+            "extracted_activity": "replan_issue",
+            "extraction_error": null,
+            "final_result": {
+                "activity": "replan_issue",
+                "status": "succeeded",
+                "error_kind": null,
+            }
+        }),
+    ));
+    store
+        .complete_runtime_job_if_owned(
+            &runtime_job.id,
+            lease_owner,
+            lease_expires_at,
+            &activity_result,
+        )
+        .await?
+        .expect("runtime job should complete with the current lease");
 
     let response = workflow_runtime_app(state)
         .oneshot(
@@ -1134,6 +1170,20 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     assert_eq!(
         child_node["commands"][0]["runtime_jobs"][0]["prompt_packet_digest"],
         prompt_packet_digest
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["activity_result_envelope"]["outcome"],
+        "repaired_structured_output"
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["activity_result_envelope"]
+            ["extraction_strategy"],
+        "json_fence_repair"
+    );
+    assert_eq!(
+        child_node["commands"][0]["runtime_jobs"][0]["activity_result_envelope"]["final_result"]
+            ["status"],
+        "succeeded"
     );
     Ok(())
 }

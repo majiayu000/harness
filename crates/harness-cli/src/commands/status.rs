@@ -1,0 +1,372 @@
+use anyhow::Context;
+use harness_core::config::HarnessConfig;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::time::Duration;
+use url::form_urlencoded;
+
+const REQUEST_TIMEOUT_SECS: u64 = 5;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RuntimeTreeSummary {
+    workflows: usize,
+    commands: usize,
+    command_statuses: BTreeMap<String, usize>,
+    jobs: usize,
+    job_statuses: BTreeMap<String, usize>,
+    activity_outcomes: BTreeMap<String, usize>,
+    jobs_without_activity_envelope: usize,
+}
+
+pub async fn run(
+    config: &HarnessConfig,
+    url: Option<String>,
+    project_id: Option<String>,
+    runtime_limit: i64,
+    raw_json: bool,
+) -> anyhow::Result<()> {
+    let base_url = server_base_url(config, url)?;
+    let token = resolve_api_token(config);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .no_proxy()
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let runtime_path = runtime_tree_path(project_id.as_deref(), runtime_limit);
+    let health = get_json(&client, &base_url, "/health", token.as_deref()).await?;
+    let queue = get_json(
+        &client,
+        &base_url,
+        "/projects/queue-stats",
+        token.as_deref(),
+    )
+    .await?;
+    let operator = get_json(
+        &client,
+        &base_url,
+        "/api/operator-snapshot",
+        token.as_deref(),
+    )
+    .await?;
+    let runtime_tree = get_json(&client, &base_url, &runtime_path, token.as_deref()).await?;
+
+    let combined = json!({
+        "server_url": base_url,
+        "health": health,
+        "queue": queue,
+        "operator_snapshot": operator,
+        "runtime_tree": runtime_tree,
+    });
+
+    if raw_json {
+        println!("{}", serde_json::to_string_pretty(&combined)?);
+    } else {
+        print_summary(&combined);
+    }
+    Ok(())
+}
+
+fn resolve_api_token(config: &HarnessConfig) -> Option<String> {
+    config
+        .server
+        .api_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var("HARNESS_API_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty())
+        })
+}
+
+fn server_base_url(config: &HarnessConfig, override_url: Option<String>) -> anyhow::Result<String> {
+    if let Some(url) = override_url {
+        let trimmed = url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            anyhow::bail!("--url must not be empty");
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return Ok(trimmed.to_string());
+        }
+        return Ok(format!("http://{trimmed}"));
+    }
+
+    let addr = config.server.http_addr;
+    let host = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    Ok(format!("http://{}:{}", host, addr.port()))
+}
+
+async fn get_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+) -> anyhow::Result<Value> {
+    let url = format!("{base_url}{path}");
+    let mut request = client.get(&url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("failed to connect to harness server at {url}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!(
+            "server rejected {path} with 401; set server.api_token in config or HARNESS_API_TOKEN"
+        );
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status} for {path}: {body}");
+    }
+    response
+        .json::<Value>()
+        .await
+        .with_context(|| format!("server returned invalid JSON for {path}"))
+}
+
+fn runtime_tree_path(project_id: Option<&str>, limit: i64) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("limit", &limit.max(1).to_string());
+    if let Some(project_id) = project_id.filter(|value| !value.is_empty()) {
+        query.append_pair("project_id", project_id);
+    }
+    format!("/api/workflows/runtime/tree?{}", query.finish())
+}
+
+fn print_summary(combined: &Value) {
+    let health = &combined["health"];
+    let queue = &combined["queue"];
+    let operator = &combined["operator_snapshot"];
+    let runtime = &combined["runtime_tree"];
+    let runtime_summary = summarize_runtime_tree(runtime);
+
+    println!(
+        "Harness status: {}",
+        health["status"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Server: {}",
+        combined["server_url"].as_str().unwrap_or("unknown")
+    );
+    println!("Tasks: {}", number_or_zero(&health["tasks"]));
+    println!(
+        "Queue: running {}/{} queued {}",
+        number_or_zero(&queue["global"]["running"]),
+        number_or_zero(&queue["global"]["limit"]),
+        number_or_zero(&queue["global"]["queued"])
+    );
+
+    let degraded = health["persistence"]["degraded_subsystems"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|items| !items.is_empty());
+    if let Some(degraded) = degraded {
+        println!("Degraded subsystems: {degraded}");
+    }
+
+    let last_tick = &operator["retry"]["last_tick"];
+    if last_tick.is_object() {
+        println!(
+            "Retry tick: checked {} stuck {} retried {} skipped {} at {}",
+            number_or_zero(&last_tick["checked"]),
+            number_or_zero(&last_tick["stuck"]),
+            number_or_zero(&last_tick["retried"]),
+            number_or_zero(&last_tick["skipped"]),
+            last_tick["at"].as_str().unwrap_or("unknown")
+        );
+    } else {
+        println!("Retry tick: none");
+    }
+    println!(
+        "Stalled tasks: {}",
+        operator["retry"]["stalled_tasks"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0)
+    );
+    println!(
+        "Recent failures: {}",
+        operator["recent_failures"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0)
+    );
+    println!(
+        "Runtime workflows: {} workflows, {} commands, {} jobs",
+        runtime_summary.workflows, runtime_summary.commands, runtime_summary.jobs
+    );
+    print_count_map("Command statuses", &runtime_summary.command_statuses);
+    print_count_map("Runtime job statuses", &runtime_summary.job_statuses);
+    print_count_map(
+        "Activity result outcomes",
+        &runtime_summary.activity_outcomes,
+    );
+    if runtime_summary.jobs_without_activity_envelope > 0 {
+        println!(
+            "Jobs without activity result envelope: {}",
+            runtime_summary.jobs_without_activity_envelope
+        );
+    }
+}
+
+fn summarize_runtime_tree(tree: &Value) -> RuntimeTreeSummary {
+    let mut summary = RuntimeTreeSummary {
+        workflows: tree["total_workflows"].as_u64().unwrap_or(0) as usize,
+        ..Default::default()
+    };
+    if let Some(workflows) = tree["workflows"].as_array() {
+        for workflow in workflows {
+            summarize_workflow_node(workflow, &mut summary);
+        }
+    }
+    summary
+}
+
+fn summarize_workflow_node(node: &Value, summary: &mut RuntimeTreeSummary) {
+    if let Some(commands) = node["commands"].as_array() {
+        for command in commands {
+            summary.commands += 1;
+            increment(
+                &mut summary.command_statuses,
+                command["status"].as_str().unwrap_or("unknown"),
+            );
+            if let Some(jobs) = command["runtime_jobs"].as_array() {
+                for job in jobs {
+                    summary.jobs += 1;
+                    increment(
+                        &mut summary.job_statuses,
+                        job["status"].as_str().unwrap_or("unknown"),
+                    );
+                    if let Some(outcome) = job["activity_result_envelope"]["outcome"].as_str() {
+                        increment(&mut summary.activity_outcomes, outcome);
+                    } else {
+                        summary.jobs_without_activity_envelope += 1;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(children) = node["children"].as_array() {
+        for child in children {
+            summarize_workflow_node(child, summary);
+        }
+    }
+}
+
+fn increment(map: &mut BTreeMap<String, usize>, key: &str) {
+    *map.entry(key.to_string()).or_insert(0) += 1;
+}
+
+fn number_or_zero(value: &Value) -> u64 {
+    value.as_u64().unwrap_or(0)
+}
+
+fn print_count_map(label: &str, counts: &BTreeMap<String, usize>) {
+    if counts.is_empty() {
+        return;
+    }
+    let rendered = counts
+        .iter()
+        .map(|(key, count)| format!("{key}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("{label}: {rendered}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn runtime_tree_path_encodes_path_like_project_id() {
+        assert_eq!(
+            runtime_tree_path(Some("/Users/apple/repo name"), 20),
+            "/api/workflows/runtime/tree?limit=20&project_id=%2FUsers%2Fapple%2Frepo+name"
+        );
+    }
+
+    #[test]
+    fn runtime_tree_path_clamps_limit_and_encodes_project_id() {
+        assert_eq!(
+            runtime_tree_path(Some("/project-a"), 0),
+            "/api/workflows/runtime/tree?limit=1&project_id=%2Fproject-a"
+        );
+    }
+
+    #[test]
+    fn server_base_url_uses_loopback_for_unspecified_config_addr() {
+        let mut config = HarnessConfig::default();
+        config.server.http_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9800));
+
+        let url = server_base_url(&config, None).expect("url should resolve");
+
+        assert_eq!(url, "http://127.0.0.1:9800");
+    }
+
+    #[test]
+    fn server_base_url_accepts_host_port_override() {
+        let config = HarnessConfig::default();
+
+        let url = server_base_url(&config, Some("127.0.0.1:9900/".to_string()))
+            .expect("url should resolve");
+
+        assert_eq!(url, "http://127.0.0.1:9900");
+    }
+
+    #[test]
+    fn summarize_runtime_tree_counts_nested_jobs_and_activity_outcomes() {
+        let tree = json!({
+            "total_workflows": 2,
+            "workflows": [{
+                "commands": [{
+                    "status": "completed",
+                    "runtime_jobs": [{
+                        "status": "succeeded",
+                        "activity_result_envelope": {
+                            "outcome": "accepted"
+                        }
+                    }]
+                }],
+                "children": [{
+                    "commands": [{
+                        "status": "pending",
+                        "runtime_jobs": [{
+                            "status": "pending"
+                        }]
+                    }],
+                    "children": []
+                }]
+            }]
+        });
+
+        let summary = summarize_runtime_tree(&tree);
+
+        assert_eq!(summary.workflows, 2);
+        assert_eq!(summary.commands, 2);
+        assert_eq!(summary.jobs, 2);
+        assert_eq!(summary.command_statuses["completed"], 1);
+        assert_eq!(summary.command_statuses["pending"], 1);
+        assert_eq!(summary.job_statuses["succeeded"], 1);
+        assert_eq!(summary.job_statuses["pending"], 1);
+        assert_eq!(summary.activity_outcomes["accepted"], 1);
+        assert_eq!(summary.jobs_without_activity_envelope, 1);
+    }
+}

@@ -1,3 +1,4 @@
+mod activity_contract;
 mod activity_result;
 mod child_workflow;
 mod data_helpers;

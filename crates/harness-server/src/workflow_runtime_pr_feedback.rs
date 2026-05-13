@@ -9,6 +9,8 @@ use harness_workflow::runtime::{
 use serde_json::json;
 use std::path::Path;
 
+const PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS: i64 = 24 * 60 * 60;
+
 pub(crate) struct PrDetectedRuntimeContext<'a> {
     pub project_root: &'a Path,
     pub repo: Option<&'a str>,
@@ -504,9 +506,31 @@ async fn has_active_pr_feedback_command(
         {
             return Ok(true);
         }
+        if matches!(instance.state.as_str(), "failed" | "blocked")
+            && has_recent_failed_child_pr_feedback_command(store, &instance.id).await?
+        {
+            return Ok(true);
+        }
     }
 
     Ok(false)
+}
+
+async fn has_recent_failed_child_pr_feedback_command(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    let cutoff =
+        chrono::Utc::now() - chrono::Duration::seconds(PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS);
+    Ok(store
+        .commands_for(workflow_id)
+        .await?
+        .into_iter()
+        .any(|record| {
+            matches!(record.status.as_str(), "failed" | "blocked")
+                && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
+                && record.updated_at >= cutoff
+        }))
 }
 
 async fn has_active_child_pr_feedback_command(
@@ -869,6 +893,83 @@ mod tests {
         assert!(
             has_active_pr_feedback_command(&store, &workflow_id).await?,
             "an inspecting child with a pending command should still suppress duplicate sweeps"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let parent = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "awaiting_feedback",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 123,
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "task-1",
+        }));
+        store.upsert_instance(&parent).await?;
+        let child = WorkflowInstance::new(
+            PR_FEEDBACK_DEFINITION_ID,
+            1,
+            "failed",
+            WorkflowSubject::new("pr", "pr:77"),
+        )
+        .with_id("pr-feedback-child-failed")
+        .with_parent(workflow_id.clone());
+        store.upsert_instance(&child).await?;
+        let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            PR_FEEDBACK_INSPECT_ACTIVITY,
+            "inspect-pr-feedback-77",
+        );
+        let child_command_id = store
+            .enqueue_command(&child.id, None, &child_command)
+            .await?;
+        store
+            .mark_command_status(&child_command_id, "failed")
+            .await?;
+
+        assert!(
+            has_active_pr_feedback_command(&store, &workflow_id).await?,
+            "a recently failed inspection child should suppress duplicate sweeps"
+        );
+
+        let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
+        assert_eq!(
+            outcome,
+            PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                workflow_id: workflow_id.clone(),
+                task_id: "task-1".to_string(),
+            }
+        );
+        assert!(
+            store.commands_for(&workflow_id).await?.is_empty(),
+            "the parent workflow must not enqueue another PR feedback child while the failed child is cooling down"
         );
         Ok(())
     }

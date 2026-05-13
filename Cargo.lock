@@ -1266,6 +1266,7 @@ dependencies = [
  "harness-skills",
  "harness-workflow",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1273,6 +1274,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
