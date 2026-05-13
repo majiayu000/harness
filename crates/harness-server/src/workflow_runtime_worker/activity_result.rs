@@ -47,6 +47,15 @@ pub(super) fn activity_result_from_turn(
                 );
             }
         }
+        ActivityResultEnvelopeOutcome::RepairedStructuredOutput => {
+            tracing::info!(
+                runtime_job_id = %job.id,
+                activity = %activity,
+                agent = %agent_name,
+                extraction_strategy = ?envelope.extraction_strategy,
+                "activity result recovered from compatible structured output"
+            );
+        }
         ActivityResultEnvelopeOutcome::TurnFailed => {
             if let Some(error) = envelope.extraction_error.as_deref() {
                 tracing::warn!(
@@ -88,6 +97,7 @@ pub(super) fn activity_result_from_turn(
 #[serde(rename_all = "snake_case")]
 enum ActivityResultExtractionStrategy {
     FencedActivityResult,
+    JsonFenceRepair,
     NotAttempted,
 }
 
@@ -95,6 +105,7 @@ enum ActivityResultExtractionStrategy {
 #[serde(rename_all = "snake_case")]
 enum ActivityResultEnvelopeOutcome {
     Accepted,
+    RepairedStructuredOutput,
     MissingStructuredOutput,
     InvalidStructuredOutput,
     TurnCancelled,
@@ -120,6 +131,21 @@ impl ActivityResultEnvelope {
         Self {
             extraction_strategy,
             outcome: ActivityResultEnvelopeOutcome::Accepted,
+            raw_status,
+            extracted_activity: Some(result.activity.clone()),
+            extraction_error: None,
+            final_result: result,
+        }
+    }
+
+    fn repaired(
+        raw_status: TurnStatus,
+        extraction_strategy: ActivityResultExtractionStrategy,
+        result: ActivityResult,
+    ) -> Self {
+        Self {
+            extraction_strategy,
+            outcome: ActivityResultEnvelopeOutcome::RepairedStructuredOutput,
             raw_status,
             extracted_activity: Some(result.activity.clone()),
             extraction_error: None,
@@ -228,6 +254,13 @@ fn activity_result_envelope_from_turn(
                 ActivityResultExtractionStrategy::FencedActivityResult,
                 result,
             ),
+            StructuredActivityResult::RepairedJsonFence(result) => {
+                ActivityResultEnvelope::repaired(
+                    *status,
+                    ActivityResultExtractionStrategy::JsonFenceRepair,
+                    result,
+                )
+            }
             StructuredActivityResult::Missing => ActivityResultEnvelope::missing_structured_output(
                 *status,
                 activity.to_string(),
@@ -261,6 +294,7 @@ fn turn_error_is_timeout(error: &str) -> bool {
 enum StructuredActivityResult {
     Missing,
     Parsed(ActivityResult),
+    RepairedJsonFence(ActivityResult),
     Invalid {
         error: String,
         extracted_activity: Option<String>,
@@ -268,26 +302,69 @@ enum StructuredActivityResult {
 }
 
 fn structured_activity_result(items: &[Item], expected_activity: &str) -> StructuredActivityResult {
-    let Some(block) = latest_activity_result_block(items) else {
-        return StructuredActivityResult::Missing;
-    };
+    if let Some(block) = latest_activity_result_block(items) {
+        return parse_activity_result_block(block, expected_activity);
+    }
 
+    latest_json_activity_result_repair(items, expected_activity)
+        .unwrap_or(StructuredActivityResult::Missing)
+}
+
+fn parse_activity_result_block(block: &str, expected_activity: &str) -> StructuredActivityResult {
+    match parse_activity_result_json(block, expected_activity) {
+        Ok(result) => StructuredActivityResult::Parsed(result),
+        Err(error) => StructuredActivityResult::Invalid {
+            error: error.error,
+            extracted_activity: error.extracted_activity,
+        },
+    }
+}
+
+fn parse_activity_result_json(
+    block: &str,
+    expected_activity: &str,
+) -> Result<ActivityResult, StructuredActivityResultError> {
     match serde_json::from_str::<ActivityResult>(block) {
-        Ok(result) if result.activity == expected_activity => {
-            StructuredActivityResult::Parsed(result)
-        }
-        Ok(result) => StructuredActivityResult::Invalid {
+        Ok(result) if result.activity == expected_activity => Ok(result),
+        Ok(result) => Err(StructuredActivityResultError {
             error: format!(
                 "activity result block reported activity `{}`, expected `{expected_activity}`",
                 result.activity
             ),
             extracted_activity: Some(result.activity),
-        },
-        Err(error) => StructuredActivityResult::Invalid {
+        }),
+        Err(error) => Err(StructuredActivityResultError {
             error: format!("activity result block is invalid JSON: {error}"),
             extracted_activity: None,
-        },
+        }),
     }
+}
+
+struct StructuredActivityResultError {
+    error: String,
+    extracted_activity: Option<String>,
+}
+
+fn latest_json_activity_result_repair(
+    items: &[Item],
+    expected_activity: &str,
+) -> Option<StructuredActivityResult> {
+    items.iter().rev().find_map(|item| match item {
+        Item::AgentReasoning { content } => {
+            let block = extract_fenced_block(content, "json")?;
+            match parse_activity_result_json(block, expected_activity) {
+                Ok(result) => Some(StructuredActivityResult::RepairedJsonFence(result)),
+                Err(error) if error.extracted_activity.is_some() => {
+                    Some(StructuredActivityResult::Invalid {
+                        error: error.error,
+                        extracted_activity: error.extracted_activity,
+                    })
+                }
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    })
 }
 
 fn latest_activity_result_block(items: &[Item]) -> Option<&str> {
@@ -497,6 +574,93 @@ Final result:
             .signals
             .iter()
             .any(|signal| signal.signal_type == "RuntimeTurnCompleted"));
+    }
+
+    #[test]
+    fn activity_result_from_turn_repairs_generic_json_activity_result_block() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue"
+            }),
+        );
+        let items = vec![Item::AgentReasoning {
+            content: r#"Work completed.
+
+```json
+{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed from generic JSON.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":88,"pr_url":"https://github.com/owner/repo/pull/88"}}]}
+```"#
+                .to_string(),
+        }];
+
+        let result = activity_result_from_turn(
+            &job,
+            &TurnStatus::Completed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "codex",
+            Path::new("/project"),
+            "digest-1",
+        );
+
+        assert_eq!(result.activity, "implement_issue");
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+        assert_eq!(
+            result.summary,
+            "Implementation completed from generic JSON."
+        );
+        let pr_artifact = result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "pull_request")
+            .expect("repaired pull request artifact should be preserved");
+        assert_eq!(pr_artifact.artifact["pr_number"], 88);
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "repaired_structured_output");
+        assert_eq!(envelope["extraction_strategy"], "json_fence_repair");
+        assert_eq!(envelope["extracted_activity"], "implement_issue");
+        assert!(envelope["extraction_error"].is_null());
+    }
+
+    #[test]
+    fn activity_result_from_turn_does_not_repair_ambiguous_json_block() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue"
+            }),
+        );
+        let items = vec![Item::AgentReasoning {
+            content: r#"Work completed.
+
+```json
+{"summary":"Done, but this is not an ActivityResult."}
+```"#
+                .to_string(),
+        }];
+
+        let result = activity_result_from_turn(
+            &job,
+            &TurnStatus::Completed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "codex",
+            Path::new("/project"),
+            "digest-1",
+        );
+
+        assert_eq!(result.activity, "implement_issue");
+        assert_eq!(result.status, ActivityStatus::Failed);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "missing_structured_output");
+        assert_eq!(envelope["extraction_strategy"], "fenced_activity_result");
     }
 
     #[test]
