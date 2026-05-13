@@ -2,6 +2,7 @@ use harness_core::types::{Item, ThreadId, TurnId, TurnStatus};
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, RuntimeJob,
 };
+use serde::Serialize;
 use serde_json::json;
 use std::path::Path;
 
@@ -25,54 +26,45 @@ pub(super) fn activity_result_from_turn(
         TurnStatus::Failed => "Agent turn failed.".to_string(),
         TurnStatus::Running => "Agent turn is still running after lifecycle returned.".to_string(),
     });
-    let result = match status {
-        TurnStatus::Completed => match structured_activity_result(items, &activity) {
-            StructuredActivityResult::Parsed(result) => result,
-            StructuredActivityResult::Missing => {
-                tracing::warn!(
-                    runtime_job_id = %job.id,
-                    activity = %activity,
-                    agent = %agent_name,
-                    "activity completed without harness-activity-result fenced block; \
-                     marking failed to prevent silent state-machine no-progress loops"
-                );
-                ActivityResult::failed(
-                    activity,
-                    summary,
-                    "agent emitted no harness-activity-result fenced JSON block",
-                )
-                .with_error_kind(ActivityErrorKind::Configuration)
-            }
-            StructuredActivityResult::Invalid(error) => {
+    let envelope = activity_result_envelope_from_turn(status, items, &activity, summary);
+    match envelope.outcome {
+        ActivityResultEnvelopeOutcome::MissingStructuredOutput => {
+            tracing::warn!(
+                runtime_job_id = %job.id,
+                activity = %activity,
+                agent = %agent_name,
+                "activity completed without harness-activity-result fenced block; \
+                 marking failed to prevent silent state-machine no-progress loops"
+            );
+        }
+        ActivityResultEnvelopeOutcome::InvalidStructuredOutput => {
+            if let Some(error) = envelope.extraction_error.as_deref() {
                 tracing::warn!(
                     runtime_job_id = %job.id,
                     activity = %activity,
                     agent = %agent_name,
                     "activity result block invalid: {error}"
                 );
-                ActivityResult::failed(activity, "Structured activity result was invalid.", error)
-                    .with_error_kind(ActivityErrorKind::Configuration)
             }
-        },
-        TurnStatus::Cancelled => ActivityResult::cancelled(activity, summary),
-        TurnStatus::Failed | TurnStatus::Running => {
-            let error = last_error(items).unwrap_or_else(|| "agent turn failed".to_string());
-            tracing::warn!(
-                runtime_job_id = %job.id,
-                activity = %activity,
-                agent = %agent_name,
-                turn_status = ?status,
-                items = items.len(),
-                "runtime turn failed: {error}"
-            );
-            let mut result = ActivityResult::failed(activity, summary, error.clone());
-            if turn_error_is_timeout(&error) {
-                result = result.with_error_kind(ActivityErrorKind::Timeout);
-            }
-            result
         }
-    };
+        ActivityResultEnvelopeOutcome::TurnFailed => {
+            if let Some(error) = envelope.extraction_error.as_deref() {
+                tracing::warn!(
+                    runtime_job_id = %job.id,
+                    activity = %activity,
+                    agent = %agent_name,
+                    turn_status = ?status,
+                    items = items.len(),
+                    "runtime turn failed: {error}"
+                );
+            }
+        }
+        ActivityResultEnvelopeOutcome::Accepted | ActivityResultEnvelopeOutcome::TurnCancelled => {}
+    }
+    let envelope_artifact = envelope.to_artifact();
+    let result = envelope.into_final_result();
     result
+        .with_artifact(envelope_artifact)
         .with_artifact(workflow_prompt_artifact(prompt_packet_digest))
         .with_artifact(ActivityArtifact::new(
             "runtime_turn",
@@ -92,6 +84,175 @@ pub(super) fn activity_result_from_turn(
         ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ActivityResultExtractionStrategy {
+    FencedActivityResult,
+    NotAttempted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ActivityResultEnvelopeOutcome {
+    Accepted,
+    MissingStructuredOutput,
+    InvalidStructuredOutput,
+    TurnCancelled,
+    TurnFailed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActivityResultEnvelope {
+    extraction_strategy: ActivityResultExtractionStrategy,
+    outcome: ActivityResultEnvelopeOutcome,
+    raw_status: TurnStatus,
+    extracted_activity: Option<String>,
+    extraction_error: Option<String>,
+    final_result: ActivityResult,
+}
+
+impl ActivityResultEnvelope {
+    fn accepted(
+        raw_status: TurnStatus,
+        extraction_strategy: ActivityResultExtractionStrategy,
+        result: ActivityResult,
+    ) -> Self {
+        Self {
+            extraction_strategy,
+            outcome: ActivityResultEnvelopeOutcome::Accepted,
+            raw_status,
+            extracted_activity: Some(result.activity.clone()),
+            extraction_error: None,
+            final_result: result,
+        }
+    }
+
+    fn missing_structured_output(
+        raw_status: TurnStatus,
+        activity: String,
+        summary: String,
+    ) -> Self {
+        let error = "agent emitted no harness-activity-result fenced JSON block".to_string();
+        Self {
+            extraction_strategy: ActivityResultExtractionStrategy::FencedActivityResult,
+            outcome: ActivityResultEnvelopeOutcome::MissingStructuredOutput,
+            raw_status,
+            extracted_activity: None,
+            extraction_error: Some(error.clone()),
+            final_result: ActivityResult::failed(activity, summary, error)
+                .with_error_kind(ActivityErrorKind::Configuration),
+        }
+    }
+
+    fn invalid_structured_output(
+        raw_status: TurnStatus,
+        activity: String,
+        error: String,
+        extracted_activity: Option<String>,
+    ) -> Self {
+        Self {
+            extraction_strategy: ActivityResultExtractionStrategy::FencedActivityResult,
+            outcome: ActivityResultEnvelopeOutcome::InvalidStructuredOutput,
+            raw_status,
+            extracted_activity,
+            extraction_error: Some(error.clone()),
+            final_result: ActivityResult::failed(
+                activity,
+                "Structured activity result was invalid.",
+                error,
+            )
+            .with_error_kind(ActivityErrorKind::Configuration),
+        }
+    }
+
+    fn cancelled(raw_status: TurnStatus, activity: String, summary: String) -> Self {
+        Self {
+            extraction_strategy: ActivityResultExtractionStrategy::NotAttempted,
+            outcome: ActivityResultEnvelopeOutcome::TurnCancelled,
+            raw_status,
+            extracted_activity: None,
+            extraction_error: None,
+            final_result: ActivityResult::cancelled(activity, summary),
+        }
+    }
+
+    fn failed(raw_status: TurnStatus, activity: String, summary: String, error: String) -> Self {
+        let mut result = ActivityResult::failed(activity, summary, error.clone());
+        if turn_error_is_timeout(&error) {
+            result = result.with_error_kind(ActivityErrorKind::Timeout);
+        }
+        Self {
+            extraction_strategy: ActivityResultExtractionStrategy::NotAttempted,
+            outcome: ActivityResultEnvelopeOutcome::TurnFailed,
+            raw_status,
+            extracted_activity: None,
+            extraction_error: Some(error),
+            final_result: result,
+        }
+    }
+
+    fn to_artifact(&self) -> ActivityArtifact {
+        ActivityArtifact::new(
+            "activity_result_envelope",
+            json!({
+                "schema": "harness.runtime.activity_result_envelope.v1",
+                "extraction_strategy": self.extraction_strategy,
+                "outcome": self.outcome,
+                "raw_status": self.raw_status,
+                "extracted_activity": self.extracted_activity,
+                "extraction_error": self.extraction_error,
+                "final_result": {
+                    "activity": self.final_result.activity,
+                    "status": self.final_result.status,
+                    "error_kind": self.final_result.error_kind,
+                }
+            }),
+        )
+    }
+
+    fn into_final_result(self) -> ActivityResult {
+        self.final_result
+    }
+}
+
+fn activity_result_envelope_from_turn(
+    status: &TurnStatus,
+    items: &[Item],
+    activity: &str,
+    summary: String,
+) -> ActivityResultEnvelope {
+    match status {
+        TurnStatus::Completed => match structured_activity_result(items, activity) {
+            StructuredActivityResult::Parsed(result) => ActivityResultEnvelope::accepted(
+                *status,
+                ActivityResultExtractionStrategy::FencedActivityResult,
+                result,
+            ),
+            StructuredActivityResult::Missing => ActivityResultEnvelope::missing_structured_output(
+                *status,
+                activity.to_string(),
+                summary,
+            ),
+            StructuredActivityResult::Invalid {
+                error,
+                extracted_activity,
+            } => ActivityResultEnvelope::invalid_structured_output(
+                *status,
+                activity.to_string(),
+                error,
+                extracted_activity,
+            ),
+        },
+        TurnStatus::Cancelled => {
+            ActivityResultEnvelope::cancelled(*status, activity.to_string(), summary)
+        }
+        TurnStatus::Failed | TurnStatus::Running => {
+            let error = last_error(items).unwrap_or_else(|| "agent turn failed".to_string());
+            ActivityResultEnvelope::failed(*status, activity.to_string(), summary, error)
+        }
+    }
+}
+
 fn turn_error_is_timeout(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     normalized.contains("timed out") || normalized.contains("timeout reached")
@@ -100,7 +261,10 @@ fn turn_error_is_timeout(error: &str) -> bool {
 enum StructuredActivityResult {
     Missing,
     Parsed(ActivityResult),
-    Invalid(String),
+    Invalid {
+        error: String,
+        extracted_activity: Option<String>,
+    },
 }
 
 fn structured_activity_result(items: &[Item], expected_activity: &str) -> StructuredActivityResult {
@@ -112,13 +276,17 @@ fn structured_activity_result(items: &[Item], expected_activity: &str) -> Struct
         Ok(result) if result.activity == expected_activity => {
             StructuredActivityResult::Parsed(result)
         }
-        Ok(result) => StructuredActivityResult::Invalid(format!(
-            "activity result block reported activity `{}`, expected `{expected_activity}`",
-            result.activity
-        )),
-        Err(error) => StructuredActivityResult::Invalid(format!(
-            "activity result block is invalid JSON: {error}"
-        )),
+        Ok(result) => StructuredActivityResult::Invalid {
+            error: format!(
+                "activity result block reported activity `{}`, expected `{expected_activity}`",
+                result.activity
+            ),
+            extracted_activity: Some(result.activity),
+        },
+        Err(error) => StructuredActivityResult::Invalid {
+            error: format!("activity result block is invalid JSON: {error}"),
+            extracted_activity: None,
+        },
     }
 }
 
@@ -253,6 +421,10 @@ mod tests {
                 .is_some_and(|e| e.contains("harness-activity-result")),
             "error message MUST mention the missing block so operators can diagnose"
         );
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "missing_structured_output");
+        assert_eq!(envelope["extraction_strategy"], "fenced_activity_result");
+        assert_eq!(envelope["raw_status"], "completed");
     }
 
     #[test]
@@ -317,6 +489,10 @@ Final result:
             .expect("runtime turn artifact should be appended");
         assert_eq!(turn_artifact.artifact["thread_id"], "thread-1");
         assert_eq!(turn_artifact.artifact["turn_id"], "turn-1");
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "accepted");
+        assert_eq!(envelope["extracted_activity"], "implement_issue");
+        assert_eq!(envelope["final_result"]["status"], "succeeded");
         assert!(result
             .signals
             .iter()
@@ -365,6 +541,9 @@ Final result:
             .artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "pull_request"));
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "invalid_structured_output");
+        assert_eq!(envelope["extracted_activity"], "replan_issue");
         assert!(result
             .artifacts
             .iter()
@@ -423,6 +602,9 @@ Final result:
             .artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "pull_request"));
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "invalid_structured_output");
+        assert!(envelope["extracted_activity"].is_null());
         assert!(result
             .artifacts
             .iter()
@@ -466,5 +648,17 @@ Final result:
             result.error.as_deref(),
             Some("Agent turn timed out after 30s")
         );
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "turn_failed");
+        assert_eq!(envelope["extraction_strategy"], "not_attempted");
+    }
+
+    fn envelope_artifact(result: &ActivityResult) -> &serde_json::Value {
+        &result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "activity_result_envelope")
+            .expect("activity result envelope artifact should be appended")
+            .artifact
     }
 }
