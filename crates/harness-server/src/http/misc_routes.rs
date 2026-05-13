@@ -18,6 +18,9 @@ use harness_workflow::runtime::{
     WorkflowEvent, WorkflowInstance,
 };
 
+const ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE: &str = "activity_result_envelope";
+const ACTIVITY_RESULT_ENVELOPE_SCHEMA: &str = "harness.runtime.activity_result_envelope.v1";
+
 fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
     let error = error?;
     let lower = error.to_ascii_lowercase();
@@ -166,17 +169,20 @@ struct WorkflowRuntimeJobNode {
     pub runtime_event_count: usize,
     pub latest_runtime_event_type: Option<String>,
     pub prompt_packet_digest: Option<String>,
+    pub activity_result_envelope: Option<Value>,
 }
 
 impl WorkflowRuntimeJobNode {
     fn new(job: RuntimeJob, runtime_events: Vec<RuntimeEvent>) -> Self {
         let latest_runtime_event_type = runtime_events.last().map(|event| event.event_type.clone());
         let prompt_packet_digest = prompt_packet_digest_from_events(&runtime_events);
+        let activity_result_envelope = activity_result_envelope_from_job(&job);
         Self {
             job,
             runtime_event_count: runtime_events.len(),
             latest_runtime_event_type,
             prompt_packet_digest,
+            activity_result_envelope,
         }
     }
 }
@@ -425,6 +431,22 @@ fn prompt_packet_digest_from_events(events: &[RuntimeEvent]) -> Option<String> {
     })
 }
 
+fn activity_result_envelope_from_job(job: &RuntimeJob) -> Option<Value> {
+    let artifacts = job.output.as_ref()?.get("artifacts")?.as_array()?;
+    artifacts.iter().rev().find_map(|artifact| {
+        if artifact.get("artifact_type").and_then(Value::as_str)
+            != Some(ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE)
+        {
+            return None;
+        }
+        let payload = artifact.get("artifact")?;
+        if payload.get("schema").and_then(Value::as_str) != Some(ACTIVITY_RESULT_ENVELOPE_SCHEMA) {
+            return None;
+        }
+        Some(payload.clone())
+    })
+}
+
 fn attach_workflow_children(
     workflow_id: &str,
     by_id: &BTreeMap<String, WorkflowRuntimeTreeNode>,
@@ -443,6 +465,72 @@ fn attach_workflow_children(
         .collect();
     path.remove(workflow_id);
     Some(node)
+}
+
+#[cfg(test)]
+mod runtime_tree_tests {
+    use super::*;
+    use harness_workflow::runtime::{ActivityArtifact, ActivityResult, RuntimeJob, RuntimeKind};
+    use serde_json::json;
+
+    fn runtime_job_with_artifacts(artifacts: Vec<ActivityArtifact>) -> RuntimeJob {
+        let result = artifacts.into_iter().fold(
+            ActivityResult::succeeded("replan_issue", "Runtime job completed."),
+            ActivityResult::with_artifact,
+        );
+        let mut job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            json!({}),
+        );
+        job.output = Some(serde_json::to_value(result).expect("activity result should serialize"));
+        job
+    }
+
+    #[test]
+    fn activity_result_envelope_from_job_returns_latest_valid_envelope() {
+        let older = ActivityArtifact::new(
+            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
+            json!({
+                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
+                "outcome": "accepted",
+            }),
+        );
+        let newer = ActivityArtifact::new(
+            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
+            json!({
+                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
+                "outcome": "repaired_structured_output",
+            }),
+        );
+        let job = runtime_job_with_artifacts(vec![older, newer]);
+
+        let envelope =
+            activity_result_envelope_from_job(&job).expect("valid envelope should be exposed");
+
+        assert_eq!(envelope["outcome"], "repaired_structured_output");
+    }
+
+    #[test]
+    fn activity_result_envelope_from_job_ignores_missing_or_invalid_envelope() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            json!({}),
+        );
+        assert!(activity_result_envelope_from_job(&job).is_none());
+
+        let job = runtime_job_with_artifacts(vec![ActivityArtifact::new(
+            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
+            json!({
+                "schema": "harness.runtime.activity_result_envelope.v0",
+                "outcome": "accepted",
+            }),
+        )]);
+        assert!(activity_result_envelope_from_job(&job).is_none());
+    }
 }
 
 pub(crate) async fn handle_rpc(
