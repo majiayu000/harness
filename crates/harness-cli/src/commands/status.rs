@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
+use url::form_urlencoded;
 
 const REQUEST_TIMEOUT_SECS: u64 = 5;
 
@@ -135,27 +136,12 @@ async fn get_json(
 }
 
 fn runtime_tree_path(project_id: Option<&str>, limit: i64) -> String {
-    let mut query = vec![format!("limit={}", limit.max(1))];
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("limit", &limit.max(1).to_string());
     if let Some(project_id) = project_id.filter(|value| !value.is_empty()) {
-        query.push(format!(
-            "project_id={}",
-            percent_encode_query_value(project_id)
-        ));
+        query.append_pair("project_id", project_id);
     }
-    format!("/api/workflows/runtime/tree?{}", query.join("&"))
-}
-
-fn percent_encode_query_value(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char);
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
+    format!("/api/workflows/runtime/tree?{}", query.finish())
 }
 
 fn print_summary(combined: &Value) {
@@ -310,10 +296,10 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]
-    fn percent_encode_query_value_encodes_path_like_project_id() {
+    fn runtime_tree_path_encodes_path_like_project_id() {
         assert_eq!(
-            percent_encode_query_value("/Users/apple/repo name"),
-            "%2FUsers%2Fapple%2Frepo%20name"
+            runtime_tree_path(Some("/Users/apple/repo name"), 20),
+            "/api/workflows/runtime/tree?limit=20&project_id=%2FUsers%2Fapple%2Frepo+name"
         );
     }
 
