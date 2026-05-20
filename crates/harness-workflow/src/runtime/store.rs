@@ -622,7 +622,7 @@ impl WorkflowRuntimeStore {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT data::text FROM workflow_instances
              WHERE ($1::text IS NULL OR data->'data'->>'project_id' = $1)
-             ORDER BY updated_at DESC
+             ORDER BY updated_at DESC, id DESC
              LIMIT $2 OFFSET $3",
         )
         .bind(project_id)

@@ -453,17 +453,15 @@ async fn build_workflow_runtime_tree(
             })
             .collect();
         summary.total_commands += commands.len();
-        let runtime_job_count = commands
-            .iter()
-            .map(|command| {
-                summary
-                    .command_statuses
-                    .entry(command.status.clone())
-                    .and_modify(|count| *count += 1)
-                    .or_insert(1);
-                command.runtime_job_count
-            })
-            .sum();
+        let mut runtime_job_count = 0;
+        for command in &commands {
+            summary
+                .command_statuses
+                .entry(command.status.clone())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            runtime_job_count += command.runtime_job_count;
+        }
         summary.total_runtime_jobs += runtime_job_count;
         by_id.insert(
             workflow_id,
