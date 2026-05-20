@@ -2383,6 +2383,66 @@ fn runtime_completion_reducer_dispatches_sprint_plan_with_pr_feedback_candidates
 }
 
 #[test]
+fn runtime_completion_reducer_blocks_pr_feedback_dispatch_without_valid_sprint_plan_output() {
+    let instance = repo_backlog_instance("planning_batch").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "repo-backlog:owner/repo:plan",
+        json!({
+            "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "issues": [],
+            "open_pr_feedback": [{
+                "pr_number": 1120,
+                "pr_url": "https://github.com/owner/repo/pull/1120",
+                "title": "feat(tasks): paginate task list queries",
+                "feedback_count": 3,
+                "summary": "Review threads request DB-level pagination."
+            }],
+            "known_dependencies": []
+        }),
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "Completed without emitting a valid sprint plan.",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("invalid sprint plan output should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .reason
+        .contains("repo sprint plan succeeded without"));
+    assert!(!decision
+        .commands
+        .iter()
+        .any(|command| command.command_type == WorkflowCommandType::StartChildWorkflow));
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("invalid sprint plan output block should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_uses_scan_candidates_for_sprint_plan_artifact() {
     let instance = repo_backlog_instance("planning_batch").with_data(json!({
         "repo": "owner/repo"

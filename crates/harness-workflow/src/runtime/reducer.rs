@@ -84,6 +84,12 @@ fn reduce_success(
     }
 
     if let Some(decision) =
+        repo_backlog_invalid_success_decision(instance, event, result, structured_decision.as_ref())
+    {
+        return Some(decision);
+    }
+
+    if let Some(decision) =
         repo_backlog_sprint_plan_decision_from_activity_result(instance, event, result)
     {
         return Some(decision);
@@ -91,12 +97,6 @@ fn reduce_success(
 
     if repo_backlog_child_dispatch_still_active(instance, event) {
         return None;
-    }
-
-    if let Some(decision) =
-        repo_backlog_invalid_success_decision(instance, event, result, structured_decision.as_ref())
-    {
-        return Some(decision);
     }
 
     if let Some(decision) = structured_decision.as_ref() {
