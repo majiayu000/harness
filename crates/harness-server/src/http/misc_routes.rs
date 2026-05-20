@@ -253,6 +253,8 @@ struct WorkflowRuntimeTreeSummary {
     pub total_runtime_jobs: usize,
     pub command_statuses: BTreeMap<String, usize>,
     pub runtime_job_statuses: BTreeMap<String, usize>,
+    pub activity_outcomes: BTreeMap<String, usize>,
+    pub jobs_without_activity_envelope: usize,
 }
 
 pub(crate) async fn get_issue_workflow_by_issue(
@@ -403,6 +405,7 @@ async fn build_workflow_runtime_tree(
     let runtime_job_statuses = store
         .runtime_job_status_counts_for_commands(&command_ids)
         .await?;
+    let all_runtime_jobs_by_command = store.runtime_jobs_for_commands(&command_ids).await?;
     let mut runtime_jobs_by_command = store
         .runtime_jobs_for_commands_limited(&command_ids, job_limit as i64)
         .await?;
@@ -418,6 +421,7 @@ async fn build_workflow_runtime_tree(
         runtime_job_statuses,
         ..Default::default()
     };
+    apply_runtime_activity_summary(&mut summary, &all_runtime_jobs_by_command);
     for instance in instances {
         let workflow_id = instance.id.clone();
         if let Some(parent_id) = instance.parent_workflow_id.as_ref() {
@@ -513,6 +517,28 @@ async fn build_workflow_runtime_tree(
         summary,
         workflows,
     })
+}
+
+fn apply_runtime_activity_summary(
+    summary: &mut WorkflowRuntimeTreeSummary,
+    jobs_by_command: &BTreeMap<String, Vec<RuntimeJob>>,
+) {
+    for job in jobs_by_command.values().flatten() {
+        if let Some(outcome) = activity_result_envelope_from_job(job).and_then(|envelope| {
+            envelope
+                .get("outcome")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }) {
+            summary
+                .activity_outcomes
+                .entry(outcome)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+        } else {
+            summary.jobs_without_activity_envelope += 1;
+        }
+    }
 }
 
 fn prompt_packet_digest_from_events(events: &[RuntimeEvent]) -> Option<String> {
@@ -627,6 +653,45 @@ mod runtime_tree_tests {
             }),
         )]);
         assert!(activity_result_envelope_from_job(&job).is_none());
+    }
+
+    #[test]
+    fn runtime_activity_summary_counts_all_loaded_jobs() {
+        let accepted = ActivityArtifact::new(
+            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
+            json!({
+                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
+                "outcome": "accepted",
+            }),
+        );
+        let repaired = ActivityArtifact::new(
+            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
+            json!({
+                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
+                "outcome": "repaired_structured_output",
+            }),
+        );
+        let mut jobs_by_command = BTreeMap::new();
+        jobs_by_command.insert(
+            "command-1".to_string(),
+            vec![
+                runtime_job_with_artifacts(vec![accepted]),
+                runtime_job_with_artifacts(vec![repaired]),
+                RuntimeJob::pending(
+                    "command-1",
+                    RuntimeKind::CodexJsonrpc,
+                    "codex-high",
+                    json!({}),
+                ),
+            ],
+        );
+        let mut summary = WorkflowRuntimeTreeSummary::default();
+
+        apply_runtime_activity_summary(&mut summary, &jobs_by_command);
+
+        assert_eq!(summary.activity_outcomes["accepted"], 1);
+        assert_eq!(summary.activity_outcomes["repaired_structured_output"], 1);
+        assert_eq!(summary.jobs_without_activity_envelope, 1);
     }
 }
 

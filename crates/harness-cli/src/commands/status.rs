@@ -237,6 +237,10 @@ fn summarize_runtime_tree(tree: &Value) -> RuntimeTreeSummary {
         summary.jobs = tree["summary"]["total_runtime_jobs"].as_u64().unwrap_or(0) as usize;
         summary.command_statuses = count_map_from_value(&tree["summary"]["command_statuses"]);
         summary.job_statuses = count_map_from_value(&tree["summary"]["runtime_job_statuses"]);
+        summary.activity_outcomes = count_map_from_value(&tree["summary"]["activity_outcomes"]);
+        summary.jobs_without_activity_envelope = tree["summary"]["jobs_without_activity_envelope"]
+            .as_u64()
+            .unwrap_or(0) as usize;
     }
     if let Some(workflows) = tree["workflows"].as_array() {
         for workflow in workflows {
@@ -265,10 +269,12 @@ fn summarize_workflow_node(node: &Value, summary: &mut RuntimeTreeSummary, inclu
                             job["status"].as_str().unwrap_or("unknown"),
                         );
                     }
-                    if let Some(outcome) = job["activity_result_envelope"]["outcome"].as_str() {
-                        increment(&mut summary.activity_outcomes, outcome);
-                    } else {
-                        summary.jobs_without_activity_envelope += 1;
+                    if include_counts {
+                        if let Some(outcome) = job["activity_result_envelope"]["outcome"].as_str() {
+                            increment(&mut summary.activity_outcomes, outcome);
+                        } else {
+                            summary.jobs_without_activity_envelope += 1;
+                        }
                     }
                 }
             }
@@ -409,7 +415,12 @@ mod tests {
                 "runtime_job_statuses": {
                     "failed": 4,
                     "succeeded": 38
-                }
+                },
+                "activity_outcomes": {
+                    "accepted": 36,
+                    "repaired_structured_output": 2
+                },
+                "jobs_without_activity_envelope": 4
             },
             "workflows": [{
                 "commands": [{
@@ -434,6 +445,8 @@ mod tests {
         assert_eq!(summary.command_statuses["pending"], 2);
         assert_eq!(summary.job_statuses["failed"], 4);
         assert_eq!(summary.job_statuses["succeeded"], 38);
-        assert_eq!(summary.activity_outcomes["accepted"], 1);
+        assert_eq!(summary.activity_outcomes["accepted"], 36);
+        assert_eq!(summary.activity_outcomes["repaired_structured_output"], 2);
+        assert_eq!(summary.jobs_without_activity_envelope, 4);
     }
 }
