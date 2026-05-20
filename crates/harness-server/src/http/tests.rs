@@ -4023,6 +4023,97 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn list_tasks_paginates_past_runtime_only_second_page() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks).post(task_routes::create_task))
+        .with_state(state);
+
+    let mut created_ids = Vec::new();
+    for index in 0..3 {
+        let body = serde_json::json!({
+            "project": project_root.display().to_string(),
+            "prompt": format!("runtime prompt page {index}"),
+            "source": "dashboard",
+            "external_id": format!("manual:prompt:page:{index}")
+        });
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))?,
+            )
+            .await?;
+        assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+        let created = response_json(create_response).await?;
+        created_ids.push(
+            created["task_id"]
+                .as_str()
+                .expect("runtime submission should return a task handle")
+                .to_string(),
+        );
+    }
+
+    let mut cursor: Option<String> = None;
+    let mut listed_ids = Vec::new();
+    for page_index in 0..3 {
+        let uri = match cursor.as_deref() {
+            Some(cursor) => format!(
+                "/tasks?limit=1&cursor={}",
+                cursor
+                    .replace('+', "%2B")
+                    .replace(':', "%3A")
+                    .replace('|', "%7C")
+            ),
+            None => "/tasks?limit=1".to_string(),
+        };
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await?;
+        let tasks = body["data"].as_array().expect("tasks should be an array");
+        assert_eq!(tasks.len(), 1, "page {page_index} should contain one task");
+        listed_ids.push(
+            tasks[0]["id"]
+                .as_str()
+                .expect("task id should be present")
+                .to_string(),
+        );
+        cursor = body["page"]["next_cursor"].as_str().map(str::to_string);
+        if page_index < 2 {
+            assert!(
+                body["page"]["has_more"].as_bool().unwrap_or(false),
+                "page {page_index} should expose another runtime-only page"
+            );
+            assert!(cursor.is_some(), "page {page_index} should return a cursor");
+        }
+    }
+
+    created_ids.sort();
+    listed_ids.sort();
+    assert_eq!(listed_ids, created_ids);
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_task_with_blocked_issue_returns_runtime_state() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

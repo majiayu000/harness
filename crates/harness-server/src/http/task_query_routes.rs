@@ -216,13 +216,8 @@ pub(crate) async fn list_tasks(
                     };
                 }
             }
-            if let Err(e) = append_runtime_submission_summaries(
-                &state,
-                &mut summaries,
-                &query.filter,
-                query.limit + 1,
-            )
-            .await
+            if let Err(e) =
+                append_runtime_submission_summaries(&state, &mut summaries, &query.filter).await
             {
                 tracing::error!("list_tasks: failed to append runtime submission summaries: {e}");
             }
@@ -526,7 +521,6 @@ async fn append_runtime_submission_summaries(
     state: &AppState,
     summaries: &mut Vec<TaskSummary>,
     filter: &TaskSummaryFilter,
-    limit: usize,
 ) -> anyhow::Result<()> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(());
@@ -537,7 +531,6 @@ async fn append_runtime_submission_summaries(
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         TaskKind::Issue,
         filter,
-        limit,
     )
     .await?;
     append_runtime_definition_summaries(
@@ -546,7 +539,6 @@ async fn append_runtime_submission_summaries(
         harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         TaskKind::Prompt,
         filter,
-        limit,
     )
     .await
 }
@@ -557,14 +549,12 @@ async fn append_runtime_definition_summaries(
     definition_id: &str,
     task_kind: TaskKind,
     filter: &TaskSummaryFilter,
-    limit: usize,
 ) -> anyhow::Result<()> {
+    if !filter.kinds.is_empty() && !filter.kinds.contains(&task_kind) {
+        return Ok(());
+    }
     let workflows = store
-        .list_instances_by_definition(
-            definition_id,
-            filter.project.as_deref(),
-            Some(i64::try_from(limit.max(1)).unwrap_or(i64::MAX)),
-        )
+        .list_instances_by_definition(definition_id, filter.project.as_deref(), None)
         .await?;
     let mut listed_ids: HashSet<String> = summaries
         .iter()
