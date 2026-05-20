@@ -106,6 +106,10 @@ fn reduce_success(
         ));
     }
 
+    if let Some(decision) = issue_implementation_missing_result_decision(instance, event, result) {
+        return Some(decision);
+    }
+
     let (next_state, decision, reason) = match (
         instance.definition_id.as_str(),
         instance.state.as_str(),
@@ -182,6 +186,56 @@ fn reduce_success(
     }
 
     Some(workflow_decision.high_confidence())
+}
+
+fn issue_implementation_missing_result_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "implementing",
+        "implement_issue",
+    ) {
+        return None;
+    }
+
+    let reason = "implement_issue succeeded without a pull_request artifact, closed-issue evidence, or another validated terminal signal";
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "block_missing_implementation_result",
+            "blocked",
+            reason,
+        )
+        .with_command(WorkflowCommand::mark_blocked(
+            reason,
+            format!(
+                "runtime-completion:{}:missing-implementation:block",
+                event.id
+            ),
+        ))
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::RequestOperatorAttention,
+            format!(
+                "runtime-completion:{}:missing-implementation:operator",
+                event.id
+            ),
+            json!({
+                "reason": reason,
+                "activity": result.activity,
+                "runtime_job_id": event_field_string(event, "runtime_job_id"),
+            }),
+        ))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
 }
 
 fn workflow_decision_from_activity_result(
