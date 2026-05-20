@@ -1511,7 +1511,7 @@ fn drain_finished_runtime_worker_ticks(
 }
 
 fn runtime_worker_open_slots(active_workers: usize, configured_concurrency: u32) -> usize {
-    (configured_concurrency.max(1) as usize).saturating_sub(active_workers)
+    (configured_concurrency as usize).saturating_sub(active_workers)
 }
 
 fn spawn_runtime_worker_ticks(
@@ -1542,6 +1542,7 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
     }
 
     let weak_state = Arc::downgrade(state);
+    let mut shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut workers = tokio::task::JoinSet::new();
         let mut next_worker_id = 0;
@@ -1565,7 +1566,27 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 lease_ttl,
                 &mut next_worker_id,
             );
-            tokio::time::sleep(interval).await;
+            drop(state);
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                shutdown_result = shutdown_rx.recv() => {
+                    match shutdown_result {
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::info!("workflow runtime job worker supervisor stopping for shutdown");
+                            workers.abort_all();
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                skipped,
+                                "workflow runtime job worker supervisor lagged shutdown signal"
+                            );
+                            workers.abort_all();
+                            break;
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -2826,7 +2847,7 @@ mod tests {
     fn runtime_worker_open_slots_preserves_capacity_when_one_worker_hangs() {
         assert_eq!(runtime_worker_open_slots(1, 6), 5);
         assert_eq!(runtime_worker_open_slots(6, 6), 0);
-        assert_eq!(runtime_worker_open_slots(0, 0), 1);
+        assert_eq!(runtime_worker_open_slots(0, 0), 0);
         assert_eq!(runtime_worker_open_slots(1, 10), 9);
     }
 
