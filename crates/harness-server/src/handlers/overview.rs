@@ -325,7 +325,7 @@ impl ActiveTaskOverviewCounts {
 
 async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCounts {
     let mut counts = ActiveTaskOverviewCounts::default();
-    let mut listed_task_ids = HashSet::new();
+    let mut active_legacy_task_ids = HashSet::new();
     let mut loaded_legacy_tasks = false;
     let mut counted_runtime_active_workflows = false;
 
@@ -333,8 +333,9 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
         Ok(summaries) => {
             loaded_legacy_tasks = true;
             for summary in summaries {
-                listed_task_ids.insert(summary.id.as_str().to_string());
-                add_active_summary(&mut counts, &summary);
+                if add_active_summary(&mut counts, &summary) {
+                    active_legacy_task_ids.insert(summary.id.as_str().to_string());
+                }
             }
         }
         Err(error) => {
@@ -360,7 +361,7 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
                         else {
                             continue;
                         };
-                        if !listed_task_ids.insert(task_id.as_str().to_string()) {
+                        if active_legacy_task_ids.contains(task_id.as_str()) {
                             continue;
                         }
                         counted_runtime_active_workflows |=
@@ -389,9 +390,9 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
     counts
 }
 
-fn add_active_summary(counts: &mut ActiveTaskOverviewCounts, summary: &TaskSummary) {
+fn add_active_summary(counts: &mut ActiveTaskOverviewCounts, summary: &TaskSummary) -> bool {
     if summary.status.is_terminal() {
-        return;
+        return false;
     }
     let bucket = if summary.scheduler.authority_state == SchedulerAuthorityState::Running {
         ActiveTaskBucket::Running
@@ -399,6 +400,7 @@ fn add_active_summary(counts: &mut ActiveTaskOverviewCounts, summary: &TaskSumma
         ActiveTaskBucket::Queued
     };
     counts.add(summary.project.as_deref(), bucket);
+    true
 }
 
 fn add_active_runtime_workflow(
@@ -684,6 +686,78 @@ mod tests {
         assert_eq!(counts.queued, 1);
         assert_eq!(counts.by_project["/repo"].running, 1);
         assert_eq!(counts.by_project["/repo"].queued, 1);
+    }
+
+    #[test]
+    fn terminal_legacy_summary_does_not_suppress_active_runtime_workflow() {
+        let mut counts = ActiveTaskOverviewCounts::default();
+        let mut active_legacy_task_ids = HashSet::new();
+        let mut terminal_legacy = crate::task_runner::TaskState::new(harness_core::types::TaskId(
+            "runtime-task-1".to_string(),
+        ))
+        .summary();
+        terminal_legacy.status = crate::task_runner::TaskStatus::Failed;
+        terminal_legacy.scheduler.authority_state = SchedulerAuthorityState::Failed;
+        terminal_legacy.project = Some("/repo".to_string());
+        if add_active_summary(&mut counts, &terminal_legacy) {
+            active_legacy_task_ids.insert(terminal_legacy.id.as_str().to_string());
+        }
+
+        let runtime = harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
+        )
+        .with_data(serde_json::json!({
+            "project_id": "/repo",
+            "task_id": "runtime-task-1",
+        }));
+        let task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&runtime)
+            .expect("runtime workflow should expose a task handle");
+        if !active_legacy_task_ids.contains(task_id.as_str()) {
+            add_active_runtime_workflow(&mut counts, &runtime);
+        }
+
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.by_project["/repo"].running, 1);
+    }
+
+    #[test]
+    fn active_legacy_summary_still_suppresses_matching_runtime_workflow() {
+        let mut counts = ActiveTaskOverviewCounts::default();
+        let mut active_legacy_task_ids = HashSet::new();
+        let mut active_legacy = crate::task_runner::TaskState::new(harness_core::types::TaskId(
+            "runtime-task-1".to_string(),
+        ))
+        .summary();
+        active_legacy.status = crate::task_runner::TaskStatus::Implementing;
+        active_legacy.scheduler.authority_state = SchedulerAuthorityState::Running;
+        active_legacy.project = Some("/repo".to_string());
+        if add_active_summary(&mut counts, &active_legacy) {
+            active_legacy_task_ids.insert(active_legacy.id.as_str().to_string());
+        }
+
+        let runtime = harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
+        )
+        .with_data(serde_json::json!({
+            "project_id": "/repo",
+            "task_id": "runtime-task-1",
+        }));
+        let task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&runtime)
+            .expect("runtime workflow should expose a task handle");
+        if !active_legacy_task_ids.contains(task_id.as_str()) {
+            add_active_runtime_workflow(&mut counts, &runtime);
+        }
+
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.by_project["/repo"].running, 1);
     }
 
     #[tokio::test]
