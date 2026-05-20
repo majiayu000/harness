@@ -32,10 +32,18 @@ runtime_dispatch:
   interval_secs: 30
   batch_limit: 25
   approval_policy: never
+  timeout_secs: 3600
+  activity_profiles:
+    inspect_pr_feedback:
+      timeout_secs: 3600
+    poll_repo_backlog:
+      runtime_kind: codex_exec
+      runtime_profile: codex-backlog-exec
+      timeout_secs: 600
 runtime_worker:
   enabled: true
   interval_secs: 5
-  concurrency: 6
+  concurrency: 10
   lease_ttl_secs: 3900
 runtime_retry_policy:
   activity_retries: {}
