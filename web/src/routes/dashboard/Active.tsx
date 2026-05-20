@@ -410,7 +410,7 @@ export function Active({ projectFilter }: Props) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [merging, setMerging] = useState<Set<string>>(new Set());
   const [cancellingWorkflows, setCancellingWorkflows] = useState<Set<string>>(new Set());
-  const { data, isLoading, isError } = useTasks();
+  const { data, isLoading, isError } = useTasks({ active: true, limit: 200 });
   const { data: dashboard } = useDashboard();
   const queryClient = useQueryClient();
 
@@ -474,7 +474,7 @@ export function Active({ projectFilter }: Props) {
     : null;
   const workflowRuntime = useWorkflowRuntimeTree(resolvedRoot);
 
-  const active = (data ?? [])
+  const active = (data?.data ?? [])
     .filter(shouldShowTask)
     .filter((t) => !resolvedRoot || t.project === resolvedRoot);
   const grouped: Record<string, Task[]> = {};

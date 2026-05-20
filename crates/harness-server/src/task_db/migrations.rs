@@ -17,6 +17,7 @@ use harness_core::db::Migration;
 /// v20 – add system_input column for restart-safe system prompt bundles.
 /// v21 – add workspace lifecycle ownership and failure classification columns.
 /// v22 – add scheduler_state column as the single authoritative ownership/recovery contract.
+/// v23 – add indexes for server-side task list filters.
 pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -161,5 +162,17 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         description: "add scheduler_state column for unified task ownership and recovery",
         sql: "ALTER TABLE tasks ADD COLUMN scheduler_state TEXT NOT NULL DEFAULT \
               '{\"authority_state\":\"queued\",\"run_generation\":0,\"recovery_generation\":0}'",
+    },
+    Migration {
+        version: 23,
+        description: "add indexes for task list filters",
+        sql: "CREATE INDEX IF NOT EXISTS idx_tasks_scheduler_state_created \
+              ON tasks((scheduler_state::jsonb ->> 'authority_state'), created_at DESC); \
+              CREATE INDEX IF NOT EXISTS idx_tasks_repo_created \
+              ON tasks(repo, created_at DESC); \
+              CREATE INDEX IF NOT EXISTS idx_tasks_source_created \
+              ON tasks(source, created_at DESC); \
+              CREATE INDEX IF NOT EXISTS idx_tasks_kind_created \
+              ON tasks(task_kind, created_at DESC)",
     },
 ];

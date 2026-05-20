@@ -1,18 +1,18 @@
 use axum::{
-    extract::{Path, State},
+    extract::{rejection::QueryRejection, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::state::AppState;
 use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskKind, TaskPhase, TaskSchedulerState, TaskState,
-    TaskStatus, TaskSummary, TaskWorkflowSummary,
+    TaskStatus, TaskSummary, TaskSummaryFilter, TaskWorkflowSummary,
 };
 use harness_core::proof_of_work::{CiStatus, ProofOfWork, QualitySignal, ReviewOutcome};
 
@@ -46,8 +46,112 @@ struct RuntimeTaskResponse {
     workflow: Option<TaskWorkflowSummary>,
 }
 
-pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
-    match state.core.tasks.list_all_summaries_with_terminal().await {
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawTaskListParams {
+    status: Option<String>,
+    scheduler_state: Option<String>,
+    active: Option<bool>,
+    kind: Option<String>,
+    source: Option<String>,
+    repo: Option<String>,
+    project_id: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskListQuery {
+    filter: TaskSummaryFilter,
+    limit: usize,
+    cursor: Option<TaskListCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskListCursor {
+    created_at: String,
+    id: String,
+}
+
+#[derive(Serialize)]
+struct TaskListResponse {
+    data: Vec<TaskSummary>,
+    page: TaskListPage,
+    counts: TaskListCounts,
+}
+
+#[derive(Serialize)]
+struct TaskListPage {
+    limit: usize,
+    has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TaskListCounts {
+    total: usize,
+    running: usize,
+    failed: usize,
+    by_status: BTreeMap<String, usize>,
+    by_scheduler_state: BTreeMap<String, usize>,
+}
+
+const DEFAULT_TASK_LIST_LIMIT: u32 = 50;
+const MAX_TASK_LIST_LIMIT: u32 = 500;
+
+#[derive(Debug)]
+struct TaskListQueryError {
+    error: &'static str,
+    message: String,
+    hint: Option<&'static str>,
+}
+
+impl IntoResponse for TaskListQueryError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": self.error,
+                "message": self.message,
+                "hint": self.hint,
+                "allowed": {
+                    "status": allowed_task_statuses(),
+                    "scheduler_state": allowed_scheduler_states(),
+                    "kind": ["issue", "pr", "prompt", "review", "planner"],
+                }
+            })),
+        )
+            .into_response()
+    }
+}
+
+pub(crate) async fn list_tasks(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<RawTaskListParams>, QueryRejection>,
+) -> Response {
+    let raw_query = match query {
+        Ok(Query(query)) => query,
+        Err(error) => {
+            return task_list_bad_request(
+                "invalid_query",
+                format!("Invalid /tasks query parameters: {error}"),
+                None,
+            )
+            .into_response();
+        }
+    };
+    let query = match TaskListQuery::from_raw(raw_query) {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
+
+    match state
+        .core
+        .tasks
+        .list_summaries_filtered_with_terminal(&query.filter)
+        .await
+    {
         Ok(mut summaries) => {
             if let Some(workflow_store) = state.core.issue_workflow_store.as_ref() {
                 // Bulk-fetch all workflows once to avoid O(N) sequential DB round trips.
@@ -102,10 +206,16 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
                     };
                 }
             }
-            if let Err(e) = append_runtime_submission_summaries(&state, &mut summaries).await {
+            if let Err(e) =
+                append_runtime_submission_summaries(&state, &mut summaries, &query.filter).await
+            {
                 tracing::error!("list_tasks: failed to append runtime submission summaries: {e}");
             }
-            Json(summaries).into_response()
+            summaries.retain(|summary| query.filter.matches_summary(summary));
+            sort_task_summaries(&mut summaries);
+            let counts = task_list_counts(&summaries);
+            let (data, page) = paginate_task_summaries(&summaries, &query);
+            Json(TaskListResponse { data, page, counts }).into_response()
         }
         Err(e) => {
             tracing::error!("list_tasks: database error: {e}");
@@ -118,9 +228,269 @@ pub(crate) async fn list_tasks(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+impl TaskListQuery {
+    fn from_raw(raw: RawTaskListParams) -> Result<Self, TaskListQueryError> {
+        let statuses = parse_task_statuses(raw.status.as_deref())?;
+        let scheduler_states = parse_scheduler_states(raw.scheduler_state.as_deref())?;
+        let active = raw.active.unwrap_or(false);
+        if active && statuses.iter().any(TaskStatus::is_terminal) {
+            return Err(task_list_bad_request(
+                "invalid_filter",
+                "`active=true` cannot be combined with terminal task statuses.",
+                Some("Remove active=true or query terminal statuses without the active filter."),
+            ));
+        }
+        let limit = raw.limit.unwrap_or(DEFAULT_TASK_LIST_LIMIT);
+        if !(1..=MAX_TASK_LIST_LIMIT).contains(&limit) {
+            return Err(task_list_bad_request(
+                "invalid_limit",
+                format!("limit must be between 1 and {MAX_TASK_LIST_LIMIT}."),
+                None,
+            ));
+        }
+        Ok(Self {
+            filter: TaskSummaryFilter {
+                statuses,
+                scheduler_states,
+                kinds: parse_task_kinds(raw.kind.as_deref())?,
+                source: normalize_optional_query_value(raw.source),
+                repo: normalize_optional_query_value(raw.repo),
+                project: normalize_optional_query_value(raw.project_id),
+                active,
+            },
+            limit: limit as usize,
+            cursor: raw
+                .cursor
+                .as_deref()
+                .map(parse_task_list_cursor)
+                .transpose()?,
+        })
+    }
+}
+
+fn parse_task_statuses(raw: Option<&str>) -> Result<Vec<TaskStatus>, TaskListQueryError> {
+    parse_csv(raw)
+        .into_iter()
+        .map(|value| {
+            value.parse::<TaskStatus>().map_err(|_| {
+                let hint = if value == "running" {
+                    Some("Use scheduler_state=running instead of status=running.")
+                } else {
+                    None
+                };
+                task_list_bad_request(
+                    "invalid_status",
+                    format!("Unknown task status `{value}`."),
+                    hint,
+                )
+            })
+        })
+        .collect()
+}
+
+fn parse_scheduler_states(
+    raw: Option<&str>,
+) -> Result<Vec<SchedulerAuthorityState>, TaskListQueryError> {
+    parse_csv(raw)
+        .into_iter()
+        .map(|value| {
+            value.parse::<SchedulerAuthorityState>().map_err(|_| {
+                task_list_bad_request(
+                    "invalid_scheduler_state",
+                    format!("Unknown scheduler_state `{value}`."),
+                    None,
+                )
+            })
+        })
+        .collect()
+}
+
+fn parse_task_kinds(raw: Option<&str>) -> Result<Vec<TaskKind>, TaskListQueryError> {
+    parse_csv(raw)
+        .into_iter()
+        .map(|value| match value.as_str() {
+            "issue" => Ok(TaskKind::Issue),
+            "pr" => Ok(TaskKind::Pr),
+            "prompt" => Ok(TaskKind::Prompt),
+            "review" => Ok(TaskKind::Review),
+            "planner" => Ok(TaskKind::Planner),
+            _ => Err(task_list_bad_request(
+                "invalid_kind",
+                format!("Unknown task kind `{value}`."),
+                None,
+            )),
+        })
+        .collect()
+}
+
+fn parse_csv(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_optional_query_value(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn parse_task_list_cursor(raw: &str) -> Result<TaskListCursor, TaskListQueryError> {
+    let Some((created_at, id)) = raw.split_once('|') else {
+        return Err(task_list_bad_request(
+            "invalid_cursor",
+            "cursor must be the opaque value returned by the previous /tasks response.",
+            None,
+        ));
+    };
+    if id.trim().is_empty() {
+        return Err(task_list_bad_request(
+            "invalid_cursor",
+            "cursor task id is empty.",
+            None,
+        ));
+    }
+    Ok(TaskListCursor {
+        created_at: created_at.to_string(),
+        id: id.to_string(),
+    })
+}
+
+fn task_list_bad_request(
+    error: &'static str,
+    message: impl Into<String>,
+    hint: Option<&'static str>,
+) -> TaskListQueryError {
+    TaskListQueryError {
+        error,
+        message: message.into(),
+        hint,
+    }
+}
+
+fn allowed_task_statuses() -> Vec<&'static str> {
+    vec![
+        "pending",
+        "awaiting_deps",
+        "triaging",
+        "planning",
+        "implementing",
+        "review_generating",
+        "review_waiting",
+        "planner_generating",
+        "planner_waiting",
+        "agent_review",
+        "waiting",
+        "reviewing",
+        "done",
+        "failed",
+        "cancelled",
+    ]
+}
+
+fn allowed_scheduler_states() -> Vec<&'static str> {
+    vec![
+        "queued",
+        "awaiting_dependencies",
+        "running",
+        "retry_backoff",
+        "leased",
+        "recovering",
+        "done",
+        "failed",
+        "cancelled",
+    ]
+}
+
+fn sort_task_summaries(summaries: &mut [TaskSummary]) {
+    summaries.sort_by(|left, right| {
+        task_summary_sort_key(right)
+            .cmp(&task_summary_sort_key(left))
+            .then_with(|| right.id.as_str().cmp(left.id.as_str()))
+    });
+}
+
+fn task_summary_sort_key(summary: &TaskSummary) -> (&str, &str) {
+    (
+        summary.created_at.as_deref().unwrap_or(""),
+        summary.id.as_str(),
+    )
+}
+
+fn task_list_counts(summaries: &[TaskSummary]) -> TaskListCounts {
+    let mut by_status = BTreeMap::new();
+    let mut by_scheduler_state = BTreeMap::new();
+    for summary in summaries {
+        *by_status
+            .entry(summary.status.as_ref().to_string())
+            .or_insert(0) += 1;
+        *by_scheduler_state
+            .entry(summary.scheduler.authority_state.as_ref().to_string())
+            .or_insert(0) += 1;
+    }
+    TaskListCounts {
+        total: summaries.len(),
+        running: *by_scheduler_state.get("running").unwrap_or(&0),
+        failed: *by_status.get("failed").unwrap_or(&0),
+        by_status,
+        by_scheduler_state,
+    }
+}
+
+fn paginate_task_summaries(
+    summaries: &[TaskSummary],
+    query: &TaskListQuery,
+) -> (Vec<TaskSummary>, TaskListPage) {
+    let mut page = summaries
+        .iter()
+        .filter(|summary| {
+            query
+                .cursor
+                .as_ref()
+                .is_none_or(|cursor| task_is_after_cursor(summary, cursor))
+        })
+        .take(query.limit + 1)
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_more = page.len() > query.limit;
+    if has_more {
+        page.truncate(query.limit);
+    }
+    let next_cursor = has_more
+        .then(|| page.last().map(task_list_cursor_for_summary))
+        .flatten();
+    (
+        page,
+        TaskListPage {
+            limit: query.limit,
+            has_more,
+            next_cursor,
+        },
+    )
+}
+
+fn task_is_after_cursor(summary: &TaskSummary, cursor: &TaskListCursor) -> bool {
+    let (created_at, id) = task_summary_sort_key(summary);
+    created_at < cursor.created_at.as_str()
+        || (created_at == cursor.created_at.as_str() && id < cursor.id.as_str())
+}
+
+fn task_list_cursor_for_summary(summary: &TaskSummary) -> String {
+    format!(
+        "{}|{}",
+        summary.created_at.as_deref().unwrap_or(""),
+        summary.id.as_str()
+    )
+}
+
 async fn append_runtime_submission_summaries(
     state: &AppState,
     summaries: &mut Vec<TaskSummary>,
+    filter: &TaskSummaryFilter,
 ) -> anyhow::Result<()> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(());
@@ -130,6 +500,7 @@ async fn append_runtime_submission_summaries(
         summaries,
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         TaskKind::Issue,
+        filter,
     )
     .await?;
     append_runtime_definition_summaries(
@@ -137,6 +508,7 @@ async fn append_runtime_submission_summaries(
         summaries,
         harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         TaskKind::Prompt,
+        filter,
     )
     .await
 }
@@ -146,9 +518,10 @@ async fn append_runtime_definition_summaries(
     summaries: &mut Vec<TaskSummary>,
     definition_id: &str,
     task_kind: TaskKind,
+    filter: &TaskSummaryFilter,
 ) -> anyhow::Result<()> {
     let workflows = store
-        .list_instances_by_definition(definition_id, None, None)
+        .list_instances_by_definition(definition_id, filter.project.as_deref(), None)
         .await?;
     let mut listed_ids: HashSet<String> = summaries
         .iter()
@@ -163,7 +536,10 @@ async fn append_runtime_definition_summaries(
         if !listed_ids.insert(task_id.as_str().to_string()) {
             continue;
         }
-        summaries.push(runtime_workflow_task_summary(workflow, task_id, task_kind));
+        let summary = runtime_workflow_task_summary(workflow, task_id, task_kind);
+        if filter.matches_summary(&summary) {
+            summaries.push(summary);
+        }
     }
     Ok(())
 }
@@ -174,7 +550,7 @@ fn runtime_workflow_task_summary(
     task_kind: TaskKind,
 ) -> TaskSummary {
     let status = runtime_workflow_state_to_task_status(&workflow.state);
-    let scheduler = runtime_workflow_scheduler_state(&status);
+    let scheduler = runtime_workflow_scheduler_state(&workflow.state, &status);
     let issue = workflow
         .data
         .get("issue_number")
@@ -240,22 +616,39 @@ fn runtime_workflow_state_to_task_phase(state: &str) -> TaskPhase {
     }
 }
 
-fn runtime_workflow_scheduler_state(status: &TaskStatus) -> TaskSchedulerState {
-    match status {
-        TaskStatus::AwaitingDeps => TaskSchedulerState::awaiting_dependencies(),
-        TaskStatus::Pending => TaskSchedulerState::queued(),
-        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
-            let mut scheduler = TaskSchedulerState::queued();
-            scheduler.mark_terminal(status);
-            scheduler
-        }
-        _ => TaskSchedulerState {
+fn runtime_workflow_scheduler_state(state: &str, status: &TaskStatus) -> TaskSchedulerState {
+    match state {
+        "awaiting_dependencies" => TaskSchedulerState::awaiting_dependencies(),
+        "scheduled" | "discovered" => TaskSchedulerState::queued(),
+        "implementing" | "replanning" | "addressing_feedback" => TaskSchedulerState {
             authority_state: SchedulerAuthorityState::Running,
             owner: None,
             run_generation: 0,
             recovery_generation: 0,
             lease_expires_at: None,
         },
+        "done" | "passed" | "failed" | "cancelled" => {
+            let mut scheduler = TaskSchedulerState::queued();
+            scheduler.mark_terminal(status);
+            scheduler
+        }
+        "pr_open" | "awaiting_feedback" | "ready_to_merge" | "blocked" => {
+            TaskSchedulerState::queued()
+        }
+        _ if matches!(status, TaskStatus::AwaitingDeps) => {
+            TaskSchedulerState::awaiting_dependencies()
+        }
+        _ if matches!(status, TaskStatus::Pending) => TaskSchedulerState::queued(),
+        _ if matches!(
+            status,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+        ) =>
+        {
+            let mut scheduler = TaskSchedulerState::queued();
+            scheduler.mark_terminal(status);
+            scheduler
+        }
+        _ => TaskSchedulerState::queued(),
     }
 }
 

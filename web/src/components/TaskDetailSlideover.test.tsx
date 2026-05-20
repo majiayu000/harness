@@ -40,6 +40,13 @@ function makeFullTask(overrides: Partial<FullTask> = {}): FullTask {
     subtask_ids: [],
     project: null,
     workflow: null,
+    scheduler: {
+      authority_state: "running",
+      owner: null,
+      run_generation: 1,
+      recovery_generation: 0,
+      lease_expires_at: null,
+    },
     rounds: [],
     system_input: null,
     request_settings: null,

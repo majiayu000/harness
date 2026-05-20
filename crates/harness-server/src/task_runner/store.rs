@@ -10,8 +10,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
-use super::state::{SchedulerOwnerKind, TaskState, TaskSummary};
-use super::types::{TaskId, TaskStatus};
+use super::state::{SchedulerAuthorityState, SchedulerOwnerKind, TaskState, TaskSummary};
+use super::types::{TaskId, TaskKind, TaskStatus};
 use super::CompletionCallback;
 
 /// Broadcast channel capacity for per-task stream events.
@@ -48,6 +48,60 @@ pub struct TaskStore {
     /// Append-only JSONL event log for crash recovery. `None` if the file
     /// could not be opened (best-effort; server still starts without it).
     pub(crate) event_log: Option<Arc<crate::event_replay::TaskEventLog>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskSummaryFilter {
+    pub statuses: Vec<TaskStatus>,
+    pub scheduler_states: Vec<SchedulerAuthorityState>,
+    pub kinds: Vec<TaskKind>,
+    pub source: Option<String>,
+    pub repo: Option<String>,
+    pub project: Option<String>,
+    pub active: bool,
+}
+
+impl TaskSummaryFilter {
+    pub fn matches_summary(&self, summary: &TaskSummary) -> bool {
+        if !self.statuses.is_empty() && !self.statuses.contains(&summary.status) {
+            return false;
+        }
+        if self.active && summary.status.is_terminal() {
+            return false;
+        }
+        if !self.scheduler_states.is_empty()
+            && !self
+                .scheduler_states
+                .contains(&summary.scheduler.authority_state)
+        {
+            return false;
+        }
+        if !self.kinds.is_empty() && !self.kinds.contains(&summary.task_kind) {
+            return false;
+        }
+        if self
+            .source
+            .as_deref()
+            .is_some_and(|source| summary.source.as_deref() != Some(source))
+        {
+            return false;
+        }
+        if self
+            .repo
+            .as_deref()
+            .is_some_and(|repo| summary.repo.as_deref() != Some(repo))
+        {
+            return false;
+        }
+        if self
+            .project
+            .as_deref()
+            .is_some_and(|project| summary.project.as_deref() != Some(project))
+        {
+            return false;
+        }
+        true
+    }
 }
 
 impl TaskStore {
@@ -368,6 +422,28 @@ impl TaskStore {
                 by_id.remove(&summary.id);
             } else {
                 by_id.insert(entry.key().clone(), summary);
+            }
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    pub async fn list_summaries_filtered_with_terminal(
+        &self,
+        filter: &TaskSummaryFilter,
+    ) -> anyhow::Result<Vec<TaskSummary>> {
+        let mut by_id: std::collections::HashMap<TaskId, TaskSummary> = self
+            .db
+            .list_summaries_filtered(filter)
+            .await?
+            .into_iter()
+            .map(|summary| (summary.id.clone(), summary))
+            .collect();
+        for entry in self.cache.iter() {
+            let summary = entry.value().summary();
+            if filter.matches_summary(&summary) {
+                by_id.insert(entry.key().clone(), summary);
+            } else {
+                by_id.remove(entry.key());
             }
         }
         Ok(by_id.into_values().collect())
