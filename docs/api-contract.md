@@ -142,6 +142,30 @@ The design is intentional:
 | Load rules for an agent to respect | `rule/load` (JSON-RPC) |
 | Record an event from within an agent | `event/log` (JSON-RPC) |
 
+## HTTP task list
+
+`GET /tasks` returns a paginated envelope, not a raw array:
+
+```json
+{
+  "data": [],
+  "page": { "limit": 50, "has_more": false, "next_cursor": null },
+  "counts": {
+    "total": 0,
+    "running": 0,
+    "failed": 0,
+    "by_status": {},
+    "by_scheduler_state": {}
+  }
+}
+```
+
+Supported query parameters are `status`, `scheduler_state`, `active`, `kind`,
+`source`, `repo`, `project_id`, `limit`, and `cursor`. `status` is the task
+lifecycle status; `scheduler_state` is the ownership/execution state. For
+example, currently executing work is queried with
+`/tasks?scheduler_state=running`, not `status=running`.
+
 ## Error codes
 
 All JSON-RPC errors follow [JSON-RPC 2.0](https://www.jsonrpc.org/specification).
