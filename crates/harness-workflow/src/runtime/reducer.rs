@@ -324,16 +324,47 @@ fn repo_backlog_poll_decision_from_activity_result(
     let parent_repo = optional_data_string(instance, "repo");
     let discovered =
         issue_candidates_from_signals(result, "IssueDiscovered", parent_repo.as_deref());
+    let pr_feedback = pr_feedback_candidates_from_signals(
+        result,
+        "OpenPrFeedbackDiscovered",
+        parent_repo.as_deref(),
+    );
     let known_dependencies =
         known_dependency_candidates_from_skipped_signals(result, parent_repo.as_deref());
 
-    if discovered.is_empty() {
+    if discovered.is_empty() && pr_feedback.is_empty() {
         return None;
+    }
+
+    if discovered.is_empty() {
+        let mut decision = WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "start_open_pr_feedback_tasks_from_scan",
+            "dispatching",
+            format!(
+                "repo backlog scan discovered {} open PR(s) with actionable review feedback",
+                pr_feedback.len()
+            ),
+        )
+        .with_evidence(runtime_completion_evidence(event, result));
+
+        for candidate in pr_feedback {
+            decision = decision
+                .with_command(candidate.start_prompt_task_command(event))
+                .with_evidence(candidate.github_pr_evidence());
+        }
+
+        return Some(decision.high_confidence());
     }
 
     let issue_payloads = discovered
         .iter()
         .map(RepoBacklogIssueCandidate::to_command_value)
+        .collect::<Vec<_>>();
+    let pr_feedback_payloads = pr_feedback
+        .iter()
+        .map(RepoBacklogPrFeedbackCandidate::to_command_value)
         .collect::<Vec<_>>();
     let known_dependency_payloads = known_dependencies
         .iter()
@@ -356,6 +387,7 @@ fn repo_backlog_poll_decision_from_activity_result(
             "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
             "repo": parent_repo,
             "issues": issue_payloads,
+            "open_pr_feedback": pr_feedback_payloads,
             "known_dependencies": known_dependency_payloads,
         }),
     ))
@@ -363,6 +395,9 @@ fn repo_backlog_poll_decision_from_activity_result(
 
     for candidate in discovered {
         decision = decision.with_evidence(candidate.github_issue_evidence());
+    }
+    for candidate in pr_feedback {
+        decision = decision.with_evidence(candidate.github_pr_evidence());
     }
 
     Some(decision.high_confidence())
@@ -390,19 +425,34 @@ fn repo_backlog_sprint_plan_decision_from_activity_result(
         sprint_plan_selected_issues(result, event, parent_repo.as_deref()),
         &sprint_plan_known_dependency_inputs(event, parent_repo.as_deref()),
     );
-    if selected.is_empty() {
+    let pr_feedback = sprint_plan_pr_feedback_inputs(event, parent_repo.as_deref());
+    if selected.is_empty() && pr_feedback.is_empty() {
         return None;
     }
 
-    let mut decision = WorkflowDecision::new(
-        &instance.id,
-        &instance.state,
-        "start_issue_workflows_from_sprint_plan",
-        "dispatching",
+    let decision_name = if pr_feedback.is_empty() {
+        "start_issue_workflows_from_sprint_plan"
+    } else {
+        "start_repo_backlog_workflows_from_sprint_plan"
+    };
+    let reason = if pr_feedback.is_empty() {
         format!(
             "runtime sprint planner selected {} issue workflow(s) for dispatch",
             selected.len()
-        ),
+        )
+    } else {
+        format!(
+            "runtime sprint planner selected {} issue workflow(s) and {} open PR feedback task(s) for dispatch",
+            selected.len(),
+            pr_feedback.len()
+        )
+    };
+    let mut decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        decision_name,
+        "dispatching",
+        reason,
     )
     .with_evidence(runtime_completion_evidence(event, result));
 
@@ -429,6 +479,11 @@ fn repo_backlog_sprint_plan_decision_from_activity_result(
             ))
             .with_evidence(candidate.github_issue_evidence());
     }
+    for candidate in pr_feedback {
+        decision = decision
+            .with_command(candidate.start_prompt_task_command(event))
+            .with_evidence(candidate.github_pr_evidence());
+    }
 
     Some(decision.high_confidence())
 }
@@ -441,6 +496,120 @@ struct RepoBacklogIssueCandidate {
     title: Option<String>,
     labels: Vec<String>,
     depends_on: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoBacklogPrFeedbackCandidate {
+    pr_number: u64,
+    repo: Option<String>,
+    pr_url: Option<String>,
+    title: Option<String>,
+    feedback_count: Option<u64>,
+    summary: Option<String>,
+}
+
+impl RepoBacklogPrFeedbackCandidate {
+    fn from_value(value: &Value, parent_repo: Option<&str>) -> Option<Self> {
+        let pr_number = value
+            .get("pr_number")
+            .or_else(|| value.get("pull_request"))
+            .or_else(|| value.get("pr"))
+            .and_then(json_value_u64)?;
+        let repo = value
+            .get("repo")
+            .and_then(non_empty_json_string)
+            .or_else(|| parent_repo.map(ToOwned::to_owned));
+        let pr_url = value
+            .get("pr_url")
+            .or_else(|| value.get("pull_request_url"))
+            .and_then(non_empty_json_string);
+        let title = value.get("title").and_then(non_empty_json_string);
+        let feedback_count = value
+            .get("feedback_count")
+            .or_else(|| value.get("review_thread_count"))
+            .or_else(|| value.get("thread_count"))
+            .and_then(json_value_u64);
+        let summary = value
+            .get("summary")
+            .or_else(|| value.get("reason"))
+            .and_then(non_empty_json_string);
+        Some(Self {
+            pr_number,
+            repo,
+            pr_url,
+            title,
+            feedback_count,
+            summary,
+        })
+    }
+
+    fn start_prompt_task_command(&self, event: &WorkflowEvent) -> WorkflowCommand {
+        let repo_key = self.repo.as_deref().unwrap_or("<none>");
+        let external_id = format!("pr-feedback:{repo_key}:{}", self.pr_number);
+        WorkflowCommand::new(
+            WorkflowCommandType::StartChildWorkflow,
+            format!("repo-backlog:{repo_key}:pr:{}:feedback", self.pr_number),
+            json!({
+                "definition_id": PROMPT_TASK_DEFINITION_ID,
+                "subject_key": format!("pr:{}:feedback", self.pr_number),
+                "repo": self.repo,
+                "pr_number": self.pr_number,
+                "pr_url": self.pr_url,
+                "title": self.title,
+                "feedback_count": self.feedback_count,
+                "source": "github_pr_feedback",
+                "external_id": external_id,
+                "task_id": format!("repo-backlog:{repo_key}:pr:{}:feedback", self.pr_number),
+                "prompt": self.prompt(),
+                "source_event_id": event.id,
+            }),
+        )
+    }
+
+    fn to_command_value(&self) -> Value {
+        json!({
+            "pr_number": self.pr_number,
+            "repo": self.repo,
+            "pr_url": self.pr_url,
+            "title": self.title,
+            "feedback_count": self.feedback_count,
+            "summary": self.summary,
+        })
+    }
+
+    fn prompt(&self) -> String {
+        let repo = self.repo.as_deref().unwrap_or("<unknown repo>");
+        let pr_ref = self
+            .pr_url
+            .as_deref()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("{repo}#{}", self.pr_number));
+        let title = self.title.as_deref().unwrap_or("<unknown title>");
+        let feedback_count = self
+            .feedback_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let summary = self.summary.as_deref().unwrap_or("No summary provided.");
+        format!(
+            "Handle unresolved review feedback for PR {pr_ref}.\n\n\
+Repository: {repo}\n\
+PR number: {}\n\
+PR title: {title}\n\
+Unresolved/actionable feedback count: {feedback_count}\n\
+Discovery summary: {summary}\n\n\
+Inspect the PR review threads, CI state, and mergeability. Address valid requested changes on the PR branch, run the relevant validation commands, push the branch, and reply to or resolve addressed review threads when possible. Do not make unrelated changes.",
+            self.pr_number
+        )
+    }
+
+    fn github_pr_evidence(&self) -> WorkflowEvidence {
+        let repo = self.repo.as_deref().unwrap_or("<none>");
+        let url = self.pr_url.as_deref().unwrap_or("<unknown>");
+        WorkflowEvidence::new(
+            "github_pr_feedback",
+            format!("repo={repo} pr={} url={url}", self.pr_number),
+        )
+    }
 }
 
 impl RepoBacklogIssueCandidate {
@@ -557,6 +726,21 @@ fn issue_candidates_from_signals(
         .collect()
 }
 
+fn pr_feedback_candidates_from_signals(
+    result: &ActivityResult,
+    signal_type: &str,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogPrFeedbackCandidate> {
+    result
+        .signals
+        .iter()
+        .filter(|signal| signal.signal_type == signal_type)
+        .filter_map(|signal| {
+            RepoBacklogPrFeedbackCandidate::from_value(&signal.signal, parent_repo)
+        })
+        .collect()
+}
+
 fn known_dependency_candidates_from_skipped_signals(
     result: &ActivityResult,
     parent_repo: Option<&str>,
@@ -624,6 +808,28 @@ fn sprint_plan_known_dependency_inputs(
                         .iter()
                         .filter_map(|value| {
                             RepoBacklogIssueCandidate::from_value(value, parent_repo)
+                        })
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn sprint_plan_pr_feedback_inputs(
+    event: &WorkflowEvent,
+    parent_repo: Option<&str>,
+) -> Vec<RepoBacklogPrFeedbackCandidate> {
+    event_workflow_command(event)
+        .and_then(|command| {
+            command
+                .command
+                .get("open_pr_feedback")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|value| {
+                            RepoBacklogPrFeedbackCandidate::from_value(value, parent_repo)
                         })
                         .collect()
                 })
@@ -821,15 +1027,33 @@ fn repo_backlog_invalid_success_decision(
                     "repo backlog poll emitted IssueDiscovered signals, but none contained a valid issue_number",
                 ));
             }
+            let pr_feedback_count = signal_count(result, "OpenPrFeedbackDiscovered");
+            let valid_pr_feedback_count =
+                pr_feedback_candidates_from_signals(result, "OpenPrFeedbackDiscovered", None).len();
+            if pr_feedback_count > 0 && valid_pr_feedback_count == 0 {
+                return Some(invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    "repo backlog poll emitted OpenPrFeedbackDiscovered signals, but none contained a valid pr_number",
+                ));
+            }
             if !has_any_signal(
                 result,
-                &["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound"],
+                &[
+                    "IssueDiscovered",
+                    "IssueSkipped",
+                    "NoOpenIssueFound",
+                    "OpenPrFeedbackDiscovered",
+                    "OpenPrFeedbackSkipped",
+                    "NoOpenPrFeedbackFound",
+                ],
             ) {
                 return Some(invalid_agent_output_blocked_decision(
                     instance,
                     event,
                     result,
-                    "repo backlog poll succeeded without IssueDiscovered, IssueSkipped, or NoOpenIssueFound signals",
+                    "repo backlog poll succeeded without issue or open PR feedback signals",
                 ));
             }
             if structured_decision.is_some() {

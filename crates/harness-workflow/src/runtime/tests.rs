@@ -2106,6 +2106,136 @@ fn runtime_completion_reducer_dispatches_repo_backlog_issue_signals() {
 }
 
 #[test]
+fn runtime_completion_reducer_dispatches_standalone_pr_feedback_signals() {
+    let instance = repo_backlog_instance("scanning").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::enqueue_activity(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "repo-backlog:owner/repo:poll",
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "Found one open PR with unresolved review feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "OpenPrFeedbackDiscovered",
+        json!({
+            "pr_number": 1120,
+            "pr_url": "https://github.com/owner/repo/pull/1120",
+            "title": "feat(tasks): paginate task list queries",
+            "feedback_count": 3,
+            "summary": "Review threads request DB-level pagination."
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("repo backlog scan signal should start a PR feedback prompt task");
+
+    assert_eq!(decision.decision, "start_open_pr_feedback_tasks_from_scan");
+    assert_eq!(decision.next_state, "dispatching");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(decision.commands[0].command["definition_id"], "prompt_task");
+    assert_eq!(decision.commands[0].command["pr_number"], 1120);
+    assert_eq!(decision.commands[0].command["source"], "github_pr_feedback");
+    assert!(decision.commands[0].command["prompt"]
+        .as_str()
+        .expect("prompt should be present")
+        .contains("Handle unresolved review feedback"));
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("standalone PR feedback dispatch should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_preserves_pr_feedback_when_scan_also_discovers_issues() {
+    let instance = repo_backlog_instance("scanning").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::enqueue_activity(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "repo-backlog:owner/repo:poll",
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "Found one issue and one open PR with unresolved review feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueDiscovered",
+        json!({
+            "issue_number": 42,
+            "issue_url": "https://github.com/owner/repo/issues/42",
+            "labels": ["harness"]
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "OpenPrFeedbackDiscovered",
+        json!({
+            "pr_number": 1120,
+            "pr_url": "https://github.com/owner/repo/pull/1120",
+            "title": "feat(tasks): paginate task list queries",
+            "feedback_count": 3,
+            "summary": "Review threads request DB-level pagination."
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("repo backlog scan should keep PR feedback candidates for sprint dispatch");
+
+    assert_eq!(decision.decision, "plan_repo_sprint_from_scan");
+    assert_eq!(decision.next_state, "planning_batch");
+    assert_eq!(
+        decision.commands[0].command["open_pr_feedback"][0]["pr_number"],
+        1120
+    );
+    assert_eq!(
+        decision.commands[0].command["open_pr_feedback"][0]["summary"],
+        "Review threads request DB-level pagination."
+    );
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("repo backlog scan planning should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_dispatches_repo_backlog_sprint_plan() {
     let instance = repo_backlog_instance("planning_batch").with_data(json!({
         "repo": "owner/repo"
@@ -2170,6 +2300,86 @@ fn runtime_completion_reducer_dispatches_repo_backlog_sprint_plan() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("repo backlog sprint dispatch should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_dispatches_sprint_plan_with_pr_feedback_candidates() {
+    let instance = repo_backlog_instance("planning_batch").with_data(json!({
+        "repo": "owner/repo"
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "repo-backlog:owner/repo:plan",
+        json!({
+            "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+            "issues": [{
+                "issue_number": 42,
+                "issue_url": "https://github.com/owner/repo/issues/42",
+                "labels": ["harness"]
+            }],
+            "open_pr_feedback": [{
+                "pr_number": 1120,
+                "pr_url": "https://github.com/owner/repo/pull/1120",
+                "title": "feat(tasks): paginate task list queries",
+                "feedback_count": 3,
+                "summary": "Review threads request DB-level pagination."
+            }],
+            "known_dependencies": []
+        }),
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+        "Selected one issue for sprint dispatch.",
+    )
+    .with_signal(ActivitySignal::new(
+        "SprintTaskSelected",
+        json!({
+            "issue_number": 42,
+            "issue_url": "https://github.com/owner/repo/issues/42",
+            "labels": ["harness"],
+            "depends_on": []
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("sprint plan should dispatch issue and PR feedback workflows");
+
+    assert_eq!(
+        decision.decision,
+        "start_repo_backlog_workflows_from_sprint_plan"
+    );
+    assert_eq!(decision.next_state, "dispatching");
+    assert_eq!(decision.commands.len(), 2);
+    assert_eq!(
+        decision.commands[0].command["definition_id"],
+        "github_issue_pr"
+    );
+    assert_eq!(decision.commands[1].command["definition_id"], "prompt_task");
+    assert_eq!(decision.commands[1].command["pr_number"], 1120);
+    assert!(decision.commands[1].command["prompt"]
+        .as_str()
+        .expect("prompt should be present")
+        .contains("Handle unresolved review feedback"));
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("mixed repo backlog dispatch should validate");
 }
 
 #[test]
