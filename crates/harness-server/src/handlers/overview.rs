@@ -327,6 +327,7 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
     let mut counts = ActiveTaskOverviewCounts::default();
     let mut listed_task_ids = HashSet::new();
     let mut loaded_legacy_tasks = false;
+    let mut counted_runtime_active_workflows = false;
 
     match state.core.tasks.list_all_summaries_with_terminal().await {
         Ok(summaries) => {
@@ -362,7 +363,8 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
                         if !listed_task_ids.insert(task_id.as_str().to_string()) {
                             continue;
                         }
-                        add_active_runtime_workflow(&mut counts, &workflow);
+                        counted_runtime_active_workflows |=
+                            add_active_runtime_workflow(&mut counts, &workflow);
                     }
                 }
                 Err(error) => {
@@ -375,7 +377,7 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
         }
     }
 
-    if !loaded_legacy_tasks {
+    if !loaded_legacy_tasks && !counted_runtime_active_workflows {
         for _ in 0..state.concurrency.task_queue.running_count() {
             counts.add(None, ActiveTaskBucket::Running);
         }
@@ -402,15 +404,16 @@ fn add_active_summary(counts: &mut ActiveTaskOverviewCounts, summary: &TaskSumma
 fn add_active_runtime_workflow(
     counts: &mut ActiveTaskOverviewCounts,
     workflow: &harness_workflow::runtime::WorkflowInstance,
-) {
+) -> bool {
     let Some(bucket) = runtime_workflow_active_bucket(&workflow.state) else {
-        return;
+        return false;
     };
     let project = workflow
         .data
         .get("project_id")
         .and_then(serde_json::Value::as_str);
     counts.add(project, bucket);
+    true
 }
 
 fn runtime_workflow_active_bucket(state: &str) -> Option<ActiveTaskBucket> {
