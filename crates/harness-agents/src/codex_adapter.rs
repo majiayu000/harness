@@ -11,6 +11,7 @@ use tokio::process::ChildStdout;
 use tokio::sync::{mpsc, Mutex};
 
 type StdoutLines = Lines<BufReader<ChildStdout>>;
+const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
 
 pub struct CodexAdapter {
     cli_path: PathBuf,
@@ -153,7 +154,12 @@ impl CodexAdapter {
         if line.trim().is_empty() {
             return Ok(Some(ParsedCodexMessage::Ignore));
         }
-        Ok(parse_codex_message(&line))
+        parse_codex_message(&line).map(Some).ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "codex app-server emitted invalid JSON-RPC stdout: {}",
+                protocol_line_preview(&line)
+            ))
+        })
     }
 
     async fn ensure_child(
@@ -325,6 +331,9 @@ impl AgentAdapter for CodexAdapter {
         })?;
         drop(state);
 
+        let mut turn_completed = false;
+        let mut receiver_closed = false;
+        let mut stdout_closed = false;
         while let Some(message) = Self::read_next_message(&mut lines).await? {
             match message {
                 ParsedCodexMessage::TurnStarted { turn_id } => {
@@ -332,6 +341,7 @@ impl AgentAdapter for CodexAdapter {
                     guard.active_turn_id = Some(turn_id);
                     drop(guard);
                     if tx.send(AgentEvent::TurnStarted).await.is_err() {
+                        receiver_closed = true;
                         break;
                     }
                 }
@@ -348,16 +358,35 @@ impl AgentAdapter for CodexAdapter {
                         self.clear_active_turn_id().await;
                     }
                     if tx.send(event).await.is_err() {
+                        receiver_closed = true;
                         break;
                     }
                     if is_terminal {
+                        turn_completed = true;
                         break;
                     }
                 }
             }
         }
+        if !turn_completed && !receiver_closed {
+            stdout_closed = true;
+        }
+
+        if stdout_closed {
+            drop(lines);
+            let mut state = self.state.lock().await;
+            state.reset_child().await;
+            return Err(harness_core::error::HarnessError::AgentExecution(
+                "codex app-server stdout closed before turn/completed".into(),
+            ));
+        }
 
         self.state.lock().await.stdout_lines = Some(lines);
+        if receiver_closed {
+            return Err(harness_core::error::HarnessError::AgentExecution(
+                "codex event receiver closed before turn/completed".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -422,6 +451,14 @@ impl AgentAdapter for CodexAdapter {
     }
 }
 
+fn protocol_line_preview(line: &str) -> String {
+    let mut preview: String = line.chars().take(MAX_PROTOCOL_LINE_PREVIEW).collect();
+    if line.chars().count() > MAX_PROTOCOL_LINE_PREVIEW {
+        preview.push_str("...");
+    }
+    preview
+}
+
 fn notification_payload(method: &str, params: Value) -> Value {
     json!({
         "method": method,
@@ -442,9 +479,9 @@ fn approval_decision_result(decision: ApprovalDecision) -> Value {
 fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
     mode.map(|value| {
         match value {
-            SandboxMode::ReadOnly => "readOnly",
-            SandboxMode::WorkspaceWrite => "workspaceWrite",
-            SandboxMode::DangerFullAccess => "dangerFullAccess",
+            SandboxMode::ReadOnly => "read-only",
+            SandboxMode::WorkspaceWrite => "workspace-write",
+            SandboxMode::DangerFullAccess => "danger-full-access",
         }
         .to_string()
     })
@@ -921,7 +958,7 @@ mod tests {
             json!({
                 "cwd": "/tmp/project",
                 "model": "gpt-runtime",
-                "sandbox": "workspaceWrite",
+                "sandbox": "workspace-write",
                 "approvalPolicy": "on-request",
                 "ephemeral": true,
             })
@@ -952,15 +989,15 @@ mod tests {
     fn sandbox_mode_value_uses_app_server_enum_shape() {
         assert_eq!(
             sandbox_mode_value(Some(SandboxMode::ReadOnly)).as_deref(),
-            Some("readOnly")
+            Some("read-only")
         );
         assert_eq!(
             sandbox_mode_value(Some(SandboxMode::WorkspaceWrite)).as_deref(),
-            Some("workspaceWrite")
+            Some("workspace-write")
         );
         assert_eq!(
             sandbox_mode_value(Some(SandboxMode::DangerFullAccess)).as_deref(),
-            Some("dangerFullAccess")
+            Some("danger-full-access")
         );
         assert_eq!(sandbox_mode_value(None), None);
     }

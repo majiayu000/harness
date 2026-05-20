@@ -32,6 +32,7 @@ impl AdapterExecutionStrategy {
 pub struct AgentDescriptor {
     pub agent: Arc<dyn CodeAgent>,
     pub adapter: Option<Arc<dyn AgentAdapter>>,
+    pub adapter_factory: Option<Arc<dyn Fn() -> Arc<dyn AgentAdapter> + Send + Sync>>,
     pub adapter_strategy: AdapterExecutionStrategy,
 }
 
@@ -67,6 +68,7 @@ impl AgentRegistry {
         // same name (the old split-registry design had this property naturally).
         let existing = self.entries.get(&name);
         let existing_adapter = existing.and_then(|d| d.adapter.clone());
+        let existing_adapter_factory = existing.and_then(|d| d.adapter_factory.clone());
         let existing_strategy = existing.map(|d| d.adapter_strategy).unwrap_or_default();
         if !self.entries.contains_key(&name) {
             self.registration_order.push(name.clone());
@@ -76,6 +78,7 @@ impl AgentRegistry {
             AgentDescriptor {
                 agent,
                 adapter: existing_adapter,
+                adapter_factory: existing_adapter_factory,
                 adapter_strategy: existing_strategy,
             },
         );
@@ -107,11 +110,39 @@ impl AgentRegistry {
         match self.entries.get_mut(name) {
             Some(descriptor) => {
                 descriptor.adapter = Some(adapter);
+                descriptor.adapter_factory = None;
                 descriptor.adapter_strategy = strategy;
                 Ok(())
             }
             None => Err(HarnessError::AgentNotFound(format!(
                 "cannot register adapter: agent '{}' not found",
+                name
+            ))),
+        }
+    }
+
+    /// Attach an adapter factory to an already-registered agent.
+    ///
+    /// Use this for stateful turn-executing adapters that must not share a
+    /// single process or protocol stream across concurrent turns.
+    pub fn register_adapter_factory_with_strategy<F>(
+        &mut self,
+        name: &str,
+        factory: F,
+        strategy: AdapterExecutionStrategy,
+    ) -> harness_core::error::Result<()>
+    where
+        F: Fn() -> Arc<dyn AgentAdapter> + Send + Sync + 'static,
+    {
+        match self.entries.get_mut(name) {
+            Some(descriptor) => {
+                descriptor.adapter = None;
+                descriptor.adapter_factory = Some(Arc::new(factory));
+                descriptor.adapter_strategy = strategy;
+                Ok(())
+            }
+            None => Err(HarnessError::AgentNotFound(format!(
+                "cannot register adapter factory: agent '{}' not found",
                 name
             ))),
         }
@@ -135,7 +166,11 @@ impl AgentRegistry {
     pub fn turn_execution_adapter(&self, name: &str) -> Option<Arc<dyn AgentAdapter>> {
         let descriptor = self.entries.get(name)?;
         if descriptor.adapter_strategy.executes_turns() {
-            descriptor.adapter.clone()
+            descriptor
+                .adapter_factory
+                .as_ref()
+                .map(|factory| factory())
+                .or_else(|| descriptor.adapter.clone())
         } else {
             None
         }
@@ -469,6 +504,31 @@ mod tests {
             Some(AdapterExecutionStrategy::ExecuteTurns)
         );
         assert!(registry.turn_execution_adapter("mock").is_some());
+    }
+
+    #[test]
+    fn adapter_factory_creates_fresh_turn_execution_adapter() {
+        let mut registry = AgentRegistry::new("mock");
+        registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
+        let create_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_for_factory = create_count.clone();
+        registry
+            .register_adapter_factory_with_strategy(
+                "mock",
+                move || {
+                    count_for_factory.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Arc::new(StubAdapter {
+                        adapter_name: "mock",
+                    })
+                },
+                AdapterExecutionStrategy::ExecuteTurns,
+            )
+            .unwrap();
+
+        assert!(registry.get_adapter("mock").is_none());
+        assert!(registry.turn_execution_adapter("mock").is_some());
+        assert!(registry.turn_execution_adapter("mock").is_some());
+        assert_eq!(create_count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
