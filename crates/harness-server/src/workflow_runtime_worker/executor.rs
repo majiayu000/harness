@@ -1,9 +1,11 @@
 use crate::http::AppState;
 use crate::task_executor::turn_lifecycle::TurnLifecycleOptions;
 use async_trait::async_trait;
+use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_core::types::{AgentId, ThreadId};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, WorkflowInstance,
+    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeProfile,
+    WorkflowInstance,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -24,6 +26,10 @@ use super::runtime_profile::{
     runtime_profile_sandbox_mode,
 };
 use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
+
+const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS: u64 = 3600;
+const DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS: u64 = 600;
 
 pub(super) struct ServerRuntimeJobExecutor {
     state: Arc<AppState>,
@@ -57,7 +63,12 @@ impl ServerRuntimeJobExecutor {
             anyhow::bail!("runtime agent `{agent_name}` is not registered");
         }
 
-        let runtime_profile = runtime_profile_for_job(&job)?;
+        let runtime_profile = runtime_profile_with_timeout_fallback(
+            runtime_profile_for_job(&job)?,
+            &workflow_document.config,
+            workflow.as_ref(),
+            &job,
+        );
         let sandbox_mode = runtime_profile_sandbox_mode(&runtime_profile)?;
         let approval_policy = runtime_profile_approval_policy(&runtime_profile, job.runtime_kind)?;
         let prompt_task_request = prompt_task_request_for_job(&job)?;
@@ -270,5 +281,169 @@ async fn persist_created_thread(state: &AppState, thread_id: &ThreadId) {
     };
     if let Err(error) = db.insert(&thread).await {
         tracing::warn!(thread_id = %thread_id, "failed to persist runtime worker thread: {error}");
+    }
+}
+
+fn runtime_profile_with_timeout_fallback(
+    mut profile: RuntimeProfile,
+    workflow_config: &WorkflowConfig,
+    workflow: Option<&WorkflowInstance>,
+    job: &RuntimeJob,
+) -> RuntimeProfile {
+    if profile.timeout_secs.is_none() {
+        profile.timeout_secs = runtime_timeout_fallback(workflow_config, workflow, job);
+    }
+    profile
+}
+
+fn runtime_timeout_fallback(
+    workflow_config: &WorkflowConfig,
+    workflow: Option<&WorkflowInstance>,
+    job: &RuntimeJob,
+) -> Option<u64> {
+    let runtime_dispatch = &workflow_config.runtime_dispatch;
+    let workflow_definition_id = workflow.map(|workflow| workflow.definition_id.as_str());
+    let activity = activity_name(job);
+
+    workflow_definition_id
+        .and_then(|definition_id| {
+            runtime_dispatch
+                .workflow_activity_profiles
+                .get(definition_id)
+                .and_then(|profiles| profiles.get(&activity))
+        })
+        .and_then(profile_timeout)
+        .or_else(|| {
+            runtime_dispatch
+                .activity_profiles
+                .get(&activity)
+                .and_then(profile_timeout)
+        })
+        .or_else(|| {
+            workflow_definition_id.and_then(|definition_id| {
+                runtime_dispatch
+                    .workflow_profiles
+                    .get(definition_id)
+                    .and_then(profile_timeout)
+            })
+        })
+        .or(runtime_dispatch.timeout_secs)
+        .or_else(|| default_runtime_timeout(&activity))
+}
+
+fn profile_timeout(profile: &RuntimeDispatchProfileOverride) -> Option<u64> {
+    profile.timeout_secs
+}
+
+fn default_runtime_timeout(activity: &str) -> Option<u64> {
+    Some(match activity {
+        "inspect_pr_feedback" => DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS,
+        "poll_repo_backlog" => DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS,
+        _ => DEFAULT_RUNTIME_TURN_TIMEOUT_SECS,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_workflow::runtime::{RuntimeKind, WorkflowSubject};
+    use serde_json::json;
+
+    fn runtime_job(activity: &str) -> RuntimeJob {
+        RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": activity }),
+        )
+    }
+
+    fn workflow(definition_id: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            definition_id,
+            1,
+            "running",
+            WorkflowSubject::new("issue", "issue-1"),
+        )
+    }
+
+    #[test]
+    fn runtime_timeout_fallback_prefers_workflow_activity_profile() {
+        let mut config = WorkflowConfig::default();
+        config.runtime_dispatch.timeout_secs = Some(900);
+        config.runtime_dispatch.activity_profiles.insert(
+            "inspect_pr_feedback".to_string(),
+            RuntimeDispatchProfileOverride {
+                timeout_secs: Some(1800),
+                ..RuntimeDispatchProfileOverride::default()
+            },
+        );
+        config.runtime_dispatch.workflow_profiles.insert(
+            "pr_feedback".to_string(),
+            RuntimeDispatchProfileOverride {
+                timeout_secs: Some(240),
+                ..RuntimeDispatchProfileOverride::default()
+            },
+        );
+        config
+            .runtime_dispatch
+            .workflow_activity_profiles
+            .entry("pr_feedback".to_string())
+            .or_default()
+            .insert(
+                "inspect_pr_feedback".to_string(),
+                RuntimeDispatchProfileOverride {
+                    timeout_secs: Some(120),
+                    ..RuntimeDispatchProfileOverride::default()
+                },
+            );
+
+        assert_eq!(
+            runtime_timeout_fallback(
+                &config,
+                Some(&workflow("pr_feedback")),
+                &runtime_job("inspect_pr_feedback"),
+            ),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn runtime_profile_with_timeout_fallback_preserves_embedded_timeout() {
+        let mut config = WorkflowConfig::default();
+        config.runtime_dispatch.timeout_secs = Some(900);
+        let mut profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        profile.timeout_secs = Some(42);
+
+        let profile = runtime_profile_with_timeout_fallback(
+            profile,
+            &config,
+            Some(&workflow("pr_feedback")),
+            &runtime_job("inspect_pr_feedback"),
+        );
+
+        assert_eq!(profile.timeout_secs, Some(42));
+    }
+
+    #[test]
+    fn runtime_timeout_fallback_has_global_activity_defaults() {
+        let config = WorkflowConfig::default();
+
+        assert_eq!(
+            runtime_timeout_fallback(
+                &config,
+                Some(&workflow("pr_feedback")),
+                &runtime_job("inspect_pr_feedback")
+            ),
+            Some(3600)
+        );
+        assert_eq!(
+            runtime_timeout_fallback(&config, None, &runtime_job("poll_repo_backlog")),
+            Some(600)
+        );
+        assert_eq!(
+            runtime_timeout_fallback(&config, None, &runtime_job("implement_issue")),
+            Some(900)
+        );
     }
 }

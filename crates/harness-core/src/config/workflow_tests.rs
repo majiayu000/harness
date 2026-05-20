@@ -46,7 +46,7 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert!(cfg.runtime_dispatch.workflow_activity_profiles.is_empty());
     assert!(cfg.runtime_worker.enabled);
     assert_eq!(cfg.runtime_worker.interval_secs, 5);
-    assert_eq!(cfg.runtime_worker.concurrency, 1);
+    assert_eq!(cfg.runtime_worker.concurrency, 10);
     assert_eq!(cfg.runtime_worker.lease_ttl_secs, 3900);
     assert!(cfg.runtime_retry_policy.is_empty());
     assert!(cfg.issue_workflow.auto_replan_on_plan_issue);

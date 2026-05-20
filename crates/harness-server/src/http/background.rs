@@ -1475,6 +1475,66 @@ fn runtime_worker_loop_policy(
     }
 }
 
+fn log_runtime_worker_tick_result(
+    result: Result<
+        anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>,
+        tokio::task::JoinError,
+    >,
+) {
+    match result {
+        Ok(Ok(tick)) if tick.touched_anything() => {
+            tracing::info!(
+                succeeded = tick.succeeded,
+                failed = tick.failed,
+                cancelled = tick.cancelled,
+                "workflow runtime job worker tick complete"
+            );
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("workflow runtime job worker tick failed: {e}");
+        }
+        Err(e) => {
+            tracing::warn!("workflow runtime job worker task panicked: {e}");
+        }
+    }
+}
+
+fn drain_finished_runtime_worker_ticks(
+    workers: &mut tokio::task::JoinSet<
+        anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>,
+    >,
+) {
+    while let Some(result) = workers.try_join_next() {
+        log_runtime_worker_tick_result(result);
+    }
+}
+
+fn runtime_worker_open_slots(active_workers: usize, configured_concurrency: u32) -> usize {
+    (configured_concurrency.max(1) as usize).saturating_sub(active_workers)
+}
+
+fn spawn_runtime_worker_ticks(
+    workers: &mut tokio::task::JoinSet<
+        anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>,
+    >,
+    state: &Arc<AppState>,
+    concurrency: u32,
+    lease_ttl: chrono::Duration,
+    next_worker_id: &mut u64,
+) {
+    let open_slots = runtime_worker_open_slots(workers.len(), concurrency);
+    for _ in 0..open_slots {
+        let state = state.clone();
+        let owner = format!("server-runtime-worker-{next_worker_id}");
+        *next_worker_id = next_worker_id.saturating_add(1);
+        workers.spawn(async move {
+            crate::workflow_runtime_worker::run_runtime_job_worker_tick(&state, owner, lease_ttl)
+                .await
+        });
+    }
+}
+
 pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
     if state.core.workflow_runtime_store.is_none() {
         tracing::debug!("workflow runtime job workers disabled: store unavailable");
@@ -1483,6 +1543,8 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
 
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
+        let mut workers = tokio::task::JoinSet::new();
+        let mut next_worker_id = 0;
         loop {
             let state = match weak_state.upgrade() {
                 Some(state) => state,
@@ -1494,38 +1556,15 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
             );
             let policy = runtime_worker_loop_policy(workflow_cfg.runtime_worker);
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
-            let concurrency = policy.concurrency.max(1);
             let lease_ttl = runtime_worker_lease_ttl(&policy);
-            let mut handles = Vec::with_capacity(concurrency as usize);
-            for worker_idx in 0..concurrency {
-                let state = state.clone();
-                let owner = format!("server-runtime-worker-{worker_idx}");
-                handles.push(tokio::spawn(async move {
-                    crate::workflow_runtime_worker::run_runtime_job_worker_tick(
-                        &state, owner, lease_ttl,
-                    )
-                    .await
-                }));
-            }
-            for handle in handles {
-                match handle.await {
-                    Ok(Ok(tick)) if tick.touched_anything() => {
-                        tracing::info!(
-                            succeeded = tick.succeeded,
-                            failed = tick.failed,
-                            cancelled = tick.cancelled,
-                            "workflow runtime job worker tick complete"
-                        );
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!("workflow runtime job worker tick failed: {e}");
-                    }
-                    Err(e) => {
-                        tracing::warn!("workflow runtime job worker task panicked: {e}");
-                    }
-                }
-            }
+            drain_finished_runtime_worker_ticks(&mut workers);
+            spawn_runtime_worker_ticks(
+                &mut workers,
+                &state,
+                policy.concurrency,
+                lease_ttl,
+                &mut next_worker_id,
+            );
             tokio::time::sleep(interval).await;
         }
     });
@@ -2779,8 +2818,48 @@ mod tests {
         let effective = runtime_worker_loop_policy(policy);
 
         assert!(effective.enabled);
-        assert_eq!(effective.concurrency, 1);
+        assert_eq!(effective.concurrency, 10);
         assert_eq!(effective.interval_secs, 5);
+    }
+
+    #[test]
+    fn runtime_worker_open_slots_preserves_capacity_when_one_worker_hangs() {
+        assert_eq!(runtime_worker_open_slots(1, 6), 5);
+        assert_eq!(runtime_worker_open_slots(6, 6), 0);
+        assert_eq!(runtime_worker_open_slots(0, 0), 1);
+        assert_eq!(runtime_worker_open_slots(1, 10), 9);
+    }
+
+    #[tokio::test]
+    async fn drain_finished_runtime_worker_ticks_does_not_wait_for_hanging_worker() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            std::future::pending::<
+                anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>,
+            >()
+            .await
+        });
+        workers.spawn(async {
+            Ok(crate::workflow_runtime_worker::RuntimeJobWorkerTick {
+                succeeded: 1,
+                ..Default::default()
+            })
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                drain_finished_runtime_worker_ticks(&mut workers);
+                if workers.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished worker should be drained without waiting for hung worker");
+
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
     }
 
     // ARCH-GH-EXEMPT test double: mirrors the logic of fetch_pr_state_by_url in

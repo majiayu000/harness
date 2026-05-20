@@ -417,7 +417,7 @@ fn default_runtime_worker_interval_secs() -> u64 {
 }
 
 fn default_runtime_worker_concurrency() -> u32 {
-    1
+    10
 }
 
 fn default_runtime_worker_lease_ttl_secs() -> u64 {
