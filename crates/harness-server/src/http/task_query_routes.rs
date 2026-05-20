@@ -6,13 +6,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::state::AppState;
 use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskKind, TaskPhase, TaskSchedulerState, TaskState,
-    TaskStatus, TaskSummary, TaskSummaryFilter, TaskWorkflowSummary,
+    TaskStatus, TaskSummary, TaskSummaryFilter, TaskSummaryPageCursor, TaskWorkflowSummary,
 };
 use harness_core::proof_of_work::{CiStatus, ProofOfWork, QualitySignal, ReviewOutcome};
 
@@ -69,7 +70,7 @@ struct TaskListQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskListCursor {
-    created_at: String,
+    created_at: chrono::DateTime<chrono::Utc>,
     id: String,
 }
 
@@ -146,10 +147,19 @@ pub(crate) async fn list_tasks(
         Err(error) => return error.into_response(),
     };
 
+    let task_store_cursor = query
+        .cursor
+        .as_ref()
+        .map(TaskListCursor::as_task_summary_cursor);
+
     match state
         .core
         .tasks
-        .list_summaries_filtered_with_terminal(&query.filter)
+        .list_summaries_filtered_page_with_terminal(
+            &query.filter,
+            task_store_cursor.as_ref(),
+            query.limit + 1,
+        )
         .await
     {
         Ok(mut summaries) => {
@@ -206,12 +216,16 @@ pub(crate) async fn list_tasks(
                     };
                 }
             }
-            if let Err(e) =
-                append_runtime_submission_summaries(&state, &mut summaries, &query.filter).await
+            if let Err(e) = append_runtime_submission_summaries(
+                &state,
+                &mut summaries,
+                &query.filter,
+                query.limit + 1,
+            )
+            .await
             {
                 tracing::error!("list_tasks: failed to append runtime submission summaries: {e}");
             }
-            summaries.retain(|summary| query.filter.matches_summary(summary));
             sort_task_summaries(&mut summaries);
             let counts = task_list_counts(&summaries);
             let (data, page) = paginate_task_summaries(&summaries, &query);
@@ -355,9 +369,26 @@ fn parse_task_list_cursor(raw: &str) -> Result<TaskListCursor, TaskListQueryErro
         ));
     }
     Ok(TaskListCursor {
-        created_at: created_at.to_string(),
+        created_at: chrono::DateTime::parse_from_rfc3339(created_at)
+            .map_err(|_| {
+                task_list_bad_request(
+                    "invalid_cursor",
+                    "cursor created_at is not a valid RFC3339 timestamp.",
+                    None,
+                )
+            })?
+            .with_timezone(&chrono::Utc),
         id: id.to_string(),
     })
+}
+
+impl TaskListCursor {
+    fn as_task_summary_cursor(&self) -> TaskSummaryPageCursor {
+        TaskSummaryPageCursor {
+            created_at: self.created_at,
+            id: self.id.clone(),
+        }
+    }
 }
 
 fn task_list_bad_request(
@@ -407,18 +438,18 @@ fn allowed_scheduler_states() -> Vec<&'static str> {
 }
 
 fn sort_task_summaries(summaries: &mut [TaskSummary]) {
-    summaries.sort_by(|left, right| {
-        task_summary_sort_key(right)
-            .cmp(&task_summary_sort_key(left))
-            .then_with(|| right.id.as_str().cmp(left.id.as_str()))
-    });
+    summaries.sort_by(compare_task_summaries_desc);
 }
 
-fn task_summary_sort_key(summary: &TaskSummary) -> (&str, &str) {
-    (
-        summary.created_at.as_deref().unwrap_or(""),
-        summary.id.as_str(),
-    )
+fn compare_task_summaries_desc(left: &TaskSummary, right: &TaskSummary) -> Ordering {
+    match (left.created_at.as_deref(), right.created_at.as_deref()) {
+        (Some(left_created), Some(right_created)) => right_created
+            .cmp(left_created)
+            .then_with(|| right.id.as_str().cmp(left.id.as_str())),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => right.id.as_str().cmp(left.id.as_str()),
+    }
 }
 
 fn task_list_counts(summaries: &[TaskSummary]) -> TaskListCounts {
@@ -461,7 +492,7 @@ fn paginate_task_summaries(
         page.truncate(query.limit);
     }
     let next_cursor = has_more
-        .then(|| page.last().map(task_list_cursor_for_summary))
+        .then(|| page.last().and_then(task_list_cursor_for_summary))
         .flatten();
     (
         page,
@@ -474,23 +505,28 @@ fn paginate_task_summaries(
 }
 
 fn task_is_after_cursor(summary: &TaskSummary, cursor: &TaskListCursor) -> bool {
-    let (created_at, id) = task_summary_sort_key(summary);
-    created_at < cursor.created_at.as_str()
-        || (created_at == cursor.created_at.as_str() && id < cursor.id.as_str())
+    let Some(created_at) = summary
+        .created_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+    else {
+        return false;
+    };
+    created_at < cursor.created_at
+        || (created_at == cursor.created_at && summary.id.as_str() < cursor.id.as_str())
 }
 
-fn task_list_cursor_for_summary(summary: &TaskSummary) -> String {
-    format!(
-        "{}|{}",
-        summary.created_at.as_deref().unwrap_or(""),
-        summary.id.as_str()
-    )
+fn task_list_cursor_for_summary(summary: &TaskSummary) -> Option<String> {
+    let created_at = summary.created_at.as_deref()?;
+    Some(format!("{}|{}", created_at, summary.id.as_str()))
 }
 
 async fn append_runtime_submission_summaries(
     state: &AppState,
     summaries: &mut Vec<TaskSummary>,
     filter: &TaskSummaryFilter,
+    limit: usize,
 ) -> anyhow::Result<()> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(());
@@ -501,6 +537,7 @@ async fn append_runtime_submission_summaries(
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         TaskKind::Issue,
         filter,
+        limit,
     )
     .await?;
     append_runtime_definition_summaries(
@@ -509,6 +546,7 @@ async fn append_runtime_submission_summaries(
         harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         TaskKind::Prompt,
         filter,
+        limit,
     )
     .await
 }
@@ -519,9 +557,14 @@ async fn append_runtime_definition_summaries(
     definition_id: &str,
     task_kind: TaskKind,
     filter: &TaskSummaryFilter,
+    limit: usize,
 ) -> anyhow::Result<()> {
     let workflows = store
-        .list_instances_by_definition(definition_id, filter.project.as_deref(), None)
+        .list_instances_by_definition(
+            definition_id,
+            filter.project.as_deref(),
+            Some(i64::try_from(limit.max(1)).unwrap_or(i64::MAX)),
+        )
         .await?;
     let mut listed_ids: HashSet<String> = summaries
         .iter()

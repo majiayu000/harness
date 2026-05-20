@@ -1,5 +1,5 @@
 use crate::task_db::TaskDb;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
 use harness_core::agent::StreamItem;
@@ -61,6 +61,12 @@ pub struct TaskSummaryFilter {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSummaryPageCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: String,
+}
+
 impl TaskSummaryFilter {
     pub fn matches_summary(&self, summary: &TaskSummary) -> bool {
         if !self.statuses.is_empty() && !self.statuses.contains(&summary.status) {
@@ -102,6 +108,19 @@ impl TaskSummaryFilter {
         }
         true
     }
+}
+
+fn task_summary_is_after_cursor(summary: &TaskSummary, cursor: &TaskSummaryPageCursor) -> bool {
+    let Some(created_at) = summary
+        .created_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+    else {
+        return false;
+    };
+    created_at < cursor.created_at
+        || (created_at == cursor.created_at && summary.id.as_str() < cursor.id.as_str())
 }
 
 impl TaskStore {
@@ -441,6 +460,33 @@ impl TaskStore {
         for entry in self.cache.iter() {
             let summary = entry.value().summary();
             if filter.matches_summary(&summary) {
+                by_id.insert(entry.key().clone(), summary);
+            } else {
+                by_id.remove(entry.key());
+            }
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    pub async fn list_summaries_filtered_page_with_terminal(
+        &self,
+        filter: &TaskSummaryFilter,
+        cursor: Option<&TaskSummaryPageCursor>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TaskSummary>> {
+        let db_limit = limit.saturating_add(self.cache.len()).saturating_add(1);
+        let mut by_id: std::collections::HashMap<TaskId, TaskSummary> = self
+            .db
+            .list_summaries_filtered_page(filter, cursor, db_limit)
+            .await?
+            .into_iter()
+            .map(|summary| (summary.id.clone(), summary))
+            .collect();
+        for entry in self.cache.iter() {
+            let summary = entry.value().summary();
+            if filter.matches_summary(&summary)
+                && cursor.is_none_or(|cursor| task_summary_is_after_cursor(&summary, cursor))
+            {
                 by_id.insert(entry.key().clone(), summary);
             } else {
                 by_id.remove(entry.key());

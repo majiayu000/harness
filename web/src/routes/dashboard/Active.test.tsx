@@ -120,9 +120,18 @@ describe("<Active>", () => {
     });
   });
 
-  it("filters to matching project when projectFilter is set", () => {
-    mockUseTasks.mockReturnValue({ data: taskList(tasks), isLoading: false, isError: false });
+  it("requests project-scoped active tasks when projectFilter is set", () => {
+    mockUseTasks.mockReturnValue({
+      data: taskList([tasks[0], tasks[2]]),
+      isLoading: false,
+      isError: false,
+    });
     wrap(<Active projectFilter="harness" />);
+    expect(mockUseTasks).toHaveBeenCalledWith({
+      active: true,
+      limit: 200,
+      project_id: "harness",
+    });
     expect(screen.getByText("t1")).toBeInTheDocument();
     expect(screen.getByText("t3")).toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
@@ -139,8 +148,13 @@ describe("<Active>", () => {
   });
 
   it("shows empty columns when projectFilter matches no tasks", () => {
-    mockUseTasks.mockReturnValue({ data: taskList(tasks), isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     wrap(<Active projectFilter="nonexistent" />);
+    expect(mockUseTasks).toHaveBeenCalledWith({
+      active: true,
+      limit: 200,
+      project_id: "nonexistent",
+    });
     expect(screen.queryByText("t1")).not.toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
     const dashes = screen.getAllByText("—");
