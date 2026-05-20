@@ -3,11 +3,24 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-CONFIG_PATH="${HARNESS_CONFIG:-config/claude.toml}"
+CONFIG_PATH="${HARNESS_CONFIG:-}"
+CONFIG_ARGS=()
 
-if [ ! -f "$CONFIG_PATH" ]; then
-    echo "ERROR: Harness config not found: $CONFIG_PATH" >&2
-    exit 1
+if [ -n "$CONFIG_PATH" ]; then
+    if [ ! -f "$CONFIG_PATH" ]; then
+        echo "ERROR: Harness config not found: $CONFIG_PATH" >&2
+        exit 1
+    fi
+    CONFIG_ARGS=(--config "$CONFIG_PATH")
+elif [ -f "config/default.toml" ]; then
+    CONFIG_PATH="config/default.toml"
+    CONFIG_ARGS=(--config "$CONFIG_PATH")
+elif [ -f "config/claude.toml" ]; then
+    CONFIG_PATH="config/claude.toml"
+    CONFIG_ARGS=(--config "$CONFIG_PATH")
+else
+    CONFIG_PATH=""
+    echo "No local config file found; using built-in defaults plus local Postgres defaults." >&2
 fi
 
 config_http_addr() {
@@ -25,7 +38,10 @@ config_http_addr() {
     ' "$CONFIG_PATH"
 }
 
-BIND_ADDR="${HARNESS_HTTP_ADDR:-$(config_http_addr)}"
+BIND_ADDR="${HARNESS_HTTP_ADDR:-}"
+if [ -z "$BIND_ADDR" ] && [ -n "$CONFIG_PATH" ]; then
+    BIND_ADDR="$(config_http_addr)"
+fi
 BIND_ADDR="${BIND_ADDR:-127.0.0.1:9800}"
 BIND_PORT="${BIND_ADDR##*:}"
 
@@ -91,11 +107,24 @@ ensure_bind_port_available() {
         exit 1
     fi
 
+    for pid in $pids; do
+        if ! is_harness_listener "$pid"; then
+            echo "ERROR: port $BIND_PORT is in use by a non-Harness process:" >&2
+            print_listener_table "$pids"
+            exit 1
+        fi
+    done
+
     echo "Harness server is already running on $BIND_ADDR:" >&2
     print_listener_table "$pids"
     health_url="http://$BIND_ADDR/health"
     if curl -fsS --max-time 2 "$health_url" >/dev/null 2>&1; then
         echo "Health check OK: $health_url" >&2
+    else
+        echo "ERROR: existing Harness server did not pass health check: $health_url" >&2
+        echo "To restart explicitly, run:" >&2
+        echo "  HARNESS_RESTART=1 ./start-server.sh" >&2
+        exit 1
     fi
     echo "No new server was started. To restart explicitly, run:" >&2
     echo "  HARNESS_RESTART=1 ./start-server.sh" >&2
@@ -111,6 +140,10 @@ else
     echo "WARNING: Docker Compose v2 not available; assuming Postgres is already running." >&2
 fi
 
+if [ -z "${HARNESS_DATABASE_URL:-}" ] && [ -z "$CONFIG_PATH" ]; then
+    export HARNESS_DATABASE_URL="postgres://harness:harness@localhost:5432/harness"
+fi
+
 # Auto-detect GITHUB_TOKEN from gh CLI if not already set
 if [ -z "${GITHUB_TOKEN:-}" ]; then
     GITHUB_TOKEN=$(gh auth token 2>/dev/null || true)
@@ -123,4 +156,4 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
     fi
 fi
 
-exec ./target/release/harness serve --config "$CONFIG_PATH"
+exec ./target/release/harness serve "${CONFIG_ARGS[@]}"
