@@ -151,8 +151,13 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         }
     }
 
-    // Get the adapter for this agent, if any.
-    let adapter_opt = server.agent_registry.get_adapter(&agent_name);
+    // Prefer the per-turn execution adapter when one exists. Stateful
+    // turn-executing adapters must not be shared across concurrent turns; the
+    // registry may return a fresh adapter instance here.
+    let execution_adapter = server.agent_registry.turn_execution_adapter(&agent_name);
+    let adapter_opt = execution_adapter
+        .clone()
+        .or_else(|| server.agent_registry.get_adapter(&agent_name));
 
     // Register as live adapter (RAII guard for cleanup on turn exit).
     // Adapters may be control-only (Claude: interrupt/steer/approval side
@@ -175,7 +180,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     // it owns the full lifecycle. This is the strategy pattern boundary between
     // Codex's App Server adapter and Claude's control-only adapter; avoid
     // branching on agent names here.
-    let execution_adapter = server.agent_registry.turn_execution_adapter(&agent_name);
     let mut execution: std::pin::Pin<
         Box<dyn std::future::Future<Output = harness_core::error::Result<()>> + Send>,
     > = if let Some(adapter_arc) = execution_adapter {
