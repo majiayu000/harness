@@ -131,8 +131,12 @@ listener_pids() {
     local pid
 
     if ! command -v lsof >/dev/null 2>&1; then
-        echo "ERROR: lsof is required to inspect listeners on $BIND_ADDR." >&2
-        exit 1
+        if [ "${HARNESS_RESTART:-}" = "1" ]; then
+            echo "ERROR: lsof is required to restart Harness on $BIND_ADDR." >&2
+            exit 1
+        fi
+        echo "WARNING: lsof is unavailable; skipping listener preflight for $BIND_ADDR." >&2
+        return 0
     fi
 
     if ! lsof_output="$(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>&1)"; then
