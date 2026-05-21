@@ -140,7 +140,8 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
                     QUALITY_FAILED_SIGNAL,
                     QUALITY_BLOCKED_SIGNAL,
                 ])
-                .requires("quality_gate_status_signal")
+                .with_accepted_artifacts(vec!["validation_report"])
+                .requires("quality_gate_status_signal_and_validation_evidence")
         }
         (REPO_BACKLOG_DEFINITION_ID, "start_child_workflow") => {
             ActivityContract::new(workflow_definition, activity)

@@ -7,7 +7,10 @@ use super::pr_feedback::{
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use super::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
-use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
+use super::quality_gate::{
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
+};
 use super::repo_backlog::{
     REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
@@ -105,6 +108,10 @@ fn reduce_success(
     if let Some(decision) =
         repo_backlog_sprint_plan_decision_from_activity_result(instance, event, result)
     {
+        return Some(decision);
+    }
+
+    if let Some(decision) = quality_gate_success_decision(instance, event, result) {
         return Some(decision);
     }
 
@@ -1151,6 +1158,66 @@ fn invalid_agent_output_blocked_decision(
     ))
     .with_evidence(runtime_completion_evidence(event, result))
     .high_confidence()
+}
+
+fn quality_gate_success_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        QUALITY_GATE_DEFINITION_ID,
+        "checking",
+        QUALITY_GATE_ACTIVITY,
+    ) {
+        return None;
+    }
+
+    let passed = signal_count(result, QUALITY_PASSED_SIGNAL);
+    let failed = signal_count(result, QUALITY_FAILED_SIGNAL);
+    let blocked = signal_count(result, QUALITY_BLOCKED_SIGNAL);
+    if passed == 1 && failed == 0 && blocked == 0 && quality_gate_has_validation_evidence(result) {
+        return Some(
+            WorkflowDecision::new(
+                &instance.id,
+                &instance.state,
+                "quality_passed",
+                "passed",
+                "quality gate activity completed successfully with passing evidence",
+            )
+            .with_evidence(runtime_completion_evidence(event, result))
+            .high_confidence(),
+        );
+    }
+
+    let status_count = passed + failed + blocked;
+    let reason = if status_count == 0 {
+        "run_quality_gate succeeded without a quality status signal"
+    } else if passed == 0 {
+        "run_quality_gate succeeded without a QualityPassed signal"
+    } else if passed > 1 || failed > 0 || blocked > 0 {
+        "run_quality_gate succeeded with ambiguous quality status signals"
+    } else {
+        "run_quality_gate succeeded without validation evidence"
+    };
+    Some(invalid_agent_output_blocked_decision(
+        instance, event, result, reason,
+    ))
+}
+
+fn quality_gate_has_validation_evidence(result: &ActivityResult) -> bool {
+    result
+        .validation
+        .iter()
+        .any(|record| !record.command.trim().is_empty())
+        || result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "validation_report")
 }
 
 fn signal_count(result: &ActivityResult, signal_type: &str) -> usize {
