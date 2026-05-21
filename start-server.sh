@@ -99,7 +99,7 @@ listener_pids() {
         if listener_name_matches_bind "$name"; then
             printf '%s\n' "$pid"
         fi
-    done < <(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>/dev/null || true)
+    done < <(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>/dev/null || true) | awk '!seen[$0]++'
 }
 
 health_check_addr() {
@@ -235,4 +235,4 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
     fi
 fi
 
-exec ./target/release/harness serve "${CONFIG_ARGS[@]}"
+exec ./target/release/harness serve "${CONFIG_ARGS[@]}" --project-root "$(pwd)"
