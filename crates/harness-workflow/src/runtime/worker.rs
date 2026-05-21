@@ -363,9 +363,17 @@ fn apply_inline_command_side_effect(
     instance: &mut WorkflowInstance,
     command: &WorkflowCommand,
 ) -> anyhow::Result<()> {
-    if command.command_type != WorkflowCommandType::BindPr {
-        return Ok(());
+    match command.command_type {
+        WorkflowCommandType::BindPr => apply_bind_pr_side_effect(instance, command),
+        WorkflowCommandType::MarkDone => apply_mark_done_side_effect(instance, command),
+        _ => Ok(()),
     }
+}
+
+fn apply_bind_pr_side_effect(
+    instance: &mut WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<()> {
     let pr_number = command
         .command
         .get("pr_number")
@@ -386,6 +394,24 @@ fn apply_inline_command_side_effect(
         .context("workflow instance data is not an object")?;
     data.insert("pr_number".to_string(), json!(pr_number));
     data.insert("pr_url".to_string(), json!(pr_url));
+    Ok(())
+}
+
+fn apply_mark_done_side_effect(
+    instance: &mut WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<()> {
+    let Some(closed_issue_evidence) = command.command.get("closed_issue_evidence").cloned() else {
+        return Ok(());
+    };
+    if !instance.data.is_object() {
+        instance.data = json!({});
+    }
+    let data = instance
+        .data
+        .as_object_mut()
+        .context("workflow instance data is not an object")?;
+    data.insert("closed_issue_evidence".to_string(), closed_issue_evidence);
     Ok(())
 }
 

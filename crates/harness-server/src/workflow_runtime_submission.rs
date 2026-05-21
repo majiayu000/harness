@@ -1,11 +1,11 @@
 use crate::task_runner::{TaskId, TaskStatus, TaskStore};
 use harness_workflow::runtime::{
-    activity_result_has_closed_issue_evidence, build_issue_submission_decision,
-    build_prompt_submission_decision, value_has_closed_issue_evidence, ActivityResult,
-    DecisionValidator, IssueSubmissionDecisionInput, PromptSubmissionDecisionInput,
-    ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject, PROMPT_TASK_DEFINITION_ID, RUNTIME_JOB_COMPLETED_EVENT,
+    activity_result_value_has_closed_issue_evidence, build_issue_submission_decision,
+    build_prompt_submission_decision, value_has_closed_issue_evidence, DecisionValidator,
+    IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, ValidationContext,
+    WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowDefinition, WorkflowEvent, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    PROMPT_TASK_DEFINITION_ID, RUNTIME_JOB_COMPLETED_EVENT,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -191,11 +191,11 @@ async fn blocked_issue_dependency_is_satisfied(
     if instance_data_has_closed_issue_evidence(&instance.data) {
         return Ok(true);
     }
-    let events = store.events_for(&instance.id).await?;
-    Ok(events
-        .iter()
-        .rev()
-        .any(runtime_event_has_closed_issue_evidence))
+    Ok(store
+        .latest_event_for_type(&instance.id, RUNTIME_JOB_COMPLETED_EVENT)
+        .await?
+        .as_ref()
+        .is_some_and(runtime_event_has_closed_issue_evidence))
 }
 
 fn instance_data_has_closed_issue_evidence(data: &serde_json::Value) -> bool {
@@ -212,9 +212,7 @@ fn runtime_event_has_closed_issue_evidence(event: &WorkflowEvent) -> bool {
     event
         .event
         .get("activity_result")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<ActivityResult>(value).ok())
-        .is_some_and(|result| activity_result_has_closed_issue_evidence(&result))
+        .is_some_and(activity_result_value_has_closed_issue_evidence)
 }
 
 pub(crate) async fn release_ready_issue_dependencies(

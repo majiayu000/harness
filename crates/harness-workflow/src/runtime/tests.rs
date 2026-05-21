@@ -876,6 +876,61 @@ fn runtime_completion_reducer_finishes_blocked_closed_issue_signal_without_pr() 
 }
 
 #[test]
+fn runtime_completion_reducer_finishes_feedback_closed_issue_signal_without_pr() {
+    let instance = issue_instance("addressing_feedback");
+    let result = ActivityResult {
+        activity: "address_pr_feedback".to_string(),
+        status: ActivityStatus::Blocked,
+        summary: "Issue was closed while addressing PR feedback.".to_string(),
+        artifacts: Vec::new(),
+        signals: vec![ActivitySignal::new(
+            "IssueClosed",
+            json!({
+                "issue_number": 123,
+                "state": "closed",
+                "issue_url": "https://github.com/owner/repo/issues/123"
+            }),
+        )],
+        validation: Vec::new(),
+        error: Some("No further feedback work is needed because the issue is closed.".to_string()),
+        error_kind: None,
+    };
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue signal from feedback work should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkDone
+    );
+    assert_eq!(
+        decision.commands[0].command["activity"],
+        "address_pr_feedback"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("feedback closed issue completion should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_uses_issue_state_artifact_as_closed_issue_evidence() {
     let instance = issue_instance("implementing");
     let result =
@@ -4367,6 +4422,10 @@ async fn runtime_worker_finishes_closed_issue_success_without_pr() -> anyhow::Re
     assert_eq!(reloaded.state, "done");
     assert_eq!(reloaded.data["project_id"], "/project-a");
     assert_eq!(reloaded.data["issue_number"], 125);
+    assert_eq!(
+        reloaded.data["closed_issue_evidence"]["issue_url"],
+        "https://github.com/owner/repo/issues/125"
+    );
 
     let commands = store.commands_for(&workflow.id).await?;
     assert_eq!(commands[0].id, command_id);

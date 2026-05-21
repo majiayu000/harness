@@ -1011,6 +1011,83 @@ async fn issue_submission_keeps_blocked_runtime_dependency_without_closed_eviden
 }
 
 #[tokio::test]
+async fn issue_submission_releases_blocked_runtime_dependency_with_persisted_closed_evidence(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = open_runtime_store(dir.path()).await?;
+    let task_store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let labels = vec!["bug".to_string()];
+    let dep_id = TaskId::from_str("runtime-blocked-persisted-closed-evidence");
+    let dep_result = record_issue_submission(
+        &store,
+        IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 86,
+            task_id: &dep_id,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+    let mut dep_workflow = store
+        .get_instance(&dep_result.workflow_id)
+        .await?
+        .expect("dependency workflow should exist");
+    dep_workflow.state = "blocked".to_string();
+    dep_workflow.data["closed_issue_evidence"] = serde_json::json!({
+        "source": "IssueClosed",
+        "issue_number": 86,
+        "state": "closed",
+        "issue_url": "https://github.com/owner/repo/issues/86",
+        "closed": true,
+    });
+    store.upsert_instance(&dep_workflow).await?;
+
+    let task_id = TaskId::from_str("runtime-dependent-on-persisted-closed-evidence");
+    let blocked = record_issue_submission(
+        &store,
+        IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 87,
+            task_id: &task_id,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: std::slice::from_ref(&dep_id),
+            dependencies_blocked: true,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+
+    let released = release_ready_issue_dependencies(&store, &task_store, 10).await?;
+    assert_eq!(released.released, 1);
+    assert_eq!(released.waiting, 0);
+    assert_eq!(released.failed, 0);
+    let workflow = store
+        .get_instance(&blocked.workflow_id)
+        .await?
+        .expect("dependent workflow should remain persisted");
+    assert_eq!(workflow.state, "implementing");
+    assert_eq!(store.commands_for(&blocked.workflow_id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn issue_submission_releases_blocked_runtime_dependency_with_closed_issue_evidence(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
