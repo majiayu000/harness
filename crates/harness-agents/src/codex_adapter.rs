@@ -1055,6 +1055,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
+        let adapter = CodexAdapter::new(PathBuf::from("codex"));
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                r#"printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress","items":[]}}}'; read _ || true"#,
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("stub app-server should spawn");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let stdin = child.stdin.take().expect("stdin should be piped");
+        {
+            let mut state = adapter.state.lock().await;
+            state.child = Some(child);
+            state.stdin = Some(stdin);
+            state.stdout_lines = Some(BufReader::new(stdout).lines());
+            state.thread_id = Some("thread-1".into());
+        }
+
+        let req = TurnRequest {
+            prompt: "ping".to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            model: None,
+            reasoning_effort: None,
+            sandbox_mode: None,
+            approval_policy: None,
+            allowed_tools: vec![],
+            context: vec![],
+            timeout_secs: None,
+            capability_token: None,
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let error = adapter
+            .start_turn(req, tx)
+            .await
+            .expect_err("stdout EOF before a terminal event should fail");
+
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::TurnStarted)));
+        assert!(format!("{error}").contains("stdout closed before turn/completed"));
+        let state = adapter.state.lock().await;
+        assert!(state.child.is_none());
+        assert!(state.stdin.is_none());
+        assert!(state.stdout_lines.is_none());
+        assert!(state.thread_id.is_none());
+        assert!(state.active_turn_id.is_none());
+    }
+
+    #[tokio::test]
     async fn adapter_state_reports_incomplete_child_when_stdout_reader_is_missing() {
         let mut child = tokio::process::Command::new("sleep")
             .arg("60")
