@@ -9,6 +9,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::{json, Value};
+use std::time::Duration as StdDuration;
 
 const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
 
@@ -45,7 +46,7 @@ impl<'a> RuntimeWorker<'a> {
         &self,
         executor: &(dyn RuntimeJobExecutor + Send + Sync),
     ) -> anyhow::Result<Option<RuntimeJob>> {
-        let lease_expires_at = Utc::now() + self.lease_ttl;
+        let mut lease_expires_at = Utc::now() + self.lease_ttl;
         let Some(job) = self
             .store
             .claim_next_runtime_job(&self.owner, lease_expires_at)
@@ -83,7 +84,11 @@ impl<'a> RuntimeWorker<'a> {
                         )
                         .await?;
                 }
-                executor.execute(job.clone()).await
+                let execution = self
+                    .execute_with_lease_renewal(&job, executor, lease_expires_at)
+                    .await?;
+                lease_expires_at = execution.lease_expires_at;
+                execution.result
             }
         };
         self.store
@@ -115,6 +120,59 @@ impl<'a> RuntimeWorker<'a> {
                 .await?;
         }
         Ok(Some(completion.runtime_job))
+    }
+
+    async fn execute_with_lease_renewal(
+        &self,
+        job: &RuntimeJob,
+        executor: &(dyn RuntimeJobExecutor + Send + Sync),
+        initial_lease_expires_at: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<RuntimeJobExecution> {
+        let mut lease_expires_at = initial_lease_expires_at;
+        let renewal_interval = runtime_lease_renewal_interval(self.lease_ttl);
+        let activity = runtime_job_activity_name(job);
+        let execution = executor.execute(job.clone());
+        tokio::pin!(execution);
+
+        loop {
+            let renewal_sleep = tokio::time::sleep(renewal_interval);
+            tokio::pin!(renewal_sleep);
+
+            tokio::select! {
+                result = &mut execution => {
+                    return Ok(RuntimeJobExecution {
+                        result,
+                        lease_expires_at,
+                    });
+                }
+                _ = &mut renewal_sleep => {
+                    let next_lease_expires_at = Utc::now() + self.lease_ttl;
+                    let Some(updated) = self.store
+                        .extend_runtime_job_lease_if_owned(
+                            &job.id,
+                            &self.owner,
+                            lease_expires_at,
+                            next_lease_expires_at,
+                        )
+                        .await?
+                    else {
+                        return Ok(RuntimeJobExecution {
+                            result: ActivityResult::failed(
+                                activity,
+                                "Runtime job lease was lost before the agent completed.",
+                                "Another runtime worker reclaimed the job after this worker's lease expired.",
+                            ),
+                            lease_expires_at,
+                        });
+                    };
+                    lease_expires_at = updated
+                        .lease
+                        .as_ref()
+                        .map(|lease| lease.expires_at)
+                        .unwrap_or(next_lease_expires_at);
+                }
+            }
+        }
     }
 
     async fn propagate_pr_feedback_child_completion(
@@ -245,6 +303,24 @@ impl<'a> RuntimeWorker<'a> {
             max_turns,
         )))
     }
+}
+
+struct RuntimeJobExecution {
+    result: ActivityResult,
+    lease_expires_at: chrono::DateTime<Utc>,
+}
+
+fn runtime_lease_renewal_interval(lease_ttl: Duration) -> StdDuration {
+    let lease_ttl_secs = lease_ttl.num_seconds().max(1) as u64;
+    StdDuration::from_secs((lease_ttl_secs / 2).clamp(1, 30))
+}
+
+fn runtime_job_activity_name(job: &RuntimeJob) -> String {
+    job.input
+        .get("activity")
+        .and_then(Value::as_str)
+        .unwrap_or("runtime_job")
+        .to_string()
 }
 
 fn runtime_event_result_succeeded(event: &super::model::WorkflowEvent) -> bool {

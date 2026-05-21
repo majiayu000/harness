@@ -27,16 +27,16 @@ use super::runtime_profile::{
 };
 use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 
-const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS: u64 = 600;
 
-pub(super) struct ServerRuntimeJobExecutor {
-    state: Arc<AppState>,
+pub(super) struct ServerRuntimeJobExecutor<'a> {
+    state: &'a Arc<AppState>,
 }
 
-impl ServerRuntimeJobExecutor {
-    pub(super) fn new(state: Arc<AppState>) -> Self {
+impl<'a> ServerRuntimeJobExecutor<'a> {
+    pub(super) fn new(state: &'a Arc<AppState>) -> Self {
         Self { state }
     }
 
@@ -77,7 +77,7 @@ impl ServerRuntimeJobExecutor {
         }
 
         let runtime_workspace = prepare_runtime_workspace(
-            &self.state,
+            self.state,
             &job,
             workflow.as_ref(),
             &source_project_root,
@@ -110,7 +110,7 @@ impl ServerRuntimeJobExecutor {
                 prompt.clone(),
                 AgentId::from_str(agent_name),
             )?;
-            persist_created_thread(&self.state, &thread_id).await;
+            persist_created_thread(self.state, &thread_id).await;
 
             crate::task_executor::turn_lifecycle::run_turn_lifecycle_with_options(
                 self.state.core.server.clone(),
@@ -150,7 +150,7 @@ impl ServerRuntimeJobExecutor {
             ))
         }
         .await;
-        let finish_result = finish_runtime_workspace(&self.state, &runtime_workspace).await;
+        let finish_result = finish_runtime_workspace(self.state, &runtime_workspace).await;
         match (activity_result, finish_result) {
             (Ok(mut result), Err(error)) => {
                 tracing::warn!(
@@ -196,13 +196,13 @@ impl ServerRuntimeJobExecutor {
     ) -> anyhow::Result<Option<ActivityResult>> {
         match activity_name(job).as_str() {
             "start_child_workflow" => Ok(Some(
-                execute_start_child_workflow(&self.state, job, parent).await?,
+                execute_start_child_workflow(self.state, job, parent).await?,
             )),
             "mark_bound_issue_done" => Ok(Some(
-                execute_mark_bound_issue_done(&self.state, job, parent).await?,
+                execute_mark_bound_issue_done(self.state, job, parent).await?,
             )),
             "recover_issue_workflow" => Ok(Some(
-                execute_recover_issue_workflow(&self.state, job, parent).await?,
+                execute_recover_issue_workflow(self.state, job, parent).await?,
             )),
             _ => Ok(None),
         }
@@ -254,7 +254,7 @@ impl ServerRuntimeJobExecutor {
 }
 
 #[async_trait]
-impl RuntimeJobExecutor for ServerRuntimeJobExecutor {
+impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
         !is_builtin_lifecycle_activity(job)
     }
@@ -443,7 +443,7 @@ mod tests {
         );
         assert_eq!(
             runtime_timeout_fallback(&config, None, &runtime_job("implement_issue")),
-            Some(900)
+            Some(3600)
         );
     }
 }
