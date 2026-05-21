@@ -31,7 +31,10 @@ config_http_addr() {
             value = $2
             sub(/^[[:space:]]*/, "", value)
             sub(/[[:space:]]*#.*/, "", value)
-            gsub(/"/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
+                value = substr(value, 2, length(value) - 2)
+            }
             print value
             exit
         }
@@ -44,9 +47,49 @@ if [ -z "$BIND_ADDR" ] && [ -n "$CONFIG_PATH" ]; then
 fi
 BIND_ADDR="${BIND_ADDR:-127.0.0.1:9800}"
 BIND_PORT="${BIND_ADDR##*:}"
+BIND_HOST="${BIND_ADDR%:*}"
+BIND_HOST="${BIND_HOST#[}"
+BIND_HOST="${BIND_HOST%]}"
+
+listener_name_matches_bind() {
+    local name="$1"
+    local listener_host
+
+    listener_host="${name%:*}"
+    listener_host="${listener_host#[}"
+    listener_host="${listener_host%]}"
+
+    case "$BIND_HOST" in
+        "" | "*" | "0.0.0.0" | "::")
+            return 0
+            ;;
+    esac
+
+    case "$listener_host" in
+        "*" | "0.0.0.0" | "::")
+            return 0
+            ;;
+    esac
+
+    [ "$listener_host" = "$BIND_HOST" ]
+}
 
 listener_pids() {
-    lsof -nP -tiTCP:"$BIND_PORT" -sTCP:LISTEN 2>/dev/null || true
+    local line
+    local name
+    local pid
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [[ "$line" == COMMAND* ]] && continue
+        set -- $line
+        pid="$2"
+        name="${line##* TCP }"
+        name="${name% (LISTEN)}"
+        if listener_name_matches_bind "$name"; then
+            printf '%s\n' "$pid"
+        fi
+    done < <(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>/dev/null || true)
 }
 
 listener_pid_args() {
