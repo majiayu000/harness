@@ -521,9 +521,10 @@ Gate rules:
 7. Missing or pending advisory reports produce `advisory_pending` only when `external_required =
    true`; otherwise the gate can still return `approved` with pending advisory status attached to the
    report.
-8. Merge readiness requires local review pass, PR-head advancement after any local review fix,
-   unchanged reviewed PR head after CI polling, CI green, and an open PR. A PR that was already
-   merged externally after local approval completes the task instead of reopening review.
+8. Merge readiness requires local review pass, PR-head advancement after any local review fix that
+   changed the workspace or reported a pushed commit, unchanged reviewed PR head after CI polling,
+   CI green, and an open PR. A PR that was already merged externally after local approval completes
+   the task instead of reopening review.
 9. If no required providers are configured, Harness must log a warning and fall back to the legacy
    behavior for one release cycle.
 
@@ -786,8 +787,9 @@ Partial implementation shipped first:
 - `harness pr review` uses configured bot command and reviewer names instead of
   hardcoded Gemini strings.
 - Hosted-bot-disabled completion requires local review approval, local
-  validation, PR-head advancement after local review fixes, unchanged reviewed PR head after CI
-  polling, green GitHub PR checks, and an open PR before recording `ReadyToMerge`;
+  validation, PR-head advancement after local review fixes that changed the workspace or reported a
+  pushed commit, unchanged reviewed PR head after CI polling, green GitHub PR checks, and an open PR
+  before recording `ReadyToMerge`;
   PRs that merged externally after local approval are marked done instead of failed;
   pending checks are polled up to the configured review wait budget instead of
   failing immediately;

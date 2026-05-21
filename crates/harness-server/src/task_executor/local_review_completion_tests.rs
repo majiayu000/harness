@@ -433,7 +433,7 @@ async fn hosted_bot_disabled_blocks_pr_head_change_during_no_fix_review() -> any
                 before_review_error: None,
                 approved_review_sha: Some("new-sha"),
                 approved_review_error: None,
-                local_fix_attempted: false,
+                local_fix_requires_pr_head_advance: false,
             },
             pr_state: LocalReviewPrState::Open,
         }),
