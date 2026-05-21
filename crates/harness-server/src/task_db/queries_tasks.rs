@@ -362,17 +362,24 @@ impl TaskDb {
         )
         .fetch_all(&self.pool)
         .await?;
-        let mut summaries = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id = row.id.clone();
-            match TaskSummaryRow::try_into_summary(row) {
-                Ok(summary) => summaries.push(summary),
-                Err(e) => {
-                    tracing::warn!(task_id = %id, "skipping malformed task row in list_summaries: {e}");
-                }
-            }
-        }
-        Ok(summaries)
+        Ok(decode_task_summary_rows(rows, "list_summaries"))
+    }
+
+    /// Return active tasks as lightweight summaries, skipping terminal history and `rounds`.
+    pub async fn list_active_summaries(
+        &self,
+    ) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
+        let rows = sqlx::query_as::<_, TaskSummaryRow>(
+            "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
+             created_at, repo, depends_on, project, workspace_path, workspace_owner, \
+             run_generation, phase, description, scheduler_state \
+             FROM tasks \
+             WHERE status NOT IN ('done', 'failed', 'cancelled') \
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(decode_task_summary_rows(rows, "list_active_summaries"))
     }
 
     /// Return `(task_id, first_token_latency_ms)` pairs for the 500 most-recently
@@ -668,6 +675,23 @@ impl TaskDb {
             .await?;
         Ok(())
     }
+}
+
+fn decode_task_summary_rows(
+    rows: Vec<TaskSummaryRow>,
+    context: &str,
+) -> Vec<crate::task_runner::TaskSummary> {
+    let mut summaries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row.id.clone();
+        match TaskSummaryRow::try_into_summary(row) {
+            Ok(summary) => summaries.push(summary),
+            Err(e) => {
+                tracing::warn!(task_id = %id, "{context}: skipping malformed task row: {e}");
+            }
+        }
+    }
+    summaries
 }
 
 #[cfg(test)]

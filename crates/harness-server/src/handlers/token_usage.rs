@@ -1,4 +1,5 @@
 use axum::{extract::State, http::StatusCode, Json};
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -6,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::http::AppState;
+
+const DEFAULT_TOKEN_USAGE_WINDOW_HOURS: i64 = 24;
 
 #[derive(Debug, Default, Clone, Serialize)]
 struct UsageBucket {
@@ -31,6 +34,43 @@ struct ParsedUsageRecord {
     cache_read: u64,
     cache_create: u64,
     model: String,
+    occurred_at: DateTime<Utc>,
+    day: String,
+    hour: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenUsageWindow {
+    hours: i64,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+}
+
+impl TokenUsageWindow {
+    fn last_hours(now: DateTime<Utc>, hours: i64) -> Self {
+        Self {
+            hours,
+            since: now - Duration::hours(hours),
+            now,
+        }
+    }
+
+    fn contains(&self, ts: DateTime<Utc>) -> bool {
+        ts >= self.since && ts <= self.now
+    }
+
+    fn to_json(self) -> Value {
+        serde_json::json!({
+            "hours": self.hours,
+            "since": self.since.to_rfc3339(),
+            "now": self.now.to_rfc3339(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedUsageTimestamp {
+    occurred_at: DateTime<Utc>,
     day: String,
     hour: String,
 }
@@ -50,6 +90,7 @@ fn home_dir() -> Result<PathBuf, String> {
 /// This endpoint is intentionally strict: malformed source data returns an
 /// explicit error response instead of silently producing partial/empty metrics.
 pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let window = TokenUsageWindow::last_hours(Utc::now(), DEFAULT_TOKEN_USAGE_WINDOW_HOURS);
     let home = match home_dir() {
         Ok(path) => path,
         Err(err) => return error_response(err),
@@ -90,7 +131,7 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
                 "token_usage: session projects directory not found; \
                  returning empty metrics (expected with --no-session-persistence)"
             );
-            return missing_dir_response();
+            return missing_dir_response(window);
         }
         Err(e) => {
             return error_response(format!(
@@ -104,9 +145,13 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         Ok(files) => files,
         Err(err) => return error_response(err),
     };
+    let files = match filter_session_files_for_window(files, window) {
+        Ok(files) => files,
+        Err(err) => return error_response(err),
+    };
 
     if files.is_empty() {
-        return empty_usage_response();
+        return empty_usage_response(window);
     }
 
     let mut by_day: BTreeMap<String, UsageBucket> = BTreeMap::new();
@@ -160,6 +205,9 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
                 Ok(None) => continue,
                 Err(err) => return error_response(err),
             };
+            if !window.contains(parsed.occurred_at) {
+                continue;
+            }
 
             let total_ctx = parsed.input + parsed.cache_read + parsed.cache_create;
 
@@ -251,6 +299,7 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     let total_context = totals.input_tokens + totals.cache_read_tokens + totals.cache_create_tokens;
 
     let body = serde_json::json!({
+        "window": window.to_json(),
         "by_day": by_day,
         "by_hour": by_hour,
         "model_trend": model_trend,
@@ -281,8 +330,9 @@ fn error_response(message: String) -> (StatusCode, Json<Value>) {
 /// so callers and monitoring can distinguish "directory absent" (potentially a
 /// misconfiguration) from "directory present but no sessions yet" (expected
 /// in --no-session-persistence environments).
-fn missing_dir_response() -> (StatusCode, Json<Value>) {
+fn missing_dir_response(window: TokenUsageWindow) -> (StatusCode, Json<Value>) {
     let body = serde_json::json!({
+        "window": window.to_json(),
         "by_day": {},
         "by_hour": {},
         "model_trend": {},
@@ -304,8 +354,9 @@ fn missing_dir_response() -> (StatusCode, Json<Value>) {
 /// This is the correct response when `--no-session-persistence` is active:
 /// agents do not write JSONL files, so an absent or empty projects directory
 /// is expected, not an error.
-fn empty_usage_response() -> (StatusCode, Json<Value>) {
+fn empty_usage_response(window: TokenUsageWindow) -> (StatusCode, Json<Value>) {
     let body = serde_json::json!({
+        "window": window.to_json(),
         "by_day": {},
         "by_hour": {},
         "model_trend": {},
@@ -335,7 +386,7 @@ fn parse_usage_record(entry: &Value, ctx: &str) -> Result<Option<ParsedUsageReco
 
     let model = required_str_at_pointer(entry, "/message/model", ctx)?.to_string();
     let ts = required_str_field(entry, "timestamp", ctx)?;
-    let (day, hour) = parse_timestamp(ts).map_err(|err| format!("{ctx}: {err}"))?;
+    let timestamp = parse_timestamp(ts).map_err(|err| format!("{ctx}: {err}"))?;
 
     Ok(Some(ParsedUsageRecord {
         input,
@@ -343,8 +394,9 @@ fn parse_usage_record(entry: &Value, ctx: &str) -> Result<Option<ParsedUsageReco
         cache_read,
         cache_create,
         model,
-        day,
-        hour,
+        occurred_at: timestamp.occurred_at,
+        day: timestamp.day,
+        hour: timestamp.hour,
     }))
 }
 
@@ -399,19 +451,32 @@ fn estimate_cost(usage: &UsageBucket) -> f64 {
 }
 
 /// Parse an ISO-8601 timestamp into (YYYY-MM-DD, YYYY-MM-DD HH:00).
-fn parse_timestamp(ts: &str) -> Result<(String, String), String> {
-    if ts.len() < 13 {
-        return Err(format!("invalid timestamp '{ts}': too short"));
-    }
+fn parse_timestamp(ts: &str) -> Result<ParsedUsageTimestamp, String> {
     if ts.as_bytes().get(10) != Some(&b'T') {
         return Err(format!("invalid timestamp '{ts}': missing 'T' separator"));
     }
-    let day = &ts[..10];
-    let hour = &ts[11..13];
-    if !hour.chars().all(|c| c.is_ascii_digit()) {
-        return Err(format!("invalid timestamp '{ts}': hour is not numeric"));
-    }
-    Ok((day.to_string(), format!("{day} {hour}:00")))
+    let occurred_at = DateTime::parse_from_rfc3339(ts)
+        .map_err(|err| format!("invalid timestamp '{ts}': {err}"))?
+        .with_timezone(&Utc);
+    let (day, hour) = if ts.ends_with('Z') || ts.ends_with("+00:00") {
+        let day = ts
+            .get(..10)
+            .ok_or_else(|| format!("invalid timestamp '{ts}': missing date component"))?;
+        let hour = ts
+            .get(11..13)
+            .ok_or_else(|| format!("invalid timestamp '{ts}': missing hour component"))?;
+        (day.to_string(), format!("{day} {hour}:00"))
+    } else {
+        (
+            occurred_at.format("%Y-%m-%d").to_string(),
+            occurred_at.format("%Y-%m-%d %H:00").to_string(),
+        )
+    };
+    Ok(ParsedUsageTimestamp {
+        occurred_at,
+        day,
+        hour,
+    })
 }
 
 fn collect_session_files(claude_projects_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -455,6 +520,32 @@ fn collect_session_files(claude_projects_dir: &Path) -> Result<Vec<PathBuf>, Str
     }
 
     Ok(files)
+}
+
+fn filter_session_files_for_window(
+    files: Vec<PathBuf>,
+    window: TokenUsageWindow,
+) -> Result<Vec<PathBuf>, String> {
+    let mut filtered = Vec::new();
+    for file in files {
+        if file_may_have_window_records(&file, window)? {
+            filtered.push(file);
+        }
+    }
+    Ok(filtered)
+}
+
+fn file_may_have_window_records(path: &Path, window: TokenUsageWindow) -> Result<bool, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("failed to stat token usage file {}: {err}", path.display()))?;
+    let modified = metadata.modified().map_err(|err| {
+        format!(
+            "failed to read token usage file mtime {}: {err}",
+            path.display()
+        )
+    })?;
+    let modified_at: DateTime<Utc> = modified.into();
+    Ok(modified_at >= window.since)
 }
 
 fn collect_jsonl_in_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -518,6 +609,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_timestamp_preserves_utc_bucket_for_offset_input() {
+        let parsed = parse_timestamp("2026-03-26T23:05:56-02:00").unwrap();
+        assert_eq!(parsed.day, "2026-03-27");
+        assert_eq!(parsed.hour, "2026-03-27 01:00");
+    }
+
+    #[test]
     fn parse_usage_record_treats_cache_fields_as_optional() {
         let entry = serde_json::json!({
             "timestamp": "2026-03-26T03:05:56.523Z",
@@ -557,5 +655,46 @@ mod tests {
         assert_eq!(parsed.cache_create, 10);
         assert_eq!(parsed.day, "2026-03-26");
         assert_eq!(parsed.hour, "2026-03-26 03:00");
+    }
+
+    #[test]
+    fn usage_window_keeps_only_recent_records() {
+        let now = DateTime::parse_from_rfc3339("2026-05-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = TokenUsageWindow::last_hours(now, 24);
+        let recent = parse_usage_record(
+            &serde_json::json!({
+                "timestamp": "2026-05-20T09:59:00Z",
+                "message": {
+                    "model": "claude-sonnet",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20
+                    }
+                }
+            }),
+            "recent:1",
+        )
+        .unwrap()
+        .unwrap();
+        let old = parse_usage_record(
+            &serde_json::json!({
+                "timestamp": "2026-05-18T09:59:00Z",
+                "message": {
+                    "model": "claude-sonnet",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20
+                    }
+                }
+            }),
+            "old:1",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(window.contains(recent.occurred_at));
+        assert!(!window.contains(old.occurred_at));
     }
 }
