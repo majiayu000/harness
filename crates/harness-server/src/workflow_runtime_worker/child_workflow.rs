@@ -3,7 +3,8 @@ use crate::task_runner::TaskId;
 use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, ActivityArtifact, ActivityErrorKind, ActivityResult,
     DecisionValidator, PrFeedbackInspectDecisionInput, RuntimeJob, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowInstance, WorkflowSubject, PR_FEEDBACK_DEFINITION_ID,
+    WorkflowDefinition, WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
+    PR_FEEDBACK_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -33,6 +34,10 @@ pub(super) async fn execute_start_child_workflow(
     let subject_key = required_string(command, "subject_key")?;
     if definition_id == PR_FEEDBACK_DEFINITION_ID {
         return execute_start_pr_feedback_child_workflow(state, job, parent, command, subject_key)
+            .await;
+    }
+    if definition_id == PROMPT_TASK_DEFINITION_ID {
+        return execute_start_prompt_task_child_workflow(state, job, parent, command, subject_key)
             .await;
     }
     if definition_id != "github_issue_pr" {
@@ -160,6 +165,105 @@ pub(super) async fn execute_start_child_workflow(
         ));
     }
     Ok(result)
+}
+
+async fn execute_start_prompt_task_child_workflow(
+    state: &Arc<AppState>,
+    job: &RuntimeJob,
+    parent: Option<&WorkflowInstance>,
+    command: &Value,
+    subject_key: &str,
+) -> anyhow::Result<ActivityResult> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        anyhow::bail!("workflow runtime store is unavailable");
+    };
+    let project_id = parent
+        .and_then(|workflow| workflow.data.get("project_id"))
+        .and_then(Value::as_str)
+        .or_else(|| job.input.get("project_id").and_then(Value::as_str))
+        .ok_or_else(|| anyhow::anyhow!("prompt task child workflow project_id is missing"))?;
+    let prompt = required_string(command, "prompt")?;
+    let repo = command.get("repo").and_then(Value::as_str).or_else(|| {
+        parent
+            .and_then(|workflow| workflow.data.get("repo"))
+            .and_then(Value::as_str)
+    });
+    let task_id = optional_string(command, "task_id").unwrap_or_else(|| {
+        format!(
+            "repo-backlog:{}:{}",
+            repo.unwrap_or("<none>"),
+            subject_key.replace(':', "-")
+        )
+    });
+    let task_id = TaskId::from_str(&task_id);
+    let source = optional_string(command, "source").unwrap_or_else(|| "runtime_child".to_string());
+    let external_id =
+        optional_string(command, "external_id").unwrap_or_else(|| subject_key.to_string());
+    let submission = crate::workflow_runtime_submission::record_prompt_submission(
+        store,
+        crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
+            project_root: Path::new(project_id),
+            task_id: &task_id,
+            prompt,
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: Some(source.as_str()),
+            external_id: Some(external_id.as_str()),
+        },
+    )
+    .await?;
+
+    let mut child = store
+        .get_instance(&submission.workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("prompt task child workflow was not persisted"))?;
+
+    if let Some(parent) = parent {
+        if child.parent_workflow_id.is_none() {
+            child.parent_workflow_id = Some(parent.id.clone());
+            store.upsert_instance(&child).await?;
+        }
+    }
+
+    store
+        .append_event(
+            &submission.workflow_id,
+            "ChildWorkflowStarted",
+            "workflow_runtime_worker",
+            json!({
+                "parent_workflow_id": parent.map(|workflow| workflow.id.as_str()),
+                "runtime_job_id": job.id.as_str(),
+                "command_id": job.command_id.as_str(),
+                "definition_id": PROMPT_TASK_DEFINITION_ID,
+                "subject_key": subject_key,
+            }),
+        )
+        .await?;
+
+    Ok(ActivityResult::succeeded(
+        activity_name(job),
+        format!("Prompt task child workflow `{}` started.", child.id),
+    )
+    .with_artifact(ActivityArtifact::new(
+        "child_workflow",
+        json!({
+            "workflow_id": child.id,
+            "definition_id": child.definition_id,
+            "state": child.state,
+            "subject_key": child.subject.subject_key,
+        }),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "child_submission",
+        json!({
+            "workflow_id": submission.workflow_id,
+            "accepted": submission.accepted,
+            "decision_id": submission.decision_id,
+            "command_ids": submission.command_ids,
+            "rejection_reason": submission.rejection_reason,
+        }),
+    )))
 }
 
 async fn execute_start_pr_feedback_child_workflow(

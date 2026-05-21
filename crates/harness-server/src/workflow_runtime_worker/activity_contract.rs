@@ -81,8 +81,15 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
     match (workflow_definition, activity) {
         (REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)
-                .with_accepted_signals(vec!["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound"])
-                .with_explicit_noop_signals(vec!["NoOpenIssueFound"])
+                .with_accepted_signals(vec![
+                    "IssueDiscovered",
+                    "IssueSkipped",
+                    "NoOpenIssueFound",
+                    "OpenPrFeedbackDiscovered",
+                    "OpenPrFeedbackSkipped",
+                    "NoOpenPrFeedbackFound",
+                ])
+                .with_explicit_noop_signals(vec!["NoOpenIssueFound", "NoOpenPrFeedbackFound"])
                 .requires("at_least_one_accepted_signal")
         }
         (REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY) => {

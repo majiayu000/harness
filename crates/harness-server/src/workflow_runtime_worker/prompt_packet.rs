@@ -327,11 +327,11 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("repo_backlog", "poll_repo_backlog") => json!({
             "on_succeeded": {
-                "reducer_next_state": "planning_batch_when_IssueDiscovered_signals_exist_else_idle",
-                "accepted_signals": ["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound"],
+                "reducer_next_state": "planning_batch_when_IssueDiscovered_signals_exist; dispatching_when_only_OpenPrFeedbackDiscovered_signals_exist; otherwise idle",
+                "accepted_signals": ["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound", "OpenPrFeedbackDiscovered", "OpenPrFeedbackSkipped", "NoOpenPrFeedbackFound"],
                 "success_requires": "At least one accepted signal. Empty signals are invalid even when status is succeeded.",
                 "empty_success_allowed": false,
-                "required_summary": "Describe the GitHub issue query, existing workflow checks, and new issue workflow candidates."
+                "required_summary": "Describe the GitHub issue query, open PR feedback query, existing workflow checks, new issue workflow candidates, and standalone PR feedback candidates."
             },
             "structured_decision": {
                 "optional": true,
@@ -476,13 +476,16 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             }
         }),
         ("repo_backlog", "poll_repo_backlog") => json!({
-            "must_include": ["repo and label queried", "open issues inspected", "existing workflow checks", "new issue workflow candidates", "next workflow action"],
+            "must_include": ["repo and label queried", "open issues inspected", "open PR feedback inspected", "existing workflow checks", "new issue workflow candidates", "open PR feedback candidates", "next workflow action"],
             "must_not_include": ["repository code changes", "workflow table mutations", "server-side GitHub polling changes"],
-            "success_rule": "A succeeded result MUST emit IssueDiscovered, IssueSkipped, or NoOpenIssueFound. Do not return succeeded with empty signals.",
+            "success_rule": "A succeeded result MUST emit at least one accepted issue or open PR feedback signal. Do not return succeeded with empty signals.",
             "signals": {
                 "IssueDiscovered": "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available.",
                 "IssueSkipped": "Use for open GitHub issues that already have a workflow, are PRs, or should not be started. Include issue_number and reason. When an issue already has a workflow, include workflow_state.",
-                "NoOpenIssueFound": "Use when the repo/label query found no candidate issues."
+                "NoOpenIssueFound": "Use when the repo/label query found no candidate issues.",
+                "OpenPrFeedbackDiscovered": "Use for each open PR with unresolved actionable review feedback and no active bound workflow. Include pr_number, pr_url, repo, title, feedback_count, and summary.",
+                "OpenPrFeedbackSkipped": "Use for open PRs intentionally skipped because they are already covered, have no actionable feedback, are draft/closed, or are otherwise not candidates. Include pr_number and reason.",
+                "NoOpenPrFeedbackFound": "Use when the open PR review query found no standalone PR feedback candidates."
             },
             "artifacts": {
                 "workflow_decision": {
@@ -697,7 +700,11 @@ mod tests {
         );
         assert_eq!(
             schema["agent_summary_contract"]["success_rule"],
-            "A succeeded result MUST emit IssueDiscovered, IssueSkipped, or NoOpenIssueFound. Do not return succeeded with empty signals."
+            "A succeeded result MUST emit at least one accepted issue or open PR feedback signal. Do not return succeeded with empty signals."
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["signals"]["OpenPrFeedbackDiscovered"],
+            "Use for each open PR with unresolved actionable review feedback and no active bound workflow. Include pr_number, pr_url, repo, title, feedback_count, and summary."
         );
         assert!(schema["workflow_decision_contract"]["allowed_transitions"]
             .as_array()
