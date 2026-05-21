@@ -68,7 +68,7 @@ pub(crate) enum LocalReviewPrHead<'a> {
         before_review_error: Option<&'a str>,
         approved_review_sha: Option<&'a str>,
         approved_review_error: Option<&'a str>,
-        must_advance: bool,
+        local_fix_attempted: bool,
     },
     #[cfg(test)]
     Verified,
@@ -87,7 +87,7 @@ impl LocalReviewPrHead<'_> {
                 before_review_error,
                 approved_review_sha,
                 approved_review_error,
-                must_advance,
+                local_fix_attempted,
                 ..
             } => {
                 if let Some(error) = before_review_error {
@@ -106,13 +106,7 @@ impl LocalReviewPrHead<'_> {
                 let approved_review_sha = approved_review_sha.ok_or_else(|| {
                     "GitHub PR head approval SHA is missing after local review".to_string()
                 })?;
-                if *must_advance && approved_review_sha == before_review_sha {
-                    return Err(format!(
-                        "GitHub PR head did not advance after local review fix for \
-                         {repo_slug}#{pr_num}; head remained {approved_review_sha}"
-                    ));
-                }
-                if !*must_advance && approved_review_sha != before_review_sha {
+                if !*local_fix_attempted && approved_review_sha != before_review_sha {
                     return Err(format!(
                         "GitHub PR head changed during local review without a local fix for \
                          {repo_slug}#{pr_num}; before {before_review_sha}, approved {approved_review_sha}"
@@ -685,4 +679,26 @@ pub(crate) async fn fail_missing_local_review_gate(
         reason: error,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pr_head_gate_allows_noop_local_fix_round() -> anyhow::Result<()> {
+        let gate = LocalReviewPrHead::GitHub {
+            repo_slug: "owner/repo",
+            github_token: None,
+            before_review_sha: Some("same-sha"),
+            before_review_error: None,
+            approved_review_sha: Some("same-sha"),
+            approved_review_error: None,
+            local_fix_attempted: true,
+        };
+
+        assert!(gate.verify_local_fix(77).await.is_ok());
+
+        Ok(())
+    }
 }

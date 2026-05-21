@@ -735,7 +735,7 @@ pub(crate) async fn run_task(
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
     }
-    let local_review_pushed_commit = agent_pushed_commit;
+    let local_review_fix_attempted = agent_pushed_commit;
     agent_pushed_commit |= implementation_pushed_commit;
 
     let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
@@ -786,7 +786,10 @@ pub(crate) async fn run_task(
                     before_review_error,
                     approved_review_sha,
                     approved_review_error,
-                    must_advance: local_review_pushed_commit,
+                    // A successful fix round may be a no-op, so do not require
+                    // the PR head to advance. It only permits a reviewed head
+                    // change; the final gate still locks that approved head.
+                    local_fix_attempted: local_review_fix_attempted,
                 },
                 pr_state: LocalReviewPrState::GitHub {
                     repo_slug: &repo_slug_for_review,
