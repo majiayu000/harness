@@ -55,6 +55,7 @@ cli_path = "codex"
 enabled = true
 reviewer_agent = "codex"
 max_rounds = 3
+review_bot_auto_trigger = false
 
 [gc]
 max_drafts_per_run = 5
@@ -316,7 +317,7 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 |-------|---------|-------------|
 | `default_agent` | `"auto"` | Default execution agent; `"auto"` picks the first registered agent |
 | `complexity_preferred_agents` | `[]` | Optional ordered list for complex/critical routing (for example `["codex","claude"]`) |
-| `sandbox_mode` | `"danger-full-access"` | Sandbox policy: `read-only`, `workspace-write`, `danger-full-access` |
+| `sandbox_mode` | `"danger-full-access"` | Sandbox policy: `read-only`, `read-only-with-network`, `workspace-write`, `danger-full-access` |
 | `approval_policy` | `"auto-edit"` | Approval policy for agent actions |
 
 ### `[agents.claude]`
@@ -346,9 +347,10 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `enabled` | `true` | Enable independent agent review after PR creation |
-| `reviewer_agent` | `"codex"` | Agent used for review (must differ from implementor) |
+| `enabled` | `true` | Enable independent agent review after PR creation. |
+| `reviewer_agent` | `"codex"` | Agent used for review. It may match the implementor when configured explicitly; Harness runs it as a separate review turn. |
 | `max_rounds` | `3` | Maximum review-fix cycles |
+| `review_bot_auto_trigger` | `false` | Post and wait for a hosted review bot command. When omitted with `enabled = false`, Harness keeps the hosted-bot path; when disabled, local completion requires local review approval, validation, PR-head advancement after local review fixes, unchanged reviewed PR head after CI polling, green GitHub PR checks, an open PR or already merged PR, and a configured GitHub token. |
 
 ### `[review]`
 

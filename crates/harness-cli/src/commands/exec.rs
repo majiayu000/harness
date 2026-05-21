@@ -6,6 +6,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecSandboxMode {
     ReadOnly,
+    ReadOnlyWithNetwork,
     WorkspaceWrite,
     DangerFullAccess,
 }
@@ -14,10 +15,11 @@ impl ExecSandboxMode {
     pub fn parse(input: &str) -> Result<Self> {
         match input {
             "read-only" => Ok(Self::ReadOnly),
+            "read-only-with-network" => Ok(Self::ReadOnlyWithNetwork),
             "workspace-write" => Ok(Self::WorkspaceWrite),
             "danger-full-access" => Ok(Self::DangerFullAccess),
             other => anyhow::bail!(
-                "unsupported sandbox mode `{other}`; expected one of: read-only, workspace-write, danger-full-access"
+                "unsupported sandbox mode `{other}`; expected one of: read-only, read-only-with-network, workspace-write, danger-full-access"
             ),
         }
     }
@@ -25,6 +27,7 @@ impl ExecSandboxMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
+            Self::ReadOnlyWithNetwork => "read-only-with-network",
             Self::WorkspaceWrite => "workspace-write",
             Self::DangerFullAccess => "danger-full-access",
         }
@@ -33,6 +36,9 @@ impl ExecSandboxMode {
     pub fn to_sandbox_mode(self) -> harness_core::config::agents::SandboxMode {
         match self {
             Self::ReadOnly => harness_core::config::agents::SandboxMode::ReadOnly,
+            Self::ReadOnlyWithNetwork => {
+                harness_core::config::agents::SandboxMode::ReadOnlyWithNetwork
+            }
             Self::WorkspaceWrite => harness_core::config::agents::SandboxMode::WorkspaceWrite,
             Self::DangerFullAccess => harness_core::config::agents::SandboxMode::DangerFullAccess,
         }

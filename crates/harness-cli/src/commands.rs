@@ -890,6 +890,11 @@ mod tests {
             ExecSandboxMode::WorkspaceWrite
         );
         assert_eq!(
+            ExecSandboxMode::parse("read-only-with-network")
+                .expect("read-only-with-network should parse"),
+            ExecSandboxMode::ReadOnlyWithNetwork
+        );
+        assert_eq!(
             ExecSandboxMode::parse("danger-full-access").expect("danger-full-access should parse"),
             ExecSandboxMode::DangerFullAccess
         );

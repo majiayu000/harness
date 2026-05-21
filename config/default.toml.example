@@ -52,9 +52,12 @@ default_model = "claude-sonnet-4-20250514"
 max_tokens = 4096
 
 [agents.review]
-enabled = false
+enabled = true
 reviewer_agent = "codex"
 max_rounds = 3
+# Hosted GitHub review bots are advisory. Leave this disabled unless you
+# explicitly want Harness to post /gemini review and wait for hosted bot output.
+review_bot_auto_trigger = false
 fallback_chain = ["gemini", "codex"]
 silence_rounds_threshold = 3
 silence_min_minutes_after_commit = 30

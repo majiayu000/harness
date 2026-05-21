@@ -71,6 +71,7 @@ pub enum ApprovalPolicy {
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
     ReadOnly,
+    ReadOnlyWithNetwork,
     WorkspaceWrite,
     #[default]
     DangerFullAccess,
@@ -80,6 +81,7 @@ impl std::fmt::Display for SandboxMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
             SandboxMode::ReadOnly => "read-only",
+            SandboxMode::ReadOnlyWithNetwork => "read-only-with-network",
             SandboxMode::WorkspaceWrite => "workspace-write",
             SandboxMode::DangerFullAccess => "danger-full-access",
         };
@@ -168,40 +170,88 @@ fn default_default_agent() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentReviewConfig {
-    #[serde(default)]
     pub enabled: bool,
     /// Agent name to use as reviewer. Empty string = auto-select.
-    #[serde(default)]
     pub reviewer_agent: String,
-    #[serde(default = "default_max_agent_review_rounds")]
     pub max_rounds: u32,
     /// Command to trigger review bot re-review (e.g. "/gemini review", "/reviewbot run").
-    #[serde(default = "default_review_bot_command")]
     pub review_bot_command: String,
     /// Automatically post review_bot_command as a PR comment when a task completes with a PR.
-    #[serde(default = "default_review_bot_auto_trigger")]
+    /// Disabled by default so local agent review is the primary gate and hosted review
+    /// bots remain advisory opt-ins.
     pub review_bot_auto_trigger: bool,
     /// GitHub login of the review bot (used for freshness checks in review loop).
-    #[serde(default = "default_reviewer_name")]
     pub reviewer_name: String,
     /// Ordered review fallback chain, e.g. ["gemini", "codex"].
-    #[serde(default = "default_review_fallback_chain")]
     pub fallback_chain: Vec<String>,
     /// Consecutive rounds with no new bot activity before silence can graduate.
-    #[serde(default = "default_silence_rounds_threshold")]
     pub silence_rounds_threshold: u32,
     /// Minimum minutes after the latest commit before silence can graduate.
-    #[serde(default = "default_silence_min_minutes_after_commit")]
     pub silence_min_minutes_after_commit: u32,
+}
+
+impl<'de> Deserialize<'de> for AgentReviewConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawAgentReviewConfig {
+            #[serde(default)]
+            enabled: Option<bool>,
+            #[serde(default)]
+            reviewer_agent: Option<String>,
+            #[serde(default)]
+            max_rounds: Option<u32>,
+            #[serde(default)]
+            review_bot_command: Option<String>,
+            #[serde(default)]
+            review_bot_auto_trigger: Option<bool>,
+            #[serde(default)]
+            reviewer_name: Option<String>,
+            #[serde(default)]
+            fallback_chain: Option<Vec<String>>,
+            #[serde(default)]
+            silence_rounds_threshold: Option<u32>,
+            #[serde(default)]
+            silence_min_minutes_after_commit: Option<u32>,
+        }
+
+        let raw = RawAgentReviewConfig::deserialize(deserializer)?;
+        let enabled = raw.enabled.unwrap_or_else(default_agent_review_enabled);
+        let review_bot_auto_trigger = raw.review_bot_auto_trigger.unwrap_or(!enabled);
+
+        Ok(Self {
+            enabled,
+            reviewer_agent: raw.reviewer_agent.unwrap_or_else(default_reviewer_agent),
+            max_rounds: raw
+                .max_rounds
+                .unwrap_or_else(default_max_agent_review_rounds),
+            review_bot_command: raw
+                .review_bot_command
+                .unwrap_or_else(default_review_bot_command),
+            review_bot_auto_trigger,
+            reviewer_name: raw.reviewer_name.unwrap_or_else(default_reviewer_name),
+            fallback_chain: raw
+                .fallback_chain
+                .unwrap_or_else(default_review_fallback_chain),
+            silence_rounds_threshold: raw
+                .silence_rounds_threshold
+                .unwrap_or_else(default_silence_rounds_threshold),
+            silence_min_minutes_after_commit: raw
+                .silence_min_minutes_after_commit
+                .unwrap_or_else(default_silence_min_minutes_after_commit),
+        })
+    }
 }
 
 impl Default for AgentReviewConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            reviewer_agent: String::new(),
+            enabled: default_agent_review_enabled(),
+            reviewer_agent: default_reviewer_agent(),
             max_rounds: default_max_agent_review_rounds(),
             review_bot_command: default_review_bot_command(),
             review_bot_auto_trigger: default_review_bot_auto_trigger(),
@@ -213,6 +263,14 @@ impl Default for AgentReviewConfig {
     }
 }
 
+fn default_agent_review_enabled() -> bool {
+    true
+}
+
+fn default_reviewer_agent() -> String {
+    "codex".to_string()
+}
+
 fn default_reviewer_name() -> String {
     "gemini-code-assist[bot]".to_string()
 }
@@ -222,7 +280,7 @@ fn default_review_bot_command() -> String {
 }
 
 fn default_review_bot_auto_trigger() -> bool {
-    true
+    false
 }
 
 fn default_max_agent_review_rounds() -> u32 {

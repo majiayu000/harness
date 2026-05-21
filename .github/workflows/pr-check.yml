@@ -23,7 +23,7 @@ jobs:
           echo "PR description looks good (${#PR_BODY} chars)."
 
   gemini-review:
-    name: Gemini Re-review
+    name: Advisory Gemini Request
     runs-on: ubuntu-latest
     if: github.event.action == 'synchronize' && vars.GEMINI_REVIEW_ENABLED == 'true'
     steps:
@@ -37,3 +37,4 @@ jobs:
               issue_number: context.issue.number,
               body: '/gemini review'
             });
+            core.notice('Advisory Gemini review requested. This check only confirms that the request comment was posted.');

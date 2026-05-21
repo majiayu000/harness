@@ -62,8 +62,14 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
         if let Some(name) = &proj_review.reviewer_name {
             review.reviewer_name = name.clone();
         }
-        if let Some(auto_trigger) = proj_review.review_bot_auto_trigger {
-            review.review_bot_auto_trigger = auto_trigger;
+        match (proj_review.review_bot_auto_trigger, proj_review.enabled) {
+            (Some(auto_trigger), _) => {
+                review.review_bot_auto_trigger = auto_trigger;
+            }
+            (None, Some(false)) => {
+                review.review_bot_auto_trigger = true;
+            }
+            (None, _) => {}
         }
     }
 
@@ -165,6 +171,46 @@ mod tests {
             resolved.review.review_bot_command,
             server.agents.review.review_bot_command
         );
+    }
+
+    #[test]
+    fn resolve_config_project_disabled_local_review_defaults_to_hosted_review() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig {
+            review: Some(ProjectReviewConfig {
+                enabled: Some(false),
+                bot_command: None,
+                reviewer_name: None,
+                review_bot_auto_trigger: None,
+                review_wait_secs: None,
+                review_max_rounds: None,
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_config(&server, &project);
+        assert!(!resolved.review.enabled);
+        assert!(resolved.review.review_bot_auto_trigger);
+    }
+
+    #[test]
+    fn resolve_config_project_disabled_local_review_respects_explicit_hosted_disable() {
+        let server = HarnessConfig::default();
+        let project = ProjectConfig {
+            review: Some(ProjectReviewConfig {
+                enabled: Some(false),
+                bot_command: None,
+                reviewer_name: None,
+                review_bot_auto_trigger: Some(false),
+                review_wait_secs: None,
+                review_max_rounds: None,
+            }),
+            ..Default::default()
+        };
+
+        let resolved = resolve_config(&server, &project);
+        assert!(!resolved.review.enabled);
+        assert!(!resolved.review.review_bot_auto_trigger);
     }
 
     #[test]

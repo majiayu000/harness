@@ -969,11 +969,8 @@ impl DefaultExecutionService {
             &self.agent_registry,
             registry_default_agent.as_deref(),
         )?;
-        let (reviewer, _) = resolve_reviewer(
-            &self.agent_registry,
-            &self.server_config.agents.review,
-            agent.name(),
-        );
+        let review_config = resolve_effective_review_config(&self.server_config, &canonical)?;
+        let (reviewer, _) = resolve_reviewer(&self.agent_registry, &review_config, agent.name());
 
         Ok(PreparedEnqueueResult::Ready(Box::new(PreparedEnqueue {
             req,
@@ -982,6 +979,20 @@ impl DefaultExecutionService {
             reviewer,
         })))
     }
+}
+
+fn resolve_effective_review_config(
+    server_config: &HarnessConfig,
+    project_root: &Path,
+) -> Result<harness_core::config::agents::AgentReviewConfig, EnqueueTaskError> {
+    let project_config =
+        harness_core::config::project::load_project_config(project_root).map_err(|error| {
+            EnqueueTaskError::Internal(format!(
+                "failed to load project config for {}: {error}",
+                project_root.display()
+            ))
+        })?;
+    Ok(harness_core::config::resolve::resolve_config(server_config, &project_config).review)
 }
 
 fn runtime_prompt_duplicate_allows_resubmission(

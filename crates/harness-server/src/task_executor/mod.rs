@@ -1,8 +1,15 @@
 pub(crate) mod agent_review;
+#[cfg(test)]
+mod agent_review_tests;
 pub(crate) mod conflict_resolver;
 pub(crate) mod gates;
 pub(crate) mod helpers;
 pub(crate) mod implement_pipeline;
+mod local_review_completion;
+#[cfg(test)]
+mod local_review_completion_gate_tests;
+#[cfg(test)]
+mod local_review_completion_tests;
 pub(crate) mod non_implementation;
 pub(crate) mod pr_detection;
 pub(crate) mod review_loop;
@@ -44,6 +51,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration, Instant};
 
+pub(crate) use local_review_completion::{
+    complete_after_local_review_without_hosted_bot, fail_missing_local_review_gate,
+    LocalReviewPrChecks, LocalReviewPrHead, LocalReviewPrState, LocalReviewReadyToMergeFeedback,
+};
+
 /// RAII guard that removes the per-task Cargo target directory on drop.
 /// This ensures cleanup regardless of how `run_task` exits (success, error,
 /// or timeout), preventing disk exhaustion from accumulated build artifacts.
@@ -77,6 +89,41 @@ pub(crate) struct TaskContext {
 
 fn should_run_issue_triage(skip_triage: bool, has_existing_pr: bool) -> bool {
     !skip_triage && !has_existing_pr
+}
+
+fn effective_agent_review_round_limit(
+    request_max_rounds: Option<u32>,
+    server_review_max_rounds: u32,
+    triage_default_rounds: u32,
+) -> u32 {
+    request_max_rounds
+        .or(Some(server_review_max_rounds))
+        .unwrap_or(triage_default_rounds)
+}
+
+fn effective_hosted_review_round_limit(
+    request_max_rounds: Option<u32>,
+    project_review_max_rounds: Option<u32>,
+    server_review_max_rounds: u32,
+    triage_default_rounds: u32,
+) -> u32 {
+    request_max_rounds
+        .or(project_review_max_rounds)
+        .or(Some(server_review_max_rounds))
+        .unwrap_or(triage_default_rounds)
+}
+
+fn local_review_pr_check_timeout_secs(wait_secs: u64, hosted_review_max_rounds: u32) -> u64 {
+    wait_secs
+        .max(60)
+        .saturating_mul(u64::from(hosted_review_max_rounds.max(1)))
+}
+
+fn review_repo_slug(pr_url: Option<&str>, detected_repo_slug: &str) -> String {
+    pr_url
+        .and_then(prompts::parse_github_pr_url)
+        .map(|(owner, repo, _)| format!("{owner}/{repo}"))
+        .unwrap_or_else(|| detected_repo_slug.to_string())
 }
 
 /// Run the project's test commands as a hard gate before accepting LGTM.
@@ -213,7 +260,6 @@ pub(crate) async fn run_task(
         )
     })?;
     let resolved = harness_core::config::resolve::resolve_config(server_config, &project_config);
-    let review_config = &resolved.review;
     let git = Some(&project_config.git);
     let repo_slug = detect_repo_slug(&project)
         .await
@@ -377,14 +423,30 @@ pub(crate) async fn run_task(
     };
 
     // Derive dynamic parameters from triage complexity.
-    // Triage provides a DEFAULT only — caller's explicit max_rounds always wins (Fix #2).
-    // Low complexity no longer skips agent review to preserve the review gate (Fix #1).
+    // Triage provides a default only; explicit request max_rounds always wins.
+    // Project review_max_rounds is scoped to hosted review-bot polling so Gemini
+    // pacing overrides do not cap local agent review.
+    // Low complexity no longer skips agent review to preserve the review gate.
     let (triage_default_rounds, skip_agent_review) = match triage_complexity {
         prompts::TriageComplexity::Low => (2u32, false),
         prompts::TriageComplexity::Medium => (8u32, false),
         prompts::TriageComplexity::High => (8u32, false),
     };
-    let effective_max_rounds = req.max_rounds.unwrap_or(triage_default_rounds);
+    let agent_review_max_rounds = effective_agent_review_round_limit(
+        req.max_rounds,
+        resolved.review.max_rounds,
+        triage_default_rounds,
+    );
+    let hosted_review_max_rounds = effective_hosted_review_round_limit(
+        req.max_rounds,
+        resolved.review_max_rounds,
+        resolved.review.max_rounds,
+        triage_default_rounds,
+    );
+    let effective_max_rounds = hosted_review_max_rounds;
+    let mut effective_review_config = resolved.review.clone();
+    effective_review_config.max_rounds = agent_review_max_rounds;
+    let review_config = &effective_review_config;
     // max_turns: per-request override wins; global config is the fallback.
     // Counts every agent API call (impl + validation retries + review rounds).
     // Start from accumulated turns (prior transient-retry attempts + pipeline phases)
@@ -395,7 +457,8 @@ pub(crate) async fn run_task(
     tracing::info!(
         task_id = %task_id,
         ?triage_complexity,
-        effective_max_rounds,
+        agent_review_max_rounds,
+        hosted_review_max_rounds,
         skip_agent_review,
         ?effective_max_turns,
         "triage complexity applied"
@@ -611,12 +674,35 @@ pub(crate) async fn run_task(
         }
     }
 
+    let repo_slug_for_review = review_repo_slug(pr_url.as_deref(), &repo_slug);
+    let should_probe_pr_head = !review_config.review_bot_auto_trigger && pr_num > 0;
+    let local_review_head_before = if should_probe_pr_head {
+        Some(
+            review_loop::fetch_pr_head_sha_for_gate(
+                &repo_slug_for_review,
+                pr_num,
+                server_config.server.github_token.as_deref(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
+    let mut local_review_approved = false;
+    let mut local_review_head_approved: Option<Result<String, String>> = None;
     if review_config.enabled && !skip_agent_review {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
-            let (review_ok, pushed) = agent_review::run_agent_review(
+            let review_head_probe =
+                should_probe_pr_head.then_some(agent_review::ReviewHeadProbe::GitHub {
+                    repo_slug: &repo_slug_for_review,
+                    pr_num,
+                    github_token: server_config.server.github_token.as_deref(),
+                });
+            let (review_ok, pushed, approved_review_head) = agent_review::run_agent_review(
                 store,
                 task_id,
                 agent,
@@ -632,6 +718,7 @@ pub(crate) async fn run_task(
                 &skills,
                 &cargo_env,
                 effective_max_turns,
+                review_head_probe,
                 &mut turns_used,
             )
             .await?;
@@ -639,34 +726,81 @@ pub(crate) async fn run_task(
             if !review_ok {
                 return Ok(());
             }
+            local_review_approved = true;
             agent_pushed_commit = pushed;
+            if !review_config.review_bot_auto_trigger {
+                local_review_head_approved = approved_review_head;
+            }
         } else {
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
     }
+    let local_review_pushed_commit = agent_pushed_commit;
     agent_pushed_commit |= implementation_pushed_commit;
 
-    // Skip external review bot wait when auto-trigger is disabled — there is
-    // no bot to wait for, so the loop would always exhaust all rounds and fail.
+    let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
+
+    // Skip hosted review bot wait when auto-trigger is disabled, but keep a
+    // validation gate so local review cannot mark a red PR complete.
     if !review_config.review_bot_auto_trigger {
-        tracing::info!("review_bot_auto_trigger disabled; skipping external review wait");
-        mutate_and_persist(store, task_id, |s| {
-            s.status = TaskStatus::Done;
-            s.turn = 2;
-        })
+        if !local_review_approved {
+            fail_missing_local_review_gate(store, task_id, turns_used, pr_url.as_deref()).await?;
+            return Ok(());
+        }
+        let (before_review_sha, before_review_error) = match local_review_head_before.as_ref() {
+            Some(Ok(sha)) => (Some(sha.as_str()), None),
+            Some(Err(error)) => (None, Some(error.as_str())),
+            None => (None, None),
+        };
+        let (approved_review_sha, approved_review_error) = match local_review_head_approved.as_ref()
+        {
+            Some(Ok(sha)) => (Some(sha.as_str()), None),
+            Some(Err(error)) => (None, Some(error.as_str())),
+            None => (None, None),
+        };
+        // This is a GitHub PR polling budget, not a local-review retry budget.
+        // Keep project review_max_rounds effective here so slow CI can use a
+        // longer wait without also capping local Codex review rounds.
+        let pr_check_timeout_secs =
+            local_review_pr_check_timeout_secs(wait_secs, hosted_review_max_rounds);
+        let pr_check_poll_interval_secs = wait_secs.clamp(5, 30);
+        complete_after_local_review_without_hosted_bot(
+            store,
+            task_id,
+            Some(LocalReviewReadyToMergeFeedback {
+                issue_workflow_store: issue_workflow_store.as_deref(),
+                workflow_runtime_store: workflow_runtime_store.as_deref(),
+                project_root: &project_root,
+                req,
+                pr_num,
+                pr_checks: LocalReviewPrChecks::GitHub {
+                    repo_slug: &repo_slug_for_review,
+                    github_token: server_config.server.github_token.as_deref(),
+                    timeout_secs: pr_check_timeout_secs,
+                    poll_interval_secs: pr_check_poll_interval_secs,
+                },
+                pr_head: LocalReviewPrHead::GitHub {
+                    repo_slug: &repo_slug_for_review,
+                    github_token: server_config.server.github_token.as_deref(),
+                    before_review_sha,
+                    before_review_error,
+                    approved_review_sha,
+                    approved_review_error,
+                    must_advance: local_review_pushed_commit,
+                },
+                pr_state: LocalReviewPrState::GitHub {
+                    repo_slug: &repo_slug_for_review,
+                    github_token: server_config.server.github_token.as_deref(),
+                },
+            }),
+            &project,
+            &project_config,
+            &cargo_env,
+            turns_used,
+            pr_url.as_deref(),
+            task_start,
+        )
         .await?;
-        store.log_event(crate::event_replay::TaskEvent::Completed {
-            task_id: task_id.0.clone(),
-            ts: crate::event_replay::now_ts(),
-        });
-        tracing::info!(
-            task_id = %task_id,
-            status = "done",
-            turns = 2,
-            pr_url = pr_url.as_deref().unwrap_or(""),
-            total_elapsed_secs = task_start.elapsed().as_secs(),
-            "task_completed"
-        );
         return Ok(());
     }
 
@@ -677,14 +811,8 @@ pub(crate) async fn run_task(
     waiting_count += 1;
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
-    let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
-    // Project-level override takes precedence over triage-derived rounds so that
-    // per-repo caps (review_max_rounds in harness.toml) are never silently bypassed.
-    let max_rounds = resolved.review_max_rounds.unwrap_or(effective_max_rounds);
     tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
     sleep(Duration::from_secs(wait_secs)).await;
-
-    let repo_slug_for_review = prompts::repo_slug_from_pr_url(pr_url.as_deref());
 
     review_loop::run_review_loop(
         store,
@@ -706,7 +834,7 @@ pub(crate) async fn run_task(
         effective_max_turns,
         effective_max_rounds,
         wait_secs,
-        max_rounds,
+        hosted_review_max_rounds,
         agent_pushed_commit,
         rebase_pushed,
         turn_timeout,

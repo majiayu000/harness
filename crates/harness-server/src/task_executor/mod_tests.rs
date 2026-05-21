@@ -22,6 +22,61 @@ fn standard_implementation_turn_uses_full_profile() {
 }
 
 #[test]
+fn effective_agent_review_round_limit_prefers_request_over_server() {
+    assert_eq!(effective_agent_review_round_limit(Some(1), 3, 5), 1);
+}
+
+#[test]
+fn effective_agent_review_round_limit_uses_server_before_triage_default() {
+    assert_eq!(effective_agent_review_round_limit(None, 3, 8), 3);
+}
+
+#[test]
+fn effective_hosted_review_round_limit_prefers_request_over_project() {
+    assert_eq!(
+        effective_hosted_review_round_limit(Some(1), Some(8), 3, 5),
+        1
+    );
+}
+
+#[test]
+fn effective_hosted_review_round_limit_uses_project_before_server() {
+    assert_eq!(effective_hosted_review_round_limit(None, Some(8), 3, 5), 8);
+}
+
+#[test]
+fn effective_hosted_review_round_limit_uses_server_before_triage_default() {
+    assert_eq!(effective_hosted_review_round_limit(None, None, 3, 8), 3);
+}
+
+#[test]
+fn local_review_pr_check_timeout_uses_hosted_review_budget() {
+    assert_eq!(local_review_pr_check_timeout_secs(30, 8), 480);
+}
+
+#[test]
+fn review_repo_slug_prefers_parseable_pr_url() {
+    assert_eq!(
+        review_repo_slug(
+            Some("https://github.com/from-url/repo/pull/77"),
+            "from-checkout/repo"
+        ),
+        "from-url/repo"
+    );
+}
+
+#[test]
+fn review_repo_slug_falls_back_to_detected_slug() {
+    assert_eq!(
+        review_repo_slug(
+            Some("https://git.example.com/from-url/repo/pull/77"),
+            "owner/repo"
+        ),
+        "owner/repo"
+    );
+}
+
+#[test]
 fn parse_harness_review_command() {
     let cmd = parse_harness_mention_command("@harness review");
     assert_eq!(cmd, Some(HarnessMentionCommand::Review));

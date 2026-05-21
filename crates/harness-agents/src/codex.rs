@@ -19,6 +19,8 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+const READ_ONLY_WITH_NETWORK_PROFILE: &str = "harness_read_only_with_network";
+
 pub struct CodexAgent {
     pub cli_path: PathBuf,
     pub default_model: String,
@@ -91,9 +93,8 @@ impl CodexAgent {
             OsString::from(model),
             OsString::from("-c"),
             OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
-            OsString::from("-s"),
-            OsString::from(codex_sandbox_mode(sandbox_mode)),
         ];
+        push_codex_sandbox_args(&mut args, sandbox_mode);
 
         if let Some(approval_policy) = req.approval_policy.as_deref() {
             args.push(OsString::from("-a"));
@@ -783,10 +784,31 @@ impl CodeAgent for CodexAgent {
 
 fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
     match mode {
-        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::ReadOnly | SandboxMode::ReadOnlyWithNetwork => "read-only",
         SandboxMode::WorkspaceWrite => "workspace-write",
         SandboxMode::DangerFullAccess => "danger-full-access",
     }
+}
+
+fn push_codex_sandbox_args(args: &mut Vec<OsString>, mode: SandboxMode) {
+    if mode == SandboxMode::ReadOnlyWithNetwork {
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(format!(
+            "default_permissions=\"{READ_ONLY_WITH_NETWORK_PROFILE}\""
+        )));
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(format!(
+            "permissions.{READ_ONLY_WITH_NETWORK_PROFILE}.filesystem={{\":minimal\"=\"read\",\":project_roots\"={{\".\"=\"read\"}}}}"
+        )));
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(format!(
+            "permissions.{READ_ONLY_WITH_NETWORK_PROFILE}.network.enabled=true"
+        )));
+        return;
+    }
+
+    args.push(OsString::from("-s"));
+    args.push(OsString::from(codex_sandbox_mode(mode)));
 }
 
 #[cfg(test)]

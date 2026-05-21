@@ -166,7 +166,7 @@ fn seatbelt_policy(spec: &SandboxSpec) -> Result<String, SandboxError> {
     }
 
     match spec.mode {
-        SandboxMode::ReadOnly => {}
+        SandboxMode::ReadOnly | SandboxMode::ReadOnlyWithNetwork => {}
         SandboxMode::WorkspaceWrite => {
             if let Some(ref paths) = spec.allowed_write_paths {
                 for path in paths {
@@ -204,6 +204,7 @@ fn linux_landlock_args(
 ) -> Result<Vec<OsString>, SandboxError> {
     let network_mode = match spec.mode {
         SandboxMode::ReadOnly => "deny",
+        SandboxMode::ReadOnlyWithNetwork => "allow",
         SandboxMode::WorkspaceWrite => "allow",
         SandboxMode::DangerFullAccess => {
             return Err(invalid_helper_mode("linux_landlock_args", spec.mode));
@@ -212,7 +213,10 @@ fn linux_landlock_args(
 
     let mut wrapped_args = vec![
         OsString::from("--mode"),
-        OsString::from(spec.mode.to_string()),
+        OsString::from(match spec.mode {
+            SandboxMode::ReadOnlyWithNetwork => SandboxMode::ReadOnly.to_string(),
+            mode => mode.to_string(),
+        }),
         OsString::from("--network"),
         OsString::from(network_mode),
     ];
@@ -264,6 +268,7 @@ fn linux_bwrap_args(
         SandboxMode::ReadOnly => {
             wrapped_args.push(OsString::from("--unshare-net"));
         }
+        SandboxMode::ReadOnlyWithNetwork => {}
         SandboxMode::WorkspaceWrite => {
             if let Some(ref paths) = spec.allowed_write_paths {
                 for path in paths {
@@ -496,6 +501,22 @@ mod tests {
     }
 
     #[test]
+    fn read_only_with_network_bwrap_args_keep_network() {
+        let spec = SandboxSpec::new(SandboxMode::ReadOnlyWithNetwork, "/tmp/project");
+        let args = linux_bwrap_args(Path::new("/usr/bin/claude"), &[], &spec).unwrap();
+        assert!(!args.contains(&OsString::from("--unshare-net")));
+        let project_occurrences = args
+            .iter()
+            .filter(|value| value == &&spec.project_root.as_os_str().to_os_string())
+            .count();
+        assert_eq!(
+            project_occurrences, 1,
+            "read-only-with-network mode should only reference project root in --chdir"
+        );
+        assert!(args.ends_with(&[OsString::from("--"), OsString::from("/usr/bin/claude"),]));
+    }
+
+    #[test]
     fn landlock_args_include_mode_network_and_protected_paths() {
         let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, "/tmp/project");
         let args = linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec).unwrap();
@@ -515,6 +536,16 @@ mod tests {
         let args = linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec).unwrap();
         assert!(args.contains(&OsString::from("read-only")));
         assert!(args.contains(&OsString::from("deny")));
+    }
+
+    #[test]
+    fn landlock_read_only_with_network_allows_network() {
+        let spec = SandboxSpec::new(SandboxMode::ReadOnlyWithNetwork, "/tmp/project");
+        let args = linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec).unwrap();
+        assert!(args.contains(&OsString::from("--network")));
+        assert!(args.contains(&OsString::from("allow")));
+        assert!(args.contains(&OsString::from("read-only")));
+        assert!(!args.contains(&OsString::from("read-only-with-network")));
     }
 
     #[test]

@@ -29,10 +29,22 @@ enum PrExternalState {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrOpenOrMergedState {
+    Open,
+    Merged,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubPullState {
     state: String,
     merged_at: Option<String>,
+    head: Option<GitHubPullHead>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPullHead {
+    sha: String,
 }
 
 /// Query the GitHub REST API with a 10 s timeout and classify the result.
@@ -44,21 +56,30 @@ async fn fetch_pr_external_state(
     project: &Path,
     github_token: Option<&str>,
 ) -> PrExternalState {
-    let Some(repo) = super::pr_detection::detect_repo_slug(project).await else {
+    let Some(repo_slug) = super::pr_detection::detect_repo_slug(project).await else {
         tracing::debug!(
             pr = pr_num,
             "PR state check skipped because repository slug is unavailable"
         );
         return PrExternalState::Unknown;
     };
+    let resolved_token = crate::github_auth::resolve_github_token(github_token);
+    fetch_pr_external_state_for_repo(&repo_slug, pr_num, resolved_token.as_deref()).await
+}
+
+async fn fetch_pr_external_state_for_repo(
+    repo_slug: &str,
+    pr_num: u64,
+    github_token: Option<&str>,
+) -> PrExternalState {
     let client = reqwest::Client::new();
     let mut request = client
         .get(format!(
-            "https://api.github.com/repos/{repo}/pulls/{pr_num}"
+            "https://api.github.com/repos/{repo_slug}/pulls/{pr_num}"
         ))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header(reqwest::header::USER_AGENT, "harness-server");
-    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+    if let Some(token) = github_token {
         request = request.bearer_auth(token);
     }
     let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
@@ -91,6 +112,79 @@ async fn fetch_pr_external_state(
         ("closed", true) => PrExternalState::Closed,
         _ => PrExternalState::Unknown,
     }
+}
+
+pub(crate) async fn verify_pr_open_or_merged(
+    repo_slug: &str,
+    pr_num: u64,
+    github_token: Option<&str>,
+) -> Result<PrOpenOrMergedState, String> {
+    let resolved_token =
+        crate::github_auth::resolve_github_token(github_token).ok_or_else(|| {
+            "GitHub token is required to verify PR open-state when hosted review is disabled; \
+         set server.github_token, GITHUB_TOKEN, or GH_TOKEN"
+                .to_string()
+        })?;
+    match fetch_pr_external_state_for_repo(repo_slug, pr_num, Some(&resolved_token)).await {
+        PrExternalState::Open => Ok(PrOpenOrMergedState::Open),
+        PrExternalState::Merged => Ok(PrOpenOrMergedState::Merged),
+        PrExternalState::Closed => Err(format!(
+            "GitHub PR {repo_slug}#{pr_num} is closed without merge"
+        )),
+        PrExternalState::Unknown => Err(format!(
+            "GitHub PR open-state lookup could not verify {repo_slug}#{pr_num}"
+        )),
+    }
+}
+
+pub(crate) async fn fetch_pr_head_sha_for_gate(
+    repo_slug: &str,
+    pr_num: u64,
+    github_token: Option<&str>,
+) -> Result<String, String> {
+    let resolved_token =
+        crate::github_auth::resolve_github_token(github_token).ok_or_else(|| {
+            "GitHub token is required to verify PR head when hosted review is disabled; \
+         set server.github_token, GITHUB_TOKEN, or GH_TOKEN"
+                .to_string()
+        })?;
+    let client = reqwest::Client::new();
+    let request = client
+        .get(format!(
+            "https://api.github.com/repos/{repo_slug}/pulls/{pr_num}"
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "harness-server")
+        .bearer_auth(resolved_token);
+    let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return Err(format!(
+                "GitHub PR head lookup failed for {repo_slug}#{pr_num}: {error}"
+            ))
+        }
+        Err(_) => {
+            return Err(format!(
+                "GitHub PR head lookup timed out for {repo_slug}#{pr_num}"
+            ))
+        }
+    };
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub PR head lookup failed for {repo_slug}#{pr_num} with status {}",
+            response.status()
+        ));
+    }
+    let state = response.json::<GitHubPullState>().await.map_err(|error| {
+        format!("GitHub PR head response was not parseable for {repo_slug}#{pr_num}: {error}")
+    })?;
+    state
+        .head
+        .map(|head| head.sha)
+        .filter(|sha| !sha.trim().is_empty())
+        .ok_or_else(|| {
+            format!("GitHub PR head lookup returned no head SHA for {repo_slug}#{pr_num}")
+        })
 }
 
 /// Returns `true` when the trailing three entries of `counts` are all `Some`
@@ -244,6 +338,7 @@ struct ActorNode {
 #[derive(Debug, Clone)]
 struct PullRequestSignals {
     latest_commit_at: DateTime<Utc>,
+    ci_state: Option<String>,
     ci_green: bool,
     latest_bot_activity_at: Option<DateTime<Utc>>,
     blocking_feedback: bool,
@@ -267,6 +362,13 @@ enum BotClassification {
     QuotaExhausted,
     Silent,
     NeverReviewed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrCheckRollupState {
+    Success,
+    Pending(String),
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +520,17 @@ fn classify_bot(
     BotClassification::ActionableFeedback
 }
 
+fn classify_pr_check_rollup_state(state: Option<&str>) -> PrCheckRollupState {
+    let Some(state) = state.map(str::trim).filter(|state| !state.is_empty()) else {
+        return PrCheckRollupState::Pending("no statusCheckRollup state yet".to_string());
+    };
+    match state.to_ascii_uppercase().as_str() {
+        "SUCCESS" => PrCheckRollupState::Success,
+        "FAILURE" | "ERROR" => PrCheckRollupState::Failed(state.to_string()),
+        _ => PrCheckRollupState::Pending(state.to_string()),
+    }
+}
+
 async fn fetch_pull_request_signals(
     repo_slug: &str,
     pr_num: u64,
@@ -511,11 +624,15 @@ async fn fetch_pull_request_signals(
         .last()
         .ok_or_else(|| anyhow::anyhow!("PR has no commits"))?;
     let latest_commit_at = latest_commit.commit.committed_date;
-    let ci_green = latest_commit
+    let ci_state = latest_commit
         .commit
         .status_check_rollup
         .as_ref()
-        .is_some_and(|rollup| rollup.state == "SUCCESS");
+        .map(|rollup| rollup.state.clone());
+    let ci_green = matches!(
+        classify_pr_check_rollup_state(ci_state.as_deref()),
+        PrCheckRollupState::Success
+    );
 
     let mut bots = HashMap::from([
         (ReviewBotKey::Gemini, BotSignals::default()),
@@ -585,11 +702,53 @@ async fn fetch_pull_request_signals(
 
     Ok(PullRequestSignals {
         latest_commit_at,
+        ci_state,
         ci_green,
         latest_bot_activity_at,
         blocking_feedback,
         bots,
     })
+}
+
+pub(crate) async fn verify_pr_checks_green(
+    repo_slug: &str,
+    pr_num: u64,
+    github_token: Option<&str>,
+    timeout_secs: u64,
+    poll_interval_secs: u64,
+) -> Result<(), String> {
+    let github_token = crate::github_auth::resolve_github_token(github_token).ok_or_else(|| {
+        "GitHub token is required to verify PR checks when hosted review is disabled; \
+         set server.github_token, GITHUB_TOKEN, or GH_TOKEN"
+            .to_string()
+    })?;
+    let timeout_secs = timeout_secs.max(1);
+    let poll_interval = Duration::from_secs(poll_interval_secs.clamp(1, 60));
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let signals = fetch_pull_request_signals(repo_slug, pr_num, Some(&github_token), &[])
+            .await
+            .map_err(|error| {
+                format!("GitHub PR check-status lookup failed for {repo_slug}#{pr_num}: {error}")
+            })?;
+        match classify_pr_check_rollup_state(signals.ci_state.as_deref()) {
+            PrCheckRollupState::Success => return Ok(()),
+            PrCheckRollupState::Failed(state) => {
+                return Err(format!(
+                    "GitHub PR checks are not green for {repo_slug}#{pr_num}: {state}"
+                ))
+            }
+            PrCheckRollupState::Pending(state) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "GitHub PR checks did not reach SUCCESS for {repo_slug}#{pr_num} \
+                         within {timeout_secs}s; last state: {state}"
+                    ));
+                }
+                sleep(poll_interval).await;
+            }
+        }
+    }
 }
 
 async fn post_review_bot_comment(
@@ -716,7 +875,7 @@ fn update_silence_rounds(
     }
 }
 
-async fn record_runtime_pr_feedback(
+pub(crate) async fn record_runtime_pr_feedback(
     issue_workflow_store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
     workflow_runtime_store: Option<&harness_workflow::runtime::WorkflowRuntimeStore>,
     project_root: &Path,
@@ -746,6 +905,59 @@ async fn record_runtime_pr_feedback(
             pr_number: pr_num,
             pr_url,
             outcome,
+            summary,
+        },
+    )
+    .await;
+}
+
+pub(crate) async fn record_runtime_pr_merged(
+    issue_workflow_store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
+    workflow_runtime_store: Option<&harness_workflow::runtime::WorkflowRuntimeStore>,
+    project_root: &Path,
+    req: &CreateTaskRequest,
+    task_id: &TaskId,
+    pr_num: u64,
+    pr_url: Option<&str>,
+    summary: &str,
+) {
+    let project_id = project_root.to_string_lossy();
+    if let Some(workflows) = issue_workflow_store {
+        if let Err(error) = workflows
+            .record_pr_merged(
+                project_id.as_ref(),
+                req.repo.as_deref(),
+                pr_num,
+                Some(summary),
+            )
+            .await
+        {
+            tracing::warn!(
+                project = %project_id,
+                repo = req.repo.as_deref().unwrap_or(""),
+                pr = pr_num,
+                "failed to record merged PR in issue workflow store: {error}"
+            );
+        }
+    }
+
+    let issue_number = resolve_runtime_feedback_issue_number(
+        issue_workflow_store,
+        project_root,
+        req.repo.as_deref(),
+        req.issue,
+        pr_num,
+    )
+    .await;
+    crate::workflow_runtime_pr_feedback::record_pr_merged(
+        workflow_runtime_store,
+        crate::workflow_runtime_pr_feedback::PrMergedRuntimeContext {
+            project_root,
+            repo: req.repo.as_deref(),
+            issue_number,
+            task_id,
+            pr_number: pr_num,
+            pr_url,
             summary,
         },
     )
@@ -1659,6 +1871,26 @@ mod tests {
         config
     }
 
+    #[test]
+    fn classifies_pr_check_rollup_states() {
+        assert_eq!(
+            classify_pr_check_rollup_state(Some("SUCCESS")),
+            PrCheckRollupState::Success
+        );
+        assert_eq!(
+            classify_pr_check_rollup_state(Some("FAILURE")),
+            PrCheckRollupState::Failed("FAILURE".to_string())
+        );
+        assert_eq!(
+            classify_pr_check_rollup_state(Some("PENDING")),
+            PrCheckRollupState::Pending("PENDING".to_string())
+        );
+        assert_eq!(
+            classify_pr_check_rollup_state(None),
+            PrCheckRollupState::Pending("no statusCheckRollup state yet".to_string())
+        );
+    }
+
     async fn open_issue_workflow_test_store(
     ) -> anyhow::Result<Option<harness_workflow::issue_lifecycle::IssueWorkflowStore>> {
         if std::env::var("DATABASE_URL").is_err() {
@@ -1799,6 +2031,7 @@ mod tests {
         bots.insert(ReviewBotKey::Codex, secondary);
         PullRequestSignals {
             latest_commit_at,
+            ci_state: Some("SUCCESS".to_string()),
             ci_green: true,
             latest_bot_activity_at: None,
             blocking_feedback: false,

@@ -2,9 +2,10 @@ use crate::task_runner::TaskId;
 use harness_workflow::runtime::{
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
     DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
-    PrFeedbackSweepDecisionInput, ValidationContext, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandType,
+    WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvidence,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, PR_FEEDBACK_DEFINITION_ID,
+    PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -28,6 +29,16 @@ pub(crate) struct PrFeedbackRuntimeContext<'a> {
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
     pub outcome: PrFeedbackOutcome,
+    pub summary: &'a str,
+}
+
+pub(crate) struct PrMergedRuntimeContext<'a> {
+    pub project_root: &'a Path,
+    pub repo: Option<&'a str>,
+    pub issue_number: Option<u64>,
+    pub task_id: &'a TaskId,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
     pub summary: &'a str,
 }
 
@@ -114,6 +125,26 @@ pub(crate) async fn record_pr_feedback(
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
             "workflow runtime PR feedback write failed: {error}"
+        );
+    }
+}
+
+pub(crate) async fn record_pr_merged(
+    store: Option<&WorkflowRuntimeStore>,
+    ctx: PrMergedRuntimeContext<'_>,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let Some(issue_number) = ctx.issue_number else {
+        return;
+    };
+    if let Err(error) = persist_pr_merged(store, &ctx, issue_number).await {
+        tracing::warn!(
+            issue = issue_number,
+            pr = ctx.pr_number,
+            task_id = %ctx.task_id.0,
+            "workflow runtime PR merge write failed: {error}"
         );
     }
 }
@@ -359,6 +390,74 @@ async fn persist_pr_feedback(
         },
     );
     apply_decision(store, instance, output.decision, Some(event.id)).await
+}
+
+async fn persist_pr_merged(
+    store: &WorkflowRuntimeStore,
+    ctx: &PrMergedRuntimeContext<'_>,
+    issue_number: u64,
+) -> anyhow::Result<()> {
+    let project_id = ctx.project_root.to_string_lossy().into_owned();
+    let workflow_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, issue_number);
+    upsert_github_issue_pr_definition(store).await?;
+    let mut instance = load_or_issue_instance(
+        store,
+        workflow_id,
+        project_id.clone(),
+        ctx.repo.map(ToOwned::to_owned),
+        issue_number,
+        "pr_open",
+    )
+    .await?;
+    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        ctx.project_root,
+        json!({
+            "project_id": project_id,
+            "repo": ctx.repo,
+            "issue_number": issue_number,
+            "task_id": ctx.task_id.as_str(),
+            "pr_number": ctx.pr_number,
+            "pr_url": ctx.pr_url,
+        }),
+    );
+    store.upsert_instance(&instance).await?;
+    let event = store
+        .append_event(
+            &instance.id,
+            "PrMerged",
+            "workflow_runtime_pr_feedback",
+            json!({
+                "task_id": ctx.task_id.as_str(),
+                "issue_number": issue_number,
+                "repo": ctx.repo,
+                "pr_number": ctx.pr_number,
+                "pr_url": ctx.pr_url,
+            }),
+        )
+        .await?;
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "record_pr_merged",
+        "done",
+        ctx.summary,
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::MarkDone,
+        format!("pr-merged:{}:{}", ctx.task_id.as_str(), ctx.pr_number),
+        json!({
+            "task_id": ctx.task_id.as_str(),
+            "pr_number": ctx.pr_number,
+            "pr_url": ctx.pr_url,
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "pr_merged",
+        ctx.pr_url.unwrap_or("merged externally"),
+    ))
+    .high_confidence();
+    apply_decision(store, instance, decision, Some(event.id)).await
 }
 
 async fn approve_runtime_merge(
