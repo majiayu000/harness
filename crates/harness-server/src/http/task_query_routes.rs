@@ -48,6 +48,12 @@ struct RuntimeTaskResponse {
     workflow: Option<TaskWorkflowSummary>,
 }
 
+enum RuntimeProofLookup {
+    Missing,
+    InFlight(String),
+    Terminal(ProofOfWork),
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawTaskListParams {
@@ -983,6 +989,132 @@ pub(crate) fn proof_from_state(task: &TaskState) -> ProofOfWork {
     }
 }
 
+fn proof_from_runtime_workflow(
+    task_id: &harness_core::types::TaskId,
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+    events: &[harness_workflow::runtime::WorkflowEvent],
+    decisions: &[harness_workflow::runtime::WorkflowDecisionRecord],
+) -> ProofOfWork {
+    let status = runtime_workflow_state_to_task_status(&workflow.state);
+    let pr_url = runtime_string_field(&workflow.data, "pr_url")
+        .or_else(|| runtime_string_field(&workflow.data, "last_pr_url"));
+    let accepted_decisions = decisions
+        .iter()
+        .filter(|record| record.accepted)
+        .collect::<Vec<_>>();
+    let approved = events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "PrReadyToMerge" | "MergeApproved" | "PrMerged"
+        )
+    }) || accepted_decisions.iter().any(|record| {
+        matches!(
+            record.decision.decision.as_str(),
+            "mark_ready_to_merge" | "approve_merge" | "record_pr_merged" | "quality_passed"
+        )
+    }) || workflow.state == "passed";
+    let changes_requested = events
+        .iter()
+        .any(|event| event.event_type == "FeedbackFound")
+        || accepted_decisions.iter().any(|record| {
+            matches!(
+                record.decision.decision.as_str(),
+                "address_pr_feedback" | "await_feedback_after_rework"
+            )
+        });
+
+    let review_outcome = if approved {
+        ReviewOutcome::Approved
+    } else if changes_requested {
+        ReviewOutcome::ChangesRequested
+    } else {
+        ReviewOutcome::Skipped
+    };
+    let ci_status = if status.is_failure() {
+        CiStatus::Failed
+    } else if status == TaskStatus::Done && review_outcome == ReviewOutcome::Approved {
+        CiStatus::Passed
+    } else {
+        CiStatus::Unknown
+    };
+    let review_event_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "FeedbackFound"
+                    | "NoFeedbackFound"
+                    | "PrReadyToMerge"
+                    | "MergeApproved"
+                    | "PrMerged"
+            )
+        })
+        .count();
+    let review_decision_count = accepted_decisions
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.decision.decision.as_str(),
+                "address_pr_feedback"
+                    | "wait_for_pr_feedback"
+                    | "mark_ready_to_merge"
+                    | "approve_merge"
+                    | "record_pr_merged"
+                    | "quality_passed"
+            )
+        })
+        .count();
+    let review_rounds = review_event_count.max(review_decision_count) as u32;
+
+    let mut signals = vec![
+        QualitySignal {
+            name: "workflow_id".to_string(),
+            value: workflow.id.clone(),
+        },
+        QualitySignal {
+            name: "workflow_state".to_string(),
+            value: workflow.state.clone(),
+        },
+    ];
+    if let Some(error) = runtime_string_field(&workflow.data, "failure_reason") {
+        signals.push(QualitySignal {
+            name: "error".to_string(),
+            value: error,
+        });
+    }
+
+    ProofOfWork {
+        task_id: task_id.as_str().to_string(),
+        status: status.as_ref().to_string(),
+        pr_url,
+        ci_status,
+        review_outcome,
+        review_rounds,
+        quality_signals: signals,
+    }
+}
+
+async fn runtime_proof_by_handle(
+    state: &AppState,
+    task_id: &harness_core::types::TaskId,
+) -> anyhow::Result<RuntimeProofLookup> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(RuntimeProofLookup::Missing);
+    };
+    let Some(workflow) = store.get_instance_by_task_id(task_id.as_str()).await? else {
+        return Ok(RuntimeProofLookup::Missing);
+    };
+    let status = runtime_workflow_state_to_task_status(&workflow.state);
+    if !status.is_terminal() {
+        return Ok(RuntimeProofLookup::InFlight(status.as_ref().to_string()));
+    }
+    let events = store.events_for(&workflow.id).await?;
+    let decisions = store.decisions_for(&workflow.id).await?;
+    Ok(RuntimeProofLookup::Terminal(proof_from_runtime_workflow(
+        task_id, &workflow, &events, &decisions,
+    )))
+}
+
 /// GET /tasks/{id}/proof — machine-readable proof-of-work summary for a
 /// completed task.
 ///
@@ -1008,11 +1140,30 @@ pub(crate) async fn get_task_proof(
             }
             Json(proof_from_state(&task)).into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "task not found"})),
-        )
-            .into_response(),
+        Ok(None) => match runtime_proof_by_handle(&state, &task_id).await {
+            Ok(RuntimeProofLookup::Terminal(proof)) => Json(proof).into_response(),
+            Ok(RuntimeProofLookup::InFlight(status)) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "task is not in a terminal state",
+                    "status": status,
+                })),
+            )
+                .into_response(),
+            Ok(RuntimeProofLookup::Missing) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "task not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("get_task_proof: runtime workflow lookup failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "internal server error"})),
+                )
+                    .into_response()
+            }
+        },
         Err(e) => {
             tracing::error!("get_task_proof: database error: {e}");
             (
