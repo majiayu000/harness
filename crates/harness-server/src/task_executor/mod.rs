@@ -22,6 +22,7 @@ use crate::task_runner::{
 use anyhow::Context;
 use harness_core::agent::CodeAgent;
 use harness_core::config::agents::CapabilityProfile;
+use harness_core::validation::{ValidationExecutor, ValidationOutcomeKind, ValidationRequest};
 use harness_core::{config::project::load_project_config, lang_detect, prompts};
 use std::collections::HashMap;
 
@@ -73,9 +74,6 @@ impl Drop for TaskTargetDir {
         }
     }
 }
-
-use tokio::process::Command as TokioCommand;
-use tokio::time::timeout;
 
 /// State shared across pipeline stages within a single task execution.
 #[allow(dead_code)]
@@ -137,6 +135,7 @@ fn review_repo_slug(pr_url: Option<&str>, detected_repo_slug: &str) -> String {
 ///
 /// Returns `Err(output)` containing stdout/stderr of the first failing command.
 async fn run_test_gate(
+    validation_executor: &dyn ValidationExecutor,
     project_root: &std::path::Path,
     custom_cmds: &[String],
     timeout_secs: u64,
@@ -169,39 +168,40 @@ async fn run_test_gate(
     for cmd in &cmds {
         tracing::info!(cmd = %cmd, "test gate: running tests before accepting LGTM");
 
-        let child = match TokioCommand::new("sh")
-            .args(["-c", cmd])
-            .current_dir(project_root)
-            // Issue 3 fix: inherit the per-task CARGO_TARGET_DIR so parallel
-            // Rust tasks do not contend on the same build directory (issue #488).
-            .envs(extra_env)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return Err(format!("test gate: failed to spawn `{cmd}`: {e}")),
-        };
+        let env: Vec<(&str, &str)> = extra_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let outcome = validation_executor
+            .run(ValidationRequest {
+                command: cmd,
+                cwd: project_root,
+                env: &env,
+                timeout: Duration::from_secs(timeout_secs),
+            })
+            .await;
 
-        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-            Ok(Ok(out)) if out.status.success() => {
+        match outcome.kind {
+            ValidationOutcomeKind::Success => {
                 tracing::info!(cmd = %cmd, "test gate: tests passed");
             }
-            Ok(Ok(out)) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let code = out.status.code().unwrap_or(-1);
+            ValidationOutcomeKind::NonZeroExit { code } => {
                 return Err(format!(
-                    "Test gate failed (exit {code})\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    "Test gate failed (exit {code})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    stdout = outcome.stdout,
+                    stderr = outcome.stderr,
                 ));
             }
-            Ok(Err(e)) => return Err(format!("test gate: `{cmd}` failed to wait: {e}")),
-            Err(_) => {
+            ValidationOutcomeKind::SpawnFailed { reason } => {
+                return Err(format!("test gate: failed to spawn `{cmd}`: {reason}"));
+            }
+            ValidationOutcomeKind::WaitFailed { reason } => {
+                return Err(format!("test gate: `{cmd}` failed to wait: {reason}"));
+            }
+            ValidationOutcomeKind::TimedOut => {
                 return Err(format!(
                     "Test gate timed out after {timeout_secs}s (command: `{cmd}`)"
-                ))
+                ));
             }
         }
     }
