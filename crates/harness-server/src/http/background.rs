@@ -630,7 +630,7 @@ async fn dispatch_runtime_command_with_project_policy(
                 .to_string();
             return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
         }
-        Err(error) => {
+        Err(RuntimeDispatchProfileSelectionError::WorkflowConfig(error)) => {
             let command_id = command.id.clone();
             let reason = format!("workflow runtime project config failed to load: {error}");
             store.mark_command_status(&command_id, "failed").await?;
@@ -647,6 +647,9 @@ async fn dispatch_runtime_command_with_project_policy(
                 .await?;
             return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
         }
+        Err(RuntimeDispatchProfileSelectionError::Other(error)) => {
+            return Err(error.context("failed to select runtime dispatch profile"));
+        }
     };
 
     RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
@@ -660,11 +663,13 @@ async fn runtime_dispatch_profile_selector_for_command(
     store: &WorkflowRuntimeStore,
     command: &WorkflowCommandRecord,
     fallback_profile_selector: &RuntimeProfileSelector,
-) -> anyhow::Result<Option<RuntimeProfileSelector>> {
-    let project_root =
-        runtime_command_project_root(store, command, &state.core.project_root).await?;
+) -> Result<Option<RuntimeProfileSelector>, RuntimeDispatchProfileSelectionError> {
+    let project_root = runtime_command_project_root(store, command, &state.core.project_root)
+        .await
+        .map_err(RuntimeDispatchProfileSelectionError::Other)?;
     let workflow_cfg =
-        load_runtime_workflow_config(&project_root, "workflow runtime command dispatcher")?;
+        load_runtime_workflow_config(&project_root, "workflow runtime command dispatcher")
+            .map_err(RuntimeDispatchProfileSelectionError::WorkflowConfig)?;
     if !workflow_cfg.runtime_dispatch.enabled || !workflow_cfg.runtime_worker.enabled {
         tracing::debug!(
             workflow_id = %command.workflow_id,
@@ -681,7 +686,8 @@ async fn runtime_dispatch_profile_selector_for_command(
         &project_root,
         Some(fallback_profile_selector.select(None, None)),
     )
-    .await?;
+    .await
+    .map_err(RuntimeDispatchProfileSelectionError::Other)?;
     persist_runtime_profile_manifest(
         store,
         &project_root,
@@ -689,12 +695,22 @@ async fn runtime_dispatch_profile_selector_for_command(
         &workflow_cfg.runtime_dispatch,
         &inherited_profile,
     )
-    .await?;
-    Ok(Some(runtime_dispatch_profile_selector(
-        &state.core.server.config,
-        &workflow_cfg.runtime_dispatch,
-        &inherited_profile,
-    )?))
+    .await
+    .map_err(RuntimeDispatchProfileSelectionError::Other)?;
+    Ok(Some(
+        runtime_dispatch_profile_selector(
+            &state.core.server.config,
+            &workflow_cfg.runtime_dispatch,
+            &inherited_profile,
+        )
+        .map_err(RuntimeDispatchProfileSelectionError::Other)?,
+    ))
+}
+
+#[derive(Debug)]
+enum RuntimeDispatchProfileSelectionError {
+    WorkflowConfig(anyhow::Error),
+    Other(anyhow::Error),
 }
 
 async fn runtime_command_project_root(

@@ -1497,6 +1497,73 @@ async fn runtime_command_dispatch_tick_fails_command_when_workflow_config_is_mal
 }
 
 #[tokio::test]
+async fn runtime_command_dispatch_tick_retries_non_workflow_config_errors() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-malformed-project-config");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let harness_dir = project_root.join(".harness");
+    std::fs::create_dir(&harness_dir)?;
+    std::fs::write(harness_dir.join("config.toml"), "agent = [")?;
+
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "replanning",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:125"),
+    )
+    .with_id("issue-125")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 125,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-125");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let err = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await
+    .expect_err("non-WORKFLOW config errors should remain retryable");
+
+    assert!(format!("{err:#}").contains("failed to load project config"));
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert_eq!(
+        store.commands_for(&workflow.id).await?[0].status,
+        "dispatching"
+    );
+    let events = store.events_for(&workflow.id).await?;
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "WorkflowRuntimeConfigError"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_pr_feedback_sweep_tick_enqueues_runtime_command() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
