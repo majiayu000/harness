@@ -127,6 +127,7 @@ listener_name_matches_bind() {
 listener_pids() {
     local line
     local lsof_output
+    local lsof_status=0
     local name
     local pid
 
@@ -139,11 +140,13 @@ listener_pids() {
         return 0
     fi
 
-    if ! lsof_output="$(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>&1)"; then
+    lsof_output="$(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>&1)" || lsof_status=$?
+    if [ "$lsof_status" -ne 0 ] &&
+        ! printf '%s\n' "$lsof_output" |
+            awk '$0 !~ /^COMMAND/ && $2 ~ /^[0-9]+$/ && $0 ~ / TCP / && $0 ~ /\(LISTEN\)/ { found = 1 } END { exit found ? 0 : 1 }'; then
         if [ -n "$lsof_output" ]; then
-            echo "ERROR: failed to inspect listeners on $BIND_ADDR:" >&2
+            echo "WARNING: lsof could not complete listener preflight for $BIND_ADDR; continuing without listener results:" >&2
             printf '%s\n' "$lsof_output" >&2
-            exit 1
         fi
         return 0
     fi
@@ -151,8 +154,11 @@ listener_pids() {
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         [[ "$line" == COMMAND* ]] && continue
+        [[ "$line" == *" TCP "* ]] || continue
+        [[ "$line" == *"(LISTEN)"* ]] || continue
         set -- $line
-        pid="$2"
+        pid="${2:-}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
         name="${line##* TCP }"
         name="${name% (LISTEN)}"
         if listener_name_matches_bind "$name"; then
