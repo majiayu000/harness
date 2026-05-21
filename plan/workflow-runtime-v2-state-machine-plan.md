@@ -54,6 +54,9 @@ Completed:
 
 - `implement_issue` success without PR or terminal evidence now has reducer and
   worker coverage and moves the workflow to `blocked`.
+- `implement_issue` success with structured closed-issue evidence now has
+  reducer, worker, and prompt-contract coverage and moves the workflow to
+  `done`.
 
 Validation:
 
@@ -274,3 +277,4 @@ Before the V2 PR can be considered merge-ready:
 | 2026-05-21 | P0.1 partial: `implement_issue` success without PR evidence blocks instead of leaving `implementing`. | `cargo test --package harness-workflow runtime_completion_reducer_blocks_issue_implementation_success_without_pr`; `cargo test --package harness-workflow runtime_worker_blocks_implementation_success_without_pr_evidence` |
 | 2026-05-21 | P0.2: worker runtime completion moved to atomic store commit. | `cargo test --package harness-workflow runtime_completion_reducer`; `cargo test --package harness-workflow runtime_worker` |
 | 2026-05-21 | P0 package verification. | `cargo test --package harness-workflow`; `RUSTFLAGS="-Dwarnings" cargo check --workspace --all-targets` |
+| 2026-05-21 | P0.1 partial: `implement_issue` success with closed issue evidence finishes the workflow. | `cargo test --package harness-workflow runtime_completion_reducer`; `cargo test --package harness-workflow runtime_worker`; `cargo test --package harness-server activity_result_schema_describes_issue_implementation_terminal_evidence_contract`; `cargo test --package harness-server runtime_job_worker_tick_runs_registered_agent_and_completes_job`; `cargo test` |

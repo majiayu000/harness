@@ -766,6 +766,143 @@ fn runtime_completion_reducer_binds_pr_from_structured_pull_request_artifact() {
 }
 
 #[test]
+fn runtime_completion_reducer_finishes_closed_issue_signal_without_pr() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult::succeeded(
+        "implement_issue",
+        "Issue was already closed before implementation created a PR.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue signal should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkDone
+    );
+    assert_eq!(
+        decision.commands[0].command["closed_issue_evidence"]["state"],
+        "closed"
+    );
+    assert!(decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "closed_issue"));
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("closed issue completion should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_uses_issue_state_artifact_as_closed_issue_evidence() {
+    let instance = issue_instance("implementing");
+    let result =
+        ActivityResult::succeeded("implement_issue", "Issue state confirms no PR is needed.")
+            .with_artifact(ActivityArtifact::new(
+                "issue_state",
+                json!({
+                    "issue_number": 123,
+                    "state": "closed"
+                }),
+            ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("issue_state artifact should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("closed issue artifact completion should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_structured_done_without_closed_issue_evidence() {
+    let instance = issue_instance("implementing");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "implementing",
+        "finish_closed_issue",
+        "done",
+        "The agent claimed the issue was closed without structured evidence.",
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::MarkDone,
+        "agent-claimed-done",
+        json!({ "reason": "missing structured issue state" }),
+    ));
+    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
+        .with_artifact(ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing terminal evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .commands
+        .iter()
+        .any(|command| command.command_type == WorkflowCommandType::MarkBlocked));
+}
+
+#[test]
 fn runtime_completion_reducer_binds_pr_when_structured_workflow_decision_is_invalid() {
     let instance = issue_instance("implementing");
     let proposed_decision = WorkflowDecision::new(
@@ -3669,6 +3806,77 @@ async fn runtime_worker_blocks_implementation_success_without_pr_evidence() -> a
     assert!(decisions.iter().any(|record| {
         record.accepted && record.decision.decision == "block_missing_implementation_result"
     }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_finishes_closed_issue_success_without_pr() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = project_issue_instance("/project-a", 125, "implementing").with_data(json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 125,
+        "task_id": "task-125",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "issue-125-implement");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        )
+        .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded(
+            "implement_issue",
+            "Issue was already resolved upstream.",
+        )
+        .with_signal(ActivitySignal::new(
+            "IssueAlreadyResolved",
+            json!({
+                "issue_number": 125,
+                "state": "closed",
+                "issue_url": "https://github.com/owner/repo/issues/125",
+            }),
+        )),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+    assert_eq!(completed.id, job.id);
+    assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
+
+    let reloaded = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(reloaded.state, "done");
+    assert_eq!(reloaded.data["project_id"], "/project-a");
+    assert_eq!(reloaded.data["issue_number"], 125);
+
+    let commands = store.commands_for(&workflow.id).await?;
+    assert_eq!(commands[0].id, command_id);
+    assert_eq!(commands[0].status, "completed");
+    assert!(commands.iter().any(|record| {
+        record.command.command_type == WorkflowCommandType::MarkDone
+            && record.status == "handled_inline"
+    }));
+
+    let decisions = store.decisions_for(&workflow.id).await?;
+    assert!(decisions
+        .iter()
+        .any(|record| record.accepted && record.decision.decision == "finish_closed_issue"));
     Ok(())
 }
 

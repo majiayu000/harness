@@ -1,5 +1,6 @@
 use harness_workflow::runtime::{
-    GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
+    ISSUE_STATE_ARTIFACT, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
     QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
     QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
@@ -105,7 +106,13 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
         }
         (GITHUB_ISSUE_PR_DEFINITION_ID, "implement_issue") => {
             ActivityContract::new(workflow_definition, activity)
-                .with_accepted_artifacts(vec!["pull_request", "workflow_decision"])
+                .with_accepted_signals(vec![ISSUE_CLOSED_SIGNAL, ISSUE_ALREADY_RESOLVED_SIGNAL])
+                .with_accepted_artifacts(vec![
+                    "pull_request",
+                    ISSUE_STATE_ARTIFACT,
+                    "workflow_decision",
+                ])
+                .requires("pull_request_artifact_or_closed_issue_signal")
         }
         (GITHUB_ISSUE_PR_DEFINITION_ID, "replan_issue") => {
             ActivityContract::new(workflow_definition, activity)

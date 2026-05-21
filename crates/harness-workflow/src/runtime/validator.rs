@@ -151,6 +151,7 @@ impl TransitionAllowlist {
                 "pr_open",
                 [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
             )
+            .allow("implementing", "done", [MarkDone])
             .allow(
                 "scheduled",
                 "pr_open",
