@@ -3027,6 +3027,66 @@ fn runtime_completion_reducer_blocks_repo_backlog_scan_with_invalid_issue_signal
 }
 
 #[test]
+fn runtime_completion_reducer_blocks_invalid_issue_signal_before_pr_feedback_dispatch() {
+    let instance = repo_backlog_instance("scanning");
+    let command = WorkflowCommand::enqueue_activity(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "repo-backlog:owner/repo:poll",
+    );
+    let result = ActivityResult::succeeded(
+        REPO_BACKLOG_POLL_ACTIVITY,
+        "Found a malformed issue candidate and one PR with feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueDiscovered",
+        json!({
+            "issue_url": "https://github.com/owner/repo/issues/42",
+            "title": "Missing issue number"
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "OpenPrFeedbackDiscovered",
+        json!({
+            "pr_number": 1123,
+            "pr_url": "https://github.com/owner/repo/pull/1123",
+            "title": "Route open PR feedback through runtime prompts",
+            "feedback_count": 1
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("invalid issue signal should block before PR feedback dispatch");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("valid issue_number"));
+    assert!(!decision
+        .commands
+        .iter()
+        .any(|command| command.command_type == WorkflowCommandType::StartChildWorkflow));
+    DecisionValidator::repo_backlog()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("invalid mixed scan signal block decision should validate");
+}
+
+#[test]
 fn repo_backlog_requires_plan_activity_when_entering_planning_batch() {
     let instance = repo_backlog_instance("scanning");
     let decision = WorkflowDecision::new(

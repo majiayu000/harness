@@ -78,13 +78,13 @@ fn reduce_success(
         return Some(decision);
     }
 
-    if let Some(decision) = repo_backlog_poll_decision_from_activity_result(instance, event, result)
+    if let Some(decision) =
+        repo_backlog_invalid_success_decision(instance, event, result, structured_decision.as_ref())
     {
         return Some(decision);
     }
 
-    if let Some(decision) =
-        repo_backlog_invalid_success_decision(instance, event, result, structured_decision.as_ref())
+    if let Some(decision) = repo_backlog_poll_decision_from_activity_result(instance, event, result)
     {
         return Some(decision);
     }
@@ -1083,7 +1083,8 @@ fn repo_backlog_invalid_success_decision(
             if !has_any_signal(
                 result,
                 &["SprintTaskSelected", "IssueSkipped", "NoSprintTaskSelected"],
-            ) && !has_valid_noop_sprint_plan_artifact
+            ) && sprint_plan_task_count == 0
+                && !has_valid_noop_sprint_plan_artifact
             {
                 return Some(invalid_agent_output_blocked_decision(
                     instance,

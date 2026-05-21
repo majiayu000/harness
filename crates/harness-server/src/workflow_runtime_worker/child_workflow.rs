@@ -214,12 +214,15 @@ async fn execute_start_prompt_task_child_workflow(
     )
     .await?;
 
+    let mut child = store
+        .get_instance(&submission.workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("prompt task child workflow was not persisted"))?;
+
     if let Some(parent) = parent {
-        if let Some(mut child) = store.get_instance(&submission.workflow_id).await? {
-            if child.parent_workflow_id.is_none() {
-                child.parent_workflow_id = Some(parent.id.clone());
-                store.upsert_instance(&child).await?;
-            }
+        if child.parent_workflow_id.is_none() {
+            child.parent_workflow_id = Some(parent.id.clone());
+            store.upsert_instance(&child).await?;
         }
     }
 
@@ -237,11 +240,6 @@ async fn execute_start_prompt_task_child_workflow(
             }),
         )
         .await?;
-
-    let child = store
-        .get_instance(&submission.workflow_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("prompt task child workflow was not persisted"))?;
 
     Ok(ActivityResult::succeeded(
         activity_name(job),
