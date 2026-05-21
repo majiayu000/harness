@@ -294,4 +294,4 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
     fi
 fi
 
-exec ./target/release/harness serve "${CONFIG_ARGS[@]}" --project-root "$(pwd)"
+exec ./target/release/harness serve "${CONFIG_ARGS[@]}" --transport http --project-root "$(pwd)"
