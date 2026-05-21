@@ -396,6 +396,7 @@ pub enum WorkflowDecisionRejectionKind {
     WaitLimitExhausted,
     TerminalReopenDenied,
     RequiredCommandMissing,
+    InvalidCommandPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,6 +550,7 @@ impl DecisionValidator {
             }
 
             self.validate_dedupe(command, &mut seen_dedupe_keys, context)?;
+            self.validate_command_payload(command)?;
 
             if command.requires_runtime_job() && !context.resource_budget_available {
                 return Err(WorkflowDecisionRejection::new(
@@ -594,6 +596,41 @@ impl DecisionValidator {
             return Err(WorkflowDecisionRejection::new(
                 WorkflowDecisionRejectionKind::ReplanLimitExhausted,
                 "run_replan decision requested after replan budget was exhausted",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_command_payload(
+        &self,
+        command: &WorkflowCommand,
+    ) -> Result<(), WorkflowDecisionRejection> {
+        if command.command_type != WorkflowCommandType::BindPr {
+            return Ok(());
+        }
+
+        if command
+            .command
+            .get("pr_number")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        {
+            return Err(WorkflowDecisionRejection::new(
+                WorkflowDecisionRejectionKind::InvalidCommandPayload,
+                "BindPr command must include numeric pr_number",
+            ));
+        }
+
+        let has_pr_url = command
+            .command
+            .get("pr_url")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !has_pr_url {
+            return Err(WorkflowDecisionRejection::new(
+                WorkflowDecisionRejectionKind::InvalidCommandPayload,
+                "BindPr command must include non-empty pr_url",
             ));
         }
 

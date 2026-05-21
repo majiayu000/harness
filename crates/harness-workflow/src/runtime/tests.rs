@@ -3415,6 +3415,32 @@ fn rejects_pr_open_transition_without_bind_pr_command() {
 }
 
 #[test]
+fn rejects_pr_open_transition_with_invalid_bind_pr_payload() {
+    let instance = issue_instance("implementing");
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "implementing",
+        "agent_reported_pr_open",
+        "pr_open",
+        "The agent reported a PR with incomplete metadata.",
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::BindPr,
+        "issue-123-bind-pr",
+        json!({ "pr_number": 77 }),
+    ));
+
+    let err = DecisionValidator::github_issue_pr()
+        .validate(&instance, &decision, &validation_context())
+        .expect_err("BindPr must include a valid pr_number and pr_url payload");
+
+    assert_eq!(
+        err.kind,
+        WorkflowDecisionRejectionKind::InvalidCommandPayload
+    );
+}
+
+#[test]
 fn rejects_scheduled_pr_open_transition_without_bind_pr_command() {
     let instance = issue_instance("scheduled");
     let decision = WorkflowDecision::new(
@@ -4190,6 +4216,84 @@ async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> any
         WorkflowCommandType::BindPr
     );
     assert_ne!(commands[1].status, "pending");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_blocks_invalid_inline_bind_pr_before_persisting_command(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = project_issue_instance("/project-a", 123, "implementing").with_data(json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 123,
+        "task_id": "task-123",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        )
+        .await?;
+    let malformed_decision = WorkflowDecision::new(
+        &workflow.id,
+        "implementing",
+        "agent_reported_pr_open",
+        "pr_open",
+        "The agent reported a PR with incomplete metadata.",
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::BindPr,
+        "issue-123-bind-pr",
+        json!({ "pr_number": 77 }),
+    ));
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded("implement_issue", "Implementation completed.")
+            .with_artifact(ActivityArtifact::new(
+                "workflow_decision",
+                serde_json::to_value(&malformed_decision).expect("decision should serialize"),
+            )),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+    assert_eq!(completed.id, job.id);
+
+    let reloaded = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(reloaded.state, "blocked");
+    assert!(reloaded.data.get("pr_number").is_none());
+    assert!(reloaded.data.get("pr_url").is_none());
+
+    let commands = store.commands_for(&workflow.id).await?;
+    assert!(commands.iter().all(|record| {
+        record.command.command_type != WorkflowCommandType::BindPr
+            && record.command.dedupe_key != "issue-123-bind-pr"
+    }));
+    assert!(commands.iter().any(|record| {
+        record.command.command_type == WorkflowCommandType::MarkBlocked
+            && record.status == "handled_inline"
+    }));
+
+    let decisions = store.decisions_for(&workflow.id).await?;
+    assert!(decisions.iter().any(|record| {
+        record.accepted && record.decision.decision == "block_invalid_agent_output"
+    }));
     Ok(())
 }
 
