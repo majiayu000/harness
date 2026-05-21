@@ -250,13 +250,17 @@ ensure_bind_port_available() {
     echo "Harness server is already running on $BIND_ADDR:" >&2
     print_listener_table "$pids"
     health_url="http://$(health_check_addr)/health"
-    if curl -fsS --max-time 2 "$health_url" >/dev/null 2>&1; then
-        echo "Health check OK: $health_url" >&2
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS --max-time 2 "$health_url" >/dev/null 2>&1; then
+            echo "Health check OK: $health_url" >&2
+        else
+            echo "ERROR: existing Harness server did not pass health check: $health_url" >&2
+            echo "To restart explicitly, run:" >&2
+            echo "  HARNESS_RESTART=1 ./start-server.sh" >&2
+            exit 1
+        fi
     else
-        echo "ERROR: existing Harness server did not pass health check: $health_url" >&2
-        echo "To restart explicitly, run:" >&2
-        echo "  HARNESS_RESTART=1 ./start-server.sh" >&2
-        exit 1
+        echo "WARNING: curl is unavailable; skipping health check for existing Harness server at $health_url." >&2
     fi
     echo "No new server was started. To restart explicitly, run:" >&2
     echo "  HARNESS_RESTART=1 ./start-server.sh" >&2
