@@ -15,6 +15,8 @@ use harness_workflow::runtime::{
 };
 use sha2::{Digest, Sha256};
 
+const RUNTIME_WORKFLOW_CONFIG_RETRY_SECS: u64 = 30;
+
 fn parse_issue_pr(task: &task_runner::TaskState) -> (Option<u64>, Option<u64>) {
     let (issue_from_external_id, pr_from_external_id) = task
         .external_id
@@ -612,19 +614,39 @@ async fn dispatch_runtime_command_with_project_policy(
             .await;
     }
 
-    let Some(profile_selector) = runtime_dispatch_profile_selector_for_command(
+    let profile_selector = match runtime_dispatch_profile_selector_for_command(
         state,
         store,
         &command,
         &fallback_profile_selector,
     )
-    .await?
-    else {
-        let command_id = command.id.clone();
-        store.mark_command_status(&command_id, "skipped").await?;
-        let reason =
-            "workflow runtime dispatch or worker is disabled for the command project".to_string();
-        return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
+    .await
+    {
+        Ok(Some(profile_selector)) => profile_selector,
+        Ok(None) => {
+            let command_id = command.id.clone();
+            store.mark_command_status(&command_id, "skipped").await?;
+            let reason = "workflow runtime dispatch or worker is disabled for the command project"
+                .to_string();
+            return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
+        }
+        Err(error) => {
+            let command_id = command.id.clone();
+            let reason = format!("workflow runtime project config failed to load: {error}");
+            store.mark_command_status(&command_id, "failed").await?;
+            store
+                .append_event(
+                    &command.workflow_id,
+                    "WorkflowRuntimeConfigError",
+                    "workflow_runtime_command_dispatcher",
+                    serde_json::json!({
+                        "command_id": command_id.clone(),
+                        "reason": reason.clone(),
+                    }),
+                )
+                .await?;
+            return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
+        }
     };
 
     RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
@@ -641,10 +663,8 @@ async fn runtime_dispatch_profile_selector_for_command(
 ) -> anyhow::Result<Option<RuntimeProfileSelector>> {
     let project_root =
         runtime_command_project_root(store, command, &state.core.project_root).await?;
-    let workflow_cfg = load_runtime_workflow_config_or_default(
-        &project_root,
-        "workflow runtime command dispatcher",
-    );
+    let workflow_cfg =
+        load_runtime_workflow_config(&project_root, "workflow runtime command dispatcher")?;
     if !workflow_cfg.runtime_dispatch.enabled || !workflow_cfg.runtime_worker.enabled {
         tracing::debug!(
             workflow_id = %command.workflow_id,
@@ -711,16 +731,19 @@ fn workflow_project_root(instance: &WorkflowInstance) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn load_runtime_workflow_config_or_default(
+fn load_runtime_workflow_config(
     project_root: &Path,
     subsystem: &str,
-) -> harness_core::config::workflow::WorkflowConfig {
-    harness_core::config::workflow::load_workflow_config(project_root).unwrap_or_else(|e| {
-        tracing::warn!(
+) -> anyhow::Result<harness_core::config::workflow::WorkflowConfig> {
+    harness_core::config::workflow::load_workflow_config(project_root).map_err(|error| {
+        tracing::error!(
             project_root = %project_root.display(),
-            "{subsystem}: failed to load WORKFLOW.md, using default config: {e}"
+            "{subsystem}: failed to load WORKFLOW.md; runtime subsystem disabled until the config is fixed: {error}"
         );
-        harness_core::config::workflow::WorkflowConfig::default()
+        anyhow::anyhow!(
+            "{subsystem}: failed to load WORKFLOW.md at {}: {error}",
+            project_root.join("WORKFLOW.md").display()
+        )
     })
 }
 
@@ -776,10 +799,16 @@ pub(super) async fn run_runtime_repo_backlog_poll_tick(
             tick.skipped += 1;
             continue;
         }
-        let workflow_cfg = load_runtime_workflow_config_or_default(
+        let workflow_cfg = match load_runtime_workflow_config(
             &project_root,
             "workflow runtime repo backlog poller",
-        );
+        ) {
+            Ok(config) => config,
+            Err(_) => {
+                tick.skipped += 1;
+                continue;
+            }
+        };
         if !workflow_cfg.repo_backlog.enabled
             || !workflow_cfg.runtime_dispatch.enabled
             || !workflow_cfg.runtime_worker.enabled
@@ -865,10 +894,19 @@ pub(super) fn spawn_runtime_repo_backlog_poller(state: &Arc<AppState>) {
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg = load_runtime_workflow_config_or_default(
+            let workflow_cfg = match load_runtime_workflow_config(
                 &state.core.project_root,
                 "workflow runtime repo backlog poller",
-            );
+            ) {
+                Ok(config) => config,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
+                    ))
+                    .await;
+                    continue;
+                }
+            };
             let interval =
                 std::time::Duration::from_secs(workflow_cfg.repo_backlog.poll_interval_secs.max(1));
             let batch_limit = workflow_cfg.repo_backlog.batch_limit.max(1) as usize;
@@ -956,10 +994,16 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
             tick.skipped += 1;
             continue;
         }
-        let workflow_cfg = load_runtime_workflow_config_or_default(
+        let workflow_cfg = match load_runtime_workflow_config(
             &project_root,
             "workflow runtime PR feedback sweeper",
-        );
+        ) {
+            Ok(config) => config,
+            Err(_) => {
+                tick.skipped += 1;
+                continue;
+            }
+        };
         if !workflow_cfg.pr_feedback.enabled
             || !workflow_cfg.runtime_dispatch.enabled
             || !workflow_cfg.runtime_worker.enabled
@@ -1055,10 +1099,19 @@ pub(super) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) {
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg = load_runtime_workflow_config_or_default(
+            let workflow_cfg = match load_runtime_workflow_config(
                 &state.core.project_root,
                 "workflow runtime PR feedback sweeper",
-            );
+            ) {
+                Ok(config) => config,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
+                    ))
+                    .await;
+                    continue;
+                }
+            };
             let interval =
                 std::time::Duration::from_secs(workflow_cfg.pr_feedback.sweep_interval_secs.max(1));
             match run_runtime_pr_feedback_sweep_tick(&state, 128).await {
@@ -1461,10 +1514,19 @@ pub(super) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg = load_runtime_workflow_config_or_default(
+            let workflow_cfg = match load_runtime_workflow_config(
                 &state.core.project_root,
                 "workflow runtime command dispatcher",
-            );
+            ) {
+                Ok(config) => config,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
+                    ))
+                    .await;
+                    continue;
+                }
+            };
             let policy = workflow_cfg.runtime_dispatch;
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
             let inherited_profile = match runtime_default_profile_for_project(
@@ -1660,10 +1722,19 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg = load_runtime_workflow_config_or_default(
+            let workflow_cfg = match load_runtime_workflow_config(
                 &state.core.project_root,
                 "workflow runtime job workers",
-            );
+            ) {
+                Ok(config) => config,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
+                    ))
+                    .await;
+                    continue;
+                }
+            };
             let policy = runtime_worker_loop_policy(workflow_cfg.runtime_worker);
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
             let lease_ttl = runtime_worker_lease_ttl(&policy);
