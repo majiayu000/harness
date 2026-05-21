@@ -20,9 +20,10 @@ use super::{
     QualityGateDecisionInput, QualityGateWorkflowAction, RepoBacklogPollDecisionInput,
     RepoBacklogWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
     RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowRuntimeStore,
-    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
+    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -5114,6 +5115,46 @@ async fn durable_store_lists_workflow_runtime_tree_inputs() -> anyhow::Result<()
     assert_eq!(jobs[0].id, job.id);
     assert_eq!(jobs[0].status, RuntimeJobStatus::Pending);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_store_lists_nonterminal_instances_by_definition() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let active = project_issue_instance("/project-a", 123, "implementing");
+    let queued = project_issue_instance("/project-a", 124, "ready_to_merge");
+    let terminal = project_issue_instance("/project-a", 125, "done");
+    let other_definition = repo_backlog_instance("dispatching").with_data(json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+    }));
+    let other_project = project_issue_instance("/project-b", 126, "implementing");
+    store.upsert_instance(&active).await?;
+    store.upsert_instance(&queued).await?;
+    store.upsert_instance(&terminal).await?;
+    store.upsert_instance(&other_definition).await?;
+    store.upsert_instance(&other_project).await?;
+
+    let listed = store
+        .list_nonterminal_instances_by_definition(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            Some("/project-a"),
+            None,
+        )
+        .await?;
+    let ids: std::collections::HashSet<_> =
+        listed.into_iter().map(|instance| instance.id).collect();
+
+    assert!(ids.contains(&active.id));
+    assert!(ids.contains(&queued.id));
+    assert!(!ids.contains(&terminal.id));
+    assert!(!ids.contains(&other_definition.id));
+    assert!(!ids.contains(&other_project.id));
     Ok(())
 }
 

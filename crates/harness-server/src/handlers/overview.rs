@@ -329,7 +329,7 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
     let mut loaded_legacy_tasks = false;
     let mut counted_runtime_active_workflows = false;
 
-    match state.core.tasks.list_all_summaries_with_terminal().await {
+    match state.core.tasks.list_active_summaries().await {
         Ok(summaries) => {
             loaded_legacy_tasks = true;
             for summary in summaries {
@@ -349,16 +349,12 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
             harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         ] {
             match store
-                .list_instances_by_definition(definition_id, None, None)
+                .list_nonterminal_instances_by_definition(definition_id, None, None)
                 .await
             {
                 Ok(workflows) => {
                     for workflow in workflows {
-                        let Some(task_id) =
-                            crate::workflow_runtime_submission::runtime_issue_task_handle(
-                                &workflow,
-                            )
-                        else {
+                        let Some(task_id) = runtime_workflow_dedupe_task_handle(&workflow) else {
                             continue;
                         };
                         if active_legacy_task_ids.contains(task_id.as_str()) {
@@ -424,6 +420,33 @@ fn runtime_workflow_active_bucket(state: &str) -> Option<ActiveTaskBucket> {
         "implementing" | "replanning" | "addressing_feedback" => Some(ActiveTaskBucket::Running),
         _ => Some(ActiveTaskBucket::Queued),
     }
+}
+
+fn runtime_workflow_dedupe_task_handle(
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+) -> Option<String> {
+    workflow
+        .data
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|task_id| !task_id.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            workflow
+                .data
+                .get("task_ids")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|task_ids| {
+                    task_ids.iter().rev().find_map(|task_id| {
+                        task_id
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|task_id| !task_id.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+                })
+        })
 }
 
 /// Top of the current hour (i.e. `HH:00:00Z`). Falls back to `now` on the
@@ -713,7 +736,7 @@ mod tests {
             "project_id": "/repo",
             "task_id": "runtime-task-1",
         }));
-        let task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&runtime)
+        let task_id = runtime_workflow_dedupe_task_handle(&runtime)
             .expect("runtime workflow should expose a task handle");
         if !active_legacy_task_ids.contains(task_id.as_str()) {
             add_active_runtime_workflow(&mut counts, &runtime);
@@ -749,8 +772,46 @@ mod tests {
             "project_id": "/repo",
             "task_id": "runtime-task-1",
         }));
-        let task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&runtime)
+        let task_id = runtime_workflow_dedupe_task_handle(&runtime)
             .expect("runtime workflow should expose a task handle");
+        if !active_legacy_task_ids.contains(task_id.as_str()) {
+            add_active_runtime_workflow(&mut counts, &runtime);
+        }
+
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.by_project["/repo"].running, 1);
+    }
+
+    #[test]
+    fn active_legacy_summary_suppresses_runtime_workflow_by_current_task_id() {
+        let mut counts = ActiveTaskOverviewCounts::default();
+        let mut active_legacy_task_ids = HashSet::new();
+        let mut active_legacy = crate::task_runner::TaskState::new(harness_core::types::TaskId(
+            "current-runtime-task".to_string(),
+        ))
+        .summary();
+        active_legacy.status = crate::task_runner::TaskStatus::Implementing;
+        active_legacy.scheduler.authority_state = SchedulerAuthorityState::Running;
+        active_legacy.project = Some("/repo".to_string());
+        if add_active_summary(&mut counts, &active_legacy) {
+            active_legacy_task_ids.insert(active_legacy.id.as_str().to_string());
+        }
+
+        let runtime = harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
+        )
+        .with_data(serde_json::json!({
+            "project_id": "/repo",
+            "task_id": "current-runtime-task",
+            "task_ids": ["historical-runtime-task", "current-runtime-task"],
+        }));
+        let task_id = runtime_workflow_dedupe_task_handle(&runtime)
+            .expect("runtime workflow should expose a task handle");
+        assert_eq!(task_id, "current-runtime-task");
         if !active_legacy_task_ids.contains(task_id.as_str()) {
             add_active_runtime_workflow(&mut counts, &runtime);
         }

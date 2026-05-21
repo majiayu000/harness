@@ -458,10 +458,24 @@ fn parse_timestamp(ts: &str) -> Result<ParsedUsageTimestamp, String> {
     let occurred_at = DateTime::parse_from_rfc3339(ts)
         .map_err(|err| format!("invalid timestamp '{ts}': {err}"))?
         .with_timezone(&Utc);
+    let (day, hour) = if ts.ends_with('Z') || ts.ends_with("+00:00") {
+        let day = ts
+            .get(..10)
+            .ok_or_else(|| format!("invalid timestamp '{ts}': missing date component"))?;
+        let hour = ts
+            .get(11..13)
+            .ok_or_else(|| format!("invalid timestamp '{ts}': missing hour component"))?;
+        (day.to_string(), format!("{day} {hour}:00"))
+    } else {
+        (
+            occurred_at.format("%Y-%m-%d").to_string(),
+            occurred_at.format("%Y-%m-%d %H:00").to_string(),
+        )
+    };
     Ok(ParsedUsageTimestamp {
         occurred_at,
-        day: occurred_at.format("%Y-%m-%d").to_string(),
-        hour: occurred_at.format("%Y-%m-%d %H:00").to_string(),
+        day,
+        hour,
     })
 }
 
@@ -592,6 +606,13 @@ mod tests {
     fn parse_timestamp_rejects_invalid_input() {
         assert!(parse_timestamp("invalid").is_err());
         assert!(parse_timestamp("2026-03-26 03:05:56Z").is_err());
+    }
+
+    #[test]
+    fn parse_timestamp_preserves_utc_bucket_for_offset_input() {
+        let parsed = parse_timestamp("2026-03-26T23:05:56-02:00").unwrap();
+        assert_eq!(parsed.day, "2026-03-27");
+        assert_eq!(parsed.hour, "2026-03-27 01:00");
     }
 
     #[test]

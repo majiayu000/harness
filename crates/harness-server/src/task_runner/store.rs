@@ -350,6 +350,29 @@ impl TaskStore {
         Ok(by_id.into_values().collect())
     }
 
+    /// Return active tasks as lightweight [`TaskSummary`] values.
+    ///
+    /// Fetches only non-terminal summary rows from the DB, then applies live cache
+    /// overrides so recently terminal tasks are removed and in-flight state wins.
+    pub async fn list_active_summaries(&self) -> anyhow::Result<Vec<TaskSummary>> {
+        let mut by_id: std::collections::HashMap<TaskId, TaskSummary> = self
+            .db
+            .list_active_summaries()
+            .await?
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+        for entry in self.cache.iter() {
+            let summary = entry.value().summary();
+            if summary.status.is_terminal() {
+                by_id.remove(&summary.id);
+            } else {
+                by_id.insert(entry.key().clone(), summary);
+            }
+        }
+        Ok(by_id.into_values().collect())
+    }
+
     /// Return `(TaskId, TaskStatus)` pairs for all tasks without deserializing `rounds`.
     ///
     /// Hot-path callers (skill governance, token usage attribution) that only need
@@ -1509,6 +1532,42 @@ mod tests {
                 pr_url: "https://github.com/acme/myrepo/pull/42".to_string(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn list_active_summaries_filters_terminal_history_and_cache_overrides(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+
+        let active_id = harness_core::types::TaskId("active".to_string());
+        let active = TaskState::new(active_id.clone());
+        store.insert(&active).await;
+
+        let terminal_id = harness_core::types::TaskId("terminal".to_string());
+        let mut terminal = TaskState::new(terminal_id.clone());
+        terminal.status = TaskStatus::Done;
+        store.insert(&terminal).await;
+
+        let stale_db_id = harness_core::types::TaskId("stale-db-active".to_string());
+        let stale_db_active = TaskState::new(stale_db_id.clone());
+        store.insert(&stale_db_active).await;
+        let mut terminal_cache = stale_db_active;
+        terminal_cache.status = TaskStatus::Failed;
+        terminal_cache.reconcile_scheduler_with_status();
+        store.cache.insert(stale_db_id.clone(), terminal_cache);
+
+        let ids: std::collections::HashSet<_> = store
+            .list_active_summaries()
+            .await?
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect();
+
+        assert!(ids.contains(&active_id));
+        assert!(!ids.contains(&terminal_id));
+        assert!(!ids.contains(&stale_db_id));
+        Ok(())
     }
 
     fn pending_task(id: &str) -> TaskState {
