@@ -17,6 +17,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
+#[path = "agent_review_workspace_snapshot.rs"]
+mod workspace_snapshot;
+use workspace_snapshot::WorkspaceSnapshot;
+
 /// Compute Jaccard word-similarity between two strings.
 ///
 /// Tokenizes each string into a set of non-empty words (split on non-alphanumeric chars),
@@ -142,8 +146,8 @@ pub(crate) async fn run_agent_review(
     let max_rounds = review_config.max_rounds;
     // (normalized_issues, consecutive_count): tracks how many consecutive rounds produced identical issues.
     let mut impasse_tracker: Option<(Vec<String>, u32)> = None;
-    // Whether the last action in this loop pushed a new commit (fix or intervention).
-    let mut pushed_commit = false;
+    // Whether any local-review fix must be proven by an advanced PR head.
+    let mut fix_requires_pr_head_advance = false;
     let mut approved_review = false;
     let mut approved_review_head: Option<Result<String, String>> = None;
     let mut last_issues: Vec<String> = Vec::new();
@@ -428,7 +432,7 @@ pub(crate) async fn run_agent_review(
                 Some(review_detail),
             )
             .await?;
-            return Ok((false, pushed_commit, approved_review_head));
+            return Ok((false, fix_requires_pr_head_advance, approved_review_head));
         }
 
         // Detect impasse: track how many consecutive rounds produced identical issues.
@@ -481,7 +485,24 @@ pub(crate) async fn run_agent_review(
             break;
         }
 
-        // Implementor fixes the issues
+        // Implementor fixes the issues. The snapshot proves whether a no-op fix
+        // really left the local workspace unchanged.
+        let snapshot_before_fix = match WorkspaceSnapshot::capture(project) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                fail_agent_review(
+                    store,
+                    events,
+                    task_id,
+                    agent_round,
+                    pr_url,
+                    format!("Agent review fix preflight failed: {error}"),
+                    None,
+                )
+                .await?;
+                return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+            }
+        };
         let fix_prompt_built_at = Utc::now();
         let fix_req = AgentRequest {
             prompt: {
@@ -526,6 +547,41 @@ pub(crate) async fn run_agent_review(
         match fix_resp {
             Ok(Ok(success)) => {
                 let r = success.response;
+                let pushed_marker = match prompts::parse_pushed_commit(&r.output) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        let error = format!(
+                            "Agent review fix round {agent_round} did not report PUSHED_COMMIT=true|false."
+                        );
+                        fail_agent_review(
+                            store,
+                            events,
+                            task_id,
+                            agent_round,
+                            pr_url,
+                            error,
+                            Some(r.output.clone()),
+                        )
+                        .await?;
+                        return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                    }
+                    Err(error) => {
+                        let error = format!(
+                            "Agent review fix round {agent_round} reported invalid PUSHED_COMMIT marker: {error}"
+                        );
+                        fail_agent_review(
+                            store,
+                            events,
+                            task_id,
+                            agent_round,
+                            pr_url,
+                            error,
+                            Some(r.output.clone()),
+                        )
+                        .await?;
+                        return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                    }
+                };
                 if let Some(val_err) = run_post_execute(interceptors, &fix_req, &r).await {
                     tracing::warn!(
                         agent_round,
@@ -533,12 +589,49 @@ pub(crate) async fn run_agent_review(
                         "post-execute validation failed in agent review fix; continuing"
                     );
                 }
+                let workspace_changed = match snapshot_before_fix.changed_since(project) {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        fail_agent_review(
+                            store,
+                            events,
+                            task_id,
+                            agent_round,
+                            pr_url,
+                            format!("Agent review fix verification failed: {error}"),
+                            Some(r.output.clone()),
+                        )
+                        .await?;
+                        return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                    }
+                };
+                if workspace_changed && !pushed_marker {
+                    let error = format!(
+                        "Agent review fix round {agent_round} changed the workspace but reported PUSHED_COMMIT=false."
+                    );
+                    fail_agent_review(
+                        store,
+                        events,
+                        task_id,
+                        agent_round,
+                        pr_url,
+                        error,
+                        Some(r.output.clone()),
+                    )
+                    .await?;
+                    return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                }
+                if workspace_changed || pushed_marker {
+                    fix_requires_pr_head_advance = true;
+                }
                 mutate_and_persist(store, task_id, |s| {
                     s.rounds.push(RoundResult::new(
                         0,
                         "agent_review_fix",
                         "fixed",
-                        None,
+                        Some(format!(
+                            "PUSHED_COMMIT={pushed_marker}; WORKSPACE_CHANGED={workspace_changed}"
+                        )),
                         Some(success.telemetry.clone()),
                         None,
                     ));
@@ -589,11 +682,10 @@ pub(crate) async fn run_agent_review(
                 return Err(anyhow::anyhow!("{msg}"));
             }
         }
-        pushed_commit = true;
     }
 
     if approved_review {
-        return Ok((true, pushed_commit, approved_review_head));
+        return Ok((true, fix_requires_pr_head_advance, approved_review_head));
     }
 
     let detail = if last_issues.is_empty() {
@@ -610,5 +702,5 @@ pub(crate) async fn run_agent_review(
         format!("Agent review exhausted {max_rounds} rounds without approval.")
     };
     fail_agent_review(store, events, task_id, max_rounds, pr_url, error, detail).await?;
-    Ok((false, pushed_commit, approved_review_head))
+    Ok((false, fix_requires_pr_head_advance, approved_review_head))
 }

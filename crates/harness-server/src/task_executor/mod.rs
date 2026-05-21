@@ -702,32 +702,33 @@ pub(crate) async fn run_task(
                     pr_num,
                     github_token: server_config.server.github_token.as_deref(),
                 });
-            let (review_ok, pushed, approved_review_head) = agent_review::run_agent_review(
-                store,
-                task_id,
-                agent,
-                reviewer,
-                review_config,
-                &context_items,
-                &project,
-                &interceptors,
-                turn_timeout,
-                pr_url.as_deref().unwrap_or(""),
-                project_config.review_type.as_str(),
-                &events,
-                &skills,
-                &cargo_env,
-                effective_max_turns,
-                review_head_probe,
-                &mut turns_used,
-            )
-            .await?;
+            let (review_ok, fix_requires_pr_head_advance, approved_review_head) =
+                agent_review::run_agent_review(
+                    store,
+                    task_id,
+                    agent,
+                    reviewer,
+                    review_config,
+                    &context_items,
+                    &project,
+                    &interceptors,
+                    turn_timeout,
+                    pr_url.as_deref().unwrap_or(""),
+                    project_config.review_type.as_str(),
+                    &events,
+                    &skills,
+                    &cargo_env,
+                    effective_max_turns,
+                    review_head_probe,
+                    &mut turns_used,
+                )
+                .await?;
             *turns_used_acc = turns_used;
             if !review_ok {
                 return Ok(());
             }
             local_review_approved = true;
-            agent_pushed_commit = pushed;
+            agent_pushed_commit = fix_requires_pr_head_advance;
             if !review_config.review_bot_auto_trigger {
                 local_review_head_approved = approved_review_head;
             }
@@ -735,7 +736,7 @@ pub(crate) async fn run_task(
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
     }
-    let local_review_fix_attempted = agent_pushed_commit;
+    let local_fix_requires_pr_head_advance = agent_pushed_commit;
     agent_pushed_commit |= implementation_pushed_commit;
 
     let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
@@ -786,10 +787,7 @@ pub(crate) async fn run_task(
                     before_review_error,
                     approved_review_sha,
                     approved_review_error,
-                    // A successful fix round may be a no-op, so do not require
-                    // the PR head to advance. It only permits a reviewed head
-                    // change; the final gate still locks that approved head.
-                    local_fix_attempted: local_review_fix_attempted,
+                    local_fix_requires_pr_head_advance,
                 },
                 pr_state: LocalReviewPrState::GitHub {
                     repo_slug: &repo_slug_for_review,

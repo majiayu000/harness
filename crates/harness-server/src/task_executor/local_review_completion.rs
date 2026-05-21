@@ -68,7 +68,7 @@ pub(crate) enum LocalReviewPrHead<'a> {
         before_review_error: Option<&'a str>,
         approved_review_sha: Option<&'a str>,
         approved_review_error: Option<&'a str>,
-        local_fix_attempted: bool,
+        local_fix_requires_pr_head_advance: bool,
     },
     #[cfg(test)]
     Verified,
@@ -87,7 +87,7 @@ impl LocalReviewPrHead<'_> {
                 before_review_error,
                 approved_review_sha,
                 approved_review_error,
-                local_fix_attempted,
+                local_fix_requires_pr_head_advance,
                 ..
             } => {
                 if let Some(error) = before_review_error {
@@ -106,7 +106,14 @@ impl LocalReviewPrHead<'_> {
                 let approved_review_sha = approved_review_sha.ok_or_else(|| {
                     "GitHub PR head approval SHA is missing after local review".to_string()
                 })?;
-                if !*local_fix_attempted && approved_review_sha != before_review_sha {
+                if *local_fix_requires_pr_head_advance && approved_review_sha == before_review_sha {
+                    return Err(format!(
+                        "GitHub PR head did not advance after local review fix for \
+                         {repo_slug}#{pr_num}; before {before_review_sha}, approved {approved_review_sha}"
+                    ));
+                }
+                if !*local_fix_requires_pr_head_advance && approved_review_sha != before_review_sha
+                {
                     return Err(format!(
                         "GitHub PR head changed during local review without a local fix for \
                          {repo_slug}#{pr_num}; before {before_review_sha}, approved {approved_review_sha}"
@@ -694,10 +701,31 @@ mod tests {
             before_review_error: None,
             approved_review_sha: Some("same-sha"),
             approved_review_error: None,
-            local_fix_attempted: true,
+            local_fix_requires_pr_head_advance: false,
         };
 
         assert!(gate.verify_local_fix(77).await.is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pr_head_gate_requires_advance_after_changed_local_fix() -> anyhow::Result<()> {
+        let gate = LocalReviewPrHead::GitHub {
+            repo_slug: "owner/repo",
+            github_token: None,
+            before_review_sha: Some("same-sha"),
+            before_review_error: None,
+            approved_review_sha: Some("same-sha"),
+            approved_review_error: None,
+            local_fix_requires_pr_head_advance: true,
+        };
+
+        let error = gate
+            .verify_local_fix(77)
+            .await
+            .expect_err("unchanged head should fail after a changed local fix");
+        assert!(error.contains("did not advance after local review fix"));
 
         Ok(())
     }

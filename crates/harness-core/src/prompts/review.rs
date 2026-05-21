@@ -201,7 +201,10 @@ pub fn agent_review_fix_prompt(
         "The independent reviewer found the following issues in PR {pr_url} \
          (agent review round {round}):\n\n{safe_issue_list}\n\n\
          Fix each issue, run {validation_cmd}, then commit and push.\n\
-         On the last line of your output, print PR_URL=<PR URL>"
+         At the end of your output, print these exact sentinel lines separately:\n\
+         PR_URL=<PR URL>\n\
+         PUSHED_COMMIT=true|false\n\
+         Use PUSHED_COMMIT=false only when no file changes were needed."
     )
 }
 
@@ -230,7 +233,10 @@ pub fn agent_review_intervention_prompt(
          instead of repeating the same fix strategy.\n\n\
          Issues that remain unresolved:\n\n{safe_issue_list}\n\n\
          Fix each issue, run {validation_cmd}, then commit and push.\n\
-         On the last line of your output, print PR_URL=<PR URL>"
+         At the end of your output, print these exact sentinel lines separately:\n\
+         PR_URL=<PR URL>\n\
+         PUSHED_COMMIT=true|false\n\
+         Use PUSHED_COMMIT=false only when no file changes were needed."
     )
 }
 
@@ -620,6 +626,8 @@ mod tests {
         assert!(p.contains("Missing error handling"));
         assert!(p.contains("Unbounded loop"));
         assert!(p.contains("PR_URL="));
+        assert!(p.contains("PUSHED_COMMIT=true|false"));
+        assert!(p.contains("sentinel lines separately"));
     }
 
     #[test]

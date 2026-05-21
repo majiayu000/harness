@@ -2,9 +2,12 @@ use super::agent_review::{jaccard_word_similarity, normalize_issues, run_agent_r
 use crate::task_runner::{TaskId, TaskState, TaskStatus, TaskStore};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::agents::SandboxMode;
-use harness_core::types::{Capability, TokenUsage};
+use harness_core::interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor};
+use harness_core::types::{Capability, ExecutionPhase, TokenUsage};
 use harness_observe::event_store::EventStore;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 
@@ -74,6 +77,85 @@ impl CodeAgent for SequenceAgent {
         let _ = tx.send(StreamItem::MessageDelta { text: output }).await;
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
+    }
+}
+
+struct MutatingAgent {
+    name: &'static str,
+    response: &'static str,
+    path: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl CodeAgent for MutatingAgent {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        Vec::new()
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        std::fs::write(&self.path, "changed").map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(error.to_string())
+        })?;
+        Ok(AgentResponse {
+            output: self.response.to_string(),
+            stderr: String::new(),
+            items: Vec::new(),
+            token_usage: TokenUsage::default(),
+            model: self.name.to_string(),
+            exit_code: Some(0),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        std::fs::write(&self.path, "changed").map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(error.to_string())
+        })?;
+        let _ = tx
+            .send(StreamItem::MessageDelta {
+                text: self.response.to_string(),
+            })
+            .await;
+        let _ = tx.send(StreamItem::Done).await;
+        Ok(())
+    }
+}
+
+struct CacheWritingPostInterceptor {
+    path: PathBuf,
+    execution_only: bool,
+}
+
+#[async_trait::async_trait]
+impl TurnInterceptor for CacheWritingPostInterceptor {
+    fn name(&self) -> &str {
+        "cache_writing_post"
+    }
+
+    async fn pre_execute(&self, _req: &AgentRequest) -> InterceptResult {
+        InterceptResult::pass()
+    }
+
+    async fn post_execute(&self, req: &AgentRequest, _resp: &AgentResponse) -> PostExecuteResult {
+        if self.execution_only && req.execution_phase != Some(ExecutionPhase::Execution) {
+            return PostExecuteResult::pass();
+        }
+        if let Some(parent) = self.path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                return PostExecuteResult::fail(error.to_string());
+            }
+        }
+        match std::fs::write(&self.path, "cache") {
+            Ok(()) => PostExecuteResult::pass(),
+            Err(error) => PostExecuteResult::fail(error.to_string()),
+        }
     }
 }
 
@@ -260,7 +342,13 @@ async fn final_impasse_round_does_not_push_unreviewed_fix() -> anyhow::Result<()
         max_rounds: 3,
         ..harness_core::config::agents::AgentReviewConfig::default()
     };
-    let implementor = SequenceAgent::new("implementor", vec!["fixed once", "fixed twice"]);
+    let implementor = SequenceAgent::new(
+        "implementor",
+        vec![
+            "fixed once\nPR_URL=https://github.com/owner/repo/pull/1\nPUSHED_COMMIT=true",
+            "fixed twice\nPR_URL=https://github.com/owner/repo/pull/1\nPUSHED_COMMIT=true",
+        ],
+    );
     let reviewer = SequenceAgent::new(
         "reviewer",
         vec![
@@ -312,6 +400,236 @@ async fn final_impasse_round_does_not_push_unreviewed_fix() -> anyhow::Result<()
             .as_deref()
             .unwrap_or_default()
             .contains("exhausted 3 rounds without approval"),
+        "unexpected error: {:?}",
+        state.error
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_fix_round_requires_pr_head_advance() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project)?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store.insert(&TaskState::new(task_id.clone())).await;
+    let events = EventStore::new(dir.path()).await?;
+    let skills = RwLock::new(harness_skills::store::SkillStore::new());
+    let config = harness_core::config::agents::AgentReviewConfig {
+        enabled: true,
+        max_rounds: 2,
+        ..harness_core::config::agents::AgentReviewConfig::default()
+    };
+    let implementor = MutatingAgent {
+        name: "implementor",
+        response: "fixed\nPR_URL=https://github.com/owner/repo/pull/1\nPUSHED_COMMIT=true",
+        path: project.join("changed.txt"),
+    };
+    let reviewer = SequenceAgent::new("reviewer", vec!["ISSUE: defect", "APPROVED"]);
+    let mut turns_used = 0;
+
+    let (approved, requires_head_advance, _) = run_agent_review(
+        &store,
+        &task_id,
+        &implementor,
+        &reviewer,
+        &config,
+        &[],
+        &project,
+        &[],
+        Duration::from_secs(5),
+        "https://github.com/owner/repo/pull/1",
+        "standard",
+        &events,
+        &skills,
+        &HashMap::new(),
+        None,
+        None,
+        &mut turns_used,
+    )
+    .await?;
+
+    assert!(approved);
+    assert!(
+        requires_head_advance,
+        "changed local fix must require a new reviewed PR head"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_fix_round_rejects_false_noop_marker() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project)?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store.insert(&TaskState::new(task_id.clone())).await;
+    let events = EventStore::new(dir.path()).await?;
+    let skills = RwLock::new(harness_skills::store::SkillStore::new());
+    let config = harness_core::config::agents::AgentReviewConfig {
+        enabled: true,
+        max_rounds: 2,
+        ..harness_core::config::agents::AgentReviewConfig::default()
+    };
+    let implementor = MutatingAgent {
+        name: "implementor",
+        response: "fixed\nPR_URL=https://github.com/owner/repo/pull/1\nPUSHED_COMMIT=false",
+        path: project.join("changed.txt"),
+    };
+    let reviewer = SequenceAgent::new("reviewer", vec!["ISSUE: defect", "APPROVED"]);
+    let mut turns_used = 0;
+
+    let (approved, requires_head_advance, _) = run_agent_review(
+        &store,
+        &task_id,
+        &implementor,
+        &reviewer,
+        &config,
+        &[],
+        &project,
+        &[],
+        Duration::from_secs(5),
+        "https://github.com/owner/repo/pull/1",
+        "standard",
+        &events,
+        &skills,
+        &HashMap::new(),
+        None,
+        None,
+        &mut turns_used,
+    )
+    .await?;
+
+    let state = store.get(&task_id).expect("task state should be present");
+    assert!(!approved);
+    assert!(!requires_head_advance);
+    assert_eq!(state.status, TaskStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed the workspace but reported PUSHED_COMMIT=false"),
+        "unexpected error: {:?}",
+        state.error
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn noop_fix_round_ignores_validation_cache_artifacts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project)?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store.insert(&TaskState::new(task_id.clone())).await;
+    let events = EventStore::new(dir.path()).await?;
+    let skills = RwLock::new(harness_skills::store::SkillStore::new());
+    let config = harness_core::config::agents::AgentReviewConfig {
+        enabled: true,
+        max_rounds: 2,
+        ..harness_core::config::agents::AgentReviewConfig::default()
+    };
+    let implementor = SequenceAgent::new(
+        "implementor",
+        vec!["no source changes\nPR_URL=https://github.com/owner/repo/pull/1\nPUSHED_COMMIT=false"],
+    );
+    let reviewer = SequenceAgent::new("reviewer", vec!["ISSUE: defect", "APPROVED"]);
+    let interceptors: Vec<Arc<dyn TurnInterceptor>> = vec![Arc::new(CacheWritingPostInterceptor {
+        path: project.join(".pytest_cache").join("nodeids"),
+        execution_only: true,
+    })];
+    let mut turns_used = 0;
+
+    let (approved, requires_head_advance, _) = run_agent_review(
+        &store,
+        &task_id,
+        &implementor,
+        &reviewer,
+        &config,
+        &[],
+        &project,
+        &interceptors,
+        Duration::from_secs(5),
+        "https://github.com/owner/repo/pull/1",
+        "standard",
+        &events,
+        &skills,
+        &HashMap::new(),
+        None,
+        None,
+        &mut turns_used,
+    )
+    .await?;
+
+    assert!(approved);
+    assert!(
+        !requires_head_advance,
+        "post-execute cache artifacts must not force PR-head advancement for no-op fixes"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn noop_fix_round_rejects_validation_source_artifacts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project)?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store.insert(&TaskState::new(task_id.clone())).await;
+    let events = EventStore::new(dir.path()).await?;
+    let skills = RwLock::new(harness_skills::store::SkillStore::new());
+    let config = harness_core::config::agents::AgentReviewConfig {
+        enabled: true,
+        max_rounds: 2,
+        ..harness_core::config::agents::AgentReviewConfig::default()
+    };
+    let implementor = SequenceAgent::new(
+        "implementor",
+        vec!["no source changes\nPR_URL=https://github.com/owner/repo/pull/1\nPUSHED_COMMIT=false"],
+    );
+    let reviewer = SequenceAgent::new("reviewer", vec!["ISSUE: defect", "APPROVED"]);
+    let interceptors: Vec<Arc<dyn TurnInterceptor>> = vec![Arc::new(CacheWritingPostInterceptor {
+        path: project.join("src").join("formatted.rs"),
+        execution_only: true,
+    })];
+    let mut turns_used = 0;
+
+    let (approved, requires_head_advance, _) = run_agent_review(
+        &store,
+        &task_id,
+        &implementor,
+        &reviewer,
+        &config,
+        &[],
+        &project,
+        &interceptors,
+        Duration::from_secs(5),
+        "https://github.com/owner/repo/pull/1",
+        "standard",
+        &events,
+        &skills,
+        &HashMap::new(),
+        None,
+        None,
+        &mut turns_used,
+    )
+    .await?;
+
+    let state = store.get(&task_id).expect("task state should be present");
+    assert!(!approved);
+    assert!(!requires_head_advance);
+    assert_eq!(state.status, TaskStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed the workspace but reported PUSHED_COMMIT=false"),
         "unexpected error: {:?}",
         state.error
     );
