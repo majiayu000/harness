@@ -21,6 +21,14 @@ pub const ISSUE_CLOSED_SIGNAL: &str = "IssueClosed";
 pub const ISSUE_ALREADY_RESOLVED_SIGNAL: &str = "IssueAlreadyResolved";
 pub const ISSUE_STATE_ARTIFACT: &str = "issue_state";
 
+pub fn activity_result_has_closed_issue_evidence(result: &ActivityResult) -> bool {
+    closed_issue_evidence_from_activity_result(result).is_some()
+}
+
+pub fn value_has_closed_issue_evidence(value: &Value) -> bool {
+    closed_issue_evidence_from_value(value, ISSUE_STATE_ARTIFACT).is_some()
+}
+
 pub fn reduce_runtime_job_completed(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
@@ -36,7 +44,8 @@ pub fn reduce_runtime_job_completed(
 
     let decision = match result.status {
         ActivityStatus::Succeeded => reduce_success(instance, event, &result),
-        ActivityStatus::Blocked => Some(runtime_blocked_decision(instance, event, &result)),
+        ActivityStatus::Blocked => issue_implementation_closed_decision(instance, event, &result)
+            .or_else(|| Some(runtime_blocked_decision(instance, event, &result))),
         ActivityStatus::Failed => Some(
             retry_failed_activity_decision(instance, event, &result)
                 .unwrap_or_else(|| runtime_failed_decision(instance, event, &result)),

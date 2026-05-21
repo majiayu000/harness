@@ -1,10 +1,11 @@
 use crate::task_runner::{TaskId, TaskStatus, TaskStore};
 use harness_workflow::runtime::{
-    build_issue_submission_decision, build_prompt_submission_decision, DecisionValidator,
-    IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, ValidationContext,
-    WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    PROMPT_TASK_DEFINITION_ID,
+    activity_result_has_closed_issue_evidence, build_issue_submission_decision,
+    build_prompt_submission_decision, value_has_closed_issue_evidence, ActivityResult,
+    DecisionValidator, IssueSubmissionDecisionInput, PromptSubmissionDecisionInput,
+    ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
+    WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowInstance,
+    WorkflowRuntimeStore, WorkflowSubject, PROMPT_TASK_DEFINITION_ID, RUNTIME_JOB_COMPLETED_EVENT,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -162,12 +163,58 @@ pub(crate) async fn resolve_issue_dependency_status(
     let Some(instance) = store.get_instance_by_task_id(task_id.as_str()).await? else {
         return Ok(RuntimeDependencyStatus::Waiting);
     };
+    runtime_dependency_status_from_instance(store, &instance).await
+}
+
+async fn runtime_dependency_status_from_instance(
+    store: &WorkflowRuntimeStore,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<RuntimeDependencyStatus> {
     Ok(match instance.state.as_str() {
         "done" => RuntimeDependencyStatus::Done,
         "failed" => RuntimeDependencyStatus::Failed,
         "cancelled" => RuntimeDependencyStatus::Cancelled,
+        "blocked" if blocked_issue_dependency_is_satisfied(store, instance).await? => {
+            RuntimeDependencyStatus::Done
+        }
         _ => RuntimeDependencyStatus::Waiting,
     })
+}
+
+async fn blocked_issue_dependency_is_satisfied(
+    store: &WorkflowRuntimeStore,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<bool> {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || instance.state != "blocked" {
+        return Ok(false);
+    }
+    if instance_data_has_closed_issue_evidence(&instance.data) {
+        return Ok(true);
+    }
+    let events = store.events_for(&instance.id).await?;
+    Ok(events
+        .iter()
+        .rev()
+        .any(runtime_event_has_closed_issue_evidence))
+}
+
+fn instance_data_has_closed_issue_evidence(data: &serde_json::Value) -> bool {
+    ["closed_issue_evidence", "issue_state"]
+        .iter()
+        .filter_map(|field| data.get(field))
+        .any(value_has_closed_issue_evidence)
+}
+
+fn runtime_event_has_closed_issue_evidence(event: &WorkflowEvent) -> bool {
+    if event.event_type != RUNTIME_JOB_COMPLETED_EVENT {
+        return false;
+    }
+    event
+        .event
+        .get("activity_result")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ActivityResult>(value).ok())
+        .is_some_and(|result| activity_result_has_closed_issue_evidence(&result))
 }
 
 pub(crate) async fn release_ready_issue_dependencies(

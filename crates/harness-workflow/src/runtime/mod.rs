@@ -53,7 +53,8 @@ pub use quality_gate::{
     QUALITY_PASSED_SIGNAL,
 };
 pub use reducer::{
-    reduce_runtime_job_completed, GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL,
+    activity_result_has_closed_issue_evidence, reduce_runtime_job_completed,
+    value_has_closed_issue_evidence, GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL,
     ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT, RUNTIME_JOB_COMPLETED_EVENT,
 };
 pub use repo_backlog::{

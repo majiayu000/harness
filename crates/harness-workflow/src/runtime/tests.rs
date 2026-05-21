@@ -821,6 +821,61 @@ fn runtime_completion_reducer_finishes_closed_issue_signal_without_pr() {
 }
 
 #[test]
+fn runtime_completion_reducer_finishes_blocked_closed_issue_signal_without_pr() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult {
+        activity: "implement_issue".to_string(),
+        status: ActivityStatus::Blocked,
+        summary: "Issue was already resolved upstream before implementation.".to_string(),
+        artifacts: Vec::new(),
+        signals: vec![ActivitySignal::new(
+            "IssueAlreadyResolved",
+            json!({
+                "issue_number": 123,
+                "state": "resolved",
+                "issue_url": "https://github.com/owner/repo/issues/123"
+            }),
+        )],
+        validation: Vec::new(),
+        error: Some("No implementation PR is needed for an already resolved issue.".to_string()),
+        error_kind: None,
+    };
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("blocked closed issue signal should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkDone
+    );
+    assert!(decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "closed_issue"));
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("blocked closed issue completion should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_uses_issue_state_artifact_as_closed_issue_evidence() {
     let instance = issue_instance("implementing");
     let result =
