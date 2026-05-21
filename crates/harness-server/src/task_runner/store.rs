@@ -1613,16 +1613,41 @@ pub async fn mutate_and_persist(
     f: impl FnOnce(&mut TaskState),
 ) -> anyhow::Result<()> {
     let original = store.cache.get(id).map(|entry| entry.value().clone());
+    let mut attempted = None;
     if let Some(mut entry) = store.cache.get_mut(id) {
         f(entry.value_mut());
+        entry.value_mut().reconcile_scheduler_with_status();
+        attempted = Some(entry.value().clone());
     }
     if let Err(error) = store.persist(id).await {
-        if let Some(original) = original {
-            store.cache.insert(id.clone(), original);
+        if let (Some(original), Some(attempted)) = (original, attempted) {
+            if let Some(mut entry) = store.cache.get_mut(id) {
+                if task_states_match_for_rollback(entry.value(), &attempted) {
+                    *entry.value_mut() = original;
+                } else {
+                    tracing::warn!(
+                        task_id = %id.0,
+                        "mutate_and_persist rollback skipped because cache changed after failed persist"
+                    );
+                }
+            }
         }
         return Err(error);
     }
     Ok(())
+}
+
+fn task_states_match_for_rollback(current: &TaskState, attempted: &TaskState) -> bool {
+    match (
+        serde_json::to_value(current),
+        serde_json::to_value(attempted),
+    ) {
+        (Ok(current), Ok(attempted)) => current == attempted,
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!("mutate_and_persist rollback comparison failed: {error}");
+            false
+        }
+    }
 }
 
 fn latest_timestamp_at_least(candidate: Option<&str>, existing: Option<&str>) -> bool {
@@ -2215,6 +2240,81 @@ mod tests {
             .expect("task should remain persisted after conflict");
         assert_eq!(persisted.status, TaskStatus::Failed);
         assert_eq!(persisted.version, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutate_and_persist_does_not_rollback_over_newer_cache_state() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = std::sync::Arc::new(TaskStore::open(&dir.path().join("tasks.db")).await?);
+        let task_id = harness_core::types::TaskId("mutate-newer-cache".to_string());
+        let task = pending_task(task_id.as_str());
+        store.insert(&task).await;
+
+        let scheduler_json =
+            serde_json::to_string(&crate::task_runner::TaskSchedulerState::queued())?;
+        store
+            .db
+            .update_status_only(
+                task_id.as_str(),
+                TaskStatus::Failed.as_ref(),
+                &scheduler_json,
+                0,
+            )
+            .await?;
+
+        let persist_lock = store
+            .persist_locks
+            .entry(task_id.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = persist_lock.lock().await;
+
+        let worker_store = store.clone();
+        let worker_task_id = task_id.clone();
+        let worker = tokio::spawn(async move {
+            mutate_and_persist(worker_store.as_ref(), &worker_task_id, |state| {
+                state.status = TaskStatus::Done;
+                state.turn = 7;
+                state.error = Some("failed mutation".to_string());
+            })
+            .await
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let mutated = store
+                .get(&task_id)
+                .is_some_and(|state| state.status == TaskStatus::Done && state.turn == 7);
+            if mutated {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mutate_and_persist did not reach the cache mutation before persist"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        if let Some(mut entry) = store.cache.get_mut(&task_id) {
+            entry.status = TaskStatus::AwaitingDeps;
+            entry.turn = 9;
+            entry.error = Some("newer cache state".to_string());
+        }
+
+        drop(guard);
+        let error = worker
+            .await
+            .expect("mutate task should not panic")
+            .expect_err("stale cache version should fail optimistic locking");
+
+        assert!(format!("{error}").contains("optimistic-lock conflict"));
+        let cached = store
+            .get(&task_id)
+            .expect("task should remain cached after failed persist");
+        assert_eq!(cached.status, TaskStatus::AwaitingDeps);
+        assert_eq!(cached.turn, 9);
+        assert_eq!(cached.error.as_deref(), Some("newer cache state"));
         Ok(())
     }
 
