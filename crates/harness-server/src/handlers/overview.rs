@@ -354,10 +354,10 @@ async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCoun
             {
                 Ok(workflows) => {
                     for workflow in workflows {
-                        let Some(task_id) = runtime_workflow_dedupe_task_handle(&workflow) else {
-                            continue;
-                        };
-                        if active_legacy_task_ids.contains(task_id.as_str()) {
+                        if runtime_workflow_matches_active_legacy_task(
+                            &workflow,
+                            &active_legacy_task_ids,
+                        ) {
                             continue;
                         }
                         counted_runtime_active_workflows |=
@@ -418,9 +418,19 @@ fn add_active_runtime_workflow(
 fn runtime_workflow_active_bucket(state: &str) -> Option<ActiveTaskBucket> {
     match state {
         "done" | "passed" | "failed" | "cancelled" => None,
-        "implementing" | "replanning" | "addressing_feedback" => Some(ActiveTaskBucket::Running),
+        "planning" | "implementing" | "replanning" | "addressing_feedback" => {
+            Some(ActiveTaskBucket::Running)
+        }
         _ => Some(ActiveTaskBucket::Queued),
     }
+}
+
+fn runtime_workflow_matches_active_legacy_task(
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+    active_legacy_task_ids: &HashSet<String>,
+) -> bool {
+    runtime_workflow_dedupe_task_handle(workflow)
+        .is_some_and(|task_id| active_legacy_task_ids.contains(task_id.as_str()))
 }
 
 fn runtime_workflow_dedupe_task_handle(
@@ -710,6 +720,56 @@ mod tests {
         assert_eq!(counts.queued, 1);
         assert_eq!(counts.by_project["/repo"].running, 1);
         assert_eq!(counts.by_project["/repo"].queued, 1);
+    }
+
+    #[test]
+    fn planning_runtime_workflow_counts_as_running_work() {
+        let mut counts = ActiveTaskOverviewCounts::default();
+        let planning = harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "planning",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
+        )
+        .with_data(serde_json::json!({
+            "project_id": "/repo",
+            "task_id": "runtime-1",
+        }));
+
+        assert!(add_active_runtime_workflow(&mut counts, &planning));
+
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.queued, 0);
+        assert_eq!(counts.by_project["/repo"].running, 1);
+    }
+
+    #[test]
+    fn runtime_workflow_without_task_handle_still_counts_active_work() {
+        let mut counts = ActiveTaskOverviewCounts::default();
+        let active_legacy_task_ids = HashSet::from(["legacy-task".to_string()]);
+        let runtime = harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
+        )
+        .with_data(serde_json::json!({
+            "project_id": "/repo",
+        }));
+
+        assert!(runtime_workflow_dedupe_task_handle(&runtime).is_none());
+        assert!(!runtime_workflow_matches_active_legacy_task(
+            &runtime,
+            &active_legacy_task_ids,
+        ));
+        if !runtime_workflow_matches_active_legacy_task(&runtime, &active_legacy_task_ids) {
+            add_active_runtime_workflow(&mut counts, &runtime);
+        }
+
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.by_project["/repo"].running, 1);
     }
 
     #[test]
