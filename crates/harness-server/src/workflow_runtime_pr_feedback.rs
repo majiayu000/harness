@@ -9,7 +9,7 @@ use harness_workflow::runtime::{
 use serde_json::json;
 use std::path::Path;
 
-const PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS: i64 = 24 * 60 * 60;
+const DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS: u64 = 24 * 60 * 60;
 
 pub(crate) struct PrDetectedRuntimeContext<'a> {
     pub project_root: &'a Path,
@@ -122,6 +122,19 @@ pub(crate) async fn request_pr_feedback_sweep(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    request_pr_feedback_sweep_with_failed_child_suppression_secs(
+        store,
+        workflow_id,
+        DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+    )
+    .await
+}
+
+pub(crate) async fn request_pr_feedback_sweep_with_failed_child_suppression_secs(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    failed_child_suppression_secs: u64,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
     let Some(instance) = store.get_instance(workflow_id).await? else {
         anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
     };
@@ -133,7 +146,7 @@ pub(crate) async fn request_pr_feedback_sweep(
             state: instance.state,
         });
     }
-    if has_active_pr_feedback_command(store, &instance.id).await? {
+    if has_active_pr_feedback_command(store, &instance.id, failed_child_suppression_secs).await? {
         let task_id = runtime_task_id_from_instance(&instance);
         return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
             workflow_id: instance.id,
@@ -469,6 +482,7 @@ async fn apply_decision(
 async fn has_active_pr_feedback_command(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
+    failed_child_suppression_secs: u64,
 ) -> anyhow::Result<bool> {
     let parent_has_active_command =
         store
@@ -507,7 +521,12 @@ async fn has_active_pr_feedback_command(
             return Ok(true);
         }
         if matches!(instance.state.as_str(), "failed" | "blocked")
-            && has_recent_failed_child_pr_feedback_command(store, &instance.id).await?
+            && has_recent_failed_child_pr_feedback_command(
+                store,
+                &instance.id,
+                failed_child_suppression_secs,
+            )
+            .await?
         {
             return Ok(true);
         }
@@ -519,9 +538,11 @@ async fn has_active_pr_feedback_command(
 async fn has_recent_failed_child_pr_feedback_command(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
+    suppression_secs: u64,
 ) -> anyhow::Result<bool> {
-    let cutoff =
-        chrono::Utc::now() - chrono::Duration::seconds(PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS);
+    let Some(cutoff) = failed_child_suppression_cutoff(suppression_secs) else {
+        return Ok(false);
+    };
     Ok(store
         .commands_for(workflow_id)
         .await?
@@ -531,6 +552,20 @@ async fn has_recent_failed_child_pr_feedback_command(
                 && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
                 && record.updated_at >= cutoff
         }))
+}
+
+fn failed_child_suppression_cutoff(suppression_secs: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if suppression_secs == 0 {
+        return None;
+    }
+    let now = chrono::Utc::now();
+    Some(
+        i64::try_from(suppression_secs)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)
+            .and_then(|duration| now.checked_sub_signed(duration))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+    )
 }
 
 async fn has_active_child_pr_feedback_command(
@@ -880,7 +915,12 @@ mod tests {
         store.upsert_instance(&child).await?;
 
         assert!(
-            !has_active_pr_feedback_command(&store, &workflow_id).await?,
+            !has_active_pr_feedback_command(
+                &store,
+                &workflow_id,
+                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            )
+            .await?,
             "an inspecting child with no active command should not suppress future sweeps"
         );
 
@@ -891,7 +931,12 @@ mod tests {
         store.enqueue_command(&child.id, None, &command).await?;
 
         assert!(
-            has_active_pr_feedback_command(&store, &workflow_id).await?,
+            has_active_pr_feedback_command(
+                &store,
+                &workflow_id,
+                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            )
+            .await?,
             "an inspecting child with a pending command should still suppress duplicate sweeps"
         );
         Ok(())
@@ -955,7 +1000,12 @@ mod tests {
             .await?;
 
         assert!(
-            has_active_pr_feedback_command(&store, &workflow_id).await?,
+            has_active_pr_feedback_command(
+                &store,
+                &workflow_id,
+                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            )
+            .await?,
             "a recently failed inspection child should suppress duplicate sweeps"
         );
 
@@ -972,6 +1022,98 @@ mod tests {
             "the parent workflow must not enqueue another PR feedback child while the failed child is cooling down"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_pr_feedback_child_respects_disabled_suppression_window() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let parent = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "awaiting_feedback",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 123,
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "task-1",
+        }));
+        store.upsert_instance(&parent).await?;
+        let child = WorkflowInstance::new(
+            PR_FEEDBACK_DEFINITION_ID,
+            1,
+            "failed",
+            WorkflowSubject::new("pr", "pr:77"),
+        )
+        .with_id("pr-feedback-child-failed")
+        .with_parent(workflow_id.clone());
+        store.upsert_instance(&child).await?;
+        let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            PR_FEEDBACK_INSPECT_ACTIVITY,
+            "inspect-pr-feedback-77",
+        );
+        let child_command_id = store
+            .enqueue_command(&child.id, None, &child_command)
+            .await?;
+        store
+            .mark_command_status(&child_command_id, "failed")
+            .await?;
+
+        assert!(
+            !has_active_pr_feedback_command(&store, &workflow_id, 0).await?,
+            "a disabled failed-child suppression window should allow a fresh sweep"
+        );
+
+        let outcome =
+            request_pr_feedback_sweep_with_failed_child_suppression_secs(&store, &workflow_id, 0)
+                .await?;
+        assert_eq!(
+            outcome,
+            PrFeedbackSweepRequestOutcome::Requested {
+                workflow_id: workflow_id.clone(),
+                task_id: "task-1".to_string(),
+            }
+        );
+        let commands = store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, "pending");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_child_suppression_cutoff_handles_oversized_windows() {
+        assert_eq!(failed_child_suppression_cutoff(0), None);
+
+        let normal_cutoff = failed_child_suppression_cutoff(60)
+            .expect("nonzero suppression window should produce a cutoff");
+        assert!(normal_cutoff <= chrono::Utc::now());
+
+        assert_eq!(
+            failed_child_suppression_cutoff(u64::MAX),
+            Some(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        );
     }
 
     #[tokio::test]
@@ -1022,7 +1164,12 @@ mod tests {
         store.upsert_instance(&child).await?;
 
         assert!(
-            !has_active_pr_feedback_command(&store, &workflow_id).await?,
+            !has_active_pr_feedback_command(
+                &store,
+                &workflow_id,
+                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            )
+            .await?,
             "a pending child without an active inspection command should not suppress future sweeps"
         );
 
@@ -1035,7 +1182,12 @@ mod tests {
             .await?;
 
         assert!(
-            has_active_pr_feedback_command(&store, &workflow_id).await?,
+            has_active_pr_feedback_command(
+                &store,
+                &workflow_id,
+                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            )
+            .await?,
             "a pending child with an active inspection command should still suppress duplicate sweeps"
         );
 
@@ -1043,7 +1195,12 @@ mod tests {
             .mark_command_status(&child_command_id, "completed")
             .await?;
         assert!(
-            !has_active_pr_feedback_command(&store, &workflow_id).await?,
+            !has_active_pr_feedback_command(
+                &store,
+                &workflow_id,
+                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            )
+            .await?,
             "a pending child with no active inspection command should stop suppressing sweeps"
         );
 
