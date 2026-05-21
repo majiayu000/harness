@@ -203,6 +203,16 @@ pub struct WorkflowInstancePage {
     pub offset: i64,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkflowRuntimeSummaryCounts {
+    pub total_commands: usize,
+    pub total_runtime_jobs: usize,
+    pub command_statuses: BTreeMap<String, usize>,
+    pub runtime_job_statuses: BTreeMap<String, usize>,
+    pub activity_outcomes: BTreeMap<String, usize>,
+    pub jobs_without_activity_envelope: usize,
+}
+
 pub struct WorkflowDecisionTransition<'a> {
     pub expected_state: &'a str,
     pub event_type: &'a str,
@@ -1833,6 +1843,98 @@ impl WorkflowRuntimeStore {
             .into_iter()
             .map(|(status, count)| (status, count.max(0) as usize))
             .collect())
+    }
+
+    pub async fn runtime_summary_counts_for_instances(
+        &self,
+        project_id: Option<&str>,
+        activity_envelope_artifact_type: &str,
+        activity_envelope_schema: &str,
+    ) -> anyhow::Result<WorkflowRuntimeSummaryCounts> {
+        let command_status_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT command.status, COUNT(*)
+             FROM workflow_commands command
+             JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+             WHERE ($1::text IS NULL OR workflow.data->'data'->>'project_id' = $1)
+             GROUP BY command.status
+             ORDER BY command.status ASC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let command_statuses: BTreeMap<String, usize> = command_status_rows
+            .into_iter()
+            .map(|(status, count)| (status, count.max(0) as usize))
+            .collect();
+        let total_commands = command_statuses.values().sum();
+
+        let runtime_job_status_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT job.status, COUNT(*)
+             FROM runtime_jobs job
+             JOIN workflow_commands command ON command.id = job.command_id
+             JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+             WHERE ($1::text IS NULL OR workflow.data->'data'->>'project_id' = $1)
+             GROUP BY job.status
+             ORDER BY job.status ASC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let runtime_job_statuses: BTreeMap<String, usize> = runtime_job_status_rows
+            .into_iter()
+            .map(|(status, count)| (status, count.max(0) as usize))
+            .collect();
+        let total_runtime_jobs = runtime_job_statuses.values().sum();
+
+        let activity_outcome_rows: Vec<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT envelope.payload->>'outcome' AS outcome, COUNT(*)
+             FROM runtime_jobs job
+             JOIN workflow_commands command ON command.id = job.command_id
+             JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+             LEFT JOIN LATERAL (
+                 SELECT artifact.value->'artifact' AS payload
+                 FROM jsonb_array_elements(
+                     CASE
+                         WHEN jsonb_typeof(job.data->'output'->'artifacts') = 'array'
+                         THEN job.data->'output'->'artifacts'
+                         ELSE '[]'::jsonb
+                     END
+                 ) WITH ORDINALITY AS artifact(value, ordinal)
+                 WHERE artifact.value->>'artifact_type' = $2
+                   AND artifact.value->'artifact'->>'schema' = $3
+                 ORDER BY artifact.ordinal DESC
+                 LIMIT 1
+             ) envelope ON true
+             WHERE ($1::text IS NULL OR workflow.data->'data'->>'project_id' = $1)
+             GROUP BY envelope.payload->>'outcome'
+             ORDER BY envelope.payload->>'outcome' ASC NULLS FIRST",
+        )
+        .bind(project_id)
+        .bind(activity_envelope_artifact_type)
+        .bind(activity_envelope_schema)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut activity_outcomes = BTreeMap::new();
+        let mut jobs_without_activity_envelope = 0;
+        for (outcome, count) in activity_outcome_rows {
+            match outcome {
+                Some(outcome) => {
+                    activity_outcomes.insert(outcome, count.max(0) as usize);
+                }
+                None => {
+                    jobs_without_activity_envelope = count.max(0) as usize;
+                }
+            }
+        }
+
+        Ok(WorkflowRuntimeSummaryCounts {
+            total_commands,
+            total_runtime_jobs,
+            command_statuses,
+            runtime_job_statuses,
+            activity_outcomes,
+            jobs_without_activity_envelope,
+        })
     }
 
     pub async fn runtime_jobs_for_commands_limited(
