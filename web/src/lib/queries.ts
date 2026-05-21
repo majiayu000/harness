@@ -7,7 +7,7 @@ import type {
   OperatorSnapshotPayload,
   OverviewPayload,
   StreamItem,
-  Task,
+  TaskListResponse,
   WorkflowRuntimeTreePayload,
 } from "@/types";
 
@@ -33,12 +33,34 @@ export function useOperatorSnapshot() {
   });
 }
 
-export function useTasks() {
-  return useQuery<Task[], Error>({
-    queryKey: ["tasks"],
+export interface TaskListParams {
+  status?: string;
+  scheduler_state?: string;
+  active?: boolean;
+  kind?: string;
+  source?: string;
+  repo?: string;
+  project_id?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+function taskListPath(params: TaskListParams): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "") continue;
+    query.set(key, String(value));
+  }
+  const suffix = query.toString();
+  return suffix ? `/tasks?${suffix}` : "/tasks";
+}
+
+export function useTasks(params: TaskListParams = { active: true, limit: 200 }) {
+  return useQuery<TaskListResponse, Error>({
+    queryKey: ["tasks", params],
     // Task list/detail/stream routes are exposed at `/tasks`; only aggregate
     // dashboard endpoints are mounted under `/api/*`.
-    queryFn: ({ signal }) => apiJson<Task[]>("/tasks", { signal }),
+    queryFn: ({ signal }) => apiJson<TaskListResponse>(taskListPath(params), { signal }),
   });
 }
 
@@ -183,14 +205,14 @@ export async function registerProject(req: {
 }
 
 export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; error: Error | null } {
-  const tasks = useTasks();
+  const tasks = useTasks({ active: true, limit: 200 });
   const overview = useOverview();
 
   const isLoading = tasks.isLoading || overview.isLoading;
   const error = tasks.error ?? overview.error ?? null;
 
   const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
-  const runningTasks = (tasks.data ?? []).filter((t) => !TERMINAL_STATUSES.has(t.status));
+  const runningTasks = (tasks.data?.data ?? []).filter((t) => !TERMINAL_STATUSES.has(t.status));
 
   const cards: WorktreeCard[] = runningTasks.map((task) => {
     const project = (overview.data?.projects ?? []).find(

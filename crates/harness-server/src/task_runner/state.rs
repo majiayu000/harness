@@ -73,6 +73,47 @@ pub enum SchedulerAuthorityState {
     Cancelled,
 }
 
+impl SchedulerAuthorityState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::AwaitingDependencies => "awaiting_dependencies",
+            Self::Running => "running",
+            Self::RetryBackoff => "retry_backoff",
+            Self::Leased => "leased",
+            Self::Recovering => "recovering",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::str::FromStr for SchedulerAuthorityState {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "awaiting_dependencies" => Ok(Self::AwaitingDependencies),
+            "running" => Ok(Self::Running),
+            "retry_backoff" => Ok(Self::RetryBackoff),
+            "leased" => Ok(Self::Leased),
+            "recovering" => Ok(Self::Recovering),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => anyhow::bail!("unknown scheduler state `{value}`"),
+        }
+    }
+}
+
+impl AsRef<str> for SchedulerAuthorityState {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskSchedulerState {
     #[serde(default)]

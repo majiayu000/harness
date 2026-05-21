@@ -60,6 +60,27 @@ function makeTask(id: string, project: string | null, status = "running", task_k
     subtask_ids: [],
     project,
     workflow: null,
+    scheduler: {
+      authority_state: "running",
+      owner: null,
+      run_generation: 1,
+      recovery_generation: 0,
+      lease_expires_at: null,
+    },
+  };
+}
+
+function taskList(data: Task[]) {
+  return {
+    data,
+    page: { limit: 200, has_more: false, next_cursor: null },
+    counts: {
+      total: data.length,
+      running: data.filter((task) => task.scheduler.authority_state === "running").length,
+      failed: data.filter((task) => task.status === "failed").length,
+      by_status: {},
+      by_scheduler_state: {},
+    },
   };
 }
 
@@ -99,9 +120,18 @@ describe("<Active>", () => {
     });
   });
 
-  it("filters to matching project when projectFilter is set", () => {
-    mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
+  it("requests project-scoped active tasks when projectFilter is set", () => {
+    mockUseTasks.mockReturnValue({
+      data: taskList([tasks[0], tasks[2]]),
+      isLoading: false,
+      isError: false,
+    });
     wrap(<Active projectFilter="harness" />);
+    expect(mockUseTasks).toHaveBeenCalledWith({
+      active: true,
+      limit: 200,
+      project_id: "harness",
+    });
     expect(screen.getByText("t1")).toBeInTheDocument();
     expect(screen.getByText("t3")).toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
@@ -109,7 +139,7 @@ describe("<Active>", () => {
   });
 
   it("shows all non-terminal tasks when no projectFilter", () => {
-    mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList(tasks), isLoading: false, isError: false });
     wrap(<Active />);
     expect(screen.getByText("t1")).toBeInTheDocument();
     expect(screen.getByText("t2")).toBeInTheDocument();
@@ -118,8 +148,13 @@ describe("<Active>", () => {
   });
 
   it("shows empty columns when projectFilter matches no tasks", () => {
-    mockUseTasks.mockReturnValue({ data: tasks, isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     wrap(<Active projectFilter="nonexistent" />);
+    expect(mockUseTasks).toHaveBeenCalledWith({
+      active: true,
+      limit: 200,
+      project_id: "nonexistent",
+    });
     expect(screen.queryByText("t1")).not.toBeInTheDocument();
     expect(screen.queryByText("t2")).not.toBeInTheDocument();
     const dashes = screen.getAllByText("—");
@@ -135,7 +170,11 @@ describe("<Active>", () => {
       ...makeTask("feedback-task", "harness", "pending"),
       workflow: { state: "addressing_feedback", pr_number: 124 },
     };
-    mockUseTasks.mockReturnValue({ data: [ready, feedback], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({
+      data: taskList([ready, feedback]),
+      isLoading: false,
+      isError: false,
+    });
     wrap(<Active projectFilter="harness" />);
 
     expect(screen.getByText("wf Ready To Merge")).toBeInTheDocument();
@@ -156,7 +195,7 @@ describe("<Active>", () => {
         review_fallback: { tier: "c", trigger: "silence", active_bot: "codex", activated_at: "2026-04-30T00:00:00Z" },
       },
     };
-    mockUseTasks.mockReturnValue({ data: [ready], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
 
     wrap(<Active projectFilter="harness" />);
 
@@ -184,7 +223,7 @@ describe("<Active>", () => {
         pr_number: 124,
       },
     };
-    mockUseTasks.mockReturnValue({ data: [ready], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
 
     wrap(<Active projectFilter="harness" />);
     fireEvent.click(screen.getByRole("button", { name: "Merge" }));
@@ -200,11 +239,11 @@ describe("<Active>", () => {
 
   it("groups planner and review lifecycle statuses outside implementing", () => {
     mockUseTasks.mockReturnValue({
-      data: [
+      data: taskList([
         makeTask("planner-task", "harness", "planner_waiting", "planner"),
         makeTask("review-task", "harness", "review_generating", "review"),
         makeTask("impl-task", "harness", "triaging", "issue"),
-      ],
+      ]),
       isLoading: false,
       isError: false,
     });
@@ -217,7 +256,7 @@ describe("<Active>", () => {
   });
 
   it("renders workflow runtime tree with jobs and rejected decisions", () => {
-    mockUseTasks.mockReturnValue({ data: [], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     mockUseWorkflowRuntimeTree.mockReturnValue({
       data: {
         total_workflows: 2,
@@ -349,7 +388,7 @@ describe("<Active>", () => {
   });
 
   it("cancels a non-terminal runtime issue workflow from the runtime panel", async () => {
-    mockUseTasks.mockReturnValue({ data: [], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     mockUseWorkflowRuntimeTree.mockReturnValue({
       data: {
         total_workflows: 1,
@@ -394,7 +433,7 @@ describe("<Active>", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const qc = makeQueryClient();
     const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
-    mockUseTasks.mockReturnValue({ data: [], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     mockUseWorkflowRuntimeTree.mockReturnValue({
       data: {
         total_workflows: 1,
@@ -444,7 +483,11 @@ describe("<Active>", () => {
   });
 
   it("clicking a standard task card opens the slide-over with that task's id", () => {
-    mockUseTasks.mockReturnValue({ data: [makeTask("t1", "proj")], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({
+      data: taskList([makeTask("t1", "proj")]),
+      isLoading: false,
+      isError: false,
+    });
     wrap(<Active />);
     fireEvent.click(screen.getByText("t1"));
     expect(screen.getByTestId("task-slideover")).toHaveAttribute("data-task-id", "t1");
@@ -452,14 +495,18 @@ describe("<Active>", () => {
 
   it("clicking a prompt task card opens the shared slide-over", () => {
     const promptTask = makeTask("prompt-task", "proj", "planning", "prompt");
-    mockUseTasks.mockReturnValue({ data: [promptTask], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({ data: taskList([promptTask]), isLoading: false, isError: false });
     wrap(<Active />);
     fireEvent.click(screen.getByText("prompt-task"));
     expect(screen.getByTestId("task-slideover")).toHaveAttribute("data-task-id", "prompt-task");
   });
 
   it("calling onClose from the slide-over hides it", () => {
-    mockUseTasks.mockReturnValue({ data: [makeTask("t1", "proj")], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({
+      data: taskList([makeTask("t1", "proj")]),
+      isLoading: false,
+      isError: false,
+    });
     wrap(<Active />);
     fireEvent.click(screen.getByText("t1"));
     expect(screen.getByTestId("task-slideover")).toBeInTheDocument();
@@ -468,7 +515,11 @@ describe("<Active>", () => {
   });
 
   it("clicking the scrim overlay closes the slide-over", () => {
-    mockUseTasks.mockReturnValue({ data: [makeTask("t1", "proj")], isLoading: false, isError: false });
+    mockUseTasks.mockReturnValue({
+      data: taskList([makeTask("t1", "proj")]),
+      isLoading: false,
+      isError: false,
+    });
     wrap(<Active />);
     fireEvent.click(screen.getByText("t1"));
     expect(screen.getByTestId("task-slideover")).toBeInTheDocument();

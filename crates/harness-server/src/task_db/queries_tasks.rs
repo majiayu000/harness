@@ -1,5 +1,6 @@
-use crate::task_runner::{TaskState, TaskStatus};
+use crate::task_runner::{TaskState, TaskStatus, TaskSummaryFilter, TaskSummaryPageCursor};
 use chrono::{DateTime, Utc};
+use sqlx::{Postgres, QueryBuilder};
 use std::collections::HashMap;
 
 use super::types::{
@@ -382,6 +383,83 @@ impl TaskDb {
         Ok(decode_task_summary_rows(rows, "list_active_summaries"))
     }
 
+    pub async fn list_summaries_filtered(
+        &self,
+        filter: &TaskSummaryFilter,
+    ) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
+             created_at, repo, depends_on, project, workspace_path, workspace_owner, \
+             run_generation, phase, description, scheduler_state FROM tasks",
+        );
+        push_task_summary_filter(&mut query, filter);
+        query.push(" ORDER BY created_at DESC, id DESC");
+
+        let rows = query
+            .build_query_as::<TaskSummaryRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.id.clone();
+            match TaskSummaryRow::try_into_summary(row) {
+                Ok(summary) => summaries.push(summary),
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = %id,
+                        "skipping malformed task row in list_summaries_filtered: {error}"
+                    );
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    pub async fn list_summaries_filtered_page(
+        &self,
+        filter: &TaskSummaryFilter,
+        cursor: Option<&TaskSummaryPageCursor>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
+             created_at, repo, depends_on, project, workspace_path, workspace_owner, \
+             run_generation, phase, description, scheduler_state FROM tasks",
+        );
+        let mut has_where = push_task_summary_filter(&mut query, filter);
+        if let Some(cursor) = cursor {
+            push_where_prefix(&mut query, &mut has_where);
+            query.push("(created_at < ");
+            query.push_bind(cursor.created_at);
+            query.push(" OR (created_at = ");
+            query.push_bind(cursor.created_at);
+            query.push(" AND id < ");
+            query.push_bind(cursor.id.as_str());
+            query.push("))");
+        }
+        query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+        query.push_bind(i64::try_from(limit.max(1)).unwrap_or(i64::MAX));
+
+        let rows = query
+            .build_query_as::<TaskSummaryRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.id.clone();
+            match TaskSummaryRow::try_into_summary(row) {
+                Ok(summary) => summaries.push(summary),
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = %id,
+                        "skipping malformed task row in list_summaries_filtered_page: {error}"
+                    );
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
     /// Return `(task_id, first_token_latency_ms)` pairs for the 500 most-recently
     /// completed terminal tasks. Latency extracted via jsonb correlated subquery.
     pub async fn list_terminal_first_token_latencies_ms(
@@ -692,6 +770,82 @@ fn decode_task_summary_rows(
         }
     }
     summaries
+}
+
+fn push_task_summary_filter<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    filter: &'a TaskSummaryFilter,
+) -> bool {
+    let mut has_where = false;
+
+    if !filter.statuses.is_empty() {
+        push_where_prefix(query, &mut has_where);
+        query.push("status IN (");
+        let mut separated = query.separated(", ");
+        for status in &filter.statuses {
+            separated.push_bind(status.as_ref());
+        }
+        separated.push_unseparated(")");
+    }
+
+    if filter.active {
+        push_where_prefix(query, &mut has_where);
+        query.push("status NOT IN (");
+        let mut separated = query.separated(", ");
+        for status in TaskStatus::terminal_statuses() {
+            separated.push_bind(*status);
+        }
+        separated.push_unseparated(")");
+    }
+
+    if !filter.scheduler_states.is_empty() {
+        push_where_prefix(query, &mut has_where);
+        query.push("(scheduler_state::jsonb ->> 'authority_state') IN (");
+        let mut separated = query.separated(", ");
+        for state in &filter.scheduler_states {
+            separated.push_bind(state.as_ref());
+        }
+        separated.push_unseparated(")");
+    }
+
+    if !filter.kinds.is_empty() {
+        push_where_prefix(query, &mut has_where);
+        query.push("task_kind IN (");
+        let mut separated = query.separated(", ");
+        for kind in &filter.kinds {
+            separated.push_bind(kind.as_ref());
+        }
+        separated.push_unseparated(")");
+    }
+
+    if let Some(source) = filter.source.as_deref() {
+        push_where_prefix(query, &mut has_where);
+        query.push("source = ");
+        query.push_bind(source.to_string());
+    }
+
+    if let Some(repo) = filter.repo.as_deref() {
+        push_where_prefix(query, &mut has_where);
+        query.push("repo = ");
+        query.push_bind(repo.to_string());
+    }
+
+    if let Some(project) = filter.project.as_deref() {
+        push_where_prefix(query, &mut has_where);
+        query.push("project = ");
+        query.push_bind(project.to_string());
+    }
+
+    has_where
+}
+
+fn push_where_prefix(query: &mut QueryBuilder<'_, Postgres>, has_where: &mut bool) {
+    if *has_where {
+        query.push(" AND ");
+    } else {
+        query.push(" WHERE ");
+        *has_where = true;
+    }
 }
 
 #[cfg(test)]

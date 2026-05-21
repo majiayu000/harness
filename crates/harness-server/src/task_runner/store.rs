@@ -1,5 +1,5 @@
 use crate::task_db::TaskDb;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
 use harness_core::agent::StreamItem;
@@ -10,8 +10,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
-use super::state::{SchedulerOwnerKind, TaskState, TaskSummary};
-use super::types::{TaskId, TaskStatus};
+use super::state::{SchedulerAuthorityState, SchedulerOwnerKind, TaskState, TaskSummary};
+use super::types::{TaskId, TaskKind, TaskStatus};
 use super::CompletionCallback;
 
 /// Broadcast channel capacity for per-task stream events.
@@ -48,6 +48,79 @@ pub struct TaskStore {
     /// Append-only JSONL event log for crash recovery. `None` if the file
     /// could not be opened (best-effort; server still starts without it).
     pub(crate) event_log: Option<Arc<crate::event_replay::TaskEventLog>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskSummaryFilter {
+    pub statuses: Vec<TaskStatus>,
+    pub scheduler_states: Vec<SchedulerAuthorityState>,
+    pub kinds: Vec<TaskKind>,
+    pub source: Option<String>,
+    pub repo: Option<String>,
+    pub project: Option<String>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSummaryPageCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: String,
+}
+
+impl TaskSummaryFilter {
+    pub fn matches_summary(&self, summary: &TaskSummary) -> bool {
+        if !self.statuses.is_empty() && !self.statuses.contains(&summary.status) {
+            return false;
+        }
+        if self.active && summary.status.is_terminal() {
+            return false;
+        }
+        if !self.scheduler_states.is_empty()
+            && !self
+                .scheduler_states
+                .contains(&summary.scheduler.authority_state)
+        {
+            return false;
+        }
+        if !self.kinds.is_empty() && !self.kinds.contains(&summary.task_kind) {
+            return false;
+        }
+        if self
+            .source
+            .as_deref()
+            .is_some_and(|source| summary.source.as_deref() != Some(source))
+        {
+            return false;
+        }
+        if self
+            .repo
+            .as_deref()
+            .is_some_and(|repo| summary.repo.as_deref() != Some(repo))
+        {
+            return false;
+        }
+        if self
+            .project
+            .as_deref()
+            .is_some_and(|project| summary.project.as_deref() != Some(project))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+fn task_summary_is_after_cursor(summary: &TaskSummary, cursor: &TaskSummaryPageCursor) -> bool {
+    let Some(created_at) = summary
+        .created_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+    else {
+        return false;
+    };
+    created_at < cursor.created_at
+        || (created_at == cursor.created_at && summary.id.as_str() < cursor.id.as_str())
 }
 
 impl TaskStore {
@@ -368,6 +441,55 @@ impl TaskStore {
                 by_id.remove(&summary.id);
             } else {
                 by_id.insert(entry.key().clone(), summary);
+            }
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    pub async fn list_summaries_filtered_with_terminal(
+        &self,
+        filter: &TaskSummaryFilter,
+    ) -> anyhow::Result<Vec<TaskSummary>> {
+        let mut by_id: std::collections::HashMap<TaskId, TaskSummary> = self
+            .db
+            .list_summaries_filtered(filter)
+            .await?
+            .into_iter()
+            .map(|summary| (summary.id.clone(), summary))
+            .collect();
+        for entry in self.cache.iter() {
+            let summary = entry.value().summary();
+            if filter.matches_summary(&summary) {
+                by_id.insert(entry.key().clone(), summary);
+            } else {
+                by_id.remove(entry.key());
+            }
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    pub async fn list_summaries_filtered_page_with_terminal(
+        &self,
+        filter: &TaskSummaryFilter,
+        cursor: Option<&TaskSummaryPageCursor>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TaskSummary>> {
+        let db_limit = limit.saturating_add(self.cache.len()).saturating_add(1);
+        let mut by_id: std::collections::HashMap<TaskId, TaskSummary> = self
+            .db
+            .list_summaries_filtered_page(filter, cursor, db_limit)
+            .await?
+            .into_iter()
+            .map(|summary| (summary.id.clone(), summary))
+            .collect();
+        for entry in self.cache.iter() {
+            let summary = entry.value().summary();
+            if filter.matches_summary(&summary)
+                && cursor.is_none_or(|cursor| task_summary_is_after_cursor(&summary, cursor))
+            {
+                by_id.insert(entry.key().clone(), summary);
+            } else {
+                by_id.remove(entry.key());
             }
         }
         Ok(by_id.into_values().collect())

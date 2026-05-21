@@ -27,7 +27,9 @@ pub use state::{
     RecentFailureTask, RoundResult, SchedulerAuthorityState, SchedulerOwner, SchedulerOwnerKind,
     TaskSchedulerState, TaskState, TaskSummary, TaskWorkflowSummary,
 };
-pub use store::{mutate_and_persist, update_status, TaskStore};
+pub use store::{
+    mutate_and_persist, update_status, TaskStore, TaskSummaryFilter, TaskSummaryPageCursor,
+};
 pub use types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
 
 impl TaskStore {

@@ -39,7 +39,7 @@ export function History({ projectFilter }: Props) {
       <div className="border border-line bg-bg-1 p-4 font-mono text-[12px] text-ink-3">
         done {totalDone} · failed {totalFailed} · filter {filter} · query {query || "(none)"}
         <div className="mt-3 text-ink-4 text-[11px]">
-          Task list endpoint is /tasks; cursor-based pagination TBD in a separate PR.
+          Task list endpoint is /tasks with server-side filters and cursor pagination.
         </div>
       </div>
     </div>

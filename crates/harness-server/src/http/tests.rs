@@ -3706,7 +3706,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         .await?;
     assert_eq!(list_response.status(), StatusCode::OK);
     let listed = response_json(list_response).await?;
-    let tasks = listed.as_array().expect("tasks should be an array");
+    let tasks = listed["data"].as_array().expect("tasks should be an array");
     let runtime_task = tasks
         .iter()
         .find(|task| task["id"] == task_id)
@@ -3999,7 +3999,7 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
         .await?;
     assert_eq!(list_response.status(), StatusCode::OK);
     let listed = response_json(list_response).await?;
-    let tasks = listed.as_array().expect("tasks should be an array");
+    let tasks = listed["data"].as_array().expect("tasks should be an array");
     let runtime_task = tasks
         .iter()
         .find(|task| task["id"] == task_id)
@@ -4019,6 +4019,97 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
     assert_eq!(runtime_task["workflow"]["id"], created["workflow_id"]);
     assert_eq!(runtime_task["workflow"]["definition_id"], "prompt_task");
     assert_eq!(runtime_task["workflow"]["state"], "implementing");
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tasks_paginates_past_runtime_only_second_page() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks).post(task_routes::create_task))
+        .with_state(state);
+
+    let mut created_ids = Vec::new();
+    for index in 0..3 {
+        let body = serde_json::json!({
+            "project": project_root.display().to_string(),
+            "prompt": format!("runtime prompt page {index}"),
+            "source": "dashboard",
+            "external_id": format!("manual:prompt:page:{index}")
+        });
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))?,
+            )
+            .await?;
+        assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+        let created = response_json(create_response).await?;
+        created_ids.push(
+            created["task_id"]
+                .as_str()
+                .expect("runtime submission should return a task handle")
+                .to_string(),
+        );
+    }
+
+    let mut cursor: Option<String> = None;
+    let mut listed_ids = Vec::new();
+    for page_index in 0..3 {
+        let uri = match cursor.as_deref() {
+            Some(cursor) => format!(
+                "/tasks?limit=1&cursor={}",
+                cursor
+                    .replace('+', "%2B")
+                    .replace(':', "%3A")
+                    .replace('|', "%7C")
+            ),
+            None => "/tasks?limit=1".to_string(),
+        };
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await?;
+        let tasks = body["data"].as_array().expect("tasks should be an array");
+        assert_eq!(tasks.len(), 1, "page {page_index} should contain one task");
+        listed_ids.push(
+            tasks[0]["id"]
+                .as_str()
+                .expect("task id should be present")
+                .to_string(),
+        );
+        cursor = body["page"]["next_cursor"].as_str().map(str::to_string);
+        if page_index < 2 {
+            assert!(
+                body["page"]["has_more"].as_bool().unwrap_or(false),
+                "page {page_index} should expose another runtime-only page"
+            );
+            assert!(cursor.is_some(), "page {page_index} should return a cursor");
+        }
+    }
+
+    created_ids.sort();
+    listed_ids.sort();
+    assert_eq!(listed_ids, created_ids);
     Ok(())
 }
 
@@ -5028,13 +5119,101 @@ async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyho
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let tasks: serde_json::Value = serde_json::from_slice(&body)?;
-    let tasks = tasks.as_array().expect("tasks array");
+    let tasks = tasks["data"].as_array().expect("tasks array");
     assert!(tasks
         .iter()
         .any(|task| { task["task_kind"] == "review" && task["status"] == "review_waiting" }));
     assert!(tasks
         .iter()
         .any(|task| { task["task_kind"] == "planner" && task["status"] == "planner_generating" }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tasks_rejects_running_as_task_status() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks?status=running")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "invalid_status");
+    assert_eq!(
+        body["hint"],
+        "Use scheduler_state=running instead of status=running."
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tasks_rejects_invalid_limit() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks?limit=0")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "invalid_limit");
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tasks_filters_by_scheduler_state_and_returns_envelope() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state.clone());
+
+    let mut running_task = task_runner::TaskState::new(task_runner::TaskId::new());
+    running_task.status = task_runner::TaskStatus::Implementing;
+    running_task.scheduler.claim_scheduler("test-scheduler");
+    let running_task_id = running_task.id.0.clone();
+
+    let mut queued_task = task_runner::TaskState::new(task_runner::TaskId::new());
+    queued_task.status = task_runner::TaskStatus::Pending;
+    queued_task.scheduler = task_runner::TaskSchedulerState::queued();
+
+    state.core.tasks.insert(&running_task).await;
+    state.core.tasks.insert(&queued_task).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks?scheduler_state=running&limit=1")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    let tasks = body["data"].as_array().expect("tasks array");
+
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], running_task_id);
+    assert_eq!(tasks[0]["scheduler"]["authority_state"], "running");
+    assert_eq!(body["page"]["limit"], 1);
+    assert_eq!(body["counts"]["total"], 1);
+    assert_eq!(body["counts"]["running"], 1);
     Ok(())
 }
 
@@ -5182,7 +5361,7 @@ async fn list_tasks_enriches_workflows_for_issue_and_pr_tasks() -> anyhow::Resul
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let tasks: serde_json::Value = serde_json::from_slice(&body)?;
-    let tasks = tasks.as_array().expect("tasks array");
+    let tasks = tasks["data"].as_array().expect("tasks array");
 
     let issue_json = tasks
         .iter()
@@ -5297,7 +5476,8 @@ async fn list_tasks_exposes_workflow_fallback_metadata() -> anyhow::Result<()> {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let tasks: serde_json::Value = serde_json::from_slice(&body)?;
     let task = tasks
-        .as_array()
+        .get("data")
+        .and_then(serde_json::Value::as_array)
         .and_then(|tasks| tasks.first())
         .expect("task row");
     assert_eq!(task["workflow"]["state"], "ready_to_merge");

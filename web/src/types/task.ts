@@ -21,6 +21,40 @@ export interface Task {
   subtask_ids: string[];
   project: string | null;
   workflow?: WorkflowSummary | null;
+  scheduler: TaskSchedulerState;
+}
+
+export interface TaskSchedulerOwner {
+  kind: string;
+  id: string;
+}
+
+export interface TaskSchedulerState {
+  authority_state: string;
+  owner?: TaskSchedulerOwner | null;
+  run_generation: number;
+  recovery_generation: number;
+  lease_expires_at?: string | null;
+}
+
+export interface TaskListPage {
+  limit: number;
+  has_more: boolean;
+  next_cursor?: string | null;
+}
+
+export interface TaskListCounts {
+  total: number;
+  running: number;
+  failed: number;
+  by_status: Record<string, number>;
+  by_scheduler_state: Record<string, number>;
+}
+
+export interface TaskListResponse {
+  data: Task[];
+  page: TaskListPage;
+  counts: TaskListCounts;
 }
 
 export interface TaskArtifact {

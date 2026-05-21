@@ -24,10 +24,21 @@ type TaskStub = {
 
 function mockFetch(tasks: TaskStub[]) {
   const overview = { projects: [], runtimes: [], kpi: { active_tasks: 0 } };
+  const taskList = {
+    data: tasks,
+    page: { limit: 200, has_more: false, next_cursor: null },
+    counts: {
+      total: tasks.length,
+      running: tasks.length,
+      failed: 0,
+      by_status: {},
+      by_scheduler_state: {},
+    },
+  };
   global.fetch = vi.fn().mockImplementation((url: string) => {
     const body = url.includes("/api/overview")
       ? JSON.stringify(overview)
-      : JSON.stringify(tasks);
+      : JSON.stringify(taskList);
     return Promise.resolve(new Response(body, { status: 200 }));
   }) as unknown as typeof fetch;
 }
@@ -130,10 +141,21 @@ describe("stream URL construction", () => {
 // ── useTasks ─────────────────────────────────────────────────────────────────
 
 describe("useTasks", () => {
-  it("fetches the task list from /tasks without an /api prefix", async () => {
+  it("fetches the active task list envelope from /tasks without an /api prefix", async () => {
     const task = { id: "t1", status: "implementing", turn: 1, project: null };
+    const taskList = {
+      data: [task],
+      page: { limit: 200, has_more: false, next_cursor: null },
+      counts: {
+        total: 1,
+        running: 1,
+        failed: 0,
+        by_status: { implementing: 1 },
+        by_scheduler_state: {},
+      },
+    };
     const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify([task]), { status: 200 }),
+      new Response(JSON.stringify(taskList), { status: 200 }),
     );
     global.fetch = fetchMock as unknown as typeof fetch;
 
@@ -141,12 +163,12 @@ describe("useTasks", () => {
     await waitFor(() => expect(result.current.isLoading).toBe(false));
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/tasks",
+      "/tasks?active=true&limit=200",
       expect.objectContaining({
         headers: expect.objectContaining({ Accept: "application/json" }),
       }),
     );
-    expect(result.current.data).toMatchObject([{ id: "t1", status: "implementing" }]);
+    expect(result.current.data?.data).toMatchObject([{ id: "t1", status: "implementing" }]);
   });
 });
 
