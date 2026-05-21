@@ -3416,28 +3416,53 @@ fn rejects_pr_open_transition_without_bind_pr_command() {
 
 #[test]
 fn rejects_pr_open_transition_with_invalid_bind_pr_payload() {
-    let instance = issue_instance("implementing");
-    let decision = WorkflowDecision::new(
-        instance.id.clone(),
-        "implementing",
-        "agent_reported_pr_open",
-        "pr_open",
-        "The agent reported a PR with incomplete metadata.",
-    )
-    .with_command(WorkflowCommand::new(
-        WorkflowCommandType::BindPr,
-        "issue-123-bind-pr",
-        json!({ "pr_number": 77 }),
-    ));
+    let cases = [
+        ("missing pr_url", json!({ "pr_number": 77 })),
+        (
+            "missing pr_number",
+            json!({ "pr_url": "https://github.com/owner/repo/pull/77" }),
+        ),
+        (
+            "non-numeric pr_number",
+            json!({
+                "pr_number": "77",
+                "pr_url": "https://github.com/owner/repo/pull/77"
+            }),
+        ),
+        (
+            "empty pr_url",
+            json!({
+                "pr_number": 77,
+                "pr_url": "  "
+            }),
+        ),
+    ];
 
-    let err = DecisionValidator::github_issue_pr()
-        .validate(&instance, &decision, &validation_context())
-        .expect_err("BindPr must include a valid pr_number and pr_url payload");
+    for (case_name, payload) in cases {
+        let instance = issue_instance("implementing");
+        let decision = WorkflowDecision::new(
+            instance.id.clone(),
+            "implementing",
+            "agent_reported_pr_open",
+            "pr_open",
+            "The agent reported a PR with incomplete metadata.",
+        )
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::BindPr,
+            "issue-123-bind-pr",
+            payload,
+        ));
 
-    assert_eq!(
-        err.kind,
-        WorkflowDecisionRejectionKind::InvalidCommandPayload
-    );
+        let err = DecisionValidator::github_issue_pr()
+            .validate(&instance, &decision, &validation_context())
+            .expect_err("BindPr must include a valid pr_number and pr_url payload");
+
+        assert_eq!(
+            err.kind,
+            WorkflowDecisionRejectionKind::InvalidCommandPayload,
+            "failed case: {case_name}"
+        );
+    }
 }
 
 #[test]

@@ -622,12 +622,12 @@ impl DecisionValidator {
             ));
         }
 
-        let has_pr_url = command
+        if !command
             .command
             .get("pr_url")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty());
-        if !has_pr_url {
+            .is_some_and(|value| !value.trim().is_empty())
+        {
             return Err(WorkflowDecisionRejection::new(
                 WorkflowDecisionRejectionKind::InvalidCommandPayload,
                 "BindPr command must include non-empty pr_url",
