@@ -23,11 +23,13 @@ else
     echo "No local config file found; using built-in defaults plus local Postgres defaults." >&2
 fi
 
-config_http_addr() {
-    awk -F= '
+config_server_value() {
+    local key="$1"
+
+    awk -F= -v key="$key" '
         $0 ~ /^\[server\]/ { in_server = 1; next }
         $0 ~ /^\[/ { in_server = 0 }
-        in_server && $1 ~ /^[[:space:]]*http_addr[[:space:]]*$/ {
+        in_server && $1 ~ "^[[:space:]]*" key "[[:space:]]*$" {
             value = $2
             sub(/^[[:space:]]*/, "", value)
             sub(/[[:space:]]*#.*/, "", value)
@@ -39,6 +41,14 @@ config_http_addr() {
             exit
         }
     ' "$CONFIG_PATH"
+}
+
+config_http_addr() {
+    config_server_value "http_addr"
+}
+
+config_database_url() {
+    config_server_value "database_url"
 }
 
 BIND_ADDR="${HARNESS_HTTP_ADDR:-}"
@@ -190,14 +200,26 @@ ensure_bind_port_available() {
 
 ensure_bind_port_available
 
-if docker compose version >/dev/null 2>&1; then
-    echo "Starting Postgres and waiting until healthy..."
-    docker compose -f docker-compose.yml up -d --wait postgres
-else
-    echo "WARNING: Docker Compose v2 not available; assuming Postgres is already running." >&2
-fi
+uses_local_postgres() {
+    if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
+        return 1
+    fi
 
-if [ -z "${HARNESS_DATABASE_URL:-}" ] && [ -z "$CONFIG_PATH" ]; then
+    if [ -n "$CONFIG_PATH" ] && [ -n "$(config_database_url)" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+if uses_local_postgres; then
+    if docker compose version >/dev/null 2>&1; then
+        echo "Starting Postgres and waiting until healthy..."
+        docker compose -f docker-compose.yml up -d --wait postgres
+    else
+        echo "WARNING: Docker Compose v2 not available; assuming Postgres is already running." >&2
+    fi
+
     export HARNESS_DATABASE_URL="postgres://harness:harness@localhost:5432/harness"
 fi
 
