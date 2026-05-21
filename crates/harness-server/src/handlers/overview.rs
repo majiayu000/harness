@@ -390,10 +390,11 @@ fn add_active_summary(counts: &mut ActiveTaskOverviewCounts, summary: &TaskSumma
     if summary.status.is_terminal() {
         return false;
     }
-    let bucket = if summary.scheduler.authority_state == SchedulerAuthorityState::Running {
-        ActiveTaskBucket::Running
-    } else {
-        ActiveTaskBucket::Queued
+    let bucket = match summary.scheduler.authority_state {
+        SchedulerAuthorityState::Running | SchedulerAuthorityState::Leased => {
+            ActiveTaskBucket::Running
+        }
+        _ => ActiveTaskBucket::Queued,
     };
     counts.add(summary.project.as_deref(), bucket);
     true
@@ -781,6 +782,26 @@ mod tests {
         assert_eq!(counts.total, 1);
         assert_eq!(counts.running, 1);
         assert_eq!(counts.by_project["/repo"].running, 1);
+    }
+
+    #[test]
+    fn leased_legacy_summary_counts_as_running_work() {
+        let mut counts = ActiveTaskOverviewCounts::default();
+        let mut leased = crate::task_runner::TaskState::new(harness_core::types::TaskId(
+            "leased-runtime-task".to_string(),
+        ))
+        .summary();
+        leased.status = crate::task_runner::TaskStatus::Implementing;
+        leased.scheduler.authority_state = SchedulerAuthorityState::Leased;
+        leased.project = Some("/repo".to_string());
+
+        assert!(add_active_summary(&mut counts, &leased));
+
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.queued, 0);
+        assert_eq!(counts.by_project["/repo"].running, 1);
+        assert_eq!(counts.by_project["/repo"].queued, 0);
     }
 
     #[test]
