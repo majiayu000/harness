@@ -452,8 +452,9 @@ impl AgentAdapter for CodexAdapter {
 }
 
 fn protocol_line_preview(line: &str) -> String {
-    let mut preview: String = line.chars().take(MAX_PROTOCOL_LINE_PREVIEW).collect();
-    if line.chars().count() > MAX_PROTOCOL_LINE_PREVIEW {
+    let mut chars = line.chars();
+    let mut preview: String = chars.by_ref().take(MAX_PROTOCOL_LINE_PREVIEW).collect();
+    if chars.next().is_some() {
         preview.push_str("...");
     }
     preview
@@ -489,12 +490,12 @@ fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
 
 fn sandbox_policy_value(mode: Option<SandboxMode>, project_root: &PathBuf) -> Option<Value> {
     mode.map(|value| match value {
-        SandboxMode::ReadOnly => json!({ "type": "readOnly" }),
+        SandboxMode::ReadOnly => json!({ "type": "read-only" }),
         SandboxMode::WorkspaceWrite => json!({
-            "type": "workspaceWrite",
+            "type": "workspace-write",
             "writableRoots": [project_root],
         }),
-        SandboxMode::DangerFullAccess => json!({ "type": "dangerFullAccess" }),
+        SandboxMode::DangerFullAccess => json!({ "type": "danger-full-access" }),
     })
 }
 
@@ -971,7 +972,7 @@ mod tests {
                 "model": "gpt-runtime",
                 "effort": "medium",
                 "sandboxPolicy": {
-                    "type": "workspaceWrite",
+                    "type": "workspace-write",
                     "writableRoots": ["/tmp/project"],
                 },
                 "approvalPolicy": "on-request",
@@ -1000,6 +1001,19 @@ mod tests {
             Some("danger-full-access")
         );
         assert_eq!(sandbox_mode_value(None), None);
+    }
+
+    #[test]
+    fn protocol_line_preview_truncates_without_full_count_scan() {
+        assert_eq!(protocol_line_preview("short"), "short");
+        assert_eq!(
+            protocol_line_preview(&"x".repeat(MAX_PROTOCOL_LINE_PREVIEW)),
+            "x".repeat(MAX_PROTOCOL_LINE_PREVIEW)
+        );
+        assert_eq!(
+            protocol_line_preview(&format!("{}y", "x".repeat(MAX_PROTOCOL_LINE_PREVIEW))),
+            format!("{}...", "x".repeat(MAX_PROTOCOL_LINE_PREVIEW))
+        );
     }
 
     #[tokio::test]
