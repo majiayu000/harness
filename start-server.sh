@@ -200,7 +200,8 @@ is_harness_listener() {
     local command
 
     command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    [[ "$command" == *"harness serve"* ]]
+    [[ "$command" =~ (^|[[:space:]/])harness([[:space:]]|$) ]] &&
+        [[ "$command" =~ (^|[[:space:]])serve([[:space:]]|$) ]]
 }
 
 ensure_bind_port_available() {
