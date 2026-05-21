@@ -201,10 +201,11 @@ pub fn agent_review_fix_prompt(
         "The independent reviewer found the following issues in PR {pr_url} \
          (agent review round {round}):\n\n{safe_issue_list}\n\n\
          Fix each issue, run {validation_cmd}, then commit and push.\n\
-         At the end of your output, print these exact sentinel lines separately:\n\
-         PR_URL=<PR URL>\n\
-         PUSHED_COMMIT=true|false\n\
-         Use PUSHED_COMMIT=false only when no file changes were needed."
+         At the end of your output, print these two sentinel lines separately:\n\
+         PR_URL={pr_url}\n\
+         PUSHED_COMMIT=<true or false>\n\
+         The pushed-commit line must be exactly PUSHED_COMMIT=true or PUSHED_COMMIT=false; \
+         use PUSHED_COMMIT=false only when no file changes were needed."
     )
 }
 
@@ -233,10 +234,11 @@ pub fn agent_review_intervention_prompt(
          instead of repeating the same fix strategy.\n\n\
          Issues that remain unresolved:\n\n{safe_issue_list}\n\n\
          Fix each issue, run {validation_cmd}, then commit and push.\n\
-         At the end of your output, print these exact sentinel lines separately:\n\
-         PR_URL=<PR URL>\n\
-         PUSHED_COMMIT=true|false\n\
-         Use PUSHED_COMMIT=false only when no file changes were needed."
+         At the end of your output, print these two sentinel lines separately:\n\
+         PR_URL={pr_url}\n\
+         PUSHED_COMMIT=<true or false>\n\
+         The pushed-commit line must be exactly PUSHED_COMMIT=true or PUSHED_COMMIT=false; \
+         use PUSHED_COMMIT=false only when no file changes were needed."
     )
 }
 
@@ -625,9 +627,25 @@ mod tests {
         assert!(p.contains("round 2"));
         assert!(p.contains("Missing error handling"));
         assert!(p.contains("Unbounded loop"));
-        assert!(p.contains("PR_URL="));
-        assert!(p.contains("PUSHED_COMMIT=true|false"));
-        assert!(p.contains("sentinel lines separately"));
+        assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/42"));
+        assert!(!p.contains("PR_URL=<actual PR URL>"));
+        assert!(p.contains("PUSHED_COMMIT=<true or false>"));
+        assert!(p.contains("exactly PUSHED_COMMIT=true or PUSHED_COMMIT=false"));
+    }
+
+    #[test]
+    fn test_agent_review_intervention_prompt_uses_exact_pr_url_sentinel() {
+        let issues = vec!["Same issue repeated".to_string()];
+        let p = agent_review_intervention_prompt(
+            "https://github.com/owner/repo/pull/42",
+            &issues,
+            3,
+            "mixed",
+        );
+        assert!(p.contains("IMPASSE DETECTED"));
+        assert!(p.contains("PR_URL=https://github.com/owner/repo/pull/42"));
+        assert!(!p.contains("PR_URL=<actual PR URL>"));
+        assert!(p.contains("PUSHED_COMMIT=<true or false>"));
     }
 
     #[test]
