@@ -1847,7 +1847,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
             ["signals"]["IssueClosed"],
-        "Use when the GitHub issue is confirmed closed and no implementation PR is needed. Include issue_number and state or issue_url."
+        "Use when the GitHub issue is confirmed closed and no implementation PR is needed. Include state=closed or state=resolved plus issue_number or issue_url."
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["optional_artifacts"]

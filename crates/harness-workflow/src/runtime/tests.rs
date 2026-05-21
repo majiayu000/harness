@@ -859,6 +859,40 @@ fn runtime_completion_reducer_uses_issue_state_artifact_as_closed_issue_evidence
 }
 
 #[test]
+fn runtime_completion_reducer_rejects_closed_issue_signal_without_closed_state() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult::succeeded(
+        "implement_issue",
+        "Issue signal omitted explicit closed evidence.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "open"
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("malformed closed issue signal should block");
+
+    assert_eq!(decision.decision, "block_missing_implementation_result");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
 fn runtime_completion_reducer_blocks_structured_done_without_closed_issue_evidence() {
     let instance = issue_instance("implementing");
     let proposed_decision = WorkflowDecision::new(

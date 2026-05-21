@@ -1100,7 +1100,7 @@ fn closed_issue_evidence_from_value(value: &Value, source: &str) -> Option<Close
     let state = value.get("state").and_then(non_empty_json_string);
     let closed = issue_state_is_closed(value);
 
-    if issue_number.is_none() && issue_url.is_none() && !closed {
+    if !closed || (issue_number.is_none() && issue_url.is_none()) {
         return None;
     }
 

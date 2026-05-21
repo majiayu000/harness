@@ -365,7 +365,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "reducer_next_state": "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked",
                 "accepted_signals": [ISSUE_CLOSED_SIGNAL, ISSUE_ALREADY_RESOLVED_SIGNAL],
                 "accepted_artifacts": ["pull_request", ISSUE_STATE_ARTIFACT],
-                "success_requires": "A succeeded implement_issue result MUST include either a pull_request artifact with pr_number/pr_url, or structured closed-issue evidence via IssueClosed/IssueAlreadyResolved signal or issue_state artifact. Empty success is blocked.",
+                "success_requires": "A succeeded implement_issue result MUST include either a pull_request artifact with pr_number/pr_url, or structured closed-issue evidence with explicit closed/resolved state plus issue_number or issue_url. Empty success is blocked.",
                 "required_summary": "Include changed files, validation commands, and the PR URL or closed issue evidence."
             },
             "follow_up_event": "PrDetected can still bind PR metadata, but a runtime result should emit pull_request directly when a PR exists."
@@ -436,8 +436,8 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 }
             },
             "signals": {
-                "IssueClosed": "Use when the GitHub issue is confirmed closed and no implementation PR is needed. Include issue_number and state or issue_url.",
-                "IssueAlreadyResolved": "Use when the task is already resolved before a PR is created. Include issue_number and state or issue_url."
+                "IssueClosed": "Use when the GitHub issue is confirmed closed and no implementation PR is needed. Include state=closed or state=resolved plus issue_number or issue_url.",
+                "IssueAlreadyResolved": "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
             }
         }),
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
@@ -602,7 +602,7 @@ mod tests {
         );
         assert_eq!(
             schema["agent_summary_contract"]["signals"]["IssueAlreadyResolved"],
-            "Use when the task is already resolved before a PR is created. Include issue_number and state or issue_url."
+            "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
         );
     }
 

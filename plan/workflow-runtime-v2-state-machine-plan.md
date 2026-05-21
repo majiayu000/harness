@@ -57,6 +57,8 @@ Completed:
 - `implement_issue` success with structured closed-issue evidence now has
   reducer, worker, and prompt-contract coverage and moves the workflow to
   `done`.
+- Closed-issue evidence requires explicit closed/resolved state plus issue
+  identity; malformed `IssueClosed` signals with open state still block.
 
 Validation:
 
