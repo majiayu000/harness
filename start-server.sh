@@ -92,6 +92,20 @@ listener_pids() {
     done < <(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>/dev/null || true)
 }
 
+health_check_addr() {
+    case "$BIND_HOST" in
+        "" | "*" | "0.0.0.0")
+            printf '127.0.0.1:%s\n' "$BIND_PORT"
+            ;;
+        "::")
+            printf '[::1]:%s\n' "$BIND_PORT"
+            ;;
+        *)
+            printf '%s\n' "$BIND_ADDR"
+            ;;
+    esac
+}
+
 listener_pid_args() {
     printf "%s" "$1" | paste -sd, -
 }
@@ -160,7 +174,7 @@ ensure_bind_port_available() {
 
     echo "Harness server is already running on $BIND_ADDR:" >&2
     print_listener_table "$pids"
-    health_url="http://$BIND_ADDR/health"
+    health_url="http://$(health_check_addr)/health"
     if curl -fsS --max-time 2 "$health_url" >/dev/null 2>&1; then
         echo "Health check OK: $health_url" >&2
     else
