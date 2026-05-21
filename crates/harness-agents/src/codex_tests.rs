@@ -787,6 +787,10 @@ async fn execute_stream_removes_claude_code_env_vars() -> anyhow::Result<()> {
 fn codex_sandbox_mode_maps_to_codex_cli_values() {
     assert_eq!(codex_sandbox_mode(SandboxMode::ReadOnly), "read-only");
     assert_eq!(
+        codex_sandbox_mode(SandboxMode::ReadOnlyWithNetwork),
+        "read-only"
+    );
+    assert_eq!(
         codex_sandbox_mode(SandboxMode::WorkspaceWrite),
         "workspace-write"
     );
@@ -820,6 +824,45 @@ fn base_args_uses_request_reasoning_effort_sandbox_and_approval_override() {
     assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
     assert!(args.windows(2).any(|window| window == ["-a", "on-request"]));
     assert_eq!(args.last().map(String::as_str), Some("ping"));
+}
+
+#[test]
+fn base_args_configures_read_only_with_network_profile() {
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::DangerFullAccess);
+    let request = AgentRequest {
+        prompt: "ping".to_string(),
+        project_root: PathBuf::from("/tmp/project"),
+        sandbox_mode: Some(SandboxMode::ReadOnlyWithNetwork),
+        ..Default::default()
+    };
+
+    let args: Vec<String> = agent
+        .base_args(&request)
+        .iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect();
+
+    assert!(!args.iter().any(|arg| arg == "-s"));
+    assert!(args.windows(2).any(|window| {
+        window
+            == [
+                "-c",
+                "default_permissions=\"harness_read_only_with_network\"",
+            ]
+    }));
+    assert!(args.windows(2).any(|window| {
+        window == [
+            "-c",
+            "permissions.harness_read_only_with_network.filesystem={\":minimal\"=\"read\",\":project_roots\"={\".\"=\"read\"}}",
+        ]
+    }));
+    assert!(args.windows(2).any(|window| {
+        window
+            == [
+                "-c",
+                "permissions.harness_read_only_with_network.network.enabled=true",
+            ]
+    }));
 }
 
 #[test]

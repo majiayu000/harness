@@ -5,6 +5,12 @@ use super::helpers::{
 use harness_core::types::{ContextItem, EventFilters, ExecutionPhase};
 use tokio::time::Duration;
 
+fn legacy_hosted_bot_server_config() -> std::sync::Arc<harness_core::config::HarnessConfig> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.agents.review.review_bot_auto_trigger = true;
+    std::sync::Arc::new(config)
+}
+
 #[tokio::test]
 async fn skills_are_injected_into_agent_context() -> anyhow::Result<()> {
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
@@ -367,7 +373,7 @@ async fn validation_phase_is_set_on_review_loop_turns() -> anyhow::Result<()> {
         store,
         agent_clone,
         None,
-        Default::default(),
+        legacy_hosted_bot_server_config(),
         skills,
         events,
         vec![],

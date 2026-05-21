@@ -480,7 +480,7 @@ fn approval_decision_result(decision: ApprovalDecision) -> Value {
 fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
     mode.map(|value| {
         match value {
-            SandboxMode::ReadOnly => "read-only",
+            SandboxMode::ReadOnly | SandboxMode::ReadOnlyWithNetwork => "read-only",
             SandboxMode::WorkspaceWrite => "workspace-write",
             SandboxMode::DangerFullAccess => "danger-full-access",
         }
@@ -490,12 +490,16 @@ fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
 
 fn sandbox_policy_value(mode: Option<SandboxMode>, project_root: &PathBuf) -> Option<Value> {
     mode.map(|value| match value {
-        SandboxMode::ReadOnly => json!({ "type": "read-only" }),
+        SandboxMode::ReadOnly => json!({ "type": "readOnly" }),
+        SandboxMode::ReadOnlyWithNetwork => json!({
+            "type": "readOnly",
+            "networkAccess": true,
+        }),
         SandboxMode::WorkspaceWrite => json!({
-            "type": "workspace-write",
+            "type": "workspaceWrite",
             "writableRoots": [project_root],
         }),
-        SandboxMode::DangerFullAccess => json!({ "type": "danger-full-access" }),
+        SandboxMode::DangerFullAccess => json!({ "type": "dangerFullAccess" }),
     })
 }
 
@@ -972,7 +976,7 @@ mod tests {
                 "model": "gpt-runtime",
                 "effort": "medium",
                 "sandboxPolicy": {
-                    "type": "workspace-write",
+                    "type": "workspaceWrite",
                     "writableRoots": ["/tmp/project"],
                 },
                 "approvalPolicy": "on-request",
@@ -993,6 +997,10 @@ mod tests {
             Some("read-only")
         );
         assert_eq!(
+            sandbox_mode_value(Some(SandboxMode::ReadOnlyWithNetwork)).as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(
             sandbox_mode_value(Some(SandboxMode::WorkspaceWrite)).as_deref(),
             Some("workspace-write")
         );
@@ -1001,6 +1009,20 @@ mod tests {
             Some("danger-full-access")
         );
         assert_eq!(sandbox_mode_value(None), None);
+    }
+
+    #[test]
+    fn sandbox_policy_value_preserves_network_for_read_only_with_network() {
+        assert_eq!(
+            sandbox_policy_value(
+                Some(SandboxMode::ReadOnlyWithNetwork),
+                &PathBuf::from("/tmp/project")
+            ),
+            Some(json!({
+                "type": "readOnly",
+                "networkAccess": true,
+            }))
+        );
     }
 
     #[test]

@@ -2,6 +2,12 @@ use super::super::*;
 use super::helpers::{wait_for_captured_prompts, wait_until, PhaseCapturingAgent};
 use tokio::time::Duration;
 
+fn legacy_hosted_bot_server_config() -> std::sync::Arc<harness_core::config::HarnessConfig> {
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.agents.review.review_bot_auto_trigger = true;
+    std::sync::Arc::new(config)
+}
+
 #[tokio::test]
 async fn resumed_pr_manual_conflict_fails_before_review_loop() -> anyhow::Result<()> {
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
@@ -114,7 +120,7 @@ async fn resumed_pr_clean_conflict_gate_enters_review_loop() -> anyhow::Result<(
         store.clone(),
         agent.clone(),
         None,
-        Default::default(),
+        legacy_hosted_bot_server_config(),
         skills,
         events,
         vec![],
@@ -180,7 +186,7 @@ async fn resumed_pr_rebase_push_requires_fresh_review_prompt() -> anyhow::Result
         store.clone(),
         agent.clone(),
         None,
-        Default::default(),
+        legacy_hosted_bot_server_config(),
         skills,
         events,
         vec![],

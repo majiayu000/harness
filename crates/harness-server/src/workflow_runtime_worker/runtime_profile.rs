@@ -32,6 +32,7 @@ pub(super) fn runtime_profile_sandbox_mode(
     };
     let mode = match raw {
         "read-only" => SandboxMode::ReadOnly,
+        "read-only-with-network" => SandboxMode::ReadOnlyWithNetwork,
         "workspace-write" => SandboxMode::WorkspaceWrite,
         "danger-full-access" => SandboxMode::DangerFullAccess,
         other => anyhow::bail!("runtime profile sandbox `{other}` is not supported"),

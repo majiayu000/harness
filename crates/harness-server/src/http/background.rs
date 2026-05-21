@@ -92,6 +92,64 @@ fn build_recovered_request(
     req
 }
 
+fn resolve_reviewer_for_request(
+    state: &AppState,
+    req: &task_runner::CreateTaskRequest,
+    implementor_name: &str,
+) -> anyhow::Result<Option<Arc<dyn harness_core::agent::CodeAgent>>> {
+    let review_config = review_config_for_request(&state.core.server.config, req)?;
+    let (reviewer, _) = super::resolve_reviewer(
+        &state.core.server.agent_registry,
+        &review_config,
+        implementor_name,
+    );
+    Ok(reviewer)
+}
+
+fn review_config_for_request(
+    server_config: &harness_core::config::HarnessConfig,
+    req: &task_runner::CreateTaskRequest,
+) -> anyhow::Result<harness_core::config::agents::AgentReviewConfig> {
+    let project_root = req
+        .project
+        .as_deref()
+        .context("task request is missing a resolved project root")?;
+    let project_config = harness_core::config::project::load_project_config(project_root)
+        .with_context(|| {
+            format!(
+                "failed to load project config for {}",
+                project_root.display()
+            )
+        })?;
+    Ok(harness_core::config::resolve::resolve_config(server_config, &project_config).review)
+}
+
+async fn fail_background_dispatch_task(
+    state: &Arc<AppState>,
+    task_id: &task_runner::TaskId,
+    reason: String,
+) {
+    if let Err(pe) = task_runner::mutate_and_persist(&state.core.tasks, task_id, move |s| {
+        s.status = task_runner::TaskStatus::Failed;
+        s.scheduler.mark_terminal(&task_runner::TaskStatus::Failed);
+        s.error = Some(reason);
+    })
+    .await
+    {
+        tracing::error!(
+            task_id = ?task_id,
+            "failed to persist failed background dispatch status: {pe}"
+        );
+        return;
+    }
+
+    if let Some(cb) = &state.intake.completion_callback {
+        if let Some(final_state) = state.core.tasks.get(task_id) {
+            cb(final_state).await;
+        }
+    }
+}
+
 async fn record_runtime_recovery_requested(
     state: &Arc<AppState>,
     project_root: &std::path::Path,
@@ -410,11 +468,16 @@ pub(super) fn spawn_awaiting_deps_watcher(state: &Arc<AppState>) {
                             return;
                         }
                     };
-                    let (reviewer, _) = super::resolve_reviewer(
-                        &state.core.server.agent_registry,
-                        &state.core.server.config.agents.review,
-                        agent.name(),
-                    );
+                    let reviewer = match resolve_reviewer_for_request(&state, &req, agent.name()) {
+                        Ok(reviewer) => reviewer,
+                        Err(error) => {
+                            let reason =
+                                format!("dep-watcher: failed to resolve reviewer: {error}");
+                            tracing::error!(task_id = ?task.id, "{reason}");
+                            fail_background_dispatch_task(&state, &task.id, reason).await;
+                            return;
+                        }
+                    };
                     state.core.tasks.register_task_stream(&task.id);
                     task_runner::spawn_preregistered_task(
                         task.id,
@@ -1849,11 +1912,16 @@ pub(super) fn spawn_pr_recovery(state: &Arc<AppState>) {
                         return;
                     }
                 };
-                let (reviewer, _) = super::resolve_reviewer(
-                    &state.core.server.agent_registry,
-                    &state.core.server.config.agents.review,
-                    agent.name(),
-                );
+                let reviewer = match resolve_reviewer_for_request(&state, &req, agent.name()) {
+                    Ok(reviewer) => reviewer,
+                    Err(error) => {
+                        let reason =
+                            format!("startup recovery: failed to resolve reviewer: {error}");
+                        tracing::error!(task_id = ?task.id, "{reason}");
+                        fail_background_dispatch_task(&state, &task.id, reason).await;
+                        return;
+                    }
+                };
                 state.core.tasks.register_task_stream(&task.id);
                 task_runner::spawn_preregistered_task(
                     task.id,
@@ -2095,11 +2163,16 @@ pub(super) fn spawn_system_task_recovery(state: &Arc<AppState>) {
                         return;
                     }
                 };
-                let (reviewer, _) = super::resolve_reviewer(
-                    &state.core.server.agent_registry,
-                    &state.core.server.config.agents.review,
-                    agent.name(),
-                );
+                let reviewer = match resolve_reviewer_for_request(&state, &req, agent.name()) {
+                    Ok(reviewer) => reviewer,
+                    Err(error) => {
+                        let reason =
+                            format!("startup recovery: failed to resolve reviewer: {error}");
+                        tracing::error!(task_id = ?task.id, "{reason}");
+                        fail_background_dispatch_task(&state, &task.id, reason).await;
+                        return;
+                    }
+                };
                 state.core.tasks.register_task_stream(&task.id);
                 task_runner::spawn_preregistered_task(
                     task.id,
@@ -2346,11 +2419,16 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                         return;
                     }
                 };
-                let (reviewer, _) = super::resolve_reviewer(
-                    &state.core.server.agent_registry,
-                    &state.core.server.config.agents.review,
-                    agent.name(),
-                );
+                let reviewer = match resolve_reviewer_for_request(&state, &req, agent.name()) {
+                    Ok(reviewer) => reviewer,
+                    Err(error) => {
+                        let reason =
+                            format!("startup recovery: failed to resolve reviewer: {error}");
+                        tracing::error!(task_id = ?task.id, "{reason}");
+                        fail_background_dispatch_task(&state, &task.id, reason).await;
+                        return;
+                    }
+                };
                 state.core.tasks.register_task_stream(&task.id);
                 task_runner::spawn_preregistered_task(
                     task.id,
@@ -2580,11 +2658,15 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
                         return;
                     }
                 };
-            let (reviewer, _) = super::resolve_reviewer(
-                &state.core.server.agent_registry,
-                &state.core.server.config.agents.review,
-                agent.name(),
-            );
+            let reviewer = match resolve_reviewer_for_request(&state, &req, agent.name()) {
+                Ok(reviewer) => reviewer,
+                Err(error) => {
+                    let reason = format!("startup recovery: failed to resolve reviewer: {error}");
+                    tracing::error!(task_id = ?task.id, "{reason}");
+                    fail_background_dispatch_task(&state, &task.id, reason).await;
+                    return;
+                }
+            };
             state.core.tasks.register_task_stream(&task.id);
             task_runner::spawn_preregistered_task(
                 task.id,
@@ -2620,6 +2702,35 @@ mod tests {
     use super::*;
 
     const RECONCILE_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn background_review_config_for_request_applies_project_override() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let harness_dir = dir.path().join(".harness");
+        std::fs::create_dir(&harness_dir)?;
+        std::fs::write(
+            harness_dir.join("config.toml"),
+            r#"
+                [review]
+                enabled = true
+                review_bot_auto_trigger = false
+            "#,
+        )?;
+        let mut server_config = harness_core::config::HarnessConfig::default();
+        server_config.agents.review.enabled = false;
+        server_config.agents.review.review_bot_auto_trigger = true;
+        let req = task_runner::CreateTaskRequest {
+            project: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let review_config = review_config_for_request(&server_config, &req)?;
+
+        assert!(review_config.enabled);
+        assert!(!review_config.review_bot_auto_trigger);
+        assert_eq!(review_config.reviewer_agent, "codex");
+        Ok(())
+    }
 
     #[test]
     fn runtime_dispatch_profile_selector_inherits_configured_agent_profile_when_unset() {

@@ -233,8 +233,9 @@ max_tokens = 4096
 
 [agents.review]
 enabled = true
-reviewer_agent = "codex"   # independent reviewer != implementor
+reviewer_agent = "codex"   # local review agent
 max_rounds = 3
+review_bot_auto_trigger = false
 
 [gc]
 max_drafts_per_run = 5

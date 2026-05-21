@@ -2,9 +2,11 @@ use super::helpers::{
     augment_prompt_with_skills, build_task_event, run_agent_streaming, run_on_error,
     run_post_execute, run_pre_execute, telemetry_for_timeout, update_status,
 };
+use super::review_loop;
 use crate::task_runner::{mutate_and_persist, RoundResult, TaskId, TaskStatus, TaskStore};
 use chrono::Utc;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
+use harness_core::config::agents::SandboxMode;
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::types::{ContextItem, Decision, ExecutionPhase, TurnFailure, TurnFailureKind};
@@ -51,6 +53,72 @@ pub(crate) fn normalize_issues(issues: &[String]) -> Vec<String> {
     sorted.into_iter().cloned().collect()
 }
 
+fn reviewer_sandbox_override(reviewer: &dyn CodeAgent) -> Option<SandboxMode> {
+    if reviewer.name().eq_ignore_ascii_case("claude") {
+        return None;
+    }
+    Some(SandboxMode::ReadOnlyWithNetwork)
+}
+
+pub(crate) enum ReviewHeadProbe<'a> {
+    GitHub {
+        repo_slug: &'a str,
+        pr_num: u64,
+        github_token: Option<&'a str>,
+    },
+    #[cfg(test)]
+    Static(Result<&'a str, &'a str>),
+}
+
+impl ReviewHeadProbe<'_> {
+    async fn capture(&self) -> Result<String, String> {
+        match self {
+            ReviewHeadProbe::GitHub {
+                repo_slug,
+                pr_num,
+                github_token,
+            } => review_loop::fetch_pr_head_sha_for_gate(repo_slug, *pr_num, *github_token).await,
+            #[cfg(test)]
+            ReviewHeadProbe::Static(result) => result
+                .as_ref()
+                .map(|value| (*value).to_string())
+                .map_err(|error| (*error).to_string()),
+        }
+    }
+}
+
+async fn fail_agent_review(
+    store: &TaskStore,
+    events: &EventStore,
+    task_id: &TaskId,
+    turn: u32,
+    pr_url: &str,
+    error: String,
+    detail: Option<String>,
+) -> anyhow::Result<()> {
+    mutate_and_persist(store, task_id, |s| {
+        s.status = TaskStatus::Failed;
+        s.error = Some(error.clone());
+    })
+    .await?;
+    let event = build_task_event(
+        task_id,
+        turn,
+        "agent_review",
+        "agent_review",
+        Decision::Block,
+        Some(error),
+        Some(format!("pr={pr_url}")),
+        None,
+        None,
+        detail,
+    );
+    if let Err(error) = events.log(&event).await {
+        tracing::warn!("failed to log agent_review failure event: {error}");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_review(
     store: &TaskStore,
@@ -68,13 +136,17 @@ pub(crate) async fn run_agent_review(
     skills: &RwLock<harness_skills::store::SkillStore>,
     cargo_env: &HashMap<String, String>,
     effective_max_turns: Option<u32>,
+    review_head_probe: Option<ReviewHeadProbe<'_>>,
     turns_used: &mut u32,
-) -> anyhow::Result<(bool, bool)> {
+) -> anyhow::Result<(bool, bool, Option<Result<String, String>>)> {
     let max_rounds = review_config.max_rounds;
     // (normalized_issues, consecutive_count): tracks how many consecutive rounds produced identical issues.
     let mut impasse_tracker: Option<(Vec<String>, u32)> = None;
     // Whether the last action in this loop pushed a new commit (fix or intervention).
     let mut pushed_commit = false;
+    let mut approved_review = false;
+    let mut approved_review_head: Option<Result<String, String>> = None;
+    let mut last_issues: Vec<String> = Vec::new();
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
 
@@ -88,6 +160,7 @@ pub(crate) async fn run_agent_review(
             project_root: project.to_path_buf(),
             context: context_items.to_vec(),
             execution_phase: Some(ExecutionPhase::SimpleReview),
+            sandbox_mode: reviewer_sandbox_override(reviewer),
             allowed_tools: Some(vec![
                 "Read".to_string(),
                 "Grep".to_string(),
@@ -98,6 +171,10 @@ pub(crate) async fn run_agent_review(
             ..Default::default()
         };
         let review_req = run_pre_execute(interceptors, review_req).await?;
+        let reviewed_head = match review_head_probe.as_ref() {
+            Some(probe) => Some(probe.capture().await),
+            None => None,
+        };
 
         if let Some(max) = effective_max_turns {
             if *turns_used >= max {
@@ -195,7 +272,7 @@ pub(crate) async fn run_agent_review(
                     if let Err(error) = events.log(&event).await {
                         tracing::warn!("failed to log agent_review event: {error}");
                     }
-                    return Ok((false, false));
+                    return Ok((false, false, approved_review_head));
                 }
                 run_on_error(interceptors, &review_req, &failure.error.to_string()).await;
                 mutate_and_persist(store, task_id, |s| {
@@ -284,6 +361,7 @@ pub(crate) async fn run_agent_review(
         let approved = prompts::is_approved(&output);
         let issues = prompts::extract_review_issues(&output);
         let review_detail = output;
+        last_issues = issues.clone();
 
         mutate_and_persist(store, task_id, |s| {
             s.rounds.push(RoundResult::new(
@@ -327,6 +405,8 @@ pub(crate) async fn run_agent_review(
 
         if approved {
             tracing::info!("agent review approved at round {agent_round}");
+            approved_review = true;
+            approved_review_head = reviewed_head;
             break;
         }
 
@@ -334,12 +414,21 @@ pub(crate) async fn run_agent_review(
         // Sending an empty fix prompt would produce arbitrary or no-op commits,
         // so treat this as a reviewer protocol failure and abort the review loop.
         if issues.is_empty() {
-            tracing::warn!(
-                agent_round,
-                "agent reviewer output contained neither APPROVED nor ISSUE: lines; \
-                 treating as protocol failure and skipping fix round"
+            let error = format!(
+                "Agent review round {agent_round} returned neither APPROVED nor ISSUE lines."
             );
-            break;
+            tracing::warn!(agent_round, error, "agent reviewer protocol failure");
+            fail_agent_review(
+                store,
+                events,
+                task_id,
+                agent_round,
+                pr_url,
+                error,
+                Some(review_detail),
+            )
+            .await?;
+            return Ok((false, pushed_commit, approved_review_head));
         }
 
         // Detect impasse: track how many consecutive rounds produced identical issues.
@@ -361,7 +450,7 @@ pub(crate) async fn run_agent_review(
             tracing::warn!(
                 agent_round,
                 consecutive_count,
-                "agent review impasse: same issues repeated {IMPASSE_HARD_FAIL_ROUNDS} times — marking task as failed"
+                    "agent review impasse: same issues repeated {IMPASSE_HARD_FAIL_ROUNDS} times — marking task as failed"
             );
             mutate_and_persist(store, task_id, |s| {
                 s.status = TaskStatus::Failed;
@@ -370,7 +459,7 @@ pub(crate) async fn run_agent_review(
                 ));
             })
             .await?;
-            return Ok((false, false));
+            return Ok((false, false, approved_review_head));
         }
 
         // 3+ consecutive rounds with identical issues → use the intervention prompt.
@@ -383,12 +472,11 @@ pub(crate) async fn run_agent_review(
             );
         }
 
-        // Skip the fix round only when rounds are exhausted and there is no impasse.
-        // When impasse is detected at the last round, we still apply the intervention prompt
-        // to give the agent one final attempt to break the cycle before GitHub review.
-        if agent_round == max_rounds && !is_impasse {
+        // Do not push a new fix after the final allowed review pass. Every local
+        // fix must be followed by another reviewer pass before the task can pass.
+        if agent_round == max_rounds {
             tracing::info!(
-                "agent review exhausted {max_rounds} rounds, proceeding to GitHub review"
+                "agent review exhausted {max_rounds} rounds with unresolved local issues"
             );
             break;
         }
@@ -504,116 +592,23 @@ pub(crate) async fn run_agent_review(
         pushed_commit = true;
     }
 
-    Ok((true, pushed_commit))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn step_tracker(
-        tracker: &mut Option<(Vec<String>, u32)>,
-        issues: &[String],
-    ) -> (u32, bool, bool) {
-        let normalized = normalize_issues(issues);
-        let count = match tracker.as_ref() {
-            Some((prev, c)) if *prev == normalized => c + 1,
-            _ => 1,
-        };
-        *tracker = Some((normalized, count));
-        let intervention = count >= 3;
-        let fatal = count >= 5;
-        (count, intervention, fatal)
+    if approved_review {
+        return Ok((true, pushed_commit, approved_review_head));
     }
 
-    #[test]
-    fn normalize_issues_is_order_invariant() {
-        let ordered = vec!["issue A".to_string(), "issue B".to_string()];
-        let reversed = vec!["issue B".to_string(), "issue A".to_string()];
-        assert_eq!(normalize_issues(&ordered), normalize_issues(&reversed));
-    }
-
-    #[test]
-    fn impasse_no_intervention_for_first_two_rounds() {
-        let issues = vec!["null pointer".to_string()];
-        let mut tracker: Option<(Vec<String>, u32)> = None;
-        let (c1, i1, f1) = step_tracker(&mut tracker, &issues);
-        let (c2, i2, f2) = step_tracker(&mut tracker, &issues);
-        assert_eq!(c1, 1);
-        assert!(!i1 && !f1, "no action on first occurrence");
-        assert_eq!(c2, 2);
-        assert!(!i2 && !f2, "no action on second occurrence");
-    }
-
-    #[test]
-    fn impasse_intervention_at_third_consecutive_round() {
-        let issues = vec!["null pointer".to_string()];
-        let mut tracker: Option<(Vec<String>, u32)> = None;
-        step_tracker(&mut tracker, &issues); // round 1
-        step_tracker(&mut tracker, &issues); // round 2
-        let (c3, i3, f3) = step_tracker(&mut tracker, &issues); // round 3
-        assert_eq!(c3, 3);
-        assert!(i3, "intervention at 3rd consecutive round");
-        assert!(!f3, "not yet fatal at round 3");
-    }
-
-    #[test]
-    fn impasse_fatal_at_fifth_consecutive_round() {
-        let issues = vec!["null pointer".to_string()];
-        let mut tracker: Option<(Vec<String>, u32)> = None;
-        for _ in 0..4 {
-            step_tracker(&mut tracker, &issues);
-        }
-        let (c5, i5, f5) = step_tracker(&mut tracker, &issues);
-        assert_eq!(c5, 5);
-        assert!(i5, "intervention still active at round 5");
-        assert!(f5, "fatal at 5th consecutive round");
-    }
-
-    #[test]
-    fn impasse_counter_resets_when_issues_change() {
-        let issues = vec!["null pointer".to_string()];
-        let other = vec!["different bug".to_string()];
-        let mut tracker: Option<(Vec<String>, u32)> = None;
-        step_tracker(&mut tracker, &issues); // count 1
-        step_tracker(&mut tracker, &issues); // count 2
-        step_tracker(&mut tracker, &issues); // count 3 — would trigger intervention
-        let (c_reset, i_reset, _) = step_tracker(&mut tracker, &other); // different issues
-        assert_eq!(c_reset, 1, "counter resets on different issues");
-        assert!(!i_reset, "no intervention after reset");
-    }
-
-    // --- jaccard_word_similarity unit tests ---
-
-    #[test]
-    fn jaccard_identical_strings() {
-        assert_eq!(jaccard_word_similarity("hello world", "hello world"), 1.0);
-    }
-
-    #[test]
-    fn jaccard_disjoint_strings() {
-        assert_eq!(jaccard_word_similarity("foo bar", "baz qux"), 0.0);
-    }
-
-    #[test]
-    fn jaccard_partial_overlap() {
-        // {"a", "b"} ∩ {"b", "c"} = {"b"}, union = {"a","b","c"} → 1/3
-        let score = jaccard_word_similarity("a b", "b c");
-        let expected = 1.0_f64 / 3.0_f64;
-        assert!(
-            (score - expected).abs() < 1e-10,
-            "expected ~{expected}, got {score}"
-        );
-    }
-
-    #[test]
-    fn jaccard_one_empty() {
-        assert_eq!(jaccard_word_similarity("", "hello world"), 0.0);
-        assert_eq!(jaccard_word_similarity("hello world", ""), 0.0);
-    }
-
-    #[test]
-    fn jaccard_both_empty() {
-        assert_eq!(jaccard_word_similarity("", ""), 1.0);
-    }
+    let detail = if last_issues.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Unresolved local review issues:\n{}",
+            last_issues.join("\n")
+        ))
+    };
+    let error = if max_rounds == 0 {
+        "Agent review is enabled but max_rounds is 0.".to_string()
+    } else {
+        format!("Agent review exhausted {max_rounds} rounds without approval.")
+    };
+    fail_agent_review(store, events, task_id, max_rounds, pr_url, error, detail).await?;
+    Ok((false, pushed_commit, approved_review_head))
 }

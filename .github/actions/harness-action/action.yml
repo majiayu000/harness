@@ -6,7 +6,7 @@ inputs:
     description: Prompt passed to `harness exec`
     required: true
   sandbox-mode:
-    description: Sandbox mode hint (read-only, workspace-write, danger-full-access)
+    description: Sandbox mode hint (read-only, read-only-with-network, workspace-write, danger-full-access)
     required: false
     default: workspace-write
   model:

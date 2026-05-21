@@ -1098,6 +1098,31 @@ fn make_task_queue() -> Arc<TaskQueue> {
     ))
 }
 
+#[test]
+fn resolve_effective_review_config_applies_project_review_override() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let harness_dir = dir.path().join(".harness");
+    std::fs::create_dir(&harness_dir)?;
+    std::fs::write(
+        harness_dir.join("config.toml"),
+        r#"
+            [review]
+            enabled = true
+            review_bot_auto_trigger = false
+        "#,
+    )?;
+    let mut server_config = HarnessConfig::default();
+    server_config.agents.review.enabled = false;
+    server_config.agents.review.review_bot_auto_trigger = true;
+
+    let review_config = resolve_effective_review_config(&server_config, dir.path())?;
+
+    assert!(review_config.enabled);
+    assert!(!review_config.review_bot_auto_trigger);
+    assert_eq!(review_config.reviewer_agent, "codex");
+    Ok(())
+}
+
 async fn make_minimal_svc(
     store: Arc<TaskStore>,
     registry: Option<Arc<ProjectRegistry>>,

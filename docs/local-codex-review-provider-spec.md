@@ -49,7 +49,8 @@ Relevant current implementation points:
 - Existing independent local review is implemented in `harness-server/src/task_executor/agent_review.rs`.
 - External bot waiting and fallback logic lives in `harness-server/src/task_executor/review_loop.rs`.
 - `ReviewBotKey::Codex` currently means the GitHub bot triggered by `@codex`, not local Codex CLI.
-- `harness pr review` in `harness-cli/src/cmd/pr.rs` is Gemini-oriented and hardcodes `/gemini review`.
+- `harness pr review` now reads the configured hosted-bot command and reviewer name, but it is
+  still the legacy hosted-bot loop until provider selection flags are implemented.
 - `review_bot_auto_trigger` controls whether Harness posts a bot trigger comment.
 - `fallback_chain = ["gemini", "codex"]` currently means hosted bot fallback order.
 
@@ -520,7 +521,9 @@ Gate rules:
 7. Missing or pending advisory reports produce `advisory_pending` only when `external_required =
    true`; otherwise the gate can still return `approved` with pending advisory status attached to the
    report.
-8. Merge readiness requires local review pass and CI green.
+8. Merge readiness requires local review pass, PR-head advancement after any local review fix,
+   unchanged reviewed PR head after CI polling, CI green, and an open PR. A PR that was already
+   merged externally after local approval completes the task instead of reopening review.
 9. If no required providers are configured, Harness must log a warning and fall back to the legacy
    behavior for one release cycle.
 
@@ -769,10 +772,34 @@ Verification:
 - Default `review_bot_auto_trigger = false` for new configs.
 - Update example configs.
 
+Partial implementation shipped first:
+
+- `AgentReviewConfig::default()` no longer auto-posts hosted bot review comments.
+- Config files that explicitly disable local review and omit
+  `review_bot_auto_trigger` keep the hosted-bot path; explicitly setting both
+  off remains a fail-closed no-provider configuration.
+- Built-in review defaults enable local Codex review so default PR tasks still
+  have a runnable review gate.
+- `config/default.toml.example` enables the local Codex reviewer and leaves hosted
+  bot triggering disabled.
+- The PR check job is named as an advisory request instead of a review gate.
+- `harness pr review` uses configured bot command and reviewer names instead of
+  hardcoded Gemini strings.
+- Hosted-bot-disabled completion requires local review approval, local
+  validation, PR-head advancement after local review fixes, unchanged reviewed PR head after CI
+  polling, green GitHub PR checks, and an open PR before recording `ReadyToMerge`;
+  PRs that merged externally after local approval are marked done instead of failed;
+  pending checks are polled up to the configured review wait budget instead of
+  failing immediately;
+  missing GitHub tokens produce a clear PR-check gate configuration error;
+  missing local approval fails closed with a configuration error.
+
 Verification:
 
 - Existing external bot tests still pass.
-- New tests confirm local approval bypasses external wait when external review is advisory.
+- New tests confirm local approval bypasses external wait only after validation
+  and green PR checks.
+- New tests confirm hosted-bot-disabled completion fails when no local review approved.
 
 ## Acceptance Criteria
 

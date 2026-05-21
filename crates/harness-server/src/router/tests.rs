@@ -397,6 +397,9 @@ async fn run_gc_adopt_and_wait_for_failure_turn(max_rounds: u32) -> anyhow::Resu
     config.gc.adopt_wait_secs = 0;
     config.gc.adopt_max_rounds = max_rounds;
     config.gc.adopt_turn_timeout_secs = 30;
+    // This test verifies the legacy hosted-bot review loop exhaustion path.
+    // The production default keeps hosted bots advisory and disabled.
+    config.agents.review.review_bot_auto_trigger = true;
     // Disable Jaccard loop detection so this test can verify max_rounds exhaustion.
     // NonLgtmAgent intentionally returns identical output every round.
     config.concurrency.loop_jaccard_threshold = 1.1;

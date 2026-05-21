@@ -43,11 +43,15 @@ pub async fn fix(
     run_review_loop(
         &agent,
         &project,
-        Some(issue),
-        pr_number,
-        Some(&pr_url),
-        wait,
-        max_rounds,
+        ReviewLoopOptions {
+            issue: Some(issue),
+            pr: pr_number,
+            pr_url: Some(&pr_url),
+            review_bot_command: &config.agents.review.review_bot_command,
+            reviewer_name: &config.agents.review.reviewer_name,
+            wait,
+            max_rounds,
+        },
     )
     .await
 }
@@ -63,7 +67,20 @@ pub async fn loop_pr(
 
     println!("[harness] Starting review loop for PR #{pr}");
 
-    run_review_loop(&agent, &project, None, pr, None, wait, max_rounds).await
+    run_review_loop(
+        &agent,
+        &project,
+        ReviewLoopOptions {
+            issue: None,
+            pr,
+            pr_url: None,
+            review_bot_command: &config.agents.review.review_bot_command,
+            reviewer_name: &config.agents.review.reviewer_name,
+            wait,
+            max_rounds,
+        },
+    )
+    .await
 }
 
 /// Resolve `owner/repo` slug from a PR URL.
@@ -77,15 +94,30 @@ async fn resolve_repo_slug(pr: u64, pr_url: Option<&str>) -> anyhow::Result<Stri
     ))
 }
 
+struct ReviewLoopOptions<'a> {
+    issue: Option<u64>,
+    pr: u64,
+    pr_url: Option<&'a str>,
+    review_bot_command: &'a str,
+    reviewer_name: &'a str,
+    wait: u64,
+    max_rounds: u32,
+}
+
 async fn run_review_loop(
     agent: &impl CodeAgent,
     project: &PathBuf,
-    issue: Option<u64>,
-    pr: u64,
-    pr_url: Option<&str>,
-    wait: u64,
-    max_rounds: u32,
+    options: ReviewLoopOptions<'_>,
 ) -> anyhow::Result<()> {
+    let ReviewLoopOptions {
+        issue,
+        pr,
+        pr_url,
+        review_bot_command,
+        reviewer_name,
+        wait,
+        max_rounds,
+    } = options;
     let url_display: std::borrow::Cow<str> = match pr_url {
         Some(url) => std::borrow::Cow::Borrowed(url),
         None => std::borrow::Cow::Owned(format!("PR #{pr}")),
@@ -109,8 +141,8 @@ async fn run_review_loop(
                 pr,
                 round,
                 prev_fixed,
-                "/gemini review",
-                "gemini-code-assist[bot]",
+                review_bot_command,
+                reviewer_name,
                 &repo,
                 false,
             ),
@@ -122,7 +154,7 @@ async fn run_review_loop(
         println!("{}", resp.output);
 
         if prompts::is_waiting(&resp.output) {
-            println!("[harness] Gemini hasn't re-reviewed yet, retrying...");
+            println!("[harness] Review bot hasn't re-reviewed yet, retrying...");
             continue;
         }
 

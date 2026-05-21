@@ -58,11 +58,11 @@ where
 #[test]
 fn agent_review_config_defaults() {
     let config = AgentReviewConfig::default();
-    assert!(!config.enabled);
-    assert!(config.reviewer_agent.is_empty());
+    assert!(config.enabled);
+    assert_eq!(config.reviewer_agent, "codex");
     assert_eq!(config.max_rounds, 3);
     assert_eq!(config.review_bot_command, "/gemini review");
-    assert!(config.review_bot_auto_trigger);
+    assert!(!config.review_bot_auto_trigger);
     assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
     assert_eq!(config.silence_rounds_threshold, 3);
     assert_eq!(config.silence_min_minutes_after_commit, 30);
@@ -80,7 +80,7 @@ fn agent_review_config_deserializes_from_toml() {
     assert_eq!(config.reviewer_agent, "codex");
     assert_eq!(config.max_rounds, 5);
     assert_eq!(config.review_bot_command, "/gemini review");
-    assert!(config.review_bot_auto_trigger);
+    assert!(!config.review_bot_auto_trigger);
     assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
     assert_eq!(config.silence_rounds_threshold, 3);
     assert_eq!(config.silence_min_minutes_after_commit, 30);
@@ -93,10 +93,10 @@ fn agent_review_config_deserializes_with_defaults() {
     "#;
     let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
     assert!(config.enabled);
-    assert!(config.reviewer_agent.is_empty());
+    assert_eq!(config.reviewer_agent, "codex");
     assert_eq!(config.max_rounds, 3);
     assert_eq!(config.review_bot_command, "/gemini review");
-    assert!(config.review_bot_auto_trigger);
+    assert!(!config.review_bot_auto_trigger);
     assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
     assert_eq!(config.silence_rounds_threshold, 3);
     assert_eq!(config.silence_min_minutes_after_commit, 30);
@@ -119,6 +119,27 @@ fn agent_review_config_deserializes_bot_settings() {
     assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
     assert_eq!(config.silence_rounds_threshold, 4);
     assert_eq!(config.silence_min_minutes_after_commit, 45);
+}
+
+#[test]
+fn agent_review_config_disabled_local_review_defaults_to_hosted_review() {
+    let toml_str = r#"
+        enabled = false
+    "#;
+    let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
+    assert!(!config.enabled);
+    assert!(config.review_bot_auto_trigger);
+}
+
+#[test]
+fn agent_review_config_disabled_local_review_respects_explicit_hosted_disable() {
+    let toml_str = r#"
+        enabled = false
+        review_bot_auto_trigger = false
+    "#;
+    let config: AgentReviewConfig = toml::from_str(toml_str).unwrap();
+    assert!(!config.enabled);
+    assert!(!config.review_bot_auto_trigger);
 }
 
 #[test]
@@ -426,7 +447,8 @@ fn harness_config_default_roundtrip() {
     assert_eq!(config.agents.default_agent, "auto");
     assert!(config.agents.complexity_preferred_agents.is_empty());
     assert_eq!(config.server.transport, Transport::Http);
-    assert!(!config.agents.review.enabled);
+    assert!(config.agents.review.enabled);
+    assert_eq!(config.agents.review.reviewer_agent, "codex");
     assert_eq!(config.otel.exporter, OtelExporter::Disabled);
     assert_eq!(config.gc.max_drafts_per_run, 5);
     assert!(!config.review.enabled);
@@ -833,6 +855,7 @@ fn otel_exporter_grpc_variant_deserializes() {
 fn agent_review_config_review_bot_command_default() {
     let config = AgentReviewConfig::default();
     assert_eq!(config.review_bot_command, "/gemini review");
+    assert!(!config.review_bot_auto_trigger);
     assert_eq!(config.fallback_chain, vec!["gemini", "codex"]);
 }
 
