@@ -1832,17 +1832,22 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["transition_contract"]
             ["on_succeeded"]["reducer_next_state"],
-        "unchanged_until_pr_detected"
+        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
             ["must_include"][2],
-        "PR URL or blocker"
+        "PR URL, closed issue evidence, or blocker"
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
             ["artifacts"]["pull_request"]["fields"][1],
         "pr_url"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
+            ["signals"]["IssueClosed"],
+        "Use when the GitHub issue is confirmed closed and no implementation PR is needed. Include state=closed or state=resolved plus issue_number or issue_url."
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["optional_artifacts"]

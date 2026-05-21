@@ -93,9 +93,14 @@ impl<'a> RuntimeWorker<'a> {
                 serde_json::to_value(&result)?,
             )
             .await?;
-        let Some(completed) = self
+        let Some(completion) = self
             .store
-            .complete_runtime_job_if_owned(&job.id, &self.owner, lease_expires_at, &result)
+            .commit_runtime_activity_completion_if_owned(
+                &job.id,
+                &self.owner,
+                lease_expires_at,
+                &result,
+            )
             .await?
         else {
             tracing::warn!(
@@ -105,65 +110,11 @@ impl<'a> RuntimeWorker<'a> {
             );
             return Ok(None);
         };
-        self.record_workflow_completion(&completed, &result).await?;
-        Ok(Some(completed))
-    }
-
-    async fn record_workflow_completion(
-        &self,
-        job: &RuntimeJob,
-        result: &ActivityResult,
-    ) -> anyhow::Result<()> {
-        let Some(command) = self.store.get_command(&job.command_id).await? else {
-            return Ok(());
-        };
-        self.store
-            .mark_command_status(&command.id, command_status_for_activity(result.status))
-            .await?;
-        let active_start_child_workflow_commands =
-            if command.command.command_type == WorkflowCommandType::StartChildWorkflow {
-                self.active_start_child_workflow_commands(&command.workflow_id)
-                    .await?
-            } else {
-                0
-            };
-        let event = self
-            .store
-            .append_event(
-                &command.workflow_id,
-                "RuntimeJobCompleted",
-                &self.owner,
-                json!({
-                    "command_id": command.id,
-                    "command": command.command,
-                    "runtime_job_id": job.id,
-                    "runtime_job_status": job.status,
-                    "active_start_child_workflow_commands": active_start_child_workflow_commands,
-                    "activity_result": result,
-                }),
-            )
-            .await?;
-        self.apply_runtime_completion_reducer(&command.workflow_id, &event)
-            .await?;
-        self.propagate_pr_feedback_child_completion(&command.workflow_id, &event)
-            .await?;
-        Ok(())
-    }
-
-    async fn active_start_child_workflow_commands(
-        &self,
-        workflow_id: &str,
-    ) -> anyhow::Result<usize> {
-        Ok(self
-            .store
-            .commands_for(workflow_id)
-            .await?
-            .into_iter()
-            .filter(|record| {
-                record.command.command_type == WorkflowCommandType::StartChildWorkflow
-                    && matches!(record.status.as_str(), "pending" | "dispatched")
-            })
-            .count())
+        if let Some(event) = completion.workflow_event.as_ref() {
+            self.propagate_pr_feedback_child_completion(&event.workflow_id, event)
+                .await?;
+        }
+        Ok(Some(completion.runtime_job))
     }
 
     async fn propagate_pr_feedback_child_completion(
@@ -360,15 +311,6 @@ fn apply_inline_command_side_effect(
     data.insert("pr_number".to_string(), json!(pr_number));
     data.insert("pr_url".to_string(), json!(pr_url));
     Ok(())
-}
-
-fn command_status_for_activity(status: ActivityStatus) -> &'static str {
-    match status {
-        ActivityStatus::Succeeded => "completed",
-        ActivityStatus::Failed => "failed",
-        ActivityStatus::Blocked => "blocked",
-        ActivityStatus::Cancelled => "cancelled",
-    }
 }
 
 fn runtime_profile_for_job(job: &RuntimeJob) -> anyhow::Result<Option<RuntimeProfile>> {

@@ -53,7 +53,8 @@ pub use quality_gate::{
     QUALITY_PASSED_SIGNAL,
 };
 pub use reducer::{
-    reduce_runtime_job_completed, GITHUB_ISSUE_PR_DEFINITION_ID, RUNTIME_JOB_COMPLETED_EVENT,
+    reduce_runtime_job_completed, GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL,
+    ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT, RUNTIME_JOB_COMPLETED_EVENT,
 };
 pub use repo_backlog::{
     build_merged_pr_decision, build_open_issue_without_workflow_decision,

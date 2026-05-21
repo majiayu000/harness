@@ -1,6 +1,7 @@
 use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
     ActivityArtifact, DecisionValidator, RuntimeJob, RuntimeProfile, WorkflowInstance,
+    ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT,
     PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
     PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
     QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
@@ -361,10 +362,13 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("github_issue_pr", "implement_issue") => json!({
             "on_succeeded": {
-                "reducer_next_state": "unchanged_until_pr_detected",
-                "required_summary": "Include changed files, validation commands, and the PR URL when one is created."
+                "reducer_next_state": "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked",
+                "accepted_signals": [ISSUE_CLOSED_SIGNAL, ISSUE_ALREADY_RESOLVED_SIGNAL],
+                "accepted_artifacts": ["pull_request", ISSUE_STATE_ARTIFACT],
+                "success_requires": "A succeeded implement_issue result MUST include either a pull_request artifact with pr_number/pr_url, or structured closed-issue evidence with explicit closed/resolved state plus issue_number or issue_url. Empty success is blocked.",
+                "required_summary": "Include changed files, validation commands, and the PR URL or closed issue evidence."
             },
-            "follow_up_event": "PrDetected binds PR metadata and advances the issue workflow."
+            "follow_up_event": "PrDetected can still bind PR metadata, but a runtime result should emit pull_request directly when a PR exists."
         }),
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
             "on_succeeded": {
@@ -419,13 +423,21 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
 fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
     match (workflow_definition, activity) {
         ("github_issue_pr", "implement_issue") => json!({
-            "must_include": ["changed files", "validation commands", "PR URL or blocker"],
+            "must_include": ["changed files", "validation commands", "PR URL, closed issue evidence, or blocker"],
             "must_not_include": ["workflow table mutations", "unverified merge claims"],
             "artifacts": {
                 "pull_request": {
                     "required_when": "A PR was created or reused by the activity.",
                     "fields": ["pr_number", "pr_url"]
+                },
+                "issue_state": {
+                    "required_when": "No PR exists because the issue is already closed or resolved.",
+                    "fields": ["issue_number", "state", "issue_url"]
                 }
+            },
+            "signals": {
+                "IssueClosed": "Use when the GitHub issue is confirmed closed and no implementation PR is needed. Include state=closed or state=resolved plus issue_number or issue_url.",
+                "IssueAlreadyResolved": "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
             }
         }),
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
@@ -551,6 +563,48 @@ mod tests {
     use harness_workflow::runtime::{
         RuntimeKind, WorkflowSubject, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
     };
+
+    #[test]
+    fn activity_result_schema_describes_issue_implementation_terminal_evidence_contract() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue"
+            }),
+        );
+        let workflow = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:123"),
+        )
+        .with_id("issue-123");
+
+        let schema = activity_result_schema(&job, Some(&workflow));
+
+        assert_eq!(
+            schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
+            "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
+        );
+        assert_eq!(
+            schema["activity_contract"]["accepted_signals"][0],
+            ISSUE_CLOSED_SIGNAL
+        );
+        assert_eq!(
+            schema["activity_contract"]["success_requires"],
+            "pull_request_artifact_or_closed_issue_signal"
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["artifacts"]["issue_state"]["fields"][1],
+            "state"
+        );
+        assert_eq!(
+            schema["agent_summary_contract"]["signals"]["IssueAlreadyResolved"],
+            "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
+        );
+    }
 
     #[test]
     fn activity_result_schema_describes_quality_gate_contract() {

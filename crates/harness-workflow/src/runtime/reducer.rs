@@ -17,6 +17,9 @@ use serde_json::{json, Value};
 
 pub const RUNTIME_JOB_COMPLETED_EVENT: &str = "RuntimeJobCompleted";
 pub const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
+pub const ISSUE_CLOSED_SIGNAL: &str = "IssueClosed";
+pub const ISSUE_ALREADY_RESOLVED_SIGNAL: &str = "IssueAlreadyResolved";
+pub const ISSUE_STATE_ARTIFACT: &str = "issue_state";
 
 pub fn reduce_runtime_job_completed(
     instance: &WorkflowInstance,
@@ -51,13 +54,17 @@ fn reduce_success(
     let structured_decision = workflow_decision_from_activity_result(instance, event, result);
     if let Some(decision) = structured_decision
         .as_ref()
-        .filter(|decision| structured_decision_validates(instance, event, decision))
+        .filter(|decision| structured_decision_validates(instance, event, result, decision))
         .cloned()
     {
         return Some(decision);
     }
 
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+
+    if let Some(decision) = issue_implementation_closed_decision(instance, event, result) {
         return Some(decision);
     }
 
@@ -104,6 +111,10 @@ fn reduce_success(
         return Some(invalid_agent_output_blocked_decision(
             instance, event, result, &reason,
         ));
+    }
+
+    if let Some(decision) = issue_implementation_missing_result_decision(instance, event, result) {
+        return Some(decision);
     }
 
     let (next_state, decision, reason) = match (
@@ -182,6 +193,100 @@ fn reduce_success(
     }
 
     Some(workflow_decision.high_confidence())
+}
+
+fn issue_implementation_missing_result_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "implementing",
+        "implement_issue",
+    ) {
+        return None;
+    }
+
+    let reason = "implement_issue succeeded without a pull_request artifact, closed-issue evidence, or another validated terminal signal";
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "block_missing_implementation_result",
+            "blocked",
+            reason,
+        )
+        .with_command(WorkflowCommand::mark_blocked(
+            reason,
+            format!(
+                "runtime-completion:{}:missing-implementation:block",
+                event.id
+            ),
+        ))
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::RequestOperatorAttention,
+            format!(
+                "runtime-completion:{}:missing-implementation:operator",
+                event.id
+            ),
+            json!({
+                "reason": reason,
+                "activity": result.activity,
+                "runtime_job_id": event_field_string(event, "runtime_job_id"),
+            }),
+        ))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
+}
+
+fn issue_implementation_closed_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "implementing",
+        "implement_issue",
+    ) {
+        return None;
+    }
+
+    let closed_issue = closed_issue_evidence_from_activity_result(result)?;
+    let reason =
+        "implement_issue reported structured evidence that the GitHub issue is already closed";
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "finish_closed_issue",
+            "done",
+            reason,
+        )
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::MarkDone,
+            format!("runtime-completion:{}:closed-issue:done", event.id),
+            json!({
+                "reason": reason,
+                "activity": result.activity,
+                "runtime_job_id": event_field_string(event, "runtime_job_id"),
+                "closed_issue_evidence": closed_issue.payload,
+            }),
+        ))
+        .with_evidence(WorkflowEvidence::new("closed_issue", closed_issue.summary))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
 }
 
 fn workflow_decision_from_activity_result(
@@ -665,8 +770,18 @@ fn append_missing_u64s(target: &mut Vec<u64>, values: Vec<u64>) {
 fn structured_decision_validates(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
+    result: &ActivityResult,
     decision: &WorkflowDecision,
 ) -> bool {
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "implementing"
+        && result.activity == "implement_issue"
+        && decision.next_state == "done"
+        && closed_issue_evidence_from_activity_result(result).is_none()
+    {
+        return false;
+    }
+
     let validator = match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
         QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
@@ -940,6 +1055,97 @@ fn pull_request_artifact(result: &ActivityResult) -> Option<(u64, String)> {
                 .to_string();
             Some((pr_number, pr_url))
         })
+}
+
+#[derive(Debug, Clone)]
+struct ClosedIssueEvidence {
+    summary: String,
+    payload: Value,
+}
+
+fn closed_issue_evidence_from_activity_result(
+    result: &ActivityResult,
+) -> Option<ClosedIssueEvidence> {
+    result
+        .signals
+        .iter()
+        .find_map(|signal| match signal.signal_type.as_str() {
+            ISSUE_CLOSED_SIGNAL | ISSUE_ALREADY_RESOLVED_SIGNAL => {
+                closed_issue_evidence_from_value(&signal.signal, &signal.signal_type)
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            result
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.artifact_type == ISSUE_STATE_ARTIFACT)
+                .find_map(|artifact| {
+                    if issue_state_is_closed(&artifact.artifact) {
+                        closed_issue_evidence_from_value(&artifact.artifact, ISSUE_STATE_ARTIFACT)
+                    } else {
+                        None
+                    }
+                })
+        })
+}
+
+fn closed_issue_evidence_from_value(value: &Value, source: &str) -> Option<ClosedIssueEvidence> {
+    let issue_number = value.get("issue_number").and_then(Value::as_u64);
+    let issue_url = value
+        .get("issue_url")
+        .or_else(|| value.get("html_url"))
+        .or_else(|| value.get("url"))
+        .and_then(non_empty_json_string);
+    let state = value.get("state").and_then(non_empty_json_string);
+    let closed = issue_state_is_closed(value);
+
+    if !closed || (issue_number.is_none() && issue_url.is_none()) {
+        return None;
+    }
+
+    let mut facts = vec![format!("source={source}")];
+    if let Some(issue_number) = issue_number {
+        facts.push(format!("issue_number={issue_number}"));
+    }
+    if let Some(issue_url) = issue_url.clone() {
+        facts.push(format!("issue_url={issue_url}"));
+    }
+    if let Some(state) = state.clone() {
+        facts.push(format!("state={state}"));
+    }
+    if closed {
+        facts.push("closed=true".to_string());
+    }
+
+    Some(ClosedIssueEvidence {
+        summary: facts.join(" "),
+        payload: json!({
+            "source": source,
+            "issue_number": issue_number,
+            "issue_url": issue_url,
+            "state": state,
+            "closed": closed,
+        }),
+    })
+}
+
+fn issue_state_is_closed(value: &Value) -> bool {
+    value
+        .get("closed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| {
+                state.trim().eq_ignore_ascii_case("closed")
+                    || state.trim().eq_ignore_ascii_case("resolved")
+            })
+        || value
+            .get("is_closed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 fn pr_feedback_sweep_decision_from_activity_result(
