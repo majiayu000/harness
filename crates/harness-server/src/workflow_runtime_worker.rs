@@ -70,7 +70,7 @@ pub(crate) async fn run_runtime_job_worker_tick(
         });
     };
     let worker = RuntimeWorker::new(store.as_ref(), owner).with_lease_ttl(lease_ttl);
-    let executor = ServerRuntimeJobExecutor::new(state.clone());
+    let executor = ServerRuntimeJobExecutor::new(state);
     let completed = worker.run_once(&executor).await?;
     if let Some(job) = completed.as_ref() {
         if let Err(error) = notify_runtime_submission_terminal(state, job).await {

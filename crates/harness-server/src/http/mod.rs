@@ -294,6 +294,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     let serve_result = serve_future.await;
     tracing::info!("server shutting down");
+    ws_shutdown_tx.send(()).ok();
     state.observability.events.shutdown().await;
     force_watcher.abort();
     serve_result?;

@@ -1362,7 +1362,6 @@ impl WorkflowRuntimeStore {
         .bind(runtime_job_id)
         .execute(&mut *tx)
         .await?;
-
         let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, data::text, created_at, updated_at
@@ -1534,6 +1533,50 @@ impl WorkflowRuntimeStore {
             workflow_event: Some(event),
             decision: decision_record,
         }))
+    }
+
+    pub async fn extend_runtime_job_lease_if_owned(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        current_lease_expires_at: DateTime<Utc>,
+        next_lease_expires_at: DateTime<Utc>,
+    ) -> anyhow::Result<Option<RuntimeJob>> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(runtime_job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            anyhow::bail!("runtime job not found: {runtime_job_id}");
+        };
+        let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let is_current_lease = job.status == RuntimeJobStatus::Running
+            && job.lease.as_ref().is_some_and(|lease| {
+                lease.owner == owner && lease.expires_at == current_lease_expires_at
+            });
+        if !is_current_lease {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        job.claim(owner, next_lease_expires_at);
+        let updated = to_jsonb_string(&job)?;
+        let status = enum_str(&job.status)?;
+        sqlx::query(
+            "UPDATE runtime_jobs
+             SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4",
+        )
+        .bind(&status)
+        .bind(job.not_before)
+        .bind(&updated)
+        .bind(runtime_job_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(job))
     }
 
     pub async fn get_runtime_job(

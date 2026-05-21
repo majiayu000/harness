@@ -30,7 +30,7 @@ use harness_core::db::resolve_database_url;
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 fn issue_instance(state: &str) -> WorkflowInstance {
@@ -2958,6 +2958,31 @@ impl RuntimeJobExecutor for CountingRuntimeExecutor {
     }
 }
 
+struct BlockingRuntimeExecutor {
+    result: ActivityResult,
+    calls: Arc<AtomicUsize>,
+    started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    finish: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl RuntimeJobExecutor for BlockingRuntimeExecutor {
+    async fn execute(&self, _job: RuntimeJob) -> ActivityResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(started) = self.started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let finish = self
+            .finish
+            .lock()
+            .unwrap()
+            .take()
+            .expect("blocking executor should only run once");
+        let _ = finish.await;
+        self.result.clone()
+    }
+}
+
 #[test]
 fn accepts_replan_decision_from_plan_issue() {
     let instance = leased_issue_instance("implementing");
@@ -3645,6 +3670,64 @@ async fn runtime_store_does_not_reclaim_unexpired_running_job() -> anyhow::Resul
         .claim_next_runtime_job("runtime-2", Utc::now() + Duration::minutes(10))
         .await?
         .is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_renews_running_job_lease_until_completion() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store =
+        Arc::new(WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?);
+    let job = store
+        .enqueue_runtime_job(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "check" }),
+        )
+        .await?;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let blocking_calls = Arc::new(AtomicUsize::new(0));
+    let blocking_executor = BlockingRuntimeExecutor {
+        result: ActivityResult::succeeded("check", "Validation passed."),
+        calls: blocking_calls.clone(),
+        started: Mutex::new(Some(started_tx)),
+        finish: Mutex::new(Some(finish_rx)),
+    };
+    let worker_store = store.clone();
+    let worker_handle = tokio::spawn(async move {
+        let worker = RuntimeWorker::new(worker_store.as_ref(), "runtime-1")
+            .with_lease_ttl(Duration::seconds(2));
+        worker.run_once(&blocking_executor).await
+    });
+
+    started_rx.await?;
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let second_executor = CountingRuntimeExecutor {
+        result: ActivityResult::succeeded("check", "Second worker should not run."),
+        calls: second_calls.clone(),
+    };
+    let second_worker =
+        RuntimeWorker::new(store.as_ref(), "runtime-2").with_lease_ttl(Duration::seconds(2));
+    let second_claim = second_worker.run_once(&second_executor).await?;
+    let _ = finish_tx.send(());
+    let completed = worker_handle
+        .await??
+        .expect("first worker should complete the runtime job");
+
+    assert!(second_claim.is_none());
+    assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(blocking_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(completed.id, job.id);
+    assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
+    assert!(completed.lease.is_none());
     Ok(())
 }
 
