@@ -1140,9 +1140,15 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await?;
     assert_eq!(body["total_workflows"], 2);
+    assert_eq!(body["pagination"]["limit"], 100);
+    assert_eq!(body["pagination"]["offset"], 0);
+    assert_eq!(body["pagination"]["returned"], 2);
+    assert_eq!(body["summary"]["total_commands"], 1);
+    assert_eq!(body["summary"]["total_runtime_jobs"], 1);
     assert_eq!(body["workflows"][0]["workflow"]["id"], "repo-backlog");
     let child_node = &body["workflows"][0]["children"][0];
     assert_eq!(child_node["workflow"]["id"], "issue-123");
+    assert_eq!(child_node["runtime_job_count"], 1);
     assert_eq!(
         child_node["decisions"][0]["rejection_reason"],
         "replan limit exhausted"
@@ -1184,6 +1190,150 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
         child_node["commands"][0]["runtime_jobs"][0]["activity_result_envelope"]["final_result"]
             ["status"],
         "succeeded"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_paginated(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    for (id, project_id, issue_number) in [
+        ("issue-101", "/project-a", 101),
+        ("issue-102", "/project-a", 102),
+        ("issue-201", "/project-b", 201),
+    ] {
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "replanning",
+            harness_workflow::runtime::WorkflowSubject::new(
+                "issue",
+                format!("issue:{issue_number}"),
+            ),
+        )
+        .with_id(id)
+        .with_data(serde_json::json!({
+            "project_id": project_id,
+            "repo": "owner/repo",
+            "issue_number": issue_number,
+        }));
+        store.upsert_instance(&workflow).await?;
+        let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            "replan_issue",
+            format!("replan-{issue_number}"),
+        );
+        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+        store
+            .enqueue_runtime_job(
+                &command_id,
+                harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+                "codex-high",
+                serde_json::json!({ "workflow_id": workflow.id }),
+            )
+            .await?;
+    }
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a&limit=1")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["total_workflows"], 2);
+    assert_eq!(body["pagination"]["returned"], 1);
+    assert_eq!(body["pagination"]["total"], 2);
+    assert_eq!(body["pagination"]["has_more"], true);
+    assert_eq!(
+        body["workflows"]
+            .as_array()
+            .expect("workflows should be an array")
+            .len(),
+        1
+    );
+    assert_eq!(body["summary"]["total_commands"], 2);
+    assert_eq!(body["summary"]["total_runtime_jobs"], 2);
+    assert_eq!(body["summary"]["command_statuses"]["pending"], 2);
+    assert_eq!(body["summary"]["runtime_job_statuses"]["pending"], 2);
+    assert_eq!(body["summary"]["jobs_without_activity_envelope"], 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_tree_endpoint_limits_runtime_jobs_per_command() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "replanning",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:456"),
+    )
+    .with_id("issue-456")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 456,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-456");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    for index in 0..7 {
+        store
+            .enqueue_runtime_job(
+                &command_id,
+                harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+                "codex-high",
+                serde_json::json!({ "index": index }),
+            )
+            .await?;
+    }
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a&job_limit=2")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    let node = &body["workflows"][0];
+    let command_node = &node["commands"][0];
+    assert_eq!(body["summary"]["total_commands"], 1);
+    assert_eq!(body["summary"]["total_runtime_jobs"], 7);
+    assert_eq!(body["pagination"]["job_limit"], 2);
+    assert_eq!(node["runtime_job_count"], 7);
+    assert_eq!(command_node["runtime_job_count"], 7);
+    assert_eq!(
+        command_node["runtime_jobs"]
+            .as_array()
+            .expect("runtime_jobs should be an array")
+            .len(),
+        2
     );
     Ok(())
 }

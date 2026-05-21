@@ -126,11 +126,16 @@ function latestRuntimeJob(command: WorkflowRuntimeCommandNode): WorkflowRuntimeJ
 
 function runtimeJobLabel(command: WorkflowRuntimeCommandNode): string {
   const job = latestRuntimeJob(command);
-  if (!job) return `${command.runtime_jobs.length} jobs`;
+  const totalJobs = command.runtime_job_count ?? command.runtime_jobs.length;
+  const jobCountLabel =
+    totalJobs === command.runtime_jobs.length
+      ? `${totalJobs} jobs`
+      : `${command.runtime_jobs.length}/${totalJobs} jobs`;
+  if (!job) return jobCountLabel;
   const notBefore = job.not_before ? ` - not before ${job.not_before}` : "";
   const latestEvent = job.latest_runtime_event_type ? ` - event ${job.latest_runtime_event_type}` : "";
   const promptDigest = job.prompt_packet_digest ? ` - prompt ${job.prompt_packet_digest.slice(0, 12)}` : "";
-  return `${command.runtime_jobs.length} jobs - ${job.status}${notBefore}${latestEvent}${promptDigest}`;
+  return `${jobCountLabel} - ${job.status}${notBefore}${latestEvent}${promptDigest}`;
 }
 
 function runtimeMergeWorkflowId(workflow?: WorkflowSummary | null): string | null {
@@ -164,6 +169,23 @@ function workflowRuntimeCounts(nodes: WorkflowRuntimeTreeNode[]) {
   };
   for (const node of nodes) visit(node);
   return { workflows, commands, jobs, rejected };
+}
+
+function workflowRuntimePanelCounts(payload?: WorkflowRuntimeTreePayload) {
+  const counts = workflowRuntimeCounts(payload?.workflows ?? []);
+  return {
+    ...counts,
+    workflows: payload?.total_workflows ?? counts.workflows,
+    commands: payload?.summary?.total_commands ?? counts.commands,
+    jobs: payload?.summary?.total_runtime_jobs ?? counts.jobs,
+  };
+}
+
+function workflowRuntimeWorkflowLabel(payload: WorkflowRuntimeTreePayload | undefined, fallback: number) {
+  if (payload?.pagination) {
+    return `${payload.pagination.returned}/${payload.pagination.total}`;
+  }
+  return `${payload?.total_workflows ?? fallback}`;
 }
 
 function WorkflowRuntimeNode({
@@ -273,7 +295,7 @@ function WorkflowRuntimePanel({
   cancellingWorkflowIds?: Set<string>;
 }) {
   const workflows = payload?.workflows ?? [];
-  const counts = workflowRuntimeCounts(workflows);
+  const counts = workflowRuntimePanelCounts(payload);
   const empty = workflows.length === 0;
   return (
     <section className="border border-line bg-bg-1">
@@ -283,7 +305,7 @@ function WorkflowRuntimePanel({
             Workflow Runtime
           </div>
           <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] text-ink-3">
-            <span>{payload?.total_workflows ?? counts.workflows} workflows</span>
+            <span>{workflowRuntimeWorkflowLabel(payload, counts.workflows)} workflows</span>
             <span>{counts.commands} commands</span>
             <span>{counts.jobs} jobs</span>
             <span>{counts.rejected} rejected</span>

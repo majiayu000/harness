@@ -260,6 +260,21 @@ describe("<Active>", () => {
     mockUseWorkflowRuntimeTree.mockReturnValue({
       data: {
         total_workflows: 2,
+        pagination: {
+          limit: 100,
+          offset: 0,
+          returned: 2,
+          total: 2,
+          has_more: false,
+          next_offset: null,
+          job_limit: 5,
+        },
+        summary: {
+          total_commands: 1,
+          total_runtime_jobs: 7,
+          command_statuses: { pending: 1 },
+          runtime_job_statuses: { failed: 3, running: 4 },
+        },
         workflows: [
           {
             workflow: {
@@ -327,6 +342,7 @@ describe("<Active>", () => {
                       dedupe_key: "issue-123-replan-2",
                       command: { activity: "replan_issue" },
                     },
+                    runtime_job_count: 7,
                     runtime_jobs: [
                       {
                         id: "job-1",
@@ -376,12 +392,14 @@ describe("<Active>", () => {
     wrap(<Active projectFilter="harness" />);
 
     expect(screen.getByText("Workflow Runtime")).toBeInTheDocument();
+    expect(screen.getByText("2/2 workflows")).toBeInTheDocument();
     expect(screen.getByText("repo_backlog - owner/repo")).toBeInTheDocument();
     expect(screen.getByText("github_issue_pr - issue:123")).toBeInTheDocument();
     expect(screen.getByText("activity: replan_issue")).toBeInTheDocument();
+    expect(screen.getByText("7 jobs")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "2 jobs - running - event ActivityStarted - prompt abcdef012345",
+        "2/7 jobs - running - event ActivityStarted - prompt abcdef012345",
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("rejected: replan limit exhausted")).toBeInTheDocument();

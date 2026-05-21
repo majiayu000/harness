@@ -231,33 +231,50 @@ fn summarize_runtime_tree(tree: &Value) -> RuntimeTreeSummary {
         workflows: tree["total_workflows"].as_u64().unwrap_or(0) as usize,
         ..Default::default()
     };
+    let has_server_summary = tree["summary"].is_object();
+    if has_server_summary {
+        summary.commands = tree["summary"]["total_commands"].as_u64().unwrap_or(0) as usize;
+        summary.jobs = tree["summary"]["total_runtime_jobs"].as_u64().unwrap_or(0) as usize;
+        summary.command_statuses = count_map_from_value(&tree["summary"]["command_statuses"]);
+        summary.job_statuses = count_map_from_value(&tree["summary"]["runtime_job_statuses"]);
+        summary.activity_outcomes = count_map_from_value(&tree["summary"]["activity_outcomes"]);
+        summary.jobs_without_activity_envelope = tree["summary"]["jobs_without_activity_envelope"]
+            .as_u64()
+            .unwrap_or(0) as usize;
+    }
     if let Some(workflows) = tree["workflows"].as_array() {
         for workflow in workflows {
-            summarize_workflow_node(workflow, &mut summary);
+            summarize_workflow_node(workflow, &mut summary, !has_server_summary);
         }
     }
     summary
 }
 
-fn summarize_workflow_node(node: &Value, summary: &mut RuntimeTreeSummary) {
+fn summarize_workflow_node(node: &Value, summary: &mut RuntimeTreeSummary, include_counts: bool) {
     if let Some(commands) = node["commands"].as_array() {
         for command in commands {
-            summary.commands += 1;
-            increment(
-                &mut summary.command_statuses,
-                command["status"].as_str().unwrap_or("unknown"),
-            );
+            if include_counts {
+                summary.commands += 1;
+                increment(
+                    &mut summary.command_statuses,
+                    command["status"].as_str().unwrap_or("unknown"),
+                );
+            }
             if let Some(jobs) = command["runtime_jobs"].as_array() {
                 for job in jobs {
-                    summary.jobs += 1;
-                    increment(
-                        &mut summary.job_statuses,
-                        job["status"].as_str().unwrap_or("unknown"),
-                    );
-                    if let Some(outcome) = job["activity_result_envelope"]["outcome"].as_str() {
-                        increment(&mut summary.activity_outcomes, outcome);
-                    } else {
-                        summary.jobs_without_activity_envelope += 1;
+                    if include_counts {
+                        summary.jobs += 1;
+                        increment(
+                            &mut summary.job_statuses,
+                            job["status"].as_str().unwrap_or("unknown"),
+                        );
+                    }
+                    if include_counts {
+                        if let Some(outcome) = job["activity_result_envelope"]["outcome"].as_str() {
+                            increment(&mut summary.activity_outcomes, outcome);
+                        } else {
+                            summary.jobs_without_activity_envelope += 1;
+                        }
                     }
                 }
             }
@@ -265,13 +282,27 @@ fn summarize_workflow_node(node: &Value, summary: &mut RuntimeTreeSummary) {
     }
     if let Some(children) = node["children"].as_array() {
         for child in children {
-            summarize_workflow_node(child, summary);
+            summarize_workflow_node(child, summary, include_counts);
         }
     }
 }
 
 fn increment(map: &mut BTreeMap<String, usize>, key: &str) {
     *map.entry(key.to_string()).or_insert(0) += 1;
+}
+
+fn count_map_from_value(value: &Value) -> BTreeMap<String, usize> {
+    value
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_u64().map(|count| (key.clone(), count as usize))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn number_or_zero(value: &Value) -> u64 {
@@ -368,5 +399,54 @@ mod tests {
         assert_eq!(summary.job_statuses["pending"], 1);
         assert_eq!(summary.activity_outcomes["accepted"], 1);
         assert_eq!(summary.jobs_without_activity_envelope, 1);
+    }
+
+    #[test]
+    fn summarize_runtime_tree_prefers_server_totals_when_present() {
+        let tree = json!({
+            "total_workflows": 2,
+            "summary": {
+                "total_commands": 7,
+                "total_runtime_jobs": 42,
+                "command_statuses": {
+                    "completed": 5,
+                    "pending": 2
+                },
+                "runtime_job_statuses": {
+                    "failed": 4,
+                    "succeeded": 38
+                },
+                "activity_outcomes": {
+                    "accepted": 36,
+                    "repaired_structured_output": 2
+                },
+                "jobs_without_activity_envelope": 4
+            },
+            "workflows": [{
+                "commands": [{
+                    "status": "completed",
+                    "runtime_jobs": [{
+                        "status": "succeeded",
+                        "activity_result_envelope": {
+                            "outcome": "accepted"
+                        }
+                    }]
+                }],
+                "children": []
+            }]
+        });
+
+        let summary = summarize_runtime_tree(&tree);
+
+        assert_eq!(summary.workflows, 2);
+        assert_eq!(summary.commands, 7);
+        assert_eq!(summary.jobs, 42);
+        assert_eq!(summary.command_statuses["completed"], 5);
+        assert_eq!(summary.command_statuses["pending"], 2);
+        assert_eq!(summary.job_statuses["failed"], 4);
+        assert_eq!(summary.job_statuses["succeeded"], 38);
+        assert_eq!(summary.activity_outcomes["accepted"], 36);
+        assert_eq!(summary.activity_outcomes["repaired_structured_output"], 2);
+        assert_eq!(summary.jobs_without_activity_envelope, 4);
     }
 }

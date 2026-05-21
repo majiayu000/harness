@@ -20,6 +20,10 @@ use harness_workflow::runtime::{
 
 const ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE: &str = "activity_result_envelope";
 const ACTIVITY_RESULT_ENVELOPE_SCHEMA: &str = "harness.runtime.activity_result_envelope.v1";
+const WORKFLOW_RUNTIME_TREE_DEFAULT_LIMIT: i64 = 100;
+const WORKFLOW_RUNTIME_TREE_MAX_LIMIT: i64 = 500;
+const WORKFLOW_RUNTIME_TREE_DEFAULT_JOB_LIMIT: i64 = 5;
+const WORKFLOW_RUNTIME_TREE_MAX_JOB_LIMIT: i64 = 50;
 
 fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
     let error = error?;
@@ -133,6 +137,8 @@ pub(crate) struct ProjectWorkflowByProjectQuery {
 pub(crate) struct WorkflowRuntimeTreeQuery {
     pub project_id: Option<String>,
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub job_limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -142,19 +148,25 @@ struct WorkflowRuntimeCommandNode {
     pub decision_id: Option<String>,
     pub status: String,
     pub command: WorkflowCommand,
+    pub runtime_job_count: usize,
     pub runtime_jobs: Vec<WorkflowRuntimeJobNode>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl WorkflowRuntimeCommandNode {
-    fn new(record: WorkflowCommandRecord, runtime_jobs: Vec<WorkflowRuntimeJobNode>) -> Self {
+    fn new(
+        record: WorkflowCommandRecord,
+        runtime_job_count: usize,
+        runtime_jobs: Vec<WorkflowRuntimeJobNode>,
+    ) -> Self {
         Self {
             id: record.id,
             workflow_id: record.workflow_id,
             decision_id: record.decision_id,
             status: record.status,
             command: record.command,
+            runtime_job_count,
             runtime_jobs,
             created_at: record.created_at,
             updated_at: record.updated_at,
@@ -190,6 +202,7 @@ impl WorkflowRuntimeJobNode {
 #[derive(Debug, Clone, serde::Serialize)]
 struct WorkflowRuntimeTreeNode {
     pub workflow: WorkflowInstance,
+    pub runtime_job_count: usize,
     pub events: Vec<WorkflowEvent>,
     pub decisions: Vec<WorkflowDecisionRecord>,
     pub commands: Vec<WorkflowRuntimeCommandNode>,
@@ -200,6 +213,48 @@ struct WorkflowRuntimeTreeNode {
 struct WorkflowRuntimeTreeResponse {
     pub workflows: Vec<WorkflowRuntimeTreeNode>,
     pub total_workflows: usize,
+    pub pagination: WorkflowRuntimeTreePagination,
+    pub summary: WorkflowRuntimeTreeSummary,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct WorkflowRuntimeTreePagination {
+    pub limit: usize,
+    pub offset: usize,
+    pub returned: usize,
+    pub total: usize,
+    pub has_more: bool,
+    pub next_offset: Option<usize>,
+    pub job_limit: usize,
+}
+
+impl WorkflowRuntimeTreePagination {
+    fn new(limit: i64, offset: i64, returned: usize, total: i64, job_limit: usize) -> Self {
+        let limit = limit.max(1) as usize;
+        let offset = offset.max(0) as usize;
+        let total = total.max(0) as usize;
+        let next_offset = offset.saturating_add(returned);
+        let has_more = next_offset < total;
+        Self {
+            limit,
+            offset,
+            returned,
+            total,
+            has_more,
+            next_offset: has_more.then_some(next_offset),
+            job_limit,
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct WorkflowRuntimeTreeSummary {
+    pub total_commands: usize,
+    pub total_runtime_jobs: usize,
+    pub command_statuses: BTreeMap<String, usize>,
+    pub runtime_job_statuses: BTreeMap<String, usize>,
+    pub activity_outcomes: BTreeMap<String, usize>,
+    pub jobs_without_activity_envelope: usize,
 }
 
 pub(crate) async fn get_issue_workflow_by_issue(
@@ -300,12 +355,27 @@ pub(crate) async fn get_workflow_runtime_tree(
         )
             .into_response();
     };
-    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let limit = query
+        .limit
+        .unwrap_or(WORKFLOW_RUNTIME_TREE_DEFAULT_LIMIT)
+        .clamp(1, WORKFLOW_RUNTIME_TREE_MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let job_limit = query
+        .job_limit
+        .unwrap_or(WORKFLOW_RUNTIME_TREE_DEFAULT_JOB_LIMIT)
+        .clamp(0, WORKFLOW_RUNTIME_TREE_MAX_JOB_LIMIT);
     match store
-        .list_instances(query.project_id.as_deref(), limit)
+        .list_instances_page(query.project_id.as_deref(), limit, offset)
         .await
     {
-        Ok(instances) => match build_workflow_runtime_tree(store, instances).await {
+        Ok(page) => match build_workflow_runtime_tree(
+            store,
+            page,
+            query.project_id.as_deref(),
+            job_limit as usize,
+        )
+        .await
+        {
             Ok(response) => (StatusCode::OK, Json(response)).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -323,8 +393,11 @@ pub(crate) async fn get_workflow_runtime_tree(
 
 async fn build_workflow_runtime_tree(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
-    instances: Vec<WorkflowInstance>,
+    page: harness_workflow::runtime::store::WorkflowInstancePage,
+    project_id: Option<&str>,
+    job_limit: usize,
 ) -> anyhow::Result<WorkflowRuntimeTreeResponse> {
+    let instances = page.instances;
     let workflow_ids: Vec<String> = instances
         .iter()
         .map(|instance| instance.id.clone())
@@ -336,7 +409,10 @@ async fn build_workflow_runtime_tree(
         .values()
         .flat_map(|commands| commands.iter().map(|command| command.id.clone()))
         .collect();
-    let mut runtime_jobs_by_command = store.runtime_jobs_for_commands(&command_ids).await?;
+    let runtime_job_counts_by_command = store.runtime_job_counts_for_commands(&command_ids).await?;
+    let mut runtime_jobs_by_command = store
+        .runtime_jobs_for_commands_limited(&command_ids, job_limit as i64)
+        .await?;
     let runtime_job_ids: Vec<String> = runtime_jobs_by_command
         .values()
         .flat_map(|jobs| jobs.iter().map(|job| job.id.clone()))
@@ -345,6 +421,21 @@ async fn build_workflow_runtime_tree(
 
     let mut by_id = BTreeMap::new();
     let mut children_by_parent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let aggregate_summary = store
+        .runtime_summary_counts_for_instances(
+            project_id,
+            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
+            ACTIVITY_RESULT_ENVELOPE_SCHEMA,
+        )
+        .await?;
+    let summary = WorkflowRuntimeTreeSummary {
+        total_commands: aggregate_summary.total_commands,
+        total_runtime_jobs: aggregate_summary.total_runtime_jobs,
+        command_statuses: aggregate_summary.command_statuses,
+        runtime_job_statuses: aggregate_summary.runtime_job_statuses,
+        activity_outcomes: aggregate_summary.activity_outcomes,
+        jobs_without_activity_envelope: aggregate_summary.jobs_without_activity_envelope,
+    };
     for instance in instances {
         let workflow_id = instance.id.clone();
         if let Some(parent_id) = instance.parent_workflow_id.as_ref() {
@@ -357,11 +448,15 @@ async fn build_workflow_runtime_tree(
         let decisions = decisions_by_workflow
             .remove(&workflow_id)
             .unwrap_or_default();
-        let commands = commands_by_workflow
+        let commands: Vec<WorkflowRuntimeCommandNode> = commands_by_workflow
             .remove(&workflow_id)
             .unwrap_or_default()
             .into_iter()
             .map(|command| {
+                let runtime_job_count = runtime_job_counts_by_command
+                    .get(&command.id)
+                    .copied()
+                    .unwrap_or_default();
                 let runtime_jobs = runtime_jobs_by_command
                     .remove(&command.id)
                     .unwrap_or_default()
@@ -372,13 +467,18 @@ async fn build_workflow_runtime_tree(
                         WorkflowRuntimeJobNode::new(job, runtime_events)
                     })
                     .collect();
-                WorkflowRuntimeCommandNode::new(command, runtime_jobs)
+                WorkflowRuntimeCommandNode::new(command, runtime_job_count, runtime_jobs)
             })
             .collect();
+        let mut runtime_job_count = 0;
+        for command in &commands {
+            runtime_job_count += command.runtime_job_count;
+        }
         by_id.insert(
             workflow_id,
             WorkflowRuntimeTreeNode {
                 workflow: instance,
+                runtime_job_count,
                 events,
                 decisions,
                 commands,
@@ -413,9 +513,40 @@ async fn build_workflow_runtime_tree(
     }
 
     Ok(WorkflowRuntimeTreeResponse {
-        total_workflows: by_id.len(),
+        total_workflows: page.total.max(0) as usize,
+        pagination: WorkflowRuntimeTreePagination::new(
+            page.limit,
+            page.offset,
+            by_id.len(),
+            page.total,
+            job_limit,
+        ),
+        summary,
         workflows,
     })
+}
+
+#[cfg(test)]
+fn apply_runtime_activity_summary(
+    summary: &mut WorkflowRuntimeTreeSummary,
+    jobs_by_command: &BTreeMap<String, Vec<RuntimeJob>>,
+) {
+    for job in jobs_by_command.values().flatten() {
+        if let Some(outcome) = activity_result_envelope_from_job(job).and_then(|envelope| {
+            envelope
+                .get("outcome")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }) {
+            summary
+                .activity_outcomes
+                .entry(outcome)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+        } else {
+            summary.jobs_without_activity_envelope += 1;
+        }
+    }
 }
 
 fn prompt_packet_digest_from_events(events: &[RuntimeEvent]) -> Option<String> {
@@ -530,6 +661,45 @@ mod runtime_tree_tests {
             }),
         )]);
         assert!(activity_result_envelope_from_job(&job).is_none());
+    }
+
+    #[test]
+    fn runtime_activity_summary_counts_all_loaded_jobs() {
+        let accepted = ActivityArtifact::new(
+            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
+            json!({
+                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
+                "outcome": "accepted",
+            }),
+        );
+        let repaired = ActivityArtifact::new(
+            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
+            json!({
+                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
+                "outcome": "repaired_structured_output",
+            }),
+        );
+        let mut jobs_by_command = BTreeMap::new();
+        jobs_by_command.insert(
+            "command-1".to_string(),
+            vec![
+                runtime_job_with_artifacts(vec![accepted]),
+                runtime_job_with_artifacts(vec![repaired]),
+                RuntimeJob::pending(
+                    "command-1",
+                    RuntimeKind::CodexJsonrpc,
+                    "codex-high",
+                    json!({}),
+                ),
+            ],
+        );
+        let mut summary = WorkflowRuntimeTreeSummary::default();
+
+        apply_runtime_activity_summary(&mut summary, &jobs_by_command);
+
+        assert_eq!(summary.activity_outcomes["accepted"], 1);
+        assert_eq!(summary.activity_outcomes["repaired_structured_output"], 1);
+        assert_eq!(summary.jobs_without_activity_envelope, 1);
     }
 }
 

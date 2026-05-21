@@ -184,10 +184,33 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               )
               WHERE data->'data'->>'pr_number' IS NOT NULL",
     },
+    Migration {
+        version: 8,
+        description: "index runtime job command pagination",
+        sql: "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_command_created
+              ON runtime_jobs (command_id, created_at DESC, id DESC)",
+    },
 ];
 
 pub struct WorkflowRuntimeStore {
     pool: PgPool,
+}
+
+pub struct WorkflowInstancePage {
+    pub instances: Vec<WorkflowInstance>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkflowRuntimeSummaryCounts {
+    pub total_commands: usize,
+    pub total_runtime_jobs: usize,
+    pub command_statuses: BTreeMap<String, usize>,
+    pub runtime_job_statuses: BTreeMap<String, usize>,
+    pub activity_outcomes: BTreeMap<String, usize>,
+    pub jobs_without_activity_envelope: usize,
 }
 
 pub struct WorkflowDecisionTransition<'a> {
@@ -586,20 +609,47 @@ impl WorkflowRuntimeStore {
         project_id: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let page = self.list_instances_page(project_id, limit, 0).await?;
+        Ok(page.instances)
+    }
+
+    pub async fn list_instances_page(
+        &self,
+        project_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<WorkflowInstancePage> {
         let limit = limit.clamp(1, 500);
+        let offset = offset.max(0);
+        let (total,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)
+             FROM workflow_instances
+             WHERE ($1::text IS NULL OR data->'data'->>'project_id' = $1)",
+        )
+        .bind(project_id)
+        .fetch_one(&self.pool)
+        .await?;
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT data::text FROM workflow_instances
              WHERE ($1::text IS NULL OR data->'data'->>'project_id' = $1)
-             ORDER BY updated_at DESC
-             LIMIT $2",
+             ORDER BY updated_at DESC, id DESC
+             LIMIT $2 OFFSET $3",
         )
         .bind(project_id)
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
+        let instances = rows
+            .into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
-            .collect()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(WorkflowInstancePage {
+            instances,
+            total,
+            limit,
+            offset,
+        })
     }
 
     pub async fn list_instances_by_definition(
@@ -1738,6 +1788,178 @@ impl WorkflowRuntimeStore {
              ORDER BY command_id ASC, created_at ASC",
         )
         .bind(command_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_command = BTreeMap::new();
+        for (command_id, data) in rows {
+            by_command
+                .entry(command_id)
+                .or_insert_with(Vec::new)
+                .push(serde_json::from_str(&data)?);
+        }
+        Ok(by_command)
+    }
+
+    pub async fn runtime_job_counts_for_commands(
+        &self,
+        command_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, usize>> {
+        if command_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT command_id, COUNT(*)
+             FROM runtime_jobs
+             WHERE command_id = ANY($1::text[])
+             GROUP BY command_id",
+        )
+        .bind(command_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(command_id, count)| (command_id, count.max(0) as usize))
+            .collect())
+    }
+
+    pub async fn runtime_job_status_counts_for_commands(
+        &self,
+        command_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, usize>> {
+        if command_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*)
+             FROM runtime_jobs
+             WHERE command_id = ANY($1::text[])
+             GROUP BY status
+             ORDER BY status ASC",
+        )
+        .bind(command_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(status, count)| (status, count.max(0) as usize))
+            .collect())
+    }
+
+    pub async fn runtime_summary_counts_for_instances(
+        &self,
+        project_id: Option<&str>,
+        activity_envelope_artifact_type: &str,
+        activity_envelope_schema: &str,
+    ) -> anyhow::Result<WorkflowRuntimeSummaryCounts> {
+        let command_status_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT command.status, COUNT(*)
+             FROM workflow_commands command
+             JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+             WHERE ($1::text IS NULL OR workflow.data->'data'->>'project_id' = $1)
+             GROUP BY command.status
+             ORDER BY command.status ASC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let command_statuses: BTreeMap<String, usize> = command_status_rows
+            .into_iter()
+            .map(|(status, count)| (status, count.max(0) as usize))
+            .collect();
+        let total_commands = command_statuses.values().sum();
+
+        let runtime_job_status_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT job.status, COUNT(*)
+             FROM runtime_jobs job
+             JOIN workflow_commands command ON command.id = job.command_id
+             JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+             WHERE ($1::text IS NULL OR workflow.data->'data'->>'project_id' = $1)
+             GROUP BY job.status
+             ORDER BY job.status ASC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let runtime_job_statuses: BTreeMap<String, usize> = runtime_job_status_rows
+            .into_iter()
+            .map(|(status, count)| (status, count.max(0) as usize))
+            .collect();
+        let total_runtime_jobs = runtime_job_statuses.values().sum();
+
+        let activity_outcome_rows: Vec<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT envelope.payload->>'outcome' AS outcome, COUNT(*)
+             FROM runtime_jobs job
+             JOIN workflow_commands command ON command.id = job.command_id
+             JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+             LEFT JOIN LATERAL (
+                 SELECT artifact.value->'artifact' AS payload
+                 FROM jsonb_array_elements(
+                     CASE
+                         WHEN jsonb_typeof(job.data->'output'->'artifacts') = 'array'
+                         THEN job.data->'output'->'artifacts'
+                         ELSE '[]'::jsonb
+                     END
+                 ) WITH ORDINALITY AS artifact(value, ordinal)
+                 WHERE artifact.value->>'artifact_type' = $2
+                   AND artifact.value->'artifact'->>'schema' = $3
+                 ORDER BY artifact.ordinal DESC
+                 LIMIT 1
+             ) envelope ON true
+             WHERE ($1::text IS NULL OR workflow.data->'data'->>'project_id' = $1)
+             GROUP BY envelope.payload->>'outcome'
+             ORDER BY envelope.payload->>'outcome' ASC NULLS FIRST",
+        )
+        .bind(project_id)
+        .bind(activity_envelope_artifact_type)
+        .bind(activity_envelope_schema)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut activity_outcomes = BTreeMap::new();
+        let mut jobs_without_activity_envelope = 0;
+        for (outcome, count) in activity_outcome_rows {
+            match outcome {
+                Some(outcome) => {
+                    activity_outcomes.insert(outcome, count.max(0) as usize);
+                }
+                None => {
+                    jobs_without_activity_envelope = count.max(0) as usize;
+                }
+            }
+        }
+
+        Ok(WorkflowRuntimeSummaryCounts {
+            total_commands,
+            total_runtime_jobs,
+            command_statuses,
+            runtime_job_statuses,
+            activity_outcomes,
+            jobs_without_activity_envelope,
+        })
+    }
+
+    pub async fn runtime_jobs_for_commands_limited(
+        &self,
+        command_ids: &[String],
+        per_command_limit: i64,
+    ) -> anyhow::Result<BTreeMap<String, Vec<RuntimeJob>>> {
+        if command_ids.is_empty() || per_command_limit <= 0 {
+            return Ok(BTreeMap::new());
+        }
+        let per_command_limit = per_command_limit.clamp(1, 50);
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT job.command_id, job.data
+             FROM unnest($1::text[]) AS selected(command_id)
+             JOIN LATERAL (
+                 SELECT command_id, data::text AS data, created_at, id
+                 FROM runtime_jobs
+                 WHERE command_id = selected.command_id
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT $2
+             ) AS job ON true
+             ORDER BY job.command_id ASC, job.created_at ASC, job.id ASC",
+        )
+        .bind(command_ids)
+        .bind(per_command_limit)
         .fetch_all(&self.pool)
         .await?;
         let mut by_command = BTreeMap::new();

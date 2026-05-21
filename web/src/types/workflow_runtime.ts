@@ -1,10 +1,26 @@
 export interface WorkflowRuntimeTreePayload {
   workflows: WorkflowRuntimeTreeNode[];
   total_workflows: number;
+  pagination?: {
+    limit: number;
+    offset: number;
+    returned: number;
+    total: number;
+    has_more: boolean;
+    next_offset?: number | null;
+    job_limit: number;
+  };
+  summary?: {
+    total_commands: number;
+    total_runtime_jobs: number;
+    command_statuses: Record<string, number>;
+    runtime_job_statuses: Record<string, number>;
+  };
 }
 
 export interface WorkflowRuntimeTreeNode {
   workflow: WorkflowRuntimeInstance;
+  runtime_job_count?: number;
   events: WorkflowRuntimeEvent[];
   decisions: WorkflowRuntimeDecisionRecord[];
   commands: WorkflowRuntimeCommandNode[];
@@ -61,6 +77,7 @@ export interface WorkflowRuntimeCommandNode {
     dedupe_key: string;
     command: Record<string, unknown>;
   };
+  runtime_job_count?: number;
   runtime_jobs: WorkflowRuntimeJob[];
   created_at: string;
   updated_at: string;
