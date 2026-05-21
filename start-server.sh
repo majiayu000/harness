@@ -6,6 +6,43 @@ cd "$(dirname "$0")"
 CONFIG_PATH="${HARNESS_CONFIG:-}"
 CONFIG_ARGS=()
 
+is_absolute_path() {
+    case "$1" in
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+discover_config_path() {
+    local candidate
+
+    if [ -n "${XDG_CONFIG_HOME:-}" ] && is_absolute_path "$XDG_CONFIG_HOME"; then
+        candidate="$XDG_CONFIG_HOME/harness/config.toml"
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    if [ -n "${HOME:-}" ] && is_absolute_path "$HOME"; then
+        candidate="$HOME/.config/harness/config.toml"
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+
+        if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]; then
+            candidate="$HOME/Library/Application Support/harness/config.toml"
+            if [ -f "$candidate" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
 if [ -n "$CONFIG_PATH" ]; then
     if [ ! -f "$CONFIG_PATH" ]; then
         echo "ERROR: Harness config not found: $CONFIG_PATH" >&2
@@ -18,6 +55,9 @@ elif [ -f "config/default.toml" ]; then
 elif [ -f "config/claude.toml" ]; then
     CONFIG_PATH="config/claude.toml"
     CONFIG_ARGS=(--config "$CONFIG_PATH")
+elif CONFIG_PATH="$(discover_config_path)"; then
+    CONFIG_ARGS=(--config "$CONFIG_PATH")
+    echo "Using discovered Harness config: $CONFIG_PATH" >&2
 else
     CONFIG_PATH=""
     echo "No local config file found; using built-in defaults plus local Postgres defaults." >&2
@@ -86,8 +126,23 @@ listener_name_matches_bind() {
 
 listener_pids() {
     local line
+    local lsof_output
     local name
     local pid
+
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "ERROR: lsof is required to inspect listeners on $BIND_ADDR." >&2
+        exit 1
+    fi
+
+    if ! lsof_output="$(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>&1)"; then
+        if [ -n "$lsof_output" ]; then
+            echo "ERROR: failed to inspect listeners on $BIND_ADDR:" >&2
+            printf '%s\n' "$lsof_output" >&2
+            exit 1
+        fi
+        return 0
+    fi
 
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -99,7 +154,7 @@ listener_pids() {
         if listener_name_matches_bind "$name"; then
             printf '%s\n' "$pid"
         fi
-    done < <(lsof -nP -iTCP:"$BIND_PORT" -sTCP:LISTEN 2>/dev/null || true) | awk '!seen[$0]++'
+    done <<< "$lsof_output" | awk '!seen[$0]++'
 }
 
 health_check_addr() {
