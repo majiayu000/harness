@@ -540,11 +540,9 @@ async fn has_recent_failed_child_pr_feedback_command(
     workflow_id: &str,
     suppression_secs: u64,
 ) -> anyhow::Result<bool> {
-    if suppression_secs == 0 {
+    let Some(cutoff) = failed_child_suppression_cutoff(suppression_secs) else {
         return Ok(false);
-    }
-    let cutoff = chrono::Utc::now()
-        - chrono::Duration::seconds(i64::try_from(suppression_secs).unwrap_or(i64::MAX));
+    };
     Ok(store
         .commands_for(workflow_id)
         .await?
@@ -554,6 +552,20 @@ async fn has_recent_failed_child_pr_feedback_command(
                 && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
                 && record.updated_at >= cutoff
         }))
+}
+
+fn failed_child_suppression_cutoff(suppression_secs: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if suppression_secs == 0 {
+        return None;
+    }
+    let now = chrono::Utc::now();
+    Some(
+        i64::try_from(suppression_secs)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)
+            .and_then(|duration| now.checked_sub_signed(duration))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+    )
 }
 
 async fn has_active_child_pr_feedback_command(
@@ -1088,6 +1100,20 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
         Ok(())
+    }
+
+    #[test]
+    fn failed_child_suppression_cutoff_handles_oversized_windows() {
+        assert_eq!(failed_child_suppression_cutoff(0), None);
+
+        let normal_cutoff = failed_child_suppression_cutoff(60)
+            .expect("nonzero suppression window should produce a cutoff");
+        assert!(normal_cutoff <= chrono::Utc::now());
+
+        assert_eq!(
+            failed_child_suppression_cutoff(u64::MAX),
+            Some(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        );
     }
 
     #[tokio::test]
