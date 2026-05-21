@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cmp::Ordering;
@@ -216,14 +217,20 @@ pub(crate) async fn list_tasks(
                     };
                 }
             }
-            if let Err(e) =
-                append_runtime_submission_summaries(&state, &mut summaries, &query.filter).await
+            if let Err(e) = append_runtime_submission_summaries(
+                &state,
+                &mut summaries,
+                &query.filter,
+                task_store_cursor.as_ref(),
+                query.limit + 1,
+            )
+            .await
             {
                 tracing::error!("list_tasks: failed to append runtime submission summaries: {e}");
             }
             sort_task_summaries(&mut summaries);
-            let counts = task_list_counts(&summaries);
             let (data, page) = paginate_task_summaries(&summaries, &query);
+            let counts = task_list_counts(&data);
             Json(TaskListResponse { data, page, counts }).into_response()
         }
         Err(e) => {
@@ -437,14 +444,25 @@ fn sort_task_summaries(summaries: &mut [TaskSummary]) {
 }
 
 fn compare_task_summaries_desc(left: &TaskSummary, right: &TaskSummary) -> Ordering {
-    match (left.created_at.as_deref(), right.created_at.as_deref()) {
+    match (
+        task_summary_created_at(left),
+        task_summary_created_at(right),
+    ) {
         (Some(left_created), Some(right_created)) => right_created
-            .cmp(left_created)
+            .cmp(&left_created)
             .then_with(|| right.id.as_str().cmp(left.id.as_str())),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => right.id.as_str().cmp(left.id.as_str()),
     }
+}
+
+fn task_summary_created_at(summary: &TaskSummary) -> Option<DateTime<Utc>> {
+    summary
+        .created_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn task_list_counts(summaries: &[TaskSummary]) -> TaskListCounts {
@@ -500,12 +518,7 @@ fn paginate_task_summaries(
 }
 
 fn task_is_after_cursor(summary: &TaskSummary, cursor: &TaskListCursor) -> bool {
-    let Some(created_at) = summary
-        .created_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&chrono::Utc))
-    else {
+    let Some(created_at) = task_summary_created_at(summary) else {
         return false;
     };
     created_at < cursor.created_at
@@ -521,6 +534,8 @@ async fn append_runtime_submission_summaries(
     state: &AppState,
     summaries: &mut Vec<TaskSummary>,
     filter: &TaskSummaryFilter,
+    cursor: Option<&TaskSummaryPageCursor>,
+    limit: usize,
 ) -> anyhow::Result<()> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(());
@@ -531,6 +546,8 @@ async fn append_runtime_submission_summaries(
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         TaskKind::Issue,
         filter,
+        cursor,
+        limit,
     )
     .await?;
     append_runtime_definition_summaries(
@@ -539,6 +556,8 @@ async fn append_runtime_submission_summaries(
         harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         TaskKind::Prompt,
         filter,
+        cursor,
+        limit,
     )
     .await
 }
@@ -549,12 +568,20 @@ async fn append_runtime_definition_summaries(
     definition_id: &str,
     task_kind: TaskKind,
     filter: &TaskSummaryFilter,
+    cursor: Option<&TaskSummaryPageCursor>,
+    limit: usize,
 ) -> anyhow::Result<()> {
     if !filter.kinds.is_empty() && !filter.kinds.contains(&task_kind) {
         return Ok(());
     }
     let workflows = store
-        .list_instances_by_definition(definition_id, filter.project.as_deref(), None)
+        .list_instances_by_definition_page(
+            definition_id,
+            filter.project.as_deref(),
+            cursor.map(|cursor| cursor.created_at),
+            cursor.map(|cursor| cursor.id.as_str()),
+            i64::try_from(limit.max(1)).unwrap_or(i64::MAX),
+        )
         .await?;
     let mut listed_ids: HashSet<String> = summaries
         .iter()
@@ -668,20 +695,16 @@ fn runtime_workflow_scheduler_state(state: &str, status: &TaskStatus) -> TaskSch
         "pr_open" | "awaiting_feedback" | "ready_to_merge" | "blocked" => {
             TaskSchedulerState::queued()
         }
-        _ if matches!(status, TaskStatus::AwaitingDeps) => {
-            TaskSchedulerState::awaiting_dependencies()
-        }
-        _ if matches!(status, TaskStatus::Pending) => TaskSchedulerState::queued(),
-        _ if matches!(
-            status,
-            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-        ) =>
-        {
-            let mut scheduler = TaskSchedulerState::queued();
-            scheduler.mark_terminal(status);
-            scheduler
-        }
-        _ => TaskSchedulerState::queued(),
+        _ => match status {
+            TaskStatus::AwaitingDeps => TaskSchedulerState::awaiting_dependencies(),
+            TaskStatus::Pending => TaskSchedulerState::queued(),
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
+                let mut scheduler = TaskSchedulerState::queued();
+                scheduler.mark_terminal(status);
+                scheduler
+            }
+            _ => TaskSchedulerState::queued(),
+        },
     }
 }
 

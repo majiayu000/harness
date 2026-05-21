@@ -626,6 +626,43 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn list_instances_by_definition_page(
+        &self,
+        definition_id: &str,
+        project_id: Option<&str>,
+        cursor_created_at: Option<DateTime<Utc>>,
+        cursor_id: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let limit = limit.max(1);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND ($2::text IS NULL OR data->'data'->>'project_id' = $2)
+               AND (
+                   $3::timestamptz IS NULL
+                   OR (data->>'created_at')::timestamptz < $3
+                   OR (
+                       (data->>'created_at')::timestamptz = $3
+                       AND COALESCE(data->'data'->'task_ids'->>0, data->'data'->>'task_id', id) < COALESCE($4::text, '')
+                   )
+               )
+             ORDER BY (data->>'created_at')::timestamptz DESC,
+                      COALESCE(data->'data'->'task_ids'->>0, data->'data'->>'task_id', id) DESC
+             LIMIT $5",
+        )
+        .bind(definition_id)
+        .bind(project_id)
+        .bind(cursor_created_at)
+        .bind(cursor_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     pub async fn list_nonterminal_instances_by_definition(
         &self,
         definition_id: &str,

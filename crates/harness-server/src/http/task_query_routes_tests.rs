@@ -218,3 +218,37 @@ fn paginate_task_summaries_returns_next_cursor_and_resumes_after_it() {
     assert!(!second_metadata.has_more);
     assert_eq!(second_metadata.next_cursor, None);
 }
+
+#[test]
+fn task_list_counts_use_returned_page_only() {
+    let summaries = vec![
+        summary_with_created_at("task-c", "2026-05-20T03:00:00Z"),
+        summary_with_created_at("task-b", "2026-05-20T02:00:00Z"),
+        summary_with_created_at("task-a", "2026-05-20T01:00:00Z"),
+    ];
+    let query = TaskListQuery {
+        filter: TaskSummaryFilter::default(),
+        limit: 2,
+        cursor: None,
+    };
+
+    let (page, metadata) = paginate_task_summaries(&summaries, &query);
+    let counts = task_list_counts(&page);
+
+    assert!(metadata.has_more);
+    assert_eq!(page.len(), 2);
+    assert_eq!(counts.total, 2);
+}
+
+#[test]
+fn sort_task_summaries_compares_rfc3339_instants() {
+    let mut summaries = vec![
+        summary_with_created_at("older-whole-second", "2026-05-20T01:00:00Z"),
+        summary_with_created_at("newer-fractional", "2026-05-20T01:00:00.100Z"),
+    ];
+
+    sort_task_summaries(&mut summaries);
+
+    assert_eq!(summaries[0].id.as_str(), "newer-fractional");
+    assert_eq!(summaries[1].id.as_str(), "older-whole-second");
+}

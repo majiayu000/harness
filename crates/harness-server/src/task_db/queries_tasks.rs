@@ -403,8 +403,7 @@ impl TaskDb {
         for row in rows {
             let id = row.id.clone();
             match TaskSummaryRow::try_into_summary(row) {
-                Ok(summary) if filter.matches_summary(&summary) => summaries.push(summary),
-                Ok(_) => {}
+                Ok(summary) => summaries.push(summary),
                 Err(error) => {
                     tracing::warn!(
                         task_id = %id,
