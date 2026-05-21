@@ -5708,3 +5708,46 @@ async fn runtime_command_dispatcher_skips_non_runtime_commands() -> anyhow::Resu
     assert_eq!(store.commands_for(&instance.id).await?[0].status, "skipped");
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_command_dispatcher_skips_terminal_workflow_before_enqueue() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "cancelled");
+    store.upsert_instance(&instance).await?;
+    let command =
+        WorkflowCommand::enqueue_activity("implement_issue", "issue-123-cancelled-implement");
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc),
+    );
+
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should be inspected");
+    match outcome {
+        CommandDispatchOutcome::Skipped {
+            command_id: skipped_command_id,
+            reason,
+        } => {
+            assert_eq!(skipped_command_id, command_id);
+            assert!(reason.contains("terminal (cancelled)"));
+        }
+        other => panic!("unexpected dispatch outcome: {other:?}"),
+    }
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert_eq!(
+        store.commands_for(&instance.id).await?[0].status,
+        "cancelled"
+    );
+    Ok(())
+}

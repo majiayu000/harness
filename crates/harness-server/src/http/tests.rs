@@ -1913,8 +1913,8 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
             harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
             "codex-default",
             serde_json::json!({
-                "workflow_id": workflow.id,
-                "command_id": command_id,
+                "workflow_id": workflow.id.clone(),
+                "command_id": command_id.clone(),
                 "command_type": command.command_type,
                 "dedupe_key": command.dedupe_key,
                 "command": command.command,
@@ -2047,6 +2047,103 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         approval_policies.as_slice(),
         &[Some("on-request".to_string())]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let agent = RuntimeStreamAgent::new();
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", agent.clone());
+    let state =
+        make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
+            .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "cancelled",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:125"),
+    )
+    .with_id("issue-125")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 125,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-125");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": workflow.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key,
+                "command": command.command,
+                "activity": "implement_issue",
+                "runtime_profile": harness_workflow::runtime::RuntimeProfile::new(
+                    "codex-default",
+                    harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+                ),
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 0);
+    assert_eq!(tick.failed, 0);
+    assert_eq!(tick.cancelled, 1);
+    assert!(!tick.idle);
+    assert!(agent.prompts.lock().await.is_empty());
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    assert_eq!(
+        completed.status,
+        harness_workflow::runtime::RuntimeJobStatus::Cancelled
+    );
+    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+        completed
+            .output
+            .expect("activity result should be recorded"),
+    )?;
+    assert_eq!(output.activity, "implement_issue");
+    assert_eq!(
+        output.summary,
+        "Workflow issue-125 was already terminal (cancelled) before runtime execution."
+    );
+    assert_eq!(
+        store.commands_for(&workflow.id).await?[0].status,
+        "cancelled"
+    );
+    let events = store.runtime_events_for(&runtime_job.id).await?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, "RuntimeJobClaimed");
+    assert_eq!(events[1].event_type, "ActivityResultReady");
     Ok(())
 }
 

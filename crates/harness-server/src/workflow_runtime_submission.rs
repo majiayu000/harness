@@ -445,7 +445,10 @@ async fn cancel_submission_instance(
     let mut cancelled = commit_runtime_decision(store, instance, decision, event.id, None).await?;
     let commands = store.commands_for(&cancelled.id).await?;
     for command in commands {
-        if matches!(command.status.as_str(), "pending" | "dispatched") {
+        if matches!(
+            command.status.as_str(),
+            "pending" | "dispatching" | "dispatched"
+        ) {
             store
                 .cancel_command_and_unfinished_runtime_jobs(
                     &command.id,

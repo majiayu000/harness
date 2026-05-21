@@ -1764,9 +1764,12 @@ impl WorkflowRuntimeStore {
         }
         sqlx::query(
             "UPDATE workflow_commands
-             SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+             SET status = 'cancelled',
+                 dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
              WHERE id = $1
-               AND status IN ('pending', 'dispatched')",
+               AND status IN ('pending', 'dispatching', 'dispatched')",
         )
         .bind(command_id)
         .execute(&mut *tx)

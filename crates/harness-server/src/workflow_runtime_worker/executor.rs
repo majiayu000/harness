@@ -42,6 +42,17 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
 
     async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
         let workflow = self.workflow_for_job(&job).await?;
+        if let Some(workflow) = workflow.as_ref() {
+            if workflow.is_terminal() {
+                return Ok(ActivityResult::cancelled(
+                    activity_name(&job),
+                    format!(
+                        "Workflow {} was already terminal ({}) before runtime execution.",
+                        workflow.id, workflow.state
+                    ),
+                ));
+            }
+        }
         if let Some(result) = self
             .execute_builtin_lifecycle_activity(&job, workflow.as_ref())
             .await?

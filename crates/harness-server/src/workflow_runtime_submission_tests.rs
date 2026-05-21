@@ -426,6 +426,85 @@ async fn cancel_issue_submission_cancels_dispatched_runtime_jobs() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn cancel_issue_submission_cancels_dispatching_runtime_command() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = open_runtime_store(dir.path()).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("runtime-handle-cancel-dispatching");
+    let result = record_issue_submission(
+        &store,
+        IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 44,
+            task_id: &task_id,
+            labels: &[],
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+    let command_id = result
+        .command_ids
+        .first()
+        .expect("issue submission should enqueue an implementation command")
+        .clone();
+    let claimed = store
+        .claim_pending_commands(
+            "dispatcher-a",
+            chrono::Utc::now() + chrono::Duration::seconds(60),
+            10,
+        )
+        .await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, command_id);
+    assert_eq!(claimed[0].status, "dispatching");
+
+    let cancelled = expect_cancelled(
+        cancel_issue_submission_by_task_id(&store, &task_id).await?,
+        "runtime issue submission should resolve by task id",
+    );
+    assert_eq!(cancelled.state, "cancelled");
+
+    let command = store
+        .get_command(&command_id)
+        .await?
+        .expect("command should remain visible");
+    assert_eq!(command.status, "cancelled");
+    assert!(command.dispatch_owner.is_none());
+    assert!(command.dispatch_lease_expires_at.is_none());
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+
+    let outcomes = harness_workflow::runtime::RuntimeCommandDispatcher::new(
+        &store,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "codex-default",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+    )
+    .dispatch_pending()
+    .await?;
+    assert!(outcomes.is_empty());
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancel_issue_submission_by_workflow_id_uses_stable_runtime_handle() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
