@@ -1644,11 +1644,10 @@ fn log_runtime_worker_tick_result(
     }
 }
 
-fn drain_finished_runtime_worker_ticks(
-    workers: &mut tokio::task::JoinSet<
-        anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>,
-    >,
-) {
+type RuntimeWorkerJoinSet =
+    tokio::task::JoinSet<anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>>;
+
+fn drain_finished_runtime_worker_ticks(workers: &mut RuntimeWorkerJoinSet) {
     while let Some(result) = workers.try_join_next() {
         log_runtime_worker_tick_result(result);
     }
@@ -1695,9 +1694,7 @@ impl Drop for RuntimeWorkerStateLease {
 }
 
 fn spawn_runtime_worker_ticks(
-    workers: &mut tokio::task::JoinSet<
-        anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>,
-    >,
+    workers: &mut RuntimeWorkerJoinSet,
     state: &Arc<AppState>,
     active_worker_state_clones: &Arc<AtomicUsize>,
     concurrency: u32,
@@ -1718,6 +1715,38 @@ fn spawn_runtime_worker_ticks(
             )
             .await
         });
+    }
+}
+
+fn stop_runtime_job_worker_supervisor_for_shutdown(
+    workers: &mut RuntimeWorkerJoinSet,
+    shutdown_result: Result<(), tokio::sync::broadcast::error::RecvError>,
+) {
+    match shutdown_result {
+        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            tracing::info!("workflow runtime job worker supervisor stopping for shutdown");
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            tracing::warn!(
+                skipped,
+                "workflow runtime job worker supervisor lagged shutdown signal"
+            );
+        }
+    }
+    workers.abort_all();
+}
+
+async fn runtime_worker_sleep_or_shutdown(
+    delay: std::time::Duration,
+    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    workers: &mut RuntimeWorkerJoinSet,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        shutdown_result = shutdown_rx.recv() => {
+            stop_runtime_job_worker_supervisor_for_shutdown(workers, shutdown_result);
+            true
+        }
     }
 }
 
@@ -1744,10 +1773,16 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
             ) {
                 Ok(config) => config,
                 Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
-                    ))
-                    .await;
+                    drop(state);
+                    if runtime_worker_sleep_or_shutdown(
+                        std::time::Duration::from_secs(RUNTIME_WORKFLOW_CONFIG_RETRY_SECS),
+                        &mut shutdown_rx,
+                        &mut workers,
+                    )
+                    .await
+                    {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -1777,25 +1812,8 @@ pub(super) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 &mut next_worker_id,
             );
             drop(state);
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                shutdown_result = shutdown_rx.recv() => {
-                    match shutdown_result {
-                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            tracing::info!("workflow runtime job worker supervisor stopping for shutdown");
-                            workers.abort_all();
-                            break;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                skipped,
-                                "workflow runtime job worker supervisor lagged shutdown signal"
-                            );
-                            workers.abort_all();
-                            break;
-                        }
-                    }
-                }
+            if runtime_worker_sleep_or_shutdown(interval, &mut shutdown_rx, &mut workers).await {
+                break;
             }
         }
     });
@@ -3159,6 +3177,35 @@ mod tests {
         .expect("finished worker should be drained without waiting for hung worker");
 
         workers.abort_all();
+        while workers.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn runtime_worker_sleep_or_shutdown_exits_before_retry_delay() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            std::future::pending::<
+                anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>,
+            >()
+            .await
+        });
+        shutdown_tx
+            .send(())
+            .expect("shutdown signal should be sent to subscribed receiver");
+
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            runtime_worker_sleep_or_shutdown(
+                std::time::Duration::from_secs(RUNTIME_WORKFLOW_CONFIG_RETRY_SECS),
+                &mut shutdown_rx,
+                &mut workers,
+            ),
+        )
+        .await
+        .expect("shutdown should interrupt retry delay");
+
+        assert!(stopped);
         while workers.join_next().await.is_some() {}
     }
 
