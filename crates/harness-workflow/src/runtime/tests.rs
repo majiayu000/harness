@@ -19,11 +19,11 @@ use super::{
     PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PromptSubmissionDecisionInput,
     QualityGateDecisionInput, QualityGateWorkflowAction, RepoBacklogPollDecisionInput,
     RepoBacklogWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
-    RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowRuntimeStore,
-    GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY,
-    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
-    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowDecisionTransition,
+    WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID,
+    REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -5030,6 +5030,146 @@ async fn durable_store_persists_workflow_runtime_bus_contract() -> anyhow::Resul
         RuntimeJobStatus::Succeeded
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_store_apply_decision_transition_can_create_initial_instance() -> anyhow::Result<()>
+{
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+
+    let initial = project_issue_instance("/project-a", 123, "implementing");
+    let decision = WorkflowDecision::new(
+        &initial.id,
+        "implementing",
+        "bind_pr",
+        "pr_open",
+        "implementation produced a pull request for the issue workflow",
+    )
+    .with_command(WorkflowCommand::bind_pr(
+        77,
+        "https://github.com/owner/repo/pull/77",
+        "pr-detected:task-1:77",
+    ));
+    let mut final_instance = initial.clone();
+    final_instance.state = "pr_open".to_string();
+    final_instance.version = final_instance.version.saturating_add(1);
+    final_instance.data = json!({
+        "project_id": "/project-a",
+        "issue_number": 123,
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "last_decision": "bind_pr",
+    });
+
+    let record = store
+        .apply_decision_transition(WorkflowDecisionTransition {
+            expected_state: "implementing",
+            create_if_missing: Some(&initial),
+            event_type: "PrDetected",
+            source: "workflow-runtime-test",
+            payload: json!({
+                "issue_number": 123,
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+            }),
+            decision: &decision,
+            final_instance: &final_instance,
+            command_status: "pending",
+        })
+        .await?
+        .expect("missing initial instance should be created inside the transition");
+
+    assert!(record.accepted);
+    assert!(record.event_id.is_some());
+    let loaded = store
+        .get_instance(&initial.id)
+        .await?
+        .expect("transition should persist final instance");
+    assert_eq!(loaded.state, "pr_open");
+    assert_eq!(loaded.data["pr_number"], 77);
+    assert_eq!(store.events_for(&initial.id).await?.len(), 1);
+    assert_eq!(store.decisions_for(&initial.id).await?.len(), 1);
+    let commands = store.commands_for(&initial.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].decision_id.as_deref(), Some(record.id.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_store_apply_decision_transition_does_not_rewind_existing_instance(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+
+    let initial = project_issue_instance("/project-a", 124, "implementing");
+    let mut existing = initial.clone();
+    existing.state = "awaiting_feedback".to_string();
+    existing.data = json!({
+        "project_id": "/project-a",
+        "issue_number": 124,
+        "pr_number": 78,
+        "last_decision": "record_feedback",
+    });
+    store.upsert_instance(&existing).await?;
+    let decision = WorkflowDecision::new(
+        &initial.id,
+        "implementing",
+        "bind_pr",
+        "pr_open",
+        "implementation produced a pull request for the issue workflow",
+    )
+    .with_command(WorkflowCommand::bind_pr(
+        79,
+        "https://github.com/owner/repo/pull/79",
+        "pr-detected:task-2:79",
+    ));
+    let mut final_instance = initial.clone();
+    final_instance.state = "pr_open".to_string();
+    final_instance.version = final_instance.version.saturating_add(1);
+    final_instance.data = json!({
+        "project_id": "/project-a",
+        "issue_number": 124,
+        "pr_number": 79,
+        "pr_url": "https://github.com/owner/repo/pull/79",
+        "last_decision": "bind_pr",
+    });
+
+    let record = store
+        .apply_decision_transition(WorkflowDecisionTransition {
+            expected_state: "implementing",
+            create_if_missing: Some(&initial),
+            event_type: "PrDetected",
+            source: "workflow-runtime-test",
+            payload: json!({
+                "issue_number": 124,
+                "pr_number": 79,
+                "pr_url": "https://github.com/owner/repo/pull/79",
+            }),
+            decision: &decision,
+            final_instance: &final_instance,
+            command_status: "pending",
+        })
+        .await?;
+
+    assert!(record.is_none());
+    let loaded = store
+        .get_instance(&initial.id)
+        .await?
+        .expect("existing instance should remain visible");
+    assert_eq!(loaded.state, "awaiting_feedback");
+    assert_eq!(loaded.data["pr_number"], 78);
+    assert!(store.events_for(&initial.id).await?.is_empty());
+    assert!(store.decisions_for(&initial.id).await?.is_empty());
     Ok(())
 }
 

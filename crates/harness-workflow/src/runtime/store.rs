@@ -215,12 +215,23 @@ pub struct WorkflowRuntimeSummaryCounts {
 
 pub struct WorkflowDecisionTransition<'a> {
     pub expected_state: &'a str,
+    pub create_if_missing: Option<&'a WorkflowInstance>,
     pub event_type: &'a str,
     pub source: &'a str,
     pub payload: Value,
     pub decision: &'a WorkflowDecision,
     pub final_instance: &'a WorkflowInstance,
     pub command_status: &'a str,
+}
+
+pub struct WorkflowRejectedDecisionTransition<'a> {
+    pub expected_state: &'a str,
+    pub create_if_missing: Option<&'a WorkflowInstance>,
+    pub event_type: &'a str,
+    pub source: &'a str,
+    pub payload: Value,
+    pub decision: &'a WorkflowDecision,
+    pub reason: &'a str,
 }
 
 type WorkflowCommandRecordRow = (
@@ -385,50 +396,36 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
         let final_instance = transition.final_instance;
         let decision = transition.decision;
+        if decision.workflow_id != final_instance.id {
+            anyhow::bail!(
+                "workflow decision `{}` targets `{}` but final instance is `{}`",
+                decision.decision,
+                decision.workflow_id,
+                final_instance.id
+            );
+        }
         let mut tx = self.pool.begin().await?;
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
-                .bind(&final_instance.id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((data,)) = row else {
+        let Some(current) = load_or_insert_initial_instance_tx(
+            &mut tx,
+            &final_instance.id,
+            transition.expected_state,
+            transition.create_if_missing,
+        )
+        .await?
+        else {
             return Ok(None);
         };
-        let current: WorkflowInstance = serde_json::from_str(&data)?;
         if current.is_terminal() || current.state != transition.expected_state {
             return Ok(None);
         }
 
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("workflow_events:{}", final_instance.id))
-            .execute(&mut *tx)
-            .await?;
-        let (next_sequence,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
-        )
-        .bind(&final_instance.id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let event = WorkflowEvent::new(
+        let event = insert_event_tx(
+            &mut tx,
             &final_instance.id,
-            next_sequence as u64,
             transition.event_type,
             transition.source,
+            transition.payload,
         )
-        .with_payload(transition.payload);
-        let event_data = to_jsonb_string(&event)?;
-        sqlx::query(
-            "INSERT INTO workflow_events
-                (id, workflow_id, sequence, event_type, source, data)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
-        )
-        .bind(&event.id)
-        .bind(&event.workflow_id)
-        .bind(event.sequence as i64)
-        .bind(&event.event_type)
-        .bind(&event.source)
-        .bind(&event_data)
-        .execute(&mut *tx)
         .await?;
 
         let record = WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id));
@@ -506,6 +503,42 @@ impl WorkflowRuntimeStore {
         .bind(final_instance.version as i64)
         .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
+        Ok(Some(record))
+    }
+
+    pub async fn record_rejected_decision_transition(
+        &self,
+        transition: WorkflowRejectedDecisionTransition<'_>,
+    ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+        let decision = transition.decision;
+        let mut tx = self.pool.begin().await?;
+        let Some(current) = load_or_insert_initial_instance_tx(
+            &mut tx,
+            &decision.workflow_id,
+            transition.expected_state,
+            transition.create_if_missing,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        if current.is_terminal() || current.state != transition.expected_state {
+            return Ok(None);
+        }
+
+        let event = insert_event_tx(
+            &mut tx,
+            &decision.workflow_id,
+            transition.event_type,
+            transition.source,
+            transition.payload,
+        )
+        .await?;
+        let record =
+            WorkflowDecisionRecord::rejected(decision.clone(), Some(event.id), transition.reason);
+        insert_decision_record_tx(&mut tx, &record).await?;
 
         tx.commit().await?;
         Ok(Some(record))
@@ -2097,6 +2130,111 @@ async fn insert_workflow_command_tx(
     .fetch_one(&mut **tx)
     .await?;
     Ok(id)
+}
+
+async fn load_or_insert_initial_instance_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+    expected_state: &str,
+    create_if_missing: Option<&WorkflowInstance>,
+) -> anyhow::Result<Option<WorkflowInstance>> {
+    if let Some(instance) = select_instance_for_update_tx(tx, workflow_id).await? {
+        return Ok(Some(instance));
+    }
+
+    let Some(initial_instance) = create_if_missing else {
+        return Ok(None);
+    };
+    if initial_instance.id != workflow_id {
+        anyhow::bail!(
+            "initial workflow instance `{}` does not match workflow `{}`",
+            initial_instance.id,
+            workflow_id
+        );
+    }
+    if initial_instance.state != expected_state {
+        return Ok(None);
+    }
+
+    if insert_instance_if_absent_tx(tx, initial_instance).await? {
+        return Ok(Some(initial_instance.clone()));
+    }
+
+    select_instance_for_update_tx(tx, workflow_id).await
+}
+
+async fn select_instance_for_update_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+) -> anyhow::Result<Option<WorkflowInstance>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
+            .bind(workflow_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    row.map(|(data,)| serde_json::from_str(&data))
+        .transpose()
+        .map_err(Into::into)
+}
+
+async fn insert_event_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+    event_type: &str,
+    source: &str,
+    payload: Value,
+) -> anyhow::Result<WorkflowEvent> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("workflow_events:{workflow_id}"))
+        .execute(&mut **tx)
+        .await?;
+    let (next_sequence,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
+    )
+    .bind(workflow_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let event = WorkflowEvent::new(workflow_id, next_sequence as u64, event_type, source)
+        .with_payload(payload);
+    let event_data = to_jsonb_string(&event)?;
+    sqlx::query(
+        "INSERT INTO workflow_events
+            (id, workflow_id, sequence, event_type, source, data)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind(&event.id)
+    .bind(&event.workflow_id)
+    .bind(event.sequence as i64)
+    .bind(&event.event_type)
+    .bind(&event.source)
+    .bind(&event_data)
+    .execute(&mut **tx)
+    .await?;
+    Ok(event)
+}
+
+async fn insert_instance_if_absent_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<bool> {
+    let data = to_jsonb_string(instance)?;
+    let result = sqlx::query(
+        "INSERT INTO workflow_instances
+            (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(&instance.id)
+    .bind(&instance.definition_id)
+    .bind(&instance.state)
+    .bind(&instance.subject.subject_type)
+    .bind(&instance.subject.subject_key)
+    .bind(&instance.parent_workflow_id)
+    .bind(&data)
+    .bind(instance.version as i64)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 async fn upsert_instance_tx(

@@ -3,9 +3,9 @@ use harness_workflow::runtime::{
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
     DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandType,
-    WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvidence,
-    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY,
+    WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
+    WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -90,6 +90,24 @@ pub(crate) enum RuntimeMergeApprovalOutcome {
         workflow_id: String,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeDecisionCommitOutcome {
+    Accepted,
+    Rejected { reason: String },
+    Stale,
+}
+
+impl RuntimeDecisionCommitOutcome {
+    fn into_result(self) -> anyhow::Result<()> {
+        match self {
+            Self::Accepted | Self::Rejected { .. } => Ok(()),
+            Self::Stale => anyhow::bail!(
+                "workflow state changed before the runtime transition could be committed"
+            ),
+        }
+    }
 }
 
 pub(crate) async fn record_pr_detected(
@@ -215,7 +233,7 @@ async fn persist_pr_detected(
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, ctx.issue_number);
     upsert_github_issue_pr_definition(store).await?;
-    let mut instance = load_or_issue_instance(
+    let (instance, new_instance) = load_or_issue_instance(
         store,
         workflow_id,
         project_id.clone(),
@@ -224,7 +242,7 @@ async fn persist_pr_detected(
         "implementing",
     )
     .await?;
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let accepted_data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
         json!({
         "project_id": project_id,
@@ -235,21 +253,6 @@ async fn persist_pr_detected(
         "pr_url": ctx.pr_url,
         }),
     );
-    store.upsert_instance(&instance).await?;
-    let event = store
-        .append_event(
-            &instance.id,
-            "PrDetected",
-            "workflow_runtime_pr_feedback",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "issue_number": ctx.issue_number,
-                "repo": ctx.repo,
-                "pr_number": ctx.pr_number,
-                "pr_url": ctx.pr_url,
-            }),
-        )
-        .await?;
     let output = build_pr_detected_decision(
         &instance,
         PrDetectedDecisionInput {
@@ -258,12 +261,29 @@ async fn persist_pr_detected(
             pr_url: ctx.pr_url,
         },
     );
-    apply_decision(store, instance, output.decision, Some(event.id)).await
+    commit_runtime_decision(
+        store,
+        instance,
+        new_instance,
+        output.decision,
+        "PrDetected",
+        "workflow_runtime_pr_feedback",
+        json!({
+            "task_id": ctx.task_id.as_str(),
+            "issue_number": ctx.issue_number,
+            "repo": ctx.repo,
+            "pr_number": ctx.pr_number,
+            "pr_url": ctx.pr_url,
+        }),
+        accepted_data,
+    )
+    .await?
+    .into_result()
 }
 
 async fn persist_pr_feedback_sweep_request(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
     let workflow_id = instance.id.clone();
     let task_id = runtime_task_id_from_instance(&instance);
@@ -274,23 +294,12 @@ async fn persist_pr_feedback_sweep_request(
         .get("issue_number")
         .and_then(|value| value.as_u64());
     let repo = optional_string_field(&instance.data, "repo");
-    let event = store
-        .append_event(
-            &instance.id,
-            "PrFeedbackSweepRequested",
-            "workflow_runtime_pr_feedback",
-            json!({
-                "issue_number": issue_number,
-                "repo": repo.as_deref(),
-                "pr_number": pr_number,
-                "pr_url": pr_url.as_deref(),
-            }),
-        )
-        .await?;
+    let accepted_data = instance.data.clone();
+    let sweep_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let output = build_pr_feedback_sweep_decision(
         &instance,
         PrFeedbackSweepDecisionInput {
-            dedupe_key: &format!("pr-feedback-sweep:{}:{}", instance.id, event.id),
+            dedupe_key: &format!("pr-feedback-sweep:{}:{sweep_nonce}", instance.id),
             pr_number,
             pr_url: pr_url.as_deref(),
             issue_number,
@@ -298,38 +307,43 @@ async fn persist_pr_feedback_sweep_request(
             summary: "Runtime workflow requested a PR feedback sweep.",
         },
     );
-    let validator = DecisionValidator::github_issue_pr();
-    let validation = validator.validate(
-        &instance,
-        &output.decision,
-        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
-    );
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(output.decision.clone(), Some(event.id)),
-        Err(error) => {
-            let reason = error.to_string();
-            let record = WorkflowDecisionRecord::rejected(output.decision, Some(event.id), &reason);
-            store.record_decision(&record).await?;
-            return Ok(PrFeedbackSweepRequestOutcome::Rejected {
-                workflow_id: instance.id,
+    let event_payload = json!({
+        "issue_number": issue_number,
+        "repo": repo.as_deref(),
+        "pr_number": pr_number,
+        "pr_url": pr_url.as_deref(),
+    });
+    match commit_runtime_decision(
+        store,
+        instance,
+        false,
+        output.decision,
+        "PrFeedbackSweepRequested",
+        "workflow_runtime_pr_feedback",
+        event_payload,
+        accepted_data,
+    )
+    .await?
+    {
+        RuntimeDecisionCommitOutcome::Accepted => Ok(PrFeedbackSweepRequestOutcome::Requested {
+            workflow_id,
+            task_id,
+        }),
+        RuntimeDecisionCommitOutcome::Rejected { reason } => {
+            Ok(PrFeedbackSweepRequestOutcome::Rejected {
+                workflow_id,
                 reason,
-            });
+            })
         }
-    };
-    store.record_decision(&record).await?;
-    for command in &output.decision.commands {
-        store
-            .enqueue_command(&instance.id, Some(&record.id), command)
-            .await?;
+        RuntimeDecisionCommitOutcome::Stale => {
+            let state = store
+                .get_instance(&workflow_id)
+                .await?
+                .map(|instance| instance.state)
+                .unwrap_or_else(|| "missing".to_string());
+            Ok(PrFeedbackSweepRequestOutcome::NotCandidate { workflow_id, state })
+        }
     }
-    instance.state = output.decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(instance.data, &output.decision.decision);
-    store.upsert_instance(&instance).await?;
-    Ok(PrFeedbackSweepRequestOutcome::Requested {
-        workflow_id,
-        task_id,
-    })
 }
 
 async fn persist_pr_feedback(
@@ -341,7 +355,7 @@ async fn persist_pr_feedback(
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, issue_number);
     upsert_github_issue_pr_definition(store).await?;
-    let mut instance = load_or_issue_instance(
+    let (instance, new_instance) = load_or_issue_instance(
         store,
         workflow_id,
         project_id.clone(),
@@ -350,7 +364,7 @@ async fn persist_pr_feedback(
         "pr_open",
     )
     .await?;
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let accepted_data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
         json!({
         "project_id": project_id,
@@ -362,23 +376,6 @@ async fn persist_pr_feedback(
         "feedback_summary": ctx.summary,
         }),
     );
-    store.upsert_instance(&instance).await?;
-    let event = store
-        .append_event(
-            &instance.id,
-            event_type(ctx.outcome),
-            "workflow_runtime_pr_feedback",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "issue_number": issue_number,
-                "repo": ctx.repo,
-                "pr_number": ctx.pr_number,
-                "pr_url": ctx.pr_url,
-                "outcome": outcome_label(ctx.outcome),
-                "summary": ctx.summary,
-            }),
-        )
-        .await?;
     let output = build_pr_feedback_decision(
         &instance,
         PrFeedbackDecisionInput {
@@ -389,7 +386,26 @@ async fn persist_pr_feedback(
             summary: ctx.summary,
         },
     );
-    apply_decision(store, instance, output.decision, Some(event.id)).await
+    commit_runtime_decision(
+        store,
+        instance,
+        new_instance,
+        output.decision,
+        event_type(ctx.outcome),
+        "workflow_runtime_pr_feedback",
+        json!({
+            "task_id": ctx.task_id.as_str(),
+            "issue_number": issue_number,
+            "repo": ctx.repo,
+            "pr_number": ctx.pr_number,
+            "pr_url": ctx.pr_url,
+            "outcome": outcome_label(ctx.outcome),
+            "summary": ctx.summary,
+        }),
+        accepted_data,
+    )
+    .await?
+    .into_result()
 }
 
 async fn persist_pr_merged(
@@ -401,7 +417,7 @@ async fn persist_pr_merged(
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, issue_number);
     upsert_github_issue_pr_definition(store).await?;
-    let mut instance = load_or_issue_instance(
+    let (instance, new_instance) = load_or_issue_instance(
         store,
         workflow_id,
         project_id.clone(),
@@ -410,7 +426,7 @@ async fn persist_pr_merged(
         "pr_open",
     )
     .await?;
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let accepted_data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
         json!({
             "project_id": project_id,
@@ -421,21 +437,6 @@ async fn persist_pr_merged(
             "pr_url": ctx.pr_url,
         }),
     );
-    store.upsert_instance(&instance).await?;
-    let event = store
-        .append_event(
-            &instance.id,
-            "PrMerged",
-            "workflow_runtime_pr_feedback",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "issue_number": issue_number,
-                "repo": ctx.repo,
-                "pr_number": ctx.pr_number,
-                "pr_url": ctx.pr_url,
-            }),
-        )
-        .await?;
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -457,12 +458,29 @@ async fn persist_pr_merged(
         ctx.pr_url.unwrap_or("merged externally"),
     ))
     .high_confidence();
-    apply_decision(store, instance, decision, Some(event.id)).await
+    commit_runtime_decision(
+        store,
+        instance,
+        new_instance,
+        decision,
+        "PrMerged",
+        "workflow_runtime_pr_feedback",
+        json!({
+            "task_id": ctx.task_id.as_str(),
+            "issue_number": issue_number,
+            "repo": ctx.repo,
+            "pr_number": ctx.pr_number,
+            "pr_url": ctx.pr_url,
+        }),
+        accepted_data,
+    )
+    .await?
+    .into_result()
 }
 
 async fn approve_runtime_merge(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     task_id: Option<&str>,
 ) -> anyhow::Result<RuntimeMergeApprovalOutcome> {
     if instance.definition_id != harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID {
@@ -478,20 +496,8 @@ async fn approve_runtime_merge(
         });
     }
 
-    let event = store
-        .append_event(
-            &instance.id,
-            "MergeApproved",
-            "workflow_runtime_dashboard",
-            json!({
-                "task_id": task_id,
-                "issue_number": instance.data.get("issue_number").and_then(|value| value.as_u64()),
-                "repo": optional_string_field(&instance.data, "repo"),
-                "pr_number": instance.data.get("pr_number").and_then(|value| value.as_u64()),
-                "pr_url": optional_string_field(&instance.data, "pr_url"),
-            }),
-        )
-        .await?;
+    let workflow_id = instance.id.clone();
+    let approval_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -501,7 +507,7 @@ async fn approve_runtime_merge(
     )
     .with_command(harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::MarkDone,
-        format!("merge-approved:{}:{}", instance.id, event.id),
+        format!("merge-approved:{}:{approval_nonce}", instance.id),
         json!({
             "workflow_id": instance.id,
             "task_id": task_id,
@@ -513,69 +519,104 @@ async fn approve_runtime_merge(
         "dashboard merge approval for ready-to-merge workflow",
     ))
     .high_confidence();
-    let validator = DecisionValidator::github_issue_pr();
-    let validation = validator.validate(
-        &instance,
-        &decision,
-        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
-    );
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id)),
-        Err(error) => {
-            let reason = error.to_string();
-            let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
-            store.record_decision(&record).await?;
-            return Ok(RuntimeMergeApprovalOutcome::Rejected {
-                workflow_id: instance.id,
-                reason,
-            });
+    let accepted_data =
+        merge_runtime_merge_data(instance.data.clone(), &decision.decision, task_id);
+    let event_payload = json!({
+        "task_id": task_id,
+        "issue_number": instance.data.get("issue_number").and_then(|value| value.as_u64()),
+        "repo": optional_string_field(&instance.data, "repo"),
+        "pr_number": instance.data.get("pr_number").and_then(|value| value.as_u64()),
+        "pr_url": optional_string_field(&instance.data, "pr_url"),
+    });
+    match commit_runtime_decision(
+        store,
+        instance,
+        false,
+        decision,
+        "MergeApproved",
+        "workflow_runtime_dashboard",
+        event_payload,
+        accepted_data,
+    )
+    .await?
+    {
+        RuntimeDecisionCommitOutcome::Accepted => {
+            Ok(RuntimeMergeApprovalOutcome::Approved { workflow_id })
         }
-    };
-    store.record_decision(&record).await?;
-    for command in &decision.commands {
-        store
-            .enqueue_command(&instance.id, Some(&record.id), command)
-            .await?;
+        RuntimeDecisionCommitOutcome::Rejected { reason } => {
+            Ok(RuntimeMergeApprovalOutcome::Rejected {
+                workflow_id,
+                reason,
+            })
+        }
+        RuntimeDecisionCommitOutcome::Stale => {
+            let state = store
+                .get_instance(&workflow_id)
+                .await?
+                .map(|instance| instance.state)
+                .unwrap_or_else(|| "missing".to_string());
+            Ok(RuntimeMergeApprovalOutcome::NotReady { workflow_id, state })
+        }
     }
-    instance.state = decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_runtime_merge_data(instance.data, &decision.decision, task_id);
-    let workflow_id = instance.id.clone();
-    store.upsert_instance(&instance).await?;
-    Ok(RuntimeMergeApprovalOutcome::Approved { workflow_id })
 }
 
-async fn apply_decision(
+async fn commit_runtime_decision(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
+    new_instance: bool,
     decision: WorkflowDecision,
-    event_id: Option<String>,
-) -> anyhow::Result<()> {
+    event_type: &'static str,
+    source: &'static str,
+    event_payload: serde_json::Value,
+    accepted_data: serde_json::Value,
+) -> anyhow::Result<RuntimeDecisionCommitOutcome> {
+    let expected_state = instance.state.clone();
     let validator = DecisionValidator::github_issue_pr();
     let validation = validator.validate(
         &instance,
         &decision,
         &ValidationContext::new("workflow-policy", chrono::Utc::now()),
     );
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), event_id),
-        Err(error) => {
-            let reason = error.to_string();
-            let record = WorkflowDecisionRecord::rejected(decision, event_id, &reason);
-            store.record_decision(&record).await?;
-            return Ok(());
-        }
-    };
-    store.record_decision(&record).await?;
-    for command in &decision.commands {
-        store
-            .enqueue_command(&instance.id, Some(&record.id), command)
+    if let Err(error) = validation {
+        let reason = error.to_string();
+        let record = store
+            .record_rejected_decision_transition(WorkflowRejectedDecisionTransition {
+                expected_state: &expected_state,
+                create_if_missing: new_instance.then_some(&instance),
+                event_type,
+                source,
+                payload: event_payload,
+                decision: &decision,
+                reason: &reason,
+            })
             .await?;
+        return Ok(match record {
+            Some(_) => RuntimeDecisionCommitOutcome::Rejected { reason },
+            None => RuntimeDecisionCommitOutcome::Stale,
+        });
     }
-    instance.state = decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(instance.data, &decision.decision);
-    store.upsert_instance(&instance).await
+
+    let mut final_instance = instance.clone();
+    final_instance.state = decision.next_state.clone();
+    final_instance.version = final_instance.version.saturating_add(1);
+    final_instance.data = merge_last_decision(accepted_data, &decision.decision);
+    let create_if_missing = new_instance.then_some(&instance);
+    let record = store
+        .apply_decision_transition(WorkflowDecisionTransition {
+            expected_state: &expected_state,
+            create_if_missing,
+            event_type,
+            source,
+            payload: event_payload,
+            decision: &decision,
+            final_instance: &final_instance,
+            command_status: "pending",
+        })
+        .await?;
+    Ok(match record {
+        Some(_) => RuntimeDecisionCommitOutcome::Accepted,
+        None => RuntimeDecisionCommitOutcome::Stale,
+    })
 }
 
 async fn has_active_pr_feedback_command(
@@ -698,10 +739,13 @@ async fn load_or_issue_instance(
     repo: Option<String>,
     issue_number: u64,
     state: &str,
-) -> anyhow::Result<WorkflowInstance> {
+) -> anyhow::Result<(WorkflowInstance, bool)> {
     Ok(match store.get_instance(&workflow_id).await? {
-        Some(instance) => instance,
-        None => issue_instance(workflow_id, project_id, repo, issue_number, state),
+        Some(instance) => (instance, false),
+        None => (
+            issue_instance(workflow_id, project_id, repo, issue_number, state),
+            true,
+        ),
     })
 }
 
@@ -829,6 +873,70 @@ mod tests {
             store.events_for(&workflow_id).await?[0].event_type,
             "PrDetected"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_new_runtime_decision_persists_initial_instance() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let instance = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "pr_open",
+        );
+        let decision = WorkflowDecision::new(
+            &workflow_id,
+            "awaiting_feedback",
+            "record_feedback",
+            "addressing_feedback",
+            "intentionally stale observed state",
+        );
+
+        let outcome = commit_runtime_decision(
+            &store,
+            instance.clone(),
+            true,
+            decision,
+            "FeedbackFound",
+            "workflow_runtime_pr_feedback_test",
+            json!({ "issue_number": 123, "pr_number": 77 }),
+            instance.data.clone(),
+        )
+        .await?;
+
+        assert!(matches!(
+            outcome,
+            RuntimeDecisionCommitOutcome::Rejected { .. }
+        ));
+        let loaded = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("rejected initial transition should still persist the workflow instance");
+        assert_eq!(loaded.state, "pr_open");
+        assert_eq!(store.events_for(&workflow_id).await?.len(), 1);
+        let decisions = store.decisions_for(&workflow_id).await?;
+        assert_eq!(decisions.len(), 1);
+        assert!(!decisions[0].accepted);
         Ok(())
     }
 

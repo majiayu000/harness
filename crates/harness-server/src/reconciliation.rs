@@ -629,6 +629,7 @@ async fn apply_runtime_workflow_transition(
     let Some(_record) = runtime_store
         .apply_decision_transition(WorkflowDecisionTransition {
             expected_state: candidate.state.as_str(),
+            create_if_missing: None,
             event_type,
             source: "reconciliation",
             payload: event_payload,
