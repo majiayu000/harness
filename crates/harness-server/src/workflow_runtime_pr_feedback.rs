@@ -3,9 +3,9 @@ use harness_workflow::runtime::{
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
     DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandType,
-    WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvidence,
-    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY,
+    WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -90,6 +90,13 @@ pub(crate) enum RuntimeMergeApprovalOutcome {
         workflow_id: String,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeTransitionApplyOutcome {
+    Applied,
+    Stale,
+    Rejected { reason: String },
 }
 
 pub(crate) async fn record_pr_detected(
@@ -235,21 +242,13 @@ async fn persist_pr_detected(
         "pr_url": ctx.pr_url,
         }),
     );
-    store.upsert_instance(&instance).await?;
-    let event = store
-        .append_event(
-            &instance.id,
-            "PrDetected",
-            "workflow_runtime_pr_feedback",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "issue_number": ctx.issue_number,
-                "repo": ctx.repo,
-                "pr_number": ctx.pr_number,
-                "pr_url": ctx.pr_url,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": ctx.task_id.as_str(),
+        "issue_number": ctx.issue_number,
+        "repo": ctx.repo,
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+    });
     let output = build_pr_detected_decision(
         &instance,
         PrDetectedDecisionInput {
@@ -258,12 +257,23 @@ async fn persist_pr_detected(
             pr_url: ctx.pr_url,
         },
     );
-    apply_decision(store, instance, output.decision, Some(event.id)).await
+    let final_data = merge_last_decision(instance.data.clone(), &output.decision.decision);
+    let _ = apply_pr_feedback_transition(
+        store,
+        instance,
+        "PrDetected",
+        "workflow_runtime_pr_feedback",
+        event_payload,
+        output.decision,
+        final_data,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn persist_pr_feedback_sweep_request(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
     let workflow_id = instance.id.clone();
     let task_id = runtime_task_id_from_instance(&instance);
@@ -274,23 +284,17 @@ async fn persist_pr_feedback_sweep_request(
         .get("issue_number")
         .and_then(|value| value.as_u64());
     let repo = optional_string_field(&instance.data, "repo");
-    let event = store
-        .append_event(
-            &instance.id,
-            "PrFeedbackSweepRequested",
-            "workflow_runtime_pr_feedback",
-            json!({
-                "issue_number": issue_number,
-                "repo": repo.as_deref(),
-                "pr_number": pr_number,
-                "pr_url": pr_url.as_deref(),
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "issue_number": issue_number,
+        "repo": repo.as_deref(),
+        "pr_number": pr_number,
+        "pr_url": pr_url.as_deref(),
+    });
+    let next_version = instance.version.saturating_add(1);
     let output = build_pr_feedback_sweep_decision(
         &instance,
         PrFeedbackSweepDecisionInput {
-            dedupe_key: &format!("pr-feedback-sweep:{}:{}", instance.id, event.id),
+            dedupe_key: &format!("pr-feedback-sweep:{}:{next_version}", instance.id),
             pr_number,
             pr_url: pr_url.as_deref(),
             issue_number,
@@ -298,38 +302,34 @@ async fn persist_pr_feedback_sweep_request(
             summary: "Runtime workflow requested a PR feedback sweep.",
         },
     );
-    let validator = DecisionValidator::github_issue_pr();
-    let validation = validator.validate(
-        &instance,
-        &output.decision,
-        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
-    );
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(output.decision.clone(), Some(event.id)),
-        Err(error) => {
-            let reason = error.to_string();
-            let record = WorkflowDecisionRecord::rejected(output.decision, Some(event.id), &reason);
-            store.record_decision(&record).await?;
-            return Ok(PrFeedbackSweepRequestOutcome::Rejected {
-                workflow_id: instance.id,
+    let final_data = merge_last_decision(instance.data.clone(), &output.decision.decision);
+    match apply_pr_feedback_transition(
+        store,
+        instance,
+        "PrFeedbackSweepRequested",
+        "workflow_runtime_pr_feedback",
+        event_payload,
+        output.decision,
+        final_data,
+    )
+    .await?
+    {
+        RuntimeTransitionApplyOutcome::Applied => Ok(PrFeedbackSweepRequestOutcome::Requested {
+            workflow_id,
+            task_id,
+        }),
+        RuntimeTransitionApplyOutcome::Rejected { reason } => {
+            Ok(PrFeedbackSweepRequestOutcome::Rejected {
+                workflow_id,
                 reason,
-            });
+            })
         }
-    };
-    store.record_decision(&record).await?;
-    for command in &output.decision.commands {
-        store
-            .enqueue_command(&instance.id, Some(&record.id), command)
-            .await?;
+        RuntimeTransitionApplyOutcome::Stale => Ok(PrFeedbackSweepRequestOutcome::Rejected {
+            workflow_id,
+            reason: "workflow state changed before PR feedback sweep transition committed"
+                .to_string(),
+        }),
     }
-    instance.state = output.decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(instance.data, &output.decision.decision);
-    store.upsert_instance(&instance).await?;
-    Ok(PrFeedbackSweepRequestOutcome::Requested {
-        workflow_id,
-        task_id,
-    })
 }
 
 async fn persist_pr_feedback(
@@ -362,23 +362,15 @@ async fn persist_pr_feedback(
         "feedback_summary": ctx.summary,
         }),
     );
-    store.upsert_instance(&instance).await?;
-    let event = store
-        .append_event(
-            &instance.id,
-            event_type(ctx.outcome),
-            "workflow_runtime_pr_feedback",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "issue_number": issue_number,
-                "repo": ctx.repo,
-                "pr_number": ctx.pr_number,
-                "pr_url": ctx.pr_url,
-                "outcome": outcome_label(ctx.outcome),
-                "summary": ctx.summary,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": ctx.task_id.as_str(),
+        "issue_number": issue_number,
+        "repo": ctx.repo,
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+        "outcome": outcome_label(ctx.outcome),
+        "summary": ctx.summary,
+    });
     let output = build_pr_feedback_decision(
         &instance,
         PrFeedbackDecisionInput {
@@ -389,7 +381,18 @@ async fn persist_pr_feedback(
             summary: ctx.summary,
         },
     );
-    apply_decision(store, instance, output.decision, Some(event.id)).await
+    let final_data = merge_last_decision(instance.data.clone(), &output.decision.decision);
+    let _ = apply_pr_feedback_transition(
+        store,
+        instance,
+        event_type(ctx.outcome),
+        "workflow_runtime_pr_feedback",
+        event_payload,
+        output.decision,
+        final_data,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn persist_pr_merged(
@@ -421,21 +424,13 @@ async fn persist_pr_merged(
             "pr_url": ctx.pr_url,
         }),
     );
-    store.upsert_instance(&instance).await?;
-    let event = store
-        .append_event(
-            &instance.id,
-            "PrMerged",
-            "workflow_runtime_pr_feedback",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "issue_number": issue_number,
-                "repo": ctx.repo,
-                "pr_number": ctx.pr_number,
-                "pr_url": ctx.pr_url,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": ctx.task_id.as_str(),
+        "issue_number": issue_number,
+        "repo": ctx.repo,
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+    });
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -457,12 +452,23 @@ async fn persist_pr_merged(
         ctx.pr_url.unwrap_or("merged externally"),
     ))
     .high_confidence();
-    apply_decision(store, instance, decision, Some(event.id)).await
+    let final_data = merge_last_decision(instance.data.clone(), &decision.decision);
+    let _ = apply_pr_feedback_transition(
+        store,
+        instance,
+        "PrMerged",
+        "workflow_runtime_pr_feedback",
+        event_payload,
+        decision,
+        final_data,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn approve_runtime_merge(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     task_id: Option<&str>,
 ) -> anyhow::Result<RuntimeMergeApprovalOutcome> {
     if instance.definition_id != harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID {
@@ -478,20 +484,14 @@ async fn approve_runtime_merge(
         });
     }
 
-    let event = store
-        .append_event(
-            &instance.id,
-            "MergeApproved",
-            "workflow_runtime_dashboard",
-            json!({
-                "task_id": task_id,
-                "issue_number": instance.data.get("issue_number").and_then(|value| value.as_u64()),
-                "repo": optional_string_field(&instance.data, "repo"),
-                "pr_number": instance.data.get("pr_number").and_then(|value| value.as_u64()),
-                "pr_url": optional_string_field(&instance.data, "pr_url"),
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": task_id,
+        "issue_number": instance.data.get("issue_number").and_then(|value| value.as_u64()),
+        "repo": optional_string_field(&instance.data, "repo"),
+        "pr_number": instance.data.get("pr_number").and_then(|value| value.as_u64()),
+        "pr_url": optional_string_field(&instance.data, "pr_url"),
+    });
+    let next_version = instance.version.saturating_add(1);
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -501,7 +501,7 @@ async fn approve_runtime_merge(
     )
     .with_command(harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::MarkDone,
-        format!("merge-approved:{}:{}", instance.id, event.id),
+        format!("merge-approved:{}:{next_version}", instance.id),
         json!({
             "workflow_id": instance.id,
             "task_id": task_id,
@@ -513,69 +513,85 @@ async fn approve_runtime_merge(
         "dashboard merge approval for ready-to-merge workflow",
     ))
     .high_confidence();
-    let validator = DecisionValidator::github_issue_pr();
-    let validation = validator.validate(
-        &instance,
-        &decision,
-        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
-    );
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id)),
-        Err(error) => {
-            let reason = error.to_string();
-            let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
-            store.record_decision(&record).await?;
-            return Ok(RuntimeMergeApprovalOutcome::Rejected {
-                workflow_id: instance.id,
-                reason,
-            });
-        }
-    };
-    store.record_decision(&record).await?;
-    for command in &decision.commands {
-        store
-            .enqueue_command(&instance.id, Some(&record.id), command)
-            .await?;
-    }
-    instance.state = decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_runtime_merge_data(instance.data, &decision.decision, task_id);
     let workflow_id = instance.id.clone();
-    store.upsert_instance(&instance).await?;
-    Ok(RuntimeMergeApprovalOutcome::Approved { workflow_id })
+    let final_data = merge_runtime_merge_data(instance.data.clone(), &decision.decision, task_id);
+    match apply_pr_feedback_transition(
+        store,
+        instance,
+        "MergeApproved",
+        "workflow_runtime_dashboard",
+        event_payload,
+        decision,
+        final_data,
+    )
+    .await?
+    {
+        RuntimeTransitionApplyOutcome::Applied => {
+            Ok(RuntimeMergeApprovalOutcome::Approved { workflow_id })
+        }
+        RuntimeTransitionApplyOutcome::Rejected { reason } => {
+            Ok(RuntimeMergeApprovalOutcome::Rejected {
+                workflow_id,
+                reason,
+            })
+        }
+        RuntimeTransitionApplyOutcome::Stale => {
+            let state = store
+                .get_instance(&workflow_id)
+                .await?
+                .map(|instance| instance.state)
+                .unwrap_or_else(|| "<missing>".to_string());
+            Ok(RuntimeMergeApprovalOutcome::NotReady { workflow_id, state })
+        }
+    }
 }
 
-async fn apply_decision(
+async fn apply_pr_feedback_transition(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
+    event_type: &str,
+    source: &str,
+    payload: serde_json::Value,
     decision: WorkflowDecision,
-    event_id: Option<String>,
-) -> anyhow::Result<()> {
+    final_data: serde_json::Value,
+) -> anyhow::Result<RuntimeTransitionApplyOutcome> {
     let validator = DecisionValidator::github_issue_pr();
     let validation = validator.validate(
         &instance,
         &decision,
         &ValidationContext::new("workflow-policy", chrono::Utc::now()),
     );
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), event_id),
-        Err(error) => {
-            let reason = error.to_string();
-            let record = WorkflowDecisionRecord::rejected(decision, event_id, &reason);
-            store.record_decision(&record).await?;
-            return Ok(());
-        }
-    };
-    store.record_decision(&record).await?;
-    for command in &decision.commands {
-        store
-            .enqueue_command(&instance.id, Some(&record.id), command)
+    if let Err(error) = validation {
+        let reason = error.to_string();
+        let event = store
+            .append_event(&instance.id, event_type, source, payload)
             .await?;
+        let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
+        store.record_decision(&record).await?;
+        return Ok(RuntimeTransitionApplyOutcome::Rejected { reason });
     }
-    instance.state = decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(instance.data, &decision.decision);
-    store.upsert_instance(&instance).await
+
+    let expected_state = instance.state.clone();
+    let mut final_instance = instance;
+    final_instance.state = decision.next_state.clone();
+    final_instance.version = final_instance.version.saturating_add(1);
+    final_instance.data = final_data;
+
+    match store
+        .apply_decision_transition(WorkflowDecisionTransition {
+            expected_state: &expected_state,
+            event_type,
+            source,
+            payload,
+            decision: &decision,
+            final_instance: &final_instance,
+            command_status: "pending",
+        })
+        .await?
+    {
+        Some(_) => Ok(RuntimeTransitionApplyOutcome::Applied),
+        None => Ok(RuntimeTransitionApplyOutcome::Stale),
+    }
 }
 
 async fn has_active_pr_feedback_command(
@@ -701,7 +717,11 @@ async fn load_or_issue_instance(
 ) -> anyhow::Result<WorkflowInstance> {
     Ok(match store.get_instance(&workflow_id).await? {
         Some(instance) => instance,
-        None => issue_instance(workflow_id, project_id, repo, issue_number, state),
+        None => {
+            let instance = issue_instance(workflow_id, project_id, repo, issue_number, state);
+            store.upsert_instance(&instance).await?;
+            instance
+        }
     })
 }
 
@@ -971,6 +991,90 @@ mod tests {
             }
         );
         assert_eq!(store.commands_for(&workflow_id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_pr_feedback_transition_does_not_leave_partial_runtime_records(
+    ) -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let parent = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "pr_open",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 123,
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "task-1",
+        }));
+        store.upsert_instance(&parent).await?;
+
+        let output = build_pr_feedback_sweep_decision(
+            &parent,
+            PrFeedbackSweepDecisionInput {
+                dedupe_key: "stale-sweep-command",
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+                issue_number: Some(123),
+                repo: Some("owner/repo"),
+                summary: "Runtime workflow requested a PR feedback sweep.",
+            },
+        );
+        let final_data = merge_last_decision(parent.data.clone(), &output.decision.decision);
+        let mut raced_parent = parent.clone();
+        raced_parent.state = "ready_to_merge".to_string();
+        raced_parent.version = raced_parent.version.saturating_add(1);
+        store.upsert_instance(&raced_parent).await?;
+
+        let outcome = apply_pr_feedback_transition(
+            &store,
+            parent,
+            "PrFeedbackSweepRequested",
+            "workflow_runtime_pr_feedback",
+            json!({
+                "issue_number": 123,
+                "repo": "owner/repo",
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+            }),
+            output.decision,
+            final_data,
+        )
+        .await?;
+
+        assert_eq!(outcome, RuntimeTransitionApplyOutcome::Stale);
+        let persisted = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("workflow should still exist");
+        assert_eq!(persisted.state, "ready_to_merge");
+        assert!(store.events_for(&workflow_id).await?.is_empty());
+        assert!(store.decisions_for(&workflow_id).await?.is_empty());
+        assert!(store.commands_for(&workflow_id).await?.is_empty());
         Ok(())
     }
 
