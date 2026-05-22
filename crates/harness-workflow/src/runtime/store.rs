@@ -215,6 +215,7 @@ pub struct WorkflowRuntimeSummaryCounts {
 
 pub struct WorkflowDecisionTransition<'a> {
     pub expected_state: &'a str,
+    pub create_if_missing: Option<&'a WorkflowInstance>,
     pub event_type: &'a str,
     pub source: &'a str,
     pub payload: Value,
@@ -385,16 +386,40 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
         let final_instance = transition.final_instance;
         let decision = transition.decision;
+        if decision.workflow_id != final_instance.id {
+            anyhow::bail!(
+                "workflow decision `{}` targets `{}` but final instance is `{}`",
+                decision.decision,
+                decision.workflow_id,
+                final_instance.id
+            );
+        }
         let mut tx = self.pool.begin().await?;
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
                 .bind(&final_instance.id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let Some((data,)) = row else {
-            return Ok(None);
+        let current: WorkflowInstance = match row {
+            Some((data,)) => serde_json::from_str(&data)?,
+            None => {
+                let Some(initial_instance) = transition.create_if_missing else {
+                    return Ok(None);
+                };
+                if initial_instance.id != final_instance.id {
+                    anyhow::bail!(
+                        "initial workflow instance `{}` does not match final instance `{}`",
+                        initial_instance.id,
+                        final_instance.id
+                    );
+                }
+                if initial_instance.state != transition.expected_state {
+                    return Ok(None);
+                }
+                upsert_instance_tx(&mut tx, initial_instance).await?;
+                initial_instance.clone()
+            }
         };
-        let current: WorkflowInstance = serde_json::from_str(&data)?;
         if current.is_terminal() || current.state != transition.expected_state {
             return Ok(None);
         }
