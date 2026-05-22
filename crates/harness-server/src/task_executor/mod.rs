@@ -165,13 +165,14 @@ async fn run_test_gate(
         }
     };
 
+    let env: Vec<(&str, &str)> = extra_env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+
     for cmd in &cmds {
         tracing::info!(cmd = %cmd, "test gate: running tests before accepting LGTM");
 
-        let env: Vec<(&str, &str)> = extra_env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
         let outcome = validation_executor
             .run(ValidationRequest {
                 command: cmd,
