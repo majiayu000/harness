@@ -1612,15 +1612,16 @@ pub async fn mutate_and_persist(
     id: &TaskId,
     f: impl FnOnce(&mut TaskState),
 ) -> anyhow::Result<()> {
-    let original = store.cache.get(id).map(|entry| entry.value().clone());
-    let mut attempted = None;
+    let mut rollback_state = None;
     if let Some(mut entry) = store.cache.get_mut(id) {
+        let original = entry.value().clone();
         f(entry.value_mut());
         entry.value_mut().reconcile_scheduler_with_status();
-        attempted = Some(entry.value().clone());
+        let attempted = entry.value().clone();
+        rollback_state = Some((original, attempted));
     }
     if let Err(error) = store.persist(id).await {
-        if let (Some(original), Some(attempted)) = (original, attempted) {
+        if let Some((original, attempted)) = rollback_state {
             if let Some(mut entry) = store.cache.get_mut(id) {
                 if task_states_match_for_rollback(entry.value(), &attempted) {
                     *entry.value_mut() = original;
