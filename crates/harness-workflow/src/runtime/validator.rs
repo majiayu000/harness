@@ -622,11 +622,11 @@ impl DecisionValidator {
             ));
         }
 
-        if !command
+        if command
             .command
             .get("pr_url")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
         {
             return Err(WorkflowDecisionRejection::new(
                 WorkflowDecisionRejectionKind::InvalidCommandPayload,
