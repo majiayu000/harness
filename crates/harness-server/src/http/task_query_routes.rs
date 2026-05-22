@@ -1030,7 +1030,7 @@ fn proof_from_runtime_workflow(
     } else {
         ReviewOutcome::Skipped
     };
-    let ci_status = if status.is_failure() {
+    let ci_status = if status == TaskStatus::Failed {
         CiStatus::Failed
     } else if status == TaskStatus::Done && review_outcome == ReviewOutcome::Approved {
         CiStatus::Passed
@@ -1042,11 +1042,7 @@ fn proof_from_runtime_workflow(
         .filter(|event| {
             matches!(
                 event.event_type.as_str(),
-                "FeedbackFound"
-                    | "NoFeedbackFound"
-                    | "PrReadyToMerge"
-                    | "MergeApproved"
-                    | "PrMerged"
+                "FeedbackFound" | "NoFeedbackFound" | "PrReadyToMerge"
             )
         })
         .count();
@@ -1058,8 +1054,6 @@ fn proof_from_runtime_workflow(
                 "address_pr_feedback"
                     | "wait_for_pr_feedback"
                     | "mark_ready_to_merge"
-                    | "approve_merge"
-                    | "record_pr_merged"
                     | "quality_passed"
             )
         })

@@ -149,6 +149,97 @@ fn proof_counts_agent_review_issues_as_changes_requested() {
 }
 
 #[test]
+fn runtime_proof_reports_cancelled_ci_as_unknown() {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "cancelled",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1139"),
+    )
+    .with_id("runtime-cancelled-proof")
+    .with_data(json!({
+        "task_id": "runtime-cancelled-proof-task",
+        "pr_url": "https://github.com/owner/repo/pull/1139",
+    }));
+
+    let task_id = harness_core::types::TaskId("runtime-cancelled-proof-task".to_string());
+    let proof = proof_from_runtime_workflow(&task_id, &workflow, &[], &[]);
+
+    assert_eq!(proof.status, "cancelled");
+    assert_eq!(proof.ci_status, CiStatus::Unknown);
+    assert_eq!(proof.review_outcome, ReviewOutcome::Skipped);
+}
+
+#[test]
+fn runtime_proof_excludes_merge_events_from_review_rounds() {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "done",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1140"),
+    )
+    .with_id("runtime-merged-proof")
+    .with_data(json!({
+        "task_id": "runtime-merged-proof-task",
+        "pr_url": "https://github.com/owner/repo/pull/1140",
+    }));
+    let events = vec![
+        harness_workflow::runtime::WorkflowEvent::new(
+            workflow.id.clone(),
+            1,
+            "PrReadyToMerge",
+            "test",
+        ),
+        harness_workflow::runtime::WorkflowEvent::new(
+            workflow.id.clone(),
+            2,
+            "MergeApproved",
+            "test",
+        ),
+        harness_workflow::runtime::WorkflowEvent::new(workflow.id.clone(), 3, "PrMerged", "test"),
+    ];
+    let decisions = vec![
+        harness_workflow::runtime::WorkflowDecisionRecord::accepted(
+            harness_workflow::runtime::WorkflowDecision::new(
+                workflow.id.clone(),
+                "awaiting_feedback",
+                "mark_ready_to_merge",
+                "ready_to_merge",
+                "review passed",
+            ),
+            Some(events[0].id.clone()),
+        ),
+        harness_workflow::runtime::WorkflowDecisionRecord::accepted(
+            harness_workflow::runtime::WorkflowDecision::new(
+                workflow.id.clone(),
+                "ready_to_merge",
+                "approve_merge",
+                "merging",
+                "operator approved merge",
+            ),
+            Some(events[1].id.clone()),
+        ),
+        harness_workflow::runtime::WorkflowDecisionRecord::accepted(
+            harness_workflow::runtime::WorkflowDecision::new(
+                workflow.id.clone(),
+                "merging",
+                "record_pr_merged",
+                "done",
+                "PR merged",
+            ),
+            Some(events[2].id.clone()),
+        ),
+    ];
+
+    let task_id = harness_core::types::TaskId("runtime-merged-proof-task".to_string());
+    let proof = proof_from_runtime_workflow(&task_id, &workflow, &events, &decisions);
+
+    assert_eq!(proof.review_outcome, ReviewOutcome::Approved);
+    assert_eq!(proof.ci_status, CiStatus::Passed);
+    assert_eq!(proof.review_rounds, 1);
+}
+
+#[test]
 fn runtime_workflow_scheduler_state_only_marks_executing_states_running() {
     let blocked = runtime_workflow_scheduler_state("blocked", &TaskStatus::Waiting);
     assert_eq!(blocked.authority_state, SchedulerAuthorityState::Queued);
