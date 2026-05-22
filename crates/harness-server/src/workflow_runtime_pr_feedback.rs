@@ -3,8 +3,8 @@ use harness_workflow::runtime::{
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
     DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandType,
-    WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition, WorkflowDefinition,
-    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
+    WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
@@ -578,13 +578,22 @@ async fn commit_runtime_decision(
         &ValidationContext::new("workflow-policy", chrono::Utc::now()),
     );
     if let Err(error) = validation {
-        let event = store
-            .append_event(&instance.id, event_type, source, event_payload)
-            .await?;
         let reason = error.to_string();
-        let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
-        store.record_decision(&record).await?;
-        return Ok(RuntimeDecisionCommitOutcome::Rejected { reason });
+        let record = store
+            .record_rejected_decision_transition(WorkflowRejectedDecisionTransition {
+                expected_state: &expected_state,
+                create_if_missing: new_instance.then_some(&instance),
+                event_type,
+                source,
+                payload: event_payload,
+                decision: &decision,
+                reason: &reason,
+            })
+            .await?;
+        return Ok(match record {
+            Some(_) => RuntimeDecisionCommitOutcome::Rejected { reason },
+            None => RuntimeDecisionCommitOutcome::Stale,
+        });
     }
 
     let mut final_instance = instance.clone();
@@ -864,6 +873,70 @@ mod tests {
             store.events_for(&workflow_id).await?[0].event_type,
             "PrDetected"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_new_runtime_decision_persists_initial_instance() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let instance = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "pr_open",
+        );
+        let decision = WorkflowDecision::new(
+            &workflow_id,
+            "awaiting_feedback",
+            "record_feedback",
+            "addressing_feedback",
+            "intentionally stale observed state",
+        );
+
+        let outcome = commit_runtime_decision(
+            &store,
+            instance.clone(),
+            true,
+            decision,
+            "FeedbackFound",
+            "workflow_runtime_pr_feedback_test",
+            json!({ "issue_number": 123, "pr_number": 77 }),
+            instance.data.clone(),
+        )
+        .await?;
+
+        assert!(matches!(
+            outcome,
+            RuntimeDecisionCommitOutcome::Rejected { .. }
+        ));
+        let loaded = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("rejected initial transition should still persist the workflow instance");
+        assert_eq!(loaded.state, "pr_open");
+        assert_eq!(store.events_for(&workflow_id).await?.len(), 1);
+        let decisions = store.decisions_for(&workflow_id).await?;
+        assert_eq!(decisions.len(), 1);
+        assert!(!decisions[0].accepted);
         Ok(())
     }
 

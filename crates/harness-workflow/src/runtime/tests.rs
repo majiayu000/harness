@@ -5102,6 +5102,78 @@ async fn durable_store_apply_decision_transition_can_create_initial_instance() -
 }
 
 #[tokio::test]
+async fn durable_store_apply_decision_transition_does_not_rewind_existing_instance(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+
+    let initial = project_issue_instance("/project-a", 124, "implementing");
+    let mut existing = initial.clone();
+    existing.state = "awaiting_feedback".to_string();
+    existing.data = json!({
+        "project_id": "/project-a",
+        "issue_number": 124,
+        "pr_number": 78,
+        "last_decision": "record_feedback",
+    });
+    store.upsert_instance(&existing).await?;
+    let decision = WorkflowDecision::new(
+        &initial.id,
+        "implementing",
+        "bind_pr",
+        "pr_open",
+        "implementation produced a pull request for the issue workflow",
+    )
+    .with_command(WorkflowCommand::bind_pr(
+        79,
+        "https://github.com/owner/repo/pull/79",
+        "pr-detected:task-2:79",
+    ));
+    let mut final_instance = initial.clone();
+    final_instance.state = "pr_open".to_string();
+    final_instance.version = final_instance.version.saturating_add(1);
+    final_instance.data = json!({
+        "project_id": "/project-a",
+        "issue_number": 124,
+        "pr_number": 79,
+        "pr_url": "https://github.com/owner/repo/pull/79",
+        "last_decision": "bind_pr",
+    });
+
+    let record = store
+        .apply_decision_transition(WorkflowDecisionTransition {
+            expected_state: "implementing",
+            create_if_missing: Some(&initial),
+            event_type: "PrDetected",
+            source: "workflow-runtime-test",
+            payload: json!({
+                "issue_number": 124,
+                "pr_number": 79,
+                "pr_url": "https://github.com/owner/repo/pull/79",
+            }),
+            decision: &decision,
+            final_instance: &final_instance,
+            command_status: "pending",
+        })
+        .await?;
+
+    assert!(record.is_none());
+    let loaded = store
+        .get_instance(&initial.id)
+        .await?
+        .expect("existing instance should remain visible");
+    assert_eq!(loaded.state, "awaiting_feedback");
+    assert_eq!(loaded.data["pr_number"], 78);
+    assert!(store.events_for(&initial.id).await?.is_empty());
+    assert!(store.decisions_for(&initial.id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn durable_store_lists_workflow_runtime_tree_inputs() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

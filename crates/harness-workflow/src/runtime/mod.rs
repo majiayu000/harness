@@ -64,7 +64,9 @@ pub use repo_backlog::{
     StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
     REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
-pub use store::{WorkflowDecisionTransition, WorkflowRuntimeStore};
+pub use store::{
+    WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+};
 pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,
     IssueSubmissionWorkflowAction,
