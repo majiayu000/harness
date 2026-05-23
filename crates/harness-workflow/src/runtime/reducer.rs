@@ -7,7 +7,10 @@ use super::pr_feedback::{
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use super::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
-use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
+use super::quality_gate::{
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
+};
 use super::repo_backlog::{
     REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
@@ -71,6 +74,31 @@ fn reduce_success(
         .cloned()
     {
         return Some(decision);
+    }
+
+    if quality_gate_activity_matches(instance, result) {
+        if let Some(decision) = structured_decision.as_ref() {
+            let reason = if let Some(contract_reason) = quality_gate_success_contract_error(result)
+            {
+                format!(
+                    "runtime activity `{}` emitted workflow_decision `{}` for workflow `{}` in state `{}`, but {contract_reason}",
+                    result.activity, decision.decision, instance.definition_id, instance.state
+                )
+            } else {
+                format!(
+                    "runtime activity `{}` emitted workflow_decision `{}` for workflow `{}` in state `{}`, but the decision to `{}` did not validate",
+                    result.activity,
+                    decision.decision,
+                    instance.definition_id,
+                    instance.state,
+                    decision.next_state
+                )
+            };
+            return Some(invalid_agent_output_blocked_decision(
+                instance, event, result, &reason,
+            ));
+        }
+        return quality_gate_success_decision(instance, event, result);
     }
 
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
@@ -1003,6 +1031,12 @@ fn structured_decision_validates(
     {
         return false;
     }
+    if quality_gate_activity_matches(instance, result)
+        && decision.next_state == "passed"
+        && quality_gate_success_contract_error(result).is_some()
+    {
+        return false;
+    }
 
     let validator = match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
@@ -1151,6 +1185,76 @@ fn invalid_agent_output_blocked_decision(
     ))
     .with_evidence(runtime_completion_evidence(event, result))
     .high_confidence()
+}
+
+fn quality_gate_success_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if !quality_gate_activity_matches(instance, result) {
+        return None;
+    }
+
+    if quality_gate_success_contract_error(result).is_none() {
+        return Some(
+            WorkflowDecision::new(
+                &instance.id,
+                &instance.state,
+                "quality_passed",
+                "passed",
+                "quality gate activity completed successfully with passing evidence",
+            )
+            .with_evidence(runtime_completion_evidence(event, result))
+            .high_confidence(),
+        );
+    }
+
+    let reason = quality_gate_success_contract_error(result)?;
+    Some(invalid_agent_output_blocked_decision(
+        instance, event, result, reason,
+    ))
+}
+
+fn quality_gate_activity_matches(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+    (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) == (
+        QUALITY_GATE_DEFINITION_ID,
+        "checking",
+        QUALITY_GATE_ACTIVITY,
+    )
+}
+
+fn quality_gate_success_contract_error(result: &ActivityResult) -> Option<&'static str> {
+    let passed = signal_count(result, QUALITY_PASSED_SIGNAL);
+    let failed = signal_count(result, QUALITY_FAILED_SIGNAL);
+    let blocked = signal_count(result, QUALITY_BLOCKED_SIGNAL);
+    let status_count = passed + failed + blocked;
+    if status_count == 0 {
+        Some("run_quality_gate succeeded without a quality status signal")
+    } else if passed == 0 {
+        Some("run_quality_gate succeeded without a QualityPassed signal")
+    } else if passed > 1 || failed > 0 || blocked > 0 {
+        Some("run_quality_gate succeeded with ambiguous quality status signals")
+    } else if !quality_gate_has_validation_evidence(result) {
+        Some("run_quality_gate succeeded without validation evidence")
+    } else {
+        None
+    }
+}
+
+fn quality_gate_has_validation_evidence(result: &ActivityResult) -> bool {
+    result
+        .validation
+        .iter()
+        .any(|record| !record.command.trim().is_empty())
+        || result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "validation_report")
 }
 
 fn signal_count(result: &ActivityResult, signal_type: &str) -> usize {

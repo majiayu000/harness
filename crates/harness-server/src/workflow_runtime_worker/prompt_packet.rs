@@ -648,7 +648,7 @@ mod tests {
         );
         assert_eq!(
             schema["activity_contract"]["success_requires"],
-            "quality_gate_status_signal"
+            "quality_gate_status_signal_and_validation_evidence"
         );
         assert!(schema["workflow_decision_contract"]["allowed_transitions"]
             .as_array()

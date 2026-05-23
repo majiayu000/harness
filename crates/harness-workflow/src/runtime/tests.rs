@@ -22,7 +22,8 @@ use super::{
     RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowDecisionTransition,
     WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
     PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID,
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID,
     REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
@@ -3284,6 +3285,12 @@ fn runtime_completion_reducer_passes_quality_gate_after_success() {
     let instance = quality_gate_instance("checking");
     let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
     let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({
+                "validation": "passed"
+            }),
+        ))
         .with_validation(ValidationRecord::new("cargo check", "passed"))
         .with_validation(ValidationRecord::new("cargo test", "passed"));
     let event = WorkflowEvent::new(
@@ -3313,6 +3320,209 @@ fn runtime_completion_reducer_passes_quality_gate_after_success() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("quality gate pass transition should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_quality_gate_success_without_status_signal() {
+    let instance = quality_gate_instance("checking");
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_validation(ValidationRecord::new("cargo check", "passed"));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate missing status signal should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkBlocked
+    );
+    assert!(decision.reason.contains("without a quality status signal"));
+    DecisionValidator::quality_gate()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("quality gate invalid output should validate as blocked");
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_quality_gate_success_without_validation_evidence() {
+    let instance = quality_gate_instance("checking");
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({
+                "validation": "passed"
+            }),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate missing validation evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("without validation evidence"));
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_quality_gate_success_with_conflicting_status_signals() {
+    let instance = quality_gate_instance("checking");
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation was inconsistent.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({
+                "validation": "passed"
+            }),
+        ))
+        .with_signal(ActivitySignal::new(
+            QUALITY_FAILED_SIGNAL,
+            json!({
+                "validation": "failed"
+            }),
+        ))
+        .with_signal(ActivitySignal::new(
+            QUALITY_BLOCKED_SIGNAL,
+            json!({
+                "blocker": "manual review needed"
+            }),
+        ))
+        .with_validation(ValidationRecord::new("cargo test", "passed"));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate conflicting status signals should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("ambiguous quality status signals"));
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_quality_gate_structured_pass_without_contract_evidence() {
+    let instance = quality_gate_instance("checking");
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "checking",
+        "quality_passed",
+        "passed",
+        "The agent claimed the quality gate passed.",
+    )
+    .with_evidence(WorkflowEvidence::new("quality_gate", "claimed pass"));
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_artifact(ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate structured pass without contract evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("without a quality status signal"));
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_quality_gate_invalid_structured_decision_with_contract_evidence(
+) {
+    let instance = quality_gate_instance("checking");
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "pending",
+        "quality_passed",
+        "passed",
+        "The agent observed a stale quality gate state.",
+    );
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({
+                "validation": "passed"
+            }),
+        ))
+        .with_validation(ValidationRecord::new("cargo test", "passed"))
+        .with_artifact(ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("invalid quality gate workflow_decision should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("did not validate"));
 }
 
 #[test]
