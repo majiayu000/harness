@@ -4,3 +4,4 @@ mod otel_export;
 pub mod quality;
 pub mod session;
 pub mod stats;
+pub mod usage;

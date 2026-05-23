@@ -15,7 +15,8 @@ use tokio::sync::RwLock;
 
 pub(crate) mod streaming;
 pub(crate) use streaming::{
-    run_agent_streaming, run_agent_streaming_with_options, RunAgentStreamingOptions,
+    run_agent_streaming, run_agent_streaming_with_options, set_usage_event_store,
+    RunAgentStreamingOptions,
 };
 
 /// Truncate validation error output to `max_chars` to avoid bloating agent prompts.
