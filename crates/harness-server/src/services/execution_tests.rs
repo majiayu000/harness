@@ -537,7 +537,10 @@ async fn enqueue_background_pr_feedback_creates_pr_scoped_runtime_workflow() -> 
 
     let task_id = svc.enqueue_background(req).await?;
 
-    assert_eq!(task_id.as_str(), "repo-backlog:owner/repo:pr:77:feedback");
+    assert_eq!(
+        task_id.as_str(),
+        format!("repo-backlog:{project_id}:owner/repo:pr:77:feedback")
+    );
     assert!(
         task_store.get_with_db_fallback(&task_id).await?.is_none(),
         "workflow runtime PR feedback submissions must not register legacy PR task rows"
