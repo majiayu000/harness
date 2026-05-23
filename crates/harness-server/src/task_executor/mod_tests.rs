@@ -1,4 +1,8 @@
 use super::*;
+use harness_core::validation::{
+    ShellValidationExecutor, ValidationExecutor, ValidationOutcome, ValidationOutcomeKind,
+    ValidationRequest, MAX_CAPTURED_OUTPUT_BYTES,
+};
 
 #[test]
 fn periodic_review_source_uses_standard_allowed_tools() {
@@ -359,6 +363,92 @@ async fn prompt_only_nonempty_output_no_pr_stays_done() -> anyhow::Result<()> {
     assert!(
         matches!(final_state.status, TaskStatus::Done),
         "prompt-only task with non-empty output and no PR must be Done"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gate_caps_large_failure_output() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir()?;
+    let script = dir.path().join("large-output-test");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ndd if=/dev/zero bs=4096 count=256 2>/dev/null\nexit 7\n",
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    let cmd = "./large-output-test".to_string();
+    let validation_executor = ShellValidationExecutor::new();
+
+    let err = run_test_gate(
+        &validation_executor,
+        dir.path(),
+        &[cmd],
+        10,
+        &HashMap::new(),
+    )
+    .await
+    .expect_err("failing test command should reject LGTM");
+
+    assert!(err.contains("Test gate failed (exit 7)"));
+    let stdout = err
+        .split_once("stdout:\n")
+        .and_then(|(_, tail)| tail.split_once("\nstderr:\n").map(|(stdout, _)| stdout))
+        .expect("test gate error should include stdout and stderr sections");
+    assert_eq!(
+        stdout.len(),
+        MAX_CAPTURED_OUTPUT_BYTES,
+        "test gate must cap captured stdout using the validation executor"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gate_passes_extra_env_to_validation_executor() -> anyhow::Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct RecordingValidationExecutor {
+        env: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ValidationExecutor for RecordingValidationExecutor {
+        async fn run<'a>(&self, request: ValidationRequest<'a>) -> ValidationOutcome {
+            self.env.lock().unwrap().extend(
+                request
+                    .env
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+            );
+            ValidationOutcome {
+                kind: ValidationOutcomeKind::Success,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let executor = RecordingValidationExecutor::default();
+    let captured = Arc::clone(&executor.env);
+    let mut extra_env = HashMap::new();
+    extra_env.insert(
+        "CARGO_TARGET_DIR".to_string(),
+        "/tmp/harness-task-target".to_string(),
+    );
+
+    run_test_gate(&executor, dir.path(), &["true".to_string()], 10, &extra_env)
+        .await
+        .expect("successful executor outcome should pass the test gate");
+
+    assert_eq!(
+        captured.lock().unwrap().as_slice(),
+        &[(
+            "CARGO_TARGET_DIR".to_string(),
+            "/tmp/harness-task-target".to_string(),
+        )]
     );
     Ok(())
 }

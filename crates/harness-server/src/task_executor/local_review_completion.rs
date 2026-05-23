@@ -2,6 +2,7 @@ use super::{review_loop, run_test_gate};
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
+use harness_core::validation::ShellValidationExecutor;
 use harness_workflow::runtime::PrFeedbackOutcome;
 use std::collections::HashMap;
 use std::path::Path;
@@ -357,7 +358,9 @@ pub(crate) async fn complete_after_local_review_without_hosted_bot(
     task_start: Instant,
 ) -> anyhow::Result<()> {
     tracing::info!("review_bot_auto_trigger disabled; running validation gate before completion");
+    let validation_executor = ShellValidationExecutor::new();
     match run_test_gate(
+        &validation_executor,
         project,
         &project_config.validation.pre_push,
         project_config.validation.test_gate_timeout_secs,

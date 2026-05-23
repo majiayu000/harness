@@ -11,6 +11,7 @@ use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::prompts;
 use harness_core::tool_isolation::validate_tool_usage;
 use harness_core::types::{Decision, ExecutionPhase, TurnFailure, TurnFailureKind};
+use harness_core::validation::ShellValidationExecutor;
 use harness_workflow::runtime::PrFeedbackOutcome;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -1673,7 +1674,9 @@ pub(crate) async fn run_review_loop(
             // Hard gate: run the project's tests before accepting LGTM.
             // This prevents agents from gaming the review by manipulating tests
             // rather than fixing code (OpenAI "Monitoring Reasoning Models", 2026).
+            let validation_executor = ShellValidationExecutor::new();
             match super::run_test_gate(
+                &validation_executor,
                 project,
                 &project_config.validation.pre_push,
                 project_config.validation.test_gate_timeout_secs,
