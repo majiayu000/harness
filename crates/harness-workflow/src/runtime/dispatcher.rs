@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const COMMAND_STATUS_SKIPPED: &str = "skipped";
+const COMMAND_STATUS_CANCELLED: &str = "cancelled";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandDispatchOutcome {
@@ -182,6 +183,26 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                 command_id: command.id,
                 reason: "command does not require runtime execution".to_string(),
             });
+        }
+
+        if let Some(instance) = self.store.get_instance(&command.workflow_id).await? {
+            if instance.is_terminal() {
+                let command_status = if instance.state == "cancelled" {
+                    COMMAND_STATUS_CANCELLED
+                } else {
+                    COMMAND_STATUS_SKIPPED
+                };
+                self.store
+                    .mark_command_status(&command.id, command_status)
+                    .await?;
+                return Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: format!(
+                        "workflow {} is terminal ({}) before dispatch",
+                        instance.id, instance.state
+                    ),
+                });
+            }
         }
 
         let activity = command.command.runtime_activity_key().to_string();

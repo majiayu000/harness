@@ -4650,6 +4650,77 @@ async fn runtime_worker_keeps_repo_backlog_dispatching_until_child_starts_finish
 }
 
 #[tokio::test]
+async fn runtime_completion_counts_dispatching_sibling_as_active() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = repo_backlog_instance("dispatching");
+    store.upsert_instance(&workflow).await?;
+    let first_command = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:200",
+        "repo-backlog:owner/repo:issue:200:start",
+    );
+    let first_command_id = store
+        .enqueue_command(&workflow.id, None, &first_command)
+        .await?;
+    let second_command = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:201",
+        "repo-backlog:owner/repo:issue:201:start",
+    );
+    let second_command_id = store
+        .enqueue_command(&workflow.id, None, &second_command)
+        .await?;
+
+    store
+        .enqueue_runtime_job_for_pending_command(
+            &first_command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "start_child_workflow" }),
+            None,
+        )
+        .await?;
+    let claimed = store
+        .claim_pending_commands("dispatcher-test", Utc::now() + Duration::minutes(5), 10)
+        .await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, second_command_id);
+    assert_eq!(claimed[0].status, "dispatching");
+
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded("workflow_activity", "Child workflow started."),
+    };
+    worker
+        .run_once(&executor)
+        .await?
+        .expect("first child dispatch job should complete");
+
+    let completion = store
+        .events_for(&workflow.id)
+        .await?
+        .into_iter()
+        .find(|event| event.event_type == "RuntimeJobCompleted")
+        .expect("completion event should exist");
+    assert_eq!(completion.event["active_start_child_workflow_commands"], 1);
+
+    let parent = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(
+        parent.state, "dispatching",
+        "parent must stay dispatching while sibling is still in dispatching status"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_worker_propagates_pr_feedback_child_completion_to_parent() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -6089,5 +6160,48 @@ async fn runtime_command_dispatcher_skips_non_runtime_commands() -> anyhow::Resu
         .await?
         .is_empty());
     assert_eq!(store.commands_for(&instance.id).await?[0].status, "skipped");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_command_dispatcher_skips_terminal_workflow_before_enqueue() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 123, "cancelled");
+    store.upsert_instance(&instance).await?;
+    let command =
+        WorkflowCommand::enqueue_activity("implement_issue", "issue-123-cancelled-implement");
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc),
+    );
+
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should be inspected");
+    match outcome {
+        CommandDispatchOutcome::Skipped {
+            command_id: skipped_command_id,
+            reason,
+        } => {
+            assert_eq!(skipped_command_id, command_id);
+            assert!(reason.contains("terminal (cancelled)"));
+        }
+        other => panic!("unexpected dispatch outcome: {other:?}"),
+    }
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert_eq!(
+        store.commands_for(&instance.id).await?[0].status,
+        "cancelled"
+    );
     Ok(())
 }

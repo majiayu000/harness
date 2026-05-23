@@ -67,28 +67,33 @@ impl<'a> RuntimeWorker<'a> {
             .await?;
 
         let consumes_runtime_turn = executor.consumes_runtime_turn(&job);
-        let result = match self
-            .max_turns_budget_result(&job, consumes_runtime_turn)
-            .await?
-        {
+        let result = match self.terminal_workflow_result(&job).await? {
             Some(result) => result,
             None => {
-                if consumes_runtime_turn {
-                    self.store
-                        .record_runtime_event(
-                            &job.id,
-                            "RuntimeTurnStarted",
-                            json!({
-                                "owner": self.owner.as_str(),
-                            }),
-                        )
-                        .await?;
+                match self
+                    .max_turns_budget_result(&job, consumes_runtime_turn)
+                    .await?
+                {
+                    Some(result) => result,
+                    None => {
+                        if consumes_runtime_turn {
+                            self.store
+                                .record_runtime_event(
+                                    &job.id,
+                                    "RuntimeTurnStarted",
+                                    json!({
+                                        "owner": self.owner.as_str(),
+                                    }),
+                                )
+                                .await?;
+                        }
+                        let execution = self
+                            .execute_with_lease_renewal(&job, executor, lease_expires_at)
+                            .await?;
+                        lease_expires_at = execution.lease_expires_at;
+                        execution.result
+                    }
                 }
-                let execution = self
-                    .execute_with_lease_renewal(&job, executor, lease_expires_at)
-                    .await?;
-                lease_expires_at = execution.lease_expires_at;
-                execution.result
             }
         };
         self.store
@@ -120,6 +125,28 @@ impl<'a> RuntimeWorker<'a> {
                 .await?;
         }
         Ok(Some(completion.runtime_job))
+    }
+
+    async fn terminal_workflow_result(
+        &self,
+        job: &RuntimeJob,
+    ) -> anyhow::Result<Option<ActivityResult>> {
+        let Some(workflow_id) = job.input.get("workflow_id").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(instance) = self.store.get_instance(workflow_id).await? else {
+            return Ok(None);
+        };
+        if !instance.is_terminal() {
+            return Ok(None);
+        }
+        Ok(Some(ActivityResult::cancelled(
+            runtime_job_activity_name(job),
+            format!(
+                "Workflow {} was already terminal ({}) before runtime execution.",
+                instance.id, instance.state
+            ),
+        )))
     }
 
     async fn execute_with_lease_renewal(
