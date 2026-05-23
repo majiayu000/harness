@@ -63,7 +63,7 @@ interface CardProps {
 }
 
 function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
-  const pct = card.maxTurns != null ? Math.round((card.turn / card.maxTurns) * 100) : null;
+  const pct = card.maxTurns != null && card.maxTurns > 0 ? Math.round((card.turn / card.maxTurns) * 100) : null;
   const failed = card.status === "failed";
 
   return (

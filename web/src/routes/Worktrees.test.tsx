@@ -176,6 +176,33 @@ describe("<Worktrees>", () => {
     expect(screen.queryByText("Disk")).not.toBeInTheDocument();
   });
 
+  it("skips progress rendering for zero turn budgets", () => {
+    mockUseWorktrees.mockReturnValue({
+      cards: [
+        worktreeCard({
+          maxTurns: 0,
+          turn: 0,
+        }),
+      ],
+      isLoading: false,
+      error: null,
+    });
+    mockUseOverview.mockReturnValue({
+      data: {
+        projects: [],
+        runtimes: [],
+        kpi: {
+          active_tasks: 1,
+        },
+      },
+    });
+
+    wrap(<Worktrees />);
+
+    expect(screen.queryByText("turn 0/0")).not.toBeInTheDocument();
+    expect(screen.queryByText("NaN%")).not.toBeInTheDocument();
+  });
+
   it("links the empty state CTA to dashboard submission", () => {
     mockUseWorktrees.mockReturnValue({
       cards: [],

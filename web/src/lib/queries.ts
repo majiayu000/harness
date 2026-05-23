@@ -234,6 +234,10 @@ function worktreeStatusRank(status: string): number {
   }
 }
 
+function normalizeMaxTurns(maxTurns: number | null): number | null {
+  return typeof maxTurns === "number" && maxTurns > 0 ? maxTurns : null;
+}
+
 export async function registerProject(req: {
   id: string;
   root: string;
@@ -266,7 +270,7 @@ export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; err
       phase: entry.phase,
       description: entry.description,
       turn: entry.turn,
-      maxTurns: entry.max_turns,
+      maxTurns: normalizeMaxTurns(entry.max_turns),
       createdAt: entry.created_at,
       durationSecs: entry.duration_secs,
       prUrl: entry.pr_url,

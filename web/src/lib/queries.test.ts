@@ -97,6 +97,15 @@ describe("useWorktrees", () => {
     });
   });
 
+  it("normalizes zero max_turns to an unknown turn budget", async () => {
+    mockWorktreeFetch([worktreeEntry({ max_turns: 0 })]);
+    const { result } = renderHook(() => useWorktrees(), { wrapper: makeWrapper() });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.cards[0].maxTurns).toBeNull();
+  });
+
   it("sorts failed, review, implementing, then queued by duration", async () => {
     mockWorktreeFetch([
       worktreeEntry({ task_id: "queued", status: "pending", duration_secs: 999 }),
