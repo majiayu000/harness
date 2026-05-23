@@ -47,15 +47,6 @@ pub(super) fn activity_result_from_turn(
                 );
             }
         }
-        ActivityResultEnvelopeOutcome::RepairedStructuredOutput => {
-            tracing::info!(
-                runtime_job_id = %job.id,
-                activity = %activity,
-                agent = %agent_name,
-                extraction_strategy = ?envelope.extraction_strategy,
-                "activity result recovered from compatible structured output"
-            );
-        }
         ActivityResultEnvelopeOutcome::TurnFailed => {
             if let Some(error) = envelope.extraction_error.as_deref() {
                 tracing::warn!(
@@ -97,7 +88,6 @@ pub(super) fn activity_result_from_turn(
 #[serde(rename_all = "snake_case")]
 enum ActivityResultExtractionStrategy {
     FencedActivityResult,
-    JsonFenceRepair,
     NotAttempted,
 }
 
@@ -105,7 +95,6 @@ enum ActivityResultExtractionStrategy {
 #[serde(rename_all = "snake_case")]
 enum ActivityResultEnvelopeOutcome {
     Accepted,
-    RepairedStructuredOutput,
     MissingStructuredOutput,
     InvalidStructuredOutput,
     TurnCancelled,
@@ -131,21 +120,6 @@ impl ActivityResultEnvelope {
         Self {
             extraction_strategy,
             outcome: ActivityResultEnvelopeOutcome::Accepted,
-            raw_status,
-            extracted_activity: Some(result.activity.clone()),
-            extraction_error: None,
-            final_result: result,
-        }
-    }
-
-    fn repaired(
-        raw_status: TurnStatus,
-        extraction_strategy: ActivityResultExtractionStrategy,
-        result: ActivityResult,
-    ) -> Self {
-        Self {
-            extraction_strategy,
-            outcome: ActivityResultEnvelopeOutcome::RepairedStructuredOutput,
             raw_status,
             extracted_activity: Some(result.activity.clone()),
             extraction_error: None,
@@ -254,13 +228,6 @@ fn activity_result_envelope_from_turn(
                 ActivityResultExtractionStrategy::FencedActivityResult,
                 result,
             ),
-            StructuredActivityResult::RepairedJsonFence(result) => {
-                ActivityResultEnvelope::repaired(
-                    *status,
-                    ActivityResultExtractionStrategy::JsonFenceRepair,
-                    result,
-                )
-            }
             StructuredActivityResult::Missing => ActivityResultEnvelope::missing_structured_output(
                 *status,
                 activity.to_string(),
@@ -294,7 +261,6 @@ fn turn_error_is_timeout(error: &str) -> bool {
 enum StructuredActivityResult {
     Missing,
     Parsed(ActivityResult),
-    RepairedJsonFence(ActivityResult),
     Invalid {
         error: String,
         extracted_activity: Option<String>,
@@ -306,8 +272,7 @@ fn structured_activity_result(items: &[Item], expected_activity: &str) -> Struct
         return parse_activity_result_block(block, expected_activity);
     }
 
-    latest_json_activity_result_repair(items, expected_activity)
-        .unwrap_or(StructuredActivityResult::Missing)
+    StructuredActivityResult::Missing
 }
 
 fn parse_activity_result_block(block: &str, expected_activity: &str) -> StructuredActivityResult {
@@ -343,28 +308,6 @@ fn parse_activity_result_json(
 struct StructuredActivityResultError {
     error: String,
     extracted_activity: Option<String>,
-}
-
-fn latest_json_activity_result_repair(
-    items: &[Item],
-    expected_activity: &str,
-) -> Option<StructuredActivityResult> {
-    items.iter().rev().find_map(|item| match item {
-        Item::AgentReasoning { content } => {
-            let block = extract_fenced_block(content, "json")?;
-            match parse_activity_result_json(block, expected_activity) {
-                Ok(result) => Some(StructuredActivityResult::RepairedJsonFence(result)),
-                Err(error) if error.extracted_activity.is_some() => {
-                    Some(StructuredActivityResult::Invalid {
-                        error: error.error,
-                        extracted_activity: error.extracted_activity,
-                    })
-                }
-                Err(_) => None,
-            }
-        }
-        _ => None,
-    })
 }
 
 fn latest_activity_result_block(items: &[Item]) -> Option<&str> {
@@ -577,7 +520,7 @@ Final result:
     }
 
     #[test]
-    fn activity_result_from_turn_repairs_generic_json_activity_result_block() {
+    fn activity_result_from_turn_rejects_generic_json_activity_result_block() {
         let job = RuntimeJob::pending(
             "command-1",
             RuntimeKind::CodexJsonrpc,
@@ -607,22 +550,23 @@ Final result:
         );
 
         assert_eq!(result.activity, "implement_issue");
-        assert_eq!(result.status, ActivityStatus::Succeeded);
+        assert_eq!(result.status, ActivityStatus::Failed);
         assert_eq!(
-            result.summary,
-            "Implementation completed from generic JSON."
+            result.error_kind,
+            Some(ActivityErrorKind::Configuration),
+            "generic JSON fences must not satisfy the final output contract"
         );
-        let pr_artifact = result
+        assert!(!result
             .artifacts
             .iter()
-            .find(|artifact| artifact.artifact_type == "pull_request")
-            .expect("repaired pull request artifact should be preserved");
-        assert_eq!(pr_artifact.artifact["pr_number"], 88);
+            .any(|artifact| artifact.artifact_type == "pull_request"));
         let envelope = envelope_artifact(&result);
-        assert_eq!(envelope["outcome"], "repaired_structured_output");
-        assert_eq!(envelope["extraction_strategy"], "json_fence_repair");
-        assert_eq!(envelope["extracted_activity"], "implement_issue");
-        assert!(envelope["extraction_error"].is_null());
+        assert_eq!(envelope["outcome"], "missing_structured_output");
+        assert_eq!(envelope["extraction_strategy"], "fenced_activity_result");
+        assert!(envelope["extracted_activity"].is_null());
+        assert!(envelope["extraction_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("harness-activity-result")));
     }
 
     #[test]
