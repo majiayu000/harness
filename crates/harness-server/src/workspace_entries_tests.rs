@@ -21,6 +21,7 @@ fn workspace_entries_return_active_workspace_metadata_sorted_by_task_id() {
             ActiveWorkspace {
                 workspace_path: workspace_path.clone(),
                 source_repo: source_repo.clone(),
+                repo: Some("owner/repo".to_string()),
                 branch: format!("harness/{}", task_id.0),
                 created_at,
                 owner_session: mgr.owner_session.clone(),
@@ -41,6 +42,7 @@ fn workspace_entries_return_active_workspace_metadata_sorted_by_task_id() {
     );
     assert_eq!(entries[0].workspace_path, root.join("task-a"));
     assert_eq!(entries[0].source_repo, tmp.path().join("repo"));
+    assert_eq!(entries[0].repo.as_deref(), Some("owner/repo"));
     assert_eq!(entries[0].branch, "harness/task-a");
     assert_eq!(entries[0].created_at, created_at);
 }

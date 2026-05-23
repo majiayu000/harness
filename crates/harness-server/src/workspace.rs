@@ -56,6 +56,7 @@ fn git_command() -> tokio::process::Command {
 pub(crate) struct ActiveWorkspace {
     pub(crate) workspace_path: PathBuf,
     pub(crate) source_repo: PathBuf,
+    pub(crate) repo: Option<String>,
     pub(crate) branch: String,
     pub(crate) created_at: SystemTime,
     pub(crate) owner_session: String,
@@ -67,6 +68,7 @@ pub struct WorkspaceEntry {
     pub task_id: TaskId,
     pub workspace_path: PathBuf,
     pub source_repo: PathBuf,
+    pub repo: Option<String>,
     pub branch: String,
     pub created_at: SystemTime,
 }
@@ -375,6 +377,7 @@ impl WorkspaceManager {
                 task_id: entry.key().clone(),
                 workspace_path: entry.workspace_path.clone(),
                 source_repo: entry.source_repo.clone(),
+                repo: entry.repo.clone(),
                 branch: entry.branch.clone(),
                 created_at: entry.created_at,
             })

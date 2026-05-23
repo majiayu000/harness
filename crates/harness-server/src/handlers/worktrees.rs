@@ -1,5 +1,5 @@
 use crate::http::state::AppState;
-use crate::task_runner::{TaskPhase, TaskState};
+use crate::task_runner::{TaskPhase, TaskState, TaskStatus};
 use crate::workspace::WorkspaceEntry;
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
@@ -48,15 +48,25 @@ async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse
     let mut responses = Vec::new();
 
     for entry in manager.entries() {
-        let Some(task) = state.core.tasks.get(&entry.task_id) else {
-            continue;
-        };
-        if let Some(response) = response_from_task(entry, &task, default_max_turns, now) {
+        let task = state.core.tasks.get(&entry.task_id);
+        if let Some(response) = response_from_entry(entry, task.as_ref(), default_max_turns, now) {
             responses.push(response);
         }
     }
 
     Ok(responses)
+}
+
+fn response_from_entry(
+    entry: WorkspaceEntry,
+    task: Option<&TaskState>,
+    default_max_turns: Option<u32>,
+    now: SystemTime,
+) -> Option<WorktreeResponse> {
+    match task {
+        Some(task) => response_from_task(entry, task, default_max_turns, now),
+        None => Some(response_from_workspace_entry(entry, default_max_turns, now)),
+    }
 }
 
 fn response_from_task(
@@ -102,6 +112,37 @@ fn response_from_task(
     })
 }
 
+fn response_from_workspace_entry(
+    entry: WorkspaceEntry,
+    default_max_turns: Option<u32>,
+    now: SystemTime,
+) -> WorktreeResponse {
+    let created_at: DateTime<Utc> = entry.created_at.into();
+    let duration_secs = now
+        .duration_since(entry.created_at)
+        .unwrap_or_default()
+        .as_secs();
+    let source_repo = entry.source_repo.to_string_lossy().into_owned();
+
+    WorktreeResponse {
+        task_id: entry.task_id.0,
+        branch: entry.branch,
+        workspace_path: entry.workspace_path.to_string_lossy().into_owned(),
+        path_short: path_short(&entry.workspace_path),
+        source_repo: source_repo.clone(),
+        repo: entry.repo,
+        status: TaskStatus::Implementing.as_ref().to_string(),
+        phase: phase_name(&TaskPhase::Implement).to_string(),
+        description: None,
+        turn: 0,
+        max_turns: default_max_turns,
+        created_at: created_at.to_rfc3339(),
+        duration_secs,
+        pr_url: None,
+        project: Some(source_repo),
+    }
+}
+
 fn path_short(path: &Path) -> String {
     let components = path
         .components()
@@ -141,6 +182,7 @@ mod tests {
             task_id: CoreTaskId(task_id.to_string()),
             workspace_path: PathBuf::from("/var/harness/workspaces/task-1"),
             source_repo: PathBuf::from("/Users/example/src/repo"),
+            repo: Some("owner/repo".to_string()),
             branch: format!("harness/{task_id}"),
             created_at: UNIX_EPOCH + Duration::from_secs(100),
         }
@@ -224,6 +266,27 @@ mod tests {
         assert_eq!(response.max_turns, Some(20));
     }
 
+    #[test]
+    fn response_from_entry_includes_workspace_without_task_state() {
+        let response = response_from_entry(
+            entry("runtime-workspace-1"),
+            None,
+            Some(20),
+            UNIX_EPOCH + Duration::from_secs(850),
+        )
+        .expect("active workspace should render without task state");
+
+        assert_eq!(response.task_id, "runtime-workspace-1");
+        assert_eq!(response.status, "implementing");
+        assert_eq!(response.phase, "implement");
+        assert_eq!(response.turn, 0);
+        assert_eq!(response.max_turns, Some(20));
+        assert_eq!(response.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(response.project.as_deref(), Some("/Users/example/src/repo"));
+        assert_eq!(response.description, None);
+        assert_eq!(response.pr_url, None);
+    }
+
     #[tokio::test]
     async fn api_route_returns_active_worktree_json() -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
@@ -246,6 +309,7 @@ mod tests {
             crate::workspace::ActiveWorkspace {
                 workspace_path: workspace_path.clone(),
                 source_repo: source_repo.clone(),
+                repo: Some("owner/repo".to_string()),
                 branch: "harness/route-task-1".to_string(),
                 created_at,
                 owner_session: manager.owner_session.clone(),
@@ -287,6 +351,65 @@ mod tests {
         assert_eq!(payload[0]["repo"], "owner/repo");
         assert_eq!(payload[0]["turn"], 2);
         assert_eq!(payload[0]["max_turns"], 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_route_returns_active_worktree_without_task_state() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-worktrees-runtime-api-")?;
+        let mut state = crate::test_helpers::make_test_state(dir.path()).await?;
+        let task_id = CoreTaskId("runtime-workspace-1".to_string());
+        let workspace_path = dir.path().join("workspaces/runtime-workspace-1");
+        let source_repo = dir.path().join("repo");
+        let created_at = UNIX_EPOCH + Duration::from_secs(100);
+
+        let manager = Arc::new(crate::workspace::WorkspaceManager::new(WorkspaceConfig {
+            root: dir.path().join("workspaces"),
+            ..Default::default()
+        })?);
+        manager.active.insert(
+            task_id.clone(),
+            crate::workspace::ActiveWorkspace {
+                workspace_path: workspace_path.clone(),
+                source_repo: source_repo.clone(),
+                repo: Some("owner/repo".to_string()),
+                branch: "harness/runtime-workspace-1".to_string(),
+                created_at,
+                owner_session: manager.owner_session.clone(),
+                run_generation: 1,
+            },
+        );
+        manager.active_paths.insert(workspace_path, task_id);
+        state.concurrency.workspace_mgr = Some(manager);
+
+        let app = axum::Router::new()
+            .route("/api/worktrees", axum::routing::get(worktrees))
+            .with_state(Arc::new(state));
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .uri("/api/worktrees")
+                .body(axum::body::Body::empty())?,
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let payload: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(payload[0]["task_id"], "runtime-workspace-1");
+        assert_eq!(payload[0]["status"], "implementing");
+        assert_eq!(payload[0]["phase"], "implement");
+        assert_eq!(payload[0]["repo"], "owner/repo");
+        assert_eq!(payload[0]["turn"], 0);
+        assert_eq!(payload[0]["max_turns"], serde_json::Value::Null);
+        assert_eq!(
+            payload[0]["project"].as_str(),
+            Some(source_repo.to_string_lossy().as_ref())
+        );
         Ok(())
     }
 }

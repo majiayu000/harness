@@ -141,6 +141,7 @@ impl WorkspaceManager {
                     vac.insert(ActiveWorkspace {
                         workspace_path: workspace_path.clone(),
                         source_repo: source_repo.to_path_buf(),
+                        repo: repo.map(str::to_owned),
                         branch: branch.clone(),
                         created_at: SystemTime::now(),
                         owner_session: owner_session.clone(),
