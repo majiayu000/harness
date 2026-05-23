@@ -5,7 +5,7 @@ use harness_workflow::runtime::{
     PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandType,
     WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
     WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    GITHUB_ISSUE_PR_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -40,6 +40,20 @@ pub(crate) struct PrMergedRuntimeContext<'a> {
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
     pub summary: &'a str,
+}
+
+pub(crate) struct PrFeedbackSweepRuntimeContext<'a> {
+    pub project_root: &'a Path,
+    pub repo: Option<&'a str>,
+    pub task_id: &'a TaskId,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
+}
+
+struct PrRuntimeTarget {
+    instance: WorkflowInstance,
+    new_instance: bool,
+    issue_number: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,12 +148,8 @@ pub(crate) async fn record_pr_feedback(
     let Some(store) = store else {
         return;
     };
-    let Some(issue_number) = ctx.issue_number else {
-        return;
-    };
-    if let Err(error) = persist_pr_feedback(store, &ctx, issue_number).await {
+    if let Err(error) = persist_pr_feedback(store, &ctx).await {
         tracing::warn!(
-            issue = issue_number,
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
             "workflow runtime PR feedback write failed: {error}"
@@ -154,17 +164,40 @@ pub(crate) async fn record_pr_merged(
     let Some(store) = store else {
         return;
     };
-    let Some(issue_number) = ctx.issue_number else {
-        return;
-    };
-    if let Err(error) = persist_pr_merged(store, &ctx, issue_number).await {
+    if let Err(error) = persist_pr_merged(store, &ctx).await {
         tracing::warn!(
-            issue = issue_number,
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
             "workflow runtime PR merge write failed: {error}"
         );
     }
+}
+
+pub(crate) async fn request_pr_feedback_sweep_for_pr(
+    store: &WorkflowRuntimeStore,
+    ctx: PrFeedbackSweepRuntimeContext<'_>,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    let project_id = ctx.project_root.to_string_lossy().into_owned();
+    let instance = pr_scoped_instance(
+        pr_workflow_id(&project_id, ctx.repo, ctx.pr_number),
+        project_id.clone(),
+        ctx.repo.map(ToOwned::to_owned),
+        ctx.pr_number,
+        "pr_open",
+    )
+    .with_data(pr_runtime_data(
+        ctx.project_root,
+        project_id,
+        ctx.repo,
+        None,
+        ctx.task_id,
+        ctx.pr_number,
+        ctx.pr_url,
+        None,
+    ));
+    upsert_github_issue_pr_definition(store).await?;
+    store.upsert_instance(&instance).await?;
+    request_pr_feedback_sweep(store, &instance.id).await
 }
 
 pub(crate) async fn request_pr_feedback_sweep(
@@ -349,32 +382,30 @@ async fn persist_pr_feedback_sweep_request(
 async fn persist_pr_feedback(
     store: &WorkflowRuntimeStore,
     ctx: &PrFeedbackRuntimeContext<'_>,
-    issue_number: u64,
 ) -> anyhow::Result<()> {
     let project_id = ctx.project_root.to_string_lossy().into_owned();
-    let workflow_id =
-        harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, issue_number);
-    upsert_github_issue_pr_definition(store).await?;
-    let (instance, new_instance) = load_or_issue_instance(
-        store,
-        workflow_id,
-        project_id.clone(),
-        ctx.repo.map(ToOwned::to_owned),
+    let PrRuntimeTarget {
+        instance,
+        new_instance,
         issue_number,
+    } = load_or_pr_runtime_target(
+        store,
+        ctx.project_root,
+        ctx.repo,
+        ctx.issue_number,
+        ctx.pr_number,
         "pr_open",
     )
     .await?;
-    let accepted_data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let accepted_data = pr_runtime_data(
         ctx.project_root,
-        json!({
-        "project_id": project_id,
-        "repo": ctx.repo,
-        "issue_number": issue_number,
-        "task_id": ctx.task_id.as_str(),
-        "pr_number": ctx.pr_number,
-        "pr_url": ctx.pr_url,
-        "feedback_summary": ctx.summary,
-        }),
+        project_id,
+        ctx.repo,
+        issue_number,
+        ctx.task_id,
+        ctx.pr_number,
+        ctx.pr_url,
+        Some(ctx.summary),
     );
     let output = build_pr_feedback_decision(
         &instance,
@@ -411,31 +442,30 @@ async fn persist_pr_feedback(
 async fn persist_pr_merged(
     store: &WorkflowRuntimeStore,
     ctx: &PrMergedRuntimeContext<'_>,
-    issue_number: u64,
 ) -> anyhow::Result<()> {
     let project_id = ctx.project_root.to_string_lossy().into_owned();
-    let workflow_id =
-        harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, issue_number);
-    upsert_github_issue_pr_definition(store).await?;
-    let (instance, new_instance) = load_or_issue_instance(
-        store,
-        workflow_id,
-        project_id.clone(),
-        ctx.repo.map(ToOwned::to_owned),
+    let PrRuntimeTarget {
+        instance,
+        new_instance,
         issue_number,
+    } = load_or_pr_runtime_target(
+        store,
+        ctx.project_root,
+        ctx.repo,
+        ctx.issue_number,
+        ctx.pr_number,
         "pr_open",
     )
     .await?;
-    let accepted_data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let accepted_data = pr_runtime_data(
         ctx.project_root,
-        json!({
-            "project_id": project_id,
-            "repo": ctx.repo,
-            "issue_number": issue_number,
-            "task_id": ctx.task_id.as_str(),
-            "pr_number": ctx.pr_number,
-            "pr_url": ctx.pr_url,
-        }),
+        project_id,
+        ctx.repo,
+        issue_number,
+        ctx.task_id,
+        ctx.pr_number,
+        ctx.pr_url,
+        None,
     );
     let decision = WorkflowDecision::new(
         &instance.id,
@@ -725,7 +755,7 @@ async fn has_active_child_pr_feedback_command(
 async fn upsert_github_issue_pr_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
     store
         .upsert_definition(&WorkflowDefinition::new(
-            "github_issue_pr",
+            GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
             "GitHub issue PR workflow",
         ))
@@ -746,6 +776,63 @@ async fn load_or_issue_instance(
             issue_instance(workflow_id, project_id, repo, issue_number, state),
             true,
         ),
+    })
+}
+
+async fn load_or_pr_runtime_target(
+    store: &WorkflowRuntimeStore,
+    project_root: &Path,
+    repo: Option<&str>,
+    issue_number: Option<u64>,
+    pr_number: u64,
+    state: &str,
+) -> anyhow::Result<PrRuntimeTarget> {
+    upsert_github_issue_pr_definition(store).await?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    if let Some(issue_number) = issue_number {
+        let workflow_id =
+            harness_workflow::issue_lifecycle::workflow_id(&project_id, repo, issue_number);
+        let (instance, new_instance) = load_or_issue_instance(
+            store,
+            workflow_id,
+            project_id,
+            repo.map(ToOwned::to_owned),
+            issue_number,
+            state,
+        )
+        .await?;
+        return Ok(PrRuntimeTarget {
+            instance,
+            new_instance,
+            issue_number: Some(issue_number),
+        });
+    }
+
+    if let Some(instance) = store
+        .get_instance_by_pr(GITHUB_ISSUE_PR_DEFINITION_ID, &project_id, repo, pr_number)
+        .await?
+    {
+        let issue_number = instance
+            .data
+            .get("issue_number")
+            .and_then(serde_json::Value::as_u64);
+        return Ok(PrRuntimeTarget {
+            instance,
+            new_instance: false,
+            issue_number,
+        });
+    }
+
+    Ok(PrRuntimeTarget {
+        instance: pr_scoped_instance(
+            pr_workflow_id(&project_id, repo, pr_number),
+            project_id,
+            repo.map(ToOwned::to_owned),
+            pr_number,
+            state,
+        ),
+        new_instance: true,
+        issue_number: None,
     })
 }
 
@@ -771,6 +858,71 @@ fn issue_instance(
             "issue_number": issue_number,
         }),
     ))
+}
+
+fn pr_scoped_instance(
+    workflow_id: String,
+    project_id: String,
+    repo: Option<String>,
+    pr_number: u64,
+    state: &str,
+) -> WorkflowInstance {
+    let task_id = TaskId::from_str(&format!(
+        "pr-feedback:{}:{}",
+        repo.as_deref().unwrap_or("<none>"),
+        pr_number
+    ));
+    let data = pr_runtime_data(
+        Path::new(&project_id),
+        project_id.clone(),
+        repo.as_deref(),
+        None,
+        &task_id,
+        pr_number,
+        None,
+        None,
+    );
+    WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        state,
+        WorkflowSubject::new("pr", format!("pr:{pr_number}")),
+    )
+    .with_id(workflow_id)
+    .with_data(data)
+}
+
+fn pr_workflow_id(project_id: &str, repo: Option<&str>, pr_number: u64) -> String {
+    format!(
+        "{project_id}::repo:{}::pr:{pr_number}:feedback",
+        repo.unwrap_or("<none>")
+    )
+}
+
+fn pr_runtime_data(
+    project_root: &Path,
+    project_id: String,
+    repo: Option<&str>,
+    issue_number: Option<u64>,
+    task_id: &TaskId,
+    pr_number: u64,
+    pr_url: Option<&str>,
+    feedback_summary: Option<&str>,
+) -> serde_json::Value {
+    let mut data = json!({
+        "project_id": project_id,
+        "repo": repo,
+        "task_id": task_id.as_str(),
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+    });
+    if let Some(issue_number) = issue_number {
+        data["issue_number"] = json!(issue_number);
+    }
+    if let Some(feedback_summary) = feedback_summary {
+        data["feedback_summary"] = json!(feedback_summary);
+    }
+    crate::workflow_runtime_policy::merge_runtime_retry_policy(project_root, data)
 }
 
 fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_json::Value {
@@ -998,6 +1150,171 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "PrReadyToMerge"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pr_feedback_without_issue_creates_pr_scoped_workflow() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("pr-feedback-task");
+
+        record_pr_feedback(
+            Some(&store),
+            PrFeedbackRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: None,
+                task_id: &task_id,
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+                outcome: PrFeedbackOutcome::BlockingFeedback,
+                summary: "Review found actionable feedback.",
+            },
+        )
+        .await;
+
+        let workflow_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
+        let instance = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("PR-scoped workflow should be persisted");
+        assert_eq!(instance.subject.subject_type, "pr");
+        assert_eq!(instance.subject.subject_key, "pr:77");
+        assert_eq!(instance.state, "addressing_feedback");
+        assert_eq!(instance.data["pr_number"], 77);
+        assert!(instance.data.get("issue_number").is_none());
+        let events = store.events_for(&workflow_id).await?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "FeedbackFound"));
+        let commands = store.commands_for(&workflow_id).await?;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].command.activity_name(),
+            Some("address_pr_feedback")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pr_feedback_without_issue_uses_runtime_workflow_bound_by_pr() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("pr-feedback-task");
+        let issue_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            123,
+        );
+        upsert_github_issue_pr_definition(&store).await?;
+        let issue_workflow = issue_instance(
+            issue_workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            123,
+            "pr_open",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 123,
+            "task_id": "issue-task",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+        }));
+        store.upsert_instance(&issue_workflow).await?;
+
+        record_pr_feedback(
+            Some(&store),
+            PrFeedbackRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: None,
+                task_id: &task_id,
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+                outcome: PrFeedbackOutcome::ReadyToMerge,
+                summary: "Reviewer approved and validation passed.",
+            },
+        )
+        .await;
+
+        let instance = store
+            .get_instance(&issue_workflow_id)
+            .await?
+            .expect("issue workflow should still exist");
+        assert_eq!(instance.state, "ready_to_merge");
+        assert_eq!(instance.data["issue_number"], 123);
+        assert_eq!(instance.data["pr_number"], 77);
+        let pr_scoped_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
+        assert!(store.get_instance(&pr_scoped_id).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pr_merged_without_issue_creates_pr_scoped_done_workflow() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("pr-feedback-task");
+
+        record_pr_merged(
+            Some(&store),
+            PrMergedRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: None,
+                task_id: &task_id,
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+                summary: "PR merged externally.",
+            },
+        )
+        .await;
+
+        let workflow_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
+        let instance = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("PR-scoped workflow should be persisted");
+        assert_eq!(instance.state, "done");
+        assert_eq!(instance.data["pr_number"], 77);
+        assert!(instance.data.get("issue_number").is_none());
+        let events = store.events_for(&workflow_id).await?;
+        assert!(events.iter().any(|event| event.event_type == "PrMerged"));
         Ok(())
     }
 

@@ -803,19 +803,37 @@ impl DefaultExecutionService {
             ));
         };
 
-        let instance = self
-            .find_runtime_issue_workflow_by_pr(store, &prepared.project_id, prepared.req.repo.as_deref(), pr_number)
-            .await?
-            .ok_or_else(|| {
-                EnqueueTaskError::BadRequest(format!(
-                    "PR feedback submission for pr:{pr_number} requires an existing runtime issue workflow with a bound PR"
-                ))
-            })?;
+        let maybe_instance = self
+            .find_runtime_issue_workflow_by_pr(
+                store,
+                &prepared.project_id,
+                prepared.req.repo.as_deref(),
+                pr_number,
+            )
+            .await?;
 
-        match crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &instance.id)
+        let outcome = if let Some(instance) = maybe_instance {
+            crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &instance.id)
+                .await
+        } else {
+            let repo_key = prepared.req.repo.as_deref().unwrap_or("<none>");
+            let task_id =
+                TaskId::from_str(&format!("repo-backlog:{repo_key}:pr:{pr_number}:feedback"));
+            crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep_for_pr(
+                store,
+                crate::workflow_runtime_pr_feedback::PrFeedbackSweepRuntimeContext {
+                    project_root: std::path::Path::new(&prepared.project_id),
+                    repo: prepared.req.repo.as_deref(),
+                    task_id: &task_id,
+                    pr_number,
+                    pr_url: None,
+                },
+            )
             .await
-            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
-        {
+        }
+        .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
+
+        match outcome {
             crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
                 task_id,
                 ..

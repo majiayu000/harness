@@ -507,7 +507,7 @@ async fn enqueue_background_pr_feedback_uses_bound_workflow_runtime_without_task
 }
 
 #[tokio::test]
-async fn enqueue_background_pr_feedback_requires_bound_runtime_workflow() -> anyhow::Result<()> {
+async fn enqueue_background_pr_feedback_creates_pr_scoped_runtime_workflow() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
@@ -515,7 +515,10 @@ async fn enqueue_background_pr_feedback_requires_bound_runtime_workflow() -> any
     let dir = tempfile::tempdir()?;
     let project_root = dir.path().join("project");
     std::fs::create_dir(&project_root)?;
+    let canonical_project_root = project_root.canonicalize()?;
+    let project_id = canonical_project_root.to_string_lossy().into_owned();
     let store = TaskStore::open(&dir.path().join("t.db")).await?;
+    let task_store = store.clone();
     let database_url = crate::test_helpers::test_database_url()?;
     let runtime_store = Arc::new(
         harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
@@ -524,7 +527,7 @@ async fn enqueue_background_pr_feedback_requires_bound_runtime_workflow() -> any
         )
         .await?,
     );
-    let svc = make_svc_with_workflow_runtime(store, runtime_store).await;
+    let svc = make_svc_with_workflow_runtime(store, runtime_store.clone()).await;
     let req = CreateTaskRequest {
         pr: Some(77),
         repo: Some("owner/repo".to_string()),
@@ -532,14 +535,28 @@ async fn enqueue_background_pr_feedback_requires_bound_runtime_workflow() -> any
         ..Default::default()
     };
 
-    let error = svc
-        .enqueue_background(req)
-        .await
-        .expect_err("unbound PR feedback submissions should fail closed");
+    let task_id = svc.enqueue_background(req).await?;
 
+    assert_eq!(task_id.as_str(), "repo-backlog:owner/repo:pr:77:feedback");
     assert!(
-        matches!(error, EnqueueTaskError::BadRequest(ref message) if message.contains("requires an existing runtime issue workflow with a bound PR")),
-        "unexpected error: {error}"
+        task_store.get_with_db_fallback(&task_id).await?.is_none(),
+        "workflow runtime PR feedback submissions must not register legacy PR task rows"
+    );
+    let workflow_id = format!("{project_id}::repo:owner/repo::pr:77:feedback");
+    let workflow = runtime_store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("PR-scoped runtime workflow should be persisted");
+    assert_eq!(workflow.subject.subject_type, "pr");
+    assert_eq!(workflow.subject.subject_key, "pr:77");
+    assert_eq!(workflow.state, "awaiting_feedback");
+    assert_eq!(workflow.data["pr_number"], 77);
+    assert!(workflow.data.get("issue_number").is_none());
+    let commands = runtime_store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.command["definition_id"],
+        harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID
     );
     Ok(())
 }
