@@ -4,11 +4,13 @@ import { History } from "./History";
 import type { Task } from "@/types";
 
 vi.mock("@/lib/queries", () => ({
+  useDashboard: vi.fn(),
   useTasks: vi.fn(),
 }));
 
-import { useTasks } from "@/lib/queries";
+import { useDashboard, useTasks } from "@/lib/queries";
 
+const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
 const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
 
 function makeHistoryTask(id: string, overrides: Partial<Task> = {}): Task {
@@ -58,6 +60,7 @@ function historyTaskList(data: Task[]) {
 describe("<History>", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockUseDashboard.mockReturnValue({ data: { projects: [] } });
   });
 
   it("paginates terminal tasks and resets pagination when filtering", () => {
@@ -101,6 +104,9 @@ describe("<History>", () => {
   });
 
   it("searches description repo and PR URL, then shows the submit CTA when empty", () => {
+    mockUseDashboard.mockReturnValue({
+      data: { projects: [{ id: "harness", root: "/work/harness" }] },
+    });
     mockUseTasks.mockReturnValue({
       data: historyTaskList([
         makeHistoryTask("task-a", {
@@ -119,6 +125,12 @@ describe("<History>", () => {
     });
 
     render(<History projectFilter="harness" />);
+
+    expect(mockUseTasks).toHaveBeenCalledWith({
+      status: "done,failed,cancelled",
+      limit: 500,
+      project_id: "/work/harness",
+    });
 
     fireEvent.change(screen.getByPlaceholderText("Search description, repo, PR…"), {
       target: { value: "frontend/pull/42" },

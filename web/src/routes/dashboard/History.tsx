@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { relativeAgo } from "@/lib/format";
-import { useTasks } from "@/lib/queries";
+import { useDashboard, useTasks } from "@/lib/queries";
 import type { Task } from "@/types";
 
 interface Props {
@@ -60,12 +60,18 @@ export function History({ projectFilter }: Props) {
   const [filter, setFilter] = useState<"all" | "done" | "failed">("all");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
+  const { data: dashboard } = useDashboard();
+  const resolvedRoot = projectFilter
+    ? (dashboard?.projects.find((p) => p.id === projectFilter)?.root ?? projectFilter)
+    : null;
   const { data, isLoading, isError } = useTasks({
     status: "done,failed,cancelled",
     limit: 500,
-    project_id: projectFilter ?? undefined,
+    project_id: resolvedRoot ?? undefined,
   });
-  const submitHref = projectFilter ? `/dashboard?tab=submit&project=${encodeURIComponent(projectFilter)}` : "/dashboard?tab=submit";
+  const submitHref = projectFilter
+    ? `/dashboard?tab=submit&project=${encodeURIComponent(projectFilter)}`
+    : "/dashboard?tab=submit";
 
   const rows = useMemo(() => {
     const statusFiltered =
@@ -79,7 +85,7 @@ export function History({ projectFilter }: Props) {
 
   useEffect(() => {
     setPage(1);
-  }, [filter, query, projectFilter]);
+  }, [filter, query, resolvedRoot]);
 
   const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
