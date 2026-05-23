@@ -8,6 +8,7 @@ use harness_core::types::{
 };
 use harness_observe::event_store::EventStore;
 use harness_observe::usage::UsageMetrics;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -95,6 +96,27 @@ mod tests {
         );
         assert!(event.is_none());
     }
+
+    #[test]
+    fn usage_project_label_prefers_canonical_task_root() {
+        let canonical = Path::new("/repo/main");
+        let workspace = Path::new("/tmp/harness-worktree");
+
+        assert_eq!(
+            usage_project_label(Some(canonical), workspace),
+            "/repo/main"
+        );
+    }
+
+    #[test]
+    fn usage_project_label_falls_back_to_request_root() {
+        let workspace = Path::new("/tmp/harness-worktree");
+
+        assert_eq!(
+            usage_project_label(None, workspace),
+            "/tmp/harness-worktree"
+        );
+    }
 }
 
 pub(crate) fn set_usage_event_store(events: Arc<EventStore>) {
@@ -179,6 +201,13 @@ fn build_llm_usage_event(
     Some(event)
 }
 
+fn usage_project_label(task_project_root: Option<&Path>, request_project_root: &Path) -> String {
+    task_project_root
+        .unwrap_or(request_project_root)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Scan `output_slice` for a `CREATED_ISSUE=` sentinel and, when a new issue
 /// number is found, write it to the database.
 async fn backfill_issue_if_found(
@@ -247,7 +276,8 @@ pub(crate) async fn run_agent_streaming_with_options(
 
     let agent_name = agent.name().to_string();
     let requested_model = req.model.clone();
-    let project = req.project_root.to_string_lossy().into_owned();
+    let task_project_root = store.get(task_id).and_then(|state| state.project_root);
+    let project = usage_project_label(task_project_root.as_deref(), &req.project_root);
     let is_prompt_only = is_prompt_only_task(store, task_id);
     let phase_str = req
         .execution_phase
