@@ -67,9 +67,7 @@ async fn runtime_workflow_id_for_task(
     state: &AppState,
     task_id: &crate::task_runner::TaskId,
 ) -> Option<String> {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return None;
-    };
+    let store = state.core.workflow_runtime_store.as_ref()?;
     match crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id).await {
         Ok(workflow) => workflow.map(|workflow| workflow.id),
         Err(error) => {
