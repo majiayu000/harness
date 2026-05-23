@@ -144,6 +144,7 @@ pub(super) fn activity_result_schema(
     let transition_contract = activity_transition_contract(workflow_definition, &activity);
     let summary_contract = agent_summary_contract(workflow_definition, &activity);
     let decision_contract = workflow_decision_contract(workflow);
+    let command_examples = workflow_decision_command_examples(workflow_definition, &activity);
     json!({
         "schema": "harness.runtime.activity_result.v1",
         "activity": activity,
@@ -184,16 +185,7 @@ pub(super) fn activity_result_schema(
                         "next_state": "...",
                         "reason": "...",
                         "confidence": "high",
-                        "commands": [
-                            {
-                                "command_type": "enqueue_activity",
-                                "dedupe_key": "<unique stable string for this command>",
-                                "command": {
-                                    "activity": "<next activity name>",
-                                    "note": "All activity-specific payload (repo, issue_number, signals, etc.) goes INSIDE this nested `command` Value. The outer object MUST have exactly the three fields: command_type, dedupe_key, command."
-                                }
-                            }
-                        ]
+                        "commands": command_examples
                     }
                 }
             ],
@@ -215,10 +207,46 @@ pub(super) fn activity_result_schema(
                 "`signals` MUST be a JSON array of {signal_type, signal} objects. Never use `kind` or any other discriminator name.",
                 "`validation` MUST be a JSON array of {command, status} objects. Never emit it as a map.",
                 "Inside a `workflow_decision` artifact, the next-step activity MUST be expressed as `commands: [{command_type, dedupe_key, command}]` (plural array). Never use a singular `command` field at the artifact level — that field is silently ignored, leaving the workflow stuck in the new state with no follow-up activity enqueued.",
+                "For `command_type: start_child_workflow`, the nested `command` object MUST include `definition_id` and `subject_key`; for GitHub issue workflows use `definition_id: github_issue_pr` and `subject_key: issue:<number>`.",
                 "Omit `artifacts`, `signals`, or `validation` entirely if there is nothing to report — empty arrays or missing fields are both fine."
             ]
         },
     })
+}
+
+fn workflow_decision_command_examples(workflow_definition: &str, activity: &str) -> Value {
+    match (workflow_definition, activity) {
+        ("repo_backlog", "plan_repo_sprint") => json!([
+            {
+                "command_type": "start_child_workflow",
+                "dedupe_key": "repo-sprint-plan:owner/repo:issue:42:start",
+                "command": {
+                    "definition_id": "github_issue_pr",
+                    "subject_key": "issue:42",
+                    "repo": "owner/repo",
+                    "issue_number": 42,
+                    "issue_url": "https://github.com/owner/repo/issues/42",
+                    "title": "Example issue selected for the sprint",
+                    "labels": ["bug"],
+                    "depends_on": [],
+                    "source": "github",
+                    "external_id": "42",
+                    "auto_submit": true,
+                    "note": "All child-workflow payload goes INSIDE this nested `command` Value. Do not omit definition_id or subject_key."
+                }
+            }
+        ]),
+        _ => json!([
+            {
+                "command_type": "enqueue_activity",
+                "dedupe_key": "<unique stable string for this command>",
+                "command": {
+                    "activity": "<next activity name>",
+                    "note": "All activity-specific payload (repo, issue_number, signals, etc.) goes INSIDE this nested `command` Value. The outer object MUST have exactly the three fields: command_type, dedupe_key, command."
+                }
+            }
+        ]),
+    }
 }
 
 fn workflow_decision_contract(workflow: Option<&WorkflowInstance>) -> Value {
@@ -561,293 +589,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use harness_workflow::runtime::{
-        RuntimeKind, WorkflowSubject, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
-    };
-
-    #[test]
-    fn activity_result_schema_describes_issue_implementation_terminal_evidence_contract() {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": "implement_issue"
-            }),
-        );
-        let workflow = WorkflowInstance::new(
-            "github_issue_pr",
-            1,
-            "implementing",
-            WorkflowSubject::new("issue", "issue:123"),
-        )
-        .with_id("issue-123");
-
-        let schema = activity_result_schema(&job, Some(&workflow));
-
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
-            "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
-        );
-        assert_eq!(
-            schema["activity_contract"]["accepted_signals"][0],
-            ISSUE_CLOSED_SIGNAL
-        );
-        assert_eq!(
-            schema["activity_contract"]["success_requires"],
-            "pull_request_artifact_or_closed_issue_signal"
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["artifacts"]["issue_state"]["fields"][1],
-            "state"
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["signals"]["IssueAlreadyResolved"],
-            "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
-        );
-    }
-
-    #[test]
-    fn activity_result_schema_describes_quality_gate_contract() {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": QUALITY_GATE_ACTIVITY
-            }),
-        );
-        let workflow = WorkflowInstance::new(
-            QUALITY_GATE_DEFINITION_ID,
-            1,
-            "checking",
-            WorkflowSubject::new("quality_gate", "issue:123"),
-        )
-        .with_id("quality-gate-1");
-
-        let schema = activity_result_schema(&job, Some(&workflow));
-
-        assert_eq!(schema["workflow_definition"], QUALITY_GATE_DEFINITION_ID);
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
-            "passed"
-        );
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["output_signal"],
-            QUALITY_PASSED_SIGNAL
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["must_include"][0],
-            "validation commands"
-        );
-        assert_eq!(
-            schema["activity_contract"]["accepted_signals"][0],
-            QUALITY_PASSED_SIGNAL
-        );
-        assert_eq!(
-            schema["activity_contract"]["success_requires"],
-            "quality_gate_status_signal_and_validation_evidence"
-        );
-        assert!(schema["workflow_decision_contract"]["allowed_transitions"]
-            .as_array()
-            .expect("allowed transitions should be an array")
-            .iter()
-            .any(|transition| transition["next_state"] == "passed"));
-    }
-
-    #[test]
-    fn activity_result_schema_describes_repo_backlog_poll_contract() {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": "poll_repo_backlog"
-            }),
-        );
-        let workflow = WorkflowInstance::new(
-            "repo_backlog",
-            1,
-            "scanning",
-            WorkflowSubject::new("repo", "owner/repo"),
-        )
-        .with_id("repo-backlog-1");
-
-        let schema = activity_result_schema(&job, Some(&workflow));
-
-        assert_eq!(schema["workflow_definition"], "repo_backlog");
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
-            "IssueDiscovered"
-        );
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["empty_success_allowed"],
-            false
-        );
-        assert_eq!(
-            schema["activity_contract"]["success_requires"],
-            "at_least_one_accepted_signal"
-        );
-        assert_eq!(
-            schema["activity_contract"]["explicit_noop_signals"][0],
-            "NoOpenIssueFound"
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["signals"]["IssueDiscovered"],
-            "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available."
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["success_rule"],
-            "A succeeded result MUST emit at least one accepted issue or open PR feedback signal. Do not return succeeded with empty signals."
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["signals"]["OpenPrFeedbackDiscovered"],
-            "Use for each open PR with unresolved actionable review feedback and no active bound workflow. Include pr_number, pr_url, repo, title, feedback_count, and summary."
-        );
-        assert!(schema["workflow_decision_contract"]["allowed_transitions"]
-            .as_array()
-            .expect("allowed transitions should be an array")
-            .iter()
-            .any(|transition| transition["next_state"] == "planning_batch"));
-    }
-
-    #[test]
-    fn activity_result_schema_describes_repo_sprint_plan_contract() {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY
-            }),
-        );
-        let workflow = WorkflowInstance::new(
-            "repo_backlog",
-            1,
-            "planning_batch",
-            WorkflowSubject::new("repo", "owner/repo"),
-        )
-        .with_id("repo-backlog-1");
-
-        let schema = activity_result_schema(&job, Some(&workflow));
-
-        assert_eq!(schema["workflow_definition"], "repo_backlog");
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
-            "SprintTaskSelected"
-        );
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["empty_success_allowed"],
-            false
-        );
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][0],
-            "sprint_plan"
-        );
-        assert_eq!(
-            schema["activity_contract"]["success_requires"],
-            "at_least_one_accepted_signal_or_artifact"
-        );
-        assert_eq!(
-            schema["activity_contract"]["accepted_artifacts"][0],
-            "sprint_plan"
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["signals"]["SprintTaskSelected"],
-            "Use once for each issue selected for execution. Include issue_number, issue_url, repo, labels, and depends_on as issue numbers."
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["success_rule"],
-            "A succeeded result MUST emit SprintTaskSelected, IssueSkipped, NoSprintTaskSelected, or a sprint_plan artifact. Do not return succeeded with empty signals and no sprint_plan artifact."
-        );
-        assert!(schema["workflow_decision_contract"]["allowed_transitions"]
-            .as_array()
-            .expect("allowed transitions should be an array")
-            .iter()
-            .any(|transition| transition["next_state"] == "dispatching"));
-    }
-
-    #[test]
-    fn activity_result_schema_describes_pr_feedback_child_contract() {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": PR_FEEDBACK_INSPECT_ACTIVITY
-            }),
-        );
-        let workflow = WorkflowInstance::new(
-            PR_FEEDBACK_DEFINITION_ID,
-            1,
-            "inspecting",
-            WorkflowSubject::new("pr", "pr:77"),
-        )
-        .with_id("pr-feedback-1");
-
-        let schema = activity_result_schema(&job, Some(&workflow));
-
-        assert_eq!(schema["workflow_definition"], PR_FEEDBACK_DEFINITION_ID);
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
-            "FeedbackFound"
-        );
-        assert_eq!(
-            schema["transition_contract"]["on_succeeded"]["parent_propagation"],
-            "The same activity result is propagated to the parent github_issue_pr workflow."
-        );
-        assert_eq!(
-            schema["activity_contract"]["child_outcome_contract"],
-            "pr_feedback_outcome"
-        );
-        assert_eq!(
-            schema["agent_summary_contract"]["signals"]["PrReadyToMerge"],
-            "Use only when review, checks, and mergeability are all ready."
-        );
-        assert!(schema["workflow_decision_contract"]["allowed_transitions"]
-            .as_array()
-            .expect("allowed transitions should be an array")
-            .iter()
-            .any(|transition| transition["next_state"] == "feedback_found"));
-    }
-
-    #[test]
-    fn runtime_prompt_packet_includes_workflow_file_contract() {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": "implement_issue",
-                "runtime_profile": RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc)
-            }),
-        );
-        let workflow_document = WorkflowDocument {
-            prompt_template: "Follow the repository workflow prompt.".to_string(),
-            source_path: Some("/repo/WORKFLOW.md".to_string()),
-            ..Default::default()
-        };
-        let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
-
-        let packet = build_runtime_prompt_packet(
-            &job,
-            None,
-            Path::new("/workspaces/job-1"),
-            Path::new("/repo"),
-            &runtime_profile,
-            &workflow_document,
-        );
-        assert_eq!(packet["project"]["root"], "/workspaces/job-1");
-        assert_eq!(packet["project"]["source_root"], "/repo");
-        assert_eq!(
-            packet["workflow_file"]["prompt_template"],
-            "Follow the repository workflow prompt."
-        );
-
-        let prompt = build_runtime_job_prompt(&packet, None);
-        assert!(prompt.contains("Repository workflow prompt template:"));
-        assert!(prompt.contains("Follow the repository workflow prompt."));
-    }
-}
+#[path = "prompt_packet_tests.rs"]
+mod tests;
