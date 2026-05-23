@@ -176,14 +176,21 @@ async fn blocking_interceptor_fails_task() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn spawn_blocking_panic_surfaces_error_and_event() -> anyhow::Result<()> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let dir = tempfile::Builder::new()
-        .prefix("harness-test-")
-        .tempdir_in(&home)?;
-    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+    let database_url = crate::test_helpers::test_database_url()?;
+    let store =
+        TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+            .await?;
     let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
     let agent = CapturingAgent::new();
-    let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+    let events = Arc::new(
+        harness_observe::event_store::EventStore::new_with_database_url(
+            dir.path(),
+            Some(&database_url),
+        )
+        .await?,
+    );
 
     let req = CreateTaskRequest {
         prompt: Some("panic path".into()),
