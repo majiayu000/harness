@@ -634,7 +634,139 @@ fn task_app(state: Arc<AppState>) -> Router {
         .route("/tasks", post(task_routes::create_task))
         .route("/tasks/batch", post(task_routes::create_tasks_batch))
         .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}/proof", get(get_task_proof))
         .with_state(state)
+}
+
+#[tokio::test]
+async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let task_id = "runtime-proof-task";
+    let pr_url = "https://github.com/owner/repo/pull/77";
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "done",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1111"),
+    )
+    .with_id("runtime-proof-workflow")
+    .with_data(serde_json::json!({
+        "task_id": task_id,
+        "task_ids": [task_id],
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 1111,
+        "pr_number": 77,
+        "pr_url": pr_url,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let event = store
+        .append_event(
+            &workflow.id,
+            "PrReadyToMerge",
+            "workflow-runtime-test",
+            serde_json::json!({ "task_id": task_id, "pr_url": pr_url }),
+        )
+        .await?;
+    let decision = harness_workflow::runtime::WorkflowDecision::new(
+        &workflow.id,
+        "awaiting_feedback",
+        "mark_ready_to_merge",
+        "ready_to_merge",
+        "review, checks, and mergeability are ready",
+    )
+    .high_confidence();
+    store
+        .record_decision(
+            &harness_workflow::runtime::WorkflowDecisionRecord::accepted(decision, Some(event.id)),
+        )
+        .await?;
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
+            .await?
+            .is_none(),
+        "runtime-backed task should not have a legacy task row"
+    );
+
+    let response = task_app(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{task_id}/proof"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["task_id"], task_id);
+    assert_eq!(body["status"], "done");
+    assert_eq!(body["pr_url"], pr_url);
+    assert_eq!(body["ci_status"], "passed");
+    assert_eq!(body["review_outcome"], "approved");
+    assert_eq!(body["review_rounds"], 1);
+    assert!(body["quality_signals"]
+        .as_array()
+        .expect("quality signals should be an array")
+        .iter()
+        .any(
+            |signal| signal["name"] == "workflow_id" && signal["value"] == "runtime-proof-workflow"
+        ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_proof_rejects_nonterminal_runtime_task() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let task_id = "runtime-proof-active";
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "prompt:active"),
+    )
+    .with_id("runtime-proof-active-workflow")
+    .with_data(serde_json::json!({
+        "task_id": task_id,
+        "project_id": "/project-a",
+    }));
+    store.upsert_instance(&workflow).await?;
+
+    let response = task_app(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{task_id}/proof"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "task is not in a terminal state");
+    assert_eq!(body["status"], "implementing");
+    Ok(())
 }
 
 fn intake_app(state: Arc<AppState>) -> Router {
