@@ -180,7 +180,6 @@ export function useCancelWorkflowRuntime() {
 
 export interface WorktreeCard {
   taskId: string;
-  runtimeWorkflowId: string | null;
   workspacePath: string;
   pathShort: string;
   sourceRepo: string;
@@ -199,7 +198,6 @@ export interface WorktreeCard {
 
 interface WorktreeApiEntry {
   task_id: string;
-  runtime_workflow_id: string | null;
   branch: string;
   workspace_path: string;
   path_short: string;
@@ -259,7 +257,6 @@ export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; err
   const cards = (query.data ?? [])
     .map((entry) => ({
       taskId: entry.task_id,
-      runtimeWorkflowId: entry.runtime_workflow_id,
       workspacePath: entry.workspace_path,
       pathShort: entry.path_short,
       sourceRepo: entry.source_repo,

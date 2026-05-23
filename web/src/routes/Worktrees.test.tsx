@@ -26,7 +26,6 @@ const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 function worktreeCard(overrides: Partial<import("@/lib/queries").WorktreeCard> = {}) {
   return {
     taskId: "runtime-task-1",
-    runtimeWorkflowId: null,
     workspacePath: "/var/harness/workspaces/runtime-task-1",
     pathShort: "workspaces/runtime-task-1",
     sourceRepo: "/Users/example/src/repo",
@@ -81,14 +80,9 @@ describe("<Worktrees>", () => {
     expect(screen.getByRole("link", { name: "Docs" })).toHaveAttribute("href", DOCS_URL);
   });
 
-  it("cancels runtime worktrees through the workflow runtime endpoint", async () => {
+  it("cancels worktrees through the task endpoint", async () => {
     mockUseWorktrees.mockReturnValue({
-      cards: [
-        worktreeCard({
-          taskId: "runtime-task-1",
-          runtimeWorkflowId: "runtime-workflow-1",
-        }),
-      ],
+      cards: [worktreeCard({ taskId: "runtime-task-1" })],
       isLoading: false,
       error: null,
     });
@@ -107,24 +101,17 @@ describe("<Worktrees>", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     await waitFor(() => {
-      expect(mockApiFetch).toHaveBeenCalledWith("/api/workflows/runtime/cancel", {
+      expect(mockApiFetch).toHaveBeenCalledWith("/tasks/runtime-task-1/cancel", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workflow_id: "runtime-workflow-1" }),
       });
     });
   });
 
-  it("refreshes worktree data when runtime cancellation fails", async () => {
+  it("refreshes worktree data when cancellation fails", async () => {
     const qc = makeQueryClient();
     const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
     mockUseWorktrees.mockReturnValue({
-      cards: [
-        worktreeCard({
-          taskId: "runtime-task-2",
-          runtimeWorkflowId: "runtime-workflow-2",
-        }),
-      ],
+      cards: [worktreeCard({ taskId: "runtime-task-2" })],
       isLoading: false,
       error: null,
     });
@@ -137,16 +124,15 @@ describe("<Worktrees>", () => {
         },
       },
     });
-    mockApiFetch.mockRejectedValueOnce(new Error("workflow already terminal"));
+    mockApiFetch.mockRejectedValueOnce(new Error("task already terminal"));
 
     wrap(<Worktrees />, qc);
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("workflow already terminal");
+      expect(screen.getByRole("alert")).toHaveTextContent("task already terminal");
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["worktrees"] });
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["tasks"] });
-      expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workflow-runtime-tree"] });
     });
   });
 

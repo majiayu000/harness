@@ -17,7 +17,6 @@ function makeWrapper() {
 function worktreeEntry(overrides: Record<string, unknown> = {}) {
   return {
     task_id: "task-1",
-    runtime_workflow_id: null,
     branch: "harness/task-1",
     workspace_path: "/var/harness/workspaces/task-1",
     path_short: "workspaces/task-1",
@@ -67,7 +66,6 @@ describe("useWorktrees", () => {
     mockWorktreeFetch([
       worktreeEntry({
         task_id: "runtime-task-1",
-        runtime_workflow_id: "runtime-workflow-1",
         branch: "harness/runtime-task-1",
         workspace_path: "/var/harness/workspaces/runtime-task-1",
         path_short: "workspaces/runtime-task-1",
@@ -85,7 +83,6 @@ describe("useWorktrees", () => {
     await waitFor(() => expect(result.current.isLoading).toBe(false));
     expect(result.current.cards[0]).toMatchObject({
       taskId: "runtime-task-1",
-      runtimeWorkflowId: "runtime-workflow-1",
       workspacePath: "/var/harness/workspaces/runtime-task-1",
       pathShort: "workspaces/runtime-task-1",
       sourceRepo: "/Users/example/src/repo",
