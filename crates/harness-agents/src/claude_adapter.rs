@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use harness_core::{agent::AgentAdapter, agent::AgentEvent, agent::TurnRequest, types::TokenUsage};
 use harness_observe::usage::parse_result_usage_metrics;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
@@ -255,7 +256,7 @@ pub fn parse_stream_json_line(line: &str) -> Option<AgentEvent> {
 
     match event_type {
         "assistant" => {
-            let text = v.get("message")?.as_str()?.to_string();
+            let text = parse_assistant_text(v.get("message")?)?;
             Some(AgentEvent::MessageDelta { text })
         }
         "tool_use" => {
@@ -284,6 +285,27 @@ pub fn parse_stream_json_line(line: &str) -> Option<AgentEvent> {
     }
 }
 
+fn parse_assistant_text(message: &Value) -> Option<String> {
+    if let Some(text) = message.as_str() {
+        return Some(text.to_string());
+    }
+
+    let content = message.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .filter_map(|block| {
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                block.get("text").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    (!text.is_empty()).then_some(text)
+}
+
 pub fn parse_stream_json_usage(line: &str) -> Option<TokenUsage> {
     let usage = parse_result_usage_metrics(line)?;
 
@@ -307,6 +329,20 @@ mod tests {
         match event {
             AgentEvent::MessageDelta { text } => {
                 assert_eq!(text, "Let me read the file...");
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_assistant_message_content_blocks() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","text":"hidden"},{"type":"text","text":"Hello "},{"type":"text","text":"world"}]}}"#;
+        let Some(event) = parse_stream_json_line(line) else {
+            panic!("assistant content blocks should parse");
+        };
+        match event {
+            AgentEvent::MessageDelta { text } => {
+                assert_eq!(text, "Hello world");
             }
             other => panic!("expected MessageDelta, got {other:?}"),
         }
