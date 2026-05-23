@@ -418,6 +418,8 @@ async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()>
             crate::workspace::ActiveWorkspace {
                 workspace_path: dir.path().join(format!("ws/fake-{i}")),
                 source_repo: dir.path().to_path_buf(),
+                branch: format!("harness/fake-{i}"),
+                created_at: std::time::SystemTime::now(),
                 owner_session: format!("session-{i}"),
                 run_generation: 1,
             },

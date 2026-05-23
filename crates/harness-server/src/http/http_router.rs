@@ -50,6 +50,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/projects/queue-stats", get(project_queue_stats))
         .route("/api/dashboard", get(crate::handlers::dashboard::dashboard))
         .route("/api/overview", get(crate::handlers::overview::overview))
+        .route("/api/worktrees", get(crate::handlers::worktrees::worktrees))
         .route(
             "/api/operator-snapshot",
             get(crate::handlers::operator_snapshot::operator_snapshot),
