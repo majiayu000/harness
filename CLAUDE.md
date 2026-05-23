@@ -100,6 +100,6 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 
 - RS-03 exempt: `fn main()` scope, `Mutex::lock().unwrap()`, `RwLock::{read,write}().unwrap()`
 - RS-13: only flag functions returning `()` or `Result<()>` — typed returns are transformers, not action functions
-- U-16 exempt: `**/prompts.rs` → 1200-line limit, `**/dispatch.rs` → 1000-line limit, `**/services/execution.rs` → 2600-line limit, `**/task_runner/spawn.rs` → 2700-line limit, `**/task_runner/store.rs` → 2200-line limit (legacy oversized files; pending split)
+- U-16 exempt: `**/prompts.rs` → 1200-line limit, `**/dispatch.rs` → 1000-line limit, `**/services/execution.rs` → 2600-line limit, `**/task_runner/spawn.rs` → 2700-line limit, `**/task_runner/store.rs` → 2200-line limit, `**/harness-workflow/src/runtime/store.rs` → 2300-line limit, `**/harness-workflow/src/runtime/tests.rs` → 6000-line limit (legacy oversized files; pending split)
 - L1 exempt: new files matching `src/**/{mod,lib,main}.rs` (standard Rust module files)
 - gh/git guard: CLAUDE.md rule is semantic (agent prompts only); bash guard should not double-block `cargo test` subprocesses

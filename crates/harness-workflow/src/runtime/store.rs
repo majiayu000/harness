@@ -1519,7 +1519,7 @@ impl WorkflowRuntimeStore {
                      WHERE workflow_id = $1
                        AND id <> $2
                        AND command_type = $3
-                       AND status IN ('pending', 'dispatched')",
+                       AND status IN ('pending', 'dispatching', 'dispatched')",
                 )
                 .bind(&command.workflow_id)
                 .bind(&command.id)
