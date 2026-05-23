@@ -106,6 +106,22 @@ fn llm_usage_summary_returns_null_without_events() {
 }
 
 #[test]
+fn feed_omits_llm_usage_events() {
+    let now = Utc::now();
+    let mut usage = Event::new(SessionId::new(), "llm_usage", "codex", Decision::Complete);
+    usage.ts = now;
+    usage.detail = Some("tokens=10".to_string());
+    let mut rule = Event::new(SessionId::new(), "rule_check", "vibeguard", Decision::Warn);
+    rule.ts = now - Duration::seconds(1);
+    rule.reason = Some("check warning".to_string());
+
+    let feed = build_feed(&[usage, rule], now);
+
+    assert_eq!(feed.len(), 1);
+    assert_eq!(feed[0]["kind"], "rule_check");
+}
+
+#[test]
 fn runtime_workflow_active_counts_match_dashboard_buckets() {
     let mut counts = ActiveTaskOverviewCounts::default();
     let running = harness_workflow::runtime::WorkflowInstance::new(

@@ -652,6 +652,7 @@ fn build_feed(events: &[Event], now: DateTime<Utc>) -> Vec<Value> {
     sorted.sort_by_key(|e| std::cmp::Reverse(e.ts));
     sorted
         .into_iter()
+        .filter(|e| e.hook != "llm_usage")
         .take(FEED_LIMIT)
         .map(|e| {
             let level = match e.decision {
