@@ -162,17 +162,26 @@ export function Worktrees() {
   const [cancelError, setCancelError] = React.useState<string | null>(null);
 
   const handleCancel = async (card: WorktreeCard) => {
-    const cancelKey = card.taskId;
+    const cancelKey = card.runtimeWorkflowId ?? card.taskId;
     setCancelError(null);
     setCancelling((prev) => new Set(prev).add(cancelKey));
     try {
-      await apiFetch(`/tasks/${card.taskId}/cancel`, { method: "POST" });
+      if (card.runtimeWorkflowId) {
+        await apiFetch("/api/workflows/runtime/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workflow_id: card.runtimeWorkflowId }),
+        });
+      } else {
+        await apiFetch(`/tasks/${card.taskId}/cancel`, { method: "POST" });
+      }
     } catch (err) {
       setCancelError(err instanceof Error ? err.message : "Cancel failed");
     } finally {
       const refreshes = [
         queryClient.invalidateQueries({ queryKey: ["worktrees"] }),
         queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+        queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] }),
       ];
       const refreshResults = await Promise.allSettled(refreshes);
       for (const result of refreshResults) {

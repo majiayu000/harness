@@ -17,6 +17,7 @@ pub struct WorktreeResponse {
     pub path_short: String,
     pub source_repo: String,
     pub repo: Option<String>,
+    pub runtime_workflow_id: Option<String>,
     pub status: String,
     pub phase: String,
     pub description: Option<String>,
@@ -97,6 +98,7 @@ fn response_from_task(
         path_short: path_short(&entry.workspace_path),
         source_repo: entry.source_repo.to_string_lossy().into_owned(),
         repo: task.repo.clone(),
+        runtime_workflow_id: entry.runtime_workflow_id,
         status: task.status.as_ref().to_string(),
         phase: phase_name(&task.phase).to_string(),
         description: task.description.clone(),
@@ -131,6 +133,7 @@ fn response_from_workspace_entry(
         path_short: path_short(&entry.workspace_path),
         source_repo: source_repo.clone(),
         repo: entry.repo,
+        runtime_workflow_id: entry.runtime_workflow_id,
         status: TaskStatus::Implementing.as_ref().to_string(),
         phase: phase_name(&TaskPhase::Implement).to_string(),
         description: None,
@@ -183,6 +186,7 @@ mod tests {
             workspace_path: PathBuf::from("/var/harness/workspaces/task-1"),
             source_repo: PathBuf::from("/Users/example/src/repo"),
             repo: Some("owner/repo".to_string()),
+            runtime_workflow_id: Some("workflow-1".to_string()),
             branch: format!("harness/{task_id}"),
             created_at: UNIX_EPOCH + Duration::from_secs(100),
         }
@@ -282,6 +286,7 @@ mod tests {
         assert_eq!(response.turn, 0);
         assert_eq!(response.max_turns, Some(20));
         assert_eq!(response.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(response.runtime_workflow_id.as_deref(), Some("workflow-1"));
         assert_eq!(response.project.as_deref(), Some("/Users/example/src/repo"));
         assert_eq!(response.description, None);
         assert_eq!(response.pr_url, None);
@@ -310,6 +315,7 @@ mod tests {
                 workspace_path: workspace_path.clone(),
                 source_repo: source_repo.clone(),
                 repo: Some("owner/repo".to_string()),
+                runtime_workflow_id: None,
                 branch: "harness/route-task-1".to_string(),
                 created_at,
                 owner_session: manager.owner_session.clone(),
@@ -377,6 +383,7 @@ mod tests {
                 workspace_path: workspace_path.clone(),
                 source_repo: source_repo.clone(),
                 repo: Some("owner/repo".to_string()),
+                runtime_workflow_id: Some("workflow-1".to_string()),
                 branch: "harness/runtime-workspace-1".to_string(),
                 created_at,
                 owner_session: manager.owner_session.clone(),
@@ -404,6 +411,7 @@ mod tests {
         assert_eq!(payload[0]["status"], "implementing");
         assert_eq!(payload[0]["phase"], "implement");
         assert_eq!(payload[0]["repo"], "owner/repo");
+        assert_eq!(payload[0]["runtime_workflow_id"], "workflow-1");
         assert_eq!(payload[0]["turn"], 0);
         assert_eq!(payload[0]["max_turns"], serde_json::Value::Null);
         assert_eq!(

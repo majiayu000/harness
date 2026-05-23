@@ -76,6 +76,7 @@ pub(super) async fn prepare_runtime_workspace(
         after_create_hook: workflow_document.config.hooks.after_create.clone(),
         hook_timeout_secs: Some(workflow_document.config.hooks.timeout_secs),
         branch_prefix: workflow_document.config.workspace.branch_prefix.clone(),
+        runtime_workflow_id: workflow.map(|workflow| workflow.id.clone()),
     };
     let lease = workspace_mgr
         .create_workspace_with_options(

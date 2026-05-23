@@ -30,6 +30,7 @@ function worktreeCard(overrides: Partial<import("@/lib/queries").WorktreeCard> =
     pathShort: "workspaces/runtime-task-1",
     sourceRepo: "/Users/example/src/repo",
     repo: "owner/repo",
+    runtimeWorkflowId: null,
     branch: "harness/runtime-task-1",
     status: "implementing",
     phase: "implement",
@@ -107,6 +108,40 @@ describe("<Worktrees>", () => {
     });
   });
 
+  it("cancels runtime worktrees through the workflow endpoint", async () => {
+    mockUseWorktrees.mockReturnValue({
+      cards: [
+        worktreeCard({
+          taskId: "runtime-wf-workspace",
+          runtimeWorkflowId: "project::repo:owner/repo::issue:42",
+        }),
+      ],
+      isLoading: false,
+      error: null,
+    });
+    mockUseOverview.mockReturnValue({
+      data: {
+        projects: [],
+        runtimes: [],
+        kpi: {
+          active_tasks: 1,
+        },
+      },
+    });
+    mockApiFetch.mockResolvedValue(new Response("{}", { status: 200 }));
+
+    wrap(<Worktrees />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith("/api/workflows/runtime/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow_id: "project::repo:owner/repo::issue:42" }),
+      });
+    });
+  });
+
   it("refreshes worktree data when cancellation fails", async () => {
     const qc = makeQueryClient();
     const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
@@ -133,6 +168,7 @@ describe("<Worktrees>", () => {
       expect(screen.getByRole("alert")).toHaveTextContent("task already terminal");
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["worktrees"] });
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["tasks"] });
+      expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workflow-runtime-tree"] });
     });
   });
 

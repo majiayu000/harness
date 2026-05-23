@@ -57,6 +57,7 @@ pub(crate) struct ActiveWorkspace {
     pub(crate) workspace_path: PathBuf,
     pub(crate) source_repo: PathBuf,
     pub(crate) repo: Option<String>,
+    pub(crate) runtime_workflow_id: Option<String>,
     pub(crate) branch: String,
     pub(crate) created_at: SystemTime,
     pub(crate) owner_session: String,
@@ -69,6 +70,7 @@ pub struct WorkspaceEntry {
     pub workspace_path: PathBuf,
     pub source_repo: PathBuf,
     pub repo: Option<String>,
+    pub runtime_workflow_id: Option<String>,
     pub branch: String,
     pub created_at: SystemTime,
 }
@@ -80,6 +82,7 @@ pub(crate) struct WorkspaceCreateOptions {
     pub(crate) after_create_hook: Option<String>,
     pub(crate) hook_timeout_secs: Option<u64>,
     pub(crate) branch_prefix: String,
+    pub(crate) runtime_workflow_id: Option<String>,
 }
 
 impl Default for WorkspaceCreateOptions {
@@ -90,6 +93,7 @@ impl Default for WorkspaceCreateOptions {
             after_create_hook: None,
             hook_timeout_secs: None,
             branch_prefix: "harness/".to_string(),
+            runtime_workflow_id: None,
         }
     }
 }
@@ -378,6 +382,7 @@ impl WorkspaceManager {
                 workspace_path: entry.workspace_path.clone(),
                 source_repo: entry.source_repo.clone(),
                 repo: entry.repo.clone(),
+                runtime_workflow_id: entry.runtime_workflow_id.clone(),
                 branch: entry.branch.clone(),
                 created_at: entry.created_at,
             })

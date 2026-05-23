@@ -142,6 +142,7 @@ impl WorkspaceManager {
                         workspace_path: workspace_path.clone(),
                         source_repo: source_repo.to_path_buf(),
                         repo: repo.map(str::to_owned),
+                        runtime_workflow_id: options.runtime_workflow_id.clone(),
                         branch: branch.clone(),
                         created_at: SystemTime::now(),
                         owner_session: owner_session.clone(),

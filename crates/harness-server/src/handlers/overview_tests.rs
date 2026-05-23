@@ -419,6 +419,7 @@ async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()>
                 workspace_path: dir.path().join(format!("ws/fake-{i}")),
                 source_repo: dir.path().to_path_buf(),
                 repo: None,
+                runtime_workflow_id: None,
                 branch: format!("harness/fake-{i}"),
                 created_at: std::time::SystemTime::now(),
                 owner_session: format!("session-{i}"),

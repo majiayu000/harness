@@ -184,6 +184,7 @@ export interface WorktreeCard {
   pathShort: string;
   sourceRepo: string;
   repo: string | null;
+  runtimeWorkflowId: string | null;
   branch: string;
   status: string;
   phase: string;
@@ -203,6 +204,7 @@ interface WorktreeApiEntry {
   path_short: string;
   source_repo: string;
   repo: string | null;
+  runtime_workflow_id: string | null;
   status: string;
   phase: string;
   description: string | null;
@@ -265,6 +267,7 @@ export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; err
       pathShort: entry.path_short,
       sourceRepo: entry.source_repo,
       repo: entry.repo,
+      runtimeWorkflowId: entry.runtime_workflow_id,
       branch: entry.branch,
       status: entry.status,
       phase: entry.phase,
