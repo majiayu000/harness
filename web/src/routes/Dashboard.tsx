@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
@@ -12,11 +11,28 @@ import { useDashboard } from "@/lib/queries";
 
 type Tab = "board" | "history" | "channels" | "submit";
 
+function parseTab(value: string | null): Tab | null {
+  if (value === "board" || value === "history" || value === "channels" || value === "submit") {
+    return value;
+  }
+  return null;
+}
+
 export function Dashboard() {
-  const [tab, setTab] = useState<Tab>("board");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = parseTab(searchParams.get("tab")) ?? "board";
   const { isError } = useDashboard();
-  const [searchParams] = useSearchParams();
   const projectFilter = searchParams.get("project");
+
+  function selectTab(nextTab: Tab) {
+    const next = new URLSearchParams(searchParams);
+    if (nextTab === "board") {
+      next.delete("tab");
+    } else {
+      next.set("tab", nextTab);
+    }
+    setSearchParams(next);
+  }
 
   const sections: SidebarSection[] = [
     {
@@ -39,7 +55,7 @@ export function Dashboard() {
       <Sidebar
         env="local"
         sections={sections}
-        onItemClick={(id) => setTab(id as Tab)}
+        onItemClick={(id) => selectTab(id as Tab)}
       />
       <main className="flex flex-col min-h-0 min-w-0">
         <TopBar
