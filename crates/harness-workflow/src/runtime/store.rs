@@ -190,6 +190,12 @@ static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_command_created
               ON runtime_jobs (command_id, created_at DESC, id DESC)",
     },
+    Migration {
+        version: 9,
+        description: "index workflow events by type",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow_type_sequence
+              ON workflow_events (workflow_id, event_type, sequence DESC)",
+    },
 ];
 
 pub struct WorkflowRuntimeStore {
@@ -821,6 +827,26 @@ impl WorkflowRuntimeStore {
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
+    }
+
+    pub async fn latest_event_for_type(
+        &self,
+        workflow_id: &str,
+        event_type: &str,
+    ) -> anyhow::Result<Option<WorkflowEvent>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_events
+             WHERE workflow_id = $1
+               AND event_type = $2
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )
+        .bind(workflow_id)
+        .bind(event_type)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .transpose()
     }
 
     pub async fn events_for_workflows(
@@ -2273,9 +2299,17 @@ fn apply_inline_command_side_effect(
     instance: &mut WorkflowInstance,
     command: &WorkflowCommand,
 ) -> anyhow::Result<()> {
-    if command.command_type != WorkflowCommandType::BindPr {
-        return Ok(());
+    match command.command_type {
+        WorkflowCommandType::BindPr => apply_bind_pr_side_effect(instance, command),
+        WorkflowCommandType::MarkDone => apply_mark_done_side_effect(instance, command),
+        _ => Ok(()),
     }
+}
+
+fn apply_bind_pr_side_effect(
+    instance: &mut WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<()> {
     let pr_number = command
         .command
         .get("pr_number")
@@ -2296,6 +2330,24 @@ fn apply_inline_command_side_effect(
         .context("workflow instance data is not an object")?;
     data.insert("pr_number".to_string(), json!(pr_number));
     data.insert("pr_url".to_string(), json!(pr_url));
+    Ok(())
+}
+
+fn apply_mark_done_side_effect(
+    instance: &mut WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<()> {
+    let Some(closed_issue_evidence) = command.command.get("closed_issue_evidence").cloned() else {
+        return Ok(());
+    };
+    if !instance.data.is_object() {
+        instance.data = json!({});
+    }
+    let data = instance
+        .data
+        .as_object_mut()
+        .context("workflow instance data is not an object")?;
+    data.insert("closed_issue_evidence".to_string(), closed_issue_evidence);
     Ok(())
 }
 

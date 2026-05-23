@@ -21,6 +21,18 @@ pub const ISSUE_CLOSED_SIGNAL: &str = "IssueClosed";
 pub const ISSUE_ALREADY_RESOLVED_SIGNAL: &str = "IssueAlreadyResolved";
 pub const ISSUE_STATE_ARTIFACT: &str = "issue_state";
 
+pub fn activity_result_has_closed_issue_evidence(result: &ActivityResult) -> bool {
+    closed_issue_evidence_from_activity_result(result).is_some()
+}
+
+pub fn activity_result_value_has_closed_issue_evidence(value: &Value) -> bool {
+    closed_issue_evidence_from_activity_result_value(value).is_some()
+}
+
+pub fn value_has_closed_issue_evidence(value: &Value) -> bool {
+    closed_issue_evidence_from_value(value, ISSUE_STATE_ARTIFACT).is_some()
+}
+
 pub fn reduce_runtime_job_completed(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
@@ -36,7 +48,8 @@ pub fn reduce_runtime_job_completed(
 
     let decision = match result.status {
         ActivityStatus::Succeeded => reduce_success(instance, event, &result),
-        ActivityStatus::Blocked => Some(runtime_blocked_decision(instance, event, &result)),
+        ActivityStatus::Blocked => github_issue_closed_decision(instance, event, &result)
+            .or_else(|| Some(runtime_blocked_decision(instance, event, &result))),
         ActivityStatus::Failed => Some(
             retry_failed_activity_decision(instance, event, &result)
                 .unwrap_or_else(|| runtime_failed_decision(instance, event, &result)),
@@ -64,7 +77,7 @@ fn reduce_success(
         return Some(decision);
     }
 
-    if let Some(decision) = issue_implementation_closed_decision(instance, event, result) {
+    if let Some(decision) = github_issue_closed_decision(instance, event, result) {
         return Some(decision);
     }
 
@@ -245,33 +258,29 @@ fn issue_implementation_missing_result_decision(
     )
 }
 
-fn issue_implementation_closed_decision(
+fn github_issue_closed_decision(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
-    if (
-        instance.definition_id.as_str(),
-        instance.state.as_str(),
-        result.activity.as_str(),
-    ) != (
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        "implementing",
-        "implement_issue",
-    ) {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || !github_issue_state_can_finish_closed(instance.state.as_str())
+    {
         return None;
     }
 
     let closed_issue = closed_issue_evidence_from_activity_result(result)?;
-    let reason =
-        "implement_issue reported structured evidence that the GitHub issue is already closed";
+    let reason = format!(
+        "{} reported structured evidence that the GitHub issue is already closed",
+        result.activity
+    );
     Some(
         WorkflowDecision::new(
             &instance.id,
             &instance.state,
             "finish_closed_issue",
             "done",
-            reason,
+            &reason,
         )
         .with_command(WorkflowCommand::new(
             WorkflowCommandType::MarkDone,
@@ -286,6 +295,13 @@ fn issue_implementation_closed_decision(
         .with_evidence(WorkflowEvidence::new("closed_issue", closed_issue.summary))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
+    )
+}
+
+fn github_issue_state_can_finish_closed(state: &str) -> bool {
+    matches!(
+        state,
+        "implementing" | "pr_open" | "awaiting_feedback" | "addressing_feedback" | "ready_to_merge"
     )
 }
 
@@ -1311,6 +1327,42 @@ fn closed_issue_evidence_from_activity_result(
                     } else {
                         None
                     }
+                })
+        })
+}
+
+fn closed_issue_evidence_from_activity_result_value(value: &Value) -> Option<ClosedIssueEvidence> {
+    value
+        .get("signals")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|signal| {
+            let signal_type = signal.get("signal_type").and_then(non_empty_json_string)?;
+            match signal_type.as_str() {
+                ISSUE_CLOSED_SIGNAL | ISSUE_ALREADY_RESOLVED_SIGNAL => signal
+                    .get("signal")
+                    .and_then(|payload| closed_issue_evidence_from_value(payload, &signal_type)),
+                _ => None,
+            }
+        })
+        .or_else(|| {
+            value
+                .get("artifacts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|artifact| {
+                    artifact.get("artifact_type").and_then(Value::as_str)
+                        == Some(ISSUE_STATE_ARTIFACT)
+                })
+                .find_map(|artifact| {
+                    artifact
+                        .get("artifact")
+                        .filter(|payload| issue_state_is_closed(payload))
+                        .and_then(|payload| {
+                            closed_issue_evidence_from_value(payload, ISSUE_STATE_ARTIFACT)
+                        })
                 })
         })
 }
