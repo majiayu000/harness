@@ -3,11 +3,15 @@ use crate::task_runner::{TaskPhase, TaskState};
 use crate::workspace::WorkspaceEntry;
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
+use harness_workflow::runtime::WorkflowInstance;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+const WORKFLOW_INSTANCE_PAGE_LIMIT: i64 = 500;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorktreeResponse {
@@ -46,13 +50,15 @@ async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse
 
     let default_max_turns = state.core.server.config.concurrency.max_turns;
     let now = SystemTime::now();
+    let entries = manager.entries();
+    let runtime_workflow_ids = runtime_workflow_ids_by_task(state, &entries).await;
     let mut responses = Vec::new();
 
-    for entry in manager.entries() {
+    for entry in entries {
         let Some(task) = state.core.tasks.get(&entry.task_id) else {
             continue;
         };
-        let runtime_workflow_id = runtime_workflow_id_for_task(state, &entry.task_id).await;
+        let runtime_workflow_id = runtime_workflow_ids.get(entry.task_id.as_str()).cloned();
         if let Some(response) =
             response_from_task(entry, &task, default_max_turns, runtime_workflow_id, now)
         {
@@ -63,17 +69,71 @@ async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse
     Ok(responses)
 }
 
-async fn runtime_workflow_id_for_task(
+async fn runtime_workflow_ids_by_task(
     state: &AppState,
-    task_id: &crate::task_runner::TaskId,
-) -> Option<String> {
-    let store = state.core.workflow_runtime_store.as_ref()?;
-    match crate::workflow_runtime_submission::runtime_issue_by_task_id(store, task_id).await {
-        Ok(workflow) => workflow.map(|workflow| workflow.id),
-        Err(error) => {
-            tracing::warn!(task_id = %task_id.0, "failed to look up workflow runtime id: {error}");
-            None
+    entries: &[WorkspaceEntry],
+) -> HashMap<String, String> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return HashMap::new();
+    };
+    let mut remaining = entries
+        .iter()
+        .map(|entry| entry.task_id.as_str().to_string())
+        .collect::<HashSet<_>>();
+    if remaining.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut ids_by_task = HashMap::new();
+    let mut offset = 0;
+    while !remaining.is_empty() {
+        let page = match store
+            .list_instances_page(None, WORKFLOW_INSTANCE_PAGE_LIMIT, offset)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!("failed to look up workflow runtime ids: {error}");
+                break;
+            }
+        };
+        if page.instances.is_empty() {
+            break;
         }
+        for workflow in page.instances {
+            for task_id in workflow_task_ids(&workflow) {
+                if remaining.remove(&task_id) {
+                    ids_by_task.insert(task_id, workflow.id.clone());
+                }
+            }
+        }
+        offset += page.limit;
+        if offset >= page.total {
+            break;
+        }
+    }
+
+    ids_by_task
+}
+
+fn workflow_task_ids(workflow: &WorkflowInstance) -> Vec<String> {
+    let mut task_ids = Vec::new();
+    if let Some(values) = workflow.data.get("task_ids").and_then(Value::as_array) {
+        for value in values {
+            if let Some(task_id) = value.as_str() {
+                push_unique_task_id(&mut task_ids, task_id);
+            }
+        }
+    }
+    if let Some(task_id) = workflow.data.get("task_id").and_then(Value::as_str) {
+        push_unique_task_id(&mut task_ids, task_id);
+    }
+    task_ids
+}
+
+fn push_unique_task_id(task_ids: &mut Vec<String>, task_id: &str) {
+    if !task_ids.iter().any(|existing| existing == task_id) {
+        task_ids.push(task_id.to_string());
     }
 }
 
@@ -153,6 +213,8 @@ mod tests {
     use crate::task_runner::{PersistedRequestSettings, TaskStatus};
     use harness_core::config::misc::WorkspaceConfig;
     use harness_core::types::TaskId as CoreTaskId;
+    use harness_workflow::runtime::WorkflowSubject;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -172,6 +234,22 @@ mod tests {
             path_short(Path::new("/var/harness/workspaces/task-1")),
             "workspaces/task-1"
         );
+    }
+
+    #[test]
+    fn workflow_task_ids_includes_history_without_duplicates() {
+        let workflow = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:1"),
+        )
+        .with_data(json!({
+            "task_ids": ["task-1", "task-2", "task-1"],
+            "task_id": "task-2"
+        }));
+
+        assert_eq!(workflow_task_ids(&workflow), vec!["task-1", "task-2"]);
     }
 
     #[test]
