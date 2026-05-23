@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use harness_core::{agent::AgentAdapter, agent::AgentEvent, agent::TurnRequest};
+use harness_core::{agent::AgentAdapter, agent::AgentEvent, agent::TurnRequest, types::TokenUsage};
+use harness_observe::usage::parse_result_usage_metrics;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
@@ -127,6 +128,12 @@ impl AgentAdapter for ClaudeAdapter {
                 Some(ev) => ev,
                 None => continue,
             };
+
+            if let Some(usage) = parse_stream_json_usage(&line) {
+                if tx.send(AgentEvent::TokenUsage { usage }).await.is_err() {
+                    break;
+                }
+            }
 
             // Accumulate output text for TurnCompleted
             if let AgentEvent::MessageDelta { ref text } = event {
@@ -277,6 +284,17 @@ pub fn parse_stream_json_line(line: &str) -> Option<AgentEvent> {
     }
 }
 
+pub fn parse_stream_json_usage(line: &str) -> Option<TokenUsage> {
+    let usage = parse_result_usage_metrics(line)?;
+
+    Some(TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens(),
+        cost_usd: 0.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +342,38 @@ mod tests {
             }
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_result_usage_with_cache_fields() {
+        let line = r#"{"type":"result","result":"Done","usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}"#;
+        let usage = parse_stream_json_usage(line).expect("usage should parse");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 19);
+    }
+
+    #[test]
+    fn parse_result_usage_allows_missing_cache_fields() {
+        let line =
+            r#"{"type":"result","result":"Done","usage":{"input_tokens":10,"output_tokens":3}}"#;
+        let usage = parse_stream_json_usage(line).expect("usage should parse");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 13);
+    }
+
+    #[test]
+    fn parse_result_usage_allows_zero_tokens() {
+        let line =
+            r#"{"type":"result","result":"Done","usage":{"input_tokens":0,"output_tokens":0}}"#;
+        let usage = parse_stream_json_usage(line).expect("usage should parse");
+        assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn parse_result_usage_ignores_malformed_json() {
+        assert!(parse_stream_json_usage("{not-json").is_none());
     }
 
     #[test]

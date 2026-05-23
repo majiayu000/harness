@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 harness-core = { workspace = true }
+harness-observe = { workspace = true }
 harness-sandbox = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 serde = { workspace = true }

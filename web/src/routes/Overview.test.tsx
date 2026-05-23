@@ -47,6 +47,7 @@ function makeOverview(): OverviewPayload {
         total: 1,
       },
     },
+    agent_tokens: [],
     distribution: {
       queued: 0,
       running: 1,
@@ -151,5 +152,30 @@ describe("<Overview>", () => {
     wrap(<Overview />);
 
     expect(screen.getByRole("link", { name: "Docs" })).toHaveAttribute("href", DOCS_URL);
+  });
+
+  it("renders agent token usage bars", () => {
+    const overview = makeOverview();
+    overview.kpi.tokens_24h = 1_508_000;
+    overview.agent_tokens = [
+      { agent: "codex", tokens_24h: 1_200_000 },
+      { agent: "claude", tokens_24h: 308_000 },
+    ];
+    mockUseOverview.mockReturnValue({
+      data: overview,
+      isError: false,
+    });
+    mockUseOperatorSnapshot.mockReturnValue({
+      data: makeSnapshot(),
+      isError: false,
+    });
+
+    wrap(<Overview />);
+
+    expect(screen.getByText("Agent usage")).toBeInTheDocument();
+    expect(screen.getByText("codex")).toBeInTheDocument();
+    expect(screen.getByText("claude")).toBeInTheDocument();
+    expect(screen.getByText("1.2M")).toBeInTheDocument();
+    expect(screen.getByText("308K")).toBeInTheDocument();
   });
 });

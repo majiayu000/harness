@@ -1226,6 +1226,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "harness-core",
+ "harness-observe",
  "harness-sandbox",
  "reqwest",
  "serde",

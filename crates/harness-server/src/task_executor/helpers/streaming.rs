@@ -3,12 +3,21 @@ use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::error::HarnessError;
 use harness_core::prompts;
-use harness_core::types::{Item, TokenUsage, TurnFailure, TurnTelemetry};
+use harness_core::types::{
+    Decision, Event, EventMetadata, Item, SessionId, TokenUsage, TurnFailure, TurnTelemetry,
+};
+use harness_observe::event_store::EventStore;
+use harness_observe::usage::UsageMetrics;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::RwLock;
 use tokio::time::Instant;
+
+static USAGE_EVENT_STORE: OnceLock<RwLock<Option<Arc<EventStore>>>> = OnceLock::new();
 
 use super::{is_prompt_only_task, persist_artifact, TurnExecutionFailure, TurnExecutionSuccess};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct RunAgentStreamingOptions {
     pub persist_artifacts: bool,
     /// Scan agent output for CREATED_ISSUE= sentinels and back-fill the task's
@@ -25,6 +34,149 @@ impl Default for RunAgentStreamingOptions {
             backfill_auto_fix_issue: false,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_llm_usage_event_records_usage_payload() -> anyhow::Result<()> {
+        let task_id = TaskId::from_str("usage-task");
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 4,
+            total_tokens: 18,
+            cost_usd: 0.0,
+        };
+
+        let event = build_llm_usage_event(
+            &task_id,
+            2,
+            "implementing",
+            "codex",
+            Some("gpt-5"),
+            "/repo",
+            &usage,
+        )
+        .ok_or_else(|| anyhow::anyhow!("missing llm_usage event"))?;
+        assert_eq!(event.hook, "llm_usage");
+        assert_eq!(event.tool, "codex");
+        assert_eq!(event.metadata.as_ref().and_then(|m| m.turn), Some(2));
+        let content = event
+            .content
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("missing llm_usage content"))?;
+        let payload: serde_json::Value = serde_json::from_str(content)?;
+        assert_eq!(payload["agent"], "codex");
+        assert_eq!(payload["model"], "gpt-5");
+        assert_eq!(payload["task_id"], "usage-task");
+        assert_eq!(payload["project"], "/repo");
+        assert_eq!(payload["input_tokens"], 10);
+        assert_eq!(payload["output_tokens"], 4);
+        assert_eq!(payload["cache_read_input_tokens"], 4);
+        assert_eq!(payload["cache_creation_input_tokens"], 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_llm_usage_event_skips_zero_placeholder_usage() {
+        let task_id = TaskId::from_str("usage-task");
+
+        let event = build_llm_usage_event(
+            &task_id,
+            1,
+            "implementing",
+            "claude",
+            None,
+            "/repo",
+            &TokenUsage::default(),
+        );
+        assert!(event.is_none());
+    }
+}
+
+pub(crate) fn set_usage_event_store(events: Arc<EventStore>) {
+    let slot = USAGE_EVENT_STORE.get_or_init(|| RwLock::new(None));
+    let mut guard = slot.write().unwrap_or_else(|error| error.into_inner());
+    *guard = Some(events);
+}
+
+fn current_usage_event_store() -> Option<Arc<EventStore>> {
+    let slot = USAGE_EVENT_STORE.get_or_init(|| RwLock::new(None));
+    let guard = slot.read().unwrap_or_else(|error| error.into_inner());
+    guard.clone()
+}
+
+async fn log_llm_usage_event(
+    events: &EventStore,
+    task_id: &TaskId,
+    turn: u32,
+    phase: &str,
+    agent: &str,
+    model: Option<&str>,
+    project: &str,
+    usage: &TokenUsage,
+) {
+    let Some(event) = build_llm_usage_event(task_id, turn, phase, agent, model, project, usage)
+    else {
+        return;
+    };
+
+    if let Err(error) = events.log(&event).await {
+        tracing::warn!(
+            task_id = %task_id,
+            agent,
+            "failed to log llm_usage event: {error}"
+        );
+    }
+}
+
+fn build_llm_usage_event(
+    task_id: &TaskId,
+    turn: u32,
+    phase: &str,
+    agent: &str,
+    model: Option<&str>,
+    project: &str,
+    usage: &TokenUsage,
+) -> Option<Event> {
+    if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.total_tokens == 0 {
+        return None;
+    }
+    let usage_metrics = UsageMetrics::from_token_usage(usage);
+    let reported_at = Utc::now();
+    let payload = serde_json::json!({
+        "agent": agent,
+        "model": model.unwrap_or("unknown"),
+        "task_id": task_id.as_str(),
+        "project": project,
+        "ts": reported_at.to_rfc3339(),
+        "input_tokens": usage_metrics.input_tokens,
+        "output_tokens": usage_metrics.output_tokens,
+        "cache_read_input_tokens": usage_metrics.cache_read_input_tokens,
+        "cache_creation_input_tokens": usage_metrics.cache_creation_input_tokens,
+        "reported_total_tokens": usage_metrics.reported_total_tokens,
+    });
+    let mut event = Event::new(SessionId::new(), "llm_usage", agent, Decision::Complete);
+    event.ts = reported_at;
+    event.detail = Some(format!(
+        "task_id={} project={} model={} tokens={}",
+        task_id.as_str(),
+        project,
+        model.unwrap_or("unknown"),
+        usage.total_tokens
+    ));
+    event.content = Some(payload.to_string());
+    event.metadata = Some(EventMetadata {
+        task_id: Some(task_id.clone()),
+        turn: Some(turn),
+        phase: Some(phase.to_string()),
+        telemetry: None,
+        failure: None,
+    });
+    Some(event)
 }
 
 /// Scan `output_slice` for a `CREATED_ISSUE=` sentinel and, when a new issue
@@ -93,6 +245,9 @@ pub(crate) async fn run_agent_streaming_with_options(
 ) -> Result<TurnExecutionSuccess, TurnExecutionFailure> {
     let turn_start = Instant::now();
 
+    let agent_name = agent.name().to_string();
+    let requested_model = req.model.clone();
+    let project = req.project_root.to_string_lossy().into_owned();
     let is_prompt_only = is_prompt_only_task(store, task_id);
     let phase_str = req
         .execution_phase
@@ -191,6 +346,19 @@ pub(crate) async fn run_agent_streaming_with_options(
                             }
                             StreamItem::TokenUsage { usage } => {
                                 token_usage = usage.clone();
+                                if let Some(events) = current_usage_event_store() {
+                                    log_llm_usage_event(
+                                        &events,
+                                        task_id,
+                                        turn,
+                                        &phase_str,
+                                        &agent_name,
+                                        requested_model.as_deref(),
+                                        &project,
+                                        usage,
+                                    )
+                                    .await;
+                                }
                             }
                             StreamItem::Done => {
                                 channel_closed = true;

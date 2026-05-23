@@ -192,6 +192,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     if let Some(error) = startup_failure_error(&startup_statuses) {
         return Err(error);
     }
+    if let Some(events) = engines.events.as_ref() {
+        crate::task_executor::helpers::set_usage_event_store(events.clone());
+    }
 
     // Phase 3: registry — thread DB, plan DB + cache, project registry, workspace manager,
     // runtime state store.

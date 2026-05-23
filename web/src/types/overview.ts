@@ -37,6 +37,11 @@ export interface OverviewThroughput {
   series: OverviewThroughputSeries[];
 }
 
+export interface OverviewAgentToken {
+  agent: string;
+  tokens_24h: number;
+}
+
 export interface OverviewProject {
   id: string;
   root: string;
@@ -111,6 +116,7 @@ export interface OverviewEvolution {
 export interface OverviewPayload {
   window: OverviewWindow;
   kpi: OverviewKpi;
+  agent_tokens: OverviewAgentToken[];
   distribution: OverviewDistribution;
   throughput: OverviewThroughput;
   projects: OverviewProject[];

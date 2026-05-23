@@ -25,10 +25,18 @@ const SERIES_COLORS = [
   "var(--rust-soft)",
 ];
 
+function fmtTokenCompact(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(tokens >= 10_000_000 ? 0 : 1)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(tokens >= 10_000 ? 0 : 1)}K`;
+  return fmtInt(tokens);
+}
+
 export function Overview() {
   const { data, isError } = useOverview();
   const { isError: isOperatorSnapshotError } = useOperatorSnapshot();
   const isSystemHealthy = !isError && !isOperatorSnapshotError;
+  const agentTokens = [...(data?.agent_tokens ?? [])].sort((a, b) => b.tokens_24h - a.tokens_24h);
+  const maxAgentTokens = Math.max(...agentTokens.map((a) => a.tokens_24h), 0);
 
   const sections: SidebarSection[] = [
     {
@@ -93,7 +101,7 @@ export function Overview() {
             <KpiCard
               label="Tokens · 24h"
               value={data?.kpi.tokens_24h != null ? fmtInt(data.kpi.tokens_24h) : "—"}
-              delta="per-agent n/a"
+              delta={agentTokens.length ? `${agentTokens.length} agents` : "no usage"}
             />
             <KpiCard
               label="Worktrees"
@@ -122,6 +130,32 @@ export function Overview() {
                   queued {fmtInt(data?.distribution.queued)} · running {fmtInt(data?.distribution.running)} · review{" "}
                   {fmtInt(data?.distribution.review)} · merged {fmtInt(data?.distribution.merged)} · failed{" "}
                   {fmtInt(data?.distribution.failed)}
+                </div>
+                <div className="mt-5 border-t border-line pt-4">
+                  <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-ink-3">Agent usage</div>
+                  <div className="mt-3 space-y-2">
+                    {agentTokens.length ? (
+                      agentTokens.map((item) => {
+                        const width = maxAgentTokens > 0 ? Math.max(4, (item.tokens_24h / maxAgentTokens) * 100) : 0;
+                        return (
+                          <div key={item.agent} className="grid grid-cols-[72px_1fr_56px] items-center gap-3">
+                            <span className="font-mono text-[11px] text-ink-2 truncate">{item.agent}</span>
+                            <span className="h-2 bg-bg-2 border border-line">
+                              <span
+                                className="block h-full bg-rust"
+                                style={{ width: `${width}%` }}
+                              />
+                            </span>
+                            <span className="font-mono text-[11px] text-right text-ink-2">
+                              {fmtTokenCompact(item.tokens_24h)}
+                            </span>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div className="font-mono text-[11px] text-ink-3">no token events</div>
+                    )}
+                  </div>
                 </div>
               </div>
             </Panel>
