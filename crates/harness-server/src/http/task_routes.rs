@@ -51,6 +51,7 @@ pub(crate) async fn enqueue_task_background_in_domain(
 pub(crate) struct TaskResponseDetails {
     pub(crate) status: String,
     pub(crate) execution_path: &'static str,
+    pub(crate) submission_id: Option<String>,
     pub(crate) workflow_id: Option<String>,
 }
 
@@ -65,9 +66,14 @@ pub(crate) async fn task_response_details(
             .await
             .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
         {
+            let submission_id =
+                crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
+                    .map(|task_id| task_id.0)
+                    .unwrap_or_else(|| task_id.as_str().to_string());
             return Ok(TaskResponseDetails {
                 status: workflow.state,
                 execution_path: "workflow_runtime",
+                submission_id: Some(submission_id),
                 workflow_id: Some(workflow.id),
             });
         }
@@ -77,6 +83,7 @@ pub(crate) async fn task_response_details(
         return Ok(TaskResponseDetails {
             status: "queued".to_string(),
             execution_path: "task_runner",
+            submission_id: None,
             workflow_id: None,
         });
     }
@@ -92,6 +99,7 @@ pub(crate) async fn task_response_details(
         return Ok(TaskResponseDetails {
             status: "queued".to_string(),
             execution_path: "task_runner",
+            submission_id: None,
             workflow_id: None,
         });
     }
@@ -136,11 +144,19 @@ fn task_submission_response(
     task_id: &task_runner::TaskId,
     details: TaskResponseDetails,
 ) -> serde_json::Value {
+    let submission_id = details.submission_id;
+    let response_task_id = submission_id
+        .as_deref()
+        .unwrap_or_else(|| task_id.as_str())
+        .to_string();
     let mut response = json!({
-        "task_id": task_id.0,
+        "task_id": response_task_id,
         "status": details.status,
         "execution_path": details.execution_path,
     });
+    if let Some(submission_id) = submission_id {
+        response["submission_id"] = json!(submission_id);
+    }
     if let Some(workflow_id) = details.workflow_id {
         response["workflow_id"] = json!(workflow_id);
     }

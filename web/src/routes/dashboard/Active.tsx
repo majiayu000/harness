@@ -143,6 +143,11 @@ function runtimeMergeWorkflowId(workflow?: WorkflowSummary | null): string | nul
   return null;
 }
 
+function taskSubmissionHandle(task: Task): string {
+  const submissionId = task.submission_id?.trim();
+  return submissionId || task.id;
+}
+
 function runtimeWorkflowCanCancel(workflow: WorkflowRuntimeTreeNode["workflow"]): boolean {
   return (
     (workflow.definition_id === "github_issue_pr" || workflow.definition_id === "prompt_task") &&
@@ -347,7 +352,8 @@ function TaskCard({
   onMerge?: (taskId: string, workflow?: WorkflowSummary | null) => void;
   merging?: boolean;
 }) {
-  const title = task.description?.trim() || task.repo || task.id.slice(0, 8);
+  const handle = taskSubmissionHandle(task);
+  const title = task.description?.trim() || task.repo || handle.slice(0, 8);
   return (
     <div
       className="w-full text-left border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors cursor-pointer"
@@ -413,7 +419,7 @@ function TaskCard({
           disabled={merging}
           onClick={(e) => {
             e.stopPropagation();
-            onMerge(task.id, workflow);
+            onMerge(handle, workflow);
           }}
           className="mt-2 w-full border border-line bg-bg-1 px-2 py-1 font-mono text-[10px] text-ink-2 hover:border-line-3 hover:text-ink transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -544,9 +550,9 @@ export function Active({ projectFilter }: Props) {
                     key={t.id}
                     task={t}
                     workflow={t.workflow ?? null}
-                    onClick={() => setSelectedTaskId(t.id)}
+                    onClick={() => setSelectedTaskId(taskSubmissionHandle(t))}
                     onMerge={handleMerge}
-                    merging={merging.has(t.id)}
+                    merging={merging.has(taskSubmissionHandle(t))}
                   />
                 ))}
               </div>
@@ -565,7 +571,7 @@ export function Active({ projectFilter }: Props) {
                   key={t.id}
                   task={t}
                   workflow={t.workflow ?? null}
-                  onClick={() => setSelectedTaskId(t.id)}
+                  onClick={() => setSelectedTaskId(taskSubmissionHandle(t))}
                 />
               ))}
             </div>

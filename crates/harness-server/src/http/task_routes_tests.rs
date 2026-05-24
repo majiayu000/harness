@@ -68,6 +68,41 @@ fn batch_request_project_defaults_to_none() {
     assert!(req.project.is_none());
 }
 
+#[test]
+fn runtime_task_submission_response_uses_submission_id_as_handle() {
+    let response = task_submission_response(
+        &task_runner::TaskId::from_str("legacy-task-id"),
+        TaskResponseDetails {
+            status: "implementing".to_string(),
+            execution_path: "workflow_runtime",
+            submission_id: Some("runtime-submission-id".to_string()),
+            workflow_id: Some("runtime-workflow-id".to_string()),
+        },
+    );
+
+    assert_eq!(response["task_id"], "runtime-submission-id");
+    assert_eq!(response["submission_id"], "runtime-submission-id");
+    assert_eq!(response["workflow_id"], "runtime-workflow-id");
+    assert_eq!(response["execution_path"], "workflow_runtime");
+}
+
+#[test]
+fn legacy_task_submission_response_keeps_task_id_handle() {
+    let response = task_submission_response(
+        &task_runner::TaskId::from_str("legacy-task-id"),
+        TaskResponseDetails {
+            status: "queued".to_string(),
+            execution_path: "task_runner",
+            submission_id: None,
+            workflow_id: None,
+        },
+    );
+
+    assert_eq!(response["task_id"], "legacy-task-id");
+    assert!(response.get("submission_id").is_none());
+    assert_eq!(response["execution_path"], "task_runner");
+}
+
 #[tokio::test]
 async fn resolve_project_from_registry_passes_through_none() {
     let result = resolve_project_from_registry(None, None).await;
