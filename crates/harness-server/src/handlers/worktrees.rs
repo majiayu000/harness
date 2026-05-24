@@ -436,6 +436,14 @@ mod tests {
         let project_id = source_repo.to_string_lossy().into_owned();
         let workflow_id =
             harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 882);
+        let workflow_runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+                Some(&crate::test_helpers::test_database_url()?),
+            )
+            .await?,
+        );
+        state.core.workflow_runtime_store = Some(workflow_runtime_store.clone());
 
         let manager = Arc::new(crate::workspace::WorkspaceManager::new(WorkspaceConfig {
             root: dir.path().join("workspaces"),
@@ -468,11 +476,7 @@ mod tests {
             max_turns: Some(8),
             ..Default::default()
         });
-        state
-            .core
-            .workflow_runtime_store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("test state should include workflow runtime store"))?
+        workflow_runtime_store
             .upsert_instance(
                 &harness_workflow::runtime::WorkflowInstance::new(
                     harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
