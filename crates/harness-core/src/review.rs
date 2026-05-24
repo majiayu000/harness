@@ -205,8 +205,10 @@ pub fn evaluate_review_gate(
     }
 
     if external_required {
+        let mut saw_advisory = false;
         for input in reports {
             if input.role == ReviewProviderRole::Advisory {
+                saw_advisory = true;
                 match input.report.decision {
                     ReviewDecision::ChangesRequested => {
                         return gate_result(
@@ -225,6 +227,13 @@ pub fn evaluate_review_gate(
                     ReviewDecision::Approved => {}
                 }
             }
+        }
+        if !saw_advisory {
+            return ReviewGateResult {
+                decision: ReviewGateDecision::Blocked,
+                blocking_provider_id: None,
+                summary: "No external review provider report was available.".to_string(),
+            };
         }
     }
 
@@ -293,7 +302,7 @@ fn parse_payload(raw_json: &str) -> Option<ReviewReportPayload> {
 fn legacy_issue_findings(raw_output: &str) -> Vec<ReviewReportFinding> {
     raw_output
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("ISSUE:"))
+        .filter_map(legacy_issue_message)
         .map(|message| ReviewReportFinding {
             severity: ReviewSeverity::High,
             category: ReviewCategory::Other,
@@ -306,6 +315,16 @@ fn legacy_issue_findings(raw_output: &str) -> Vec<ReviewReportFinding> {
             confidence: None,
         })
         .collect()
+}
+
+fn legacy_issue_message(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let prefix = trimmed.get(..6)?;
+    if prefix.eq_ignore_ascii_case("ISSUE:") {
+        trimmed.get(6..).map(str::trim)
+    } else {
+        None
+    }
 }
 
 fn last_non_empty_line(raw_output: &str) -> Option<&str> {
@@ -402,7 +421,7 @@ mod tests {
         let report = parse_review_report(
             "codex_agent_review",
             ReviewProviderKind::LocalAgent,
-            "ISSUE: Missing retry coverage\nISSUE: Wrong timeout",
+            "ISSUE: Missing retry coverage\nIssue: Wrong timeout",
             started(),
             completed(),
         );
@@ -480,6 +499,20 @@ mod tests {
         );
 
         assert_eq!(result.decision, ReviewGateDecision::Approved);
+    }
+
+    #[test]
+    fn gate_blocks_when_external_required_without_advisory_report() {
+        let result = evaluate_review_gate(
+            &[approved_report(
+                "codex_cli_review",
+                ReviewProviderRole::Required,
+            )],
+            true,
+        );
+
+        assert_eq!(result.decision, ReviewGateDecision::Blocked);
+        assert_eq!(result.blocking_provider_id, None);
     }
 
     #[test]
