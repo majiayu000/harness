@@ -140,7 +140,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
     #[cfg(test)]
-    let db_state_guard = Some(crate::test_helpers::acquire_db_state_guard().await);
+    let db_setup_guard = crate::test_helpers::acquire_db_state_guard().await;
 
     tracing::debug!(
         data_dir = %dir.display(),
@@ -253,6 +253,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let (review_store, review_status) =
         build_review_store(&dir, server.config.server.database_url.as_deref()).await?;
+    #[cfg(test)]
+    drop(db_setup_guard);
     startup_statuses.push(review_status);
 
     // NOTE: add a matching entry here whenever a new optional store is added.
@@ -315,7 +317,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             workspace_mgr: registry.workspace_mgr,
         },
         #[cfg(test)]
-        _db_state_guard: db_state_guard,
+        _db_state_guard: None,
         runtime_hosts: services.runtime_hosts,
         runtime_project_cache: services.runtime_project_cache,
         runtime_state_persist_lock: Mutex::new(()),
