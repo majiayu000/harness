@@ -201,8 +201,7 @@ async fn make_state_inner(
     agent_registry: AgentRegistry,
     mut config: HarnessConfig,
 ) -> anyhow::Result<AppState> {
-    #[cfg(test)]
-    let db_state_guard = Some(acquire_db_state_guard().await);
+    let db_setup_guard = acquire_db_state_guard().await;
     let database_url = ensure_test_database_url_override()?;
     config.server.database_url = Some(database_url.clone());
     let server = Arc::new(HarnessServer::new(
@@ -266,6 +265,7 @@ async fn make_state_inner(
         None,
         vec![],
     );
+    drop(db_setup_guard);
 
     Ok(AppState {
         core: crate::http::CoreServices {
@@ -305,7 +305,7 @@ async fn make_state_inner(
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: db_state_guard,
+        _db_state_guard: None,
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),

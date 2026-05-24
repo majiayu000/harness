@@ -266,6 +266,7 @@ mod tests {
         dir: &std::path::Path,
         config: HarnessConfig,
     ) -> anyhow::Result<AppState> {
+        let db_setup_guard = crate::test_helpers::acquire_db_state_guard().await;
         let notification_broadcast_capacity = config.server.notification_broadcast_capacity.max(1);
         let notification_lag_log_every = config.server.notification_lag_log_every;
         let server = Arc::new(HarnessServer::new(
@@ -321,6 +322,8 @@ mod tests {
             None,
             vec![],
         );
+        drop(db_setup_guard);
+
         Ok(AppState {
             core: crate::http::CoreServices {
                 server,
@@ -361,7 +364,7 @@ mod tests {
                 workspace_mgr: None,
             },
             #[cfg(test)]
-            _db_state_guard: Some(crate::test_helpers::acquire_db_state_guard().await),
+            _db_state_guard: None,
             runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
             runtime_project_cache: Arc::new(
                 crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
