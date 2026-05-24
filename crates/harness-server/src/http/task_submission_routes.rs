@@ -23,8 +23,9 @@ pub(crate) async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    let response = super::task_query_routes::get_task(State(state), Path(id)).await;
-    decorate_json_response(response, decorate_runtime_task_value, "get_task").await
+    let response = super::task_query_routes::get_task(State(state.clone()), Path(id)).await;
+    let response = decorate_json_response(response, decorate_runtime_task_value, "get_task").await;
+    normalize_task_detail_response(&state, response).await
 }
 
 pub(crate) async fn get_task_artifacts(
@@ -127,9 +128,7 @@ fn decorate_runtime_task_value(value: &mut Value) {
     };
 
     object.insert("submission_id".to_string(), json!(submission_id.clone()));
-    object
-        .entry("task_id".to_string())
-        .or_insert_with(|| json!(submission_id));
+    object.insert("task_id".to_string(), json!(submission_id.clone()));
 
     let workflow_id = object
         .get("workflow_id")
@@ -146,6 +145,76 @@ fn decorate_runtime_task_value(value: &mut Value) {
         object.insert("workflow_id".to_string(), json!(workflow_id));
     }
     object.insert("execution_path".to_string(), json!("workflow_runtime"));
+}
+
+async fn normalize_task_detail_response(state: &AppState, response: Response) -> Response {
+    let (mut parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!("get_task: failed to read decorated response body: {error}");
+            return internal_server_error();
+        }
+    };
+
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, Body::from(bytes));
+    }
+
+    let mut value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!("get_task: failed to decode decorated response JSON: {error}");
+            return internal_server_error();
+        }
+    };
+    if let Err(error) = normalize_runtime_detail_submission_handle(state, &mut value).await {
+        tracing::error!("get_task: failed to normalize runtime submission handle: {error}");
+        return internal_server_error();
+    }
+
+    let body = match serde_json::to_vec(&value) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!("get_task: failed to encode normalized response JSON: {error}");
+            return internal_server_error();
+        }
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(body))
+}
+
+async fn normalize_runtime_detail_submission_handle(
+    state: &AppState,
+    value: &mut Value,
+) -> anyhow::Result<()> {
+    let lookup_ids = {
+        let Some(object) = value.as_object() else {
+            return Ok(());
+        };
+        if !is_runtime_submission_object(object) {
+            return Ok(());
+        }
+        ["submission_id", "task_id", "id"]
+            .into_iter()
+            .filter_map(|field| object.get(field).and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    for lookup_id in lookup_ids {
+        let task_id = harness_core::types::TaskId::from_str(&lookup_id);
+        let Some(workflow) = runtime_workflow_by_handle(state, &task_id).await? else {
+            continue;
+        };
+        let submission_id = runtime_submission_handle(&workflow, &task_id);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("submission_id".to_string(), json!(submission_id.clone()));
+            object.insert("task_id".to_string(), json!(submission_id));
+        }
+        return Ok(());
+    }
+    Ok(())
 }
 
 fn is_runtime_submission_object(object: &serde_json::Map<String, Value>) -> bool {
@@ -345,6 +414,27 @@ mod tests {
     }
 
     #[test]
+    fn decorate_runtime_detail_normalizes_task_id_to_submission_handle() {
+        let mut value = json!({
+            "id": "alias-handle",
+            "task_id": "alias-handle",
+            "submission_id": "canonical-handle",
+            "task_kind": "issue",
+            "status": "implementing",
+            "execution_path": "workflow_runtime",
+            "workflow_id": "workflow-1"
+        });
+
+        decorate_runtime_task_value(&mut value);
+
+        assert_eq!(value["id"], "alias-handle");
+        assert_eq!(value["task_id"], "canonical-handle");
+        assert_eq!(value["submission_id"], "canonical-handle");
+        assert_eq!(value["workflow_id"], "workflow-1");
+        assert_eq!(value["execution_path"], "workflow_runtime");
+    }
+
+    #[test]
     fn decorate_runtime_list_row_uses_workflow_summary() {
         let mut value = json!({
             "id": "runtime-list-handle",
@@ -483,7 +573,8 @@ mod tests {
         state.core.workflow_runtime_store = Some(store.clone());
         let state = Arc::new(state);
 
-        let task_id = harness_core::types::TaskId::from_str("runtime-route-handle");
+        let lookup_task_id = harness_core::types::TaskId::from_str("runtime-route-handle");
+        let canonical_task_id = harness_core::types::TaskId::from_str("runtime-canonical-handle");
         let workflow = WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
@@ -492,8 +583,8 @@ mod tests {
         )
         .with_id("runtime-route-workflow")
         .with_data(json!({
-            "task_id": task_id.as_str(),
-            "task_ids": [task_id.as_str()],
+            "task_id": lookup_task_id.as_str(),
+            "task_ids": [canonical_task_id.as_str(), lookup_task_id.as_str()],
             "issue_number": 1128,
             "repo": "owner/repo",
             "project_id": "/tmp/project"
@@ -531,7 +622,7 @@ mod tests {
         assert!(state
             .core
             .tasks
-            .get_with_db_fallback(&task_id)
+            .get_with_db_fallback(&lookup_task_id)
             .await?
             .is_none());
 
@@ -544,12 +635,12 @@ mod tests {
 
         let detail = get_json(&app, "/tasks/runtime-route-handle").await?;
         assert_eq!(detail["id"], "runtime-route-handle");
-        assert_eq!(detail["task_id"], "runtime-route-handle");
-        assert_eq!(detail["submission_id"], "runtime-route-handle");
+        assert_eq!(detail["task_id"], "runtime-canonical-handle");
+        assert_eq!(detail["submission_id"], "runtime-canonical-handle");
         assert_eq!(detail["workflow_id"], "runtime-route-workflow");
 
         let artifacts = get_json(&app, "/tasks/runtime-route-handle/artifacts").await?;
-        assert_eq!(artifacts[0]["task_id"], "runtime-route-handle");
+        assert_eq!(artifacts[0]["task_id"], "runtime-canonical-handle");
         assert_eq!(artifacts[0]["artifact_type"], "pull_request");
 
         let prompts = get_json(&app, "/tasks/runtime-route-handle/prompts").await?;
@@ -566,10 +657,10 @@ mod tests {
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("task list data should be an array"))?
             .iter()
-            .find(|task| task["id"] == "runtime-route-handle")
+            .find(|task| task["id"] == "runtime-canonical-handle")
             .ok_or_else(|| anyhow::anyhow!("runtime row should be listed"))?;
-        assert_eq!(row["task_id"], "runtime-route-handle");
-        assert_eq!(row["submission_id"], "runtime-route-handle");
+        assert_eq!(row["task_id"], "runtime-canonical-handle");
+        assert_eq!(row["submission_id"], "runtime-canonical-handle");
         assert_eq!(row["workflow_id"], "runtime-route-workflow");
         assert_eq!(row["execution_path"], "workflow_runtime");
 
