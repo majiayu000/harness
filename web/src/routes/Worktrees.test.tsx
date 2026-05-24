@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { PaletteProvider } from "@/lib/palette";
 import { DOCS_URL } from "@/lib/links";
 import { Worktrees } from "./Worktrees";
@@ -139,6 +139,51 @@ describe("<Worktrees>", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ workflow_id: "project::repo:owner/repo::issue:42" }),
       });
+    });
+  });
+
+  it("disables runtime cancel while workflow cancellation is pending", async () => {
+    let resolveCancel: (response: Response) => void = () => {};
+    mockUseWorktrees.mockReturnValue({
+      cards: [
+        worktreeCard({
+          taskId: "runtime-wf-workspace",
+          runtimeWorkflowId: "project::repo:owner/repo::issue:42",
+        }),
+      ],
+      isLoading: false,
+      error: null,
+    });
+    mockUseOverview.mockReturnValue({
+      data: {
+        projects: [],
+        runtimes: [],
+        kpi: {
+          active_tasks: 1,
+        },
+      },
+    });
+    mockApiFetch.mockReset();
+    mockApiFetch.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveCancel = resolve;
+        }),
+    );
+
+    wrap(<Worktrees />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    const cancellingButton = await screen.findByRole("button", { name: "Cancelling..." });
+    expect(cancellingButton).toBeDisabled();
+    fireEvent.click(cancellingButton);
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveCancel(new Response("{}", { status: 200 }));
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Cancel" })).not.toBeDisabled();
     });
   });
 

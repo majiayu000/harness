@@ -153,6 +153,10 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
   );
 }
 
+function cancelStateKey(card: WorktreeCard) {
+  return card.runtimeWorkflowId ?? card.taskId;
+}
+
 export function Worktrees() {
   const { cards, isLoading, error } = useWorktrees();
   const { data: overview } = useOverview();
@@ -162,7 +166,7 @@ export function Worktrees() {
   const [cancelError, setCancelError] = React.useState<string | null>(null);
 
   const handleCancel = async (card: WorktreeCard) => {
-    const cancelKey = card.runtimeWorkflowId ?? card.taskId;
+    const cancelKey = cancelStateKey(card);
     setCancelError(null);
     setCancelling((prev) => new Set(prev).add(cancelKey));
     try {
@@ -269,7 +273,7 @@ export function Worktrees() {
                     key={card.taskId}
                     card={card}
                     onCancel={handleCancel}
-                    cancelling={cancelling.has(card.taskId)}
+                    cancelling={cancelling.has(cancelStateKey(card))}
                   />
                 ))}
               </div>
