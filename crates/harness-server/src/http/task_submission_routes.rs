@@ -11,8 +11,6 @@ use std::{collections::BTreeMap, sync::Arc};
 use super::{state::AppState, task_query_routes::RawTaskListParams};
 use crate::task_db::{TaskArtifact, TaskPrompt};
 
-const RESPONSE_BODY_LIMIT: usize = 10 * 1024 * 1024;
-
 pub(crate) async fn list_tasks(
     State(state): State<Arc<AppState>>,
     query: Result<Query<RawTaskListParams>, QueryRejection>,
@@ -69,7 +67,7 @@ async fn decorate_json_response(
     handler_name: &'static str,
 ) -> Response {
     let (mut parts, body) = response.into_parts();
-    let bytes = match to_bytes(body, RESPONSE_BODY_LIMIT).await {
+    let bytes = match to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(error) => {
             tracing::error!("{handler_name}: failed to read response body: {error}");
@@ -365,6 +363,30 @@ mod tests {
         assert_eq!(value["submission_id"], "runtime-list-handle");
         assert_eq!(value["workflow_id"], "workflow-2");
         assert_eq!(value["execution_path"], "workflow_runtime");
+    }
+
+    #[tokio::test]
+    async fn decorate_json_response_allows_large_success_body() -> anyhow::Result<()> {
+        let body = json!({
+            "id": "runtime-large-handle",
+            "task_kind": "issue",
+            "status": "implementing",
+            "execution_path": "workflow_runtime",
+            "payload": "x".repeat(10 * 1024 * 1024 + 1)
+        });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(serde_json::to_vec(&body)?))?;
+
+        let response =
+            decorate_json_response(response, decorate_runtime_task_value, "large_body_test").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["task_id"], "runtime-large-handle");
+        assert_eq!(value["submission_id"], "runtime-large-handle");
+        Ok(())
     }
 
     #[test]
