@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use super::{state::AppState, task_query_routes::RawTaskListParams};
 use crate::task_db::{TaskArtifact, TaskPrompt};
@@ -219,12 +219,30 @@ async fn runtime_artifacts_by_handle(
     let jobs_by_command = store.runtime_jobs_for_commands(&command_ids).await?;
     let submission_id = runtime_submission_handle(&workflow, task_id);
     let mut artifacts = Vec::new();
-    for jobs in jobs_by_command.values() {
+    append_runtime_artifacts_by_command_order(
+        &mut artifacts,
+        &submission_id,
+        &command_ids,
+        &jobs_by_command,
+    )?;
+    Ok(Some(artifacts))
+}
+
+fn append_runtime_artifacts_by_command_order(
+    artifacts: &mut Vec<TaskArtifact>,
+    submission_id: &str,
+    command_ids: &[String],
+    jobs_by_command: &BTreeMap<String, Vec<harness_workflow::runtime::RuntimeJob>>,
+) -> anyhow::Result<()> {
+    for command_id in command_ids {
+        let Some(jobs) = jobs_by_command.get(command_id) else {
+            continue;
+        };
         for job in jobs {
-            append_runtime_job_artifacts(&mut artifacts, &submission_id, job)?;
+            append_runtime_job_artifacts(artifacts, submission_id, job)?;
         }
     }
-    Ok(Some(artifacts))
+    Ok(())
 }
 
 fn append_runtime_job_artifacts(
@@ -385,6 +403,43 @@ mod tests {
         assert_eq!(artifacts[0].task_id, "runtime-handle");
         assert_eq!(artifacts[0].artifact_type, "pull_request");
         assert!(artifacts[0].content.contains("\"number\": 1157"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_job_artifacts_follow_workflow_command_order() -> anyhow::Result<()> {
+        let mut first_command_job =
+            RuntimeJob::pending("command-b", RuntimeKind::CodexExec, "default", json!({}));
+        let first_result = ActivityResult::succeeded("implement_issue", "first").with_artifact(
+            ActivityArtifact::new("pull_request", json!({"source": "command-b"})),
+        );
+        first_command_job.complete(&first_result)?;
+
+        let mut second_command_job =
+            RuntimeJob::pending("command-a", RuntimeKind::CodexExec, "default", json!({}));
+        let second_result = ActivityResult::succeeded("implement_issue", "second").with_artifact(
+            ActivityArtifact::new("pull_request", json!({"source": "command-a"})),
+        );
+        second_command_job.complete(&second_result)?;
+
+        let command_ids = vec!["command-b".to_string(), "command-a".to_string()];
+        let mut jobs_by_command = std::collections::BTreeMap::new();
+        jobs_by_command.insert("command-a".to_string(), vec![second_command_job]);
+        jobs_by_command.insert("command-b".to_string(), vec![first_command_job]);
+        let mut artifacts = Vec::new();
+
+        append_runtime_artifacts_by_command_order(
+            &mut artifacts,
+            "runtime-handle",
+            &command_ids,
+            &jobs_by_command,
+        )?;
+
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].turn, 0);
+        assert!(artifacts[0].content.contains("\"source\": \"command-b\""));
+        assert_eq!(artifacts[1].turn, 1);
+        assert!(artifacts[1].content.contains("\"source\": \"command-a\""));
         Ok(())
     }
 
