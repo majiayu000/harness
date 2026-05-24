@@ -51,6 +51,7 @@ async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse
     let entries = manager.entries();
     let mut tasks_by_id = HashMap::new();
     let mut workflow_candidates = HashMap::new();
+    let mut taskless_runtime_task_ids = Vec::new();
 
     for entry in &entries {
         if let Some(task) = state.core.tasks.get(&entry.task_id) {
@@ -63,17 +64,26 @@ async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse
                 }
             }
             tasks_by_id.insert(entry.task_id.as_str().to_string(), task);
+        } else if entry.runtime_workflow_id.is_none() {
+            taskless_runtime_task_ids.push(entry.task_id.as_str().to_string());
         }
     }
 
     let workflow_ids_by_task =
         resolve_existing_runtime_workflow_ids(state, workflow_candidates).await?;
+    let taskless_workflow_ids_by_task =
+        resolve_runtime_workflow_ids_by_task_id(state, taskless_runtime_task_ids).await?;
 
     for entry in entries {
         let runtime_workflow_id = entry
             .runtime_workflow_id
             .clone()
-            .or_else(|| workflow_ids_by_task.get(entry.task_id.as_str()).cloned());
+            .or_else(|| workflow_ids_by_task.get(entry.task_id.as_str()).cloned())
+            .or_else(|| {
+                taskless_workflow_ids_by_task
+                    .get(entry.task_id.as_str())
+                    .cloned()
+            });
         let task = tasks_by_id.get(entry.task_id.as_str());
         if let Some(response) =
             response_from_entry(entry, task, runtime_workflow_id, default_max_turns, now)
@@ -104,6 +114,23 @@ async fn resolve_existing_runtime_workflow_ids(
                     .or_insert_with(|| instance.id.clone());
             }
         }
+    }
+    Ok(by_task_id)
+}
+
+async fn resolve_runtime_workflow_ids_by_task_id(
+    state: &AppState,
+    task_ids: Vec<String>,
+) -> anyhow::Result<HashMap<String, String>> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let mut by_task_id = HashMap::new();
+    for task_id in task_ids {
+        let Some(instance) = store.get_instance_by_task_id(&task_id).await? else {
+            continue;
+        };
+        by_task_id.entry(task_id).or_insert_with(|| instance.id);
     }
     Ok(by_task_id)
 }
@@ -548,6 +575,14 @@ mod tests {
         let workspace_path = dir.path().join("workspaces/runtime-workspace-1");
         let source_repo = dir.path().join("repo");
         let created_at = UNIX_EPOCH + Duration::from_secs(100);
+        let workflow_runtime_store = Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+                Some(&crate::test_helpers::test_database_url()?),
+            )
+            .await?,
+        );
+        state.core.workflow_runtime_store = Some(workflow_runtime_store.clone());
 
         let manager = Arc::new(crate::workspace::WorkspaceManager::new(WorkspaceConfig {
             root: dir.path().join("workspaces"),
@@ -559,13 +594,28 @@ mod tests {
                 workspace_path: workspace_path.clone(),
                 source_repo: source_repo.clone(),
                 repo: Some("owner/repo".to_string()),
-                runtime_workflow_id: Some("workflow-1".to_string()),
+                runtime_workflow_id: None,
                 branch: "harness/runtime-workspace-1".to_string(),
                 created_at,
                 owner_session: manager.owner_session.clone(),
                 run_generation: 1,
             },
         );
+        workflow_runtime_store
+            .upsert_instance(
+                &harness_workflow::runtime::WorkflowInstance::new(
+                    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+                    1,
+                    "implementing",
+                    harness_workflow::runtime::WorkflowSubject::new("issue", "issue:884"),
+                )
+                .with_id("workflow-1".to_string())
+                .with_data(json!({
+                    "task_id": "runtime-workspace-1",
+                    "task_ids": ["runtime-workspace-1"]
+                })),
+            )
+            .await?;
         manager.active_paths.insert(workspace_path, task_id);
         state.concurrency.workspace_mgr = Some(manager);
 

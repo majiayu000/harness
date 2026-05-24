@@ -244,7 +244,7 @@ describe("<Worktrees>", () => {
 
     wrap(<Worktrees />);
 
-    expect(screen.getByText("harness/runtime-")).toBeInTheDocument();
+    expect(screen.getByText("harness/1234567890abcdef")).toBeInTheDocument();
     expect(screen.getByText("1h")).toBeInTheDocument();
     expect(screen.getByText("Fix worktree cards")).toBeInTheDocument();
     expect(screen.getByText("review")).toBeInTheDocument();
@@ -304,7 +304,7 @@ describe("<Worktrees>", () => {
 
     expect(screen.getByRole("link", { name: "Submit task" })).toHaveAttribute(
       "href",
-      "/dashboard?tab=submit",
+      "/?tab=submit",
     );
   });
 });
