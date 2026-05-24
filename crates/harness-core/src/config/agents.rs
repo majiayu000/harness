@@ -170,17 +170,12 @@ fn default_default_agent() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewStrategy {
+    #[default]
     LocalFirst,
     LegacyHostedBot,
-}
-
-impl Default for ReviewStrategy {
-    fn default() -> Self {
-        Self::LocalFirst
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,10 +515,10 @@ fn default_review_fallback_chain() -> Vec<String> {
 fn normalize_external_bot_chain(chain: &[String]) -> Vec<String> {
     chain
         .iter()
-        .filter_map(|provider| match provider.as_str() {
-            "gemini" | "gemini_github_bot" => Some("gemini_github_bot".to_string()),
-            "codex" | "codex_github_bot" => Some("codex_github_bot".to_string()),
-            _ => Some(provider.clone()),
+        .map(|provider| match provider.as_str() {
+            "gemini" | "gemini_github_bot" => "gemini_github_bot".to_string(),
+            "codex" | "codex_github_bot" => "codex_github_bot".to_string(),
+            _ => provider.clone(),
         })
         .collect()
 }
