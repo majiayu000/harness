@@ -237,6 +237,33 @@ describe("<Active>", () => {
     });
   });
 
+  it("opens runtime rows by submission_id when present", () => {
+    const runtimeTask = {
+      ...makeTask("legacy-task-alias", "harness", "implementing"),
+      submission_id: "runtime-submission-handle",
+      execution_path: "workflow_runtime",
+      workflow_id: "runtime-workflow-1128",
+      workflow: {
+        id: "runtime-workflow-1128",
+        definition_id: "github_issue_pr",
+        state: "implementing",
+      },
+    };
+    mockUseTasks.mockReturnValue({
+      data: taskList([runtimeTask]),
+      isLoading: false,
+      isError: false,
+    });
+
+    wrap(<Active projectFilter="harness" />);
+    fireEvent.click(screen.getByText("legacy-task-alias"));
+
+    expect(screen.getByTestId("task-slideover")).toHaveAttribute(
+      "data-task-id",
+      "runtime-submission-handle",
+    );
+  });
+
   it("groups planner and review lifecycle statuses outside implementing", () => {
     mockUseTasks.mockReturnValue({
       data: taskList([

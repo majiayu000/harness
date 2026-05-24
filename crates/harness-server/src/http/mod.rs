@@ -28,6 +28,7 @@ pub(crate) mod state;
 pub(crate) mod task_mutation_routes;
 pub(crate) mod task_query_routes;
 pub(crate) mod task_routes;
+pub(crate) mod task_submission_routes;
 
 #[cfg(test)]
 mod reviewer_resolution_tests;
@@ -55,8 +56,9 @@ pub(crate) use misc_routes::{
     intake_status, password_reset, project_queue_stats,
 };
 pub(crate) use sse_routes::stream_task_sse;
-pub(crate) use task_query_routes::{
-    get_task, get_task_artifacts, get_task_prompts, get_task_proof, list_tasks,
+pub(crate) use task_query_routes::get_task_proof;
+pub(crate) use task_submission_routes::{
+    get_task, get_task_artifacts, get_task_prompts, list_tasks,
 };
 
 /// Resolve the reviewer agent for independent agent review.

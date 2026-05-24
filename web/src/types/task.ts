@@ -4,8 +4,12 @@
  */
 export interface Task {
   id: string;
+  task_id?: string | null;
+  submission_id?: string | null;
   task_kind: string;
   status: string;
+  execution_path?: string | null;
+  workflow_id?: string | null;
   turn: number;
   pr_url: string | null;
   error: string | null;
@@ -124,6 +128,7 @@ export type CreateTaskPayload =
 
 export interface CreateTaskResponse {
   task_id: string;
+  submission_id?: string | null;
   status: string;
   execution_path?: string;
   workflow_id?: string | null;

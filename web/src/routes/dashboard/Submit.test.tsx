@@ -267,6 +267,39 @@ describe("<Submit>", () => {
     );
   });
 
+  it("successful runtime submit prefers the returned submission_id handle", async () => {
+    mockApiFetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          task_id: "legacy-alias",
+          submission_id: "runtime-submission",
+          status: "implementing",
+          execution_path: "workflow_runtime",
+          workflow_id: "workflow-1128",
+        }),
+        { status: 200 },
+      ),
+    );
+    wrap(<Submit />);
+
+    goToConfig("Prompt");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "do something" } });
+    fireEvent.change(screen.getByRole("combobox", { name: /Project/ }), {
+      target: { value: "alpha" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Next/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Submit Task/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText("runtime-submission")).toBeInTheDocument();
+      expect(mockUseTaskStream).toHaveBeenCalledWith(
+        "runtime-submission",
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
+  });
+
   it("no projects: shows empty state message and form can still advance to submit", async () => {
     mockUseOverview.mockReturnValue({ data: { projects: [] } });
     wrap(<Submit />);

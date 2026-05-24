@@ -415,7 +415,7 @@ export function Submit({ projectFilter }: Props) {
       });
       const json = (await resp.json()) as CreateTaskResponse;
       setCreatedSubmission({
-        taskId: json.task_id,
+        taskId: json.submission_id ?? json.task_id,
         workflowId: json.workflow_id ?? null,
         executionPath: json.execution_path ?? null,
       });
