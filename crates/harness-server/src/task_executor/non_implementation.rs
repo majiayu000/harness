@@ -22,7 +22,7 @@ pub(crate) async fn run_non_implementation_task(
     req: &CreateTaskRequest,
     project: &std::path::Path,
     server_config: &harness_core::config::HarnessConfig,
-    interceptors: &Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
+    interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     events: &Arc<harness_observe::event_store::EventStore>,
     skills: &Arc<RwLock<harness_skills::store::SkillStore>>,
     cargo_env: &HashMap<String, String>,

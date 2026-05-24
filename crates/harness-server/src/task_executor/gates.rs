@@ -130,7 +130,7 @@ pub(crate) async fn run_resumed_pr_conflict_gate(
     pr_num: u64,
     repo_slug: &str,
     context_items: &[harness_core::types::ContextItem],
-    interceptors: &Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
+    interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     events: &Arc<harness_observe::event_store::EventStore>,
     cargo_env: &HashMap<String, String>,
     turn_timeout: Duration,
