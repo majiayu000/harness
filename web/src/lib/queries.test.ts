@@ -14,32 +14,34 @@ function makeWrapper() {
   return Wrapper;
 }
 
-type TaskStub = {
-  id: string;
-  status: string;
-  turn?: number;
-  project?: null;
-  workflow?: { id?: string | null; definition_id?: string | null } | null;
-};
-
-function mockFetch(tasks: TaskStub[]) {
-  const overview = { projects: [], runtimes: [], kpi: { active_tasks: 0 } };
-  const taskList = {
-    data: tasks,
-    page: { limit: 200, has_more: false, next_cursor: null },
-    counts: {
-      total: tasks.length,
-      running: tasks.length,
-      failed: 0,
-      by_status: {},
-      by_scheduler_state: {},
-    },
+function worktreeEntry(overrides: Record<string, unknown> = {}) {
+  return {
+    task_id: "task-1",
+    branch: "harness/task-1",
+    workspace_path: "/var/harness/workspaces/task-1",
+    path_short: "workspaces/task-1",
+    source_repo: "/Users/example/src/repo",
+    repo: "owner/repo",
+    runtime_workflow_id: null,
+    status: "implementing",
+    phase: "implement",
+    description: "Fix worktree cards",
+    turn: 1,
+    max_turns: null,
+    created_at: "2026-04-21T03:40:21Z",
+    duration_secs: 60,
+    pr_url: null,
+    project: "/Users/example/src/repo",
+    ...overrides,
   };
+}
+
+function mockWorktreeFetch(worktrees: Array<ReturnType<typeof worktreeEntry>>) {
   global.fetch = vi.fn().mockImplementation((url: string) => {
-    const body = url.includes("/api/overview")
-      ? JSON.stringify(overview)
-      : JSON.stringify(taskList);
-    return Promise.resolve(new Response(body, { status: 200 }));
+    if (url === "/api/worktrees") {
+      return Promise.resolve(new Response(JSON.stringify(worktrees), { status: 200 }));
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
   }) as unknown as typeof fetch;
 }
 
@@ -50,67 +52,79 @@ afterEach(() => {
   sessionStorage.clear();
 });
 
-// ── useWorktrees: active-status filtering ─────────────────────────────────────
+// ── useWorktrees: API-backed cards ────────────────────────────────────────────
 
-describe("useWorktrees – active-status filtering", () => {
-  it("includes all non-terminal statuses as active worktrees", async () => {
-    mockFetch([
-      { id: "1", status: "implementing", turn: 1, project: null },
-      { id: "2", status: "pending", turn: 0, project: null },
-      { id: "3", status: "agent_review", turn: 3, project: null },
-      { id: "4", status: "waiting", turn: 2, project: null },
-      { id: "5", status: "reviewing", turn: 4, project: null },
-      { id: "6", status: "awaiting_deps", turn: 0, project: null },
-    ]);
-    const { result } = renderHook(() => useWorktrees(), { wrapper: makeWrapper() });
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.cards).toHaveLength(6);
-  });
-
-  it("excludes terminal statuses: done, failed, cancelled", async () => {
-    mockFetch([
-      { id: "1", status: "done", turn: 5, project: null },
-      { id: "2", status: "failed", turn: 2, project: null },
-      { id: "3", status: "cancelled", turn: 1, project: null },
-      { id: "4", status: "implementing", turn: 3, project: null },
-    ]);
+describe("useWorktrees", () => {
+  it("fetches worktrees from /api/worktrees", async () => {
+    mockWorktreeFetch([worktreeEntry({ task_id: "task-1", duration_secs: 125 })]);
     const { result } = renderHook(() => useWorktrees(), { wrapper: makeWrapper() });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
     expect(result.current.cards).toHaveLength(1);
-    expect(result.current.cards[0].taskId).toBe("4");
+    expect(result.current.cards[0].taskId).toBe("task-1");
   });
 
-  it("returns empty array when all tasks are terminal", async () => {
-    mockFetch([
-      { id: "a", status: "done", turn: 1, project: null },
-      { id: "b", status: "failed", turn: 0, project: null },
+  it("maps API fields to card fields", async () => {
+    mockWorktreeFetch([
+      worktreeEntry({
+        task_id: "runtime-task-1",
+        branch: "harness/runtime-task-1",
+        workspace_path: "/var/harness/workspaces/runtime-task-1",
+        path_short: "workspaces/runtime-task-1",
+        source_repo: "/Users/example/src/repo",
+        status: "agent_review",
+        phase: "review",
+        description: "Review generated PR",
+        turn: 3,
+        max_turns: 10,
+        duration_secs: 300,
+        pr_url: "https://github.com/owner/repo/pull/123",
+      }),
     ]);
     const { result } = renderHook(() => useWorktrees(), { wrapper: makeWrapper() });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.cards).toHaveLength(0);
+    expect(result.current.cards[0]).toMatchObject({
+      taskId: "runtime-task-1",
+      workspacePath: "/var/harness/workspaces/runtime-task-1",
+      pathShort: "workspaces/runtime-task-1",
+      sourceRepo: "/Users/example/src/repo",
+      runtimeWorkflowId: null,
+      branch: "harness/runtime-task-1",
+      status: "agent_review",
+      phase: "review",
+      description: "Review generated PR",
+      turn: 3,
+      maxTurns: 10,
+      durationSecs: 300,
+      prUrl: "https://github.com/owner/repo/pull/123",
+    });
   });
 
-  it("carries runtime workflow ids for runtime-backed tasks", async () => {
-    mockFetch([
-      {
-        id: "runtime-task-1",
-        status: "implementing",
-        turn: 1,
-        project: null,
-        workflow: { id: "runtime-workflow-1", definition_id: "quality_gate" },
-      },
-      {
-        id: "legacy-task-1",
-        status: "implementing",
-        turn: 1,
-        project: null,
-        workflow: { id: "legacy-workflow-1", definition_id: null },
-      },
+  it("normalizes zero max_turns to an unknown turn budget", async () => {
+    mockWorktreeFetch([worktreeEntry({ max_turns: 0 })]);
+    const { result } = renderHook(() => useWorktrees(), { wrapper: makeWrapper() });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.cards[0].maxTurns).toBeNull();
+  });
+
+  it("sorts failed, review, implementing, then queued by duration", async () => {
+    mockWorktreeFetch([
+      worktreeEntry({ task_id: "queued", status: "pending", duration_secs: 999 }),
+      worktreeEntry({ task_id: "implementing-short", status: "implementing", duration_secs: 5 }),
+      worktreeEntry({ task_id: "review", status: "reviewing", duration_secs: 10 }),
+      worktreeEntry({ task_id: "implementing-long", status: "implementing", duration_secs: 50 }),
+      worktreeEntry({ task_id: "failed", status: "failed", duration_secs: 1 }),
     ]);
     const { result } = renderHook(() => useWorktrees(), { wrapper: makeWrapper() });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.cards[0].runtimeWorkflowId).toBe("runtime-workflow-1");
-    expect(result.current.cards[1].runtimeWorkflowId).toBeNull();
+    expect(result.current.cards.map((card) => card.taskId)).toEqual([
+      "failed",
+      "review",
+      "implementing-long",
+      "implementing-short",
+      "queued",
+    ]);
   });
 });
 

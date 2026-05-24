@@ -1,5 +1,6 @@
 import React from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
 import { PaletteFab } from "@/components/PaletteFab";
@@ -8,16 +9,25 @@ import { useWorktrees, useOverview } from "@/lib/queries";
 import { apiFetch, TOKEN_KEY } from "@/lib/api";
 import type { WorktreeCard } from "@/lib/queries";
 
-function fmtPct(v: number | null): string {
-  return v != null ? `${v.toFixed(1)}%` : "—";
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3_600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3_600)}h`;
+  return `${Math.floor(seconds / 86_400)}d`;
 }
 
-function fmtBytes(v: number | null): string {
-  return v != null ? `${(v / 1_073_741_824).toFixed(1)} GB` : "—";
+function phaseLabel(phase: string): string {
+  return phase.replace(/_/g, " ");
+}
+
+function branchLabel(card: WorktreeCard): string {
+  return card.branch;
 }
 
 function statusColor(status: string): string {
   switch (status) {
+    case "failed":
+      return "text-danger border-danger/40";
     case "implementing":
     case "planner_generating":
       return "text-ok border-ok/40";
@@ -51,24 +61,49 @@ interface CardProps {
 }
 
 function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
-  const pct = card.maxTurns != null ? Math.round((card.turn / card.maxTurns) * 100) : null;
+  const pct = card.maxTurns != null && card.maxTurns > 0 ? Math.round((card.turn / card.maxTurns) * 100) : null;
+  const failed = card.status === "failed";
 
   return (
-    <div className="border border-line rounded-[4px] bg-bg-1 flex flex-col gap-0 overflow-hidden">
-      <div className="px-4 py-3 flex items-center gap-2 border-b border-line">
-        <span className="font-mono text-[13px] text-ink font-medium truncate" title={card.pathShort}>
-          {card.pathShort}
-        </span>
-        <span className="font-mono text-[10.5px] px-1.5 py-[1px] border border-line-2 text-ink-3 rounded-[3px] flex-none">
-          {card.taskId.slice(0, 8)}
-        </span>
-        <span className="font-mono text-[10.5px] px-1.5 py-[1px] border border-line-2 text-ink-3 rounded-[3px] flex-none">
-          {card.branch}
-        </span>
+    <div
+      className={`border border-line rounded-[4px] bg-bg-1 flex flex-col gap-0 overflow-hidden ${
+        failed ? "border-l-2 border-l-danger" : ""
+      }`}
+    >
+      <div className="px-4 py-3 flex items-center gap-2 border-b border-line min-w-0">
         <span
-          className={`ml-auto font-mono text-[10.5px] px-1.5 py-[1px] border rounded-[10px] ${statusColor(card.status)}`}
+          className={`font-mono text-[10.5px] px-1.5 py-[1px] border rounded-[10px] flex-none ${statusColor(card.status)}`}
         >
           {card.status}
+        </span>
+        <span className="font-mono text-[12px] text-ink font-medium truncate" title={card.branch}>
+          {branchLabel(card)}
+        </span>
+        <span className="font-mono text-[10.5px] text-ink-3 flex-none">
+          {formatDuration(card.durationSecs)}
+        </span>
+        {card.prUrl && (
+          <a
+            href={card.prUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="ml-auto font-mono text-[10.5px] px-1.5 py-[1px] border border-rust/40 text-rust rounded-[3px] flex-none hover:bg-rust/5"
+          >
+            PR
+          </a>
+        )}
+        {!card.prUrl && <span className="ml-auto" />}
+      </div>
+
+      <div className="px-4 py-3 border-b border-line min-h-[74px]">
+        <p
+          className="m-0 text-[13px] leading-5 text-ink-2 line-clamp-2"
+          title={card.description ?? undefined}
+        >
+          {card.description ?? "No description"}
+        </p>
+        <span className="inline-flex mt-2 font-mono text-[10.5px] px-1.5 py-[1px] border border-line-2 text-ink-3 rounded-[3px]">
+          {phaseLabel(card.phase)}
         </span>
       </div>
 
@@ -89,22 +124,13 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
         </div>
       )}
 
-      <div className="px-4 py-2 grid grid-cols-3 border-b border-line">
-        <div>
-          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">CPU</div>
-          <div className="font-mono text-[12px] text-ink">{fmtPct(card.cpuPct)}</div>
-        </div>
-        <div>
-          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">RAM</div>
-          <div className="font-mono text-[12px] text-ink">{fmtPct(card.ramPct)}</div>
-        </div>
-        <div>
-          <div className="font-mono text-[10px] text-ink-4 uppercase tracking-[0.1em]">Disk</div>
-          <div className="font-mono text-[12px] text-ink">{fmtBytes(card.diskBytes)}</div>
-        </div>
-      </div>
-
-      <div className="px-4 py-2.5 flex items-center gap-2">
+      <div className="px-4 py-2.5 flex items-center gap-2 min-w-0">
+        <span
+          className="font-mono text-[11.5px] text-ink-3 truncate mr-auto"
+          title={card.workspacePath}
+        >
+          {card.pathShort}
+        </span>
         <button
           type="button"
           onClick={() => openStream(card.taskId)}
@@ -114,23 +140,19 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
         </button>
         <button
           type="button"
-          disabled
-          title="Coming soon"
-          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-4 rounded-[3px] cursor-not-allowed"
-        >
-          Shell
-        </button>
-        <button
-          type="button"
           disabled={cancelling}
           onClick={() => onCancel(card)}
-          className="ml-auto font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {cancelling ? "Cancelling..." : "Cancel"}
         </button>
       </div>
     </div>
   );
+}
+
+function cancelStateKey(card: WorktreeCard) {
+  return card.runtimeWorkflowId ?? card.taskId;
 }
 
 export function Worktrees() {
@@ -142,8 +164,7 @@ export function Worktrees() {
   const [cancelError, setCancelError] = React.useState<string | null>(null);
 
   const handleCancel = async (card: WorktreeCard) => {
-    const cancelKey = card.runtimeWorkflowId ?? card.taskId;
-    const refreshRuntimeTree = !!card.runtimeWorkflowId;
+    const cancelKey = cancelStateKey(card);
     setCancelError(null);
     setCancelling((prev) => new Set(prev).add(cancelKey));
     try {
@@ -159,10 +180,11 @@ export function Worktrees() {
     } catch (err) {
       setCancelError(err instanceof Error ? err.message : "Cancel failed");
     } finally {
-      const refreshes = [queryClient.invalidateQueries({ queryKey: ["tasks"] })];
-      if (refreshRuntimeTree) {
-        refreshes.push(queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] }));
-      }
+      const refreshes = [
+        queryClient.invalidateQueries({ queryKey: ["worktrees"] }),
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+        queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] }),
+      ];
       const refreshResults = await Promise.allSettled(refreshes);
       for (const result of refreshResults) {
         if (result.status === "rejected") {
@@ -233,8 +255,14 @@ export function Worktrees() {
               </div>
             )}
             {!isLoading && !error && cards.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-24 text-ink-3">
+              <div className="flex flex-col items-center justify-center gap-3 py-24 text-ink-3">
                 <span className="font-mono text-[13px]">No active worktrees</span>
+                <Link
+                  to="/?tab=submit"
+                  className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
+                >
+                  Submit task
+                </Link>
               </div>
             ) : (
               <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-4">
@@ -243,7 +271,7 @@ export function Worktrees() {
                     key={card.taskId}
                     card={card}
                     onCancel={handleCancel}
-                    cancelling={cancelling.has(card.runtimeWorkflowId ?? card.taskId)}
+                    cancelling={cancelling.has(cancelStateKey(card))}
                   />
                 ))}
               </div>

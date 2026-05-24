@@ -180,15 +180,64 @@ export function useCancelWorkflowRuntime() {
 
 export interface WorktreeCard {
   taskId: string;
-  runtimeWorkflowId: string | null;
+  workspacePath: string;
   pathShort: string;
+  sourceRepo: string;
+  repo: string | null;
+  runtimeWorkflowId: string | null;
   branch: string;
   status: string;
+  phase: string;
+  description: string | null;
   turn: number;
   maxTurns: number | null;
-  cpuPct: number | null;
-  ramPct: number | null;
-  diskBytes: number | null;
+  createdAt: string;
+  durationSecs: number;
+  prUrl: string | null;
+  project: string | null;
+}
+
+interface WorktreeApiEntry {
+  task_id: string;
+  branch: string;
+  workspace_path: string;
+  path_short: string;
+  source_repo: string;
+  repo: string | null;
+  runtime_workflow_id: string | null;
+  status: string;
+  phase: string;
+  description: string | null;
+  turn: number;
+  max_turns: number | null;
+  created_at: string;
+  duration_secs: number;
+  pr_url: string | null;
+  project: string | null;
+}
+
+function worktreeStatusRank(status: string): number {
+  switch (status) {
+    case "failed":
+      return 0;
+    case "agent_review":
+    case "reviewing":
+    case "review_generating":
+    case "review_waiting":
+      return 1;
+    case "implementing":
+    case "triaging":
+    case "planning":
+    case "planner_generating":
+    case "planner_waiting":
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+function normalizeMaxTurns(maxTurns: number | null): number | null {
+  return typeof maxTurns === "number" && maxTurns > 0 ? maxTurns : null;
 }
 
 export async function registerProject(req: {
@@ -205,44 +254,36 @@ export async function registerProject(req: {
 }
 
 export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; error: Error | null } {
-  const tasks = useTasks({ active: true, limit: 200 });
-  const overview = useOverview();
-
-  const isLoading = tasks.isLoading || overview.isLoading;
-  const error = tasks.error ?? overview.error ?? null;
-
-  const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
-  const runningTasks = (tasks.data?.data ?? []).filter((t) => !TERMINAL_STATUSES.has(t.status));
-
-  const cards: WorktreeCard[] = runningTasks.map((task) => {
-    const project = (overview.data?.projects ?? []).find(
-      (p) => p.id === task.project || p.root === task.project,
-    );
-
-    let pathShort = "—";
-    if (project?.root) {
-      const parts = project.root.replace(/\\/g, "/").split("/").filter(Boolean);
-      pathShort = parts.slice(-2).join("/") || project.root;
-    }
-
-    const agentId = project?.agents?.[0];
-    const runtime = agentId
-      ? (overview.data?.runtimes ?? []).find((r) => r.id === agentId)
-      : undefined;
-
-    return {
-      taskId: task.id,
-      runtimeWorkflowId: task.workflow?.definition_id ? (task.workflow.id ?? null) : null,
-      pathShort,
-      branch: "—",
-      status: task.status,
-      turn: task.turn,
-      maxTurns: null,
-      cpuPct: runtime?.cpu_pct ?? null,
-      ramPct: runtime?.ram_pct ?? null,
-      diskBytes: null,
-    };
+  const query = useQuery<WorktreeApiEntry[], Error>({
+    queryKey: ["worktrees"],
+    queryFn: ({ signal }) => apiJson<WorktreeApiEntry[]>("/api/worktrees", { signal }),
+    refetchInterval: 5_000,
   });
 
-  return { cards, isLoading, error };
+  const cards = (query.data ?? [])
+    .map((entry) => ({
+      taskId: entry.task_id,
+      workspacePath: entry.workspace_path,
+      pathShort: entry.path_short,
+      sourceRepo: entry.source_repo,
+      repo: entry.repo,
+      runtimeWorkflowId: entry.runtime_workflow_id,
+      branch: entry.branch,
+      status: entry.status,
+      phase: entry.phase,
+      description: entry.description,
+      turn: entry.turn,
+      maxTurns: normalizeMaxTurns(entry.max_turns),
+      createdAt: entry.created_at,
+      durationSecs: entry.duration_secs,
+      prUrl: entry.pr_url,
+      project: entry.project,
+    }))
+    .sort((left, right) => {
+      const rankDiff = worktreeStatusRank(left.status) - worktreeStatusRank(right.status);
+      if (rankDiff !== 0) return rankDiff;
+      return right.durationSecs - left.durationSecs;
+    });
+
+  return { cards, isLoading: query.isLoading, error: query.error ?? null };
 }
