@@ -140,13 +140,17 @@ impl<'a> RuntimeWorker<'a> {
         if !instance.is_terminal() {
             return Ok(None);
         }
-        Ok(Some(ActivityResult::cancelled(
-            runtime_job_activity_name(job),
-            format!(
-                "Workflow {} was already terminal ({}) before runtime execution.",
-                instance.id, instance.state
-            ),
-        )))
+        let activity = runtime_job_activity_name(job);
+        let summary = format!(
+            "Workflow {} was already terminal ({}) before runtime execution.",
+            instance.id, instance.state
+        );
+        let result = match instance.state.as_str() {
+            "cancelled" => ActivityResult::cancelled(activity, summary),
+            "failed" => ActivityResult::failed(activity, summary, "workflow already failed"),
+            _ => ActivityResult::succeeded(activity, summary),
+        };
+        Ok(Some(result))
     }
 
     async fn execute_with_lease_renewal(

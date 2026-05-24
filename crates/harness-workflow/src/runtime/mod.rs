@@ -14,6 +14,7 @@ pub mod quality_gate;
 pub mod reducer;
 pub mod repo_backlog;
 pub mod store;
+mod store_migrations;
 pub mod submission;
 pub mod validator;
 pub mod worker;

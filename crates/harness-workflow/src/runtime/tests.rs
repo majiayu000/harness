@@ -35,6 +35,8 @@ use std::sync::{
     Arc, Mutex,
 };
 
+mod p1_followups;
+
 fn issue_instance(state: &str) -> WorkflowInstance {
     WorkflowInstance::new(
         "github_issue_pr",

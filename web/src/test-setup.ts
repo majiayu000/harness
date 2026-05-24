@@ -24,8 +24,16 @@ function createMemoryStorage(): Storage {
   };
 }
 
+function readGlobalStorage(): Storage | null {
+  try {
+    return globalThis.localStorage;
+  } catch {
+    return null;
+  }
+}
+
 if (typeof window !== "undefined") {
-  const globalStorage = globalThis.localStorage;
+  const globalStorage = readGlobalStorage();
   const hasUsableStorage =
     typeof globalStorage?.getItem === "function" &&
     typeof globalStorage?.setItem === "function" &&
