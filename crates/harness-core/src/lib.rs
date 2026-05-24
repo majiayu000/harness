@@ -10,6 +10,7 @@ pub mod interceptor;
 pub mod lang_detect;
 pub mod prompts;
 pub mod proof_of_work;
+pub mod review;
 pub mod shell_safety;
 #[cfg(test)]
 mod test_support;
