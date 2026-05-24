@@ -1,10 +1,11 @@
 use crate::http::state::AppState;
-use crate::task_runner::{TaskPhase, TaskState, TaskStatus};
+use crate::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus};
 use crate::workspace::WorkspaceEntry;
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -47,10 +48,36 @@ async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse
     let default_max_turns = state.core.server.config.concurrency.max_turns;
     let now = SystemTime::now();
     let mut responses = Vec::new();
+    let entries = manager.entries();
+    let mut tasks_by_id = HashMap::new();
+    let mut workflow_candidates = HashMap::new();
 
-    for entry in manager.entries() {
-        let task = state.core.tasks.get(&entry.task_id);
-        if let Some(response) = response_from_entry(entry, task.as_ref(), default_max_turns, now) {
+    for entry in &entries {
+        if let Some(task) = state.core.tasks.get(&entry.task_id) {
+            if entry.runtime_workflow_id.is_none() {
+                if let Some(workflow_id) = runtime_workflow_id_candidate(&task) {
+                    workflow_candidates
+                        .entry(workflow_id)
+                        .or_insert_with(Vec::new)
+                        .push(entry.task_id.as_str().to_string());
+                }
+            }
+            tasks_by_id.insert(entry.task_id.as_str().to_string(), task);
+        }
+    }
+
+    let workflow_ids_by_task =
+        resolve_existing_runtime_workflow_ids(state, workflow_candidates).await?;
+
+    for entry in entries {
+        let runtime_workflow_id = entry
+            .runtime_workflow_id
+            .clone()
+            .or_else(|| workflow_ids_by_task.get(entry.task_id.as_str()).cloned());
+        let task = tasks_by_id.get(entry.task_id.as_str());
+        if let Some(response) =
+            response_from_entry(entry, task, runtime_workflow_id, default_max_turns, now)
+        {
             responses.push(response);
         }
     }
@@ -58,21 +85,96 @@ async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse
     Ok(responses)
 }
 
+async fn resolve_existing_runtime_workflow_ids(
+    state: &AppState,
+    candidates: HashMap<String, Vec<String>>,
+) -> anyhow::Result<HashMap<String, String>> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let mut by_task_id = HashMap::new();
+    for (workflow_id, task_ids) in candidates {
+        let Some(instance) = store.get_instance(&workflow_id).await? else {
+            continue;
+        };
+        for task_id in task_ids {
+            if workflow_contains_task_id(&instance, &task_id) {
+                by_task_id
+                    .entry(task_id)
+                    .or_insert_with(|| instance.id.clone());
+            }
+        }
+    }
+    Ok(by_task_id)
+}
+
+fn runtime_workflow_id_candidate(task: &TaskState) -> Option<String> {
+    let project_id = task.project_root.as_ref()?.to_string_lossy();
+    match task.task_kind {
+        TaskKind::Issue => {
+            let issue_number = task
+                .external_id
+                .as_deref()?
+                .strip_prefix("issue:")?
+                .parse::<u64>()
+                .ok()?;
+            Some(harness_workflow::issue_lifecycle::workflow_id(
+                &project_id,
+                task.repo.as_deref(),
+                issue_number,
+            ))
+        }
+        TaskKind::Prompt => Some(crate::workflow_runtime_submission::prompt_workflow_id(
+            &project_id,
+            task.external_id.as_deref(),
+            &task.id,
+        )),
+        TaskKind::Pr | TaskKind::Review | TaskKind::Planner => None,
+    }
+}
+
+fn workflow_contains_task_id(
+    instance: &harness_workflow::runtime::WorkflowInstance,
+    task_id: &str,
+) -> bool {
+    instance
+        .data
+        .get("task_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == task_id)
+        || instance
+            .data
+            .get("task_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.as_str().is_some_and(|value| value == task_id))
+            })
+}
+
 fn response_from_entry(
     entry: WorkspaceEntry,
     task: Option<&TaskState>,
+    runtime_workflow_id: Option<String>,
     default_max_turns: Option<u32>,
     now: SystemTime,
 ) -> Option<WorktreeResponse> {
     match task {
-        Some(task) => response_from_task(entry, task, default_max_turns, now),
-        None => Some(response_from_workspace_entry(entry, default_max_turns, now)),
+        Some(task) => response_from_task(entry, task, runtime_workflow_id, default_max_turns, now),
+        None => Some(response_from_workspace_entry(
+            entry,
+            runtime_workflow_id,
+            default_max_turns,
+            now,
+        )),
     }
 }
 
 fn response_from_task(
     entry: WorkspaceEntry,
     task: &TaskState,
+    runtime_workflow_id: Option<String>,
     default_max_turns: Option<u32>,
     now: SystemTime,
 ) -> Option<WorktreeResponse> {
@@ -98,7 +200,7 @@ fn response_from_task(
         path_short: path_short(&entry.workspace_path),
         source_repo: entry.source_repo.to_string_lossy().into_owned(),
         repo: task.repo.clone(),
-        runtime_workflow_id: entry.runtime_workflow_id,
+        runtime_workflow_id,
         status: task.status.as_ref().to_string(),
         phase: phase_name(&task.phase).to_string(),
         description: task.description.clone(),
@@ -116,6 +218,7 @@ fn response_from_task(
 
 fn response_from_workspace_entry(
     entry: WorkspaceEntry,
+    runtime_workflow_id: Option<String>,
     default_max_turns: Option<u32>,
     now: SystemTime,
 ) -> WorktreeResponse {
@@ -133,7 +236,7 @@ fn response_from_workspace_entry(
         path_short: path_short(&entry.workspace_path),
         source_repo: source_repo.clone(),
         repo: entry.repo,
-        runtime_workflow_id: entry.runtime_workflow_id,
+        runtime_workflow_id,
         status: TaskStatus::Implementing.as_ref().to_string(),
         phase: phase_name(&TaskPhase::Implement).to_string(),
         description: None,
@@ -218,6 +321,7 @@ mod tests {
         let response = response_from_task(
             entry("task-1"),
             &task,
+            Some("workflow-1".to_string()),
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
@@ -248,10 +352,33 @@ mod tests {
         assert!(response_from_task(
             entry("task-1"),
             &task,
+            Some("workflow-1".to_string()),
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
         .is_none());
+    }
+
+    #[test]
+    fn response_from_task_uses_resolved_runtime_workflow_id() {
+        let mut workspace = entry("task-1");
+        workspace.runtime_workflow_id = None;
+        let mut task = TaskState::new(CoreTaskId("task-1".to_string()));
+        task.status = TaskStatus::Implementing;
+
+        let response = response_from_task(
+            workspace,
+            &task,
+            Some("resolved-workflow-1".to_string()),
+            Some(20),
+            UNIX_EPOCH + Duration::from_secs(850),
+        )
+        .expect("active task should render");
+
+        assert_eq!(
+            response.runtime_workflow_id.as_deref(),
+            Some("resolved-workflow-1")
+        );
     }
 
     #[test]
@@ -262,6 +389,7 @@ mod tests {
         let response = response_from_task(
             entry("task-1"),
             &task,
+            Some("workflow-1".to_string()),
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
@@ -275,6 +403,7 @@ mod tests {
         let response = response_from_entry(
             entry("runtime-workspace-1"),
             None,
+            Some("workflow-1".to_string()),
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
@@ -304,6 +433,9 @@ mod tests {
         let workspace_path = dir.path().join("workspaces/route-task-1");
         let source_repo = dir.path().join("repo");
         let created_at = UNIX_EPOCH + Duration::from_secs(100);
+        let project_id = source_repo.to_string_lossy().into_owned();
+        let workflow_id =
+            harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 882);
 
         let manager = Arc::new(crate::workspace::WorkspaceManager::new(WorkspaceConfig {
             root: dir.path().join("workspaces"),
@@ -325,14 +457,39 @@ mod tests {
         manager.active_paths.insert(workspace_path, task_id.clone());
 
         let mut task = TaskState::new(task_id);
+        task.task_kind = TaskKind::Issue;
         task.status = TaskStatus::Implementing;
         task.description = Some("Render active worktrees".to_string());
+        task.external_id = Some("issue:882".to_string());
         task.repo = Some("owner/repo".to_string());
+        task.project_root = Some(source_repo.clone());
         task.turn = 2;
         task.request_settings = Some(PersistedRequestSettings {
             max_turns: Some(8),
             ..Default::default()
         });
+        state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("test state should include workflow runtime store"))?
+            .upsert_instance(
+                &harness_workflow::runtime::WorkflowInstance::new(
+                    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+                    1,
+                    "implementing",
+                    harness_workflow::runtime::WorkflowSubject::new("issue", "issue:882"),
+                )
+                .with_id(workflow_id.clone())
+                .with_data(json!({
+                    "project_id": project_id,
+                    "repo": "owner/repo",
+                    "issue_number": 882,
+                    "task_id": "route-task-1",
+                    "task_ids": ["route-task-1"]
+                })),
+            )
+            .await?;
         state.core.tasks.insert(&task).await;
         state.concurrency.workspace_mgr = Some(manager);
 
@@ -355,9 +512,24 @@ mod tests {
         assert_eq!(payload[0]["path_short"], "workspaces/route-task-1");
         assert_eq!(payload[0]["description"], "Render active worktrees");
         assert_eq!(payload[0]["repo"], "owner/repo");
+        assert_eq!(payload[0]["runtime_workflow_id"], workflow_id);
         assert_eq!(payload[0]["turn"], 2);
         assert_eq!(payload[0]["max_turns"], 8);
         Ok(())
+    }
+
+    #[test]
+    fn runtime_workflow_id_candidate_uses_issue_task_metadata() {
+        let mut task = TaskState::new(CoreTaskId("task-1".to_string()));
+        task.task_kind = TaskKind::Issue;
+        task.project_root = Some(PathBuf::from("/Users/example/src/repo"));
+        task.repo = Some("owner/repo".to_string());
+        task.external_id = Some("issue:882".to_string());
+
+        assert_eq!(
+            runtime_workflow_id_candidate(&task).as_deref(),
+            Some("/Users/example/src/repo::repo:owner/repo::issue:882")
+        );
     }
 
     #[tokio::test]
