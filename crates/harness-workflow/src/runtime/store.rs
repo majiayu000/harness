@@ -8,10 +8,11 @@ use super::prompt_task::PROMPT_TASK_DEFINITION_ID;
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use super::reducer::{reduce_runtime_job_completed, GITHUB_ISSUE_PR_DEFINITION_ID};
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
+use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
 use super::validator::{DecisionValidator, ValidationContext};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use harness_core::db::{Migration, PgStoreContext};
+use harness_core::db::PgStoreContext;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
@@ -20,183 +21,6 @@ use std::path::Path;
 use uuid::Uuid;
 
 const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
-
-static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        description: "create generic workflow runtime tables",
-        sql: "CREATE TABLE IF NOT EXISTS workflow_definitions (
-            id              TEXT NOT NULL,
-            version         BIGINT NOT NULL,
-            data            JSONB NOT NULL,
-            active          BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id, version)
-        );
-
-        CREATE TABLE IF NOT EXISTS workflow_instances (
-            id              TEXT PRIMARY KEY,
-            definition_id   TEXT NOT NULL,
-            state           TEXT NOT NULL,
-            subject_type    TEXT NOT NULL,
-            subject_key     TEXT NOT NULL,
-            parent_workflow_id TEXT,
-            data            JSONB NOT NULL,
-            version         BIGINT NOT NULL DEFAULT 0,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS workflow_events (
-            id              TEXT PRIMARY KEY,
-            workflow_id     TEXT NOT NULL,
-            sequence        BIGINT NOT NULL,
-            event_type      TEXT NOT NULL,
-            source          TEXT NOT NULL,
-            data            JSONB NOT NULL,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (workflow_id, sequence)
-        );
-
-        CREATE TABLE IF NOT EXISTS workflow_decisions (
-            id              TEXT PRIMARY KEY,
-            workflow_id     TEXT NOT NULL,
-            event_id        TEXT,
-            accepted        BOOLEAN NOT NULL,
-            data            JSONB NOT NULL,
-            rejection_reason TEXT,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS workflow_commands (
-            id              TEXT PRIMARY KEY,
-            workflow_id     TEXT NOT NULL,
-            decision_id     TEXT,
-            command_type    TEXT NOT NULL,
-            dedupe_key      TEXT NOT NULL,
-            status          TEXT NOT NULL,
-            data            JSONB NOT NULL,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (workflow_id, dedupe_key)
-        );
-
-        CREATE TABLE IF NOT EXISTS runtime_jobs (
-            id              TEXT PRIMARY KEY,
-            command_id      TEXT NOT NULL,
-            runtime_kind    TEXT NOT NULL,
-            runtime_profile TEXT NOT NULL,
-            status          TEXT NOT NULL,
-            data            JSONB NOT NULL,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS runtime_events (
-            id              TEXT PRIMARY KEY,
-            runtime_job_id  TEXT NOT NULL,
-            sequence        BIGINT NOT NULL,
-            event_type      TEXT NOT NULL,
-            data            JSONB NOT NULL,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (runtime_job_id, sequence)
-        );
-
-        CREATE TABLE IF NOT EXISTS workflow_artifacts (
-            id              TEXT PRIMARY KEY,
-            workflow_id     TEXT NOT NULL,
-            runtime_job_id  TEXT,
-            artifact_type   TEXT NOT NULL,
-            data            JSONB NOT NULL,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )",
-    },
-    Migration {
-        version: 2,
-        description: "index generic workflow runtime lookups",
-        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_subject
-              ON workflow_instances (definition_id, subject_type, subject_key);
-              CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow_sequence
-              ON workflow_events (workflow_id, sequence);
-              CREATE INDEX IF NOT EXISTS idx_workflow_commands_status
-              ON workflow_commands (status, created_at);
-              CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status
-              ON runtime_jobs (status, created_at);
-              CREATE INDEX IF NOT EXISTS idx_runtime_events_job_sequence
-              ON runtime_events (runtime_job_id, sequence)",
-    },
-    Migration {
-        version: 3,
-        description: "promote runtime job not_before to indexed column",
-        sql: "ALTER TABLE runtime_jobs
-              ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;
-              UPDATE runtime_jobs
-              SET not_before = (data->>'not_before')::timestamptz
-              WHERE not_before IS NULL
-                AND jsonb_typeof(data->'not_before') = 'string'
-                AND data->>'not_before' ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}';
-              CREATE INDEX IF NOT EXISTS idx_runtime_jobs_ready
-              ON runtime_jobs (status, not_before, created_at)",
-    },
-    Migration {
-        version: 4,
-        description: "index runtime workflow handle lookups",
-        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_state
-              ON workflow_instances (definition_id, state, updated_at);
-              CREATE INDEX IF NOT EXISTS idx_workflow_instances_task_id
-              ON workflow_instances ((data->'data'->>'task_id'))",
-    },
-    Migration {
-        version: 5,
-        description: "index runtime workflow handle history",
-        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_task_ids
-              ON workflow_instances USING GIN ((data->'data'->'task_ids'))",
-    },
-    Migration {
-        version: 6,
-        description: "add workflow command dispatch leases",
-        sql: "ALTER TABLE workflow_commands
-              ADD COLUMN IF NOT EXISTS dispatch_owner TEXT;
-              ALTER TABLE workflow_commands
-              ADD COLUMN IF NOT EXISTS dispatch_lease_expires_at TIMESTAMPTZ;
-              CREATE INDEX IF NOT EXISTS idx_workflow_commands_dispatch_claim
-              ON workflow_commands (status, dispatch_lease_expires_at, created_at)",
-    },
-    Migration {
-        version: 7,
-        description: "index runtime issue workflow PR lookups",
-        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_pr
-              ON workflow_instances (
-                  definition_id,
-                  (data->'data'->>'project_id'),
-                  (data->'data'->>'pr_number'),
-                  updated_at DESC
-              )
-              WHERE data->'data'->>'pr_number' IS NOT NULL;
-              CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_repo_pr
-              ON workflow_instances (
-                  definition_id,
-                  (data->'data'->>'project_id'),
-                  (data->'data'->>'repo'),
-                  (data->'data'->>'pr_number'),
-                  updated_at DESC
-              )
-              WHERE data->'data'->>'pr_number' IS NOT NULL",
-    },
-    Migration {
-        version: 8,
-        description: "index runtime job command pagination",
-        sql: "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_command_created
-              ON runtime_jobs (command_id, created_at DESC, id DESC)",
-    },
-    Migration {
-        version: 9,
-        description: "index workflow events by type",
-        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow_type_sequence
-              ON workflow_events (workflow_id, event_type, sequence DESC)",
-    },
-];
 
 pub struct WorkflowRuntimeStore {
     pool: PgPool,
@@ -597,7 +421,12 @@ impl WorkflowRuntimeStore {
                AND data->'data'->>'project_id' = $2
                AND ($3::text IS NULL OR data->'data'->>'repo' = $3)
                AND data->'data'->>'pr_number' = $4
-             ORDER BY updated_at DESC
+             ORDER BY
+               CASE
+                 WHEN subject_type = 'issue' OR data->'data' ? 'issue_number' THEN 0
+                 ELSE 1
+               END,
+               updated_at DESC
              LIMIT 1",
         )
         .bind(definition_id)
@@ -1500,6 +1329,24 @@ impl WorkflowRuntimeStore {
         result: &ActivityResult,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         let mut tx = self.pool.begin().await?;
+        let command_id_row: Option<(String,)> =
+            sqlx::query_as("SELECT command_id FROM runtime_jobs WHERE id = $1")
+                .bind(runtime_job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((command_id,)) = command_id_row else {
+            anyhow::bail!("runtime job not found: {runtime_job_id}");
+        };
+        let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
+            "SELECT id, workflow_id, decision_id, status, dispatch_owner,
+                    dispatch_lease_expires_at, data::text, created_at, updated_at
+             FROM workflow_commands
+             WHERE id = $1
+             FOR UPDATE",
+        )
+        .bind(&command_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(runtime_job_id)
@@ -1532,16 +1379,6 @@ impl WorkflowRuntimeStore {
         .bind(&updated)
         .bind(runtime_job_id)
         .execute(&mut *tx)
-        .await?;
-        let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
-            "SELECT id, workflow_id, decision_id, status, dispatch_owner,
-                    dispatch_lease_expires_at, data::text, created_at, updated_at
-             FROM workflow_commands
-             WHERE id = $1
-             FOR UPDATE",
-        )
-        .bind(&job.command_id)
-        .fetch_optional(&mut *tx)
         .await?;
         let Some(command_row) = command_row else {
             tx.commit().await?;
