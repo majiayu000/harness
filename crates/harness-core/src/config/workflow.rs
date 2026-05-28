@@ -441,10 +441,11 @@ fn default_runtime_dispatch_timeout_secs() -> Option<u64> {
 }
 
 fn default_workflow_runtime_dispatch_policy() -> RuntimeDispatchPolicy {
-    let mut policy = RuntimeDispatchPolicy::default();
-    policy.runtime_kind = default_runtime_dispatch_runtime_kind();
-    policy.timeout_secs = default_runtime_dispatch_timeout_secs();
-    policy
+    RuntimeDispatchPolicy {
+        runtime_kind: default_runtime_dispatch_runtime_kind(),
+        timeout_secs: default_runtime_dispatch_timeout_secs(),
+        ..RuntimeDispatchPolicy::default()
+    }
 }
 
 fn default_runtime_worker_interval_secs() -> u64 {

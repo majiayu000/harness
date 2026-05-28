@@ -451,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             runtime_timeout_fallback(&config, None, &runtime_job("poll_repo_backlog")),
-            Some(600)
+            Some(3600)
         );
         assert_eq!(
             runtime_timeout_fallback(&config, None, &runtime_job("implement_issue")),
