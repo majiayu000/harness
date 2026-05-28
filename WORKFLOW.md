@@ -39,7 +39,7 @@ runtime_dispatch:
     poll_repo_backlog:
       runtime_kind: codex_exec
       runtime_profile: codex-backlog-exec
-      timeout_secs: 600
+      timeout_secs: 3600
 runtime_worker:
   enabled: true
   interval_secs: 5

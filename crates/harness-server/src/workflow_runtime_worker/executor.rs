@@ -29,7 +29,7 @@ use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 
 const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS: u64 = 3600;
-const DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS: u64 = 3600;
 
 pub(super) struct ServerRuntimeJobExecutor<'a> {
     state: &'a Arc<AppState>,
@@ -450,7 +450,7 @@ mod tests {
         );
         assert_eq!(
             runtime_timeout_fallback(&config, None, &runtime_job("poll_repo_backlog")),
-            Some(600)
+            Some(3600)
         );
         assert_eq!(
             runtime_timeout_fallback(&config, None, &runtime_job("implement_issue")),
