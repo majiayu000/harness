@@ -119,7 +119,7 @@ pub struct RuntimeDispatchPolicy {
     pub interval_secs: u64,
     #[serde(default = "default_runtime_dispatch_batch_limit")]
     pub batch_limit: u32,
-    #[serde(default)]
+    #[serde(default = "default_runtime_dispatch_runtime_kind")]
     pub runtime_kind: Option<String>,
     #[serde(default)]
     pub runtime_profile: Option<String>,
@@ -133,7 +133,7 @@ pub struct RuntimeDispatchPolicy {
     pub approval_policy: Option<String>,
     #[serde(default)]
     pub max_turns: Option<u32>,
-    #[serde(default)]
+    #[serde(default = "default_runtime_dispatch_timeout_secs")]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub workflow_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
@@ -207,7 +207,7 @@ pub struct RuntimeActivityRetryPolicy {
     pub max_retry_delay_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowConfig {
     #[serde(default)]
     pub workflow: WorkflowIdentityPolicy,
@@ -225,7 +225,7 @@ pub struct WorkflowConfig {
     pub repo_backlog: RepoBacklogPolicy,
     #[serde(default)]
     pub pr_feedback: PrFeedbackPolicy,
-    #[serde(default)]
+    #[serde(default = "default_workflow_runtime_dispatch_policy")]
     pub runtime_dispatch: RuntimeDispatchPolicy,
     #[serde(default)]
     pub runtime_worker: RuntimeWorkerPolicy,
@@ -290,6 +290,26 @@ impl Default for RuntimeDispatchPolicy {
             workflow_profiles: BTreeMap::new(),
             activity_profiles: BTreeMap::new(),
             workflow_activity_profiles: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            workflow: WorkflowIdentityPolicy::default(),
+            source: WorkflowSourcePolicy::default(),
+            base: WorkflowBasePolicy::default(),
+            workspace: WorkflowWorkspacePolicy::default(),
+            hooks: WorkflowHooksPolicy::default(),
+            issue_workflow: IssueWorkflowPolicy::default(),
+            repo_backlog: RepoBacklogPolicy::default(),
+            pr_feedback: PrFeedbackPolicy::default(),
+            runtime_dispatch: default_workflow_runtime_dispatch_policy(),
+            runtime_worker: RuntimeWorkerPolicy::default(),
+            runtime_retry_policy: RuntimeRetryPolicy::default(),
+            storage: WorkflowStoragePolicy::default(),
+            activities: BTreeMap::new(),
         }
     }
 }
@@ -410,6 +430,21 @@ fn default_runtime_dispatch_interval_secs() -> u64 {
 
 fn default_runtime_dispatch_batch_limit() -> u32 {
     25
+}
+
+fn default_runtime_dispatch_runtime_kind() -> Option<String> {
+    Some("codex_exec".to_string())
+}
+
+fn default_runtime_dispatch_timeout_secs() -> Option<u64> {
+    Some(3600)
+}
+
+fn default_workflow_runtime_dispatch_policy() -> RuntimeDispatchPolicy {
+    let mut policy = RuntimeDispatchPolicy::default();
+    policy.runtime_kind = default_runtime_dispatch_runtime_kind();
+    policy.timeout_secs = default_runtime_dispatch_timeout_secs();
+    policy
 }
 
 fn default_runtime_worker_interval_secs() -> u64 {

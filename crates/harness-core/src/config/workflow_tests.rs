@@ -33,14 +33,17 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert!(cfg.runtime_dispatch.enabled);
     assert_eq!(cfg.runtime_dispatch.interval_secs, 30);
     assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
-    assert_eq!(cfg.runtime_dispatch.runtime_kind, None);
+    assert_eq!(
+        cfg.runtime_dispatch.runtime_kind.as_deref(),
+        Some("codex_exec")
+    );
     assert_eq!(cfg.runtime_dispatch.runtime_profile, None);
     assert_eq!(cfg.runtime_dispatch.model, None);
     assert_eq!(cfg.runtime_dispatch.reasoning_effort, None);
     assert_eq!(cfg.runtime_dispatch.sandbox, None);
     assert_eq!(cfg.runtime_dispatch.approval_policy, None);
     assert_eq!(cfg.runtime_dispatch.max_turns, None);
-    assert_eq!(cfg.runtime_dispatch.timeout_secs, None);
+    assert_eq!(cfg.runtime_dispatch.timeout_secs, Some(3600));
     assert!(cfg.runtime_dispatch.workflow_profiles.is_empty());
     assert!(cfg.runtime_dispatch.activity_profiles.is_empty());
     assert!(cfg.runtime_dispatch.workflow_activity_profiles.is_empty());
