@@ -673,7 +673,7 @@ fn codex_sandbox_mode_maps_to_codex_cli_values() {
 }
 
 #[test]
-fn base_args_uses_request_reasoning_effort_sandbox_and_approval_override() {
+fn base_args_uses_request_reasoning_effort_and_sandbox_without_approval_flag() {
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::DangerFullAccess);
     let request = AgentRequest {
         prompt: "ping".to_string(),
@@ -694,7 +694,7 @@ fn base_args_uses_request_reasoning_effort_sandbox_and_approval_override() {
         .windows(2)
         .any(|window| window == ["-c", "model_reasoning_effort=\"medium\""]));
     assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
-    assert!(args.windows(2).any(|window| window == ["-a", "on-request"]));
+    assert!(!args.iter().any(|arg| arg == "-a" || arg == "on-request"));
     assert_eq!(args.last().map(String::as_str), Some("ping"));
 }
 
