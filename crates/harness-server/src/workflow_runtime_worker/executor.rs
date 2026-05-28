@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_core::types::{AgentId, ThreadId};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeProfile,
+    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeKind, RuntimeProfile,
     WorkflowInstance,
 };
 use serde_json::{json, Value};
@@ -138,6 +138,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     sandbox_mode,
                     approval_policy,
                     timeout_secs: runtime_profile.timeout_secs,
+                    force_code_agent: matches!(job.runtime_kind, RuntimeKind::CodexExec),
                 },
             )
             .await;
