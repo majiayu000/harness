@@ -160,9 +160,13 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     } else {
         server.agent_registry.turn_execution_adapter(&agent_name)
     };
-    let adapter_opt = execution_adapter
-        .clone()
-        .or_else(|| server.agent_registry.get_adapter(&agent_name));
+    let adapter_opt = if options.force_code_agent {
+        None
+    } else {
+        execution_adapter
+            .clone()
+            .or_else(|| server.agent_registry.get_adapter(&agent_name))
+    };
 
     // Register as live adapter (RAII guard for cleanup on turn exit).
     // Adapters may be control-only (Claude: interrupt/steer/approval side
