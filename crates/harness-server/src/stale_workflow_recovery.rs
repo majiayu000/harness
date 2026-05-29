@@ -155,7 +155,7 @@ async fn workflow_has_active_repo_backlog_work(
     workflow_id: &str,
 ) -> anyhow::Result<bool> {
     let commands = store.commands_for(workflow_id).await?;
-    for command in commands.iter().filter(is_repo_backlog_poll_command) {
+    for command in commands.iter().rev().filter(is_repo_backlog_poll_command) {
         match command.status.as_str() {
             "pending" | "dispatching" => return Ok(true),
             "dispatched" => {

@@ -38,17 +38,24 @@ pub struct RuntimeProfileSelector {
 
 impl RuntimeProfileSelector {
     pub fn new(default_profile: RuntimeProfile) -> Self {
-        let mut activity_profiles = BTreeMap::new();
-        activity_profiles.insert(
-            REPO_BACKLOG_POLL_ACTIVITY.to_string(),
-            default_repo_backlog_poll_runtime_profile(&default_profile),
-        );
+        let activity_profiles = Self::default_activity_profiles(&default_profile);
         Self {
             default_profile,
             workflow_profiles: BTreeMap::new(),
             activity_profiles,
             workflow_activity_profiles: BTreeMap::new(),
         }
+    }
+
+    fn default_activity_profiles(
+        default_profile: &RuntimeProfile,
+    ) -> BTreeMap<String, RuntimeProfile> {
+        let mut activity_profiles = BTreeMap::new();
+        activity_profiles.insert(
+            REPO_BACKLOG_POLL_ACTIVITY.to_string(),
+            default_repo_backlog_poll_runtime_profile(default_profile),
+        );
+        activity_profiles
     }
 
     pub fn with_workflow_profile(

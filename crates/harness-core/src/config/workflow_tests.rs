@@ -42,7 +42,27 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.runtime_dispatch.max_turns, None);
     assert_eq!(cfg.runtime_dispatch.timeout_secs, None);
     assert!(cfg.runtime_dispatch.workflow_profiles.is_empty());
-    assert!(cfg.runtime_dispatch.activity_profiles.is_empty());
+    assert_eq!(
+        cfg.runtime_dispatch
+            .activity_profiles
+            .get("poll_repo_backlog")
+            .and_then(|profile| profile.runtime_kind.as_deref()),
+        Some("codex_exec")
+    );
+    assert_eq!(
+        cfg.runtime_dispatch
+            .activity_profiles
+            .get("poll_repo_backlog")
+            .and_then(|profile| profile.runtime_profile.as_deref()),
+        Some("codex-backlog-exec")
+    );
+    assert_eq!(
+        cfg.runtime_dispatch
+            .activity_profiles
+            .get("poll_repo_backlog")
+            .and_then(|profile| profile.timeout_secs),
+        Some(3600)
+    );
     assert!(cfg.runtime_dispatch.workflow_activity_profiles.is_empty());
     assert!(cfg.runtime_worker.enabled);
     assert_eq!(cfg.runtime_worker.interval_secs, 5);
@@ -256,6 +276,27 @@ Body
     );
     assert_eq!(replan_profile.model.as_deref(), Some("gpt-5.4-mini"));
     assert_eq!(replan_profile.timeout_secs, Some(180));
+    assert_eq!(
+        cfg.runtime_dispatch
+            .activity_profiles
+            .get("poll_repo_backlog")
+            .and_then(|profile| profile.runtime_kind.as_deref()),
+        Some("codex_exec")
+    );
+    assert_eq!(
+        cfg.runtime_dispatch
+            .activity_profiles
+            .get("poll_repo_backlog")
+            .and_then(|profile| profile.runtime_profile.as_deref()),
+        Some("codex-backlog-exec")
+    );
+    assert_eq!(
+        cfg.runtime_dispatch
+            .activity_profiles
+            .get("poll_repo_backlog")
+            .and_then(|profile| profile.timeout_secs),
+        Some(3600)
+    );
     let issue_replan_profile = cfg
         .runtime_dispatch
         .workflow_activity_profiles
@@ -324,6 +365,53 @@ fn load_workflow_document_reads_prompt_template_body() -> anyhow::Result<()> {
         .source_path
         .as_deref()
         .is_some_and(|path| { path.ends_with("WORKFLOW.md") }));
+    Ok(())
+}
+
+#[test]
+fn load_workflow_config_merges_poll_activity_profile_defaults() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+runtime_dispatch:
+  activity_profiles:
+    poll_repo_backlog:
+      timeout_secs: 7200
+  workflow_activity_profiles:
+    repo_backlog:
+      poll_repo_backlog:
+        timeout_secs: 5400
+---
+Body
+"#,
+    )?;
+
+    let cfg = load_workflow_config(dir.path())?;
+    let poll_profile = cfg
+        .runtime_dispatch
+        .activity_profiles
+        .get("poll_repo_backlog");
+    assert_eq!(
+        poll_profile.and_then(|profile| profile.runtime_kind.as_deref()),
+        Some("codex_exec")
+    );
+    assert_eq!(
+        poll_profile.and_then(|profile| profile.runtime_profile.as_deref()),
+        Some("codex-backlog-exec")
+    );
+    assert_eq!(
+        poll_profile.and_then(|profile| profile.timeout_secs),
+        Some(7200)
+    );
+    assert_eq!(
+        cfg.runtime_dispatch
+            .workflow_activity_profiles
+            .get("repo_backlog")
+            .and_then(|profiles| profiles.get("poll_repo_backlog"))
+            .and_then(|profile| profile.timeout_secs),
+        Some(5400)
+    );
     Ok(())
 }
 
