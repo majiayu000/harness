@@ -19,6 +19,7 @@ use crate::runtime::repo_backlog::{
     REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use crate::runtime::validator::{DecisionValidator, ValidationContext};
+#[cfg(test)]
 use chrono::Utc;
 use serde_json::{json, Value};
 
@@ -373,7 +374,7 @@ pub(super) fn repo_backlog_legacy_scan_dispatch_decision_from_activity_result(
         .validate(
             instance,
             &normalized,
-            &ValidationContext::new(event.source.as_str(), Utc::now()),
+            &ValidationContext::new(event.source.as_str(), event.created_at),
         )
         .is_ok()
         .then_some(normalized)

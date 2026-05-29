@@ -81,7 +81,8 @@ pub(super) fn retry_failed_activity_decision(
     }
     let next_attempt = retry_attempt + 1;
     let reason = runtime_failure_reason(result, "Runtime activity failed.");
-    let retry_schedule = failed_activity_retry_schedule(instance, &activity, next_attempt);
+    let retry_schedule =
+        failed_activity_retry_schedule(instance, &activity, next_attempt, event.created_at);
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -162,6 +163,7 @@ fn failed_activity_retry_schedule(
     instance: &WorkflowInstance,
     activity: &str,
     next_attempt: u64,
+    base_time: DateTime<Utc>,
 ) -> Option<RetrySchedule> {
     let base_delay = retry_policy_u64(instance, activity, "retry_delay_secs")?;
     if base_delay == 0 {
@@ -180,7 +182,7 @@ fn failed_activity_retry_schedule(
     delay_secs = delay_secs.min(MAX_SAFE_RETRY_DELAY_SECS);
     Some(RetrySchedule {
         delay_secs,
-        not_before: Utc::now() + Duration::seconds(delay_secs as i64),
+        not_before: base_time + Duration::seconds(delay_secs as i64),
     })
 }
 
