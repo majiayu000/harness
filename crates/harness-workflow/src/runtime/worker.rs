@@ -19,6 +19,10 @@ pub trait RuntimeJobExecutor: Send + Sync {
         true
     }
 
+    async fn preflight_result(&self, _job: &RuntimeJob) -> Option<ActivityResult> {
+        None
+    }
+
     async fn execute(&self, job: RuntimeJob) -> ActivityResult;
 }
 
@@ -75,24 +79,27 @@ impl<'a> RuntimeWorker<'a> {
                     .await?
                 {
                     Some(result) => result,
-                    None => {
-                        if consumes_runtime_turn {
-                            self.store
-                                .record_runtime_event(
-                                    &job.id,
-                                    "RuntimeTurnStarted",
-                                    json!({
-                                        "owner": self.owner.as_str(),
-                                    }),
-                                )
+                    None => match executor.preflight_result(&job).await {
+                        Some(result) => result,
+                        None => {
+                            if consumes_runtime_turn {
+                                self.store
+                                    .record_runtime_event(
+                                        &job.id,
+                                        "RuntimeTurnStarted",
+                                        json!({
+                                            "owner": self.owner.as_str(),
+                                        }),
+                                    )
+                                    .await?;
+                            }
+                            let execution = self
+                                .execute_with_lease_renewal(&job, executor, lease_expires_at)
                                 .await?;
+                            lease_expires_at = execution.lease_expires_at;
+                            execution.result
                         }
-                        let execution = self
-                            .execute_with_lease_renewal(&job, executor, lease_expires_at)
-                            .await?;
-                        lease_expires_at = execution.lease_expires_at;
-                        execution.result
-                    }
+                    },
                 }
             }
         };
@@ -475,5 +482,77 @@ fn runtime_budget_blocked_result(
         validation: Vec::new(),
         error: Some(error),
         error_kind: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{RuntimeJobStatus, RuntimeKind, WorkflowRuntimeStore};
+    use async_trait::async_trait;
+    use harness_core::db::resolve_database_url;
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct PreflightRuntimeExecutor {
+        result: ActivityResult,
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeJobExecutor for PreflightRuntimeExecutor {
+        async fn preflight_result(&self, _job: &RuntimeJob) -> Option<ActivityResult> {
+            Some(self.result.clone())
+        }
+
+        async fn execute(&self, _job: RuntimeJob) -> ActivityResult {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            ActivityResult::succeeded("check", "executed")
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_result_completes_job_before_runtime_turn_starts() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&harness_core::config::dirs::default_db_path(
+            dir.path(),
+            "workflow_runtime",
+        ))
+        .await?;
+        let job = store
+            .enqueue_runtime_job(
+                "command-1",
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({ "activity": "check" }),
+            )
+            .await?;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executor = PreflightRuntimeExecutor {
+            result: ActivityResult::cancelled("check", "Runtime worker disabled."),
+            executions: executions.clone(),
+        };
+
+        let completed = RuntimeWorker::new(&store, "runtime-1")
+            .with_lease_ttl(Duration::minutes(5))
+            .run_once(&executor)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("worker should complete the claimed job"))?;
+
+        assert_eq!(completed.id, job.id);
+        assert_eq!(completed.status, RuntimeJobStatus::Cancelled);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let events = store.runtime_events_for(&completed.id).await?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "RuntimeJobClaimed");
+        assert_eq!(events[1].event_type, "ActivityResultReady");
+        Ok(())
     }
 }

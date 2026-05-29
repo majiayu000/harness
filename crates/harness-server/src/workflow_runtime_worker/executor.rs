@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_core::types::{AgentId, ThreadId};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeProfile,
-    WorkflowInstance,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobExecutor,
+    RuntimeProfile, WorkflowInstance,
 };
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::Arc;
 
 use super::activity_result::activity_result_from_turn;
@@ -264,12 +265,44 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         }
         Ok(self.state.core.project_root.clone())
     }
+
+    async fn runtime_worker_disabled_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
+        let activity = activity_name(job);
+        let workflow = match self.workflow_for_job(job).await {
+            Ok(workflow) => workflow,
+            Err(error) => {
+                return Some(runtime_policy_preflight_failed_result(activity, error));
+            }
+        };
+        let source_project_root = match self.project_root_for_job(job, workflow.as_ref()) {
+            Ok(project_root) => project_root,
+            Err(error) => {
+                return Some(runtime_policy_preflight_failed_result(activity, error));
+            }
+        };
+        let workflow_document =
+            match harness_core::config::workflow::load_workflow_document(&source_project_root) {
+                Ok(document) => document,
+                Err(error) => {
+                    return Some(runtime_policy_preflight_failed_result(activity, error));
+                }
+            };
+        runtime_worker_disabled_result_for_config(
+            &activity,
+            &source_project_root,
+            &workflow_document.config,
+        )
+    }
 }
 
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
         !is_builtin_lifecycle_activity(job)
+    }
+
+    async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
+        self.runtime_worker_disabled_result(job).await
     }
 
     async fn execute(&self, job: RuntimeJob) -> ActivityResult {
@@ -354,6 +387,35 @@ fn default_runtime_timeout(activity: &str) -> Option<u64> {
         "poll_repo_backlog" => DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS,
         _ => DEFAULT_RUNTIME_TURN_TIMEOUT_SECS,
     })
+}
+
+fn runtime_policy_preflight_failed_result(
+    activity: String,
+    error: impl std::fmt::Display,
+) -> ActivityResult {
+    ActivityResult::failed(
+        activity,
+        "Runtime job policy preflight failed before agent execution.",
+        error.to_string(),
+    )
+    .with_error_kind(ActivityErrorKind::Configuration)
+}
+
+fn runtime_worker_disabled_result_for_config(
+    activity: &str,
+    project_root: &Path,
+    workflow_config: &WorkflowConfig,
+) -> Option<ActivityResult> {
+    if workflow_config.runtime_worker.enabled {
+        return None;
+    }
+    Some(ActivityResult::cancelled(
+        activity,
+        format!(
+            "Runtime worker is disabled for project {}; claimed job was cancelled before agent execution.",
+            project_root.display()
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -458,5 +520,40 @@ mod tests {
             runtime_timeout_fallback(&config, None, &runtime_job("implement_issue")),
             Some(3600)
         );
+    }
+
+    #[test]
+    fn runtime_worker_disabled_result_for_config_cancels_agent_work() {
+        let mut config = WorkflowConfig::default();
+        config.runtime_worker.enabled = false;
+
+        let Some(result) = runtime_worker_disabled_result_for_config(
+            "implement_issue",
+            Path::new("/tmp/project"),
+            &config,
+        ) else {
+            panic!("disabled runtime worker should produce a preflight result");
+        };
+
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Cancelled
+        );
+        assert_eq!(result.activity, "implement_issue");
+        assert!(result
+            .summary
+            .contains("Runtime worker is disabled for project /tmp/project"));
+    }
+
+    #[test]
+    fn runtime_worker_disabled_result_for_config_allows_enabled_project() {
+        let config = WorkflowConfig::default();
+
+        assert!(runtime_worker_disabled_result_for_config(
+            "implement_issue",
+            Path::new("/tmp/project"),
+            &config,
+        )
+        .is_none());
     }
 }
