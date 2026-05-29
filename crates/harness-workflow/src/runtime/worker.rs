@@ -262,7 +262,7 @@ impl<'a> RuntimeWorker<'a> {
         let validation = validator.validate(
             &instance,
             &decision,
-            &ValidationContext::new(&self.owner, Utc::now()),
+            &ValidationContext::new(&self.owner, event.created_at),
         );
         let record = match validation {
             Ok(()) => super::model::WorkflowDecisionRecord::accepted(

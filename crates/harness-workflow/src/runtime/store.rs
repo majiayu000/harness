@@ -1539,7 +1539,7 @@ impl WorkflowRuntimeStore {
                                 match validator.validate(
                                     &instance,
                                     &decision,
-                                    &ValidationContext::new(owner, Utc::now()),
+                                    &ValidationContext::new(owner, event.created_at),
                                 ) {
                                     Ok(()) => WorkflowDecisionRecord::accepted(
                                         decision.clone(),
