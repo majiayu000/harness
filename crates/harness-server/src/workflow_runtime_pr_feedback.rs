@@ -649,6 +649,10 @@ async fn commit_runtime_decision(
     })
 }
 
+fn is_active_pr_feedback_command_status(status: &str) -> bool {
+    matches!(status, "pending" | "dispatching" | "dispatched")
+}
+
 async fn has_active_pr_feedback_command(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
@@ -660,12 +664,12 @@ async fn has_active_pr_feedback_command(
             .await?
             .into_iter()
             .any(|record| {
-                matches!(record.status.as_str(), "pending" | "dispatched")
+                is_active_pr_feedback_command_status(record.status.as_str())
                     && matches!(
                         record.command.activity_name(),
                         Some("sweep_pr_feedback" | "address_pr_feedback")
                     )
-                    || matches!(record.status.as_str(), "pending" | "dispatched")
+                    || is_active_pr_feedback_command_status(record.status.as_str())
                         && record.command.command_type
                             == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
                         && record
@@ -747,7 +751,7 @@ async fn has_active_child_pr_feedback_command(
         .await?
         .into_iter()
         .any(|record| {
-            matches!(record.status.as_str(), "pending" | "dispatched")
+            is_active_pr_feedback_command_status(record.status.as_str())
                 && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
         }))
 }
@@ -1387,6 +1391,16 @@ mod tests {
         );
         assert_eq!(commands[0].command.command["pr_number"], 77);
 
+        let claimed = store
+            .claim_pending_commands(
+                "dispatching-pr-feedback-test",
+                chrono::Utc::now() + chrono::Duration::seconds(30),
+                1,
+            )
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].status, "dispatching");
+
         let second = request_pr_feedback_sweep(&store, &workflow_id).await?;
         assert_eq!(
             second,
@@ -1453,6 +1467,15 @@ mod tests {
             "inspect-pr-feedback-77",
         );
         store.enqueue_command(&child.id, None, &command).await?;
+        let claimed = store
+            .claim_pending_commands(
+                "dispatching-child-pr-feedback-test",
+                chrono::Utc::now() + chrono::Duration::seconds(30),
+                1,
+            )
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].status, "dispatching");
 
         assert!(
             has_active_pr_feedback_command(
