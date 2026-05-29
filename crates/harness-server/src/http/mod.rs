@@ -37,6 +37,8 @@ mod shutdown_test;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]
+mod test_fixtures;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_password_reset;
