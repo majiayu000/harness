@@ -1,13 +1,13 @@
 //! Stale workflow recovery — periodic tick that resets workflows stuck in
 //! non-terminal, non-candidate states back to a state the poller can pick up.
 //!
-//! The `repo_backlog` workflow type has known dead-end middle states:
-//! `scanning`, `planning_batch`, `dispatching`, `reconciling`. The poller's
+//! The `repo_backlog` workflow type has known dead-end states:
+//! `scanning`, `planning_batch`, `dispatching`, `reconciling`, `blocked`. The poller's
 //! eligibility check is `state IN ('idle','failed')`, so once a workflow lands
-//! in one of the middle states with no follow-up command (e.g. claude returned
-//! empty output, server restart interrupted the dispatch path, wire-format
-//! drift swallowed the next-step decision), it sits there forever and the
-//! corresponding repo's GitHub issues stop being processed.
+//! in one of those states with no follow-up command (e.g. claude returned empty
+//! output, server restart interrupted the dispatch path, wire-format drift
+//! swallowed the next-step decision), it sits there forever and the corresponding
+//! repo's GitHub issues stop being processed.
 //!
 //! This recovery tick is the operational backstop. It scans the runtime store
 //! every `interval_secs` (default 600 = 10 min), finds `repo_backlog`
@@ -39,7 +39,13 @@ const RECOVERED_DEFINITION_ID: &str = "repo_backlog";
 /// States that are non-terminal AND non-candidate-for-poller. A workflow in
 /// one of these states relies on the next reducer transition firing; if that
 /// never happens, the workflow is stuck.
-const STUCK_STATES: &[&str] = &["scanning", "planning_batch", "dispatching", "reconciling"];
+const STUCK_STATES: &[&str] = &[
+    "scanning",
+    "planning_batch",
+    "dispatching",
+    "reconciling",
+    "blocked",
+];
 
 /// State to reset stuck workflows to. `idle` is in the poller's candidate set
 /// (`idle | failed`), so the next poller tick will re-claim it and re-issue a
@@ -229,6 +235,32 @@ mod tests {
         let post = store.get_instance(&instance.id).await.unwrap().unwrap();
         assert_eq!(post.state, "idle", "stuck workflow should be reset to idle");
         assert!(post.version > pre.version, "version should bump");
+    }
+
+    #[tokio::test]
+    async fn recovery_tick_resets_stuck_blocked_to_idle() -> anyhow::Result<()> {
+        let Some(store) = open_recovery_test_store().await else {
+            return Ok(());
+        };
+        let instance = stuck_instance("test::stale-recovery::blocked::1", "blocked");
+        store.upsert_instance(&instance).await?;
+
+        let tick = run_stale_workflow_recovery_tick(&store, 0).await?;
+
+        assert!(
+            tick.scanned >= 1,
+            "should scan at least the blocked instance"
+        );
+        assert!(tick.recovered >= 1, "should recover blocked instance");
+
+        let Some(post) = store.get_instance(&instance.id).await? else {
+            anyhow::bail!("seeded blocked workflow should still exist after recovery");
+        };
+        assert_eq!(
+            post.state, "idle",
+            "blocked workflow should be reset to idle"
+        );
+        Ok(())
     }
 
     #[tokio::test]
