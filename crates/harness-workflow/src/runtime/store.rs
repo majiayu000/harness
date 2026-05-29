@@ -1168,7 +1168,18 @@ impl WorkflowRuntimeStore {
                  AND (data->'lease' ? 'expires_at')
                  AND (data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
              )
-             ORDER BY created_at ASC
+             ORDER BY
+                 CASE
+                     WHEN COALESCE(data #>> '{input,activity}', '') IN (
+                         'implement_issue',
+                         'implement_prompt',
+                         'inspect_pr_feedback',
+                         'address_pr_feedback'
+                     ) THEN 0
+                     WHEN COALESCE(data #>> '{input,activity}', '') = 'poll_repo_backlog' THEN 2
+                     ELSE 1
+                 END ASC,
+                 created_at ASC
              LIMIT 1
              FOR UPDATE SKIP LOCKED",
         )

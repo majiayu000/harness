@@ -4348,6 +4348,65 @@ async fn runtime_store_reclaims_expired_running_job() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn runtime_store_prioritizes_ready_work_over_older_backlog_jobs() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let backlog = store
+        .enqueue_runtime_job(
+            "command-backlog",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
+        )
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let sprint_plan = store
+        .enqueue_runtime_job(
+            "command-sprint-plan",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY }),
+        )
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let implementation = store
+        .enqueue_runtime_job(
+            "command-implement",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        )
+        .await?;
+
+    let first = store
+        .claim_next_runtime_job("runtime-1", Utc::now() + Duration::minutes(5))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ready implementation job should be claimed first"))?;
+    assert_eq!(first.id, implementation.id);
+
+    let second = store
+        .claim_next_runtime_job("runtime-1", Utc::now() + Duration::minutes(5))
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("ready non-backlog job should be claimed before backlog scan")
+        })?;
+    assert_eq!(second.id, sprint_plan.id);
+
+    let third = store
+        .claim_next_runtime_job("runtime-1", Utc::now() + Duration::minutes(5))
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("backlog scan should still run when higher-priority jobs are drained")
+        })?;
+    assert_eq!(third.id, backlog.id);
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_store_does_not_reclaim_unexpired_running_job() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
