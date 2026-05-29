@@ -356,11 +356,27 @@ async fn runtime_prompts_by_handle(
         return Ok(None);
     };
     let submission_id = runtime_submission_handle(&workflow, task_id);
-    let prompt = workflow
+    let prompt_ref = workflow
         .data
         .get("prompt_ref")
         .and_then(Value::as_str)
-        .and_then(crate::workflow_runtime_submission::lookup_prompt_submission_prompt);
+        .map(str::to_string);
+    let prompt = match (
+        state.core.workflow_runtime_store.as_ref(),
+        prompt_ref.as_deref(),
+    ) {
+        (Some(store), Some(prompt_ref)) => {
+            crate::workflow_runtime_submission::lookup_prompt_submission_prompt_durable(
+                store.as_ref(),
+                prompt_ref,
+            )
+            .await?
+        }
+        (None, Some(prompt_ref)) => {
+            crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref)
+        }
+        (_, None) => None,
+    };
 
     let prompts = prompt
         .map(|prompt| {

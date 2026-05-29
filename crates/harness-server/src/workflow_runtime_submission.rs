@@ -32,11 +32,20 @@ pub(crate) use dependencies::{
     release_ready_issue_dependencies, release_ready_prompt_dependencies,
     resolve_issue_dependency_status, RuntimeDependencyStatus,
 };
+#[cfg(test)]
+pub(crate) use prompt_memory::clear_prompt_submission_prompt_cache_for_test;
+#[cfg(test)]
 use prompt_memory::{
-    cache_prompt_submission_prompt, prompt_ref_for_submission, remove_prompt_submission_prompt,
+    cache_prompt_submission_prompt, remove_prompt_submission_prompt,
+    remove_terminal_prompt_submission_prompt,
 };
 pub(crate) use prompt_memory::{
-    lookup_prompt_submission_prompt, remove_terminal_prompt_submission_prompt,
+    lookup_prompt_submission_prompt, lookup_prompt_submission_prompt_durable,
+    remove_terminal_prompt_submission_payload,
+};
+use prompt_memory::{
+    persist_prompt_submission_prompt, prompt_ref_for_submission,
+    remove_prompt_submission_prompt_durable,
 };
 
 pub(crate) struct PromptSubmissionRuntimeContext<'a> {
@@ -328,9 +337,9 @@ async fn apply_prompt_decision(
     let prompt_ref = string_field(&accepted_data, "prompt_ref")?;
     let previous_prompt_ref = optional_string_field(&instance.data, "prompt_ref");
     if previous_prompt_ref.as_deref() != Some(prompt_ref.as_str()) {
-        remove_prompt_submission_prompt(previous_prompt_ref.as_deref());
+        remove_prompt_submission_prompt_durable(store, previous_prompt_ref.as_deref()).await?;
     }
-    cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
+    persist_prompt_submission_prompt(store, &prompt_ref, ctx.prompt).await?;
     let mut command_ids = Vec::with_capacity(decision.commands.len());
     for command in &decision.commands {
         command_ids.push(

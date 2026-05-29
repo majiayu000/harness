@@ -175,4 +175,14 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow_type_sequence
               ON workflow_events (workflow_id, event_type, sequence DESC)",
     },
+    Migration {
+        version: 10,
+        description: "persist workflow runtime prompt payloads",
+        sql: "CREATE TABLE IF NOT EXISTS workflow_prompt_payloads (
+            prompt_ref TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    },
 ];
