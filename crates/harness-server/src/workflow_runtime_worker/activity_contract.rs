@@ -132,6 +132,7 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)
                 .with_accepted_artifacts(vec!["validation_report"])
+                .requires("validation_evidence")
         }
         (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)

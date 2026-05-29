@@ -129,6 +129,14 @@ fn reduce_success(
         return quality_gate_success_decision(instance, event, result);
     }
 
+    if prompt_task_activity_matches(instance, result) {
+        if let Some(reason) = prompt_task_success_contract_error(result) {
+            return Some(invalid_agent_output_blocked_decision(
+                instance, event, result, reason,
+            ));
+        }
+    }
+
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
         return Some(decision);
     }
@@ -307,11 +315,18 @@ fn structured_decision_validates(
     {
         return false;
     }
+    if prompt_task_activity_matches(instance, result)
+        && decision.next_state == "done"
+        && prompt_task_success_contract_error(result).is_some()
+    {
+        return false;
+    }
 
     let validator = match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
         QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
         PR_FEEDBACK_DEFINITION_ID => DecisionValidator::pr_feedback(),
+        PROMPT_TASK_DEFINITION_ID => DecisionValidator::prompt_task(),
         REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
         _ => return true,
     };
@@ -322,4 +337,87 @@ fn structured_decision_validates(
             &ValidationContext::new(event.source.as_str(), Utc::now()),
         )
         .is_ok()
+}
+
+fn prompt_task_activity_matches(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+    (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) == (
+        PROMPT_TASK_DEFINITION_ID,
+        "implementing",
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    )
+}
+
+fn prompt_task_success_contract_error(result: &ActivityResult) -> Option<&'static str> {
+    if prompt_task_has_validation_evidence(result) {
+        None
+    } else {
+        Some("implement_prompt succeeded without validation evidence")
+    }
+}
+
+fn prompt_task_has_validation_evidence(result: &ActivityResult) -> bool {
+    result
+        .validation
+        .iter()
+        .any(|record| !record.command.trim().is_empty())
+        || result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "validation_report")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::model::{
+        ActivityResult, WorkflowCommandType, WorkflowEvent, WorkflowInstance, WorkflowSubject,
+    };
+    use crate::runtime::validator::{DecisionValidator, ValidationContext};
+    use chrono::Utc;
+    use serde_json::json;
+
+    #[test]
+    fn prompt_task_success_without_validation_evidence_blocks() -> anyhow::Result<()> {
+        let instance = WorkflowInstance::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "task-123"),
+        );
+        let result = ActivityResult::succeeded(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "Prompt implementation completed.",
+        );
+        let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
+            .with_payload(json!({
+                "command_id": "command-1",
+                "runtime_job_id": "job-1",
+                "activity_result": result,
+            }));
+
+        let decision = reduce_runtime_job_completed(&instance, &event)?.ok_or_else(|| {
+            anyhow::anyhow!("prompt success without validation evidence should block")
+        })?;
+
+        assert_eq!(decision.decision, "block_invalid_agent_output");
+        assert_eq!(decision.next_state, "blocked");
+        assert!(decision
+            .commands
+            .iter()
+            .any(|command| command.command_type == WorkflowCommandType::MarkBlocked));
+        assert!(decision
+            .commands
+            .iter()
+            .any(|command| command.command_type == WorkflowCommandType::RequestOperatorAttention));
+        DecisionValidator::prompt_task().validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )?;
+        Ok(())
+    }
 }

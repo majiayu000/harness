@@ -401,6 +401,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
             "on_succeeded": {
                 "reducer_next_state": "done",
+                "success_requires": "A succeeded implement_prompt result MUST include validation evidence via validation records or a validation_report artifact.",
                 "required_summary": "Include changed files, validation commands, and remaining blockers."
             },
             "on_failed": {
@@ -473,7 +474,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_not_include": ["workflow table mutations", "unverified merge claims"],
             "artifacts": {
                 "validation_report": {
-                    "optional": true,
+                    "required_when": "No validation records are present in the activity result.",
                     "fields": ["commands", "passed", "failed", "blocked"]
                 }
             }
