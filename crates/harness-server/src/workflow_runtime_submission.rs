@@ -692,5 +692,8 @@ fn set_data_string(mut data: serde_json::Value, key: &str, value: &str) -> serde
 mod identity_tests;
 
 #[cfg(test)]
+#[path = "workflow_runtime_submission/dependency_tests.rs"]
+mod dependency_tests;
+#[cfg(test)]
 #[path = "workflow_runtime_submission_tests.rs"]
 mod tests;

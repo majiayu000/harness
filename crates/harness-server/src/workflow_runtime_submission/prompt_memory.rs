@@ -4,14 +4,13 @@ use harness_workflow::runtime::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Mutex, OnceLock},
 };
 
 use super::optional_string_field;
 
 static PROMPT_SUBMISSION_PROMPTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-static REMOVED_PROMPT_SUBMISSION_PROMPTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 pub(crate) fn lookup_prompt_submission_prompt(prompt_ref: &str) -> Option<String> {
     prompt_submission_prompts()
@@ -27,13 +26,6 @@ pub(crate) async fn lookup_prompt_submission_prompt_durable(
     if let Some(prompt) = lookup_prompt_submission_prompt(prompt_ref) {
         return Ok(Some(prompt));
     }
-    if removed_prompt_submission_prompts()
-        .lock()
-        .map(|prompts| prompts.contains(prompt_ref))
-        .unwrap_or(false)
-    {
-        return Ok(None);
-    }
     let Some(prompt) = store.get_prompt_payload(prompt_ref).await? else {
         return Ok(None);
     };
@@ -47,9 +39,6 @@ pub(super) async fn persist_prompt_submission_prompt(
     prompt: &str,
 ) -> anyhow::Result<()> {
     store.upsert_prompt_payload(prompt_ref, prompt).await?;
-    if let Ok(mut removed_prompts) = removed_prompt_submission_prompts().lock() {
-        removed_prompts.remove(prompt_ref);
-    }
     cache_prompt_submission_prompt(prompt_ref, prompt);
     Ok(())
 }
@@ -67,8 +56,8 @@ pub(super) async fn remove_prompt_submission_prompt_durable(
     let Some(prompt_ref) = prompt_ref else {
         return Ok(());
     };
-    remove_prompt_submission_prompt(Some(prompt_ref));
     store.delete_prompt_payload(prompt_ref).await?;
+    remove_prompt_submission_prompt(Some(prompt_ref));
     Ok(())
 }
 
@@ -79,18 +68,12 @@ pub(super) fn remove_prompt_submission_prompt(prompt_ref: Option<&str>) {
     if let Ok(mut prompts) = prompt_submission_prompts().lock() {
         prompts.remove(prompt_ref);
     }
-    if let Ok(mut removed_prompts) = removed_prompt_submission_prompts().lock() {
-        removed_prompts.insert(prompt_ref.to_string());
-    }
 }
 
 #[cfg(test)]
 pub(crate) fn clear_prompt_submission_prompt_cache_for_test(prompt_ref: &str) {
     if let Ok(mut prompts) = prompt_submission_prompts().lock() {
         prompts.remove(prompt_ref);
-    }
-    if let Ok(mut removed_prompts) = removed_prompt_submission_prompts().lock() {
-        removed_prompts.remove(prompt_ref);
     }
 }
 
@@ -118,10 +101,6 @@ pub(crate) async fn remove_terminal_prompt_submission_payload(
 
 fn prompt_submission_prompts() -> &'static Mutex<HashMap<String, String>> {
     PROMPT_SUBMISSION_PROMPTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn removed_prompt_submission_prompts() -> &'static Mutex<HashSet<String>> {
-    REMOVED_PROMPT_SUBMISSION_PROMPTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 pub(super) fn prompt_ref_for_submission(
