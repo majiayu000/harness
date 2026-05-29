@@ -8,10 +8,10 @@ use harness_workflow::runtime::{
 };
 use serde_json::json;
 
-use super::prompt_memory::remove_prompt_submission_prompt;
+use super::prompt_memory::remove_prompt_submission_prompt_durable;
 use super::{
     commit_runtime_decision, depends_on_strings, issue_submission_fields,
-    lookup_prompt_submission_prompt, optional_string_field, prompt_submission_fields,
+    lookup_prompt_submission_prompt_durable, optional_string_field, prompt_submission_fields,
     set_data_bool, set_data_string, task_ids_from_data, GITHUB_ISSUE_PR_DEFINITION_ID,
     PROMPT_TASK_DEFINITION_ID,
 };
@@ -347,7 +347,8 @@ async fn release_prompt_after_dependencies(
     depends_on: &[TaskId],
 ) -> anyhow::Result<PromptDependencyReleaseOutcome> {
     let fields = prompt_submission_fields(&instance)?;
-    let Some(prompt) = lookup_prompt_submission_prompt(&fields.prompt_ref) else {
+    let Some(prompt) = lookup_prompt_submission_prompt_durable(store, &fields.prompt_ref).await?
+    else {
         fail_prompt_for_missing_prompt(store, instance, &fields).await?;
         return Ok(PromptDependencyReleaseOutcome::MissingPrompt);
     };
@@ -429,7 +430,7 @@ async fn fail_prompt_for_dependency(
         dependency_status,
     );
     commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
-    remove_prompt_submission_prompt(prompt_ref.as_deref());
+    remove_prompt_submission_prompt_durable(store, prompt_ref.as_deref()).await?;
     Ok(())
 }
 

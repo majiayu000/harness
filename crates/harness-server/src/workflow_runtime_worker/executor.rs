@@ -82,7 +82,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         );
         let sandbox_mode = runtime_profile_sandbox_mode(&runtime_profile)?;
         let approval_policy = runtime_profile_approval_policy(&runtime_profile, job.runtime_kind)?;
-        let prompt_task_request = prompt_task_request_for_job(&job)?;
+        let prompt_task_request =
+            prompt_task_request_for_job(&job, self.state.core.workflow_runtime_store.as_deref())
+                .await?;
         if let PromptTaskRequest::PayloadUnavailable { prompt_ref } = &prompt_task_request {
             return Ok(prompt_payload_unavailable_result(&job, prompt_ref));
         }

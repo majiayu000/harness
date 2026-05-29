@@ -105,7 +105,11 @@ pub(crate) async fn notify_runtime_submission_terminal_workflow(
     let Some(instance) = store.get_instance(workflow_id).await? else {
         return Ok(false);
     };
-    crate::workflow_runtime_submission::remove_terminal_prompt_submission_prompt(&instance);
+    crate::workflow_runtime_submission::remove_terminal_prompt_submission_payload(
+        store.as_ref(),
+        &instance,
+    )
+    .await?;
     let Some(callback) = state.intake.completion_callback.as_ref() else {
         return Ok(false);
     };

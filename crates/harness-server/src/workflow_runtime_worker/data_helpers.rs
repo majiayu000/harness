@@ -1,6 +1,8 @@
 use crate::task_runner::TaskId;
 use anyhow::Context;
-use harness_workflow::runtime::{RuntimeJob, WorkflowInstance, PROMPT_TASK_IMPLEMENT_ACTIVITY};
+use harness_workflow::runtime::{
+    RuntimeJob, WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -244,7 +246,10 @@ impl PromptTaskRequest {
     }
 }
 
-pub(super) fn prompt_task_request_for_job(job: &RuntimeJob) -> anyhow::Result<PromptTaskRequest> {
+pub(super) async fn prompt_task_request_for_job(
+    job: &RuntimeJob,
+    store: Option<&WorkflowRuntimeStore>,
+) -> anyhow::Result<PromptTaskRequest> {
     if activity_name(job) != PROMPT_TASK_IMPLEMENT_ACTIVITY {
         return Ok(PromptTaskRequest::NotPromptActivity);
     }
@@ -257,14 +262,23 @@ pub(super) fn prompt_task_request_for_job(job: &RuntimeJob) -> anyhow::Result<Pr
     else {
         anyhow::bail!("runtime prompt task command is missing prompt_ref");
     };
-    Ok(
-        match crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref) {
-            Some(prompt) => PromptTaskRequest::Ready(prompt),
-            None => PromptTaskRequest::PayloadUnavailable {
-                prompt_ref: prompt_ref.to_string(),
-            },
-        },
-    )
+    if let Some(store) = store {
+        if let Some(prompt) =
+            crate::workflow_runtime_submission::lookup_prompt_submission_prompt_durable(
+                store, prompt_ref,
+            )
+            .await?
+        {
+            return Ok(PromptTaskRequest::Ready(prompt));
+        }
+    } else if let Some(prompt) =
+        crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref)
+    {
+        return Ok(PromptTaskRequest::Ready(prompt));
+    }
+    Ok(PromptTaskRequest::PayloadUnavailable {
+        prompt_ref: prompt_ref.to_string(),
+    })
 }
 
 pub(super) fn prompt_payload_unavailable_result(
@@ -340,8 +354,8 @@ mod tests {
         assert_eq!(activity_name(&job), "start_child_workflow");
     }
 
-    #[test]
-    fn prompt_task_request_blocks_when_cached_payload_is_unavailable() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn prompt_task_request_blocks_when_cached_payload_is_unavailable() -> anyhow::Result<()> {
         let job = RuntimeJob::pending(
             "command-1",
             RuntimeKind::CodexJsonrpc,
@@ -355,7 +369,7 @@ mod tests {
             }),
         );
 
-        let request = prompt_task_request_for_job(&job)?;
+        let request = prompt_task_request_for_job(&job, None).await?;
         assert_eq!(
             request,
             PromptTaskRequest::PayloadUnavailable {
@@ -375,6 +389,74 @@ mod tests {
         assert_eq!(
             result.artifacts[0].artifact_type,
             "prompt_payload_unavailable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prompt_task_request_recovers_persisted_payload_after_cache_miss() -> anyhow::Result<()>
+    {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store = WorkflowRuntimeStore::open_with_database_url(
+            &dir.path().join("workflow_runtime"),
+            Some(&database_url),
+        )
+        .await?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let task_id = TaskId::from_str("restart-safe-prompt-task");
+        let submission = crate::workflow_runtime_submission::record_prompt_submission(
+            &store,
+            crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
+                project_root: &project_root,
+                task_id: &task_id,
+                prompt: "restart safe prompt",
+                depends_on: &[],
+                serialization_depends_on: &[],
+                dependencies_blocked: false,
+                source: Some("test"),
+                external_id: Some("manual:restart-safe"),
+            },
+        )
+        .await?;
+        let workflow = store
+            .get_instance(&submission.workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("prompt workflow should be persisted"))?;
+        let prompt_ref = workflow.data["prompt_ref"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("prompt ref should be persisted"))?;
+        crate::workflow_runtime_submission::clear_prompt_submission_prompt_cache_for_test(
+            prompt_ref,
+        );
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "command": {
+                    "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                    "prompt_ref": prompt_ref
+                }
+            }),
+        );
+
+        let request = prompt_task_request_for_job(&job, Some(&store)).await?;
+
+        assert_eq!(
+            request,
+            PromptTaskRequest::Ready("restart safe prompt".to_string())
+        );
+        assert_eq!(
+            crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref)
+                .as_deref(),
+            Some("restart safe prompt")
         );
         Ok(())
     }

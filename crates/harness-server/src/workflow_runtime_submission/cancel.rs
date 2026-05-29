@@ -5,7 +5,7 @@ use harness_workflow::runtime::{
 use serde_json::json;
 use std::fmt;
 
-use super::prompt_memory::remove_prompt_submission_prompt;
+use super::prompt_memory::remove_prompt_submission_prompt_durable;
 use super::{
     commit_runtime_decision, optional_string_field, runtime_issue_task_handle, set_data_bool,
     GITHUB_ISSUE_PR_DEFINITION_ID,
@@ -144,9 +144,11 @@ async fn cancel_submission_instance(
     cancelled.data = set_data_bool(cancelled.data, "cancelled", true);
     store.upsert_instance(&cancelled).await?;
     if is_prompt {
-        remove_prompt_submission_prompt(
+        remove_prompt_submission_prompt_durable(
+            store,
             optional_string_field(&cancelled.data, "prompt_ref").as_deref(),
-        );
+        )
+        .await?;
     }
     Ok(RuntimeSubmissionCancelOutcome::Cancelled(cancelled))
 }
