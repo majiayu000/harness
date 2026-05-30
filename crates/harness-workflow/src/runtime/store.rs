@@ -589,6 +589,31 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    /// List instances whose `parent_workflow_id` matches `parent_workflow_id`.
+    ///
+    /// Scoped to a single parent's children via the dedicated column instead of
+    /// scanning a whole definition and filtering in memory.
+    pub async fn list_instances_by_parent(
+        &self,
+        parent_workflow_id: &str,
+        limit: Option<i64>,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let limit = limit.map(|value| value.clamp(1, 500));
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE parent_workflow_id = $1
+             ORDER BY updated_at DESC
+             LIMIT COALESCE($2, 2147483647)",
+        )
+        .bind(parent_workflow_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     pub async fn list_instances_by_definition_page(
         &self,
         definition_id: &str,

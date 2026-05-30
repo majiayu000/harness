@@ -727,11 +727,15 @@ async fn has_active_pr_feedback_command_with_activity(
         return Ok(true);
     }
 
+    // Scope the child lookup to this parent's children via the indexed-by-value
+    // `parent_workflow_id` column, rather than loading every PR-feedback instance
+    // across all projects and filtering in memory (which scales with the whole
+    // table and inflates memory use).
     for instance in store
-        .list_instances_by_definition(PR_FEEDBACK_DEFINITION_ID, None, None)
+        .list_instances_by_parent(workflow_id, None)
         .await?
         .into_iter()
-        .filter(|instance| instance.parent_workflow_id.as_deref() == Some(workflow_id))
+        .filter(|instance| instance.definition_id == PR_FEEDBACK_DEFINITION_ID)
     {
         if matches!(instance.state.as_str(), "pending" | "inspecting")
             && has_active_child_pr_feedback_command(store, &instance.id).await?
