@@ -126,16 +126,30 @@ pub enum StoreLocation {
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Open (and migrate) a connection/handle for a store at `loc`.
-    async fn open(&self, loc: &StoreLocation, migrations: &Migrations) -> Result<StoreHandle>;
+    /// `migrations` matches the existing API: a slice of the `Migration` struct
+    /// already defined in `crates/harness-core/src/db.rs` (passed as `&[Migration]`).
+    async fn open(&self, loc: &StoreLocation, migrations: &[Migration]) -> Result<StoreHandle>;
 }
 
 /// Generic typed repository over a JSON-blob entity (most stores already are KV-JSON).
+/// Note: the existing `DbEntity` trait (`crates/harness-core/src/db.rs`) has no
+/// `Filter` associated type, so the generic repository deliberately exposes only
+/// id-keyed CRUD + unfiltered `list`. Filtered/aggregate queries live on
+/// store-specific repository traits (see below), which is where cross-entity
+/// query needs actually exist (e.g. TaskRepository, ReviewRepository).
 #[async_trait]
 pub trait Repository<E: DbEntity>: Send + Sync {
     async fn get(&self, id: &str) -> Result<Option<E>>;
     async fn put(&self, e: &E) -> Result<()>;
-    async fn list(&self, filter: E::Filter) -> Result<Vec<E>>;
+    async fn list(&self) -> Result<Vec<E>>;
     async fn delete(&self, id: &str) -> Result<()>;
+}
+
+/// Store-specific traits add the filtered/aggregate queries each store needs,
+/// keeping the generic `Repository<E>` minimal and dialect-agnostic. Example:
+#[async_trait]
+pub trait TaskRepository: Repository<Task> {
+    async fn list_summaries(&self, filter: TaskSummaryFilter) -> Result<Vec<TaskSummary>>;
 }
 ```
 
@@ -160,9 +174,18 @@ pub trait Repository<E: DbEntity>: Send + Sync {
   logs/                            # already used
 ```
 
-- Per-workspace files live under the workspace dir (or a mirrored
-  `~/.harness/workspaces/<id>/`) so `finish_runtime_workspace`/`remove_workspace`
-  deletes them automatically. No central catalog, no separate GC.
+- **Auto-GC requires the files to live *inside* the workspace directory.** Today
+  `remove_workspace` (`crates/harness-server/src/workspace.rs:285`) only runs
+  `git worktree remove` on the worktree path — it does **not** touch any mirrored
+  `~/.harness/workspaces/<id>/` directory. Therefore:
+  - **Default (recommended):** place per-workspace store files *under the workspace
+    dir itself* (e.g. `<workspace>/.harness/threads.sqlite`), so the existing
+    worktree removal deletes them with no new code.
+  - **If** a mirrored `~/.harness/workspaces/<id>/` layout is preferred (e.g. to
+    keep scratch out of the git worktree), then Phase 3 **must** extend
+    `remove_workspace`/`finish_runtime_workspace` to explicitly delete the mirrored
+    directory. This is an explicit lifecycle requirement, not free behavior.
+  Either way: no central catalog, no per-entity schema.
 
 ### 6.4 Backend implementations
 
@@ -228,9 +251,19 @@ pub trait Repository<E: DbEntity>: Send + Sync {
 
 ## 10. Open Questions
 
-- **O-1**: Exact process/call-path that opens stores with `project_root =
-  <workspace>` (server worker vs spawned agent `harness` process). Determines where
-  to inject the file backend.
+- **O-1 (largely answered — confirm exact line in Phase 2):** Empirically, the
+  exploded schemas are keyed by **per-runtime-job workspace paths** under
+  `~/Library/Application Support/harness-codex-runtime/workspaces/` — e.g. a
+  `threads` row's `cwd` = `.../harness-codex-runtime/workspaces/runtime-job-<hash>`,
+  and a `tasks` row's `workspace_path` = `.../workspaces/<hash>__<repo>__issue_N`.
+  The per-job workspace id is minted at
+  `crates/harness-server/src/workflow_runtime_worker/workspace.rs:244`
+  (`runtime-job-{stable_hash_8(job.id)}`). So it is the **harness Codex-runtime
+  path (server-side), not the external agent**, that opens ThreadDb/TaskDb/EventStore
+  rooted at the per-job workspace → one schema-set per runtime job. Remaining
+  confirmation for Phase 2: pin the exact store-open call site in the Codex
+  adapter / per-job harness init (data dir `harness-codex-runtime`) — that is the
+  file-backend injection point.
 - **O-2**: Should `event_store` audit be local JSONL per project (CC/Codex style)
   or a shared Postgres table? Depends on cross-project query needs.
 - **O-3**: Do any "durable per-workspace" stores (per inventory) actually need
@@ -248,4 +281,3 @@ pub trait Repository<E: DbEntity>: Send + Sync {
   (kept only as the interim stopgap).
 - **C. Status quo + raise Postgres limits.** Does not scale; catalog operations
   degrade regardless. Rejected.
-</content>
