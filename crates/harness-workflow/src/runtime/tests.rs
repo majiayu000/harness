@@ -36,6 +36,7 @@ use std::sync::{
 };
 
 mod p1_followups;
+mod replay_determinism;
 
 fn issue_instance(state: &str) -> WorkflowInstance {
     WorkflowInstance::new(

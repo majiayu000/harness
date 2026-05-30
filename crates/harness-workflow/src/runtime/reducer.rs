@@ -43,7 +43,6 @@ use super::repo_backlog::{
     REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use super::validator::{DecisionValidator, ValidationContext};
-use chrono::Utc;
 use serde_json::{json, Value};
 
 pub const RUNTIME_JOB_COMPLETED_EVENT: &str = "RuntimeJobCompleted";
@@ -334,7 +333,7 @@ fn structured_decision_validates(
         .validate(
             instance,
             decision,
-            &ValidationContext::new(event.source.as_str(), Utc::now()),
+            &ValidationContext::new(event.source.as_str(), event.created_at),
         )
         .is_ok()
 }
