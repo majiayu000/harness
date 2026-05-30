@@ -8,6 +8,7 @@ use harness_workflow::runtime::{
     WorkflowInstance,
 };
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::Arc;
 
 use super::activity_result::activity_result_from_turn;
@@ -264,12 +265,42 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         }
         Ok(self.state.core.project_root.clone())
     }
+
+    async fn runtime_worker_disabled_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
+        let activity = activity_name(job);
+        // If any preflight helper fails (e.g. a transient database error or a
+        // missing project root), defer to the main `execute` path rather than
+        // permanently failing the job here. That path classifies transient vs
+        // fatal errors and applies the retry policy; a hard failure in preflight
+        // would bypass it.
+        let workflow = self.workflow_for_job(job).await.ok()?;
+        let source_project_root = self.project_root_for_job(job, workflow.as_ref()).ok()?;
+        let workflow_document =
+            harness_core::config::workflow::load_workflow_document(&source_project_root).ok()?;
+        runtime_worker_disabled_result_for_config(
+            &activity,
+            &source_project_root,
+            &workflow_document.config,
+        )
+    }
 }
 
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
         !is_builtin_lifecycle_activity(job)
+    }
+
+    async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
+        // Builtin lifecycle activities (start_child_workflow, mark_bound_issue_done,
+        // recover_issue_workflow, ...) are internal state transitions that do not run
+        // a user agent. They must keep flowing even when the runtime worker is disabled,
+        // otherwise disabling the worker would strand workflows (e.g. a manually merged
+        // PR could never be marked done).
+        if is_builtin_lifecycle_activity(job) {
+            return None;
+        }
+        self.runtime_worker_disabled_result(job).await
     }
 
     async fn execute(&self, job: RuntimeJob) -> ActivityResult {
@@ -354,6 +385,23 @@ fn default_runtime_timeout(activity: &str) -> Option<u64> {
         "poll_repo_backlog" => DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS,
         _ => DEFAULT_RUNTIME_TURN_TIMEOUT_SECS,
     })
+}
+
+fn runtime_worker_disabled_result_for_config(
+    activity: &str,
+    project_root: &Path,
+    workflow_config: &WorkflowConfig,
+) -> Option<ActivityResult> {
+    if workflow_config.runtime_worker.enabled {
+        return None;
+    }
+    Some(ActivityResult::cancelled(
+        activity,
+        format!(
+            "Runtime worker is disabled for project {}; claimed job was cancelled before agent execution.",
+            project_root.display()
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -458,5 +506,40 @@ mod tests {
             runtime_timeout_fallback(&config, None, &runtime_job("implement_issue")),
             Some(3600)
         );
+    }
+
+    #[test]
+    fn runtime_worker_disabled_result_for_config_cancels_agent_work() {
+        let mut config = WorkflowConfig::default();
+        config.runtime_worker.enabled = false;
+
+        let Some(result) = runtime_worker_disabled_result_for_config(
+            "implement_issue",
+            Path::new("/tmp/project"),
+            &config,
+        ) else {
+            panic!("disabled runtime worker should produce a preflight result");
+        };
+
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Cancelled
+        );
+        assert_eq!(result.activity, "implement_issue");
+        assert!(result
+            .summary
+            .contains("Runtime worker is disabled for project /tmp/project"));
+    }
+
+    #[test]
+    fn runtime_worker_disabled_result_for_config_allows_enabled_project() {
+        let config = WorkflowConfig::default();
+
+        assert!(runtime_worker_disabled_result_for_config(
+            "implement_issue",
+            Path::new("/tmp/project"),
+            &config,
+        )
+        .is_none());
     }
 }
