@@ -19,10 +19,15 @@ This RFC proposes:
    code no longer depends on `PgStoreContext`/`PgPool` directly.
 2. **Stop schema-per-path.** Durable orchestration state lives in a small fixed
    set of shared Postgres schemas, row-keyed by id — never one schema per entity.
-3. **Move ephemeral per-workspace/per-run scratch to local files under
-   `~/.harness/`** (SQLite or JSONL), so it is created cheaply and garbage-collected
-   automatically when the workspace is removed — mirroring `~/.claude/` and
-   `~/.codex/`.
+3. **Move ephemeral per-workspace/per-run scratch to local files** (SQLite or
+   JSONL) placed *inside the workspace directory*, so they are created cheaply and
+   removed together with the workspace's existing worktree cleanup (see §6.3 for
+   the exact lifecycle requirement) — mirroring `~/.claude/` and `~/.codex/`.
+
+**Core decision (one line):** decouple a store's *logical identity* from its
+*physical location* — durable orchestration state → a small fixed set of shared
+Postgres schemas (row-keyed, never one-schema-per-entity); ephemeral per-run
+scratch → workspace-local files. No store path is ever hashed into its own schema.
 
 ## 2. Problem & Evidence (facts)
 
