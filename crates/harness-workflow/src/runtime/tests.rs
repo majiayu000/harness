@@ -683,7 +683,8 @@ fn runtime_completion_reducer_finishes_prompt_task_after_implementation() {
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "Prompt implementation completed.",
-    );
+    )
+    .with_validation(ValidationRecord::new("cargo test", "passed"));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
