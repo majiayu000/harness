@@ -29,7 +29,7 @@ use sqlx::postgres::PgPool;
 use crate::db::{Migration, PgStoreContext};
 
 /// Logical location of a store, independent of the physical backend.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StoreLocation {
     /// Durable, shared: a fixed, named Postgres schema (bounded count).
     SharedSchema(String),
