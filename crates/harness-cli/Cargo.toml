@@ -2,6 +2,9 @@
 name = "harness-cli"
 version.workspace = true
 edition.workspace = true
+description = "Command-line interface for the Harness agent orchestration layer"
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "harness"

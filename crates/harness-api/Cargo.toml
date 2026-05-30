@@ -2,6 +2,8 @@
 name = "harness-api"
 version.workspace = true
 edition.workspace = true
+description = "API contracts and types for the Harness agent orchestration layer"
+repository.workspace = true
 license.workspace = true
 
 [dependencies]

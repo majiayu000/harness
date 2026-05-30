@@ -2,6 +2,9 @@
 name = "harness-agents"
 version.workspace = true
 edition.workspace = true
+description = "Agent adapters (Claude Code, Codex) for the Harness orchestration layer"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 harness-core = { workspace = true }

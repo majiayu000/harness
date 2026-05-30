@@ -17,25 +17,26 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.33"
+version = "0.6.34"
 edition = "2021"
 license = "MIT"
 rust-version = "1.88"
+repository = "https://github.com/majiayu000/harness"
 
 [workspace.dependencies]
-# Internal crates
-harness-core = { path = "crates/harness-core" }
-harness-protocol = { path = "crates/harness-protocol" }
-harness-api = { path = "crates/harness-api" }
-harness-server = { path = "crates/harness-server" }
-harness-agents = { path = "crates/harness-agents" }
-harness-sandbox = { path = "crates/harness-sandbox" }
-harness-gc = { path = "crates/harness-gc" }
-harness-rules = { path = "crates/harness-rules" }
-harness-skills = { path = "crates/harness-skills" }
-harness-exec = { path = "crates/harness-exec" }
-harness-observe = { path = "crates/harness-observe" }
-harness-workflow = { path = "crates/harness-workflow" }
+# Internal crates (version required so they can be published to crates.io)
+harness-core = { path = "crates/harness-core", version = "0.6.34" }
+harness-protocol = { path = "crates/harness-protocol", version = "0.6.34" }
+harness-api = { path = "crates/harness-api", version = "0.6.34" }
+harness-server = { path = "crates/harness-server", version = "0.6.34" }
+harness-agents = { path = "crates/harness-agents", version = "0.6.34" }
+harness-sandbox = { path = "crates/harness-sandbox", version = "0.6.34" }
+harness-gc = { path = "crates/harness-gc", version = "0.6.34" }
+harness-rules = { path = "crates/harness-rules", version = "0.6.34" }
+harness-skills = { path = "crates/harness-skills", version = "0.6.34" }
+harness-exec = { path = "crates/harness-exec", version = "0.6.34" }
+harness-observe = { path = "crates/harness-observe", version = "0.6.34" }
+harness-workflow = { path = "crates/harness-workflow", version = "0.6.34" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
