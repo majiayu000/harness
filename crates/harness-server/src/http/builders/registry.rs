@@ -89,11 +89,18 @@ pub(crate) async fn build_registry(
     };
 
     // ── Thread DB ─────────────────────────────────────────────────────────────
+    // Constructed through the storage `Backend` seam (RFC Phase 2.2 sample). This
+    // is behavior-identical to the previous inline `PgStoreContext::new(url,
+    // pg_schema_for_path(path))`, but routes the schema strategy through
+    // `StoreLocation` so it lives in one place. `PathDerivedSchema` preserves the
+    // legacy per-path schema for now; switching this store to a shared schema is a
+    // later, deliberate (behavior-changing) step.
     let thread_db_path = harness_core::config::dirs::default_db_path(data_dir, "threads");
-    let thread_context = harness_core::db::PgStoreContext::new(
-        database_url.clone(),
-        harness_core::db::pg_schema_for_path(&thread_db_path)?,
-    )?;
+    let thread_context =
+        harness_core::store_backend::PostgresBackend::new(Some(database_url.clone()))
+            .store_context(
+                &harness_core::store_backend::StoreLocation::PathDerivedSchema(thread_db_path),
+            )?;
     let thread_db = match super::forced_startup_error("thread_db") {
         Some(error) => {
             startup_results.push(StoreStartupResult::critical("thread_db").failed(error));
