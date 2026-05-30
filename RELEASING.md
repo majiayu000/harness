@@ -58,6 +58,21 @@ The crates are publish-ready (they carry `description`, `license`, `repository`,
 and versioned internal dependencies), but publishing is a separate, manual,
 **irreversible** step (a published version can only be yanked, not removed).
 
+> **Status (2026-05-30): Harness is not published to crates.io, and there is no
+> current plan to.** Two of the workspace crate names are already owned by
+> unrelated projects — `harness-core` (owner: `avifenesh`) and `harness-cli`
+> (owner: `wenyuzhao`, a benchmarking tool) — so the workspace cannot be
+> published under its current names. Harness is an internal agent-orchestration
+> application rather than a reusable library, so the intended distribution path
+> is **GitHub releases** plus `cargo install --git https://github.com/majiayu000/harness`,
+> not crates.io. Revisit only if there is a concrete need to consume these crates
+> as external dependencies; that would first require renaming all crates to an
+> available namespace (keep `[lib] name = "harness_*"` so Rust `use` paths stay
+> unchanged, and only change `package.name` + the internal `[workspace.dependencies]`
+> entries).
+
+The remainder of this section documents the procedure should that decision change.
+
 ### Prerequisites
 
 1. Run from an environment with crates.io network access.
