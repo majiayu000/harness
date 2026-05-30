@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_core::types::{AgentId, ThreadId};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobExecutor,
-    RuntimeProfile, WorkflowInstance,
+    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeProfile,
+    WorkflowInstance,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -268,25 +268,15 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
 
     async fn runtime_worker_disabled_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
         let activity = activity_name(job);
-        let workflow = match self.workflow_for_job(job).await {
-            Ok(workflow) => workflow,
-            Err(error) => {
-                return Some(runtime_policy_preflight_failed_result(activity, error));
-            }
-        };
-        let source_project_root = match self.project_root_for_job(job, workflow.as_ref()) {
-            Ok(project_root) => project_root,
-            Err(error) => {
-                return Some(runtime_policy_preflight_failed_result(activity, error));
-            }
-        };
+        // If any preflight helper fails (e.g. a transient database error or a
+        // missing project root), defer to the main `execute` path rather than
+        // permanently failing the job here. That path classifies transient vs
+        // fatal errors and applies the retry policy; a hard failure in preflight
+        // would bypass it.
+        let workflow = self.workflow_for_job(job).await.ok()?;
+        let source_project_root = self.project_root_for_job(job, workflow.as_ref()).ok()?;
         let workflow_document =
-            match harness_core::config::workflow::load_workflow_document(&source_project_root) {
-                Ok(document) => document,
-                Err(error) => {
-                    return Some(runtime_policy_preflight_failed_result(activity, error));
-                }
-            };
+            harness_core::config::workflow::load_workflow_document(&source_project_root).ok()?;
         runtime_worker_disabled_result_for_config(
             &activity,
             &source_project_root,
@@ -302,6 +292,14 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     }
 
     async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
+        // Builtin lifecycle activities (start_child_workflow, mark_bound_issue_done,
+        // recover_issue_workflow, ...) are internal state transitions that do not run
+        // a user agent. They must keep flowing even when the runtime worker is disabled,
+        // otherwise disabling the worker would strand workflows (e.g. a manually merged
+        // PR could never be marked done).
+        if is_builtin_lifecycle_activity(job) {
+            return None;
+        }
         self.runtime_worker_disabled_result(job).await
     }
 
@@ -387,18 +385,6 @@ fn default_runtime_timeout(activity: &str) -> Option<u64> {
         "poll_repo_backlog" => DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS,
         _ => DEFAULT_RUNTIME_TURN_TIMEOUT_SECS,
     })
-}
-
-fn runtime_policy_preflight_failed_result(
-    activity: String,
-    error: impl std::fmt::Display,
-) -> ActivityResult {
-    ActivityResult::failed(
-        activity,
-        "Runtime job policy preflight failed before agent execution.",
-        error.to_string(),
-    )
-    .with_error_kind(ActivityErrorKind::Configuration)
 }
 
 fn runtime_worker_disabled_result_for_config(
