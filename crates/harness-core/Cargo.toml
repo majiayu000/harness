@@ -2,6 +2,8 @@
 name = "harness-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Core domain model, configuration, prompts, and agent traits for Harness"
 
 [dependencies]

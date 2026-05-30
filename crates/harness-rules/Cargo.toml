@@ -2,6 +2,9 @@
 name = "harness-rules"
 version.workspace = true
 edition.workspace = true
+description = "Rule loading and evaluation for the Harness agent orchestration layer"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 harness-core = { workspace = true }

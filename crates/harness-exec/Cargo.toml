@@ -2,6 +2,9 @@
 name = "harness-exec"
 version.workspace = true
 edition.workspace = true
+description = "Process execution helpers for the Harness agent orchestration layer"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 harness-core = { workspace = true }
