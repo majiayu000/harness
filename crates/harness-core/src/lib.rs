@@ -12,6 +12,7 @@ pub mod prompts;
 pub mod proof_of_work;
 pub mod review;
 pub mod shell_safety;
+pub mod store_backend;
 #[cfg(test)]
 mod test_support;
 pub mod tool_isolation;
