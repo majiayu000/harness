@@ -197,7 +197,13 @@ pub(crate) async fn request_pr_feedback_sweep_for_pr(
     ));
     upsert_github_issue_pr_definition(store).await?;
     store.upsert_instance(&instance).await?;
-    request_pr_feedback_sweep(store, &instance.id).await
+    request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activity(
+        store,
+        &instance.id,
+        DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+        Some(chrono::Utc::now()),
+    )
+    .await
 }
 
 pub(crate) async fn request_pr_feedback_sweep(
@@ -217,6 +223,21 @@ pub(crate) async fn request_pr_feedback_sweep_with_failed_child_suppression_secs
     workflow_id: &str,
     failed_child_suppression_secs: u64,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activity(
+        store,
+        workflow_id,
+        failed_child_suppression_secs,
+        None,
+    )
+    .await
+}
+
+async fn request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activity(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    failed_child_suppression_secs: u64,
+    latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
     let Some(instance) = store.get_instance(workflow_id).await? else {
         anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
     };
@@ -228,7 +249,14 @@ pub(crate) async fn request_pr_feedback_sweep_with_failed_child_suppression_secs
             state: instance.state,
         });
     }
-    if has_active_pr_feedback_command(store, &instance.id, failed_child_suppression_secs).await? {
+    if has_active_pr_feedback_command_with_activity(
+        store,
+        &instance.id,
+        failed_child_suppression_secs,
+        latest_pr_activity_at,
+    )
+    .await?
+    {
         let task_id = runtime_task_id_from_instance(&instance);
         return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
             workflow_id: instance.id,
@@ -653,10 +681,26 @@ fn is_active_pr_feedback_command_status(status: &str) -> bool {
     matches!(status, "pending" | "dispatching" | "dispatched")
 }
 
+#[cfg(test)]
 async fn has_active_pr_feedback_command(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
     failed_child_suppression_secs: u64,
+) -> anyhow::Result<bool> {
+    has_active_pr_feedback_command_with_activity(
+        store,
+        workflow_id,
+        failed_child_suppression_secs,
+        None,
+    )
+    .await
+}
+
+async fn has_active_pr_feedback_command_with_activity(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    failed_child_suppression_secs: u64,
+    latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<bool> {
     let parent_has_active_command =
         store
@@ -683,11 +727,15 @@ async fn has_active_pr_feedback_command(
         return Ok(true);
     }
 
+    // Scope the child lookup to this parent's children via the indexed-by-value
+    // `parent_workflow_id` column, rather than loading every PR-feedback instance
+    // across all projects and filtering in memory (which scales with the whole
+    // table and inflates memory use).
     for instance in store
-        .list_instances_by_definition(PR_FEEDBACK_DEFINITION_ID, None, None)
+        .list_instances_by_parent(workflow_id, None)
         .await?
         .into_iter()
-        .filter(|instance| instance.parent_workflow_id.as_deref() == Some(workflow_id))
+        .filter(|instance| instance.definition_id == PR_FEEDBACK_DEFINITION_ID)
     {
         if matches!(instance.state.as_str(), "pending" | "inspecting")
             && has_active_child_pr_feedback_command(store, &instance.id).await?
@@ -699,6 +747,7 @@ async fn has_active_pr_feedback_command(
                 store,
                 &instance.id,
                 failed_child_suppression_secs,
+                latest_pr_activity_at,
             )
             .await?
         {
@@ -713,6 +762,7 @@ async fn has_recent_failed_child_pr_feedback_command(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
     suppression_secs: u64,
+    latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<bool> {
     let Some(cutoff) = failed_child_suppression_cutoff(suppression_secs) else {
         return Ok(false);
@@ -725,7 +775,17 @@ async fn has_recent_failed_child_pr_feedback_command(
             matches!(record.status.as_str(), "failed" | "blocked")
                 && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
                 && record.updated_at >= cutoff
+                && failed_child_suppression_still_applies(record.updated_at, latest_pr_activity_at)
         }))
+}
+
+fn failed_child_suppression_still_applies(
+    failed_command_updated_at: chrono::DateTime<chrono::Utc>,
+    latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    latest_pr_activity_at
+        .map(|activity_at| activity_at < failed_command_updated_at)
+        .unwrap_or(true)
 }
 
 fn failed_child_suppression_cutoff(suppression_secs: u64) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1567,6 +1627,87 @@ mod tests {
         assert!(
             store.commands_for(&workflow_id).await?.is_empty(),
             "the parent workflow must not enqueue another PR feedback child while the failed child is cooling down"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_pr_feedback_request_bypasses_failed_child_suppression() -> anyhow::Result<()>
+    {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => store,
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let project_id = project_root.to_string_lossy().into_owned();
+        let workflow_id = pr_workflow_id(&project_id, Some("owner/repo"), 77);
+        upsert_github_issue_pr_definition(&store).await?;
+        let parent = pr_scoped_instance(
+            workflow_id.clone(),
+            project_id,
+            Some("owner/repo".to_string()),
+            77,
+            "awaiting_feedback",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "task-1",
+        }));
+        store.upsert_instance(&parent).await?;
+        let child = WorkflowInstance::new(
+            PR_FEEDBACK_DEFINITION_ID,
+            1,
+            "failed",
+            WorkflowSubject::new("pr", "pr:77"),
+        )
+        .with_id("pr-feedback-child-failed-explicit-request")
+        .with_parent(workflow_id.clone());
+        store.upsert_instance(&child).await?;
+        let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            PR_FEEDBACK_INSPECT_ACTIVITY,
+            "inspect-pr-feedback-77",
+        );
+        let child_command_id = store
+            .enqueue_command(&child.id, None, &child_command)
+            .await?;
+        store
+            .mark_command_status(&child_command_id, "failed")
+            .await?;
+
+        let outcome = request_pr_feedback_sweep_for_pr(
+            &store,
+            PrFeedbackSweepRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                task_id: &TaskId::from_str("task-1"),
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            PrFeedbackSweepRequestOutcome::Requested {
+                workflow_id: workflow_id.clone(),
+                task_id: "task-1".to_string(),
+            }
+        );
+        assert_eq!(
+            store.commands_for(&workflow_id).await?.len(),
+            1,
+            "new explicit PR feedback activity should enqueue a fresh child workflow"
         );
         Ok(())
     }
