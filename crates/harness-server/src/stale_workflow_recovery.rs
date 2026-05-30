@@ -245,6 +245,11 @@ mod tests {
         let instance = stuck_instance("test::stale-recovery::blocked::1", "blocked");
         store.upsert_instance(&instance).await?;
 
+        let Some(pre) = store.get_instance(&instance.id).await? else {
+            anyhow::bail!("seeded blocked workflow should exist before recovery");
+        };
+        assert_eq!(pre.state, "blocked");
+
         let tick = run_stale_workflow_recovery_tick(&store, 0).await?;
 
         assert!(
@@ -260,6 +265,7 @@ mod tests {
             post.state, "idle",
             "blocked workflow should be reset to idle"
         );
+        assert!(post.version > pre.version, "version should bump");
         Ok(())
     }
 
