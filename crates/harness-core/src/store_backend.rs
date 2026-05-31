@@ -82,14 +82,14 @@ impl PostgresBackend {
     /// lands (Phase 3).
     pub fn store_context(&self, loc: &StoreLocation) -> anyhow::Result<PgStoreContext> {
         let url = self.configured_database_url.as_deref();
-        Ok(match loc {
-            StoreLocation::SharedSchema(schema) => PgStoreContext::from_schema(schema, url)?,
-            StoreLocation::PathDerivedSchema(path) => PgStoreContext::from_path(path, url)?,
-            StoreLocation::LocalFile(path) => anyhow::bail!(
+        match loc {
+            StoreLocation::SharedSchema(schema) => PgStoreContext::from_schema(schema, url),
+            StoreLocation::PathDerivedSchema(path) => PgStoreContext::from_path(path, url),
+            StoreLocation::LocalFile(path) => Err(anyhow::anyhow!(
                 "LocalFile backend is not implemented yet (RFC storage redesign Phase 3): {}",
                 path.display()
-            ),
-        })
+            )),
+        }
     }
 }
 
