@@ -140,10 +140,8 @@ pub(crate) async fn build_registry(
 
     // ── Plan DB + cache ───────────────────────────────────────────────────────
     let plans_db_path = harness_core::config::dirs::default_db_path(data_dir, "plans");
-    let plan_context = harness_core::db::PgStoreContext::new(
-        database_url.clone(),
-        harness_core::db::pg_schema_for_path(&plans_db_path)?,
-    )?;
+    let plan_context =
+        harness_core::db::PgStoreContext::from_path(&plans_db_path, Some(&database_url))?;
     let plan_db = match super::forced_startup_error("plan_db") {
         Some(error) => {
             startup_results.push(StoreStartupResult::critical("plan_db").failed(error));
@@ -386,10 +384,8 @@ pub(crate) async fn build_registry(
 
     // ── Project registry ──────────────────────────────────────────────────────
     let projects_db_path = harness_core::config::dirs::default_db_path(data_dir, "projects");
-    let project_context = harness_core::db::PgStoreContext::new(
-        database_url.clone(),
-        harness_core::db::pg_schema_for_path(&projects_db_path)?,
-    )?;
+    let project_context =
+        harness_core::db::PgStoreContext::from_path(&projects_db_path, Some(&database_url))?;
     let project_registry = match super::forced_startup_error("project_registry") {
         Some(error) => {
             startup_results.push(StoreStartupResult::critical("project_registry").failed(error));
@@ -539,8 +535,9 @@ pub(crate) async fn build_registry(
                     .push(StoreStartupResult::optional("runtime_state_store").failed(error));
                 None
             }
-            None => match harness_core::db::pg_schema_for_path(&runtime_state_db_path).and_then(
-                |schema| harness_core::db::PgStoreContext::new(database_url.clone(), schema),
+            None => match harness_core::db::PgStoreContext::from_path(
+                &runtime_state_db_path,
+                Some(&database_url),
             ) {
                 Ok(context) => {
                     match crate::runtime_state_store::RuntimeStateStore::open_with_context(

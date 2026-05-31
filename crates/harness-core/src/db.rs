@@ -9,6 +9,12 @@ pub use crate::db_pg::{
     configure_pg_pool_from_server, pg_create_schema_if_not_exists, pg_open_pool,
     pg_open_pool_schematized, pg_schema_for_path, resolve_database_url, PgMigrator, PgStoreContext,
 };
+pub use crate::db_pg_schema_registry::{
+    apply_pg_schema_cleanup, ensure_pg_schema_registry, pg_schema_cleanup_plan,
+    register_pg_schema_ownership, PgSchemaCleanupAction, PgSchemaCleanupCandidate,
+    PgSchemaCleanupPlan, PgSchemaDropResult, PgSchemaOwnership, PG_SCHEMA_REGISTRY_SCHEMA,
+    PG_SCHEMA_REGISTRY_TABLE,
+};
 
 /// Create a Postgres connection pool for the logical store at `path`.
 ///

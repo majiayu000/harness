@@ -6,6 +6,7 @@ use std::str::FromStr as _;
 use std::sync::Mutex;
 
 use crate::db::Migration;
+use crate::db_pg_schema_registry::{register_pg_schema_ownership, PgSchemaOwnership};
 
 const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
 const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
@@ -330,6 +331,7 @@ pub fn pg_schema_for_path(path: &Path) -> anyhow::Result<String> {
 pub struct PgStoreContext {
     database_url: String,
     schema: String,
+    ownership: Option<PgSchemaOwnership>,
 }
 
 impl std::fmt::Debug for PgStoreContext {
@@ -337,6 +339,7 @@ impl std::fmt::Debug for PgStoreContext {
         f.debug_struct("PgStoreContext")
             .field("database_url", &"[REDACTED]")
             .field("schema", &self.schema)
+            .field("ownership", &self.ownership)
             .finish()
     }
 }
@@ -344,7 +347,10 @@ impl std::fmt::Debug for PgStoreContext {
 impl PgStoreContext {
     pub fn from_path(path: &Path, configured_database_url: Option<&str>) -> anyhow::Result<Self> {
         let database_url = resolve_database_url(configured_database_url)?;
-        Self::new(database_url, pg_schema_for_path(path)?)
+        let hash_path = schema_hash_path(path)?;
+        let schema = pg_schema_for_path(&hash_path)?;
+        let ownership = PgSchemaOwnership::path_derived(schema.clone(), hash_path)?;
+        Ok(Self::new(database_url, schema)?.with_ownership(ownership))
     }
 
     pub fn from_schema(
@@ -365,7 +371,13 @@ impl PgStoreContext {
         Ok(Self {
             database_url,
             schema,
+            ownership: None,
         })
+    }
+
+    pub fn with_ownership(mut self, ownership: PgSchemaOwnership) -> Self {
+        self.ownership = Some(ownership);
+        self
     }
 
     pub fn database_url(&self) -> &str {
@@ -376,6 +388,10 @@ impl PgStoreContext {
         &self.schema
     }
 
+    pub fn ownership(&self) -> Option<&PgSchemaOwnership> {
+        self.ownership.as_ref()
+    }
+
     pub async fn ensure_schema(&self, setup_pool: &PgPool) -> anyhow::Result<()> {
         pg_create_schema_if_not_exists(setup_pool, &self.schema)
             .await
@@ -384,7 +400,18 @@ impl PgStoreContext {
                     "failed to ensure Postgres schema '{}' is ready: {error}",
                     self.schema
                 )
-            })
+            })?;
+        if let Some(ownership) = &self.ownership {
+            register_pg_schema_ownership(setup_pool, ownership)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to register Postgres schema '{}' ownership: {error}",
+                        self.schema
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub async fn open_runtime_pool(&self) -> anyhow::Result<PgPool> {
@@ -467,7 +494,7 @@ pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
 /// PostgreSQL's 63-byte identifier limit (NAMEDATALEN-1). Rejects the name
 /// before it is ever interpolated into SQL, providing defence in depth against
 /// injection if the schema-name construction ever changes.
-fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
     let mut chars = schema.chars();
     let first = match chars.next() {
         Some(c) => c,
