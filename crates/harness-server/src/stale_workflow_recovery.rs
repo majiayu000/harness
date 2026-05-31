@@ -26,7 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use harness_workflow::runtime::WorkflowRuntimeStore;
+use harness_workflow::runtime::{
+    RuntimeJobStatus, WorkflowCommandRecord, WorkflowRuntimeStore, REPO_BACKLOG_POLL_ACTIVITY,
+};
 
 use crate::http::AppState;
 
@@ -72,11 +74,12 @@ pub struct StaleRecoveryTick {
     pub scanned: usize,
     pub recovered: usize,
     pub failed: usize,
+    pub skipped_active: usize,
 }
 
 impl StaleRecoveryTick {
     fn has_recovery_activity(&self) -> bool {
-        self.scanned > 0
+        self.scanned > 0 || self.skipped_active > 0
     }
 }
 
@@ -99,6 +102,16 @@ pub async fn run_stale_workflow_recovery_tick(
             tick.scanned += 1;
             let original_state = instance.state.clone();
             let stuck_secs = (Utc::now() - instance.updated_at).num_seconds();
+            if workflow_has_active_repo_backlog_work(store, &instance.id).await? {
+                tick.skipped_active += 1;
+                tracing::debug!(
+                    workflow_id = %instance.id,
+                    state = %original_state,
+                    stuck_secs,
+                    "stale_workflow_recovery: skipped workflow with active repo backlog runtime work"
+                );
+                continue;
+            }
             instance.state = RECOVERY_TARGET_STATE.to_string();
             instance.version = instance.version.saturating_add(1);
             // Bump the JSON-baked updated_at so subsequent recovery ticks see a
@@ -143,6 +156,35 @@ pub async fn run_stale_workflow_recovery_tick(
     Ok(tick)
 }
 
+async fn workflow_has_active_repo_backlog_work(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    let commands = store.commands_for(workflow_id).await?;
+    for command in commands.iter().rev().filter(is_repo_backlog_poll_command) {
+        match command.status.as_str() {
+            "pending" | "dispatching" => return Ok(true),
+            "dispatched" => {
+                let jobs = store.runtime_jobs_for_command(&command.id).await?;
+                if jobs.iter().any(|job| {
+                    matches!(
+                        job.status,
+                        RuntimeJobStatus::Pending | RuntimeJobStatus::Running
+                    )
+                }) {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn is_repo_backlog_poll_command(command: &&WorkflowCommandRecord) -> bool {
+    command.command.activity_name() == Some(REPO_BACKLOG_POLL_ACTIVITY)
+}
+
 /// Spawn the periodic recovery loop. Idempotent across restarts because each
 /// tick is itself idempotent: workflows that have moved out of the stuck
 /// state set since the last tick are simply not returned by the query.
@@ -168,6 +210,7 @@ pub fn spawn_stale_workflow_recovery(state: &Arc<AppState>) {
                         scanned = tick.scanned,
                         recovered = tick.recovered,
                         failed = tick.failed,
+                        skipped_active = tick.skipped_active,
                         "stale_workflow_recovery: tick complete"
                     );
                 }
@@ -186,7 +229,10 @@ pub fn spawn_stale_workflow_recovery(state: &Arc<AppState>) {
 mod tests {
     use super::*;
     use harness_core::db::resolve_database_url;
-    use harness_workflow::runtime::{WorkflowInstance, WorkflowSubject};
+    use harness_workflow::runtime::{
+        RuntimeKind, WorkflowCommand, WorkflowInstance, WorkflowSubject,
+    };
+    use serde_json::json;
     use std::sync::Arc;
 
     async fn open_recovery_test_store() -> Option<Arc<WorkflowRuntimeStore>> {
@@ -372,5 +418,44 @@ mod tests {
             "fresh stuck workflow should not be reset before threshold"
         );
         assert_eq!(tick.recovered, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_tick_skips_workflow_with_active_runtime_job() -> anyhow::Result<()> {
+        let Some(store) = open_recovery_test_store().await else {
+            return Ok(());
+        };
+        let id = "test::stale-recovery::active-runtime-job";
+        let mut instance = stuck_instance(id, "scanning");
+        instance.updated_at = Utc::now() - chrono::Duration::hours(1);
+        store.upsert_instance(&instance).await?;
+        let command =
+            WorkflowCommand::enqueue_activity(REPO_BACKLOG_POLL_ACTIVITY, "active-runtime-job");
+        let command_id = store.enqueue_command(id, None, &command).await?;
+        store
+            .enqueue_runtime_job(
+                &command_id,
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
+            )
+            .await?;
+        store.mark_command_status(&command_id, "dispatched").await?;
+
+        let tick = run_stale_workflow_recovery_tick(&store, 300).await?;
+
+        let after = store.get_instance(id).await?.ok_or_else(|| {
+            anyhow::anyhow!("active runtime workflow missing after recovery tick")
+        })?;
+        assert_eq!(
+            after.state, "scanning",
+            "active runtime work must protect the workflow from stale recovery"
+        );
+        assert_eq!(tick.recovered, 0);
+        assert!(
+            tick.skipped_active >= 1,
+            "active runtime job should be counted as an active skip"
+        );
+        Ok(())
     }
 }

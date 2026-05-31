@@ -137,7 +137,7 @@ pub struct RuntimeDispatchPolicy {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub workflow_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
-    #[serde(default)]
+    #[serde(default = "default_runtime_dispatch_activity_profiles")]
     pub activity_profiles: BTreeMap<String, RuntimeDispatchProfileOverride>,
     #[serde(default)]
     pub workflow_activity_profiles:
@@ -288,8 +288,48 @@ impl Default for RuntimeDispatchPolicy {
             max_turns: None,
             timeout_secs: None,
             workflow_profiles: BTreeMap::new(),
-            activity_profiles: BTreeMap::new(),
+            activity_profiles: default_runtime_dispatch_activity_profiles(),
             workflow_activity_profiles: BTreeMap::new(),
+        }
+    }
+}
+
+impl RuntimeDispatchPolicy {
+    fn apply_default_activity_profiles(&mut self) {
+        for (activity, default_profile) in default_runtime_dispatch_activity_profiles() {
+            self.activity_profiles
+                .entry(activity)
+                .and_modify(|profile| profile.apply_defaults_from(&default_profile))
+                .or_insert(default_profile);
+        }
+    }
+}
+
+impl RuntimeDispatchProfileOverride {
+    fn apply_defaults_from(&mut self, default: &Self) {
+        if self.runtime_kind.is_none() {
+            self.runtime_kind = default.runtime_kind.clone();
+        }
+        if self.runtime_profile.is_none() {
+            self.runtime_profile = default.runtime_profile.clone();
+        }
+        if self.model.is_none() {
+            self.model = default.model.clone();
+        }
+        if self.reasoning_effort.is_none() {
+            self.reasoning_effort = default.reasoning_effort.clone();
+        }
+        if self.sandbox.is_none() {
+            self.sandbox = default.sandbox.clone();
+        }
+        if self.approval_policy.is_none() {
+            self.approval_policy = default.approval_policy.clone();
+        }
+        if self.max_turns.is_none() {
+            self.max_turns = default.max_turns;
+        }
+        if self.timeout_secs.is_none() {
+            self.timeout_secs = default.timeout_secs;
         }
     }
 }
@@ -412,6 +452,19 @@ fn default_runtime_dispatch_batch_limit() -> u32 {
     25
 }
 
+fn default_runtime_dispatch_activity_profiles() -> BTreeMap<String, RuntimeDispatchProfileOverride>
+{
+    BTreeMap::from([(
+        "poll_repo_backlog".to_string(),
+        RuntimeDispatchProfileOverride {
+            runtime_kind: Some("codex_exec".to_string()),
+            runtime_profile: Some("codex-backlog-exec".to_string()),
+            timeout_secs: Some(3600),
+            ..Default::default()
+        },
+    )])
+}
+
 fn default_runtime_worker_interval_secs() -> u64 {
     5
 }
@@ -456,7 +509,7 @@ pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDoc
     };
 
     let (front_matter, prompt_template) = split_front_matter_and_body(&contents);
-    let config = match front_matter {
+    let mut config = match front_matter {
         None => WorkflowConfig::default(),
         Some(front_matter) if front_matter.trim().is_empty() => WorkflowConfig::default(),
         Some(front_matter) => serde_yaml::from_str(front_matter).map_err(|e| {
@@ -466,6 +519,7 @@ pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDoc
             )
         })?,
     };
+    config.runtime_dispatch.apply_default_activity_profiles();
 
     Ok(WorkflowDocument {
         config,

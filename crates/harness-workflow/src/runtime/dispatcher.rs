@@ -1,4 +1,5 @@
-use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
+use super::model::{RuntimeJob, RuntimeKind, RuntimeProfile, WorkflowCommandRecord};
+use super::repo_backlog::REPO_BACKLOG_POLL_ACTIVITY;
 use super::store::{RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
@@ -8,6 +9,8 @@ use uuid::Uuid;
 
 const COMMAND_STATUS_SKIPPED: &str = "skipped";
 const COMMAND_STATUS_CANCELLED: &str = "cancelled";
+const DEFAULT_REPO_BACKLOG_POLL_RUNTIME_PROFILE: &str = "codex-backlog-exec";
+const DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandDispatchOutcome {
@@ -35,12 +38,24 @@ pub struct RuntimeProfileSelector {
 
 impl RuntimeProfileSelector {
     pub fn new(default_profile: RuntimeProfile) -> Self {
+        let activity_profiles = Self::default_activity_profiles(&default_profile);
         Self {
             default_profile,
             workflow_profiles: BTreeMap::new(),
-            activity_profiles: BTreeMap::new(),
+            activity_profiles,
             workflow_activity_profiles: BTreeMap::new(),
         }
+    }
+
+    fn default_activity_profiles(
+        default_profile: &RuntimeProfile,
+    ) -> BTreeMap<String, RuntimeProfile> {
+        let mut activity_profiles = BTreeMap::new();
+        activity_profiles.insert(
+            REPO_BACKLOG_POLL_ACTIVITY.to_string(),
+            default_repo_backlog_poll_runtime_profile(default_profile),
+        );
+        activity_profiles
     }
 
     pub fn with_workflow_profile(
@@ -93,6 +108,25 @@ impl RuntimeProfileSelector {
             .and_then(|id| self.workflow_profiles.get(id))
             .unwrap_or(&self.default_profile)
     }
+}
+
+fn default_repo_backlog_poll_runtime_profile(default_profile: &RuntimeProfile) -> RuntimeProfile {
+    let mut profile = RuntimeProfile::new(
+        DEFAULT_REPO_BACKLOG_POLL_RUNTIME_PROFILE,
+        RuntimeKind::CodexExec,
+    );
+    if matches!(
+        default_profile.kind,
+        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
+    ) {
+        profile.model = default_profile.model.clone();
+        profile.reasoning_effort = default_profile.reasoning_effort.clone();
+        profile.approval_policy = default_profile.approval_policy.clone();
+    }
+    profile.sandbox = default_profile.sandbox.clone();
+    profile.max_turns = default_profile.max_turns;
+    profile.timeout_secs = Some(DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS);
+    profile
 }
 
 impl From<RuntimeProfile> for RuntimeProfileSelector {
@@ -286,4 +320,43 @@ fn retry_not_before_for_command(
                 command.id
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_selector_defaults_repo_backlog_poll_to_codex_exec() {
+        let mut default_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        default_profile.model = Some("gpt-5.5".to_string());
+        default_profile.reasoning_effort = Some("high".to_string());
+
+        let selector = RuntimeProfileSelector::new(default_profile);
+        let profile = selector.select(Some("repo_backlog"), Some(REPO_BACKLOG_POLL_ACTIVITY));
+
+        assert_eq!(profile.kind, RuntimeKind::CodexExec);
+        assert_eq!(profile.name, DEFAULT_REPO_BACKLOG_POLL_RUNTIME_PROFILE);
+        assert_eq!(profile.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(profile.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            profile.timeout_secs,
+            Some(DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn profile_selector_allows_explicit_repo_backlog_poll_override() {
+        let default_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        let mut override_profile = RuntimeProfile::new("custom-backlog", RuntimeKind::ClaudeCode);
+        override_profile.timeout_secs = Some(7200);
+
+        let selector = RuntimeProfileSelector::new(default_profile)
+            .with_activity_profile(REPO_BACKLOG_POLL_ACTIVITY, override_profile);
+        let profile = selector.select(Some("repo_backlog"), Some(REPO_BACKLOG_POLL_ACTIVITY));
+
+        assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(profile.name, "custom-backlog");
+        assert_eq!(profile.timeout_secs, Some(7200));
+    }
 }
