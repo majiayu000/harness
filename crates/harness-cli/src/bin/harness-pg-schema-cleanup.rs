@@ -2,7 +2,7 @@ use clap::Parser;
 use harness_core::config::HarnessConfig;
 use harness_core::db::{
     apply_pg_schema_cleanup, configure_pg_pool_from_server, pg_open_pool, pg_schema_cleanup_plan,
-    resolve_database_url, PgSchemaCleanupAction, PgSchemaCleanupPlan,
+    reap_orphaned_path_schemas, resolve_database_url, PgSchemaCleanupAction, PgSchemaCleanupPlan,
 };
 use std::path::PathBuf;
 
@@ -30,6 +30,10 @@ struct Args {
     /// Explicitly allow an unregistered schema to be dropped with --apply.
     #[arg(long = "allow-unregistered")]
     allow_unregistered: Vec<String>,
+    /// Drop registered path-derived schemas whose owning workspace directory no
+    /// longer exists. Dry-run unless combined with --confirm-drop.
+    #[arg(long)]
+    reap_orphans: bool,
     /// Print JSON output.
     #[arg(long)]
     json: bool,
@@ -43,6 +47,37 @@ async fn main() -> anyhow::Result<()> {
     configure_pg_pool_from_server(&config.server);
     let database_url = resolve_database_url(config.server.database_url.as_deref())?;
     let pool = pg_open_pool(&database_url).await?;
+
+    if args.reap_orphans {
+        let report = reap_orphaned_path_schemas(&pool, args.confirm_drop).await?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else if report.orphans.is_empty() {
+            println!(
+                "No orphaned path-derived schemas (scanned {})",
+                report.scanned
+            );
+        } else {
+            println!(
+                "{} {} orphaned schema(s) of {} scanned:",
+                if report.dropped {
+                    "Reaped"
+                } else {
+                    "Would reap"
+                },
+                report.orphans.len(),
+                report.scanned
+            );
+            for schema in &report.orphans {
+                println!("  {schema}");
+            }
+            if !report.dropped {
+                println!("Re-run with --confirm-drop to drop them.");
+            }
+        }
+        pool.close().await;
+        return Ok(());
+    }
 
     if args.apply {
         if !args.confirm_drop {
