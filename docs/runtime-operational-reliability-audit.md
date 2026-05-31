@@ -21,18 +21,20 @@ production readiness still needs live workload evidence after code fixes land.
 5. Fail turns when adapters emit terminal error events.
 6. Preserve `CodexExec` versus `CodexJsonrpc` execution strategy across the
    agent/runtime boundary.
+7. Continue the existing repo backlog polling work without opening a duplicate
+   remediation track.
 
 ## Issue Map
 
 | Priority | Issue | Risk | First PR shape |
 |---|---|---|---|
 | P1 | #1199 | Path-derived Postgres schemas have no ownership or cleanup lifecycle. | Add schema ownership registry and dry-run cleanup inventory. |
-| P1 | #1200 | Runtime activity side effects can be durable before lease-owned completion commits. | Move transition, event, decision, command, and completion writes behind one store boundary. |
-| P1 | #1201 | `remote_host` is configurable but workflow runtime jobs are not claimable through the runtime-host API. | Add runtime-job claim/complete/fail APIs backed by `WorkflowRuntimeStore`. |
-| P1 | #1202 | Runtime persistence/query failures can return successful or partial responses without a response-level contract. | Classify required stores and add explicit degraded/partial response behavior. |
-| P1 | #1203 | Adapter terminal errors can be appended as items while the turn is still marked completed. | Promote terminal adapter errors to failed turn execution with regression tests. |
-| P1 | #1204 | `CodexExec` and `CodexJsonrpc` can collapse to the same `codex` agent execution path. | Carry execution strategy into turn executor selection and test both paths. |
-| P1 | #1170 | Repo backlog polling can still starve useful work under active or stuck repositories. | Continue the existing lightweight/observable backlog polling work instead of opening a duplicate issue. |
+| P2 | #1200 | Runtime activity side effects can be durable before lease-owned completion commits. | Move transition, event, decision, command, and completion writes behind one store boundary. |
+| P3 | #1201 | `remote_host` is configurable but workflow runtime jobs are not claimable through the runtime-host API. | Add runtime-job claim/complete/fail APIs backed by `WorkflowRuntimeStore`. |
+| P4 | #1202 | Runtime persistence/query failures can return successful or partial responses without a response-level contract. | Classify required stores and add explicit degraded/partial response behavior. |
+| P5 | #1203 | Adapter terminal errors can be appended as items while the turn is still marked completed. | Promote terminal adapter errors to failed turn execution with regression tests. |
+| P6 | #1204 | `CodexExec` and `CodexJsonrpc` can collapse to the same `codex` agent execution path. | Carry execution strategy into turn executor selection and test both paths. |
+| P7 | #1170 | Repo backlog polling can still starve useful work under active or stuck repositories. | Continue the existing lightweight/observable backlog polling work instead of opening a duplicate issue. |
 
 ## Findings
 
