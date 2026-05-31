@@ -4,6 +4,7 @@ pub mod capability;
 pub mod config;
 pub mod db;
 pub mod db_pg;
+pub mod db_pg_schema_registry;
 mod db_pg_split;
 pub mod error;
 pub mod interceptor;

@@ -4,6 +4,7 @@ use super::{
     DEFAULT_PG_MAX_CONNECTIONS,
 };
 use crate::config::server::ServerConfig;
+use crate::db_pg_schema_registry::{PG_SCHEMA_REGISTRY_SCHEMA, PG_SCHEMA_REGISTRY_TABLE};
 use crate::test_support::process_env_lock;
 use std::path::Path;
 
@@ -159,7 +160,7 @@ fn pg_schema_for_path_normalizes_absolute_aliases() {
 }
 
 #[test]
-fn pg_store_context_from_path_uses_configured_url_and_path_schema() {
+fn pg_store_context_from_path_uses_configured_url_and_path_schema() -> anyhow::Result<()> {
     let context = PgStoreContext::from_path(
         Path::new("/tmp/harness/tasks.db"),
         Some(" postgres://user:pass@localhost:5432/harness "),
@@ -171,6 +172,16 @@ fn pg_store_context_from_path_uses_configured_url_and_path_schema() {
         "postgres://user:pass@localhost:5432/harness"
     );
     assert_eq!(context.schema(), "h1b76aa87802f7705");
+    let ownership = context
+        .ownership()
+        .ok_or_else(|| anyhow::anyhow!("path-derived context should carry ownership metadata"))?;
+    assert_eq!(ownership.owner_kind, "path_derived_store");
+    assert_eq!(ownership.retention_class, "path_derived");
+    assert_eq!(
+        ownership.owner_path.as_deref(),
+        Some("/tmp/harness/tasks.db")
+    );
+    Ok(())
 }
 
 #[test]
@@ -188,6 +199,28 @@ fn pg_store_context_debug_redacts_database_url() {
         !debug.contains("secret"),
         "debug output must not expose database credentials: {debug}"
     );
+}
+
+#[test]
+fn pg_store_context_from_schema_leaves_legacy_hash_schemas_unowned() -> anyhow::Result<()> {
+    let context = PgStoreContext::from_schema(
+        "h0123456789abcdef",
+        Some("postgres://user:pass@localhost:5432/harness"),
+    )?;
+
+    assert!(context.ownership().is_none());
+    Ok(())
+}
+
+#[test]
+fn pg_store_context_from_schema_leaves_shared_schema_canonical() -> anyhow::Result<()> {
+    let context = PgStoreContext::from_schema(
+        "workflow_runtime",
+        Some("postgres://user:pass@localhost:5432/harness"),
+    )?;
+
+    assert!(context.ownership().is_none());
+    Ok(())
 }
 
 #[test]
@@ -240,6 +273,62 @@ fn pg_store_context_can_reuse_shared_setup_pool() {
         pool.close().await;
         setup_pool.close().await;
     });
+}
+
+#[tokio::test]
+async fn pg_store_context_registers_path_schema_with_shared_setup_pool() -> anyhow::Result<()> {
+    let database_url = {
+        let _lock = process_env_lock();
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        database_url
+    };
+    let setup_pool = match pg_open_pool(&database_url).await {
+        Ok(pool) => pool,
+        Err(_) => return Ok(()),
+    };
+    let dir = tempfile::tempdir()?;
+    let store_path = dir.path().join(format!(
+        "registered-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let context = PgStoreContext::from_path(&store_path, Some(&database_url))?;
+    let schema = context.schema().to_string();
+    let expected_owner_path = context
+        .ownership()
+        .and_then(|ownership| ownership.owner_path.clone())
+        .ok_or_else(|| anyhow::anyhow!("path-derived context should carry owner_path"))?;
+    let pool = context.open_pool_with_setup_pool(&setup_pool).await?;
+
+    let row: (String, String, Option<String>, String) = sqlx::query_as(&format!(
+        "SELECT owner_kind, owner_key, owner_path, retention_class
+         FROM \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\"
+         WHERE schema_name = $1"
+    ))
+    .bind(&schema)
+    .fetch_one(&setup_pool)
+    .await?;
+
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", schema))
+        .execute(&setup_pool)
+        .await?;
+    sqlx::query(&format!(
+        "DELETE FROM \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\"
+         WHERE schema_name = $1"
+    ))
+    .bind(&schema)
+    .execute(&setup_pool)
+    .await?;
+    setup_pool.close().await;
+
+    assert_eq!(row.0, "path_derived_store");
+    assert_eq!(row.1, expected_owner_path);
+    assert_eq!(row.2.as_deref(), Some(expected_owner_path.as_str()));
+    assert_eq!(row.3, "path_derived");
+    Ok(())
 }
 
 #[test]

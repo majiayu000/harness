@@ -81,10 +81,7 @@ pub(crate) async fn build_storage_with_database_url(
         }
     };
 
-    let task_context = harness_core::db::PgStoreContext::new(
-        database_url.clone(),
-        harness_core::db::pg_schema_for_path(&db_path)?,
-    )?;
+    let task_context = harness_core::db::PgStoreContext::from_path(&db_path, Some(&database_url))?;
     let (tasks, task_result) = match super::forced_startup_error("tasks") {
         Some(error) => (None, StoreStartupResult::critical("tasks").failed(error)),
         None => match TaskStore::open_with_context(&db_path, &task_context, &setup_pool).await {
@@ -101,9 +98,10 @@ pub(crate) async fn build_storage_with_database_url(
             None,
             StoreStartupResult::optional("q_value_store").failed(error),
         ),
-        None => match harness_core::db::pg_schema_for_path(&q_values_db_path)
-            .and_then(|schema| harness_core::db::PgStoreContext::new(database_url, schema))
-        {
+        None => match harness_core::db::PgStoreContext::from_path(
+            &q_values_db_path,
+            Some(&database_url),
+        ) {
             Ok(q_value_context) => {
                 match QValueStore::open_with_context(&q_value_context, &setup_pool).await {
                     Ok(store) => (
