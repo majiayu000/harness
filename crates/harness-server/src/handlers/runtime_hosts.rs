@@ -5,7 +5,9 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, TimeDelta, Utc};
-use harness_workflow::runtime::{ActivityResult, RuntimeKind, WorkflowRuntimeStore};
+use harness_workflow::runtime::{
+    ActivityResult, RuntimeJobNotFoundError, RuntimeKind, WorkflowRuntimeStore,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -367,7 +369,7 @@ pub async fn complete_runtime_job_for_runtime_host(
                 })),
             );
         }
-        Err(e) if e.to_string().contains("runtime job not found") => {
+        Err(e) if e.downcast_ref::<RuntimeJobNotFoundError>().is_some() => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": e.to_string() })),

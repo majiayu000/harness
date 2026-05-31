@@ -69,6 +69,16 @@ async fn post_json(
     uri: String,
     body: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
+    let (status, json) = post_json_with_status(app, uri, body).await?;
+    assert_eq!(status, StatusCode::OK);
+    Ok(json)
+}
+
+async fn post_json_with_status(
+    app: &Router,
+    uri: String,
+    body: serde_json::Value,
+) -> anyhow::Result<(StatusCode, serde_json::Value)> {
     let response = app
         .clone()
         .oneshot(
@@ -79,11 +89,11 @@ async fn post_json(
                 .body(Body::from(body.to_string()))?,
         )
         .await?;
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let bytes = http_body_util::BodyExt::collect(response.into_body())
         .await?
         .to_bytes();
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok((status, serde_json::from_slice(&bytes)?))
 }
 
 #[tokio::test]
@@ -278,5 +288,34 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
         .expect("runtime job should be persisted");
     assert_eq!(persisted.status, RuntimeJobStatus::Failed);
     assert!(persisted.lease.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_completion_endpoint_returns_not_found_for_missing_job() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, _store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+
+    let result = ActivityResult::failed(
+        "remote_check",
+        "Remote host reported a failed activity.",
+        "remote execution failed",
+    );
+    let (status, body) = post_json_with_status(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/missing-job/complete".to_string(),
+        json!({
+            "lease_expires_at": chrono::Utc::now(),
+            "result": result,
+        }),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "runtime job not found: missing-job");
     Ok(())
 }

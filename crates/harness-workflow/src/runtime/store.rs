@@ -1,3 +1,4 @@
+use super::errors::RuntimeJobNotFoundError;
 use super::model::{
     ActivityResult, ActivityStatus, RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind,
     WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision,
@@ -1371,7 +1372,7 @@ impl WorkflowRuntimeStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some((data,)) = row else {
-            anyhow::bail!("runtime job not found: {runtime_job_id}");
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
         let is_current_lease = job.status == RuntimeJobStatus::Running
@@ -1416,7 +1417,7 @@ impl WorkflowRuntimeStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some((command_id,)) = command_id_row else {
-            anyhow::bail!("runtime job not found: {runtime_job_id}");
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
@@ -1434,7 +1435,7 @@ impl WorkflowRuntimeStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some((data,)) = row else {
-            anyhow::bail!("runtime job not found: {runtime_job_id}");
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
         let is_current_lease = job.status == RuntimeJobStatus::Running
@@ -1638,7 +1639,7 @@ impl WorkflowRuntimeStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some((data,)) = row else {
-            anyhow::bail!("runtime job not found: {runtime_job_id}");
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
         let is_current_lease = job.status == RuntimeJobStatus::Running
