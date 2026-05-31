@@ -373,11 +373,23 @@ fn classify_schema_cleanup_candidate(row: PgSchemaInventoryRow) -> PgSchemaClean
 }
 
 async fn drop_schema_cascade(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
-    crate::db_pg::validate_schema_name(schema)?;
-    sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", schema))
+    sqlx::query(&drop_schema_cascade_statement(schema, false)?)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+async fn drop_schema_cascade_if_exists(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
+    sqlx::query(&drop_schema_cascade_statement(schema, true)?)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn drop_schema_cascade_statement(schema: &str, if_exists: bool) -> anyhow::Result<String> {
+    crate::db_pg::validate_schema_name(schema)?;
+    let if_exists = if if_exists { " IF EXISTS" } else { "" };
+    Ok(format!("DROP SCHEMA{if_exists} \"{schema}\" CASCADE"))
 }
 
 async fn delete_schema_ownership(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
@@ -391,9 +403,129 @@ async fn delete_schema_ownership(pool: &PgPool, schema: &str) -> anyhow::Result<
     Ok(())
 }
 
+/// Report from a reap pass over orphaned path-derived schemas.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PgSchemaReapReport {
+    /// Number of registered path-derived schemas examined.
+    pub scanned: usize,
+    /// Schemas whose owning workspace directory no longer exists (orphans).
+    pub orphans: Vec<String>,
+    /// `true` if the orphans were dropped, `false` for a dry run.
+    pub dropped: bool,
+}
+
+/// True if a path-derived schema's owner store path is orphaned: the directory
+/// that contained the store (the owner path's *parent*) no longer exists on disk.
+///
+/// This is the conservative orphan signal. A path-derived schema is created from
+/// a store-identity path like `<workspace>/threads`; when the owning workspace is
+/// removed, that parent directory disappears and the schema is dead. Live stores
+/// (the server's fixed data dir, or an on-disk workspace) keep an existing parent
+/// directory and are therefore never considered orphaned, so this never drops a
+/// schema that could still be reopened.
+///
+/// Only a definitive `NotFound` counts as orphaned. Any other error reading the
+/// parent's metadata (permissions, a transiently-unavailable mount, etc.) is
+/// treated as "keep", so a transient IO failure can never cause a destructive
+/// drop of a live schema. `metadata` (not `Path::exists`) is used precisely so
+/// these two cases can be distinguished.
+fn owner_path_is_orphaned(owner_path: &Path) -> bool {
+    let Some(parent) = owner_path.parent() else {
+        return false;
+    };
+    match std::fs::metadata(parent) {
+        Ok(_) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Drop registered path-derived schemas whose owning workspace directory is gone.
+///
+/// This bounds Postgres catalog growth automatically: per-job / ephemeral stores
+/// create a schema under their workspace path, and once the workspace is removed
+/// the schema becomes a dead orphan that nothing can reopen. Reaping drops only
+/// those orphans (owner path's parent directory missing) and the matching
+/// registry rows — never a live store's schema.
+///
+/// With `apply = false` it reports what would be reaped (dry run) without
+/// dropping anything. Must run on the host that owns the workspace paths.
+pub async fn reap_orphaned_path_schemas(
+    pool: &PgPool,
+    apply: bool,
+) -> anyhow::Result<PgSchemaReapReport> {
+    ensure_pg_schema_registry(pool).await?;
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT schema_name, owner_path
+         FROM \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\"
+         WHERE owner_kind = $1"
+    ))
+    .bind(PATH_DERIVED_OWNER_KIND)
+    .fetch_all(pool)
+    .await?;
+
+    let scanned = rows.len();
+    let mut orphans = Vec::new();
+    for (schema_name, owner_path) in rows {
+        // No recorded path: cannot prove the schema is orphaned, so keep it.
+        let Some(owner_path) = owner_path else {
+            continue;
+        };
+        if owner_path_is_orphaned(Path::new(&owner_path)) {
+            orphans.push(schema_name);
+        }
+    }
+
+    if apply {
+        for schema_name in &orphans {
+            // Reaping is registry-driven, so stale rows may point at schemas
+            // already removed by manual cleanup or an interrupted prior run.
+            // Delete those ownership rows and keep processing later orphans.
+            drop_schema_cascade_if_exists(pool, schema_name).await?;
+            delete_schema_ownership(pool, schema_name).await?;
+        }
+    }
+
+    Ok(PgSchemaReapReport {
+        scanned,
+        orphans,
+        dropped: apply,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_path_is_orphaned_detects_missing_parent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Live store: its parent directory (the temp dir) exists -> kept.
+        let live = dir.path().join("threads");
+        assert!(
+            !owner_path_is_orphaned(&live),
+            "schema whose parent dir exists must never be reaped"
+        );
+        // Orphan: the owning workspace directory was removed.
+        let dead = dir.path().join("removed-workspace/threads");
+        assert!(
+            owner_path_is_orphaned(&dead),
+            "schema whose parent dir is gone must be reaped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drop_schema_cascade_statement_can_tolerate_missing_schema() -> anyhow::Result<()> {
+        assert_eq!(
+            drop_schema_cascade_statement("h1234567890abcdef", true)?,
+            "DROP SCHEMA IF EXISTS \"h1234567890abcdef\" CASCADE"
+        );
+        assert_eq!(
+            drop_schema_cascade_statement("h1234567890abcdef", false)?,
+            "DROP SCHEMA \"h1234567890abcdef\" CASCADE"
+        );
+        Ok(())
+    }
 
     #[test]
     fn path_derived_ownership_records_canonical_path() -> anyhow::Result<()> {

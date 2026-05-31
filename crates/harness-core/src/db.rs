@@ -11,9 +11,9 @@ pub use crate::db_pg::{
 };
 pub use crate::db_pg_schema_registry::{
     apply_pg_schema_cleanup, ensure_pg_schema_registry, pg_schema_cleanup_plan,
-    register_pg_schema_ownership, PgSchemaCleanupAction, PgSchemaCleanupCandidate,
-    PgSchemaCleanupPlan, PgSchemaDropResult, PgSchemaOwnership, PG_SCHEMA_REGISTRY_SCHEMA,
-    PG_SCHEMA_REGISTRY_TABLE,
+    reap_orphaned_path_schemas, register_pg_schema_ownership, PgSchemaCleanupAction,
+    PgSchemaCleanupCandidate, PgSchemaCleanupPlan, PgSchemaDropResult, PgSchemaOwnership,
+    PgSchemaReapReport, PG_SCHEMA_REGISTRY_SCHEMA, PG_SCHEMA_REGISTRY_TABLE,
 };
 
 /// Create a Postgres connection pool for the logical store at `path`.
