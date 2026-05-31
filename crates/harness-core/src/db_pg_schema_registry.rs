@@ -373,11 +373,23 @@ fn classify_schema_cleanup_candidate(row: PgSchemaInventoryRow) -> PgSchemaClean
 }
 
 async fn drop_schema_cascade(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
-    crate::db_pg::validate_schema_name(schema)?;
-    sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", schema))
+    sqlx::query(&drop_schema_cascade_statement(schema, false)?)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+async fn drop_schema_cascade_if_exists(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
+    sqlx::query(&drop_schema_cascade_statement(schema, true)?)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn drop_schema_cascade_statement(schema: &str, if_exists: bool) -> anyhow::Result<String> {
+    crate::db_pg::validate_schema_name(schema)?;
+    let if_exists = if if_exists { " IF EXISTS" } else { "" };
+    Ok(format!("DROP SCHEMA{if_exists} \"{schema}\" CASCADE"))
 }
 
 async fn delete_schema_ownership(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
@@ -465,7 +477,10 @@ pub async fn reap_orphaned_path_schemas(
 
     if apply {
         for schema_name in &orphans {
-            drop_schema_cascade(pool, schema_name).await?;
+            // Reaping is registry-driven, so stale rows may point at schemas
+            // already removed by manual cleanup or an interrupted prior run.
+            // Delete those ownership rows and keep processing later orphans.
+            drop_schema_cascade_if_exists(pool, schema_name).await?;
             delete_schema_ownership(pool, schema_name).await?;
         }
     }
@@ -495,6 +510,19 @@ mod tests {
         assert!(
             owner_path_is_orphaned(&dead),
             "schema whose parent dir is gone must be reaped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drop_schema_cascade_statement_can_tolerate_missing_schema() -> anyhow::Result<()> {
+        assert_eq!(
+            drop_schema_cascade_statement("h1234567890abcdef", true)?,
+            "DROP SCHEMA IF EXISTS \"h1234567890abcdef\" CASCADE"
+        );
+        assert_eq!(
+            drop_schema_cascade_statement("h1234567890abcdef", false)?,
+            "DROP SCHEMA \"h1234567890abcdef\" CASCADE"
         );
         Ok(())
     }
