@@ -236,6 +236,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     };
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
+    let mut stream_error: Option<String> = None;
     let mut last_activity = Instant::now();
     let execution_deadline = options
         .timeout_secs
@@ -258,6 +259,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 match incoming {
                     Some(item) => {
                         last_activity = Instant::now();
+                        if let StreamItem::Error { message } = &item {
+                            stream_error.get_or_insert_with(|| message.clone());
+                        }
                         process_stream_item(
                             &server,
                             &thread_db,
@@ -311,39 +315,8 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             "turn execution ended without agent result".to_string(),
         ))
     }) {
-        Ok(()) => match server.thread_manager.complete_turn(&thread_id, &turn_id) {
-            Ok(Some(usage)) => {
-                persist_runtime_thread(&thread_db, &server, &thread_id).await;
-                emit_runtime_notification(
-                    &notify_tx,
-                    &notification_tx,
-                    Notification::TurnCompleted {
-                        turn_id: turn_id.clone(),
-                        status: harness_core::types::TurnStatus::Completed,
-                        token_usage: usage,
-                    },
-                );
-            }
-            Ok(None) => {}
-            Err(err) => {
-                let error_msg = err.to_string();
-                tracing::error!(
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    "failed to complete turn after execution: {error_msg}"
-                );
-                if let Err(e) = server.thread_manager.add_item(
-                    &thread_id,
-                    &turn_id,
-                    harness_core::types::Item::Error {
-                        code: -1,
-                        message: format!("Failed to complete turn: {error_msg}"),
-                    },
-                ) {
-                    tracing::warn!("failed to add error item to turn: {e}");
-                } else {
-                    persist_runtime_thread(&thread_db, &server, &thread_id).await;
-                }
+        Ok(()) => {
+            if let Some(error_msg) = stream_error {
                 mark_turn_failed(
                     &server,
                     &thread_db,
@@ -354,8 +327,54 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     error_msg,
                 )
                 .await;
+                return;
             }
-        },
+            match server.thread_manager.complete_turn(&thread_id, &turn_id) {
+                Ok(Some(usage)) => {
+                    persist_runtime_thread(&thread_db, &server, &thread_id).await;
+                    emit_runtime_notification(
+                        &notify_tx,
+                        &notification_tx,
+                        Notification::TurnCompleted {
+                            turn_id: turn_id.clone(),
+                            status: harness_core::types::TurnStatus::Completed,
+                            token_usage: usage,
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let error_msg = err.to_string();
+                    tracing::error!(
+                        thread_id = %thread_id,
+                        turn_id = %turn_id,
+                        "failed to complete turn after execution: {error_msg}"
+                    );
+                    if let Err(e) = server.thread_manager.add_item(
+                        &thread_id,
+                        &turn_id,
+                        harness_core::types::Item::Error {
+                            code: -1,
+                            message: format!("Failed to complete turn: {error_msg}"),
+                        },
+                    ) {
+                        tracing::warn!("failed to add error item to turn: {e}");
+                    } else {
+                        persist_runtime_thread(&thread_db, &server, &thread_id).await;
+                    }
+                    mark_turn_failed(
+                        &server,
+                        &thread_db,
+                        &notify_tx,
+                        &notification_tx,
+                        &thread_id,
+                        &turn_id,
+                        error_msg,
+                    )
+                    .await;
+                }
+            }
+        }
         Err(err) => {
             let error_msg = err.to_string();
             if let Err(e) = server.thread_manager.add_item(

@@ -16,6 +16,8 @@ pub(crate) mod review_loop;
 mod run_task;
 pub(crate) mod triage_pipeline;
 pub(crate) mod turn_lifecycle;
+#[cfg(test)]
+mod turn_lifecycle_terminal_error_tests;
 mod validation_gate;
 
 use harness_core::config::agents::CapabilityProfile;
