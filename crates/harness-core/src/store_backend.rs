@@ -70,6 +70,27 @@ impl PostgresBackend {
             configured_database_url,
         }
     }
+
+    /// Resolve the `PgStoreContext` for `loc`.
+    ///
+    /// This is the Postgres-specific construction seam: it centralizes the schema
+    /// strategy (shared vs path-derived) in one place, so callers no longer compute
+    /// `pg_schema_for_path` inline. Builders that open against a shared setup pool
+    /// (`*_with_context`) use this; the `Backend::open_migrated` convenience below
+    /// delegates to it. The handle (`PgStoreContext`/`PgPool`) is Postgres-specific
+    /// by design in Phase 2 and will be generalized when the local-file backend
+    /// lands (Phase 3).
+    pub fn store_context(&self, loc: &StoreLocation) -> anyhow::Result<PgStoreContext> {
+        let url = self.configured_database_url.as_deref();
+        match loc {
+            StoreLocation::SharedSchema(schema) => PgStoreContext::from_schema(schema, url),
+            StoreLocation::PathDerivedSchema(path) => PgStoreContext::from_path(path, url),
+            StoreLocation::LocalFile(path) => Err(anyhow::anyhow!(
+                "LocalFile backend is not implemented yet (RFC storage redesign Phase 3): {}",
+                path.display()
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -79,16 +100,9 @@ impl Backend for PostgresBackend {
         loc: &StoreLocation,
         migrations: &[Migration],
     ) -> anyhow::Result<PgPool> {
-        let url = self.configured_database_url.as_deref();
-        let context = match loc {
-            StoreLocation::SharedSchema(schema) => PgStoreContext::from_schema(schema, url)?,
-            StoreLocation::PathDerivedSchema(path) => PgStoreContext::from_path(path, url)?,
-            StoreLocation::LocalFile(path) => anyhow::bail!(
-                "LocalFile backend is not implemented yet (RFC storage redesign Phase 3): {}",
-                path.display()
-            ),
-        };
-        context.open_migrated_pool(migrations).await
+        self.store_context(loc)?
+            .open_migrated_pool(migrations)
+            .await
     }
 }
 
