@@ -411,10 +411,19 @@ pub struct PgSchemaReapReport {
 /// (the server's fixed data dir, or an on-disk workspace) keep an existing parent
 /// directory and are therefore never considered orphaned, so this never drops a
 /// schema that could still be reopened.
+///
+/// Only a definitive `NotFound` counts as orphaned. Any other error reading the
+/// parent's metadata (permissions, a transiently-unavailable mount, etc.) is
+/// treated as "keep", so a transient IO failure can never cause a destructive
+/// drop of a live schema. `metadata` (not `Path::exists`) is used precisely so
+/// these two cases can be distinguished.
 fn owner_path_is_orphaned(owner_path: &Path) -> bool {
-    match owner_path.parent() {
-        Some(parent) => !parent.exists(),
-        None => false,
+    let Some(parent) = owner_path.parent() else {
+        return false;
+    };
+    match std::fs::metadata(parent) {
+        Ok(_) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
