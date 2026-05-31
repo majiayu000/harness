@@ -57,6 +57,32 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
 }
 
 #[test]
+fn load_workflow_config_keeps_runtime_dispatch_optional_fields_unset_when_omitted(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+runtime_dispatch:
+  enabled: true
+  approval_policy: never
+---
+
+Body
+"#,
+    )?;
+
+    let cfg = load_workflow_config(dir.path())?;
+    assert_eq!(cfg.runtime_dispatch.runtime_kind, None);
+    assert_eq!(cfg.runtime_dispatch.timeout_secs, None);
+    assert_eq!(
+        cfg.runtime_dispatch.approval_policy.as_deref(),
+        Some("never")
+    );
+    Ok(())
+}
+
+#[test]
 fn load_workflow_config_reads_front_matter() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(
