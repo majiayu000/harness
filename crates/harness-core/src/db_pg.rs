@@ -6,7 +6,9 @@ use std::str::FromStr as _;
 use std::sync::Mutex;
 
 use crate::db::Migration;
-use crate::db_pg_schema_registry::{register_pg_schema_ownership, PgSchemaOwnership};
+use crate::db_pg_schema_registry::{
+    normalize_path_lexically, register_pg_schema_ownership, PgSchemaOwnership,
+};
 
 const DEFAULT_PG_MAX_CONNECTIONS: u32 = 8;
 const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
@@ -283,24 +285,6 @@ fn schema_hash_path(path: &Path) -> anyhow::Result<PathBuf> {
     }
 
     Ok(normalize_path_lexically(&absolute))
-}
-
-fn normalize_path_lexically(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
 }
 
 /// Derive the legacy per-store Postgres schema name from a store identity path.

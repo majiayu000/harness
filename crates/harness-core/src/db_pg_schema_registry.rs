@@ -1,12 +1,13 @@
 use serde::Serialize;
 use sqlx::postgres::PgPool;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const PG_SCHEMA_REGISTRY_SCHEMA: &str = "harness_admin";
 pub const PG_SCHEMA_REGISTRY_TABLE: &str = "schema_ownership";
 
 const PATH_DERIVED_OWNER_KIND: &str = "path_derived_store";
+const PATH_DERIVED_DIRECTORY_OWNER_KIND: &str = "path_derived_directory_store";
 const PATH_DERIVED_RETENTION_CLASS: &str = "path_derived";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -26,12 +27,123 @@ impl PgSchemaOwnership {
             .to_string();
         Ok(Self {
             schema_name,
-            owner_kind: PATH_DERIVED_OWNER_KIND.to_string(),
+            owner_kind: path_derived_owner_kind(&canonical_path).to_string(),
             owner_key: owner_path.clone(),
             owner_path: Some(owner_path),
             retention_class: PATH_DERIVED_RETENTION_CLASS.to_string(),
         })
     }
+}
+
+fn path_derived_owner_kind(path: &Path) -> &'static str {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => PATH_DERIVED_DIRECTORY_OWNER_KIND,
+        _ => PATH_DERIVED_OWNER_KIND,
+    }
+}
+
+fn is_path_derived_owner_kind(owner_kind: &str) -> bool {
+    matches!(
+        owner_kind,
+        PATH_DERIVED_OWNER_KIND | PATH_DERIVED_DIRECTORY_OWNER_KIND
+    )
+}
+
+fn normalize_path_for_comparison(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    absolute
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path_lexically(&absolute))
+}
+
+pub(crate) fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::Prefix(_)) | Some(Component::RootDir) => {}
+                Some(Component::ParentDir) | None => normalized.push(component.as_os_str()),
+                Some(Component::CurDir) => unreachable!(),
+            },
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn is_legacy_workspace_directory_owner_path(
+    owner_path: &Path,
+    workspace_roots: &[PathBuf],
+) -> bool {
+    if workspace_roots.is_empty() || !legacy_owner_path_has_workspace_key(owner_path) {
+        return false;
+    }
+    let Some(parent) = owner_path.parent() else {
+        return false;
+    };
+    let normalized_parent = normalize_path_lexically(parent);
+    if workspace_roots.contains(&normalized_parent) {
+        return true;
+    }
+    workspace_roots.contains(&normalize_path_for_comparison(parent))
+}
+
+fn legacy_owner_path_has_workspace_key(owner_path: &Path) -> bool {
+    let Some(name) = owner_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    is_issue_or_pr_workspace_key(name)
+        || is_uuid_or_suffixed_workspace_key(name)
+        || name.starts_with("runtime-wf-")
+        || name.starts_with("runtime-job-")
+}
+
+fn is_issue_or_pr_workspace_key(name: &str) -> bool {
+    let Some(suffix) = name.rsplit("__").next() else {
+        return false;
+    };
+    let number = if let Some(number) = suffix.strip_prefix("issue_") {
+        number
+    } else if let Some(number) = suffix.strip_prefix("pr_") {
+        number
+    } else {
+        return false;
+    };
+    !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_uuid_workspace_key(name: &str) -> bool {
+    name.len() == 36
+        && name.chars().enumerate().all(|(idx, ch)| match idx {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_hexdigit(),
+        })
+}
+
+fn is_uuid_or_suffixed_workspace_key(name: &str) -> bool {
+    if is_uuid_workspace_key(name) {
+        return true;
+    }
+    let Some((prefix, suffix)) = name.rsplit_once('-') else {
+        return false;
+    };
+    is_uuid_workspace_key(prefix)
+        && (suffix == "seq"
+            || suffix
+                .strip_prefix('p')
+                .is_some_and(|idx| !idx.is_empty() && idx.chars().all(|ch| ch.is_ascii_digit())))
 }
 
 pub fn is_legacy_path_schema_name(schema: &str) -> bool {
@@ -330,7 +442,11 @@ fn classify_schema_cleanup_candidate(row: PgSchemaInventoryRow) -> PgSchemaClean
             PgSchemaCleanupAction::Blocked,
             "unregistered path-derived schema; cleanup requires explicit allowlist".to_string(),
         )
-    } else if row.owner_kind.as_deref() == Some(PATH_DERIVED_OWNER_KIND) {
+    } else if row
+        .owner_kind
+        .as_deref()
+        .is_some_and(is_path_derived_owner_kind)
+    {
         (
             PgSchemaCleanupAction::Keep,
             "registered path-derived schema; owner_path is an identity key, not a liveness check"
@@ -414,29 +530,67 @@ pub struct PgSchemaReapReport {
     pub dropped: bool,
 }
 
-/// True if a path-derived schema's owner store path is orphaned: the directory
-/// that contained the store (the owner path's *parent*) no longer exists on disk.
+/// True if a path-derived schema's owner store path is orphaned.
 ///
-/// This is the conservative orphan signal. A path-derived schema is created from
-/// a store-identity path like `<workspace>/threads`; when the owning workspace is
-/// removed, that parent directory disappears and the schema is dead. Live stores
-/// (the server's fixed data dir, or an on-disk workspace) keep an existing parent
-/// directory and are therefore never considered orphaned, so this never drops a
-/// schema that could still be reopened.
+/// File-style logical paths use the directory that contained the store (the owner
+/// path's parent) as the liveness signal. Directory owner paths are registered
+/// separately and use the owner path itself as the liveness signal, so deleting a
+/// workspace directory whose parent still exists is still detected as orphaned.
+/// Older registry rows did not distinguish directory owners, so generated
+/// workspace-key children of known workspace roots are treated as legacy
+/// directory owners.
 ///
 /// Only a definitive `NotFound` counts as orphaned. Any other error reading the
-/// parent's metadata (permissions, a transiently-unavailable mount, etc.) is
+/// liveness path metadata (permissions, a transiently-unavailable mount, etc.) is
 /// treated as "keep", so a transient IO failure can never cause a destructive
 /// drop of a live schema. `metadata` (not `Path::exists`) is used precisely so
 /// these two cases can be distinguished.
-fn owner_path_is_orphaned(owner_path: &Path) -> bool {
-    let Some(parent) = owner_path.parent() else {
-        return false;
+#[cfg(test)]
+fn owner_path_is_orphaned(owner_kind: &str, owner_path: &Path) -> bool {
+    owner_path_is_orphaned_with_workspace_roots(owner_kind, owner_path, &[])
+}
+
+fn owner_path_is_orphaned_with_workspace_roots(
+    owner_kind: &str,
+    owner_path: &Path,
+    workspace_roots: &[PathBuf],
+) -> bool {
+    let liveness_path = if owner_kind == PATH_DERIVED_DIRECTORY_OWNER_KIND
+        || (owner_kind == PATH_DERIVED_OWNER_KIND
+            && is_legacy_workspace_directory_owner_path(owner_path, workspace_roots))
+    {
+        owner_path
+    } else {
+        let Some(parent) = owner_path.parent() else {
+            return false;
+        };
+        parent
     };
-    match std::fs::metadata(parent) {
+    match std::fs::metadata(liveness_path) {
         Ok(_) => false,
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
+}
+
+fn orphaned_path_schema_names(
+    rows: Vec<(String, String, Option<String>)>,
+    workspace_roots: Vec<PathBuf>,
+) -> Vec<String> {
+    let mut orphans = Vec::new();
+    for (schema_name, owner_kind, owner_path) in rows {
+        // No recorded path: cannot prove the schema is orphaned, so keep it.
+        let Some(owner_path) = owner_path else {
+            continue;
+        };
+        if owner_path_is_orphaned_with_workspace_roots(
+            &owner_kind,
+            Path::new(&owner_path),
+            &workspace_roots,
+        ) {
+            orphans.push(schema_name);
+        }
+    }
+    orphans
 }
 
 /// Drop registered path-derived schemas whose owning workspace directory is gone.
@@ -444,8 +598,8 @@ fn owner_path_is_orphaned(owner_path: &Path) -> bool {
 /// This bounds Postgres catalog growth automatically: per-job / ephemeral stores
 /// create a schema under their workspace path, and once the workspace is removed
 /// the schema becomes a dead orphan that nothing can reopen. Reaping drops only
-/// those orphans (owner path's parent directory missing) and the matching
-/// registry rows — never a live store's schema.
+/// those orphans (the owner directory or file owner parent is missing) and the
+/// matching registry rows — never a live store's schema.
 ///
 /// With `apply = false` it reports what would be reaped (dry run) without
 /// dropping anything. Must run on the host that owns the workspace paths.
@@ -453,27 +607,35 @@ pub async fn reap_orphaned_path_schemas(
     pool: &PgPool,
     apply: bool,
 ) -> anyhow::Result<PgSchemaReapReport> {
+    reap_orphaned_path_schemas_with_workspace_roots(pool, apply, &[]).await
+}
+
+pub async fn reap_orphaned_path_schemas_with_workspace_roots(
+    pool: &PgPool,
+    apply: bool,
+    workspace_roots: &[PathBuf],
+) -> anyhow::Result<PgSchemaReapReport> {
     ensure_pg_schema_registry(pool).await?;
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT schema_name, owner_path
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT schema_name, owner_kind, owner_path
          FROM \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\"
-         WHERE owner_kind = $1"
+         WHERE owner_kind IN ($1, $2)"
     ))
     .bind(PATH_DERIVED_OWNER_KIND)
+    .bind(PATH_DERIVED_DIRECTORY_OWNER_KIND)
     .fetch_all(pool)
     .await?;
 
     let scanned = rows.len();
-    let mut orphans = Vec::new();
-    for (schema_name, owner_path) in rows {
-        // No recorded path: cannot prove the schema is orphaned, so keep it.
-        let Some(owner_path) = owner_path else {
-            continue;
-        };
-        if owner_path_is_orphaned(Path::new(&owner_path)) {
-            orphans.push(schema_name);
-        }
-    }
+    let workspace_roots = workspace_roots.to_vec();
+    let orphans = tokio::task::spawn_blocking(move || {
+        let workspace_roots: Vec<PathBuf> = workspace_roots
+            .iter()
+            .map(|root| normalize_path_for_comparison(root))
+            .collect();
+        orphaned_path_schema_names(rows, workspace_roots)
+    })
+    .await?;
 
     if apply {
         for schema_name in &orphans {
@@ -493,204 +655,5 @@ pub async fn reap_orphaned_path_schemas(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn owner_path_is_orphaned_detects_missing_parent() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        // Live store: its parent directory (the temp dir) exists -> kept.
-        let live = dir.path().join("threads");
-        assert!(
-            !owner_path_is_orphaned(&live),
-            "schema whose parent dir exists must never be reaped"
-        );
-        // Orphan: the owning workspace directory was removed.
-        let dead = dir.path().join("removed-workspace/threads");
-        assert!(
-            owner_path_is_orphaned(&dead),
-            "schema whose parent dir is gone must be reaped"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn drop_schema_cascade_statement_can_tolerate_missing_schema() -> anyhow::Result<()> {
-        assert_eq!(
-            drop_schema_cascade_statement("h1234567890abcdef", true)?,
-            "DROP SCHEMA IF EXISTS \"h1234567890abcdef\" CASCADE"
-        );
-        assert_eq!(
-            drop_schema_cascade_statement("h1234567890abcdef", false)?,
-            "DROP SCHEMA \"h1234567890abcdef\" CASCADE"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn path_derived_ownership_records_canonical_path() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("tasks.db");
-        let ownership =
-            PgSchemaOwnership::path_derived("h1234567890abcdef".to_string(), path.clone())?;
-
-        assert_eq!(ownership.schema_name, "h1234567890abcdef");
-        assert_eq!(ownership.owner_kind, "path_derived_store");
-        assert_eq!(ownership.owner_key, path.to_string_lossy());
-        assert_eq!(
-            ownership.owner_path.as_deref(),
-            Some(path.to_string_lossy().as_ref())
-        );
-        assert_eq!(ownership.retention_class, "path_derived");
-        Ok(())
-    }
-
-    #[test]
-    fn cleanup_keeps_path_derived_schema_when_owner_path_exists() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let row = PgSchemaInventoryRow {
-            schema_name: "h1111111111111111".to_string(),
-            owner_kind: Some("path_derived_store".to_string()),
-            owner_key: Some(dir.path().to_string_lossy().to_string()),
-            owner_path: Some(dir.path().to_string_lossy().to_string()),
-            retention_class: Some("path_derived".to_string()),
-            table_count: 2,
-            estimated_row_count: 5,
-        };
-
-        let candidate = classify_schema_cleanup_candidate(row);
-
-        assert!(candidate.registered);
-        assert_eq!(candidate.action, PgSchemaCleanupAction::Keep);
-        assert_eq!(
-            candidate.reason,
-            "registered path-derived schema; owner_path is an identity key, not a liveness check"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cleanup_keeps_path_derived_schema_when_owner_path_is_missing() {
-        let row = PgSchemaInventoryRow {
-            schema_name: "h2222222222222222".to_string(),
-            owner_kind: Some("path_derived_store".to_string()),
-            owner_key: Some("/definitely/missing/harness/schema-owner".to_string()),
-            owner_path: Some("/definitely/missing/harness/schema-owner".to_string()),
-            retention_class: Some("path_derived".to_string()),
-            table_count: 1,
-            estimated_row_count: 0,
-        };
-
-        let candidate = classify_schema_cleanup_candidate(row);
-
-        assert!(candidate.registered);
-        assert_eq!(candidate.action, PgSchemaCleanupAction::Keep);
-        assert_eq!(
-            candidate.reason,
-            "registered path-derived schema; owner_path is an identity key, not a liveness check"
-        );
-    }
-
-    #[test]
-    fn cleanup_marks_unknown_registered_schema_with_missing_path_as_drop_candidate() {
-        let row = PgSchemaInventoryRow {
-            schema_name: "h4444444444444444".to_string(),
-            owner_kind: Some("external_owner".to_string()),
-            owner_key: Some("/definitely/missing/harness/schema-owner".to_string()),
-            owner_path: Some("/definitely/missing/harness/schema-owner".to_string()),
-            retention_class: Some("path_derived".to_string()),
-            table_count: 1,
-            estimated_row_count: 0,
-        };
-
-        let candidate = classify_schema_cleanup_candidate(row);
-
-        assert!(candidate.registered);
-        assert_eq!(candidate.action, PgSchemaCleanupAction::DropCandidate);
-        assert_eq!(candidate.reason, "registered owner path is missing");
-    }
-
-    #[test]
-    fn cleanup_blocks_unregistered_schema_by_default() {
-        let row = PgSchemaInventoryRow {
-            schema_name: "h3333333333333333".to_string(),
-            owner_kind: None,
-            owner_key: None,
-            owner_path: None,
-            retention_class: None,
-            table_count: 1,
-            estimated_row_count: 0,
-        };
-
-        let candidate = classify_schema_cleanup_candidate(row);
-
-        assert!(!candidate.registered);
-        assert_eq!(candidate.action, PgSchemaCleanupAction::Blocked);
-        assert!(candidate.reason.contains("explicit allowlist"));
-    }
-
-    #[test]
-    fn drop_request_validation_rejects_registered_keep_candidate() {
-        let plan = PgSchemaCleanupPlan {
-            candidates: vec![PgSchemaCleanupCandidate {
-                schema_name: "h1111111111111111".to_string(),
-                registered: true,
-                owner_kind: Some("path_derived_store".to_string()),
-                owner_key: Some("h1111111111111111".to_string()),
-                owner_path: None,
-                retention_class: Some("path_derived".to_string()),
-                table_count: 1,
-                estimated_row_count: 0,
-                action: PgSchemaCleanupAction::Keep,
-                reason: "registered path-derived schema".to_string(),
-            }],
-        };
-        let requested_registered = HashSet::from(["h1111111111111111".to_string()]);
-        let allowlist = HashSet::new();
-
-        let err = validate_pg_schema_drop_request(plan, &requested_registered, &allowlist)
-            .expect_err("keep schema should be rejected");
-
-        assert!(err
-            .to_string()
-            .contains("registered schema 'h1111111111111111' is not a cleanup drop candidate"));
-    }
-
-    #[test]
-    fn drop_request_validation_fails_before_selecting_partial_targets() {
-        let plan = PgSchemaCleanupPlan {
-            candidates: vec![PgSchemaCleanupCandidate {
-                schema_name: "h1111111111111111".to_string(),
-                registered: true,
-                owner_kind: Some("external_owner".to_string()),
-                owner_key: Some("/definitely/missing/harness/schema-owner".to_string()),
-                owner_path: Some("/definitely/missing/harness/schema-owner".to_string()),
-                retention_class: Some("path_derived".to_string()),
-                table_count: 1,
-                estimated_row_count: 0,
-                action: PgSchemaCleanupAction::DropCandidate,
-                reason: "registered owner path is missing".to_string(),
-            }],
-        };
-        let requested_registered = HashSet::from([
-            "h1111111111111111".to_string(),
-            "h9999999999999999".to_string(),
-        ]);
-        let allowlist = HashSet::new();
-
-        let err = validate_pg_schema_drop_request(plan, &requested_registered, &allowlist)
-            .expect_err("missing schema should reject the whole cleanup request");
-
-        assert!(err
-            .to_string()
-            .contains("registered schema 'h9999999999999999' was not found"));
-    }
-
-    #[test]
-    fn legacy_path_schema_name_detection_is_exact() {
-        assert!(is_legacy_path_schema_name("h0123456789abcdef"));
-        assert!(!is_legacy_path_schema_name("workflow_runtime"));
-        assert!(!is_legacy_path_schema_name("h0123456789abcdeg"));
-        assert!(!is_legacy_path_schema_name("h0123456789abcde"));
-    }
-}
+#[path = "db_pg_schema_registry_tests.rs"]
+mod db_pg_schema_registry_tests;

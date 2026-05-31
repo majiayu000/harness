@@ -2,7 +2,8 @@ use clap::Parser;
 use harness_core::config::HarnessConfig;
 use harness_core::db::{
     apply_pg_schema_cleanup, configure_pg_pool_from_server, pg_open_pool, pg_schema_cleanup_plan,
-    reap_orphaned_path_schemas, resolve_database_url, PgSchemaCleanupAction, PgSchemaCleanupPlan,
+    reap_orphaned_path_schemas_with_workspace_roots, resolve_database_url, PgSchemaCleanupAction,
+    PgSchemaCleanupPlan,
 };
 use std::path::PathBuf;
 
@@ -49,7 +50,13 @@ async fn main() -> anyhow::Result<()> {
     let pool = pg_open_pool(&database_url).await?;
 
     if args.reap_orphans {
-        let report = reap_orphaned_path_schemas(&pool, args.confirm_drop).await?;
+        let workspace_roots = configured_workspace_roots(&config);
+        let report = reap_orphaned_path_schemas_with_workspace_roots(
+            &pool,
+            args.confirm_drop,
+            &workspace_roots,
+        )
+        .await?;
         if args.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else if report.orphans.is_empty() {
@@ -141,6 +148,14 @@ fn load_cleanup_config(path: Option<&std::path::Path>) -> anyhow::Result<Harness
     Ok(HarnessConfig::default())
 }
 
+fn configured_workspace_roots(config: &HarnessConfig) -> Vec<PathBuf> {
+    if config.workspace.root.as_os_str().is_empty() {
+        Vec::new()
+    } else {
+        vec![config.workspace.root.clone()]
+    }
+}
+
 fn print_plan(plan: &PgSchemaCleanupPlan) {
     let mut keep = 0usize;
     let mut drop_candidates = 0usize;
@@ -170,6 +185,30 @@ fn print_plan(plan: &PgSchemaCleanupPlan) {
             candidate.table_count,
             candidate.estimated_row_count,
             candidate.reason
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_workspace_roots_omits_empty_root() {
+        let mut config = HarnessConfig::default();
+        config.workspace.root = PathBuf::new();
+
+        assert!(configured_workspace_roots(&config).is_empty());
+    }
+
+    #[test]
+    fn configured_workspace_roots_keeps_non_empty_root() {
+        let mut config = HarnessConfig::default();
+        config.workspace.root = PathBuf::from("/tmp/harness-workspaces");
+
+        assert_eq!(
+            configured_workspace_roots(&config),
+            vec![PathBuf::from("/tmp/harness-workspaces")]
         );
     }
 }
