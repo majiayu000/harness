@@ -241,6 +241,14 @@ pub struct WorkflowConfig {
 pub struct WorkflowStoragePolicy {
     #[serde(default = "default_workflow_schema_namespace")]
     pub schema_namespace: String,
+    /// Whether the background orphan-path-schema reaper runs. Bounds Postgres
+    /// catalog growth automatically by dropping path-derived schemas whose
+    /// owning workspace directory has been removed.
+    #[serde(default = "default_true")]
+    pub orphan_reaper_enabled: bool,
+    /// Interval, in seconds, between background orphan-schema reap passes.
+    #[serde(default = "default_orphan_reaper_interval_secs")]
+    pub orphan_reaper_interval_secs: u64,
 }
 
 impl Default for IssueWorkflowPolicy {
@@ -349,6 +357,8 @@ impl Default for WorkflowStoragePolicy {
     fn default() -> Self {
         Self {
             schema_namespace: default_workflow_schema_namespace(),
+            orphan_reaper_enabled: true,
+            orphan_reaper_interval_secs: default_orphan_reaper_interval_secs(),
         }
     }
 }
@@ -479,6 +489,10 @@ fn default_runtime_worker_lease_ttl_secs() -> u64 {
 
 fn default_workflow_schema_namespace() -> String {
     "workflow".to_string()
+}
+
+fn default_orphan_reaper_interval_secs() -> u64 {
+    3600
 }
 
 fn default_true() -> bool {
