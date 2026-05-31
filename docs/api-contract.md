@@ -34,6 +34,32 @@ observes results. The following capabilities are **only available over HTTP**:
 | `POST /signals` | ingest | Signal ingestion (rate-limited) |
 | `GET  /health` | health | Server health check |
 
+#### Degraded persistence responses
+
+Runtime persistence failures are part of the HTTP contract, not log-only
+events. `GET /health` returns a JSON `status` of `degraded` when startup store
+initialization failed or runtime state is dirty; the `persistence.startup.stores`
+array reports each store by name with `critical`, `ready`, and a redacted
+`error` code.
+
+`GET /tasks` keeps returning the task rows it can safely load, but includes a
+`degraded` object when runtime-only submissions could not be loaded:
+
+```json
+{
+  "degraded": {
+    "partial": true,
+    "missing": ["workflow_runtime_submissions"],
+    "reason": "runtime_submission_summaries_unavailable"
+  }
+}
+```
+
+Runtime-host mutations fail with `503 Service Unavailable` when runtime state
+persistence was required at startup but the runtime state store is unavailable.
+This prevents a successful registration or deregistration response from hiding
+non-durable host state.
+
 Authentication: when `api_token` is configured, all routes require proof of the
 token; without a configured token the middleware is a no-op (backward
 compatibility).  Exempt routes that bypass auth entirely: `/health`,

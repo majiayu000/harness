@@ -1,6 +1,42 @@
 use super::*;
 
 #[tokio::test]
+async fn list_tasks_marks_runtime_submission_summaries_degraded_when_store_failed(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_read_only_route_test_state(dir.path()).await?;
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("workflow_runtime_store")
+                .failed("failed to connect to Postgres"),
+        ];
+    state_mut.degraded_subsystems = vec!["workflow_runtime_store"];
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["data"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["degraded"]["partial"], true);
+    assert_eq!(
+        body["degraded"]["missing"],
+        serde_json::json!(["workflow_runtime_submissions"])
+    );
+    assert_eq!(
+        body["degraded"]["reason"],
+        "runtime_submission_summaries_unavailable"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
