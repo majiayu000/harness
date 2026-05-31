@@ -44,6 +44,9 @@ pub async fn sync_runtime_host_projects(
     Path(host_id): Path<String>,
     Json(req): Json<SyncWatchedProjectsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = ensure_runtime_state_persistence_available(&state) {
+        return response;
+    }
     if !host_exists(&state, &host_id) {
         return (
             StatusCode::NOT_FOUND,
@@ -141,10 +144,31 @@ async fn persist_runtime_state(
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if let Err(e) = state.persist_runtime_state().await {
         tracing::error!("failed to persist runtime state after project cache sync: {e}");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to persist runtime state: {e}") })),
-        ));
+        return Err(runtime_state_persistence_error_response(e));
     }
     Ok(())
+}
+
+fn ensure_runtime_state_persistence_available(
+    state: &Arc<AppState>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Err(e) = state.ensure_runtime_state_persistence_available() {
+        tracing::error!(
+            "runtime project cache sync rejected because runtime state persistence is unavailable: {e}"
+        );
+        return Err(runtime_state_persistence_error_response(e));
+    }
+    Ok(())
+}
+
+fn runtime_state_persistence_error_response(
+    error: anyhow::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "runtime state persistence unavailable",
+            "message": error.to_string(),
+        })),
+    )
 }

@@ -40,6 +40,9 @@ pub async fn register_runtime_host(
             Json(json!({ "error": "host_id must not be empty" })),
         );
     }
+    if let Err(response) = ensure_runtime_state_persistence_available(&state) {
+        return response;
+    }
     let host = state.runtime_hosts.register(
         host_id.to_string(),
         req.display_name.map(|v| v.trim().to_string()),
@@ -82,6 +85,9 @@ pub async fn deregister_runtime_host(
     State(state): State<Arc<AppState>>,
     Path(host_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = ensure_runtime_state_persistence_available(&state) {
+        return response;
+    }
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         // Host already gone from memory (idempotent retry).  If a prior
         // deregister mutated memory but failed to persist, converge now.
@@ -225,15 +231,106 @@ pub async fn claim_task_for_runtime_host(
     (StatusCode::OK, Json(json!({ "claimed": false })))
 }
 
+fn ensure_runtime_state_persistence_available(
+    state: &Arc<AppState>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Err(e) = state.ensure_runtime_state_persistence_available() {
+        tracing::error!(
+            "runtime host mutation rejected because runtime state persistence is unavailable: {e}"
+        );
+        return Err(runtime_state_persistence_error_response(e));
+    }
+    Ok(())
+}
+
 async fn persist_runtime_state(
     state: &Arc<AppState>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if let Err(e) = state.persist_runtime_state().await {
         tracing::error!("failed to persist runtime state after runtime host mutation: {e}");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to persist runtime state: {e}") })),
-        ));
+        return Err(runtime_state_persistence_error_response(e));
     }
     Ok(())
+}
+
+fn runtime_state_persistence_error_response(
+    error: anyhow::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "runtime state persistence unavailable",
+            "message": error.to_string(),
+        })),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn register_runtime_host_rejects_required_missing_runtime_state_store(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+        let state_mut =
+            Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+        state_mut.startup_statuses =
+            vec![
+                crate::http::state::StoreStartupResult::optional("runtime_state_store")
+                    .failed("pool timed out while waiting for an open connection"),
+            ];
+        state_mut.degraded_subsystems = vec!["runtime_state_store"];
+
+        let (status, body) = register_runtime_host(
+            State(state.clone()),
+            Json(RegisterRuntimeHostRequest {
+                host_id: "host-a".to_string(),
+                display_name: None,
+                capabilities: vec![],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["error"], "runtime state persistence unavailable");
+        assert!(
+            !state.runtime_hosts.hosts.contains_key("host-a"),
+            "host registration must not mutate memory when required persistence is unavailable"
+        );
+        assert!(state.is_runtime_state_dirty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deregister_runtime_host_rejects_required_missing_runtime_state_store_before_lookup(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+        let state_mut =
+            Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+        state_mut.startup_statuses =
+            vec![
+                crate::http::state::StoreStartupResult::optional("runtime_state_store")
+                    .failed("pool timed out while waiting for an open connection"),
+            ];
+        state_mut.degraded_subsystems = vec!["runtime_state_store"];
+
+        let (status, body) =
+            deregister_runtime_host(State(state.clone()), Path("ghost-host".to_string())).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["error"], "runtime state persistence unavailable");
+        assert!(state.is_runtime_state_dirty());
+        Ok(())
+    }
 }

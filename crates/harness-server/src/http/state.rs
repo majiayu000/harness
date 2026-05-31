@@ -171,6 +171,21 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn runtime_state_persistence_required(&self) -> bool {
+        self.startup_statuses
+            .iter()
+            .any(|status| status.name == "runtime_state_store")
+            || self.degraded_subsystems.contains(&"runtime_state_store")
+    }
+
+    pub fn ensure_runtime_state_persistence_available(&self) -> anyhow::Result<()> {
+        if self.core.runtime_state_store.is_some() || !self.runtime_state_persistence_required() {
+            return Ok(());
+        }
+        self.runtime_state_dirty.store(true, Ordering::Release);
+        anyhow::bail!("runtime state persistence is unavailable");
+    }
+
     pub fn observe_notification_lag(&self, dropped: u64) -> u64 {
         let previous_total = self
             .notifications
@@ -192,6 +207,10 @@ impl AppState {
     pub async fn persist_runtime_state(&self) -> anyhow::Result<()> {
         let _guard = self.runtime_state_persist_lock.lock().await;
         let Some(store) = self.core.runtime_state_store.as_ref() else {
+            if self.runtime_state_persistence_required() {
+                self.runtime_state_dirty.store(true, Ordering::Release);
+                anyhow::bail!("runtime state persistence is unavailable");
+            }
             return Ok(());
         };
         let hosts = self.runtime_hosts.snapshot_state();
