@@ -30,21 +30,24 @@ repo_backlog:
 runtime_dispatch:
   enabled: true
   interval_secs: 30
-  batch_limit: 25
+  batch_limit: 32
   approval_policy: never
   timeout_secs: 3600
   activity_profiles:
     inspect_pr_feedback:
       timeout_secs: 3600
+    plan_repo_sprint:
+      reasoning_effort: xhigh
     poll_repo_backlog:
       runtime_kind: codex_exec
       runtime_profile: codex-backlog-exec
-      timeout_secs: 3600
+      reasoning_effort: xhigh
+      timeout_secs: 600
 runtime_worker:
   enabled: true
   interval_secs: 5
-  concurrency: 10
-  lease_ttl_secs: 3900
+  concurrency: 32
+  lease_ttl_secs: 600
 runtime_retry_policy:
   activity_retries: {}
 storage:
