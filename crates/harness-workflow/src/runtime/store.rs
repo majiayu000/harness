@@ -23,7 +23,7 @@ use uuid::Uuid;
 const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
 
 pub struct WorkflowRuntimeStore {
-    pool: PgPool,
+    pub(super) pool: PgPool,
 }
 
 pub struct WorkflowInstancePage {
@@ -1987,11 +1987,11 @@ impl WorkflowRuntimeStore {
     }
 }
 
-fn to_jsonb_string(value: &impl Serialize) -> anyhow::Result<String> {
+pub(super) fn to_jsonb_string(value: &impl Serialize) -> anyhow::Result<String> {
     Ok(serde_json::to_string(value)?.replace("\\u0000", ""))
 }
 
-fn enum_str(value: &impl Serialize) -> anyhow::Result<String> {
+pub(super) fn enum_str(value: &impl Serialize) -> anyhow::Result<String> {
     serde_json::to_value(value)?
         .as_str()
         .map(str::to_string)

@@ -6,6 +6,7 @@
 
 pub mod bus;
 pub mod dispatcher;
+mod job_claim;
 pub mod model;
 pub mod plan_issue;
 pub mod pr_feedback;

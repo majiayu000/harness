@@ -1,5 +1,5 @@
 use super::model::{
-    ActivityResult, ActivityStatus, RuntimeJob, RuntimeProfile, WorkflowCommand,
+    ActivityResult, ActivityStatus, RuntimeJob, RuntimeKind, RuntimeProfile, WorkflowCommand,
     WorkflowCommandRecord, WorkflowCommandType, WorkflowInstance,
 };
 use super::reducer::reduce_runtime_job_completed;
@@ -53,7 +53,11 @@ impl<'a> RuntimeWorker<'a> {
         let mut lease_expires_at = Utc::now() + self.lease_ttl;
         let Some(job) = self
             .store
-            .claim_next_runtime_job(&self.owner, lease_expires_at)
+            .claim_next_runtime_job_excluding_runtime_kind(
+                RuntimeKind::RemoteHost,
+                &self.owner,
+                lease_expires_at,
+            )
             .await?
         else {
             return Ok(None);
@@ -553,6 +557,57 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "RuntimeJobClaimed");
         assert_eq!(events[1].event_type, "ActivityResultReady");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_worker_skips_remote_host_jobs_for_external_claims() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&harness_core::config::dirs::default_db_path(
+            dir.path(),
+            "workflow_runtime",
+        ))
+        .await?;
+        let remote_job = store
+            .enqueue_runtime_job(
+                "command-remote",
+                RuntimeKind::RemoteHost,
+                "remote-host-default",
+                json!({ "activity": "remote_check" }),
+            )
+            .await?;
+        let local_job = store
+            .enqueue_runtime_job(
+                "command-local",
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({ "activity": "local_check" }),
+            )
+            .await?;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executor = PreflightRuntimeExecutor {
+            result: ActivityResult::succeeded("local_check", "Local worker completed."),
+            executions,
+        };
+
+        let completed = RuntimeWorker::new(&store, "runtime-1")
+            .with_lease_ttl(Duration::minutes(5))
+            .run_once(&executor)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("worker should claim the local job"))?;
+
+        assert_eq!(completed.id, local_job.id);
+        let remote = store
+            .get_runtime_job(&remote_job.id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("remote job should remain pending for runtime host API")
+            })?;
+        assert_eq!(remote.status, RuntimeJobStatus::Pending);
         Ok(())
     }
 }

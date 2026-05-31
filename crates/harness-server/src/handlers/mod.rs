@@ -26,6 +26,9 @@ mod runtime_project_cache_api_tests;
 #[cfg(test)]
 mod runtime_hosts_api_tests;
 
+#[cfg(test)]
+mod runtime_hosts_workflow_api_tests;
+
 /// Validate a project root path, returning early with an `INTERNAL_ERROR`
 /// response on failure.
 ///
