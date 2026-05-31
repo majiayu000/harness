@@ -55,10 +55,14 @@ array reports each store by name with `critical`, `ready`, and a redacted
 }
 ```
 
-Runtime-host mutations fail with `503 Service Unavailable` when runtime state
-persistence was required at startup but the runtime state store is unavailable.
-This prevents a successful registration or deregistration response from hiding
-non-durable host state.
+`GET /tasks/{id}` and `GET /tasks/{id}/proof` return `503 Service Unavailable`
+with `error: "workflow runtime store unavailable"` when the requested handle
+could be runtime-backed but the required workflow runtime store is unavailable.
+
+Runtime-host mutations, including watched-project sync, fail with
+`503 Service Unavailable` when runtime state persistence was required at startup
+but the runtime state store is unavailable. This prevents a successful response
+from hiding non-durable host state.
 
 Authentication: when `api_token` is configured, all routes require proof of the
 token; without a configured token the middleware is a no-op (backward

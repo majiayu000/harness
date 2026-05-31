@@ -20,6 +20,68 @@ async fn get_task_returns_not_found_for_missing_id() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn get_task_returns_service_unavailable_when_required_workflow_runtime_store_missing(
+) -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = tempfile::tempdir()?;
+    let mut state = make_read_only_route_test_state(dir.path()).await?;
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("workflow_runtime_store")
+                .failed("failed to connect to Postgres"),
+        ];
+    state_mut.degraded_subsystems = vec!["workflow_runtime_store"];
+    let app = task_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/runtime-only-task")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "workflow runtime store unavailable");
+    assert_eq!(body["message"], "workflow runtime store is unavailable");
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_proof_returns_service_unavailable_when_required_workflow_runtime_store_missing(
+) -> anyhow::Result<()> {
+    let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = tempfile::tempdir()?;
+    let mut state = make_read_only_route_test_state(dir.path()).await?;
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("workflow_runtime_store")
+                .failed("failed to connect to Postgres"),
+        ];
+    state_mut.degraded_subsystems = vec!["workflow_runtime_store"];
+    let app = task_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/runtime-only-task/proof")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "workflow runtime store unavailable");
+    assert_eq!(body["message"], "workflow runtime store is unavailable");
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_then_get_task_returns_state() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

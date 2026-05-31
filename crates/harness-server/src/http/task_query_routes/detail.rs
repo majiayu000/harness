@@ -50,22 +50,27 @@ pub(crate) async fn get_task(
             })
             .into_response()
         }
-        Ok(None) => match runtime_task_response_by_handle(&state, &task_id).await {
-            Ok(Some(runtime_task)) => Json(runtime_task).into_response(),
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "task not found"})),
-            )
-                .into_response(),
-            Err(e) => {
-                tracing::error!("get_task: runtime workflow lookup failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
-                )
-                    .into_response()
+        Ok(None) => {
+            if workflow_runtime_store_unavailable(&state) {
+                return workflow_runtime_store_unavailable_response();
             }
-        },
+            match runtime_task_response_by_handle(&state, &task_id).await {
+                Ok(Some(runtime_task)) => Json(runtime_task).into_response(),
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "task not found"})),
+                )
+                    .into_response(),
+                Err(e) => {
+                    tracing::error!("get_task: runtime workflow lookup failed: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response()
+                }
+            }
+        }
         Err(e) => {
             tracing::error!("get_task: database error: {e}");
             (
@@ -82,9 +87,6 @@ async fn runtime_task_response_by_handle(
     task_id: &harness_core::types::TaskId,
 ) -> anyhow::Result<Option<RuntimeTaskResponse>> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        if workflow_runtime_store_required(state) {
-            anyhow::bail!("workflow runtime store is unavailable");
-        }
         return Ok(None);
     };
     let Some(workflow) = store.get_instance_by_task_id(task_id.as_str()).await? else {
@@ -123,6 +125,21 @@ async fn runtime_task_response_by_handle(
         issue,
         workflow: Some(TaskWorkflowSummary::from_runtime(&workflow)),
     }))
+}
+
+fn workflow_runtime_store_unavailable(state: &AppState) -> bool {
+    state.core.workflow_runtime_store.is_none() && workflow_runtime_store_required(state)
+}
+
+fn workflow_runtime_store_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "workflow runtime store unavailable",
+            "message": "workflow runtime store is unavailable",
+        })),
+    )
+        .into_response()
 }
 
 /// Look up the issue-workflow instance for a task using targeted store queries.
@@ -383,9 +400,6 @@ async fn runtime_proof_by_handle(
     task_id: &harness_core::types::TaskId,
 ) -> anyhow::Result<RuntimeProofLookup> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        if workflow_runtime_store_required(state) {
-            anyhow::bail!("workflow runtime store is unavailable");
-        }
         return Ok(RuntimeProofLookup::Missing);
     };
     let Some(workflow) = store.get_instance_by_task_id(task_id.as_str()).await? else {
@@ -427,30 +441,35 @@ pub(crate) async fn get_task_proof(
             }
             Json(proof_from_state(&task)).into_response()
         }
-        Ok(None) => match runtime_proof_by_handle(&state, &task_id).await {
-            Ok(RuntimeProofLookup::Terminal(proof)) => Json(proof).into_response(),
-            Ok(RuntimeProofLookup::InFlight(status)) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "error": "task is not in a terminal state",
-                    "status": status,
-                })),
-            )
-                .into_response(),
-            Ok(RuntimeProofLookup::Missing) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "task not found"})),
-            )
-                .into_response(),
-            Err(e) => {
-                tracing::error!("get_task_proof: runtime workflow lookup failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
-                )
-                    .into_response()
+        Ok(None) => {
+            if workflow_runtime_store_unavailable(&state) {
+                return workflow_runtime_store_unavailable_response();
             }
-        },
+            match runtime_proof_by_handle(&state, &task_id).await {
+                Ok(RuntimeProofLookup::Terminal(proof)) => Json(proof).into_response(),
+                Ok(RuntimeProofLookup::InFlight(status)) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "error": "task is not in a terminal state",
+                        "status": status,
+                    })),
+                )
+                    .into_response(),
+                Ok(RuntimeProofLookup::Missing) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "task not found"})),
+                )
+                    .into_response(),
+                Err(e) => {
+                    tracing::error!("get_task_proof: runtime workflow lookup failed: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "internal server error"})),
+                    )
+                        .into_response()
+                }
+            }
+        }
         Err(e) => {
             tracing::error!("get_task_proof: database error: {e}");
             (

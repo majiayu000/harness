@@ -132,6 +132,58 @@ async fn sync_unknown_host_returns_not_found() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sync_rejects_required_missing_runtime_state_store_before_cache_mutation(
+) -> anyhow::Result<()> {
+    let data_dir = tempfile::tempdir()?;
+    let project_dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(project_dir.path().join(".git"))?;
+
+    let Some(mut state) = make_test_state(data_dir.path()).await? else {
+        return Ok(());
+    };
+    state
+        .runtime_hosts
+        .register("host-a".to_string(), None, vec![]);
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("runtime_state_store")
+                .failed("pool timed out while waiting for an open connection"),
+        ];
+    state_mut.degraded_subsystems = vec!["runtime_state_store"];
+
+    let app = runtime_project_cache_app(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/projects/sync")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "projects": [{"project": project_dir.path().to_string_lossy()}]
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await?
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(json["error"], "runtime state persistence unavailable");
+    assert!(state
+        .runtime_project_cache
+        .get_host_cache("host-a")
+        .is_none());
+    assert!(state.is_runtime_state_dirty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn sync_by_project_id_resolves_registry_root() -> anyhow::Result<()> {
     let data_dir = tempfile::tempdir()?;
     let project_dir = tempfile::tempdir()?;
