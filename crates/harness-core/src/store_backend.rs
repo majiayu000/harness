@@ -19,7 +19,9 @@
 //! still open Postgres directly; migrating ephemeral stores onto
 //! [`LocalFileBackend`] happens in follow-up changes.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
@@ -147,16 +149,20 @@ impl LocalFileBackend {
 
     /// Open a migrated SQLite pool at `path`, creating parent dirs and the file.
     pub async fn open_sqlite_migrated(
-        path: &Path,
+        path: PathBuf,
         migrations: &[Migration],
     ) -> anyhow::Result<SqlitePool> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
         let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new().connect_with(options).await?;
+            .filename(&path)
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(30));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
         run_sqlite_migrations(&pool, migrations).await?;
         Ok(pool)
     }
@@ -171,7 +177,7 @@ impl Backend for LocalFileBackend {
     ) -> anyhow::Result<StoreHandle> {
         match loc {
             StoreLocation::LocalFile(path) => {
-                let pool = Self::open_sqlite_migrated(path, migrations).await?;
+                let pool = Self::open_sqlite_migrated(path.clone(), migrations).await?;
                 Ok(StoreHandle::Sqlite(pool))
             }
             StoreLocation::SharedSchema(_) | StoreLocation::PathDerivedSchema(_) => {
@@ -196,50 +202,60 @@ async fn run_sqlite_migrations(pool: &SqlitePool, migrations: &[Migration]) -> a
     .execute(pool)
     .await?;
 
-    let mut pending: Vec<&Migration> = Vec::new();
-    for migration in migrations {
-        let version = i64::from(migration.version);
-        let already: Option<(i64,)> =
-            sqlx::query_as("SELECT version FROM schema_migrations WHERE version = ?")
-                .bind(version)
-                .fetch_optional(pool)
-                .await?;
-        if already.is_some() {
-            continue;
-        }
-        pending.push(migration);
-    }
-    pending.sort_by_key(|migration| migration.version);
+    sqlx::query("BEGIN IMMEDIATE").execute(pool).await?;
+    let result: anyhow::Result<()> = async {
+        let applied_versions: HashSet<i64> =
+            sqlx::query_scalar("SELECT version FROM schema_migrations")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .collect();
 
-    for migration in pending {
-        let version = i64::from(migration.version);
-        let mut tx = pool.begin().await?;
-        for statement in migration.sql.split(';') {
-            let statement = statement.trim();
-            if statement.is_empty() {
-                continue;
-            }
-            sqlx::query(statement)
-                .execute(&mut *tx)
+        let mut pending: Vec<&Migration> = migrations
+            .iter()
+            .filter(|migration| !applied_versions.contains(&i64::from(migration.version)))
+            .collect();
+        pending.sort_by_key(|migration| migration.version);
+
+        for migration in pending {
+            let version = i64::from(migration.version);
+            sqlx::raw_sql(migration.sql)
+                .execute(pool)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "SQLite migration v{} '{}' failed: {} [sql: {}]",
+                        "SQLite migration v{} '{}' failed: {}",
                         migration.version,
                         migration.description,
-                        error,
-                        statement
+                        error
                     )
                 })?;
+            sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+                .bind(version)
+                .bind(migration.description)
+                .execute(pool)
+                .await?;
         }
-        sqlx::query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
-            .bind(version)
-            .bind(migration.description)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        Ok(())
     }
-    Ok(())
+    .await;
+
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT").execute(pool).await?;
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(rollback_error) = sqlx::query("ROLLBACK").execute(pool).await {
+                return Err(anyhow::anyhow!(
+                    "{}; additionally failed to roll back SQLite migration transaction: {}",
+                    error,
+                    rollback_error
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +266,13 @@ mod tests {
         version: 1,
         description: "create t",
         sql: "CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT NOT NULL)",
+    }];
+
+    const SEMICOLON_MIGRATIONS: &[Migration] = &[Migration {
+        version: 1,
+        description: "create notes with semicolon literal",
+        sql: "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+              INSERT INTO notes (id, body) VALUES ('a', 'hello;world')",
     }];
 
     #[test]
@@ -315,5 +338,43 @@ mod tests {
             .expect("read back");
         assert_eq!(v, "1");
         assert!(path.exists(), "sqlite file should exist on disk");
+    }
+
+    #[tokio::test]
+    async fn local_file_backend_runs_full_sqlite_migration_scripts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notes.sqlite");
+
+        let pool = LocalFileBackend::open_sqlite_migrated(path.clone(), SEMICOLON_MIGRATIONS)
+            .await
+            .expect("open sqlite");
+        let (body,): (String,) = sqlx::query_as("SELECT body FROM notes WHERE id = ?")
+            .bind("a")
+            .fetch_one(&pool)
+            .await
+            .expect("read note");
+        assert_eq!(body, "hello;world");
+    }
+
+    #[tokio::test]
+    async fn local_file_backend_serializes_concurrent_migrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shared.sqlite");
+        let path_a = path.clone();
+        let path_b = path.clone();
+
+        let (pool_a, pool_b) = tokio::join!(
+            LocalFileBackend::open_sqlite_migrated(path_a, T_MIGRATIONS),
+            LocalFileBackend::open_sqlite_migrated(path_b, T_MIGRATIONS)
+        );
+        let pool_a = pool_a.expect("first concurrent open");
+        let _pool_b = pool_b.expect("second concurrent open");
+
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 1")
+                .fetch_one(&pool_a)
+                .await
+                .expect("count migrations");
+        assert_eq!(count, 1);
     }
 }
