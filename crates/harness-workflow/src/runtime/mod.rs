@@ -6,6 +6,8 @@
 
 pub mod bus;
 pub mod dispatcher;
+pub mod errors;
+mod job_claim;
 pub mod model;
 pub mod plan_issue;
 pub mod pr_feedback;
@@ -24,6 +26,7 @@ mod tests;
 
 pub use bus::InMemoryWorkflowBus;
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
+pub use errors::RuntimeJobNotFoundError;
 pub use model::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, ActivityStatus,
     RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord,
