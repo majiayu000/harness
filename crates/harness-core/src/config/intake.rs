@@ -14,12 +14,44 @@ pub struct GitHubRepoConfig {
     pub project_root: Option<String>,
 }
 
+/// How GitHub issue intake is driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IntakeMode {
+    /// Autonomous polling discovers and works open issues (legacy default).
+    #[default]
+    Poll,
+    /// Event-driven: the `/webhook` endpoint auto-enqueues `issues`
+    /// opened/reopened events (no `@harness` mention required) and the
+    /// repo-backlog poller is skipped.
+    Webhook,
+    /// Both: webhook auto-enqueues for immediacy, poller runs as a backstop
+    /// so events missed during downtime are still picked up.
+    Hybrid,
+}
+
+impl IntakeMode {
+    /// Whether the webhook should auto-enqueue plain issue events (no mention).
+    pub fn webhook_autonomous(self) -> bool {
+        matches!(self, IntakeMode::Webhook | IntakeMode::Hybrid)
+    }
+
+    /// Whether the repo-backlog poller should run.
+    pub fn poller_enabled(self) -> bool {
+        matches!(self, IntakeMode::Poll | IntakeMode::Hybrid)
+    }
+}
+
 /// GitHub Issues intake configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubIntakeConfig {
     /// Enable polling GitHub Issues for tasks. Default: false.
     #[serde(default)]
     pub enabled: bool,
+    /// Intake driver mode: `poll` (autonomous polling), `webhook` (event-driven,
+    /// poller off), or `hybrid` (both). Default: `poll`.
+    #[serde(default)]
+    pub mode: IntakeMode,
     /// Single repo (backward compat shorthand).
     #[serde(default)]
     pub repo: String,
@@ -106,6 +138,7 @@ impl Default for GitHubIntakeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: IntakeMode::default(),
             repo: String::new(),
             label: default_intake_label(),
             poll_interval_secs: default_poll_interval_secs(),

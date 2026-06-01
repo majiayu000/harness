@@ -955,11 +955,23 @@ pub(crate) async fn github_webhook(
         );
     }
 
-    let (request, reason) =
-        match crate::webhook::parse_github_webhook_task_request(event, body.as_ref()) {
-            Ok(parsed) => parsed,
-            Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
-        };
+    let autonomous_issues = state
+        .core
+        .server
+        .config
+        .intake
+        .github
+        .as_ref()
+        .map(|github| github.mode.webhook_autonomous())
+        .unwrap_or(false);
+    let (request, reason) = match crate::webhook::parse_github_webhook_task_request(
+        event,
+        body.as_ref(),
+        autonomous_issues,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    };
 
     let Some(mut req) = request else {
         return (

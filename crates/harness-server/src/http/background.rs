@@ -794,7 +794,7 @@ pub(super) async fn run_runtime_repo_backlog_poll_tick(
         .intake
         .github
         .as_ref()
-        .filter(|config| config.enabled)
+        .filter(|config| config.enabled && config.mode.poller_enabled())
     else {
         return Ok(RuntimeRepoBacklogPollTick::default());
     };
