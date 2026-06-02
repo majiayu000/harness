@@ -11,6 +11,12 @@ struct GitHubRepositoryRef {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubLabelRef {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GitHubIssueRef {
     number: u64,
     #[serde(default)]
@@ -19,6 +25,14 @@ struct GitHubIssueRef {
     html_url: Option<String>,
     #[serde(default)]
     pull_request: Option<serde_json::Value>,
+    #[serde(default)]
+    labels: Vec<GitHubLabelRef>,
+}
+
+impl GitHubIssueRef {
+    fn has_label(&self, label: &str) -> bool {
+        self.labels.iter().any(|l| l.name == label)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +55,9 @@ struct GitHubIssuesEvent {
     action: String,
     issue: GitHubIssueRef,
     repository: GitHubRepositoryRef,
+    /// The label that was just added — present on the `labeled` action.
+    #[serde(default)]
+    label: Option<GitHubLabelRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,33 +146,76 @@ pub(crate) fn is_valid_github_event_name(event: &str) -> bool {
 pub(crate) fn parse_github_webhook_task_request(
     event: &str,
     payload: &[u8],
+    autonomous_issues: bool,
+    autonomous_label: Option<&str>,
 ) -> Result<(Option<CreateTaskRequest>, String), String> {
     match event {
         "ping" => Ok((None, "ping".to_string())),
         "issues" => {
             let parsed: GitHubIssuesEvent = serde_json::from_slice(payload)
                 .map_err(|err| format!("invalid issues payload: {err}"))?;
-            if !matches!(parsed.action.as_str(), "opened" | "reopened") {
-                return Ok((None, "ignored issues action".to_string()));
-            }
             if parsed.issue.pull_request.is_some() {
                 return Ok((None, "issues event references pull request".to_string()));
             }
-            match parse_harness_mention_command(parsed.issue.body.as_deref().unwrap_or("")) {
-                Some(HarnessMentionCommand::Mention) => Ok((
-                    Some(issue_task_request(
-                        parsed.issue.number,
-                        &parsed.repository.full_name,
+            let enqueue = || issue_task_request(parsed.issue.number, &parsed.repository.full_name);
+            match parsed.action.as_str() {
+                "opened" | "reopened" => {
+                    match parse_harness_mention_command(parsed.issue.body.as_deref().unwrap_or(""))
+                    {
+                        Some(HarnessMentionCommand::Mention) => {
+                            Ok((Some(enqueue()), "issue mention".to_string()))
+                        }
+                        Some(HarnessMentionCommand::Review) => {
+                            Ok((None, "review command ignored on issue body".to_string()))
+                        }
+                        Some(HarnessMentionCommand::FixCi) => {
+                            Ok((None, "fix ci command ignored on issue body".to_string()))
+                        }
+                        // In webhook/hybrid intake mode, an opened/reopened issue is
+                        // enqueued directly — no `@harness` mention required — so the
+                        // webhook drives autonomous intake the way the poller does. The
+                        // configured label filter is honored: with a non-empty label,
+                        // only issues carrying it are enqueued.
+                        None if autonomous_issues => match autonomous_label {
+                            Some(label) if !label.is_empty() && !parsed.issue.has_label(label) => {
+                                Ok((
+                                    None,
+                                    format!(
+                                        "autonomous intake skipped: issue lacks label '{label}'"
+                                    ),
+                                ))
+                            }
+                            _ => Ok((Some(enqueue()), "autonomous issue intake".to_string())),
+                        },
+                        None => Ok((None, "no @harness command in issue body".to_string())),
+                    }
+                }
+                // In webhook-only mode the poller is off, so an issue that gains the
+                // configured intake label *after* it was opened must be picked up via
+                // the `labeled` event (the poller would have caught it on its next
+                // scan). Only enqueue when the just-added label is the configured one.
+                "labeled" if autonomous_issues => match autonomous_label {
+                    Some(want) if !want.is_empty() => {
+                        let added = parsed.label.as_ref().map(|l| l.name.as_str());
+                        if added == Some(want) {
+                            Ok((
+                                Some(enqueue()),
+                                "autonomous issue intake (labeled)".to_string(),
+                            ))
+                        } else {
+                            Ok((
+                                None,
+                                "labeled action: not the configured intake label".to_string(),
+                            ))
+                        }
+                    }
+                    // No label filter configured → `labeled` events are noise.
+                    _ => Ok((
+                        None,
+                        "labeled action ignored: no intake label configured".to_string(),
                     )),
-                    "issue mention".to_string(),
-                )),
-                Some(HarnessMentionCommand::Review) => {
-                    Ok((None, "review command ignored on issue body".to_string()))
-                }
-                Some(HarnessMentionCommand::FixCi) => {
-                    Ok((None, "fix ci command ignored on issue body".to_string()))
-                }
-                None => Ok((None, "no @harness command in issue body".to_string())),
+                },
+                _ => Ok((None, "ignored issues action".to_string())),
             }
         }
         "issue_comment" => {
@@ -322,9 +382,13 @@ mod tests {
             "repository": { "full_name": "majiayu000/harness" }
         });
 
-        let (request, _) =
-            parse_github_webhook_task_request("issue_comment", payload.to_string().as_bytes())
-                .unwrap();
+        let (request, _) = parse_github_webhook_task_request(
+            "issue_comment",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         let request = request.expect("request should exist");
         assert_eq!(request.issue, Some(106));
         assert_eq!(request.pr, None);
@@ -341,9 +405,13 @@ mod tests {
             "repository": { "full_name": "majiayu000/harness" }
         });
 
-        let (request, _) =
-            parse_github_webhook_task_request("issue_comment", payload.to_string().as_bytes())
-                .unwrap();
+        let (request, _) = parse_github_webhook_task_request(
+            "issue_comment",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         let request = request.expect("request should exist");
         assert_eq!(request.issue, None);
         assert_eq!(request.pr, Some(42));
@@ -367,9 +435,13 @@ mod tests {
             "repository": { "full_name": "majiayu000/harness" }
         });
 
-        let (request, _) =
-            parse_github_webhook_task_request("issue_comment", payload.to_string().as_bytes())
-                .unwrap();
+        let (request, _) = parse_github_webhook_task_request(
+            "issue_comment",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         let request = request.expect("request should exist");
         assert_eq!(request.issue, None);
         assert_eq!(request.pr, None);
@@ -392,8 +464,13 @@ mod tests {
             "repository": { "full_name": "org/repo" }
         });
 
-        let (request, reason) =
-            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        let (request, reason) = parse_github_webhook_task_request(
+            "issues",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         let request = request.expect("request should exist");
         assert_eq!(reason, "issue mention");
         assert_eq!(request.issue, Some(77));
@@ -413,8 +490,13 @@ mod tests {
             "repository": { "full_name": "org/repo" }
         });
 
-        let (request, reason) =
-            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        let (request, reason) = parse_github_webhook_task_request(
+            "issues",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         let request = request.expect("request should exist");
         assert_eq!(reason, "issue mention");
         assert_eq!(request.issue, Some(88));
@@ -432,8 +514,13 @@ mod tests {
             "repository": { "full_name": "org/repo" }
         });
 
-        let (request, reason) =
-            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        let (request, reason) = parse_github_webhook_task_request(
+            "issues",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "no @harness command in issue body");
     }
@@ -446,10 +533,110 @@ mod tests {
             "repository": { "full_name": "org/repo" }
         });
 
-        let (request, reason) =
-            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        let (request, reason) = parse_github_webhook_task_request(
+            "issues",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "no @harness command in issue body");
+    }
+
+    #[test]
+    fn parse_issues_opened_autonomous_enqueues_without_mention() {
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": { "number": 100, "body": "plain issue, no mention" },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        // autonomous_issues=true (webhook/hybrid mode) enqueues without @harness.
+        let (request, reason) =
+            parse_github_webhook_task_request("issues", payload.to_string().as_bytes(), true, None)
+                .unwrap();
+        let request = request.expect("autonomous mode should enqueue the issue");
+        assert_eq!(request.issue, Some(100));
+        assert_eq!(request.repo.as_deref(), Some("org/repo"));
+        assert_eq!(reason, "autonomous issue intake");
+    }
+
+    #[test]
+    fn parse_issues_autonomous_honors_label_filter() {
+        let labeled = serde_json::json!({
+            "action": "opened",
+            "issue": { "number": 101, "body": "x", "labels": [{ "name": "harness" }] },
+            "repository": { "full_name": "org/repo" }
+        });
+        let unlabeled = serde_json::json!({
+            "action": "opened",
+            "issue": { "number": 102, "body": "x", "labels": [{ "name": "bug" }] },
+            "repository": { "full_name": "org/repo" }
+        });
+
+        // With a configured label, only the matching issue is enqueued.
+        let (req, _) = parse_github_webhook_task_request(
+            "issues",
+            labeled.to_string().as_bytes(),
+            true,
+            Some("harness"),
+        )
+        .unwrap();
+        assert_eq!(req.expect("labeled issue enqueued").issue, Some(101));
+
+        let (req, reason) = parse_github_webhook_task_request(
+            "issues",
+            unlabeled.to_string().as_bytes(),
+            true,
+            Some("harness"),
+        )
+        .unwrap();
+        assert!(
+            req.is_none(),
+            "issue without the configured label is skipped"
+        );
+        assert!(reason.contains("lacks label"));
+    }
+
+    #[test]
+    fn parse_issues_labeled_action_enqueues_on_configured_label() {
+        // Issue gains the configured intake label after being opened: in
+        // webhook-only mode the poller is off, so the `labeled` event must enqueue.
+        let matching = serde_json::json!({
+            "action": "labeled",
+            "issue": { "number": 200, "labels": [{ "name": "harness" }] },
+            "label": { "name": "harness" },
+            "repository": { "full_name": "org/repo" }
+        });
+        let (req, reason) = parse_github_webhook_task_request(
+            "issues",
+            matching.to_string().as_bytes(),
+            true,
+            Some("harness"),
+        )
+        .unwrap();
+        assert_eq!(
+            req.expect("labeled with intake label enqueues").issue,
+            Some(200)
+        );
+        assert!(reason.contains("labeled"));
+
+        // A different label being added is not an intake trigger.
+        let other = serde_json::json!({
+            "action": "labeled",
+            "issue": { "number": 201, "labels": [{ "name": "bug" }] },
+            "label": { "name": "bug" },
+            "repository": { "full_name": "org/repo" }
+        });
+        let (req, _) = parse_github_webhook_task_request(
+            "issues",
+            other.to_string().as_bytes(),
+            true,
+            Some("harness"),
+        )
+        .unwrap();
+        assert!(req.is_none(), "unrelated label add must not enqueue");
     }
 
     #[test]
@@ -463,8 +650,13 @@ mod tests {
             "repository": { "full_name": "org/repo" }
         });
 
-        let (request, reason) =
-            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        let (request, reason) = parse_github_webhook_task_request(
+            "issues",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "ignored issues action");
     }
@@ -472,7 +664,7 @@ mod tests {
     #[test]
     fn parse_unsupported_event_returns_static_reason() {
         let (request, reason) =
-            parse_github_webhook_task_request("unknown_event", br#"{}"#).unwrap();
+            parse_github_webhook_task_request("unknown_event", br#"{}"#, false, None).unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "unsupported event");
     }
@@ -494,7 +686,8 @@ mod tests {
     #[test]
     fn ping_event_returns_none_request() {
         let (request, reason) =
-            parse_github_webhook_task_request("ping", br#"{"zen":"anything"}"#).unwrap();
+            parse_github_webhook_task_request("ping", br#"{"zen":"anything"}"#, false, None)
+                .unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "ping");
     }
@@ -507,9 +700,13 @@ mod tests {
             "comment": { "body": "@harness review" },
             "repository": { "full_name": "org/repo" }
         });
-        let (request, reason) =
-            parse_github_webhook_task_request("issue_comment", payload.to_string().as_bytes())
-                .unwrap();
+        let (request, reason) = parse_github_webhook_task_request(
+            "issue_comment",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "ignored issue_comment action");
     }
@@ -522,9 +719,13 @@ mod tests {
             "comment": { "body": "just a regular comment" },
             "repository": { "full_name": "org/repo" }
         });
-        let (request, reason) =
-            parse_github_webhook_task_request("issue_comment", payload.to_string().as_bytes())
-                .unwrap();
+        let (request, reason) = parse_github_webhook_task_request(
+            "issue_comment",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "no @harness command in comment");
     }
@@ -540,15 +741,20 @@ mod tests {
             },
             "repository": { "full_name": "org/repo" }
         });
-        let (request, reason) =
-            parse_github_webhook_task_request("issues", payload.to_string().as_bytes()).unwrap();
+        let (request, reason) = parse_github_webhook_task_request(
+            "issues",
+            payload.to_string().as_bytes(),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(request.is_none());
         assert_eq!(reason, "issues event references pull request");
     }
 
     #[test]
     fn invalid_payload_json_returns_error() {
-        let result = parse_github_webhook_task_request("issues", b"not valid json");
+        let result = parse_github_webhook_task_request("issues", b"not valid json", false, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid issues payload"));
     }
@@ -586,6 +792,8 @@ mod tests {
         let (request, reason) = parse_github_webhook_task_request(
             "pull_request_review",
             payload.to_string().as_bytes(),
+            false,
+            None,
         )
         .unwrap();
         let request = request.expect("request should exist");
@@ -617,6 +825,8 @@ mod tests {
         let (request, reason) = parse_github_webhook_task_request(
             "pull_request_review",
             payload.to_string().as_bytes(),
+            false,
+            None,
         )
         .unwrap();
         let request = request.expect("request should exist");
@@ -648,6 +858,8 @@ mod tests {
         let (request, reason) = parse_github_webhook_task_request(
             "pull_request_review",
             payload.to_string().as_bytes(),
+            false,
+            None,
         )
         .unwrap();
         let request = request.expect("request should exist");
@@ -676,6 +888,8 @@ mod tests {
         let (request, reason) = parse_github_webhook_task_request(
             "pull_request_review",
             payload.to_string().as_bytes(),
+            false,
+            None,
         )
         .unwrap();
         assert!(request.is_none());
@@ -697,6 +911,8 @@ mod tests {
         let (request, reason) = parse_github_webhook_task_request(
             "pull_request_review",
             payload.to_string().as_bytes(),
+            false,
+            None,
         )
         .unwrap();
         assert!(request.is_none());
@@ -705,7 +921,12 @@ mod tests {
 
     #[test]
     fn pull_request_review_invalid_payload_returns_error() {
-        let result = parse_github_webhook_task_request("pull_request_review", b"not valid json");
+        let result = parse_github_webhook_task_request(
+            "pull_request_review",
+            b"not valid json",
+            false,
+            None,
+        );
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -731,6 +952,8 @@ mod tests {
         let (request, reason) = parse_github_webhook_task_request(
             "pull_request_review",
             payload.to_string().as_bytes(),
+            false,
+            None,
         )
         .unwrap();
         assert!(request.is_some());
@@ -752,6 +975,8 @@ mod tests {
         let (request, reason) = parse_github_webhook_task_request(
             "pull_request_review",
             payload.to_string().as_bytes(),
+            false,
+            None,
         )
         .unwrap();
         assert!(request.is_none());
