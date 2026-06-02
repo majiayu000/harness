@@ -493,3 +493,107 @@ fn load_workflow_config_reads_crlf_front_matter_delimiter_at_eof() -> anyhow::Re
     assert_eq!(cfg.runtime_dispatch.batch_limit, 11);
     Ok(())
 }
+
+#[test]
+fn deep_merge_yaml_overrides_only_declared_fields() {
+    let base: serde_yaml::Value = serde_yaml::from_str(
+        "runtime_retry_policy:\n  max_failed_activity_retries: 6\n  retry_delay_secs: 30\nrepo_backlog:\n  enabled: true\n  poll_interval_secs: 60\n",
+    )
+    .unwrap();
+    let over: serde_yaml::Value = serde_yaml::from_str(
+        "runtime_retry_policy:\n  max_failed_activity_retries: 2\nrepo_backlog:\n  poll_interval_secs: 900\n",
+    )
+    .unwrap();
+
+    let merged = deep_merge_yaml(base, over);
+
+    // The override replaces only the nested fields it declares; sibling base
+    // fields survive (field-level override).
+    assert_eq!(
+        merged["runtime_retry_policy"]["max_failed_activity_retries"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        merged["runtime_retry_policy"]["retry_delay_secs"].as_u64(),
+        Some(30)
+    );
+    assert_eq!(
+        merged["repo_backlog"]["poll_interval_secs"].as_u64(),
+        Some(900)
+    );
+    assert_eq!(merged["repo_backlog"]["enabled"].as_bool(), Some(true));
+}
+
+#[test]
+fn deep_merge_yaml_null_override_keeps_base() {
+    let base: serde_yaml::Value = serde_yaml::from_str("a: 1\n").unwrap();
+    let over: serde_yaml::Value = serde_yaml::from_str("a: ~\n").unwrap();
+    let merged = deep_merge_yaml(base, over);
+    assert_eq!(merged["a"].as_u64(), Some(1));
+}
+
+#[test]
+fn load_workflow_document_merges_base_then_repo_override() -> anyhow::Result<()> {
+    let base_dir = tempfile::tempdir()?;
+    let base_path = base_dir.path().join("WORKFLOW.md");
+    std::fs::write(
+        &base_path,
+        "---\nrepo_backlog:\n  enabled: true\n  poll_interval_secs: 60\nruntime_retry_policy:\n  max_failed_activity_retries: 6\n  retry_delay_secs: 30\n---\nbase body\n",
+    )?;
+
+    let repo_dir = tempfile::tempdir()?;
+    std::fs::write(
+        repo_dir.path().join("WORKFLOW.md"),
+        "---\nrepo_backlog:\n  poll_interval_secs: 900\n---\nrepo body\n",
+    )?;
+
+    let doc = load_workflow_document_with_base(repo_dir.path(), Some(&base_path))?;
+
+    // Repo overrides the field it declares.
+    assert_eq!(doc.config.repo_backlog.poll_interval_secs, 900);
+    // Base fields not declared by the repo survive.
+    assert!(doc.config.repo_backlog.enabled);
+    assert_eq!(
+        doc.config.runtime_retry_policy.max_failed_activity_retries,
+        Some(6)
+    );
+    assert_eq!(doc.config.runtime_retry_policy.retry_delay_secs, Some(30));
+    // The repo body wins when present.
+    assert_eq!(doc.prompt_template, "repo body");
+    Ok(())
+}
+
+#[test]
+fn load_workflow_document_inherits_base_when_repo_absent() -> anyhow::Result<()> {
+    let base_dir = tempfile::tempdir()?;
+    let base_path = base_dir.path().join("WORKFLOW.md");
+    std::fs::write(
+        &base_path,
+        "---\nruntime_retry_policy:\n  max_failed_activity_retries: 5\n---\nbase body\n",
+    )?;
+    let repo_dir = tempfile::tempdir()?; // no WORKFLOW.md
+
+    let doc = load_workflow_document_with_base(repo_dir.path(), Some(&base_path))?;
+
+    assert_eq!(
+        doc.config.runtime_retry_policy.max_failed_activity_retries,
+        Some(5)
+    );
+    assert_eq!(doc.prompt_template, "base body");
+    Ok(())
+}
+
+#[test]
+fn load_workflow_document_without_base_uses_repo_only() -> anyhow::Result<()> {
+    let repo_dir = tempfile::tempdir()?;
+    std::fs::write(
+        repo_dir.path().join("WORKFLOW.md"),
+        "---\nruntime_retry_policy:\n  max_failed_activity_retries: 3\n---\n",
+    )?;
+    let doc = load_workflow_document_with_base(repo_dir.path(), None)?;
+    assert_eq!(
+        doc.config.runtime_retry_policy.max_failed_activity_retries,
+        Some(3)
+    );
+    Ok(())
+}

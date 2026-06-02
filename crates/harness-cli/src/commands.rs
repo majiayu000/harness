@@ -314,6 +314,16 @@ enum ConfigSource {
     BuiltInDefaults,
 }
 
+impl ConfigSource {
+    /// Path of the loaded config file, if any (built-in defaults have none).
+    fn config_path(&self) -> Option<&Path> {
+        match self {
+            ConfigSource::Flag(path) | ConfigSource::Discovered(path) => Some(path.as_path()),
+            ConfigSource::BuiltInDefaults => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TeeMakeWriter {
     runtime_log_file: Option<Arc<Mutex<File>>>,
@@ -606,6 +616,25 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     init_tracing(&logging)?;
     log_config_source(&config_source);
     log_runtime_log_status(&logging);
+
+    // Register the central base WORKFLOW.md (sibling of the loaded config file,
+    // e.g. config/WORKFLOW.md) as the single source of default workflow policy.
+    // Per-repo WORKFLOW.md files deep-merge on top of it field-by-field. The
+    // path is resolved to an absolute location so it does not depend on the
+    // server process's working directory.
+    if let Some(config_dir) = config_source.config_path().and_then(Path::parent) {
+        let base = config_dir.join("WORKFLOW.md");
+        let base = std::fs::canonicalize(&base).unwrap_or(base);
+        if base.exists() {
+            tracing::info!("central workflow base config: {}", base.display());
+        } else {
+            tracing::info!(
+                "no central workflow base config at {} (per-repo WORKFLOW.md only)",
+                base.display()
+            );
+        }
+        harness_core::config::workflow::set_workflow_base_path(base);
+    }
 
     match cli.command {
         Command::Serve {

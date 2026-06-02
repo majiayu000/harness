@@ -1,10 +1,17 @@
 ---
+# Central base workflow policy for Harness.
+#
+# This file lives next to the server config (claude.toml) and is the single
+# source of DEFAULT workflow policy for every managed repository. Each repo's
+# own `{repo}/WORKFLOW.md` (when present) is deep-merged on top of this base
+# field-by-field, so a repo only needs a WORKFLOW.md to override repo-specific
+# fields such as `source.repo` or per-language `activities.*.validation`
+# commands. A repo with no WORKFLOW.md inherits this base entirely.
 workflow:
   id: github_issue_pr
   version: 1
 source:
   kind: github
-  repo: majiayu000/harness
 base:
   remote: origin
   branch: main
@@ -58,11 +65,6 @@ storage:
 activities:
   implement_issue:
     prompt: default
-    validation:
-      - cargo fmt --all -- --check
-      - cargo check
-      - cargo test
-      - RUSTFLAGS="-Dwarnings" cargo check --workspace --all-targets
   inspect_pr_feedback:
     prompt: pr_feedback
   quality_gate:
