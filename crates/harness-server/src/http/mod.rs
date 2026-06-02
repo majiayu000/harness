@@ -22,6 +22,7 @@ pub(crate) mod builders;
 pub(crate) mod http_router;
 pub(crate) mod init;
 pub(crate) mod misc_routes;
+mod orphan_reaper;
 pub(crate) mod rate_limit;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
@@ -188,6 +189,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Periodically ask repo backlog workflows to scan GitHub through runtime
     // jobs so GitHub intake becomes workflow-owned when the runtime is enabled.
     background::spawn_runtime_repo_backlog_poller(&state);
+
+    // Periodically reap orphaned path-derived Postgres schemas whose owning
+    // workspace directory has been removed, bounding catalog growth (storage RFC).
+    orphan_reaper::spawn_orphan_schema_reaper(&state);
 
     // Defensive recovery loop: reset repo_backlog workflows that have been
     // sitting in non-candidate middle states (scanning / planning_batch /

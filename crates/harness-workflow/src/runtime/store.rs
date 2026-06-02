@@ -20,20 +20,16 @@ use sqlx::postgres::PgPool;
 use std::collections::BTreeMap;
 use std::path::Path;
 use uuid::Uuid;
-
 const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
-
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
 }
-
 pub struct WorkflowInstancePage {
     pub instances: Vec<WorkflowInstance>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
 }
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WorkflowRuntimeSummaryCounts {
     pub total_commands: usize,
@@ -43,7 +39,6 @@ pub struct WorkflowRuntimeSummaryCounts {
     pub activity_outcomes: BTreeMap<String, usize>,
     pub jobs_without_activity_envelope: usize,
 }
-
 pub struct WorkflowDecisionTransition<'a> {
     pub expected_state: &'a str,
     pub create_if_missing: Option<&'a WorkflowInstance>,
@@ -54,7 +49,6 @@ pub struct WorkflowDecisionTransition<'a> {
     pub final_instance: &'a WorkflowInstance,
     pub command_status: &'a str,
 }
-
 pub struct WorkflowRejectedDecisionTransition<'a> {
     pub expected_state: &'a str,
     pub create_if_missing: Option<&'a WorkflowInstance>,
@@ -153,6 +147,10 @@ impl WorkflowRuntimeStore {
             .open_migrated_pool_with_setup_pool(setup_pool, WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
         Ok(Self { pool })
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     pub async fn upsert_definition(&self, definition: &WorkflowDefinition) -> anyhow::Result<()> {
@@ -2224,6 +2222,11 @@ fn apply_inline_command_side_effect(
     match command.command_type {
         WorkflowCommandType::BindPr => apply_bind_pr_side_effect(instance, command),
         WorkflowCommandType::MarkDone => apply_mark_done_side_effect(instance, command),
+        WorkflowCommandType::MarkFailed
+        | WorkflowCommandType::MarkBlocked
+        | WorkflowCommandType::MarkCancelled => {
+            super::worker::apply_failure_reason_side_effect(instance, command)
+        }
         _ => Ok(()),
     }
 }

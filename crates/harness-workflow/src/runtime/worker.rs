@@ -408,8 +408,39 @@ fn apply_inline_command_side_effect(
     match command.command_type {
         WorkflowCommandType::BindPr => apply_bind_pr_side_effect(instance, command),
         WorkflowCommandType::MarkDone => apply_mark_done_side_effect(instance, command),
+        WorkflowCommandType::MarkFailed
+        | WorkflowCommandType::MarkBlocked
+        | WorkflowCommandType::MarkCancelled => apply_failure_reason_side_effect(instance, command),
         _ => Ok(()),
     }
+}
+
+/// Persist the terminal-failure `reason` into the instance `data` under
+/// `failure_reason` so task queries surface it as the task `error`. Without
+/// this the reason lives only in the command payload/event log and the task
+/// projection reports `error: null` (silent degradation).
+pub(super) fn apply_failure_reason_side_effect(
+    instance: &mut WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<()> {
+    let reason = command
+        .command
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    if !instance.data.is_object() {
+        instance.data = json!({});
+    }
+    let data = instance
+        .data
+        .as_object_mut()
+        .context("workflow instance data is not an object")?;
+    data.insert("failure_reason".to_string(), json!(reason));
+    Ok(())
 }
 
 fn apply_bind_pr_side_effect(
@@ -609,5 +640,51 @@ mod tests {
             })?;
         assert_eq!(remote.status, RuntimeJobStatus::Pending);
         Ok(())
+    }
+
+    #[test]
+    fn mark_failed_inline_command_persists_failure_reason_into_data() {
+        use crate::runtime::WorkflowSubject;
+
+        let mut instance = WorkflowInstance::new(
+            "repo_backlog",
+            1,
+            "running",
+            WorkflowSubject::new("issue", "1"),
+        );
+        let command = WorkflowCommand::new(
+            WorkflowCommandType::MarkFailed,
+            "runtime-completion:evt-1:failed",
+            json!({ "reason": "Agent turn timed out after 900s" }),
+        );
+
+        apply_inline_command_side_effect(&mut instance, &command).unwrap();
+
+        assert_eq!(
+            instance.data.get("failure_reason").and_then(Value::as_str),
+            Some("Agent turn timed out after 900s"),
+            "MarkFailed must surface its reason as the queryable failure_reason"
+        );
+    }
+
+    #[test]
+    fn mark_failed_without_reason_leaves_data_untouched() {
+        use crate::runtime::WorkflowSubject;
+
+        let mut instance = WorkflowInstance::new(
+            "repo_backlog",
+            1,
+            "running",
+            WorkflowSubject::new("issue", "1"),
+        );
+        let command = WorkflowCommand::new(
+            WorkflowCommandType::MarkFailed,
+            "runtime-completion:evt-2:failed",
+            json!({}),
+        );
+
+        apply_inline_command_side_effect(&mut instance, &command).unwrap();
+
+        assert!(instance.data.get("failure_reason").is_none());
     }
 }
