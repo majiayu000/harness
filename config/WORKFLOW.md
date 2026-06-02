@@ -31,7 +31,10 @@ pr_feedback:
   sweep_interval_secs: 60
   claim_stale_after_secs: 300
 repo_backlog:
-  enabled: true
+  # Disabled by default: issues/PRs are picked up via webhook events only, so an
+  # idle system (no GitHub events) runs zero LLM turns. Set enabled: true in a
+  # repo's own WORKFLOW.md to opt that repo into autonomous LLM backlog polling.
+  enabled: false
   poll_interval_secs: 60
   batch_limit: 128
 runtime_dispatch:
