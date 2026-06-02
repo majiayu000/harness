@@ -955,19 +955,32 @@ pub(crate) async fn github_webhook(
         );
     }
 
-    let autonomous_issues = state
-        .core
-        .server
-        .config
-        .intake
-        .github
-        .as_ref()
-        .map(|github| github.mode.webhook_autonomous())
+    // Autonomous webhook intake requires github intake to be enabled AND the
+    // mode to opt in (webhook/hybrid). Honor the per-repo label filter so the
+    // webhook only auto-enqueues issues the poller would have considered.
+    let github = state.core.server.config.intake.github.as_ref();
+    let autonomous_issues = github
+        .map(|github| github.enabled && github.mode.webhook_autonomous())
         .unwrap_or(false);
+    let autonomous_label = github.and_then(|github| {
+        let repo = serde_json::from_slice::<serde_json::Value>(body.as_ref())
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("repository")
+                    .and_then(|repo| repo.get("full_name"))
+                    .and_then(|name| name.as_str())
+                    .map(str::to_string)
+            });
+        repo.and_then(|repo| github.find_repo_config(&repo))
+            .map(|cfg| cfg.label)
+            .or_else(|| Some(github.label.clone()))
+    });
     let (request, reason) = match crate::webhook::parse_github_webhook_task_request(
         event,
         body.as_ref(),
         autonomous_issues,
+        autonomous_label.as_deref(),
     ) {
         Ok(parsed) => parsed,
         Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
