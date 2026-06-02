@@ -55,6 +55,9 @@ struct GitHubIssuesEvent {
     action: String,
     issue: GitHubIssueRef,
     repository: GitHubRepositoryRef,
+    /// The label that was just added — present on the `labeled` action.
+    #[serde(default)]
+    label: Option<GitHubLabelRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,36 +154,68 @@ pub(crate) fn parse_github_webhook_task_request(
         "issues" => {
             let parsed: GitHubIssuesEvent = serde_json::from_slice(payload)
                 .map_err(|err| format!("invalid issues payload: {err}"))?;
-            if !matches!(parsed.action.as_str(), "opened" | "reopened") {
-                return Ok((None, "ignored issues action".to_string()));
-            }
             if parsed.issue.pull_request.is_some() {
                 return Ok((None, "issues event references pull request".to_string()));
             }
             let enqueue = || issue_task_request(parsed.issue.number, &parsed.repository.full_name);
-            match parse_harness_mention_command(parsed.issue.body.as_deref().unwrap_or("")) {
-                Some(HarnessMentionCommand::Mention) => {
-                    Ok((Some(enqueue()), "issue mention".to_string()))
+            match parsed.action.as_str() {
+                "opened" | "reopened" => {
+                    match parse_harness_mention_command(parsed.issue.body.as_deref().unwrap_or(""))
+                    {
+                        Some(HarnessMentionCommand::Mention) => {
+                            Ok((Some(enqueue()), "issue mention".to_string()))
+                        }
+                        Some(HarnessMentionCommand::Review) => {
+                            Ok((None, "review command ignored on issue body".to_string()))
+                        }
+                        Some(HarnessMentionCommand::FixCi) => {
+                            Ok((None, "fix ci command ignored on issue body".to_string()))
+                        }
+                        // In webhook/hybrid intake mode, an opened/reopened issue is
+                        // enqueued directly — no `@harness` mention required — so the
+                        // webhook drives autonomous intake the way the poller does. The
+                        // configured label filter is honored: with a non-empty label,
+                        // only issues carrying it are enqueued.
+                        None if autonomous_issues => match autonomous_label {
+                            Some(label) if !label.is_empty() && !parsed.issue.has_label(label) => {
+                                Ok((
+                                    None,
+                                    format!(
+                                        "autonomous intake skipped: issue lacks label '{label}'"
+                                    ),
+                                ))
+                            }
+                            _ => Ok((Some(enqueue()), "autonomous issue intake".to_string())),
+                        },
+                        None => Ok((None, "no @harness command in issue body".to_string())),
+                    }
                 }
-                Some(HarnessMentionCommand::Review) => {
-                    Ok((None, "review command ignored on issue body".to_string()))
-                }
-                Some(HarnessMentionCommand::FixCi) => {
-                    Ok((None, "fix ci command ignored on issue body".to_string()))
-                }
-                // In webhook/hybrid intake mode, an opened/reopened issue is enqueued
-                // directly — no `@harness` mention required — so the webhook drives
-                // autonomous intake the way the backlog poller does. The configured
-                // label filter is honored: when a non-empty label is set, only issues
-                // carrying it are enqueued (matching the poller's eligibility rule).
-                None if autonomous_issues => match autonomous_label {
-                    Some(label) if !label.is_empty() && !parsed.issue.has_label(label) => Ok((
+                // In webhook-only mode the poller is off, so an issue that gains the
+                // configured intake label *after* it was opened must be picked up via
+                // the `labeled` event (the poller would have caught it on its next
+                // scan). Only enqueue when the just-added label is the configured one.
+                "labeled" if autonomous_issues => match autonomous_label {
+                    Some(want) if !want.is_empty() => {
+                        let added = parsed.label.as_ref().map(|l| l.name.as_str());
+                        if added == Some(want) {
+                            Ok((
+                                Some(enqueue()),
+                                "autonomous issue intake (labeled)".to_string(),
+                            ))
+                        } else {
+                            Ok((
+                                None,
+                                "labeled action: not the configured intake label".to_string(),
+                            ))
+                        }
+                    }
+                    // No label filter configured → `labeled` events are noise.
+                    _ => Ok((
                         None,
-                        format!("autonomous intake skipped: issue lacks label '{label}'"),
+                        "labeled action ignored: no intake label configured".to_string(),
                     )),
-                    _ => Ok((Some(enqueue()), "autonomous issue intake".to_string())),
                 },
-                None => Ok((None, "no @harness command in issue body".to_string())),
+                _ => Ok((None, "ignored issues action".to_string())),
             }
         }
         "issue_comment" => {
@@ -562,6 +597,46 @@ mod tests {
             "issue without the configured label is skipped"
         );
         assert!(reason.contains("lacks label"));
+    }
+
+    #[test]
+    fn parse_issues_labeled_action_enqueues_on_configured_label() {
+        // Issue gains the configured intake label after being opened: in
+        // webhook-only mode the poller is off, so the `labeled` event must enqueue.
+        let matching = serde_json::json!({
+            "action": "labeled",
+            "issue": { "number": 200, "labels": [{ "name": "harness" }] },
+            "label": { "name": "harness" },
+            "repository": { "full_name": "org/repo" }
+        });
+        let (req, reason) = parse_github_webhook_task_request(
+            "issues",
+            matching.to_string().as_bytes(),
+            true,
+            Some("harness"),
+        )
+        .unwrap();
+        assert_eq!(
+            req.expect("labeled with intake label enqueues").issue,
+            Some(200)
+        );
+        assert!(reason.contains("labeled"));
+
+        // A different label being added is not an intake trigger.
+        let other = serde_json::json!({
+            "action": "labeled",
+            "issue": { "number": 201, "labels": [{ "name": "bug" }] },
+            "label": { "name": "bug" },
+            "repository": { "full_name": "org/repo" }
+        });
+        let (req, _) = parse_github_webhook_task_request(
+            "issues",
+            other.to_string().as_bytes(),
+            true,
+            Some("harness"),
+        )
+        .unwrap();
+        assert!(req.is_none(), "unrelated label add must not enqueue");
     }
 
     #[test]
