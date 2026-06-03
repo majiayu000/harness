@@ -44,3 +44,128 @@ fn local_review_changes_requested_command_carries_review_findings() {
         )
         .expect("local review changes-requested decision should validate");
 }
+
+#[test]
+fn local_review_after_rework_uses_completion_command_dedupe_key() {
+    let instance = issue_instance("addressing_feedback");
+    let command = WorkflowCommand::enqueue_activity("address_pr_feedback", "feedback-1");
+    let result = ActivityResult::succeeded("address_pr_feedback", "Feedback addressed.");
+    let first_event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+    let second_event = WorkflowEvent::new(
+        &instance.id,
+        2,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-2",
+        "command": WorkflowCommand::enqueue_activity("address_pr_feedback", "feedback-2"),
+        "runtime_job_id": "job-2",
+        "activity_result": ActivityResult::succeeded(
+            "address_pr_feedback",
+            "Feedback addressed again."
+        ),
+    }));
+
+    let first_decision = reduce_runtime_job_completed(&instance, &first_event)
+        .expect("event should parse")
+        .expect("feedback completion should request local review");
+    let second_decision = reduce_runtime_job_completed(&instance, &second_event)
+        .expect("event should parse")
+        .expect("second feedback completion should request local review");
+
+    assert_eq!(first_decision.next_state, "local_review_gate");
+    assert_eq!(second_decision.next_state, "local_review_gate");
+    assert_eq!(first_decision.commands.len(), 1);
+    assert_eq!(second_decision.commands.len(), 1);
+    assert_eq!(
+        first_decision.commands[0].activity_name(),
+        Some(LOCAL_REVIEW_ACTIVITY)
+    );
+    assert_eq!(
+        second_decision.commands[0].activity_name(),
+        Some(LOCAL_REVIEW_ACTIVITY)
+    );
+    assert_eq!(
+        first_decision.commands[0].dedupe_key,
+        format!("local-review:{}:after-rework:command-1", instance.id)
+    );
+    assert_eq!(
+        second_decision.commands[0].dedupe_key,
+        format!("local-review:{}:after-rework:command-2", instance.id)
+    );
+    assert_ne!(
+        first_decision.commands[0].dedupe_key,
+        second_decision.commands[0].dedupe_key
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &first_decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("first post-rework local review decision should validate");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &second_decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("second post-rework local review decision should validate");
+}
+
+#[test]
+fn local_review_after_rework_replay_keeps_command_dedupe_key() {
+    let instance = issue_instance("addressing_feedback");
+    let event_payload = json!({
+        "command_id": "command-1",
+        "command": WorkflowCommand::enqueue_activity("address_pr_feedback", "feedback-1"),
+        "runtime_job_id": "job-1",
+        "activity_result": ActivityResult::succeeded(
+            "address_pr_feedback",
+            "Feedback addressed."
+        ),
+    });
+    let first_event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(event_payload.clone());
+    let replayed_event = WorkflowEvent::new(
+        &instance.id,
+        2,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(event_payload);
+
+    let first_decision = reduce_runtime_job_completed(&instance, &first_event)
+        .expect("event should parse")
+        .expect("feedback completion should request local review");
+    let replayed_decision = reduce_runtime_job_completed(&instance, &replayed_event)
+        .expect("event should parse")
+        .expect("replayed feedback completion should request local review");
+
+    assert_ne!(first_event.id, replayed_event.id);
+    assert_eq!(
+        first_decision.commands[0].dedupe_key,
+        format!("local-review:{}:after-rework:command-1", instance.id)
+    );
+    assert_eq!(
+        first_decision.commands[0].dedupe_key,
+        replayed_decision.commands[0].dedupe_key
+    );
+}

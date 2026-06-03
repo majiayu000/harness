@@ -30,7 +30,8 @@ use self::runtime_failure::{
     runtime_failed_decision,
 };
 use self::support::{
-    event_command_type, invalid_agent_output_blocked_decision, runtime_completion_evidence,
+    event_command_type, event_field_string, invalid_agent_output_blocked_decision,
+    runtime_completion_evidence,
 };
 use super::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
@@ -285,9 +286,14 @@ fn reduce_success(
         && result.activity == "address_pr_feedback"
         && next_state == "local_review_gate"
     {
+        let completion_command_id =
+            event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
         workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
             super::pr_feedback::LOCAL_REVIEW_ACTIVITY,
-            format!("local-review:{}:after-rework", instance.id),
+            format!(
+                "local-review:{}:after-rework:{completion_command_id}",
+                instance.id
+            ),
         ));
     }
 
