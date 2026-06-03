@@ -204,6 +204,7 @@ export function Worktrees() {
       label: "System",
       items: [
         { id: "overview", label: "Overview", href: "/overview" },
+        { id: "usage", label: "Usage", href: "/usage" },
         { id: "projects", label: "Projects", href: "/overview#projects", count: overview?.projects.length },
         { id: "runtimes", label: "Runtimes", href: "/overview#runtimes", count: overview?.runtimes.length },
         { id: "observability", label: "Observability", href: "/overview#observability" },

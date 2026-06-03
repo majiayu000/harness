@@ -43,6 +43,7 @@ export function Overview() {
       label: "System",
       items: [
         { id: "overview", label: "Overview", href: "/overview", active: true },
+        { id: "usage", label: "Usage", href: "/usage" },
         { id: "projects", label: "Projects", href: "/overview#projects", count: data?.projects.length },
         { id: "runtimes", label: "Runtimes", href: "/overview#runtimes", count: data?.runtimes.length },
         { id: "observability", label: "Observability", href: "/overview#observability" },
