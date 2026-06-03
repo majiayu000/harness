@@ -35,6 +35,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+mod local_review;
 mod p1_followups;
 mod replay_determinism;
 mod retry;

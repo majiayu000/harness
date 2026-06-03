@@ -240,9 +240,17 @@ pub fn build_local_review_completed_decision(
                 "addressing_feedback",
                 input.summary,
             )
-            .with_command(WorkflowCommand::enqueue_activity(
-                "address_pr_feedback",
+            .with_command(WorkflowCommand::new(
+                super::model::WorkflowCommandType::EnqueueActivity,
                 format!("local-review:{}:{}:address", input.task_id, input.pr_number),
+                serde_json::json!({
+                    "activity": "address_pr_feedback",
+                    "source": "local_review",
+                    "task_id": input.task_id,
+                    "pr_number": input.pr_number,
+                    "pr_url": input.pr_url,
+                    "review_summary": input.summary,
+                }),
             ))
             .with_evidence(local_review_evidence(input));
             PrFeedbackDecisionOutput {
