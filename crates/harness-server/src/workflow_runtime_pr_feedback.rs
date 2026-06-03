@@ -646,12 +646,18 @@ async fn persist_local_review_passed(
         ctx.pr_url,
         Some(ctx.summary),
     );
+    let repair_dedupe_key = format!(
+        "local-review:{}:{}:address:passed",
+        ctx.task_id.as_str(),
+        ctx.pr_number
+    );
     let output = build_local_review_completed_decision(
         &instance,
         LocalReviewCompletedInput {
             task_id: ctx.task_id.as_str(),
             pr_number: ctx.pr_number,
             pr_url: ctx.pr_url,
+            repair_dedupe_key: &repair_dedupe_key,
             outcome: LocalReviewOutcome::Passed,
             summary: ctx.summary,
         },

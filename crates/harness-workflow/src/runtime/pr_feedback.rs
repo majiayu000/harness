@@ -78,6 +78,7 @@ pub struct LocalReviewCompletedInput<'a> {
     pub task_id: &'a str,
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
+    pub repair_dedupe_key: &'a str,
     pub outcome: LocalReviewOutcome,
     pub summary: &'a str,
 }
@@ -251,7 +252,7 @@ pub fn build_local_review_completed_decision(
             )
             .with_command(WorkflowCommand::new(
                 super::model::WorkflowCommandType::EnqueueActivity,
-                format!("local-review:{}:{}:address", input.task_id, input.pr_number),
+                input.repair_dedupe_key,
                 serde_json::json!({
                     "activity": "address_pr_feedback",
                     "source": "local_review",

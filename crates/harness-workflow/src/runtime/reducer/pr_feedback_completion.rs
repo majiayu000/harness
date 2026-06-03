@@ -78,6 +78,12 @@ pub(super) fn local_review_decision_from_activity_result(
     let task_id = event_field_string(event, "runtime_job_id")
         .or_else(|| optional_data_string(instance, "task_id"))
         .unwrap_or_else(|| event.id.clone());
+    let repair_dedupe_source =
+        event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+    let repair_dedupe_key = format!(
+        "local-review:{}:{}:address:{}",
+        instance.id, pr_number, repair_dedupe_source
+    );
     Some(
         build_local_review_completed_decision(
             instance,
@@ -85,6 +91,7 @@ pub(super) fn local_review_decision_from_activity_result(
                 task_id: &task_id,
                 pr_number,
                 pr_url: pr_url.as_deref(),
+                repair_dedupe_key: &repair_dedupe_key,
                 outcome,
                 summary: result.summary.as_str(),
             },

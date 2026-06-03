@@ -14,6 +14,7 @@ fn local_review_changes_requested_command_carries_review_findings() {
             task_id: "task-1",
             pr_number: 77,
             pr_url: Some("https://github.com/owner/repo/pull/77"),
+            repair_dedupe_key: "local-review:workflow-1:77:address:command-1",
             outcome: LocalReviewOutcome::ChangesRequested,
             summary,
         },
@@ -36,6 +37,10 @@ fn local_review_changes_requested_command_carries_review_findings() {
         "https://github.com/owner/repo/pull/77"
     );
     assert_eq!(command.command["review_summary"], summary);
+    assert_eq!(
+        command.dedupe_key,
+        "local-review:workflow-1:77:address:command-1"
+    );
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
@@ -123,6 +128,79 @@ fn local_review_after_rework_uses_completion_command_dedupe_key() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("second post-rework local review decision should validate");
+}
+
+#[test]
+fn local_review_changes_requested_uses_completed_command_dedupe_key() {
+    let instance = issue_instance("local_review_gate");
+    let first_result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Changes requested.")
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+            }),
+        ));
+    let second_result =
+        ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Changes requested again.").with_signal(
+            ActivitySignal::new(
+                super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+                json!({
+                    "pr_number": 77,
+                    "pr_url": "https://github.com/owner/repo/pull/77",
+                }),
+            ),
+        );
+    let first_event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "local-review-command-1",
+        "runtime_job_id": "local-review-job-1",
+        "activity_result": first_result,
+    }));
+    let second_event = WorkflowEvent::new(
+        &instance.id,
+        2,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "local-review-command-2",
+        "runtime_job_id": "local-review-job-2",
+        "activity_result": second_result,
+    }));
+
+    let first_decision = reduce_runtime_job_completed(&instance, &first_event)
+        .expect("event should parse")
+        .expect("local review changes should request repair");
+    let second_decision = reduce_runtime_job_completed(&instance, &second_event)
+        .expect("event should parse")
+        .expect("second local review changes should request repair");
+
+    assert_eq!(first_decision.next_state, "addressing_feedback");
+    assert_eq!(second_decision.next_state, "addressing_feedback");
+    assert_eq!(
+        first_decision.commands[0].dedupe_key,
+        format!(
+            "local-review:{}:77:address:local-review-command-1",
+            instance.id
+        )
+    );
+    assert_eq!(
+        second_decision.commands[0].dedupe_key,
+        format!(
+            "local-review:{}:77:address:local-review-command-2",
+            instance.id
+        )
+    );
+    assert_ne!(
+        first_decision.commands[0].dedupe_key,
+        second_decision.commands[0].dedupe_key
+    );
 }
 
 #[test]
