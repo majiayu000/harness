@@ -813,8 +813,12 @@ impl DefaultExecutionService {
             .await?;
 
         let outcome = if let Some(instance) = maybe_instance {
-            crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &instance.id)
-                .await
+            if instance.state == "pr_open" {
+                crate::workflow_runtime_pr_feedback::request_local_review(store, &instance.id).await
+            } else {
+                crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &instance.id)
+                    .await
+            }
         } else {
             let repo_key = prepared.req.repo.as_deref().unwrap_or("<none>");
             let task_id = TaskId::from_str(&format!(
