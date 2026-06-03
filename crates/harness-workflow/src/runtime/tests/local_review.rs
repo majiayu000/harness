@@ -204,6 +204,42 @@ fn local_review_changes_requested_uses_completed_command_dedupe_key() {
 }
 
 #[test]
+fn local_review_success_without_outcome_signal_blocks_invalid_output() {
+    let instance = issue_instance("local_review_gate");
+    let result = ActivityResult::succeeded(
+        LOCAL_REVIEW_ACTIVITY,
+        "Local review finished without a structured outcome.",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "local-review-command-1",
+        "runtime_job_id": "local-review-job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing local review outcome should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.commands.len(), 2);
+    assert!(decision.reason.contains("run_local_review succeeded"));
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("missing local review outcome block should validate");
+}
+
+#[test]
 fn local_review_after_rework_replay_keeps_command_dedupe_key() {
     let instance = issue_instance("addressing_feedback");
     let event_payload = json!({

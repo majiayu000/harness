@@ -153,6 +153,15 @@ fn reduce_success(
     if let Some(decision) = local_review_decision_from_activity_result(instance, event, result) {
         return Some(decision);
     }
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "local_review_gate"
+        && result.activity == super::pr_feedback::LOCAL_REVIEW_ACTIVITY
+    {
+        let reason = "run_local_review succeeded without a LocalReviewPassed, LocalReviewChangesRequested, or LocalReviewBlocked signal";
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, reason,
+        ));
+    }
 
     if let Some(decision) = pr_feedback_child_decision_from_activity_result(instance, event, result)
     {
