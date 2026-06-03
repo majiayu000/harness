@@ -2,10 +2,18 @@ use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, Workflow
 
 pub const PR_FEEDBACK_DEFINITION_ID: &str = "pr_feedback";
 pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
+pub const LOCAL_REVIEW_ACTIVITY: &str = "run_local_review";
+pub const LOCAL_REVIEW_PASSED_SIGNAL: &str = "LocalReviewPassed";
+pub const LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL: &str = "LocalReviewChangesRequested";
+pub const LOCAL_REVIEW_BLOCKED_SIGNAL: &str = "LocalReviewBlocked";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrFeedbackWorkflowAction {
     BindPr,
+    RequestLocalReview,
+    LocalReviewPassed,
+    LocalReviewChangesRequested,
+    LocalReviewBlocked,
     SweepFeedback,
     InspectFeedback,
     AddressFeedback,
@@ -43,6 +51,32 @@ pub struct PrFeedbackSweepDecisionInput<'a> {
     pub pr_url: Option<&'a str>,
     pub issue_number: Option<u64>,
     pub repo: Option<&'a str>,
+    pub summary: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalReviewDecisionInput<'a> {
+    pub dedupe_key: &'a str,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
+    pub issue_number: Option<u64>,
+    pub repo: Option<&'a str>,
+    pub summary: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalReviewOutcome {
+    Passed,
+    ChangesRequested,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LocalReviewCompletedInput<'a> {
+    pub task_id: &'a str,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
+    pub outcome: LocalReviewOutcome,
     pub summary: &'a str,
 }
 
@@ -147,6 +181,96 @@ pub fn build_pr_feedback_decision(
     }
 }
 
+pub fn build_local_review_request_decision(
+    instance: &WorkflowInstance,
+    input: LocalReviewDecisionInput<'_>,
+) -> PrFeedbackDecisionOutput {
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "run_local_review",
+        "local_review_gate",
+        input.summary,
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        LOCAL_REVIEW_ACTIVITY,
+        input.dedupe_key,
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "local_review_request",
+        local_review_summary(input),
+    ))
+    .high_confidence();
+
+    PrFeedbackDecisionOutput {
+        action: PrFeedbackWorkflowAction::RequestLocalReview,
+        decision,
+    }
+}
+
+pub fn build_local_review_completed_decision(
+    instance: &WorkflowInstance,
+    input: LocalReviewCompletedInput<'_>,
+) -> PrFeedbackDecisionOutput {
+    match input.outcome {
+        LocalReviewOutcome::Passed => {
+            let decision = WorkflowDecision::new(
+                &instance.id,
+                &instance.state,
+                "local_review_passed",
+                "awaiting_feedback",
+                input.summary,
+            )
+            .with_command(WorkflowCommand::wait(
+                "Local review passed; waiting for remote review, checks, and mergeability.",
+                format!("local-review:{}:{}:passed", input.task_id, input.pr_number),
+            ))
+            .with_evidence(local_review_evidence(input))
+            .high_confidence();
+            PrFeedbackDecisionOutput {
+                action: PrFeedbackWorkflowAction::LocalReviewPassed,
+                decision,
+            }
+        }
+        LocalReviewOutcome::ChangesRequested => {
+            let decision = WorkflowDecision::new(
+                &instance.id,
+                &instance.state,
+                "address_local_review_feedback",
+                "addressing_feedback",
+                input.summary,
+            )
+            .with_command(WorkflowCommand::enqueue_activity(
+                "address_pr_feedback",
+                format!("local-review:{}:{}:address", input.task_id, input.pr_number),
+            ))
+            .with_evidence(local_review_evidence(input));
+            PrFeedbackDecisionOutput {
+                action: PrFeedbackWorkflowAction::LocalReviewChangesRequested,
+                decision,
+            }
+        }
+        LocalReviewOutcome::Blocked => {
+            let decision = WorkflowDecision::new(
+                &instance.id,
+                &instance.state,
+                "local_review_blocked",
+                "blocked",
+                input.summary,
+            )
+            .with_command(WorkflowCommand::mark_blocked(
+                input.summary,
+                format!("local-review:{}:{}:blocked", input.task_id, input.pr_number),
+            ))
+            .with_evidence(local_review_evidence(input));
+            PrFeedbackDecisionOutput {
+                action: PrFeedbackWorkflowAction::LocalReviewBlocked,
+                decision,
+            }
+        }
+    }
+}
+
 pub fn build_pr_feedback_sweep_decision(
     instance: &WorkflowInstance,
     input: PrFeedbackSweepDecisionInput<'_>,
@@ -224,6 +348,29 @@ fn feedback_evidence(input: PrFeedbackDecisionInput<'_>) -> WorkflowEvidence {
         None => format!("pr={} {}", input.pr_number, input.summary),
     };
     WorkflowEvidence::new("pr_feedback", summary)
+}
+
+fn local_review_evidence(input: LocalReviewCompletedInput<'_>) -> WorkflowEvidence {
+    let summary = match input.pr_url {
+        Some(pr_url) => format!("pr={} url={} {}", input.pr_number, pr_url, input.summary),
+        None => format!("pr={} {}", input.pr_number, input.summary),
+    };
+    WorkflowEvidence::new("local_review", summary)
+}
+
+fn local_review_summary(input: LocalReviewDecisionInput<'_>) -> String {
+    let mut parts = vec![format!("pr={}", input.pr_number)];
+    if let Some(pr_url) = input.pr_url {
+        parts.push(format!("url={pr_url}"));
+    }
+    if let Some(issue_number) = input.issue_number {
+        parts.push(format!("issue={issue_number}"));
+    }
+    if let Some(repo) = input.repo {
+        parts.push(format!("repo={repo}"));
+    }
+    parts.push(input.summary.to_string());
+    parts.join(" ")
 }
 
 fn feedback_inspect_summary(input: PrFeedbackInspectDecisionInput<'_>) -> String {

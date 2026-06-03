@@ -1,11 +1,14 @@
 use crate::task_runner::TaskId;
 use harness_workflow::runtime::{
+    build_local_review_completed_decision, build_local_review_request_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
-    DecisionValidator, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
+    DecisionValidator, LocalReviewCompletedInput, LocalReviewDecisionInput, LocalReviewOutcome,
+    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandType,
     WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
     WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
+    PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -29,6 +32,16 @@ pub(crate) struct PrFeedbackRuntimeContext<'a> {
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
     pub outcome: PrFeedbackOutcome,
+    pub summary: &'a str,
+}
+
+pub(crate) struct LocalReviewPassedRuntimeContext<'a> {
+    pub project_root: &'a Path,
+    pub repo: Option<&'a str>,
+    pub issue_number: Option<u64>,
+    pub task_id: &'a TaskId,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
     pub summary: &'a str,
 }
 
@@ -157,6 +170,22 @@ pub(crate) async fn record_pr_feedback(
     }
 }
 
+pub(crate) async fn record_local_review_passed(
+    store: Option<&WorkflowRuntimeStore>,
+    ctx: LocalReviewPassedRuntimeContext<'_>,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    if let Err(error) = persist_local_review_passed(store, &ctx).await {
+        tracing::warn!(
+            pr = ctx.pr_number,
+            task_id = %ctx.task_id.0,
+            "workflow runtime local review write failed: {error}"
+        );
+    }
+}
+
 pub(crate) async fn record_pr_merged(
     store: Option<&WorkflowRuntimeStore>,
     ctx: PrMergedRuntimeContext<'_>,
@@ -197,13 +226,30 @@ pub(crate) async fn request_pr_feedback_sweep_for_pr(
     ));
     upsert_github_issue_pr_definition(store).await?;
     store.upsert_instance(&instance).await?;
-    request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activity(
-        store,
-        &instance.id,
-        DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
-        Some(chrono::Utc::now()),
-    )
-    .await
+    request_local_review(store, &instance.id).await
+}
+
+pub(crate) async fn request_local_review(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    let Some(instance) = store.get_instance(workflow_id).await? else {
+        anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
+    };
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || instance.state != "pr_open" {
+        return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
+            workflow_id: instance.id,
+            state: instance.state,
+        });
+    }
+    if has_active_local_review_command(store, &instance.id).await? {
+        let task_id = runtime_task_id_from_instance(&instance);
+        return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+            workflow_id: instance.id,
+            task_id,
+        });
+    }
+    persist_local_review_request(store, instance).await
 }
 
 pub(crate) async fn request_pr_feedback_sweep(
@@ -241,9 +287,7 @@ async fn request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activi
     let Some(instance) = store.get_instance(workflow_id).await? else {
         anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
     };
-    if instance.definition_id != "github_issue_pr"
-        || !matches!(instance.state.as_str(), "pr_open" | "awaiting_feedback")
-    {
+    if instance.definition_id != "github_issue_pr" || instance.state != "awaiting_feedback" {
         return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
             workflow_id: instance.id,
             state: instance.state,
@@ -264,6 +308,71 @@ async fn request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activi
         });
     }
     persist_pr_feedback_sweep_request(store, instance).await
+}
+
+async fn persist_local_review_request(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    let workflow_id = instance.id.clone();
+    let task_id = runtime_task_id_from_instance(&instance);
+    let pr_number = required_u64_field(&instance.data, "pr_number")?;
+    let pr_url = optional_string_field(&instance.data, "pr_url");
+    let issue_number = instance
+        .data
+        .get("issue_number")
+        .and_then(|value| value.as_u64());
+    let repo = optional_string_field(&instance.data, "repo");
+    let accepted_data = instance.data.clone();
+    let review_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let output = build_local_review_request_decision(
+        &instance,
+        LocalReviewDecisionInput {
+            dedupe_key: &format!("local-review:{}:{review_nonce}", instance.id),
+            pr_number,
+            pr_url: pr_url.as_deref(),
+            issue_number,
+            repo: repo.as_deref(),
+            summary: "Runtime workflow requested local agent review before remote feedback.",
+        },
+    );
+    let event_payload = json!({
+        "issue_number": issue_number,
+        "repo": repo.as_deref(),
+        "pr_number": pr_number,
+        "pr_url": pr_url.as_deref(),
+    });
+    match commit_runtime_decision(
+        store,
+        instance,
+        false,
+        output.decision,
+        "LocalReviewRequested",
+        "workflow_runtime_pr_feedback",
+        event_payload,
+        accepted_data,
+    )
+    .await?
+    {
+        RuntimeDecisionCommitOutcome::Accepted => Ok(PrFeedbackSweepRequestOutcome::Requested {
+            workflow_id,
+            task_id,
+        }),
+        RuntimeDecisionCommitOutcome::Rejected { reason } => {
+            Ok(PrFeedbackSweepRequestOutcome::Rejected {
+                workflow_id,
+                reason,
+            })
+        }
+        RuntimeDecisionCommitOutcome::Stale => {
+            let state = store
+                .get_instance(&workflow_id)
+                .await?
+                .map(|instance| instance.state)
+                .unwrap_or_else(|| "missing".to_string());
+            Ok(PrFeedbackSweepRequestOutcome::NotCandidate { workflow_id, state })
+        }
+    }
 }
 
 pub(crate) async fn approve_runtime_merge_by_task_id(
@@ -425,6 +534,20 @@ async fn persist_pr_feedback(
         "pr_open",
     )
     .await?;
+    if instance.state == "pr_open" {
+        store.upsert_instance(&instance).await?;
+        request_local_review(store, &instance.id).await?;
+        return Ok(());
+    }
+    if instance.state != "awaiting_feedback" {
+        tracing::debug!(
+            workflow_id = %instance.id,
+            state = %instance.state,
+            pr = ctx.pr_number,
+            "workflow runtime ignored PR feedback outside awaiting_feedback"
+        );
+        return Ok(());
+    }
     let accepted_data = pr_runtime_data(
         ctx.project_root,
         project_id,
@@ -459,6 +582,86 @@ async fn persist_pr_feedback(
             "pr_number": ctx.pr_number,
             "pr_url": ctx.pr_url,
             "outcome": outcome_label(ctx.outcome),
+            "summary": ctx.summary,
+        }),
+        accepted_data,
+    )
+    .await?
+    .into_result()
+}
+
+async fn persist_local_review_passed(
+    store: &WorkflowRuntimeStore,
+    ctx: &LocalReviewPassedRuntimeContext<'_>,
+) -> anyhow::Result<()> {
+    let project_id = ctx.project_root.to_string_lossy().into_owned();
+    let PrRuntimeTarget {
+        mut instance,
+        mut new_instance,
+        issue_number,
+    } = load_or_pr_runtime_target(
+        store,
+        ctx.project_root,
+        ctx.repo,
+        ctx.issue_number,
+        ctx.pr_number,
+        "pr_open",
+    )
+    .await?;
+    if instance.state == "pr_open" {
+        let workflow_id = instance.id.clone();
+        persist_local_review_request(store, instance).await?;
+        let Some(loaded) = store.get_instance(&workflow_id).await? else {
+            anyhow::bail!("workflow runtime instance `{workflow_id}` was not found after local review request");
+        };
+        instance = loaded;
+        new_instance = false;
+    }
+    if instance.state == "awaiting_feedback" {
+        return Ok(());
+    }
+    if instance.state != "local_review_gate" {
+        tracing::debug!(
+            workflow_id = %instance.id,
+            state = %instance.state,
+            pr = ctx.pr_number,
+            "workflow runtime ignored local review pass outside local_review_gate"
+        );
+        return Ok(());
+    }
+    let accepted_data = pr_runtime_data(
+        ctx.project_root,
+        project_id,
+        ctx.repo,
+        issue_number,
+        ctx.task_id,
+        ctx.pr_number,
+        ctx.pr_url,
+        Some(ctx.summary),
+    );
+    let output = build_local_review_completed_decision(
+        &instance,
+        LocalReviewCompletedInput {
+            task_id: ctx.task_id.as_str(),
+            pr_number: ctx.pr_number,
+            pr_url: ctx.pr_url,
+            outcome: LocalReviewOutcome::Passed,
+            summary: ctx.summary,
+        },
+    );
+    commit_runtime_decision(
+        store,
+        instance,
+        new_instance,
+        output.decision,
+        "LocalReviewPassed",
+        "workflow_runtime_pr_feedback",
+        json!({
+            "task_id": ctx.task_id.as_str(),
+            "issue_number": issue_number,
+            "repo": ctx.repo,
+            "pr_number": ctx.pr_number,
+            "pr_url": ctx.pr_url,
             "summary": ctx.summary,
         }),
         accepted_data,
@@ -679,6 +882,20 @@ async fn commit_runtime_decision(
 
 fn is_active_pr_feedback_command_status(status: &str) -> bool {
     matches!(status, "pending" | "dispatching" | "dispatched")
+}
+
+async fn has_active_local_review_command(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(store
+        .commands_for(workflow_id)
+        .await?
+        .into_iter()
+        .any(|record| {
+            is_active_pr_feedback_command_status(record.status.as_str())
+                && record.command.activity_name() == Some(LOCAL_REVIEW_ACTIVITY)
+        }))
 }
 
 #[cfg(test)]
@@ -1041,865 +1258,4 @@ fn outcome_label(outcome: PrFeedbackOutcome) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use harness_core::db::resolve_database_url;
-
-    #[tokio::test]
-    async fn pr_detected_persists_pr_open_state() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let task_id = TaskId::from_str("task-1");
-
-        record_pr_detected(
-            Some(&store),
-            PrDetectedRuntimeContext {
-                project_root: &project_root,
-                repo: Some("owner/repo"),
-                issue_number: 123,
-                task_id: &task_id,
-                pr_number: 77,
-                pr_url: "https://github.com/owner/repo/pull/77",
-            },
-        )
-        .await;
-
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        let instance = store
-            .get_instance(&workflow_id)
-            .await?
-            .expect("workflow instance should be persisted");
-        assert_eq!(instance.state, "pr_open");
-        assert_eq!(
-            store.events_for(&workflow_id).await?[0].event_type,
-            "PrDetected"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejected_new_runtime_decision_persists_initial_instance() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        upsert_github_issue_pr_definition(&store).await?;
-        let instance = issue_instance(
-            workflow_id.clone(),
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-            "pr_open",
-        );
-        let decision = WorkflowDecision::new(
-            &workflow_id,
-            "awaiting_feedback",
-            "record_feedback",
-            "addressing_feedback",
-            "intentionally stale observed state",
-        );
-
-        let outcome = commit_runtime_decision(
-            &store,
-            instance.clone(),
-            true,
-            decision,
-            "FeedbackFound",
-            "workflow_runtime_pr_feedback_test",
-            json!({ "issue_number": 123, "pr_number": 77 }),
-            instance.data.clone(),
-        )
-        .await?;
-
-        assert!(matches!(
-            outcome,
-            RuntimeDecisionCommitOutcome::Rejected { .. }
-        ));
-        let loaded = store
-            .get_instance(&workflow_id)
-            .await?
-            .expect("rejected initial transition should still persist the workflow instance");
-        assert_eq!(loaded.state, "pr_open");
-        assert_eq!(store.events_for(&workflow_id).await?.len(), 1);
-        let decisions = store.decisions_for(&workflow_id).await?;
-        assert_eq!(decisions.len(), 1);
-        assert!(!decisions[0].accepted);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pr_feedback_ready_to_merge_updates_parent_workflow() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let task_id = TaskId::from_str("task-1");
-        record_pr_detected(
-            Some(&store),
-            PrDetectedRuntimeContext {
-                project_root: &project_root,
-                repo: Some("owner/repo"),
-                issue_number: 123,
-                task_id: &task_id,
-                pr_number: 77,
-                pr_url: "https://github.com/owner/repo/pull/77",
-            },
-        )
-        .await;
-
-        record_pr_feedback(
-            Some(&store),
-            PrFeedbackRuntimeContext {
-                project_root: &project_root,
-                repo: Some("owner/repo"),
-                issue_number: Some(123),
-                task_id: &task_id,
-                pr_number: 77,
-                pr_url: Some("https://github.com/owner/repo/pull/77"),
-                outcome: PrFeedbackOutcome::ReadyToMerge,
-                summary: "Reviewer approved and validation passed.",
-            },
-        )
-        .await;
-
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        let instance = store
-            .get_instance(&workflow_id)
-            .await?
-            .expect("workflow instance should be persisted");
-        assert_eq!(instance.state, "ready_to_merge");
-        let events = store.events_for(&workflow_id).await?;
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "PrReadyToMerge"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pr_feedback_without_issue_creates_pr_scoped_workflow() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let task_id = TaskId::from_str("pr-feedback-task");
-
-        record_pr_feedback(
-            Some(&store),
-            PrFeedbackRuntimeContext {
-                project_root: &project_root,
-                repo: Some("owner/repo"),
-                issue_number: None,
-                task_id: &task_id,
-                pr_number: 77,
-                pr_url: Some("https://github.com/owner/repo/pull/77"),
-                outcome: PrFeedbackOutcome::BlockingFeedback,
-                summary: "Review found actionable feedback.",
-            },
-        )
-        .await;
-
-        let workflow_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
-        let instance = store
-            .get_instance(&workflow_id)
-            .await?
-            .expect("PR-scoped workflow should be persisted");
-        assert_eq!(instance.subject.subject_type, "pr");
-        assert_eq!(instance.subject.subject_key, "pr:77");
-        assert_eq!(instance.state, "addressing_feedback");
-        assert_eq!(instance.data["pr_number"], 77);
-        assert!(instance.data.get("issue_number").is_none());
-        let events = store.events_for(&workflow_id).await?;
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "FeedbackFound"));
-        let commands = store.commands_for(&workflow_id).await?;
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0].command.activity_name(),
-            Some("address_pr_feedback")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pr_feedback_without_issue_uses_runtime_workflow_bound_by_pr() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let task_id = TaskId::from_str("pr-feedback-task");
-        let issue_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        upsert_github_issue_pr_definition(&store).await?;
-        let issue_workflow = issue_instance(
-            issue_workflow_id.clone(),
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-            "pr_open",
-        )
-        .with_data(json!({
-            "project_id": project_root.to_string_lossy(),
-            "repo": "owner/repo",
-            "issue_number": 123,
-            "task_id": "issue-task",
-            "pr_number": 77,
-            "pr_url": "https://github.com/owner/repo/pull/77",
-        }));
-        store.upsert_instance(&issue_workflow).await?;
-
-        record_pr_feedback(
-            Some(&store),
-            PrFeedbackRuntimeContext {
-                project_root: &project_root,
-                repo: Some("owner/repo"),
-                issue_number: None,
-                task_id: &task_id,
-                pr_number: 77,
-                pr_url: Some("https://github.com/owner/repo/pull/77"),
-                outcome: PrFeedbackOutcome::ReadyToMerge,
-                summary: "Reviewer approved and validation passed.",
-            },
-        )
-        .await;
-
-        let instance = store
-            .get_instance(&issue_workflow_id)
-            .await?
-            .expect("issue workflow should still exist");
-        assert_eq!(instance.state, "ready_to_merge");
-        assert_eq!(instance.data["issue_number"], 123);
-        assert_eq!(instance.data["pr_number"], 77);
-        let pr_scoped_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
-        assert!(store.get_instance(&pr_scoped_id).await?.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pr_merged_without_issue_creates_pr_scoped_done_workflow() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let task_id = TaskId::from_str("pr-feedback-task");
-
-        record_pr_merged(
-            Some(&store),
-            PrMergedRuntimeContext {
-                project_root: &project_root,
-                repo: Some("owner/repo"),
-                issue_number: None,
-                task_id: &task_id,
-                pr_number: 77,
-                pr_url: Some("https://github.com/owner/repo/pull/77"),
-                summary: "PR merged externally.",
-            },
-        )
-        .await;
-
-        let workflow_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
-        let instance = store
-            .get_instance(&workflow_id)
-            .await?
-            .expect("PR-scoped workflow should be persisted");
-        assert_eq!(instance.state, "done");
-        assert_eq!(instance.data["pr_number"], 77);
-        assert!(instance.data.get("issue_number").is_none());
-        let events = store.events_for(&workflow_id).await?;
-        assert!(events.iter().any(|event| event.event_type == "PrMerged"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn request_pr_feedback_sweep_records_runtime_command() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        upsert_github_issue_pr_definition(&store).await?;
-        let instance = issue_instance(
-            workflow_id.clone(),
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-            "pr_open",
-        )
-        .with_data(json!({
-            "project_id": project_root.to_string_lossy(),
-            "repo": "owner/repo",
-            "issue_number": 123,
-            "pr_number": 77,
-            "pr_url": "https://github.com/owner/repo/pull/77",
-            "task_id": "task-1",
-        }));
-        store.upsert_instance(&instance).await?;
-
-        let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
-        assert_eq!(
-            outcome,
-            PrFeedbackSweepRequestOutcome::Requested {
-                workflow_id: workflow_id.clone(),
-                task_id: "task-1".to_string(),
-            }
-        );
-        let updated = store
-            .get_instance(&workflow_id)
-            .await?
-            .expect("workflow should still exist");
-        assert_eq!(updated.state, "awaiting_feedback");
-        assert_eq!(updated.data["last_decision"], "sweep_pr_feedback");
-        let commands = store.commands_for(&workflow_id).await?;
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].status, "pending");
-        assert_eq!(
-            commands[0].command.command_type,
-            harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
-        );
-        assert_eq!(
-            commands[0].command.command["definition_id"],
-            PR_FEEDBACK_DEFINITION_ID
-        );
-        assert_eq!(
-            commands[0].command.command["child_activity"],
-            harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY
-        );
-        assert_eq!(commands[0].command.command["pr_number"], 77);
-
-        let claimed = store
-            .claim_pending_commands(
-                "dispatching-pr-feedback-test",
-                chrono::Utc::now() + chrono::Duration::seconds(30),
-                1,
-            )
-            .await?;
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].status, "dispatching");
-
-        let second = request_pr_feedback_sweep(&store, &workflow_id).await?;
-        assert_eq!(
-            second,
-            PrFeedbackSweepRequestOutcome::ActiveCommandExists {
-                workflow_id: workflow_id.clone(),
-                task_id: "task-1".to_string(),
-            }
-        );
-        assert_eq!(store.commands_for(&workflow_id).await?.len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn completed_inspecting_child_does_not_block_next_feedback_sweep() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        upsert_github_issue_pr_definition(&store).await?;
-        let parent = issue_instance(
-            workflow_id.clone(),
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-            "awaiting_feedback",
-        );
-        store.upsert_instance(&parent).await?;
-        let child = WorkflowInstance::new(
-            PR_FEEDBACK_DEFINITION_ID,
-            1,
-            "inspecting",
-            WorkflowSubject::new("pr", "pr:77"),
-        )
-        .with_id("pr-feedback-child-completed")
-        .with_parent(workflow_id.clone());
-        store.upsert_instance(&child).await?;
-
-        assert!(
-            !has_active_pr_feedback_command(
-                &store,
-                &workflow_id,
-                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
-            )
-            .await?,
-            "an inspecting child with no active command should not suppress future sweeps"
-        );
-
-        let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
-            PR_FEEDBACK_INSPECT_ACTIVITY,
-            "inspect-pr-feedback-77",
-        );
-        store.enqueue_command(&child.id, None, &command).await?;
-        let claimed = store
-            .claim_pending_commands(
-                "dispatching-child-pr-feedback-test",
-                chrono::Utc::now() + chrono::Duration::seconds(30),
-                1,
-            )
-            .await?;
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].status, "dispatching");
-
-        assert!(
-            has_active_pr_feedback_command(
-                &store,
-                &workflow_id,
-                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
-            )
-            .await?,
-            "an inspecting child with a pending command should still suppress duplicate sweeps"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        upsert_github_issue_pr_definition(&store).await?;
-        let parent = issue_instance(
-            workflow_id.clone(),
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-            "awaiting_feedback",
-        )
-        .with_data(json!({
-            "project_id": project_root.to_string_lossy(),
-            "repo": "owner/repo",
-            "issue_number": 123,
-            "pr_number": 77,
-            "pr_url": "https://github.com/owner/repo/pull/77",
-            "task_id": "task-1",
-        }));
-        store.upsert_instance(&parent).await?;
-        let child = WorkflowInstance::new(
-            PR_FEEDBACK_DEFINITION_ID,
-            1,
-            "failed",
-            WorkflowSubject::new("pr", "pr:77"),
-        )
-        .with_id("pr-feedback-child-failed")
-        .with_parent(workflow_id.clone());
-        store.upsert_instance(&child).await?;
-        let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
-            PR_FEEDBACK_INSPECT_ACTIVITY,
-            "inspect-pr-feedback-77",
-        );
-        let child_command_id = store
-            .enqueue_command(&child.id, None, &child_command)
-            .await?;
-        store
-            .mark_command_status(&child_command_id, "failed")
-            .await?;
-
-        assert!(
-            has_active_pr_feedback_command(
-                &store,
-                &workflow_id,
-                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
-            )
-            .await?,
-            "a recently failed inspection child should suppress duplicate sweeps"
-        );
-
-        let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
-        assert_eq!(
-            outcome,
-            PrFeedbackSweepRequestOutcome::ActiveCommandExists {
-                workflow_id: workflow_id.clone(),
-                task_id: "task-1".to_string(),
-            }
-        );
-        assert!(
-            store.commands_for(&workflow_id).await?.is_empty(),
-            "the parent workflow must not enqueue another PR feedback child while the failed child is cooling down"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn explicit_pr_feedback_request_bypasses_failed_child_suppression() -> anyhow::Result<()>
-    {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let project_id = project_root.to_string_lossy().into_owned();
-        let workflow_id = pr_workflow_id(&project_id, Some("owner/repo"), 77);
-        upsert_github_issue_pr_definition(&store).await?;
-        let parent = pr_scoped_instance(
-            workflow_id.clone(),
-            project_id,
-            Some("owner/repo".to_string()),
-            77,
-            "awaiting_feedback",
-        )
-        .with_data(json!({
-            "project_id": project_root.to_string_lossy(),
-            "repo": "owner/repo",
-            "pr_number": 77,
-            "pr_url": "https://github.com/owner/repo/pull/77",
-            "task_id": "task-1",
-        }));
-        store.upsert_instance(&parent).await?;
-        let child = WorkflowInstance::new(
-            PR_FEEDBACK_DEFINITION_ID,
-            1,
-            "failed",
-            WorkflowSubject::new("pr", "pr:77"),
-        )
-        .with_id("pr-feedback-child-failed-explicit-request")
-        .with_parent(workflow_id.clone());
-        store.upsert_instance(&child).await?;
-        let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
-            PR_FEEDBACK_INSPECT_ACTIVITY,
-            "inspect-pr-feedback-77",
-        );
-        let child_command_id = store
-            .enqueue_command(&child.id, None, &child_command)
-            .await?;
-        store
-            .mark_command_status(&child_command_id, "failed")
-            .await?;
-
-        let outcome = request_pr_feedback_sweep_for_pr(
-            &store,
-            PrFeedbackSweepRuntimeContext {
-                project_root: &project_root,
-                repo: Some("owner/repo"),
-                task_id: &TaskId::from_str("task-1"),
-                pr_number: 77,
-                pr_url: Some("https://github.com/owner/repo/pull/77"),
-            },
-        )
-        .await?;
-
-        assert_eq!(
-            outcome,
-            PrFeedbackSweepRequestOutcome::Requested {
-                workflow_id: workflow_id.clone(),
-                task_id: "task-1".to_string(),
-            }
-        );
-        assert_eq!(
-            store.commands_for(&workflow_id).await?.len(),
-            1,
-            "new explicit PR feedback activity should enqueue a fresh child workflow"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_pr_feedback_child_respects_disabled_suppression_window() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        upsert_github_issue_pr_definition(&store).await?;
-        let parent = issue_instance(
-            workflow_id.clone(),
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-            "awaiting_feedback",
-        )
-        .with_data(json!({
-            "project_id": project_root.to_string_lossy(),
-            "repo": "owner/repo",
-            "issue_number": 123,
-            "pr_number": 77,
-            "pr_url": "https://github.com/owner/repo/pull/77",
-            "task_id": "task-1",
-        }));
-        store.upsert_instance(&parent).await?;
-        let child = WorkflowInstance::new(
-            PR_FEEDBACK_DEFINITION_ID,
-            1,
-            "failed",
-            WorkflowSubject::new("pr", "pr:77"),
-        )
-        .with_id("pr-feedback-child-failed")
-        .with_parent(workflow_id.clone());
-        store.upsert_instance(&child).await?;
-        let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
-            PR_FEEDBACK_INSPECT_ACTIVITY,
-            "inspect-pr-feedback-77",
-        );
-        let child_command_id = store
-            .enqueue_command(&child.id, None, &child_command)
-            .await?;
-        store
-            .mark_command_status(&child_command_id, "failed")
-            .await?;
-
-        assert!(
-            !has_active_pr_feedback_command(&store, &workflow_id, 0).await?,
-            "a disabled failed-child suppression window should allow a fresh sweep"
-        );
-
-        let outcome =
-            request_pr_feedback_sweep_with_failed_child_suppression_secs(&store, &workflow_id, 0)
-                .await?;
-        assert_eq!(
-            outcome,
-            PrFeedbackSweepRequestOutcome::Requested {
-                workflow_id: workflow_id.clone(),
-                task_id: "task-1".to_string(),
-            }
-        );
-        let commands = store.commands_for(&workflow_id).await?;
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].status, "pending");
-        Ok(())
-    }
-
-    #[test]
-    fn failed_child_suppression_cutoff_handles_oversized_windows() {
-        assert_eq!(failed_child_suppression_cutoff(0), None);
-
-        let normal_cutoff = failed_child_suppression_cutoff(60)
-            .expect("nonzero suppression window should produce a cutoff");
-        assert!(normal_cutoff <= chrono::Utc::now());
-
-        assert_eq!(
-            failed_child_suppression_cutoff(u64::MAX),
-            Some(chrono::DateTime::<chrono::Utc>::MIN_UTC)
-        );
-    }
-
-    #[tokio::test]
-    async fn orphan_pending_child_does_not_block_next_feedback_sweep() -> anyhow::Result<()> {
-        let Ok(database_url) = resolve_database_url(None) else {
-            return Ok(());
-        };
-        let dir = tempfile::tempdir()?;
-        let store =
-            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-                .await
-            {
-                Ok(store) => store,
-                Err(_) => return Ok(()),
-            };
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root.to_string_lossy(),
-            Some("owner/repo"),
-            123,
-        );
-        upsert_github_issue_pr_definition(&store).await?;
-        let parent = issue_instance(
-            workflow_id.clone(),
-            project_root.to_string_lossy().into_owned(),
-            Some("owner/repo".to_string()),
-            123,
-            "awaiting_feedback",
-        )
-        .with_data(json!({
-            "project_id": project_root.to_string_lossy(),
-            "repo": "owner/repo",
-            "issue_number": 123,
-            "pr_number": 77,
-            "pr_url": "https://github.com/owner/repo/pull/77",
-            "task_id": "task-1",
-        }));
-        store.upsert_instance(&parent).await?;
-        let child = WorkflowInstance::new(
-            PR_FEEDBACK_DEFINITION_ID,
-            1,
-            "pending",
-            WorkflowSubject::new("pr", "pr:77"),
-        )
-        .with_id("pr-feedback-child-orphan")
-        .with_parent(workflow_id.clone());
-        store.upsert_instance(&child).await?;
-
-        assert!(
-            !has_active_pr_feedback_command(
-                &store,
-                &workflow_id,
-                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
-            )
-            .await?,
-            "a pending child without an active inspection command should not suppress future sweeps"
-        );
-
-        let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
-            PR_FEEDBACK_INSPECT_ACTIVITY,
-            "inspect-pr-feedback-77",
-        );
-        let child_command_id = store
-            .enqueue_command(&child.id, None, &child_command)
-            .await?;
-
-        assert!(
-            has_active_pr_feedback_command(
-                &store,
-                &workflow_id,
-                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
-            )
-            .await?,
-            "a pending child with an active inspection command should still suppress duplicate sweeps"
-        );
-
-        store
-            .mark_command_status(&child_command_id, "completed")
-            .await?;
-        assert!(
-            !has_active_pr_feedback_command(
-                &store,
-                &workflow_id,
-                DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
-            )
-            .await?,
-            "a pending child with no active inspection command should stop suppressing sweeps"
-        );
-
-        let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
-        assert_eq!(
-            outcome,
-            PrFeedbackSweepRequestOutcome::Requested {
-                workflow_id: workflow_id.clone(),
-                task_id: "task-1".to_string(),
-            }
-        );
-        Ok(())
-    }
-}
+mod tests;

@@ -271,21 +271,17 @@ async fn runtime_pr_feedback_sweep_tick_enqueues_runtime_command() -> anyhow::Re
         .get_instance(&workflow.id)
         .await?
         .expect("workflow should still exist");
-    assert_eq!(updated.state, "awaiting_feedback");
+    assert_eq!(updated.state, "local_review_gate");
     let commands = store.commands_for(&workflow.id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
     assert_eq!(
         commands[0].command.command_type,
-        harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity
     );
     assert_eq!(
-        commands[0].command.command["definition_id"],
-        harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID
-    );
-    assert_eq!(
-        commands[0].command.command["child_activity"],
-        harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY
+        commands[0].command.activity_name(),
+        Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
     );
     Ok(())
 }

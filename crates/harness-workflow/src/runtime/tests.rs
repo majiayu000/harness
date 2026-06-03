@@ -517,7 +517,7 @@ fn pr_feedback_decision_addresses_blocking_feedback() {
 
 #[test]
 fn pr_feedback_sweep_decision_starts_child_workflow() {
-    let instance = issue_instance("pr_open");
+    let instance = issue_instance("awaiting_feedback");
     let output = build_pr_feedback_sweep_decision(
         &instance,
         PrFeedbackSweepDecisionInput {
@@ -558,7 +558,7 @@ fn pr_feedback_sweep_decision_starts_child_workflow() {
 
 #[test]
 fn pr_feedback_decision_waits_when_no_actionable_feedback_exists() {
-    let instance = issue_instance("pr_open");
+    let instance = issue_instance("awaiting_feedback");
     let output = build_pr_feedback_decision(
         &instance,
         PrFeedbackDecisionInput {
@@ -584,7 +584,7 @@ fn pr_feedback_decision_waits_when_no_actionable_feedback_exists() {
 
 #[test]
 fn pr_feedback_decision_marks_ready_to_merge() {
-    let instance = issue_instance("addressing_feedback");
+    let instance = issue_instance("awaiting_feedback");
     let output = build_pr_feedback_decision(
         &instance,
         PrFeedbackDecisionInput {
@@ -1111,10 +1111,10 @@ fn runtime_completion_reducer_binds_pr_when_structured_workflow_decision_is_inva
 
 #[test]
 fn runtime_completion_reducer_accepts_structured_workflow_decision_artifact() {
-    let instance = issue_instance("pr_open");
+    let instance = issue_instance("awaiting_feedback");
     let proposed_decision = WorkflowDecision::new(
         &instance.id,
-        "pr_open",
+        "awaiting_feedback",
         "wait_for_pr_feedback",
         "awaiting_feedback",
         "PR feedback check completed without actionable feedback.",

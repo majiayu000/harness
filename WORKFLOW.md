@@ -34,6 +34,8 @@ runtime_dispatch:
   approval_policy: never
   timeout_secs: 3600
   activity_profiles:
+    run_local_review:
+      timeout_secs: 3600
     inspect_pr_feedback:
       timeout_secs: 3600
     plan_repo_sprint:
@@ -60,6 +62,8 @@ activities:
       - cargo check
       - cargo test
       - RUSTFLAGS="-Dwarnings" cargo check --workspace --all-targets
+  run_local_review:
+    prompt: pr_feedback
   inspect_pr_feedback:
     prompt: pr_feedback
   quality_gate:
@@ -88,9 +92,11 @@ Issue implementation flow:
 
 PR feedback flow:
 
-1. Inspect top-level PR comments, inline review comments, review states, checks, and mergeability.
-2. Treat actionable feedback as blocking until it is fixed or explicitly answered with a justified response.
-3. Re-run validation after feedback-driven changes.
+1. Run the local agent review first after a PR opens or after feedback-driven rework completes.
+2. If local review finds blocking issues, address them before querying remote PR feedback again.
+3. Only after local review passes, inspect top-level PR comments, inline review comments, review states, checks, and mergeability.
+4. Treat actionable remote feedback as blocking until it is fixed or explicitly answered with a justified response.
+5. Re-run validation after feedback-driven changes, then return to local review before remote feedback.
 
 Final response:
 

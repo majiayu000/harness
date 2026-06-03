@@ -12,7 +12,7 @@ use self::github_issue_completion::{
     github_issue_closed_decision, issue_implementation_missing_result_decision,
 };
 use self::pr_feedback_completion::{
-    pr_feedback_child_decision_from_activity_result,
+    local_review_decision_from_activity_result, pr_feedback_child_decision_from_activity_result,
     pr_feedback_sweep_decision_from_activity_result,
 };
 use self::quality_gate_completion::{
@@ -149,6 +149,10 @@ fn reduce_success(
         return Some(decision);
     }
 
+    if let Some(decision) = local_review_decision_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+
     if let Some(decision) = pr_feedback_child_decision_from_activity_result(instance, event, result)
     {
         return Some(decision);
@@ -213,9 +217,9 @@ fn reduce_success(
             "replan activity completed; implementation can continue",
         ),
         (GITHUB_ISSUE_PR_DEFINITION_ID, "addressing_feedback", "address_pr_feedback") => (
-            "awaiting_feedback",
-            "await_feedback_after_rework",
-            "PR feedback rework activity completed; wait for fresh feedback",
+            "local_review_gate",
+            "run_local_review_after_rework",
+            "PR feedback rework activity completed; run local review before remote feedback",
         ),
         (REPO_BACKLOG_DEFINITION_ID, "dispatching", _)
             if event_command_type(event) == Some("start_child_workflow") =>
@@ -274,6 +278,16 @@ fn reduce_success(
                 "activity": result.activity,
                 "workflow_id": instance.id,
             }),
+        ));
+    }
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "addressing_feedback"
+        && result.activity == "address_pr_feedback"
+        && next_state == "local_review_gate"
+    {
+        workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
+            super::pr_feedback::LOCAL_REVIEW_ACTIVITY,
+            format!("local-review:{}:after-rework", instance.id),
         ));
     }
 
