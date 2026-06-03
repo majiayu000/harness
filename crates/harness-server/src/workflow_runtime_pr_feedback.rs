@@ -610,14 +610,16 @@ async fn persist_local_review_passed(
     .await?;
     if instance.state == "pr_open" {
         let workflow_id = instance.id.clone();
-        match persist_local_review_request(store, instance).await? {
-            PrFeedbackSweepRequestOutcome::Requested { .. } => {}
-            outcome => {
-                anyhow::bail!("failed to transition to local_review_gate: {outcome:?}");
-            }
-        }
+        persist_completed_local_review_gate_record(
+            store,
+            instance,
+            new_instance,
+            issue_number,
+            ctx,
+        )
+        .await?;
         let Some(loaded) = store.get_instance(&workflow_id).await? else {
-            anyhow::bail!("workflow runtime instance `{workflow_id}` was not found after local review request");
+            anyhow::bail!("workflow runtime instance `{workflow_id}` was not found after local review gate record");
         };
         instance = loaded;
         new_instance = false;
@@ -660,6 +662,54 @@ async fn persist_local_review_passed(
         new_instance,
         output.decision,
         "LocalReviewPassed",
+        "workflow_runtime_pr_feedback",
+        json!({
+            "task_id": ctx.task_id.as_str(),
+            "issue_number": issue_number,
+            "repo": ctx.repo,
+            "pr_number": ctx.pr_number,
+            "pr_url": ctx.pr_url,
+            "summary": ctx.summary,
+        }),
+        accepted_data,
+    )
+    .await?
+    .into_result()
+}
+
+async fn persist_completed_local_review_gate_record(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+    new_instance: bool,
+    issue_number: Option<u64>,
+    ctx: &LocalReviewPassedRuntimeContext<'_>,
+) -> anyhow::Result<()> {
+    let project_id = ctx.project_root.to_string_lossy().into_owned();
+    let accepted_data = pr_runtime_data(
+        ctx.project_root,
+        project_id,
+        ctx.repo,
+        issue_number,
+        ctx.task_id,
+        ctx.pr_number,
+        ctx.pr_url,
+        Some(ctx.summary),
+    );
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "record_completed_local_review_gate",
+        "local_review_gate",
+        "Local review already passed; record the local review gate before remote feedback.",
+    )
+    .with_evidence(WorkflowEvidence::new("local_review", ctx.summary))
+    .high_confidence();
+    commit_runtime_decision(
+        store,
+        instance,
+        new_instance,
+        decision,
+        "LocalReviewGateRecorded",
         "workflow_runtime_pr_feedback",
         json!({
             "task_id": ctx.task_id.as_str(),

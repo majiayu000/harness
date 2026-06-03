@@ -123,6 +123,11 @@ async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
     let project_root = dir.path().join("project");
     std::fs::create_dir(&project_root)?;
     let task_id = TaskId::from_str("task-1");
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
     record_pr_detected(
         Some(&store),
         PrDetectedRuntimeContext {
@@ -150,6 +155,15 @@ async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
     )
     .await;
 
+    let commands_after_local_review = store.commands_for(&workflow_id).await?;
+    assert!(
+        commands_after_local_review
+            .iter()
+            .all(|command| command.command.activity_name()
+                != Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)),
+        "legacy local review pass must not leave a duplicate run_local_review activity queued"
+    );
+
     record_pr_feedback(
         Some(&store),
         PrFeedbackRuntimeContext {
@@ -165,11 +179,6 @@ async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
     )
     .await;
 
-    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-        &project_root.to_string_lossy(),
-        Some("owner/repo"),
-        123,
-    );
     let instance = store
         .get_instance(&workflow_id)
         .await?
