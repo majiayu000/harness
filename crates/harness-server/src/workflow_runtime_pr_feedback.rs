@@ -610,7 +610,12 @@ async fn persist_local_review_passed(
     .await?;
     if instance.state == "pr_open" {
         let workflow_id = instance.id.clone();
-        persist_local_review_request(store, instance).await?;
+        match persist_local_review_request(store, instance).await? {
+            PrFeedbackSweepRequestOutcome::Requested { .. } => {}
+            outcome => {
+                anyhow::bail!("failed to transition to local_review_gate: {outcome:?}");
+            }
+        }
         let Some(loaded) = store.get_instance(&workflow_id).await? else {
             anyhow::bail!("workflow runtime instance `{workflow_id}` was not found after local review request");
         };
