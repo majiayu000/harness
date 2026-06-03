@@ -20,11 +20,7 @@ if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
     cargo test --workspace --lib
 else
     echo "HARNESS_DATABASE_URL not set — skipping live Postgres lib tests"
-    cargo test --workspace --lib \
-        --exclude harness-server \
-        --exclude harness-observe \
-        --exclude harness-workflow \
-        -- --skip db::tests
+    cargo test --workspace --lib -- --skip db::tests
 fi
 
 echo "=== pre-commit: all checks passed ==="

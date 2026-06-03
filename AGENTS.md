@@ -17,7 +17,7 @@ All outputs MUST be in English, including:
   - Targeted behavior change: run the relevant `cargo test -p <crate> <test_filter>`
 - Do not run the CI-equivalent workspace check after every edit. Use it for final PR readiness or when warning-sensitive code changed.
 - Before committing, run `cargo fmt --all -- --check` plus the relevant package tests. Run full workspace tests when the change affects shared behavior, persistence, workflow runtime, or agent adapters.
-- Before pushing a PR, ALWAYS run `RUSTFLAGS="-Dwarnings" cargo check --workspace --all-targets` to catch CI-equivalent errors (dead code, unused imports, missing match arms)
+- Before pushing a PR, ALWAYS run `cargo clippy --workspace --all-targets -- -D warnings` to catch CI-equivalent warnings and lints (dead code, unused imports, missing match arms, clippy findings)
 - When adding a new enum variant, grep ALL match sites for that enum and update them — CI uses exhaustive match checks
 - Run `cargo fmt --all` before every commit — CI enforces `cargo fmt --all -- --check`
 - Dead code in `#[cfg(test)]` modules still triggers `-D warnings` in CI; delete unused test helpers instead of suppressing with `#[allow(dead_code)]`
