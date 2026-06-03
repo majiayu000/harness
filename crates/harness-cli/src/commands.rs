@@ -624,16 +624,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // server process's working directory.
     if let Some(config_dir) = config_source.config_path().and_then(Path::parent) {
         let base = config_dir.join("WORKFLOW.md");
-        let base = std::fs::canonicalize(&base).unwrap_or(base);
-        if base.exists() {
+        if base.try_exists()? {
+            let base = std::fs::canonicalize(&base)?;
             tracing::info!("central workflow base config: {}", base.display());
+            harness_core::config::workflow::set_workflow_base_path(base);
         } else {
             tracing::info!(
                 "no central workflow base config at {} (per-repo WORKFLOW.md only)",
                 base.display()
             );
         }
-        harness_core::config::workflow::set_workflow_base_path(base);
     }
 
     match cli.command {

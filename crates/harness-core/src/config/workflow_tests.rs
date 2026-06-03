@@ -584,6 +584,17 @@ fn load_workflow_document_inherits_base_when_repo_absent() -> anyhow::Result<()>
 }
 
 #[test]
+fn workflow_path_identity_treats_canonical_and_relative_same_file_as_equal() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo_path = dir.path().join(".").join("WORKFLOW.md");
+    std::fs::write(&repo_path, "---\nrepo_backlog:\n  enabled: false\n---\n")?;
+    let base_path = std::fs::canonicalize(dir.path().join("WORKFLOW.md"))?;
+
+    assert!(!workflow_paths_are_distinct(&base_path, &repo_path));
+    Ok(())
+}
+
+#[test]
 fn load_workflow_document_without_base_uses_repo_only() -> anyhow::Result<()> {
     let repo_dir = tempfile::tempdir()?;
     std::fs::write(

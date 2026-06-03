@@ -598,7 +598,7 @@ fn load_workflow_document_with_base(
     // WORKFLOW.md (otherwise a repo that *is* the config dir would merge with
     // itself).
     let base = match base_path {
-        Some(base_path) if base_path != repo_path => {
+        Some(base_path) if workflow_paths_are_distinct(base_path, &repo_path) => {
             read_workflow_file(base_path)?.map(|loaded| (base_path, loaded))
         }
         _ => None,
@@ -637,6 +637,14 @@ fn load_workflow_document_with_base(
         prompt_template,
         source_path: Some(source_path),
     })
+}
+
+fn workflow_paths_are_distinct(left: &Path, right: &Path) -> bool {
+    workflow_path_identity(left) != workflow_path_identity(right)
+}
+
+fn workflow_path_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn split_front_matter_and_body(contents: &str) -> (Option<&str>, &str) {
