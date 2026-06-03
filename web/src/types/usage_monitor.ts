@@ -77,8 +77,7 @@ export interface AgentProcess {
   age_secs: number;
   cpu_pct: number;
   memory_bytes: number;
-  cwd: string | null;
-  command: string;
+  command_label: string;
 }
 
 export interface ActiveCount {

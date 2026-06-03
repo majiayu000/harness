@@ -12,8 +12,8 @@ use harness_workflow::runtime::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
 
 use crate::http::AppState;
 
@@ -174,6 +174,11 @@ struct PriceCatalog {
 }
 
 impl PriceCatalog {
+    fn from_env_cached() -> &'static Self {
+        static PRICE_CATALOG: OnceLock<PriceCatalog> = OnceLock::new();
+        PRICE_CATALOG.get_or_init(Self::from_env)
+    }
+
     fn from_env() -> Self {
         let Ok(raw) = std::env::var("HARNESS_USAGE_PRICE_CATALOG_JSON") else {
             return Self::default();
@@ -288,30 +293,25 @@ async fn build_usage_monitor_response(
 ) -> anyhow::Result<UsageMonitorResponse> {
     let now = Utc::now();
     let window = UsageWindow::from_query(query.hours, now);
-    let price_catalog = PriceCatalog::from_env();
-    let usage_records = load_usage_records(state, window, &price_catalog).await?;
+    let price_catalog = PriceCatalog::from_env_cached();
+    let usage_records = load_usage_records(state, window, price_catalog).await?;
     let runtime_rows = load_runtime_usage_rows(state, window.since, query.limit).await?;
     let agent_invocations = runtime_rows
         .iter()
         .map(|row| agent_invocation_from_row(row, now))
         .collect::<Vec<_>>();
-    let external_agent_processes = sample_agent_processes(now);
+    let external_agent_processes =
+        sample_agent_processes(now, &runtime_attribution_tokens(&runtime_rows));
 
-    let tokens_by_agent = aggregate_usage(
-        &usage_records,
-        |record| record.agent.clone(),
-        &price_catalog,
-    );
+    let tokens_by_agent =
+        aggregate_usage(&usage_records, |record| record.agent.clone(), price_catalog);
     let tokens_by_project = aggregate_usage(
         &usage_records,
         |record| blank_label(&record.project),
-        &price_catalog,
+        price_catalog,
     );
-    let tokens_by_model = aggregate_usage(
-        &usage_records,
-        |record| record.model.clone(),
-        &price_catalog,
-    );
+    let tokens_by_model =
+        aggregate_usage(&usage_records, |record| record.model.clone(), price_catalog);
     let total_usage = total_usage_aggregate(&usage_records);
 
     let running_agent_invocations = agent_invocations
@@ -450,8 +450,9 @@ async fn load_runtime_usage_rows(
     let limit = limit
         .unwrap_or(DEFAULT_RUNTIME_JOB_LIMIT)
         .clamp(1, DEFAULT_RUNTIME_JOB_LIMIT);
-    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
         "SELECT
+             workflow.id,
              workflow.data::text,
              command.id,
              command.status,
@@ -477,19 +478,61 @@ async fn load_runtime_usage_rows(
     .fetch_all(store.pool())
     .await?;
 
-    rows.into_iter()
-        .map(
-            |(workflow, command_id, command_status, command, runtime_job)| {
-                Ok(RuntimeUsageRow {
-                    workflow: serde_json::from_str(&workflow)?,
+    Ok(rows
+        .into_iter()
+        .filter_map(
+            |(workflow_id, workflow, command_id, command_status, command, runtime_job)| {
+                match parse_runtime_usage_row(
+                    &workflow_id,
                     command_id,
                     command_status,
-                    command: serde_json::from_str(&command)?,
-                    runtime_job: serde_json::from_str(&runtime_job)?,
-                })
+                    &workflow,
+                    &command,
+                    &runtime_job,
+                ) {
+                    Ok(row) => Some(row),
+                    Err(error) => {
+                        tracing::warn!(
+                            workflow_id = %workflow_id,
+                            "usage_monitor: skipping invalid runtime row: {error}"
+                        );
+                        None
+                    }
+                }
             },
         )
-        .collect()
+        .collect())
+}
+
+fn parse_runtime_usage_row(
+    workflow_id: &str,
+    command_id: String,
+    command_status: String,
+    workflow: &str,
+    command: &str,
+    runtime_job: &str,
+) -> anyhow::Result<RuntimeUsageRow> {
+    Ok(RuntimeUsageRow {
+        workflow: serde_json::from_str(workflow).map_err(|error| {
+            anyhow::anyhow!("workflow `{workflow_id}` JSON is invalid: {error}")
+        })?,
+        command_id: command_id.clone(),
+        command_status,
+        command: serde_json::from_str(command)
+            .map_err(|error| anyhow::anyhow!("command `{command_id}` JSON is invalid: {error}"))?,
+        runtime_job: serde_json::from_str(runtime_job).map_err(|error| {
+            anyhow::anyhow!("runtime job for command `{command_id}` JSON is invalid: {error}")
+        })?,
+    })
+}
+
+fn runtime_attribution_tokens(rows: &[RuntimeUsageRow]) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    for row in rows {
+        tokens.insert(row.command_id.clone());
+        tokens.insert(row.runtime_job.id.clone());
+    }
+    tokens
 }
 
 fn agent_invocation_from_row(row: &RuntimeUsageRow, now: DateTime<Utc>) -> AgentInvocation {

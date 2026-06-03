@@ -183,8 +183,8 @@ function ExternalProcessesTable({ processes }: { processes: AgentProcess[] }) {
                 <td className="px-4 py-2 text-right text-ink-2">{fmtDuration(process.age_secs)}</td>
                 <td className="px-4 py-2 text-right text-ink-2">{process.cpu_pct.toFixed(1)}%</td>
                 <td className="px-4 py-2 text-right text-ink-2">{fmtBytes(process.memory_bytes)}</td>
-                <td className="px-4 py-2 text-ink-3 max-w-[440px] truncate" title={process.command}>
-                  {process.command || process.name}
+                <td className="px-4 py-2 text-ink-3 max-w-[220px] truncate">
+                  {process.command_label || process.name}
                 </td>
               </tr>
             ))

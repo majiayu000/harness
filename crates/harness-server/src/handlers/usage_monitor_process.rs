@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::Path;
-use sysinfo::{ProcessesToUpdate, System};
+use std::sync::{Mutex, OnceLock};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct AgentProcess {
@@ -11,13 +13,28 @@ pub(crate) struct AgentProcess {
     pub(crate) age_secs: u64,
     pub(crate) cpu_pct: f32,
     pub(crate) memory_bytes: u64,
-    pub(crate) cwd: Option<String>,
-    pub(crate) command: String,
+    pub(crate) command_label: &'static str,
 }
 
-pub(crate) fn sample_agent_processes(now: DateTime<Utc>) -> Vec<AgentProcess> {
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+static PROCESS_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+
+pub(crate) fn sample_agent_processes(
+    now: DateTime<Utc>,
+    attribution_tokens: &BTreeSet<String>,
+) -> Vec<AgentProcess> {
+    let process_system = PROCESS_SYSTEM.get_or_init(|| Mutex::new(System::new()));
+    let Ok(mut system) = process_system.lock() else {
+        tracing::error!("usage_monitor: process sampler lock poisoned");
+        return Vec::new();
+    };
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::new()
+            .with_cpu()
+            .with_memory()
+            .with_cmd(UpdateKind::OnlyIfNotSet),
+    );
     let now_ts = now.timestamp().max(0) as u64;
     let mut processes = system
         .processes()
@@ -37,6 +54,9 @@ pub(crate) fn sample_agent_processes(now: DateTime<Utc>) -> Vec<AgentProcess> {
                 .map(|part| part.to_string_lossy().into_owned())
                 .unwrap_or_else(|| name.clone());
             let agent = classify_agent_process(&name, &executable, &command)?;
+            if is_attributed_runtime_process(&command, attribution_tokens) {
+                return None;
+            }
             Some(AgentProcess {
                 pid: pid.as_u32(),
                 name,
@@ -44,8 +64,7 @@ pub(crate) fn sample_agent_processes(now: DateTime<Utc>) -> Vec<AgentProcess> {
                 age_secs: now_ts.saturating_sub(process.start_time()),
                 cpu_pct: process.cpu_usage(),
                 memory_bytes: process.memory(),
-                cwd: process.cwd().map(|path| path.display().to_string()),
-                command: truncate(&command, 240),
+                command_label: command_label(agent, &command),
             })
         })
         .collect::<Vec<_>>();
@@ -80,16 +99,21 @@ fn classify_agent_process(name: &str, executable: &str, command: &str) -> Option
     None
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
+fn is_attributed_runtime_process(command: &str, attribution_tokens: &BTreeSet<String>) -> bool {
+    attribution_tokens
+        .iter()
+        .filter(|token| token.len() >= 8)
+        .any(|token| command.contains(token))
+}
+
+fn command_label(agent: &str, command: &str) -> &'static str {
+    if agent == "codex" && command.to_lowercase().contains(" exec ") {
+        return "codex exec";
     }
-    let mut out = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    out.push_str("...");
-    out
+    if agent == "claude" {
+        return "claude";
+    }
+    "codex"
 }
 
 #[cfg(test)]
@@ -129,6 +153,29 @@ mod tests {
                 "/Users/apple/.local/share/claude/versions/2.1.159 --chrome-native-host"
             ),
             None
+        );
+    }
+
+    #[test]
+    fn attributed_runtime_processes_are_not_external() {
+        let mut tokens = BTreeSet::new();
+        tokens.insert("runtime-job-123".to_string());
+        assert!(is_attributed_runtime_process(
+            "codex -p 'Runtime job id: runtime-job-123'",
+            &tokens
+        ));
+        assert!(!is_attributed_runtime_process("codex exec", &tokens));
+    }
+
+    #[test]
+    fn command_label_does_not_expose_prompt_text() {
+        assert_eq!(
+            command_label("codex", "codex exec -p 'secret prompt body'"),
+            "codex exec"
+        );
+        assert_eq!(
+            command_label("claude", "claude -p 'secret prompt body'"),
+            "claude"
         );
     }
 }

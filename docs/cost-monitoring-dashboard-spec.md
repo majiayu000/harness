@@ -110,9 +110,9 @@ These events are the target contract. The first read-only release may derive act
 
 Sample active local Codex and Claude CLI processes that are not already attributed through workflow runtime state:
 
-- PID, parent PID, elapsed time, CPU, memory
-- model and reasoning effort from command args when visible
-- workspace path
+- PID, elapsed time, CPU, memory
+- agent type and a coarse command label, such as `codex exec` or `claude`
+- no raw argv, prompt text, environment, or workspace path
 
 This sampler is an external-session liveness hint, not the source of truth for Harness-owned agents and not an authoritative billing source. Harness-owned agents must be represented by agent invocation records from the runtime database and runtime events.
 
@@ -122,7 +122,7 @@ Process sampling must exclude:
 - browser native-host helper processes
 - shell wrapper or waiter processes that merely contain `codex` or `claude` in a string
 
-If a process can be matched to a Harness invocation through a recorded PID, it belongs under `agent_invocations` and must not be duplicated under `external_agent_processes`.
+If a process can be matched to a Harness invocation through a recorded PID, runtime job id, or command id, it belongs under `agent_invocations` and must not be duplicated under `external_agent_processes`.
 
 ### Provider or Plan Quota
 
