@@ -337,7 +337,7 @@ async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() ->
         .get_instance(&workflow.id)
         .await?
         .expect("workflow should still exist");
-    assert_eq!(updated.state, "awaiting_feedback");
+    assert_eq!(updated.state, "local_review_gate");
     assert_eq!(updated.data["pr_number"], 80);
     assert_eq!(
         updated.data["pr_url"],
@@ -347,8 +347,13 @@ async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() ->
     assert_eq!(commands.len(), 2);
     assert_eq!(
         commands[1].command.command_type,
-        harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity
     );
+    assert_eq!(
+        commands[1].command.activity_name(),
+        Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
+    );
+    assert_eq!(commands[1].command.command["pr_number"], 80);
     Ok(())
 }
 

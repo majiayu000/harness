@@ -108,7 +108,7 @@ async fn webhook_review_on_pr_requests_runtime_pr_feedback() -> anyhow::Result<(
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "awaiting_feedback");
+    assert_eq!(json["status"], "local_review_gate");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(json["task_id"], runtime_task_id);
     assert_eq!(state.core.tasks.count(), before_count);

@@ -1,4 +1,6 @@
-use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, WorkflowInstance};
+use super::model::{
+    WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
+};
 
 pub const PR_FEEDBACK_DEFINITION_ID: &str = "pr_feedback";
 pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
@@ -192,9 +194,16 @@ pub fn build_local_review_request_decision(
         "local_review_gate",
         input.summary,
     )
-    .with_command(WorkflowCommand::enqueue_activity(
-        LOCAL_REVIEW_ACTIVITY,
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
         input.dedupe_key,
+        serde_json::json!({
+            "activity": LOCAL_REVIEW_ACTIVITY,
+            "pr_number": input.pr_number,
+            "pr_url": input.pr_url,
+            "issue_number": input.issue_number,
+            "repo": input.repo,
+        }),
     ))
     .with_evidence(WorkflowEvidence::new(
         "local_review_request",
