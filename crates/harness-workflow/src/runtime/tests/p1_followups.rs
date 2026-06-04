@@ -83,3 +83,46 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
     assert!(output.summary.contains("already terminal (done)"));
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = repo_backlog_instance("dispatching").with_id("repo-backlog-dedupe-refresh");
+    store.upsert_instance(&instance).await?;
+
+    let first = WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "repo-backlog:owner/repo:issue:1200:start",
+    );
+    let command_id = store
+        .enqueue_command(&instance.id, Some("decision-old"), &first)
+        .await?;
+    let updated = WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:1200",
+        "repo-backlog:owner/repo:issue:1200:start",
+    );
+    let duplicate_id = store
+        .enqueue_command(&instance.id, Some("decision-new"), &updated)
+        .await?;
+
+    assert_eq!(duplicate_id, command_id);
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    let command = &commands[0];
+    assert_eq!(command.id, command_id);
+    assert_eq!(command.status, "pending");
+    assert_eq!(command.decision_id.as_deref(), Some("decision-new"));
+    assert_eq!(
+        command.command.command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(command.command.command["definition_id"], "github_issue_pr");
+    assert_eq!(command.command.command["subject_key"], "issue:1200");
+    Ok(())
+}

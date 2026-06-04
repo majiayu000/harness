@@ -34,6 +34,7 @@ mod runtime_dispatch_tests;
 mod runtime_task_route_tests;
 mod runtime_tree_tests;
 mod runtime_worker_followup_tests;
+mod runtime_worker_replay_tests;
 mod runtime_worker_tests;
 mod task_detail_sse_tests;
 mod webhook_runtime_tests;

@@ -3,8 +3,8 @@ use crate::task_runner::TaskId;
 use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, ActivityArtifact, ActivityErrorKind, ActivityResult,
     DecisionValidator, PrFeedbackInspectDecisionInput, RuntimeJob, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
-    PR_FEEDBACK_DEFINITION_ID,
+    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -18,6 +18,63 @@ use super::data_helpers::{
 };
 use super::workspace::{is_active_pr_feedback_inspect_command, is_pr_feedback_inspect_command};
 
+async fn ensure_runtime_job_still_owns_lease(
+    store: &WorkflowRuntimeStore,
+    job: &RuntimeJob,
+) -> anyhow::Result<()> {
+    if store.runtime_job_matches_running_lease(job).await? {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "runtime job `{}` no longer owns the current lease for `{}`",
+        job.id,
+        activity_name(job)
+    )
+}
+
+async fn child_start_event_recorded(
+    store: &WorkflowRuntimeStore,
+    child_id: &str,
+    command_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(store.events_for(child_id).await?.iter().any(|event| {
+        event.event_type == "ChildWorkflowStarted"
+            && event
+                .event
+                .get("command_id")
+                .and_then(Value::as_str)
+                .is_some_and(|recorded| recorded == command_id)
+    }))
+}
+
+fn child_started_by_command(child: &WorkflowInstance, command_id: &str) -> bool {
+    child
+        .data
+        .get("started_by_command_id")
+        .and_then(Value::as_str)
+        .is_some_and(|recorded| recorded == command_id)
+}
+
+fn issue_submission_recorded(child: &WorkflowInstance, task_id: &TaskId) -> bool {
+    let task_id = task_id.as_str();
+    child
+        .data
+        .get("submission_id")
+        .or_else(|| child.data.get("task_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|recorded| recorded == task_id)
+        || child
+            .data
+            .get("task_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|task_ids| {
+                task_ids
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|recorded| recorded == task_id)
+            })
+}
+
 pub(super) async fn execute_start_child_workflow(
     state: &Arc<AppState>,
     job: &RuntimeJob,
@@ -26,6 +83,7 @@ pub(super) async fn execute_start_child_workflow(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         anyhow::bail!("workflow runtime store is unavailable");
     };
+    ensure_runtime_job_still_owns_lease(store, job).await?;
     let command = job
         .input
         .get("command")
@@ -71,6 +129,9 @@ pub(super) async fn execute_start_child_workflow(
         )
         .with_id(child_id.clone()),
     };
+    let child_started_by_command = child_started_by_command(&child, &job.command_id);
+    let child_start_event_recorded =
+        child_start_event_recorded(store, &child.id, &job.command_id).await?;
     if child.parent_workflow_id.is_none() {
         if let Some(parent) = parent {
             child.parent_workflow_id = Some(parent.id.clone());
@@ -84,21 +145,25 @@ pub(super) async fn execute_start_child_workflow(
         job.id.as_str(),
         job.command_id.as_str(),
     );
-    store.upsert_instance(&child).await?;
-    store
-        .append_event(
-            &child.id,
-            "ChildWorkflowStarted",
-            "workflow_runtime_worker",
-            json!({
-                "parent_workflow_id": parent.map(|workflow| workflow.id.as_str()),
-                "runtime_job_id": job.id.as_str(),
-                "command_id": job.command_id.as_str(),
-                "definition_id": definition_id,
-                "subject_key": subject_key,
-            }),
-        )
-        .await?;
+    if !child_started_by_command || !child_start_event_recorded {
+        store.upsert_instance(&child).await?;
+        if !child_start_event_recorded {
+            store
+                .append_event(
+                    &child.id,
+                    "ChildWorkflowStarted",
+                    "workflow_runtime_worker",
+                    json!({
+                        "parent_workflow_id": parent.map(|workflow| workflow.id.as_str()),
+                        "runtime_job_id": job.id.as_str(),
+                        "command_id": job.command_id.as_str(),
+                        "definition_id": definition_id,
+                        "subject_key": subject_key,
+                    }),
+                )
+                .await?;
+        }
+    }
 
     let mut child_submission = None;
     if command
@@ -112,30 +177,32 @@ pub(super) async fn execute_start_child_workflow(
             "repo-backlog:{}:issue:{issue_number}",
             repo.unwrap_or("<none>")
         ));
-        let source = optional_string(command, "source").unwrap_or_else(|| "github".to_string());
-        let external_id =
-            optional_string(command, "external_id").unwrap_or_else(|| issue_number.to_string());
-        let depends_on = dependency_task_ids_from_command(command, repo);
-        let submission = crate::workflow_runtime_submission::record_issue_submission(
-            store,
-            crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
-                project_root: Path::new(project_id),
-                repo,
-                issue_number,
-                task_id: &task_id,
-                labels: &labels,
-                force_execute,
-                additional_prompt: None,
-                depends_on: &depends_on,
-                dependencies_blocked: !depends_on.is_empty(),
-                source: Some(source.as_str()),
-                external_id: Some(external_id.as_str()),
-            },
-        )
-        .await?;
-        child_submission = Some(submission);
-        if let Some(updated) = store.get_instance(&child.id).await? {
-            child = updated;
+        if !issue_submission_recorded(&child, &task_id) {
+            let source = optional_string(command, "source").unwrap_or_else(|| "github".to_string());
+            let external_id =
+                optional_string(command, "external_id").unwrap_or_else(|| issue_number.to_string());
+            let depends_on = dependency_task_ids_from_command(command, repo);
+            let submission = crate::workflow_runtime_submission::record_issue_submission(
+                store,
+                crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+                    project_root: Path::new(project_id),
+                    repo,
+                    issue_number,
+                    task_id: &task_id,
+                    labels: &labels,
+                    force_execute,
+                    additional_prompt: None,
+                    depends_on: &depends_on,
+                    dependencies_blocked: !depends_on.is_empty(),
+                    source: Some(source.as_str()),
+                    external_id: Some(external_id.as_str()),
+                },
+            )
+            .await?;
+            child_submission = Some(submission);
+            if let Some(updated) = store.get_instance(&child.id).await? {
+                child = updated;
+            }
         }
     }
 
@@ -177,6 +244,7 @@ async fn execute_start_prompt_task_child_workflow(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         anyhow::bail!("workflow runtime store is unavailable");
     };
+    ensure_runtime_job_still_owns_lease(store, job).await?;
     let project_id = parent
         .and_then(|workflow| workflow.data.get("project_id"))
         .and_then(Value::as_str)
@@ -276,6 +344,7 @@ async fn execute_start_pr_feedback_child_workflow(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         anyhow::bail!("workflow runtime store is unavailable");
     };
+    ensure_runtime_job_still_owns_lease(store, job).await?;
     let parent =
         parent.ok_or_else(|| anyhow::anyhow!("pr_feedback child workflow requires a parent"))?;
     let pr_number = parse_pr_subject_key(subject_key)
@@ -549,6 +618,7 @@ async fn upsert_child_issue_state(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         anyhow::bail!("workflow runtime store is unavailable");
     };
+    ensure_runtime_job_still_owns_lease(store, job).await?;
     let project_id = required_data_string(parent, "project_id")?;
     let repo = parent.data.get("repo").and_then(Value::as_str);
     let child_id = harness_workflow::issue_lifecycle::workflow_id(project_id, repo, issue_number);
