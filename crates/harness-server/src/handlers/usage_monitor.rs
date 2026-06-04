@@ -17,9 +17,14 @@ use std::sync::{Arc, OnceLock};
 
 use crate::http::AppState;
 
+#[path = "usage_monitor_ccstats.rs"]
+mod usage_monitor_ccstats;
 #[path = "usage_monitor_process.rs"]
 mod usage_monitor_process;
 
+use usage_monitor_ccstats::{
+    any_ccstats_source_available, load_ccstats_local_sources, CcstatsLocalSource,
+};
 use usage_monitor_process::{sample_agent_processes, AgentProcess};
 
 const DEFAULT_USAGE_WINDOW_HOURS: i64 = 24;
@@ -40,6 +45,7 @@ struct UsageMonitorResponse {
     tokens_by_agent: Vec<UsageGroup>,
     tokens_by_project: Vec<UsageGroup>,
     tokens_by_model: Vec<UsageGroup>,
+    local_usage_sources: Vec<CcstatsLocalSource>,
     agent_invocations: Vec<AgentInvocation>,
     external_agent_processes: Vec<AgentProcess>,
     active_by_repo: Vec<ActiveCount>,
@@ -294,6 +300,8 @@ async fn build_usage_monitor_response(
     let now = Utc::now();
     let window = UsageWindow::from_query(query.hours, now);
     let price_catalog = PriceCatalog::from_env_cached();
+    let local_usage_sources = load_ccstats_local_sources(window.since, window.now).await;
+    let ccstats_available = any_ccstats_source_available(&local_usage_sources);
     let usage_records = load_usage_records(state, window, price_catalog).await?;
     let runtime_rows = load_runtime_usage_rows(state, window.since, query.limit).await?;
     let agent_invocations = runtime_rows
@@ -334,18 +342,14 @@ async fn build_usage_monitor_response(
     let cost = CostConfig {
         currency: "USD",
         configured: price_catalog.configured(),
-        source: "HARNESS_USAGE_PRICE_CATALOG_JSON",
+        source: cost_source(price_catalog.configured(), ccstats_available),
         missing_model_count: usage_records
             .iter()
             .filter(|record| record.estimated_cost_usd.is_none())
             .map(|record| record.model.as_str())
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
-        message: if price_catalog.configured() {
-            "Token counts are exact when events exist; cost is estimated from the configured local price catalog."
-        } else {
-            "Token counts are exact when events exist; cost is unavailable until a local price catalog is configured."
-        },
+        message: cost_message(price_catalog.configured(), ccstats_available),
     };
 
     Ok(UsageMonitorResponse {
@@ -368,6 +372,7 @@ async fn build_usage_monitor_response(
         tokens_by_agent,
         tokens_by_project,
         tokens_by_model,
+        local_usage_sources,
         active_by_repo: aggregate_active_counts(&agent_invocations, |invocation| {
             invocation
                 .repo
@@ -752,6 +757,32 @@ fn blank_label(value: &str) -> String {
         "unassigned".to_string()
     } else {
         value.to_string()
+    }
+}
+
+fn cost_source(price_catalog_configured: bool, ccstats_available: bool) -> &'static str {
+    match (price_catalog_configured, ccstats_available) {
+        (true, true) => "HARNESS_USAGE_PRICE_CATALOG_JSON + ccstats CLI",
+        (true, false) => "HARNESS_USAGE_PRICE_CATALOG_JSON",
+        (false, true) => "ccstats CLI (--offline cache)",
+        (false, false) => "unconfigured",
+    }
+}
+
+fn cost_message(price_catalog_configured: bool, ccstats_available: bool) -> &'static str {
+    match (price_catalog_configured, ccstats_available) {
+        (true, true) => {
+            "Harness token costs use the configured local price catalog; ccstats local source totals are shown separately from task attribution."
+        }
+        (true, false) => {
+            "Harness token costs use the configured local price catalog; ccstats local source totals are unavailable."
+        }
+        (false, true) => {
+            "Harness token counts are exact when events exist; ccstats local source totals use cached pricing and are not per-task attribution."
+        }
+        (false, false) => {
+            "Harness token counts are exact when events exist; cost is unavailable until a local price catalog or ccstats installation is available."
+        }
     }
 }
 

@@ -7,7 +7,7 @@ import { PaletteFab } from "@/components/PaletteFab";
 import { DOCS_URL } from "@/lib/links";
 import { fmtInt } from "@/lib/format";
 import { useUsageMonitor } from "@/lib/queries";
-import type { ActiveCount, AgentInvocation, AgentProcess, UsageGroup } from "@/types";
+import type { ActiveCount, AgentInvocation, AgentProcess, LocalUsageSource, UsageGroup } from "@/types";
 
 function fmtTokens(tokens: number | null | undefined): string {
   if (tokens == null || !Number.isFinite(tokens)) return "-";
@@ -79,6 +79,48 @@ function UsageGroupsTable({ rows, empty }: { rows: UsageGroup[]; empty: string }
           ) : (
             <tr>
               <td className="px-4 py-6 text-ink-3" colSpan={4}>{empty}</td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function LocalUsageSourcesTable({ sources }: { sources: LocalUsageSource[] }) {
+  return (
+    <div className="overflow-auto">
+      <table className="w-full border-collapse font-mono text-[11.5px]">
+        <thead className="text-ink-3 border-b border-line">
+          <tr>
+            <th className="text-left font-medium px-4 py-2">Source</th>
+            <th className="text-right font-medium px-4 py-2">Tokens</th>
+            <th className="text-right font-medium px-4 py-2">Cost</th>
+            <th className="text-left font-medium px-4 py-2">Model</th>
+            <th className="text-left font-medium px-4 py-2">Range</th>
+            <th className="text-left font-medium px-4 py-2">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sources.length ? (
+            sources.map((source) => {
+              const topModel = source.models[0]?.model ?? "-";
+              return (
+                <tr key={source.source} className="border-b border-line/70">
+                  <td className="px-4 py-2 text-ink">{source.display_name}</td>
+                  <td className="px-4 py-2 text-right text-ink">{fmtTokens(source.total_tokens)}</td>
+                  <td className="px-4 py-2 text-right text-ink-2">{fmtCost(source.estimated_cost_usd)}</td>
+                  <td className="px-4 py-2 text-ink-2 max-w-[180px] truncate" title={topModel}>{topModel}</td>
+                  <td className="px-4 py-2 text-ink-3">{source.since} / {source.until}</td>
+                  <td className="px-4 py-2 text-ink-3 max-w-[260px] truncate" title={source.message ?? source.status}>
+                    {source.status === "available" ? "available" : source.message ?? "unavailable"}
+                  </td>
+                </tr>
+              );
+            })
+          ) : (
+            <tr>
+              <td className="px-4 py-6 text-ink-3" colSpan={6}>no local source usage</td>
             </tr>
           )}
         </tbody>
@@ -247,9 +289,9 @@ export function UsageMonitor() {
           <div className="grid grid-cols-6 border-b border-line">
             <KpiCard label="Tokens" value={fmtTokens(data?.summary.total_tokens)} delta={`${fmtInt(data?.summary.request_count)} requests`} />
             <KpiCard
-              label="Est. cost"
+              label="Harness cost"
               value={fmtCost(data?.summary.estimated_cost_usd)}
-              delta={data?.cost.configured ? `${data.cost.currency} catalog` : "price unavailable"}
+              delta={data?.cost.configured ? `${data.cost.currency} catalog` : "see local totals"}
             />
             <KpiCard label="Running agents" value={fmtInt(data?.summary.running_agent_invocations)} delta={`${fmtInt(data?.summary.pending_agent_invocations)} pending`} />
             <KpiCard label="High burn" value={fmtInt(data?.summary.high_burn_invocations)} delta={`${fmtInt(data?.summary.stale_agent_invocations)} stale`} />
@@ -277,12 +319,18 @@ export function UsageMonitor() {
           </div>
 
           <div className="grid grid-cols-3">
+            <Panel title="Local ccstats totals" sub="cached source totals" className="border-r border-line">
+              <LocalUsageSourcesTable sources={data?.local_usage_sources ?? []} />
+            </Panel>
             <Panel title="Tokens by agent" sub="completed turns" className="border-r border-line">
               <UsageGroupsTable rows={data?.tokens_by_agent ?? []} empty="no token events" />
             </Panel>
             <Panel title="Tokens by project" sub="completed turns" className="border-r border-line">
               <UsageGroupsTable rows={data?.tokens_by_project ?? []} empty="no project usage" />
             </Panel>
+          </div>
+
+          <div className="grid grid-cols-1">
             <Panel title="Tokens by model" sub="completed turns">
               <UsageGroupsTable rows={data?.tokens_by_model ?? []} empty="no model usage" />
             </Panel>

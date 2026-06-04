@@ -39,6 +39,35 @@ export interface UsageGroup {
   cost_confidence: string;
 }
 
+export interface LocalUsageModel {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+  estimated_cost_usd: number | null;
+}
+
+export interface LocalUsageSource {
+  source: string;
+  display_name: string;
+  status: string;
+  message: string | null;
+  range: string;
+  since: string;
+  until: string;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+  estimated_cost_usd: number | null;
+  models: LocalUsageModel[];
+}
+
 export interface AgentInvocation {
   agent_invocation_id: string;
   source: "workflow_runtime";
@@ -101,6 +130,7 @@ export interface UsageMonitorPayload {
   tokens_by_agent: UsageGroup[];
   tokens_by_project: UsageGroup[];
   tokens_by_model: UsageGroup[];
+  local_usage_sources: LocalUsageSource[];
   agent_invocations: AgentInvocation[];
   external_agent_processes: AgentProcess[];
   active_by_repo: ActiveCount[];

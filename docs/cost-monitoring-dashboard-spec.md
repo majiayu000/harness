@@ -339,8 +339,11 @@ This allows useful "why did usage jump" debugging even when exact provider quota
 - active and recent Harness-owned agent invocations from the workflow database
 - local Codex and Claude process samples only for external-session visibility
 - optional estimated USD values when `HARNESS_USAGE_PRICE_CATALOG_JSON` is configured
+- ccstats-backed local Codex and Claude source totals, shown separately from Harness task attribution
 
 The endpoint must not hardcode model prices. If no price catalog is configured, token counts remain exact and cost fields remain null with diagnostics explaining why.
+
+The ccstats integration is intentionally a separate source summary. It may show local Codex and Claude token/cost totals even when Harness has no `llm_usage` events, but those totals are not assigned to individual Harness workflows until adapters persist a runtime job to agent-session linkage. A direct in-process `ccstats` SDK dependency is blocked while `ccstats` depends on `rusqlite` with a `libsqlite3-sys` version that conflicts with Harness's `sqlx` SQLite dependency, so the read-only dashboard consumes ccstats JSON output at the process boundary.
 
 Current response fields:
 
@@ -352,6 +355,7 @@ Current response fields:
 | `tokens_by_agent` | Historical exact token usage grouped by usage event agent |
 | `tokens_by_project` | Historical exact token usage grouped by project field |
 | `tokens_by_model` | Historical exact token usage grouped by model |
+| `local_usage_sources` | ccstats local Codex/Claude source totals with cached pricing, not per-task attribution |
 | `agent_invocations` | Harness-owned runtime jobs derived from workflow runtime state |
 | `external_agent_processes` | Local Codex/Claude CLI process hints outside Harness attribution |
 | `active_by_repo` | Active Harness invocation pressure grouped by repo |
@@ -546,6 +550,7 @@ Stale rows should be excluded from active burn rate, but shown as reliability is
 - Add process sampler only for external Codex/Claude CLI visibility.
 - Show active invocations, stale rows, high-burn rows, historical token groups, and estimated burn.
 - Add optional local price catalog parsing through `HARNESS_USAGE_PRICE_CATALOG_JSON`.
+- Add ccstats local source totals for Codex and Claude as a separate cost context.
 - No enforcement.
 
 ### Phase 1: Usage Persistence
@@ -584,6 +589,7 @@ Stale rows should be excluded from active burn rate, but shown as reliability is
 - Parse token usage from known `codex exec --json` fixtures.
 - Parse token usage from known JSON-RPC fixtures.
 - Calculate USD estimates from price catalog rows.
+- Parse ccstats JSON source summaries and preserve unavailable-source errors.
 - Calculate quota units from model and reasoning weights.
 - Mark stale-running jobs correctly.
 - Redact metadata before persistence.
@@ -592,6 +598,7 @@ Stale rows should be excluded from active burn rate, but shown as reliability is
 
 - Create fake runtime jobs and process samples without launching real Codex.
 - Verify `/api/usage-monitor` returns exact usage, active runtime jobs, process samples, and cost diagnostics.
+- Verify `/api/usage-monitor` returns ccstats local source totals without merging them into Harness task attribution.
 - Verify Harness-owned invocation counts come from runtime jobs even when no local process is sampled.
 - Verify external process rows do not include desktop helpers, browser native hosts, or shell waiters.
 - Verify `/api/usage/running` groups runtime database rows with live process samples.
