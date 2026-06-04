@@ -39,6 +39,40 @@ export interface UsageGroup {
   cost_confidence: string;
 }
 
+export interface LocalUsageModelSummary {
+  model: string;
+  estimated_cost_usd: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  total_tokens: number;
+}
+
+export interface LocalUsageSourceSummary {
+  source: string;
+  display_name: string;
+  attribution: "global_local_source_logs";
+  status: "available" | "unavailable";
+  since: string;
+  until: string;
+  currency: string;
+  estimated_cost_usd: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  total_tokens: number;
+  period_count: number;
+  model_count: number;
+  models: LocalUsageModelSummary[];
+  cost_confidence: string;
+  elapsed_ms: number;
+  error: string | null;
+}
+
 export interface AgentInvocation {
   agent_invocation_id: string;
   source: "workflow_runtime";
@@ -103,6 +137,7 @@ export interface UsageMonitorPayload {
   tokens_by_model: UsageGroup[];
   agent_invocations: AgentInvocation[];
   external_agent_processes: AgentProcess[];
+  local_usage_sources: LocalUsageSourceSummary[];
   active_by_repo: ActiveCount[];
   active_by_activity: ActiveCount[];
   diagnostics: UsageDiagnostics;

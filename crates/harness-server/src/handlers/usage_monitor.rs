@@ -17,9 +17,12 @@ use std::sync::{Arc, OnceLock};
 
 use crate::http::AppState;
 
+#[path = "usage_monitor_local_usage.rs"]
+mod usage_monitor_local_usage;
 #[path = "usage_monitor_process.rs"]
 mod usage_monitor_process;
 
+use usage_monitor_local_usage::{load_local_usage_summaries, LocalUsageSourceSummary};
 use usage_monitor_process::{sample_agent_processes, AgentProcess};
 
 const DEFAULT_USAGE_WINDOW_HOURS: i64 = 24;
@@ -42,6 +45,7 @@ struct UsageMonitorResponse {
     tokens_by_model: Vec<UsageGroup>,
     agent_invocations: Vec<AgentInvocation>,
     external_agent_processes: Vec<AgentProcess>,
+    local_usage_sources: Vec<LocalUsageSourceSummary>,
     active_by_repo: Vec<ActiveCount>,
     active_by_activity: Vec<ActiveCount>,
     diagnostics: UsageDiagnostics,
@@ -302,6 +306,7 @@ async fn build_usage_monitor_response(
         .collect::<Vec<_>>();
     let external_agent_processes =
         sample_agent_processes(now, &runtime_attribution_tokens(&runtime_rows));
+    let local_usage_sources = load_local_usage_summaries(window).await;
 
     let tokens_by_agent =
         aggregate_usage(&usage_records, |record| record.agent.clone(), price_catalog);
@@ -342,9 +347,9 @@ async fn build_usage_monitor_response(
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
         message: if price_catalog.configured() {
-            "Token counts are exact when events exist; cost is estimated from the configured local price catalog."
+            "Harness-attributed token costs use the configured local price catalog. ccstats local source totals are reported separately from workflow and task attribution."
         } else {
-            "Token counts are exact when events exist; cost is unavailable until a local price catalog is configured."
+            "Harness-attributed token costs need a local price catalog. ccstats local source totals may still report global Codex and Claude costs separately."
         },
     };
 
@@ -379,6 +384,7 @@ async fn build_usage_monitor_response(
         }),
         agent_invocations,
         external_agent_processes,
+        local_usage_sources,
         diagnostics: UsageDiagnostics {
             runtime_store_available: state.core.workflow_runtime_store.is_some(),
             token_source: "llm_usage_events",
