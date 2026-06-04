@@ -99,8 +99,7 @@ impl CodexAgent {
         ];
         push_codex_sandbox_args(&mut args, sandbox_mode);
         if let Some(approval_policy) = req.approval_policy.as_deref() {
-            args.push(OsString::from("-a"));
-            args.push(OsString::from(approval_policy));
+            push_codex_approval_policy_args(&mut args, approval_policy);
         }
 
         if self.cloud.enabled {
@@ -534,6 +533,13 @@ fn push_codex_sandbox_args(args: &mut Vec<OsString>, mode: SandboxMode) {
 
     args.push(OsString::from("-s"));
     args.push(OsString::from(codex_sandbox_mode(mode)));
+}
+
+fn push_codex_approval_policy_args(args: &mut Vec<OsString>, approval_policy: &str) {
+    args.push(OsString::from("-c"));
+    args.push(OsString::from(format!(
+        "approval_policy=\"{approval_policy}\""
+    )));
 }
 
 #[cfg(test)]
