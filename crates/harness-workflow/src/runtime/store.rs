@@ -1604,7 +1604,7 @@ impl WorkflowRuntimeStore {
             return Ok(None);
         }
 
-        job.claim(owner, next_lease_expires_at);
+        job.renew_lease(owner, next_lease_expires_at);
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         sqlx::query(
@@ -1640,10 +1640,19 @@ impl WorkflowRuntimeStore {
         &self,
         expected: &RuntimeJob,
     ) -> anyhow::Result<bool> {
+        let Some(expected_lease) = expected.lease.as_ref() else {
+            return Ok(false);
+        };
         let Some(current) = self.get_runtime_job(&expected.id).await? else {
             return Ok(false);
         };
-        Ok(current.status == RuntimeJobStatus::Running && current.lease == expected.lease)
+        let Some(current_lease) = current.lease.as_ref() else {
+            return Ok(false);
+        };
+        Ok(current.status == RuntimeJobStatus::Running
+            && current.lease_generation == expected.lease_generation
+            && current_lease.owner == expected_lease.owner
+            && current_lease.expires_at >= expected_lease.expires_at)
     }
 
     pub async fn runtime_jobs_for_command(
