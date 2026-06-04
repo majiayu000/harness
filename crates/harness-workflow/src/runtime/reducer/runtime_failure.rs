@@ -304,7 +304,7 @@ fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool 
         (definition_id, state),
         (
             GITHUB_ISSUE_PR_DEFINITION_ID,
-            "implementing" | "awaiting_feedback" | "addressing_feedback"
+            "implementing" | "local_review_gate" | "awaiting_feedback" | "addressing_feedback"
         ) | (
             REPO_BACKLOG_DEFINITION_ID,
             "scanning" | "dispatching" | "reconciling" | "planning_batch"

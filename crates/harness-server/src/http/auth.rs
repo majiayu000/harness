@@ -84,6 +84,12 @@ mod tests {
         assert_eq!(percent_decode("tok%2"), "tok%2");
         assert_eq!(percent_decode("tok%"), "tok%");
     }
+
+    #[test]
+    fn usage_page_html_is_auth_exempt() {
+        assert!(is_auth_exempt_path("/usage"));
+        assert!(!is_auth_exempt_path("/api/usage-monitor"));
+    }
 }
 
 /// Resolve the effective API token from server config or `HARNESS_API_TOKEN` env var.
@@ -116,6 +122,7 @@ pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
             | "/auth/reset-password"
             | "/"
             | "/overview"
+            | "/usage"
             | "/worktrees"
             | "/ws"
     ) || path.starts_with("/assets/")
@@ -124,8 +131,8 @@ pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
 /// Bearer token authentication middleware.
 ///
 /// Exempts `/health`, `/webhook`, `/webhook/feishu`, `/signals`, `/favicon.ico`,
-/// `/auth/reset-password`, `/` (dashboard HTML), `/overview` (system overview
-/// HTML), `/assets/*` (hashed React bundle assets), and `/ws` (WebSocket
+/// `/auth/reset-password`, `/` (dashboard HTML), `/overview` and `/usage`
+/// (React SPA HTML), `/assets/*` (hashed React bundle assets), and `/ws` (WebSocket
 /// upgrade).
 /// The dashboard HTML no longer embeds the token, so it is safe to serve without
 /// auth. `/ws` is exempt from *this middleware* because the WebSocket upgrade

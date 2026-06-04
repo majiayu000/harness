@@ -12,7 +12,7 @@ use self::github_issue_completion::{
     github_issue_closed_decision, issue_implementation_missing_result_decision,
 };
 use self::pr_feedback_completion::{
-    pr_feedback_child_decision_from_activity_result,
+    local_review_decision_from_activity_result, pr_feedback_child_decision_from_activity_result,
     pr_feedback_sweep_decision_from_activity_result,
 };
 use self::quality_gate_completion::{
@@ -30,7 +30,8 @@ use self::runtime_failure::{
     runtime_failed_decision,
 };
 use self::support::{
-    event_command_type, invalid_agent_output_blocked_decision, runtime_completion_evidence,
+    event_command_type, event_field_string, invalid_agent_output_blocked_decision,
+    runtime_completion_evidence,
 };
 use super::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
@@ -149,6 +150,19 @@ fn reduce_success(
         return Some(decision);
     }
 
+    if let Some(decision) = local_review_decision_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "local_review_gate"
+        && result.activity == super::pr_feedback::LOCAL_REVIEW_ACTIVITY
+    {
+        let reason = "run_local_review succeeded without a LocalReviewPassed, LocalReviewChangesRequested, or LocalReviewBlocked signal";
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, reason,
+        ));
+    }
+
     if let Some(decision) = pr_feedback_child_decision_from_activity_result(instance, event, result)
     {
         return Some(decision);
@@ -213,9 +227,9 @@ fn reduce_success(
             "replan activity completed; implementation can continue",
         ),
         (GITHUB_ISSUE_PR_DEFINITION_ID, "addressing_feedback", "address_pr_feedback") => (
-            "awaiting_feedback",
-            "await_feedback_after_rework",
-            "PR feedback rework activity completed; wait for fresh feedback",
+            "local_review_gate",
+            "run_local_review_after_rework",
+            "PR feedback rework activity completed; run local review before remote feedback",
         ),
         (REPO_BACKLOG_DEFINITION_ID, "dispatching", _)
             if event_command_type(event) == Some("start_child_workflow") =>
@@ -274,6 +288,21 @@ fn reduce_success(
                 "activity": result.activity,
                 "workflow_id": instance.id,
             }),
+        ));
+    }
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "addressing_feedback"
+        && result.activity == "address_pr_feedback"
+        && next_state == "local_review_gate"
+    {
+        let completion_command_id =
+            event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+        workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
+            super::pr_feedback::LOCAL_REVIEW_ACTIVITY,
+            format!(
+                "local-review:{}:after-rework:{completion_command_id}",
+                instance.id
+            ),
         ));
     }
 

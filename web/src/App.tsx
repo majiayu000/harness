@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Route, Routes, useLocation } from "react-router-dom";
 import { Dashboard } from "./routes/Dashboard";
 import { Overview } from "./routes/Overview";
+import { UsageMonitor } from "./routes/UsageMonitor";
 import { Worktrees } from "./routes/Worktrees";
 import { PaletteProvider } from "./lib/palette";
 import { TokenPrompt } from "./components/TokenPrompt";
@@ -48,6 +49,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/overview" element={<Overview />} />
+          <Route path="/usage" element={<UsageMonitor />} />
           <Route path="/worktrees" element={<Worktrees />} />
         </Routes>
         <TokenPrompt />

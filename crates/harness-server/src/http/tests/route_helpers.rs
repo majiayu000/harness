@@ -363,7 +363,7 @@ pub(super) async fn seed_bound_runtime_pr_workflow(
     Ok((workflow_id, task_id))
 }
 
-pub(super) async fn assert_runtime_pr_feedback_requested(
+pub(super) async fn assert_runtime_local_review_requested(
     state: &Arc<AppState>,
     workflow_id: &str,
     task_id: &str,
@@ -377,14 +377,14 @@ pub(super) async fn assert_runtime_pr_feedback_requested(
         .get_instance(workflow_id)
         .await?
         .expect("runtime workflow should exist");
-    assert_eq!(instance.state, "awaiting_feedback");
+    assert_eq!(instance.state, "local_review_gate");
     assert_eq!(instance.data["task_id"], task_id);
     let commands = store.commands_for(workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
     assert_eq!(
-        commands[0].command.command["definition_id"],
-        harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID
+        commands[0].command.activity_name(),
+        Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
     );
     assert!(
         state

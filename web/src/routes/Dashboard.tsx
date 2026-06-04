@@ -46,7 +46,10 @@ export function Dashboard() {
     },
     {
       label: "System",
-      items: [{ id: "overview", label: "Overview", href: "/overview" }],
+      items: [
+        { id: "overview", label: "Overview", href: "/overview" },
+        { id: "usage", label: "Usage", href: "/usage" },
+      ],
     },
   ];
 

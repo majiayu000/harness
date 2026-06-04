@@ -398,7 +398,7 @@ async fn webhook_ignores_issue_tasks_when_repo_is_unmapped() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn webhook_pull_request_review_changes_requested_creates_runtime_prompt_submission(
+async fn webhook_pull_request_review_changes_requested_requests_local_review_gate(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -453,11 +453,20 @@ async fn webhook_pull_request_review_changes_requested_creates_runtime_prompt_su
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["status"], "local_review_gate");
     assert_eq!(json["execution_path"], "workflow_runtime");
     let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
     assert_eq!(state.core.tasks.count(), before_count);
-    assert_runtime_prompt_submission(&state, dir.path(), runtime_task_id).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let instance = store
+        .get_instance_by_task_id(runtime_task_id)
+        .await?
+        .expect("runtime local review workflow should be persisted");
+    assert_runtime_local_review_requested(&state, &instance.id, runtime_task_id).await?;
     Ok(())
 }
 

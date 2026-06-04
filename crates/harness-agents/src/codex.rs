@@ -98,6 +98,9 @@ impl CodexAgent {
             OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
         ];
         push_codex_sandbox_args(&mut args, sandbox_mode);
+        if let Some(approval_policy) = req.approval_policy.as_deref() {
+            push_codex_approval_policy_args(&mut args, approval_policy);
+        }
 
         if self.cloud.enabled {
             args.push(OsString::from("--ephemeral"));
@@ -530,6 +533,55 @@ fn push_codex_sandbox_args(args: &mut Vec<OsString>, mode: SandboxMode) {
 
     args.push(OsString::from("-s"));
     args.push(OsString::from(codex_sandbox_mode(mode)));
+}
+
+fn push_codex_approval_policy_args(args: &mut Vec<OsString>, approval_policy: &str) {
+    let approval_policy = escape_codex_config_string(approval_policy);
+    args.push(OsString::from("-c"));
+    args.push(OsString::from(format!(
+        "approval_policy=\"{approval_policy}\""
+    )));
+}
+
+fn escape_codex_config_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod approval_policy_arg_tests {
+    use super::push_codex_approval_policy_args;
+
+    #[test]
+    fn approval_policy_args_escape_config_string_delimiters() {
+        let mut args = Vec::new();
+
+        push_codex_approval_policy_args(&mut args, "ask\"me\\first\nnext");
+
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                "approval_policy=\"ask\\\"me\\\\first\\nnext\"".to_string()
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

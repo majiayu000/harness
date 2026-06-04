@@ -1,5 +1,25 @@
 use super::*;
 
+async fn record_runtime_local_review_passed(
+    runtime_store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    project_root: &std::path::Path,
+    task_id: &TaskId,
+) {
+    crate::workflow_runtime_pr_feedback::record_local_review_passed(
+        Some(runtime_store),
+        crate::workflow_runtime_pr_feedback::LocalReviewPassedRuntimeContext {
+            project_root,
+            repo: Some("owner/repo"),
+            issue_number: Some(123),
+            task_id,
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            summary: "Local agent review approved the PR.",
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn hosted_bot_disabled_completion_requires_validation_pass() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -167,6 +187,8 @@ async fn hosted_bot_disabled_validation_failure_records_blocking_feedback() -> a
     let mut project_config = harness_core::config::project::ProjectConfig::default();
     project_config.validation.pre_push = vec!["false".to_string()];
 
+    record_runtime_local_review_passed(&runtime_store, &project_root, &task_id).await;
+
     complete_after_local_review_without_hosted_bot(
         &store,
         &task_id,
@@ -236,6 +258,8 @@ async fn hosted_bot_disabled_completion_records_ready_to_merge_feedback() -> any
     };
     let mut project_config = harness_core::config::project::ProjectConfig::default();
     project_config.validation.pre_push = vec!["true".to_string()];
+
+    record_runtime_local_review_passed(&runtime_store, &project_root, &task_id).await;
 
     complete_after_local_review_without_hosted_bot(
         &store,

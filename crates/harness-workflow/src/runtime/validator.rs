@@ -158,20 +158,17 @@ impl TransitionAllowlist {
                 [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
             )
             .allow("pr_open", "pr_open", [BindPr, Wait])
+            .allow("pr_open", "local_review_gate", [EnqueueActivity, Wait])
             .allow(
-                "pr_open",
-                "awaiting_feedback",
-                [EnqueueActivity, StartChildWorkflow, Wait],
+                "local_review_gate",
+                "local_review_gate",
+                [EnqueueActivity, Wait],
             )
+            .allow("local_review_gate", "awaiting_feedback", [Wait])
             .allow(
-                "pr_open",
+                "local_review_gate",
                 "addressing_feedback",
-                [EnqueueActivity, StartChildWorkflow, MarkBlocked, Wait],
-            )
-            .allow(
-                "pr_open",
-                "ready_to_merge",
-                [EnqueueActivity, StartChildWorkflow, Wait],
+                [EnqueueActivity, MarkBlocked, Wait],
             )
             .allow("pr_open", "done", [MarkDone])
             .allow(
@@ -191,12 +188,7 @@ impl TransitionAllowlist {
             )
             .allow(
                 "addressing_feedback",
-                "awaiting_feedback",
-                [EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow(
-                "addressing_feedback",
-                "ready_to_merge",
+                "local_review_gate",
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
             .allow(
