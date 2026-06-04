@@ -694,7 +694,10 @@ fn base_args_uses_request_reasoning_effort_sandbox_and_approval_policy() {
         .windows(2)
         .any(|window| window == ["-c", "model_reasoning_effort=\"medium\""]));
     assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
-    assert!(args.windows(2).any(|window| window == ["-a", "on-request"]));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["-c", "approval_policy=\"on-request\""]));
+    assert!(!args.iter().any(|arg| arg == "-a"));
     assert_eq!(args.last().map(String::as_str), Some("ping"));
 }
 
