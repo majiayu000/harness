@@ -8,6 +8,7 @@ import type {
   OverviewPayload,
   StreamItem,
   TaskListResponse,
+  UsageMonitorPayload,
   WorkflowRuntimeTreePayload,
 } from "@/types";
 
@@ -30,6 +31,14 @@ export function useOperatorSnapshot() {
     queryKey: ["operator-snapshot"],
     queryFn: ({ signal }) => apiJson<OperatorSnapshotPayload>("/api/operator-snapshot", { signal }),
     refetchInterval: 30_000,
+  });
+}
+
+export function useUsageMonitor() {
+  return useQuery<UsageMonitorPayload, Error>({
+    queryKey: ["usage-monitor"],
+    queryFn: ({ signal }) => apiJson<UsageMonitorPayload>("/api/usage-monitor", { signal }),
+    refetchInterval: 5_000,
   });
 }
 
