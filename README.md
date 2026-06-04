@@ -154,6 +154,24 @@ Integration tests that require a database (e.g. `runtime_state_store`,
 `thread_db`, `q_value_store`) skip automatically when no Harness database URL
 is configured.
 
+**Harness-server validation ladder:**
+
+```bash
+# Routine server work: fast module and lightweight route path.
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-fast.sh
+
+# Full server DB, startup, recovery, route, and workflow profile.
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh
+
+# Final PR handoff: full workspace coverage.
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness cargo test --workspace
+```
+
+`scripts/test-server-fast.sh` is the warm local feedback path for routine
+`harness-server` changes. `scripts/test-server-db.sh` runs the full server suite
+single-threaded so DB-backed startup, recovery, full `AppState`, route, and
+workflow-runtime coverage remains explicit and stable.
+
 ### Run
 
 **HTTP server:**
