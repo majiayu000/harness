@@ -158,7 +158,7 @@ is configured.
 
 ```bash
 # Routine server work: fast module and lightweight route path.
-HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-fast.sh
+scripts/test-server-fast.sh
 
 # Full server DB, startup, recovery, route, and workflow profile.
 HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh

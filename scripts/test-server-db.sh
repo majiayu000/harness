@@ -16,5 +16,5 @@ EOF
   exit 2
 fi
 
-cargo test -p harness-server --lib -- --test-threads=1 "$@"
-cargo test -p harness-server --tests -- --test-threads=1 "$@"
+RUST_TEST_THREADS=1 cargo test -p harness-server --lib "$@"
+RUST_TEST_THREADS=1 cargo test -p harness-server --tests "$@"

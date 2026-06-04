@@ -30,10 +30,12 @@ jobs:
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'scripts/test-server-*.sh'
             server:
               - 'crates/harness-server/**'
               - 'crates/harness-core/**'
               - 'crates/harness-workflow/**'
+              - 'scripts/test-server-*.sh'
             agents:
               - 'crates/harness-agents/**'
               - 'crates/harness-core/**'
