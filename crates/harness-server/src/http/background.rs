@@ -1032,9 +1032,13 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
         }
         considered_candidates += 1;
 
-        match crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &workflow.id)
-            .await?
-        {
+        let request_outcome = if workflow.state == "pr_open" {
+            crate::workflow_runtime_pr_feedback::request_local_review(store, &workflow.id).await?
+        } else {
+            crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &workflow.id)
+                .await?
+        };
+        match request_outcome {
             crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
                 ..
             } => tick.requested += 1,

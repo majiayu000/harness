@@ -494,13 +494,13 @@ async fn enqueue_background_pr_feedback_uses_bound_workflow_runtime_without_task
         .get_instance(&workflow_id)
         .await?
         .expect("bound issue workflow should still exist");
-    assert_eq!(updated.state, "awaiting_feedback");
+    assert_eq!(updated.state, "local_review_gate");
     let commands = runtime_store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
     assert_eq!(
-        commands[0].command.command["definition_id"],
-        harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID
+        commands[0].command.activity_name(),
+        Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
     );
     assert_eq!(runtime_store.pending_commands(10).await?.len(), 1);
     Ok(())
@@ -552,14 +552,14 @@ async fn enqueue_background_pr_feedback_creates_pr_scoped_runtime_workflow() -> 
         .expect("PR-scoped runtime workflow should be persisted");
     assert_eq!(workflow.subject.subject_type, "pr");
     assert_eq!(workflow.subject.subject_key, "pr:77");
-    assert_eq!(workflow.state, "awaiting_feedback");
+    assert_eq!(workflow.state, "local_review_gate");
     assert_eq!(workflow.data["pr_number"], 77);
     assert!(workflow.data.get("issue_number").is_none());
     let commands = runtime_store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(
-        commands[0].command.command["definition_id"],
-        harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID
+        commands[0].command.activity_name(),
+        Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
     );
     Ok(())
 }

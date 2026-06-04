@@ -314,8 +314,23 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("github_issue_pr", "address_pr_feedback") => json!({
             "on_succeeded": {
-                "reducer_next_state": "awaiting_feedback",
-                "required_summary": "Describe addressed review feedback and validation evidence."
+                "reducer_next_state": "local_review_gate",
+                "required_summary": "Describe addressed review feedback and validation evidence. Harness will run local review before remote feedback."
+            },
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
+        ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({
+            "on_succeeded": {
+                "reducer_next_state": "awaiting_feedback_or_addressing_feedback_or_blocked_from_signals",
+                "accepted_signals": [
+                    harness_workflow::runtime::LOCAL_REVIEW_PASSED_SIGNAL,
+                    harness_workflow::runtime::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+                    harness_workflow::runtime::LOCAL_REVIEW_BLOCKED_SIGNAL
+                ],
+                "required_summary": "Describe the local agent review result, blocking findings if any, and validation evidence inspected."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -486,6 +501,15 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
         ("github_issue_pr", "address_pr_feedback") => json!({
             "must_include": ["review feedback addressed", "changed files", "validation commands"],
             "must_not_include": ["claiming review approval without a fresh review signal"],
+        }),
+        ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({
+            "must_include": ["PR diff reviewed", "blocking findings or explicit approval", "validation evidence checked", "next workflow action"],
+            "must_not_include": ["repository code changes", "workflow table mutations", "remote review approval claims"],
+            "signals": {
+                "LocalReviewPassed": "Use only when the local agent review finds no blocking issues.",
+                "LocalReviewChangesRequested": "Use when local review finds blocking code, test, regression, or security issues that need a fix round.",
+                "LocalReviewBlocked": "Use when local review cannot complete because required PR context or validation evidence is unavailable."
+            }
         }),
         ("github_issue_pr", "sweep_pr_feedback")
         | ("github_issue_pr", PR_FEEDBACK_INSPECT_ACTIVITY)

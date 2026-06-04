@@ -598,6 +598,19 @@ pub(crate) async fn run_task(
                 return Ok(());
             }
             local_review_approved = true;
+            crate::workflow_runtime_pr_feedback::record_local_review_passed(
+                workflow_runtime_store.as_deref(),
+                crate::workflow_runtime_pr_feedback::LocalReviewPassedRuntimeContext {
+                    project_root: &project_root,
+                    repo: req.repo.as_deref(),
+                    issue_number: req.issue,
+                    task_id,
+                    pr_number: pr_num,
+                    pr_url: pr_url.as_deref(),
+                    summary: "Local agent review approved the PR.",
+                },
+            )
+            .await;
             agent_pushed_commit = fix_requires_pr_head_advance;
             if !review_config.review_bot_auto_trigger {
                 local_review_head_approved = approved_review_head;

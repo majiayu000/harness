@@ -688,7 +688,9 @@ pub(super) fn runtime_workflow_state_to_task_status(state: &str) -> TaskStatus {
         "awaiting_dependencies" => TaskStatus::AwaitingDeps,
         "scheduled" | "discovered" => TaskStatus::Pending,
         "implementing" | "replanning" | "addressing_feedback" => TaskStatus::Implementing,
-        "pr_open" | "awaiting_feedback" | "ready_to_merge" | "blocked" => TaskStatus::Waiting,
+        "pr_open" | "local_review_gate" | "awaiting_feedback" | "ready_to_merge" | "blocked" => {
+            TaskStatus::Waiting
+        }
         "done" | "passed" => TaskStatus::Done,
         "failed" => TaskStatus::Failed,
         "cancelled" => TaskStatus::Cancelled,
@@ -699,7 +701,9 @@ pub(super) fn runtime_workflow_state_to_task_status(state: &str) -> TaskStatus {
 fn runtime_workflow_state_to_task_phase(state: &str) -> TaskPhase {
     match state {
         "done" | "passed" | "failed" | "cancelled" => TaskPhase::Terminal,
-        "pr_open" | "awaiting_feedback" | "ready_to_merge" => TaskPhase::Review,
+        "pr_open" | "local_review_gate" | "awaiting_feedback" | "ready_to_merge" => {
+            TaskPhase::Review
+        }
         "replanning" | "blocked" => TaskPhase::Plan,
         _ => TaskPhase::Implement,
     }
@@ -721,7 +725,7 @@ fn runtime_workflow_scheduler_state(state: &str, status: &TaskStatus) -> TaskSch
             scheduler.mark_terminal(status);
             scheduler
         }
-        "pr_open" | "awaiting_feedback" | "ready_to_merge" | "blocked" => {
+        "pr_open" | "local_review_gate" | "awaiting_feedback" | "ready_to_merge" | "blocked" => {
             TaskSchedulerState::queued()
         }
         _ => match status {

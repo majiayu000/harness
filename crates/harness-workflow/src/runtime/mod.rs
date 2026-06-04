@@ -39,10 +39,13 @@ pub use plan_issue::{
     PlanIssueWorkflowAction,
 };
 pub use pr_feedback::{
+    build_local_review_completed_decision, build_local_review_request_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_inspect_decision,
-    build_pr_feedback_sweep_decision, PrDetectedDecisionInput, PrFeedbackDecisionInput,
-    PrFeedbackDecisionOutput, PrFeedbackInspectDecisionInput, PrFeedbackOutcome,
-    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PR_FEEDBACK_DEFINITION_ID,
+    build_pr_feedback_sweep_decision, LocalReviewCompletedInput, LocalReviewDecisionInput,
+    LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackDecisionOutput,
+    PrFeedbackInspectDecisionInput, PrFeedbackOutcome, PrFeedbackSweepDecisionInput,
+    PrFeedbackWorkflowAction, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL,
+    LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL, PR_FEEDBACK_DEFINITION_ID,
     PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 pub use prompt_task::{
