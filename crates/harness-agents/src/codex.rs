@@ -98,6 +98,10 @@ impl CodexAgent {
             OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
         ];
         push_codex_sandbox_args(&mut args, sandbox_mode);
+        if let Some(approval_policy) = req.approval_policy.as_deref() {
+            args.push(OsString::from("-a"));
+            args.push(OsString::from(approval_policy));
+        }
 
         if self.cloud.enabled {
             args.push(OsString::from("--ephemeral"));

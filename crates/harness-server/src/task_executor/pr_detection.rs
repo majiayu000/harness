@@ -163,34 +163,6 @@ pub(crate) fn build_fix_ci_prompt(
     )
 }
 
-pub(crate) fn build_pr_rework_prompt(
-    repository: &str,
-    pr_number: u64,
-    review_state: &str,
-    review_body: &str,
-    review_url: Option<&str>,
-    pr_url: Option<&str>,
-) -> String {
-    let canonical_pr_url = format!("https://github.com/{repository}/pull/{pr_number}");
-    let preamble = PromptBuilder::new(format!(
-        "PR review feedback received on PR #{pr_number} in `{repository}`.\nReview state: {review_state}"
-    ))
-    .add_optional_url("Review URL", review_url)
-    .add_optional_url("PR URL", pr_url)
-    .add_section("Review feedback", review_body)
-    .build();
-
-    format!(
-        "{preamble}\n\
-         Required workflow:\n\
-         1. Read the review feedback above carefully.\n\
-         2. Address all requested changes.\n\
-         3. Run the repository's standard validation commands.\n\
-         4. Commit and push to the existing PR branch (do not create a new PR).\n\n\
-         On the last line, print PR_URL={canonical_pr_url}"
-    )
-}
-
 pub(crate) fn build_pr_approved_prompt(
     repository: &str,
     pr_number: u64,

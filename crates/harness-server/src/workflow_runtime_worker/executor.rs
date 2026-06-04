@@ -141,7 +141,18 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     sandbox_mode,
                     approval_policy,
                     timeout_secs: runtime_profile.timeout_secs,
-                    force_code_agent: matches!(job.runtime_kind, RuntimeKind::CodexExec),
+                    // Always drive Codex turns through the `codex exec` CLI rather
+                    // than the persistent `codex app-server` JSON-RPC adapter. The
+                    // app-server holds one long-lived connection per turn, which is
+                    // dropped mid-stream on long (xhigh, 100+ item) turns and surfaces
+                    // as "Reconnecting... N/5" failures; `codex exec` opens a fresh
+                    // short-lived connection per turn and does not hit this. Both
+                    // Codex runtime kinds (exec and the legacy jsonrpc label) now
+                    // resolve to the CLI exec path.
+                    force_code_agent: matches!(
+                        job.runtime_kind,
+                        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
+                    ),
                 },
             )
             .await;

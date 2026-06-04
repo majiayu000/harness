@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowDocument {
@@ -507,25 +508,37 @@ pub fn load_workflow_config(project_root: &Path) -> anyhow::Result<WorkflowConfi
     load_workflow_document(project_root).map(|document| document.config)
 }
 
-/// Load the workflow policy and prompt template from `{project_root}/WORKFLOW.md`.
+/// Central base `WORKFLOW.md` path (the file that lives next to the loaded
+/// server config, e.g. `config/WORKFLOW.md`). Registered once at server startup.
+static WORKFLOW_BASE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Register the central base `WORKFLOW.md` (sibling of the loaded config file).
 ///
-/// Missing files fall back to defaults with an empty prompt template. Files
-/// without front matter use default config and treat the whole body as the
-/// repository workflow prompt template.
-pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDocument> {
-    let path = project_root.join("WORKFLOW.md");
-    let contents = match std::fs::read_to_string(&path) {
+/// This is the single source of default workflow policy. Per-repo
+/// `{project_root}/WORKFLOW.md` files are deep-merged on top of this base
+/// field-by-field, so a managed repository only needs a WORKFLOW.md when it
+/// wants to override specific fields; a repo with no WORKFLOW.md inherits the
+/// base entirely. Set once at startup; subsequent calls are ignored.
+pub fn set_workflow_base_path(path: PathBuf) {
+    let _ = WORKFLOW_BASE_PATH.set(path);
+}
+
+fn workflow_base_path() -> Option<&'static Path> {
+    WORKFLOW_BASE_PATH.get().map(PathBuf::as_path)
+}
+
+/// Parse a single `WORKFLOW.md` into its front-matter YAML value and prompt body.
+/// Returns `Ok(None)` when the file does not exist.
+fn read_workflow_file(path: &Path) -> anyhow::Result<Option<(serde_yaml::Value, String)>> {
+    let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(WorkflowDocument::default());
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-
-    let (front_matter, prompt_template) = split_front_matter_and_body(&contents);
-    let mut config = match front_matter {
-        None => WorkflowConfig::default(),
-        Some(front_matter) if front_matter.trim().is_empty() => WorkflowConfig::default(),
+    let (front_matter, body) = split_front_matter_and_body(&contents);
+    let value = match front_matter {
+        None => serde_yaml::Value::Null,
+        Some(front_matter) if front_matter.trim().is_empty() => serde_yaml::Value::Null,
         Some(front_matter) => serde_yaml::from_str(front_matter).map_err(|e| {
             anyhow::anyhow!(
                 "failed to parse workflow front matter at {}: {e}",
@@ -533,13 +546,105 @@ pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDoc
             )
         })?,
     };
+    Ok(Some((value, body.trim().to_string())))
+}
+
+/// Recursively merge `over` onto `base`. Mappings are merged key-by-key
+/// (recursing into nested mappings); a YAML `null` override keeps the base
+/// value; every other scalar/sequence override replaces the base value. This
+/// gives field-level override semantics for nested workflow policy.
+fn deep_merge_yaml(base: serde_yaml::Value, over: serde_yaml::Value) -> serde_yaml::Value {
+    use serde_yaml::Value;
+    match (base, over) {
+        (Value::Mapping(mut base_map), Value::Mapping(over_map)) => {
+            for (key, over_value) in over_map {
+                let merged = match base_map.remove(&key) {
+                    Some(base_value) => deep_merge_yaml(base_value, over_value),
+                    None => over_value,
+                };
+                base_map.insert(key, merged);
+            }
+            Value::Mapping(base_map)
+        }
+        // An explicit null override means "not set" — preserve the base value.
+        (base, Value::Null) => base,
+        // Scalars and sequences: the override wins outright.
+        (_, over) => over,
+    }
+}
+
+/// Load the workflow policy and prompt template for `project_root`.
+///
+/// Resolution: the central base `WORKFLOW.md` (registered via
+/// [`set_workflow_base_path`], normally `config/WORKFLOW.md` next to the server
+/// config) supplies defaults, and `{project_root}/WORKFLOW.md` — when present —
+/// is deep-merged on top with field-level override. Either file may be absent:
+/// if both are missing, defaults are returned with an empty prompt template.
+/// The repo body overrides the base body only when the repo provides one.
+pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDocument> {
+    load_workflow_document_with_base(project_root, workflow_base_path())
+}
+
+/// Core resolution with an explicit base path (kept separate from the global
+/// registration so it can be unit-tested without touching process state).
+fn load_workflow_document_with_base(
+    project_root: &Path,
+    base_path: Option<&Path>,
+) -> anyhow::Result<WorkflowDocument> {
+    let repo_path = project_root.join("WORKFLOW.md");
+    let repo = read_workflow_file(&repo_path)?;
+
+    // The base only applies when it is a distinct file from the repo's own
+    // WORKFLOW.md (otherwise a repo that *is* the config dir would merge with
+    // itself).
+    let base = match base_path {
+        Some(base_path) if workflow_paths_are_distinct(base_path, &repo_path) => {
+            read_workflow_file(base_path)?.map(|loaded| (base_path, loaded))
+        }
+        _ => None,
+    };
+
+    let (merged_value, prompt_template, source_path) = match (base, repo) {
+        (None, None) => return Ok(WorkflowDocument::default()),
+        (Some((base_path, (base_value, base_body))), None) => {
+            (base_value, base_body, base_path.display().to_string())
+        }
+        (None, Some((repo_value, repo_body))) => {
+            (repo_value, repo_body, repo_path.display().to_string())
+        }
+        (Some((base_path, (base_value, base_body))), Some((repo_value, repo_body))) => {
+            let merged = deep_merge_yaml(base_value, repo_value);
+            let body = if repo_body.is_empty() {
+                base_body
+            } else {
+                repo_body
+            };
+            let source = format!("{} + {}", base_path.display(), repo_path.display());
+            (merged, body, source)
+        }
+    };
+
+    let mut config: WorkflowConfig = match merged_value {
+        serde_yaml::Value::Null => WorkflowConfig::default(),
+        value => serde_yaml::from_value(value).map_err(|e| {
+            anyhow::anyhow!("failed to parse merged workflow front matter ({source_path}): {e}")
+        })?,
+    };
     config.runtime_dispatch.apply_default_activity_profiles();
 
     Ok(WorkflowDocument {
         config,
-        prompt_template: prompt_template.trim().to_string(),
-        source_path: Some(path.display().to_string()),
+        prompt_template,
+        source_path: Some(source_path),
     })
+}
+
+fn workflow_paths_are_distinct(left: &Path, right: &Path) -> bool {
+    workflow_path_identity(left) != workflow_path_identity(right)
+}
+
+fn workflow_path_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn split_front_matter_and_body(contents: &str) -> (Option<&str>, &str) {

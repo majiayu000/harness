@@ -1,6 +1,6 @@
 use crate::task_executor::pr_detection::{
-    build_fix_ci_prompt, build_pr_approved_prompt, build_pr_rework_prompt,
-    parse_harness_mention_command, HarnessMentionCommand,
+    build_fix_ci_prompt, build_pr_approved_prompt, parse_harness_mention_command,
+    HarnessMentionCommand,
 };
 use crate::task_runner::CreateTaskRequest;
 use serde::Deserialize;
@@ -63,8 +63,6 @@ struct GitHubIssuesEvent {
 #[derive(Debug, Deserialize)]
 struct GitHubPullRequestRef {
     number: u64,
-    #[serde(default)]
-    html_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,20 +93,6 @@ fn review_task_request(pr_number: u64, repo: &str) -> CreateTaskRequest {
     let mut req = CreateTaskRequest::default();
     req.pr = Some(pr_number);
     req.repo = Some(repo.to_string());
-    req
-}
-
-fn pr_rework_task_request(event: &GitHubPullRequestReviewEvent) -> CreateTaskRequest {
-    let mut req = CreateTaskRequest::default();
-    req.prompt = Some(build_pr_rework_prompt(
-        &event.repository.full_name,
-        event.pull_request.number,
-        &event.review.state,
-        event.review.body.as_deref().unwrap_or(""),
-        event.review.html_url.as_deref(),
-        event.pull_request.html_url.as_deref(),
-    ));
-    req.repo = Some(event.repository.full_name.clone());
     req
 }
 
@@ -268,9 +252,20 @@ pub(crate) fn parse_github_webhook_task_request(
             if parsed.action != "submitted" {
                 return Ok((None, "ignored pull_request_review action".to_string()));
             }
+            // Actionable review feedback (changes requested, or a non-empty
+            // commented review) is routed into the structured per-PR feedback
+            // workflow via `review_task_request` (which sets `pr`). That path is
+            // keyed by the PR and deduped (ActiveCommandExists), so multiple
+            // reviews on the same PR coalesce into one inspect_pr_feedback turn
+            // instead of spawning concurrent freeform reworks that race on the
+            // branch. The activity re-reads all PR feedback itself, so the review
+            // body does not need to be threaded through here.
             match parsed.review.state.to_ascii_lowercase().as_str() {
                 "changes_requested" => Ok((
-                    Some(pr_rework_task_request(&parsed)),
+                    Some(review_task_request(
+                        parsed.pull_request.number,
+                        &parsed.repository.full_name,
+                    )),
                     "pr review changes_requested".to_string(),
                 )),
                 "approved" => Ok((
@@ -283,7 +278,10 @@ pub(crate) fn parse_github_webhook_task_request(
                         return Ok((None, "pr review comment: empty body ignored".to_string()));
                     }
                     Ok((
-                        Some(pr_rework_task_request(&parsed)),
+                        Some(review_task_request(
+                            parsed.pull_request.number,
+                            &parsed.repository.full_name,
+                        )),
                         "pr review comment: actionable feedback".to_string(),
                     ))
                 }
@@ -799,11 +797,10 @@ mod tests {
         let request = request.expect("request should exist");
         assert_eq!(reason, "pr review changes_requested");
         assert_eq!(request.repo.as_deref(), Some("org/repo"));
-        let prompt = request.prompt.unwrap();
-        assert!(prompt.contains("PR #10"));
-        assert!(prompt.contains("org/repo"));
-        assert!(prompt.contains("changes_requested"));
-        assert!(prompt.contains("Please fix the error handling"));
+        // Actionable reviews now route through the structured per-PR feedback
+        // sweep (pr set → deduped), not a freeform rework prompt.
+        assert_eq!(request.pr, Some(10));
+        assert!(request.prompt.is_none());
     }
 
     #[test]
@@ -865,8 +862,9 @@ mod tests {
         let request = request.expect("request should exist");
         assert_eq!(reason, "pr review comment: actionable feedback");
         assert_eq!(request.repo.as_deref(), Some("org/repo"));
-        let prompt = request.prompt.unwrap();
-        assert!(prompt.contains("Consider renaming this variable"));
+        // Routed through the structured per-PR feedback sweep, not a prompt.
+        assert_eq!(request.pr, Some(10));
+        assert!(request.prompt.is_none());
     }
 
     #[test]
