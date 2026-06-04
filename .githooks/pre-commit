@@ -10,16 +10,17 @@ echo "=== pre-commit: fmt ==="
 cargo fmt --all -- --check
 
 echo "=== pre-commit: clippy ==="
-RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 
 echo "=== pre-commit: test ==="
-# harness-server lib tests require a live Postgres instance.
-# Run them when a Harness database URL is set; otherwise skip them and let CI catch failures.
+# Live Postgres tests require a configured Harness database URL.
+# Run them when available; otherwise skip only the known live-Postgres lib tests
+# and let CI or a configured local database provide full DB coverage.
 if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
     cargo test --workspace --lib
 else
-    echo "HARNESS_DATABASE_URL not set — skipping Postgres-dependent lib tests (harness-server, harness-observe, harness-workflow)"
-    cargo test --workspace --lib --exclude harness-server --exclude harness-observe --exclude harness-workflow
+    echo "HARNESS_DATABASE_URL not set — skipping live Postgres lib tests"
+    cargo test --workspace --lib -- --skip db::tests
 fi
 
 echo "=== pre-commit: all checks passed ==="

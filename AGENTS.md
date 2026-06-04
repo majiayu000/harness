@@ -11,20 +11,25 @@ All outputs MUST be in English, including:
 
 ## Build
 
-- `cargo check` after every change
-- `cargo test` before commit
-- Before pushing a PR, ALWAYS run `RUSTFLAGS="-Dwarnings" cargo check --workspace --all-targets` to catch CI-equivalent errors (dead code, unused imports, missing match arms)
+- During implementation, prefer the smallest validation command that covers the changed surface:
+  - Single crate change: `cargo check -p <crate> --all-targets`
+  - Cross-crate API change: `cargo check --workspace --all-targets`
+  - Targeted behavior change: run the relevant `cargo test -p <crate> <test_filter>`
+- Do not run the CI-equivalent workspace check after every edit. Use it for final PR readiness or when warning-sensitive code changed.
+- Before committing, run `cargo fmt --all -- --check` plus the relevant package tests. Run full workspace tests when the change affects shared behavior, persistence, workflow runtime, or agent adapters.
+- Before pushing a PR, ALWAYS run `cargo clippy --workspace --all-targets -- -D warnings` to catch CI-equivalent warnings and lints (dead code, unused imports, missing match arms, clippy findings)
 - When adding a new enum variant, grep ALL match sites for that enum and update them — CI uses exhaustive match checks
 - Run `cargo fmt --all` before every commit — CI enforces `cargo fmt --all -- --check`
 - Dead code in `#[cfg(test)]` modules still triggers `-D warnings` in CI; delete unused test helpers instead of suppressing with `#[allow(dead_code)]`
-- Pre-commit hook (`.githooks/pre-commit`) runs fmt + clippy + test automatically. After cloning, activate with: `git config core.hooksPath .githooks`
+- Pre-commit hook (`.githooks/pre-commit`) runs fmt + clippy + tests as a final local gate. After cloning, activate with: `git config core.hooksPath .githooks`
+- Local Postgres-dependent tests require `HARNESS_DATABASE_URL`. Without it, the pre-commit hook skips the known live-Postgres lib tests and leaves full DB coverage to CI or a configured local database.
 
 ## Architecture
 
 Harness is an agent orchestration layer. It constructs prompts and manages lifecycle — agents (Codex CLI) decide how to execute.
 
 - ZERO `Command::new("gh")` or `Command::new("git")` calls inside harness crates — all GitHub/git interaction must be in agent prompts only
-- When user says "fix issue X" or "handle PR Y", ALWAYS delegate to harness server (`POST /tasks`) instead of implementing directly
+- When testing Harness product behavior for "fix issue X" or "handle PR Y", delegate to harness server (`POST /tasks`). For direct repository maintenance in this checkout, implement and verify the requested code change directly unless the user explicitly asks to exercise the Harness server flow.
 
 ## Glossary
 
@@ -62,9 +67,9 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 ## Server Operation
 
 - `harness serve` may be started from Codex when product behavior needs to be exercised, but start it with a sanitized environment so spawned agents do not inherit Codex/Claude wrapper variables.
-- Prefer a standalone terminal for long-running manual sessions. For Codex smoke tests, use:
+- Prefer a standalone terminal for long-running manual dogfood sessions. For Codex-launched smoke tests, use an explicit clean environment, for example:
   `env -u Codex -u CLAUDE_CODE_ENTRYPOINT ./target/release/harness serve --transport http --port 9800 --project-root <path>`
-- Before starting a server, check whether the target port is already in use. Stop only harness processes that this session started, unless the user explicitly asks otherwise.
+- Before starting a server, check whether the target port is already in use. Stop only harness processes you started yourself unless the user explicitly asks otherwise.
 
 ## Dependencies
 
