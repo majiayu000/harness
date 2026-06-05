@@ -377,73 +377,6 @@ print(data.get("status") or data.get("workflow", {}).get("state") or "unknown")
 PY
 }
 
-annotate_submission() {
-  local submission="$1"
-  local mode="$2"
-  local http_status="$3"
-  python3 - "$submission" "$mode" "$http_status" <<'PY'
-import json
-import sys
-
-path, mode, http_status = sys.argv[1:]
-raw = ""
-try:
-    with open(path, "r", encoding="utf-8") as fh:
-        raw = fh.read()
-except OSError:
-    raw = ""
-
-try:
-    data = json.loads(raw) if raw else {}
-except json.JSONDecodeError:
-    data = {"raw_response": raw}
-
-if not isinstance(data, dict):
-    data = {"raw_response": data}
-
-data["eval_submission_mode"] = mode
-data["http_status"] = http_status
-
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2, sort_keys=True)
-    fh.write("\n")
-PY
-}
-
-write_submission_failure_detail() {
-  local submission="$1"
-  local http_status="$2"
-  local task_detail="$3"
-  python3 - "$submission" "$http_status" "$task_detail" <<'PY'
-import json
-import sys
-
-submission_path, http_status, task_detail_path = sys.argv[1:]
-try:
-    with open(submission_path, "r", encoding="utf-8") as fh:
-        submission = json.load(fh)
-except (OSError, json.JSONDecodeError):
-    submission = {}
-
-error = (
-    submission.get("error")
-    or submission.get("message")
-    or submission.get("detail")
-    or submission.get("raw_response")
-    or "POST /tasks did not return a task"
-)
-
-detail = {
-    "status": "failed",
-    "error": error,
-    "http_status": http_status,
-}
-with open(task_detail_path, "w", encoding="utf-8") as fh:
-    json.dump(detail, fh, indent=2, sort_keys=True)
-    fh.write("\n")
-PY
-}
-
 snapshot_summary() {
   python3 - "$1" <<'PY'
 import json
@@ -470,41 +403,6 @@ from urllib.parse import quote
 
 print(quote(sys.argv[1], safe=""))
 PY
-}
-
-post_task() {
-  local body="$1"
-  local out="$2"
-  local status_file="$3"
-  local response
-  local http_status
-  local curl_status
-  response="$(mktemp)"
-
-  set +e
-  http_status="$(
-    curl "${post_curl_args[@]}" \
-      -X POST "$SERVER_URL/tasks" \
-      -H "Content-Type: application/json" \
-      --data @"$body" \
-      -o "$response" \
-      -w "%{http_code}"
-  )"
-  curl_status=$?
-  set -e
-
-  cp "$response" "$out"
-  rm -f "$response"
-
-  if [[ "$curl_status" -ne 0 ]]; then
-    printf "000\n" > "$status_file"
-    return "$curl_status"
-  fi
-
-  printf "%s\n" "$http_status" > "$status_file"
-  if [[ ! "$http_status" =~ ^2 ]]; then
-    return 22
-  fi
 }
 
 classify_snapshot() {
@@ -776,7 +674,6 @@ FINAL_JSON="$OUTPUT_DIR/final_pr.json"
 SUBMISSION_JSON="$OUTPUT_DIR/submission.json"
 TASK_DETAIL_JSON="$OUTPUT_DIR/task_detail_final.json"
 TASK_BODY_JSON="$OUTPUT_DIR/task_body.json"
-SUBMISSION_STATUS_TXT="$OUTPUT_DIR/submission.http_status"
 HEALTH_JSON="$OUTPUT_DIR/health.json"
 
 echo "Collecting baseline for $REPO#$PR"
@@ -790,10 +687,8 @@ if [[ "$COLLECT_ONLY" -eq 1 ]]; then
 fi
 
 curl_args=(-fsS --max-time 5)
-post_curl_args=(-sS --max-time 5)
 if [[ -n "${HARNESS_API_TOKEN:-}" ]]; then
   curl_args+=(-H "Authorization: Bearer ${HARNESS_API_TOKEN}")
-  post_curl_args+=(-H "Authorization: Bearer ${HARNESS_API_TOKEN}")
 fi
 
 if ! curl "${curl_args[@]}" "$SERVER_URL/health" > "$HEALTH_JSON"; then
@@ -835,11 +730,9 @@ print(json.dumps(body, indent=2))
 PY
 
 echo "Submitting Harness PR repair task"
-if ! post_task "$TASK_BODY_JSON" "$SUBMISSION_JSON" "$SUBMISSION_STATUS_TXT"; then
-  submission_http_status="$(cat "$SUBMISSION_STATUS_TXT")"
-  annotate_submission "$SUBMISSION_JSON" "prompt_task" "$submission_http_status"
-  write_submission_failure_detail "$SUBMISSION_JSON" "$submission_http_status" "$TASK_DETAIL_JSON"
-  echo "POST /tasks failed with HTTP $submission_http_status; see $SUBMISSION_JSON" >&2
+if ! python3 "$(dirname "$0")/evaluate_pr_repair_submit.py" --server-url "$SERVER_URL" --body "$TASK_BODY_JSON" --output "$SUBMISSION_JSON" --mode prompt_task; then
+  printf '{"status":"failed"}\n' > "$TASK_DETAIL_JSON"
+  echo "POST /tasks failed; see $SUBMISSION_JSON" >&2
   echo "Collecting final PR snapshot"
   collect_snapshot "$FINAL_JSON"
   snapshot_summary "$FINAL_JSON"
@@ -847,8 +740,6 @@ if ! post_task "$TASK_BODY_JSON" "$SUBMISSION_JSON" "$SUBMISSION_STATUS_TXT"; th
   echo "Evaluation report: $OUTPUT_DIR/summary.md"
   exit 4
 fi
-submission_http_status="$(cat "$SUBMISSION_STATUS_TXT")"
-annotate_submission "$SUBMISSION_JSON" "prompt_task" "$submission_http_status"
 
 TASK_ID="$(python3 - "$SUBMISSION_JSON" <<'PY'
 import json
@@ -864,7 +755,7 @@ print(data.get("task_id") or data.get("submission_id") or "")
 PY
 )"
 if [[ -z "$TASK_ID" ]]; then
-  write_submission_failure_detail "$SUBMISSION_JSON" "$submission_http_status" "$TASK_DETAIL_JSON"
+  printf '{"status":"failed"}\n' > "$TASK_DETAIL_JSON"
   echo "POST /tasks did not return task_id; see $SUBMISSION_JSON" >&2
   echo "Collecting final PR snapshot"
   collect_snapshot "$FINAL_JSON"
