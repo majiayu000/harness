@@ -11,6 +11,7 @@ use super::round_cost;
 
 const CCSTATS_TIMEOUT_SECS: u64 = 15;
 const CCSTATS_CACHE_TTL_SECS: u64 = 60;
+const CCSTATS_RANGE_KIND: &str = "local_calendar_days";
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct CcstatsLocalSource {
@@ -231,7 +232,7 @@ fn source_from_rows(
         display_name,
         status: "available",
         message: None,
-        range: "local_date_range",
+        range: CCSTATS_RANGE_KIND,
         since: since.to_string(),
         until: until.to_string(),
         input_tokens: aggregate.input_tokens,
@@ -257,7 +258,7 @@ fn unavailable_source(
         display_name,
         status: "unavailable",
         message: Some(message),
-        range: "local_date_range",
+        range: CCSTATS_RANGE_KIND,
         since: since.to_string(),
         until: until.to_string(),
         input_tokens: 0,
@@ -379,6 +380,7 @@ mod tests {
         let source = source_from_rows("codex", "Codex", "2026-06-04", "2026-06-04", rows);
 
         assert_eq!(source.status, "available");
+        assert_eq!(source.range, CCSTATS_RANGE_KIND);
         assert_eq!(source.total_tokens, 165);
         assert_eq!(source.estimated_cost_usd, Some(0.3333));
         assert_eq!(source.models.len(), 1);
@@ -397,6 +399,7 @@ mod tests {
         );
 
         assert_eq!(source.status, "unavailable");
+        assert_eq!(source.range, CCSTATS_RANGE_KIND);
         assert_eq!(source.estimated_cost_usd, None);
         assert_eq!(source.message.as_deref(), Some("ccstats missing"));
     }

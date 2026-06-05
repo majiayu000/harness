@@ -97,7 +97,7 @@ function LocalUsageSourcesTable({ sources }: { sources: LocalUsageSource[] }) {
             <th className="text-right font-medium px-4 py-2">Tokens</th>
             <th className="text-right font-medium px-4 py-2">Cost</th>
             <th className="text-left font-medium px-4 py-2">Model</th>
-            <th className="text-left font-medium px-4 py-2">Range</th>
+            <th className="text-left font-medium px-4 py-2">Local days</th>
             <th className="text-left font-medium px-4 py-2">Status</th>
           </tr>
         </thead>
@@ -111,7 +111,7 @@ function LocalUsageSourcesTable({ sources }: { sources: LocalUsageSource[] }) {
                   <td className="px-4 py-2 text-right text-ink">{fmtTokens(source.total_tokens)}</td>
                   <td className="px-4 py-2 text-right text-ink-2">{fmtCost(source.estimated_cost_usd)}</td>
                   <td className="px-4 py-2 text-ink-2 max-w-[180px] truncate" title={topModel}>{topModel}</td>
-                  <td className="px-4 py-2 text-ink-3">{source.since} / {source.until}</td>
+                  <td className="px-4 py-2 text-ink-3" title={source.range}>{source.since} / {source.until}</td>
                   <td className="px-4 py-2 text-ink-3 max-w-[260px] truncate" title={source.message ?? source.status}>
                     {source.status === "available" ? "available" : source.message ?? "unavailable"}
                   </td>
@@ -319,7 +319,7 @@ export function UsageMonitor() {
           </div>
 
           <div className="grid grid-cols-3">
-            <Panel title="Local ccstats totals" sub="cached source totals" className="border-r border-line">
+            <Panel title="Local ccstats day totals" sub="full local days, cached" className="border-r border-line">
               <LocalUsageSourcesTable sources={data?.local_usage_sources ?? []} />
             </Panel>
             <Panel title="Tokens by agent" sub="completed turns" className="border-r border-line">
