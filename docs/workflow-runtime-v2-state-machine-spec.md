@@ -69,7 +69,7 @@ The design is based on a ten-lane static audit of the current runtime:
 - Keep `pr_feedback` as a long-lived independent state machine with
   non-terminal outcome states.
 - Hide unavailable runtime storage behind empty counts or default policies.
-- Start `harness serve` from inside Codex sessions.
+- Change long-running server process ownership policy.
 
 ## Runtime Ownership
 

@@ -18,7 +18,12 @@ The binary is at `./target/release/harness`.
 
 ## Server Startup
 
-> **Important:** Never start the server from within Claude Code or other agent sessions. The `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` environment variables propagate to spawned agents and cause SIGTRAP crashes. Always use a standalone terminal.
+`harness serve` can be started from a normal terminal or from an agent session
+when product behavior needs live verification. Caller-side Codex/Claude
+environment cleanup is not required before startup; Harness owns the child
+agent environment boundary. For long-running manual dogfood sessions, a
+standalone terminal remains a convenient way for the operator to own the
+process lifetime directly.
 
 ### Single Project
 
@@ -653,7 +658,10 @@ macOS Seatbelt sandbox blocks Claude Code syscalls. Set `sandbox_mode = "danger-
 
 ### Tasks fail with SIGTRAP
 
-Started server from within Claude Code. Restart from a standalone terminal.
+Use a current Harness binary and inspect the server logs for the failing
+adapter command. Harness protects spawned child agents from wrapper-specific
+environment leakage; a SIGTRAP usually points to a stale binary, adapter
+configuration, or macOS sandbox setting rather than the parent shell alone.
 
 ### Codex review shows "unexpected argument"
 

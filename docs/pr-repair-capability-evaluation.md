@@ -142,7 +142,7 @@ class. Use this before every live repair run.
 
 ### Level 2: Harness Live PR Repair
 
-Start Harness from a standalone terminal, not from a Codex session:
+Start or reuse a Harness server:
 
 ```bash
 ./target/release/harness serve \

@@ -406,7 +406,12 @@ path.
 
 ## Server Startup
 
-**Important:** Always start the server from a standalone terminal, not from within Claude Code or other agent sessions. Agent environment variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) propagate to spawned subprocesses and cause SIGTRAP.
+`harness serve` can be started from a normal terminal or from an agent session
+when product behavior needs live verification. Caller-side Codex/Claude
+environment cleanup is not required before startup; Harness owns the child
+agent environment boundary. For long-running manual dogfood sessions, a
+standalone terminal is still useful because the operator owns the process
+lifetime directly.
 
 ```bash
 # Single project (backward compatible)

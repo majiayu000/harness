@@ -151,7 +151,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     // Run one reconciliation tick against GitHub before any recovery so that
     // recovery decisions are made on fresh GitHub truth.
-    {
+    if state.core.server.config.reconciliation.enabled {
         let max_calls = state
             .core
             .server
@@ -167,6 +167,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             state.core.server.config.server.github_token.as_deref(),
         )
         .await;
+    } else {
+        tracing::debug!("startup reconciliation disabled by config");
     }
 
     // Re-dispatch tasks that were recovered to pending after server restart.
