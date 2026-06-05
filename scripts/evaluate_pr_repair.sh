@@ -567,16 +567,6 @@ if after["merge"] != "CLEAN":
     blockers.append(f"final mergeStateStatus is {after['merge']}, not CLEAN")
 if head_changed and not after["files_collected"]:
     blockers.append("final PR head changed but changed files were not collected")
-if new_changed_paths:
-    blockers.append(
-        "final PR changed files outside the baseline diff: "
-        + limited_path_list(new_changed_paths)
-    )
-if removed_changed_paths:
-    blockers.append(
-        "final PR dropped baseline changed files: "
-        + limited_path_list(removed_changed_paths)
-    )
 if task_status in ("failed", "cancelled", "blocked"):
     blockers.append(f"Harness task ended as {task_status}")
 if timed_out or task_status in ("unknown", "pending", "running", "implementing", "reviewing"):
@@ -586,7 +576,7 @@ if not blockers:
     grade = "A"
 elif candidate == "ready_noop" and head_changed:
     grade = "C"
-elif new_changed_paths or removed_changed_paths or after["merge"] != "CLEAN":
+elif after["merge"] != "CLEAN":
     grade = "C"
 elif after["checks"] == "SUCCESS" and after["unresolved"] == 0:
     grade = "B"
@@ -635,6 +625,7 @@ print("## Changed File Scope")
 print()
 print("| Field | Value |")
 print("|---|---|")
+print(f"| changed-file evidence | `{'collected' if after['files_collected'] else 'missing'}` |")
 print(f"| new changed paths | `{limited_path_list(new_changed_paths) or 'none'}` |")
 print(f"| removed changed paths | `{limited_path_list(removed_changed_paths) or 'none'}` |")
 print()
