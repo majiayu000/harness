@@ -533,11 +533,17 @@ import json
 import sys
 
 project_root, repo, pr, wait_secs, max_rounds, max_turns, max_budget = sys.argv[1:]
+wait_secs_value = int(wait_secs)
+max_rounds_value = int(max_rounds)
+max_turns_value = int(max_turns)
 body = {
     "project": project_root,
     "repo": repo,
     "source": "pr_repair_eval",
     "external_id": f"pr-repair-eval:{repo}#{pr}",
+    "wait_secs": wait_secs_value,
+    "max_rounds": max_rounds_value,
+    "max_turns": max_turns_value,
     "prompt": (
         f"PR repair capability evaluation for {repo}#{pr}. Inspect the current "
         "PR feedback, status checks, mergeability, and head SHA. Address "
@@ -550,6 +556,8 @@ body = {
         "continuing. Report the validation commands and final PR evidence."
     ),
 }
+if max_budget:
+    body["max_budget_usd"] = float(max_budget)
 print(json.dumps(body, indent=2))
 PY
 
