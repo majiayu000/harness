@@ -1,15 +1,18 @@
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
+use std::{sync::OnceLock, time::Instant};
 use tokio::{
     process::Command,
+    sync::Mutex,
     time::{timeout, Duration},
 };
 
 use super::round_cost;
 
 const CCSTATS_TIMEOUT_SECS: u64 = 15;
+const CCSTATS_CACHE_TTL_SECS: u64 = 60;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct CcstatsLocalSource {
     pub source: &'static str,
     pub display_name: &'static str,
@@ -86,10 +89,61 @@ pub(super) async fn load_ccstats_local_sources(
     let since = since.with_timezone(&Local).date_naive().to_string();
     let until = until.with_timezone(&Local).date_naive().to_string();
 
-    let codex = load_ccstats_source("codex", "Codex", &since, &until);
-    let claude = load_ccstats_source("claude", "Claude", &since, &until);
+    let mut cache = ccstats_local_sources_cache().lock().await;
+    if let Some(sources) = cache
+        .as_ref()
+        .and_then(|entry| cached_local_sources(entry, &since, &until, Instant::now()))
+    {
+        return sources;
+    }
+
+    let sources = load_ccstats_local_sources_uncached(&since, &until).await;
+    *cache = Some(CcstatsLocalSourcesCacheEntry {
+        since,
+        until,
+        loaded_at: Instant::now(),
+        sources: sources.clone(),
+    });
+    sources
+}
+
+async fn load_ccstats_local_sources_uncached(since: &str, until: &str) -> Vec<CcstatsLocalSource> {
+    let codex = load_ccstats_source("codex", "Codex", since, until);
+    let claude = load_ccstats_source("claude", "Claude", since, until);
     let (codex, claude) = tokio::join!(codex, claude);
     vec![codex, claude]
+}
+
+#[derive(Debug)]
+struct CcstatsLocalSourcesCacheEntry {
+    since: String,
+    until: String,
+    loaded_at: Instant,
+    sources: Vec<CcstatsLocalSource>,
+}
+
+static CCSTATS_LOCAL_SOURCES_CACHE: OnceLock<Mutex<Option<CcstatsLocalSourcesCacheEntry>>> =
+    OnceLock::new();
+
+fn ccstats_local_sources_cache() -> &'static Mutex<Option<CcstatsLocalSourcesCacheEntry>> {
+    CCSTATS_LOCAL_SOURCES_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_local_sources(
+    entry: &CcstatsLocalSourcesCacheEntry,
+    since: &str,
+    until: &str,
+    now: Instant,
+) -> Option<Vec<CcstatsLocalSource>> {
+    if entry.since == since
+        && entry.until == until
+        && now.saturating_duration_since(entry.loaded_at)
+            < Duration::from_secs(CCSTATS_CACHE_TTL_SECS)
+    {
+        Some(entry.sources.clone())
+    } else {
+        None
+    }
 }
 
 pub(super) fn any_ccstats_source_available(sources: &[CcstatsLocalSource]) -> bool {
@@ -158,7 +212,14 @@ fn source_from_rows(
         aggregate.add_row(row);
     }
 
-    let mut models = aggregate.models.into_values().collect::<Vec<_>>();
+    let mut models = aggregate
+        .models
+        .into_values()
+        .map(|mut model| {
+            model.estimated_cost_usd = model.estimated_cost_usd.map(round_cost);
+            model
+        })
+        .collect::<Vec<_>>();
     models.sort_by(|a, b| {
         b.total_tokens
             .cmp(&a.total_tokens)
@@ -322,7 +383,7 @@ mod tests {
         assert_eq!(source.estimated_cost_usd, Some(0.3333));
         assert_eq!(source.models.len(), 1);
         assert_eq!(source.models[0].total_tokens, 165);
-        assert_eq!(source.models[0].estimated_cost_usd, Some(0.33333));
+        assert_eq!(source.models[0].estimated_cost_usd, Some(0.3333));
     }
 
     #[test]
@@ -338,5 +399,49 @@ mod tests {
         assert_eq!(source.status, "unavailable");
         assert_eq!(source.estimated_cost_usd, None);
         assert_eq!(source.message.as_deref(), Some("ccstats missing"));
+    }
+
+    #[test]
+    fn cached_local_sources_returns_fresh_matching_range() {
+        let now = Instant::now();
+        let entry = CcstatsLocalSourcesCacheEntry {
+            since: "2026-06-04".to_string(),
+            until: "2026-06-05".to_string(),
+            loaded_at: now - Duration::from_secs(CCSTATS_CACHE_TTL_SECS - 1),
+            sources: vec![unavailable_source(
+                "codex",
+                "Codex",
+                "2026-06-04",
+                "2026-06-05",
+                "ccstats missing".to_string(),
+            )],
+        };
+
+        let Some(sources) = cached_local_sources(&entry, "2026-06-04", "2026-06-05", now) else {
+            panic!("fresh matching range should be cached");
+        };
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source, "codex");
+    }
+
+    #[test]
+    fn cached_local_sources_misses_expired_or_different_range() {
+        let now = Instant::now();
+        let entry = CcstatsLocalSourcesCacheEntry {
+            since: "2026-06-04".to_string(),
+            until: "2026-06-05".to_string(),
+            loaded_at: now - Duration::from_secs(CCSTATS_CACHE_TTL_SECS),
+            sources: vec![unavailable_source(
+                "codex",
+                "Codex",
+                "2026-06-04",
+                "2026-06-05",
+                "ccstats missing".to_string(),
+            )],
+        };
+
+        assert!(cached_local_sources(&entry, "2026-06-04", "2026-06-05", now).is_none());
+        assert!(cached_local_sources(&entry, "2026-06-03", "2026-06-05", now).is_none());
     }
 }

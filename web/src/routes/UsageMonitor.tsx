@@ -325,7 +325,7 @@ export function UsageMonitor() {
             <Panel title="Tokens by agent" sub="completed turns" className="border-r border-line">
               <UsageGroupsTable rows={data?.tokens_by_agent ?? []} empty="no token events" />
             </Panel>
-            <Panel title="Tokens by project" sub="completed turns" className="border-r border-line">
+            <Panel title="Tokens by project" sub="completed turns">
               <UsageGroupsTable rows={data?.tokens_by_project ?? []} empty="no project usage" />
             </Panel>
           </div>
