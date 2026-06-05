@@ -98,8 +98,7 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         reviewer_gate(&input),
     ];
 
-    let objective_score = score_breakdown(
-        &input,
+    let gate_signals = GateSignals {
         target_matches,
         branch_safe,
         no_unrelated_pr,
@@ -108,7 +107,8 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         checks_passing,
         review_threads_closed,
         runtime_complete,
-    );
+    };
+    let objective_score = score_breakdown(&input, gate_signals);
     let final_score = objective_score.total();
     let raw_grade = EvalGrade::from_score(final_score);
     let grade_cap = most_restrictive_cap(&hard_gates);
@@ -246,8 +246,8 @@ fn most_restrictive_cap(gates: &[HardGateResult]) -> Option<EvalGrade> {
         .min_by_key(|grade| grade.rank())
 }
 
-fn score_breakdown(
-    input: &PrRepairEvalInput,
+#[derive(Copy, Clone)]
+struct GateSignals {
     target_matches: bool,
     branch_safe: bool,
     no_unrelated_pr: bool,
@@ -256,10 +256,12 @@ fn score_breakdown(
     checks_passing: bool,
     review_threads_closed: bool,
     runtime_complete: bool,
-) -> ScoreBreakdown {
+}
+
+fn score_breakdown(input: &PrRepairEvalInput, gates: GateSignals) -> ScoreBreakdown {
     let changed_or_noop = input.scenario == EvalScenario::ReadyNoopControl
         || input.baseline_pr.head_oid != input.final_pr.head_oid;
-    let current_head_verified = final_evidence_fresh && checks_passing;
+    let current_head_verified = gates.final_evidence_fresh && gates.checks_passing;
     let has_usage = input.usage.iter().any(|usage| usage.total_tokens.is_some());
     let has_confident_usage = input.usage.iter().any(|usage| {
         usage.token_confidence != Confidence::Unknown
@@ -269,7 +271,7 @@ fn score_breakdown(
     ScoreBreakdown {
         task_classification_and_baseline_evidence: component(
             ScoreDimensionName::TaskClassificationAndBaselineEvidence,
-            if target_matches && !input.baseline_pr.collected_at.is_empty() {
+            if gates.target_matches && !input.baseline_pr.collected_at.is_empty() {
                 12
             } else {
                 4
@@ -278,12 +280,16 @@ fn score_breakdown(
         ),
         feedback_discovery_and_prioritization: component(
             ScoreDimensionName::FeedbackDiscoveryAndPrioritization,
-            if review_threads_closed { 14 } else { 4 },
+            if gates.review_threads_closed { 14 } else { 4 },
             14,
         ),
         branch_and_pr_safety: component(
             ScoreDimensionName::BranchAndPrSafety,
-            if target_matches && branch_safe && no_unrelated_pr && scope_contained {
+            if gates.target_matches
+                && gates.branch_safe
+                && gates.no_unrelated_pr
+                && gates.scope_contained
+            {
                 10
             } else {
                 0
@@ -302,7 +308,7 @@ fn score_breakdown(
         ),
         runtime_workflow_behavior_and_persistence: component(
             ScoreDimensionName::RuntimeWorkflowBehaviorAndPersistence,
-            if runtime_complete { 12 } else { 0 },
+            if gates.runtime_complete { 12 } else { 0 },
             12,
         ),
         cost_and_time_efficiency: component(
@@ -312,7 +318,7 @@ fn score_breakdown(
         ),
         reporting_and_attribution_quality: component(
             ScoreDimensionName::ReportingAndAttributionQuality,
-            if runtime_complete && final_evidence_fresh && has_confident_usage {
+            if gates.runtime_complete && gates.final_evidence_fresh && has_confident_usage {
                 6
             } else {
                 2
