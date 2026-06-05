@@ -7,7 +7,7 @@ import { PaletteFab } from "@/components/PaletteFab";
 import { DOCS_URL } from "@/lib/links";
 import { fmtInt } from "@/lib/format";
 import { useUsageMonitor } from "@/lib/queries";
-import type { ActiveCount, AgentInvocation, AgentProcess, UsageGroup } from "@/types";
+import type { ActiveCount, AgentInvocation, AgentProcess, LocalUsageSourceSummary, UsageGroup } from "@/types";
 
 function fmtTokens(tokens: number | null | undefined): string {
   if (tokens == null || !Number.isFinite(tokens)) return "-";
@@ -199,6 +199,46 @@ function ExternalProcessesTable({ processes }: { processes: AgentProcess[] }) {
   );
 }
 
+function LocalUsageSourcesTable({ sources }: { sources: LocalUsageSourceSummary[] }) {
+  return (
+    <div className="overflow-auto">
+      <table className="w-full border-collapse font-mono text-[11.5px]">
+        <thead className="text-ink-3 border-b border-line">
+          <tr>
+            <th className="text-left font-medium px-4 py-2">Source</th>
+            <th className="text-left font-medium px-4 py-2">Range</th>
+            <th className="text-right font-medium px-4 py-2">Tokens</th>
+            <th className="text-right font-medium px-4 py-2">Periods</th>
+            <th className="text-right font-medium px-4 py-2">Cost</th>
+            <th className="text-left font-medium px-4 py-2">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sources.length ? (
+            sources.map((source) => (
+              <tr key={source.source} className="border-b border-line/70">
+                <td className="px-4 py-2 text-ink">{source.display_name}</td>
+                <td className="px-4 py-2 text-ink-3">{source.since} / {source.until}</td>
+                <td className="px-4 py-2 text-right text-ink">{fmtTokens(source.total_tokens)}</td>
+                <td className="px-4 py-2 text-right text-ink-2">{fmtInt(source.period_count)}</td>
+                <td className="px-4 py-2 text-right text-ink-2">{fmtCost(source.estimated_cost_usd)}</td>
+                <td className="px-4 py-2 text-ink-3 max-w-[260px] truncate" title={source.error ?? source.cost_confidence}>
+                  {source.status}
+                  {source.model_count ? <span className="text-ink-4"> / {fmtInt(source.model_count)} models</span> : null}
+                </td>
+              </tr>
+            ))
+          ) : (
+            <tr>
+              <td className="px-4 py-6 text-ink-3" colSpan={6}>no local source summaries</td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export function UsageMonitor() {
   const { data, isError } = useUsageMonitor();
 
@@ -287,6 +327,13 @@ export function UsageMonitor() {
               <UsageGroupsTable rows={data?.tokens_by_model ?? []} empty="no model usage" />
             </Panel>
           </div>
+
+          <Panel
+            title="Local ccstats sources"
+            sub="global Codex and Claude logs outside workflow attribution"
+          >
+            <LocalUsageSourcesTable sources={data?.local_usage_sources ?? []} />
+          </Panel>
 
           <Panel
             title="External local CLI processes"
