@@ -436,6 +436,8 @@ if after["unresolved"] > 0:
     blockers.append(f"{after['unresolved']} active unresolved review threads remain")
 if candidate in ("review_feedback_repair", "ci_repair") and not head_changed:
     blockers.append("PR head did not change for a repair candidate")
+if candidate == "ready_noop" and head_changed:
+    blockers.append("ready/no-op control changed the PR head")
 if candidate == "mergeability_repair" and after["merge"] != "CLEAN":
     blockers.append(f"final mergeStateStatus is {after['merge']}, not CLEAN")
 if task_status in ("failed", "cancelled", "blocked"):
@@ -444,7 +446,9 @@ if timed_out or task_status in ("unknown", "pending", "running", "implementing",
     blockers.append("Harness task did not reach a terminal state before the evaluation timeout")
 
 if not blockers:
-    grade = "A" if candidate != "ready_noop" or not head_changed else "B"
+    grade = "A"
+elif candidate == "ready_noop" and head_changed:
+    grade = "C"
 elif after["checks"] == "SUCCESS" and after["unresolved"] == 0:
     grade = "B"
 elif head_changed or after["checks"] == "SUCCESS" or after["unresolved"] < before["unresolved"]:
