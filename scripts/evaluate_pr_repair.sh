@@ -13,9 +13,9 @@ Options:
   --project-root PATH     Local project root sent to POST /tasks. Default: current directory.
   --output DIR            Report directory. Default: docs/pr-repair-evals/<timestamp>-<repo>-pr<N>
   --collect-only          Collect GitHub baseline only; do not submit a Harness task.
-  --wait-secs N           Harness review wait seconds. Default: 10
-  --max-rounds N          Harness max review rounds. Default: 2
-  --max-turns N           Harness max agent turns. Default: 6
+  --wait-secs N           Eval wait guidance included in the task prompt. Default: 10
+  --max-rounds N          Eval round guidance included in the task prompt. Default: 2
+  --max-turns N           Eval turn guidance included in the task prompt. Default: 6
   --max-budget-usd N      Optional Harness max budget in USD.
   --poll-secs N           Poll interval for GET /tasks/{id}. Default: 30
   --timeout-secs N        Overall task poll timeout. Default: 7200
@@ -364,11 +364,26 @@ write_final_report() {
   local task_detail="$4"
   local timed_out="$5"
   local report="$OUTPUT_DIR/summary.md"
-  python3 - "$baseline" "$final" "$submission" "$task_detail" "$RUN_ID" "$REPO" "$PR" "$SERVER_URL" "$timed_out" <<'PY' > "$report"
+  python3 - "$baseline" "$final" "$submission" "$task_detail" "$RUN_ID" "$REPO" "$PR" "$SERVER_URL" "$timed_out" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" "$TIMEOUT_SECS" <<'PY' > "$report"
 import json
 import sys
 
-baseline_path, final_path, submission_path, task_detail_path, run_id, repo, pr_number, server_url, timed_out_arg = sys.argv[1:]
+(
+    baseline_path,
+    final_path,
+    submission_path,
+    task_detail_path,
+    run_id,
+    repo,
+    pr_number,
+    server_url,
+    timed_out_arg,
+    wait_secs,
+    max_rounds,
+    max_turns,
+    max_budget,
+    timeout_secs,
+) = sys.argv[1:]
 
 def load(path):
     try:
@@ -419,6 +434,8 @@ if after["unresolved"] > 0:
     blockers.append(f"{after['unresolved']} active unresolved review threads remain")
 if candidate in ("review_feedback_repair", "ci_repair") and not head_changed:
     blockers.append("PR head did not change for a repair candidate")
+if candidate == "mergeability_repair" and after["merge"] != "CLEAN":
+    blockers.append(f"final mergeStateStatus is {after['merge']}, not CLEAN")
 if task_status in ("failed", "cancelled", "blocked"):
     blockers.append(f"Harness task ended as {task_status}")
 if timed_out or task_status in ("unknown", "pending", "running", "implementing", "reviewing"):
@@ -447,6 +464,16 @@ print(f"- Workflow ID: `{workflow_id}`")
 print(f"- Task status: `{task_status}`")
 print(f"- Timed out: `{str(timed_out).lower()}`")
 print(f"- Grade: `{grade}`")
+print()
+print("## Eval Bounds")
+print()
+print("| Field | Value |")
+print("|---|---|")
+print(f"| `wait_secs` | `{wait_secs}` |")
+print(f"| `max_rounds` | `{max_rounds}` |")
+print(f"| `max_turns` | `{max_turns}` |")
+print(f"| `max_budget_usd` | `{max_budget or 'not set'}` |")
+print(f"| `timeout_secs` | `{timeout_secs}` |")
 print()
 print("## Baseline vs Final")
 print()
@@ -505,19 +532,18 @@ body = {
     "repo": repo,
     "source": "pr_repair_eval",
     "external_id": f"pr-repair-eval:{repo}#{pr}",
-    "wait_secs": int(wait_secs),
-    "max_rounds": int(max_rounds),
-    "max_turns": int(max_turns),
     "prompt": (
         f"PR repair capability evaluation for {repo}#{pr}. Inspect the current "
         "PR feedback, status checks, mergeability, and head SHA. Address "
         "actionable review feedback or failing checks with the smallest safe "
         "change. Commit and push only to the existing PR branch. Do not create "
-        "a new PR. Report the validation commands and final PR evidence."
+        "a new PR. Evaluation envelope: wait_secs="
+        f"{wait_secs}, max_rounds={max_rounds}, max_turns={max_turns}"
+        f"{', max_budget_usd=' + max_budget if max_budget else ''}. If those "
+        "bounds are insufficient, stop and report the limit instead of "
+        "continuing. Report the validation commands and final PR evidence."
     ),
 }
-if max_budget:
-    body["max_budget_usd"] = float(max_budget)
 print(json.dumps(body, indent=2))
 PY
 
