@@ -16,6 +16,7 @@ harness-rules = { workspace = true }
 harness-skills = { workspace = true }
 harness-observe = { workspace = true }
 harness-exec = { workspace = true }
+harness-eval = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

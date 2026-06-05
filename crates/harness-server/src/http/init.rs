@@ -29,7 +29,7 @@ fn resolve_project_root(configured_root: &std::path::Path) -> anyhow::Result<std
 
 /// Expand a leading `~/` or standalone `~` to the value of `$HOME`.
 /// Returns the path unchanged when `~` is not present or `HOME` is unset.
-pub(super) fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
     if let Some(s) = path.to_str() {
         if let Some(rest) = s.strip_prefix("~/") {
             if let Ok(home) = std::env::var("HOME") {

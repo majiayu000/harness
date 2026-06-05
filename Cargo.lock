@@ -1416,6 +1416,7 @@ dependencies = [
  "futures",
  "harness-agents",
  "harness-core",
+ "harness-eval",
  "harness-exec",
  "harness-gc",
  "harness-observe",
