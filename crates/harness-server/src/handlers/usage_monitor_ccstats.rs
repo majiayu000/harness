@@ -197,7 +197,18 @@ async fn run_ccstats(
         });
     }
 
-    serde_json::from_slice::<Vec<CcstatsDailyRow>>(&output.stdout)
+    parse_ccstats_daily_rows(&output.stdout)
+}
+
+fn parse_ccstats_daily_rows(stdout: &[u8]) -> Result<Vec<CcstatsDailyRow>, String> {
+    let stdout = std::str::from_utf8(stdout)
+        .map_err(|error| format!("ccstats stdout was not UTF-8: {error}"))?
+        .trim();
+    if stdout.is_empty() || (stdout.starts_with("No ") && stdout.ends_with(" data found.")) {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str::<Vec<CcstatsDailyRow>>(stdout)
         .map_err(|error| format!("failed to parse ccstats JSON: {error}"))
 }
 
@@ -402,6 +413,15 @@ mod tests {
         assert_eq!(source.range, CCSTATS_RANGE_KIND);
         assert_eq!(source.estimated_cost_usd, None);
         assert_eq!(source.message.as_deref(), Some("ccstats missing"));
+    }
+
+    #[test]
+    fn parse_ccstats_daily_rows_treats_no_data_output_as_empty_usage() {
+        assert_eq!(
+            parse_ccstats_daily_rows(b"No codex data found.\n").map(|rows| rows.len()),
+            Ok(0)
+        );
+        assert_eq!(parse_ccstats_daily_rows(b"").map(|rows| rows.len()), Ok(0));
     }
 
     #[test]
