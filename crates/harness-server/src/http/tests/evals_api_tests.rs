@@ -87,7 +87,6 @@ async fn eval_routes_persist_score_and_pr_lookup() -> anyhow::Result<()> {
         "pr_repair_eval_input"
     );
 
-    let score_body = serde_json::json!({});
     let score = app
         .clone()
         .oneshot(
@@ -95,7 +94,7 @@ async fn eval_routes_persist_score_and_pr_lookup() -> anyhow::Result<()> {
                 .method("POST")
                 .uri(format!("/api/evals/runs/{run_id}/score"))
                 .header("content-type", "application/json")
-                .body(Body::from(score_body.to_string()))?,
+                .body(Body::empty())?,
         )
         .await?;
     assert_eq!(score.status(), axum::http::StatusCode::OK);

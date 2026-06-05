@@ -1,5 +1,6 @@
 use anyhow::Context as _;
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
@@ -110,8 +111,12 @@ pub async fn list_eval_artifacts(
 pub async fn score_eval_run(
     State(state): State<Arc<AppState>>,
     Path(run_id): Path<String>,
-    Json(req): Json<ScoreEvalRunRequest>,
+    body: Bytes,
 ) -> (StatusCode, Json<Value>) {
+    let req = match parse_score_eval_run_request(&body) {
+        Ok(req) => req,
+        Err(error) => return bad_request(error),
+    };
     let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
@@ -140,6 +145,13 @@ pub async fn score_eval_run(
         Err(error) if is_request_error(&error) => bad_request(error.to_string()),
         Err(error) => internal_error("failed to score eval run", error),
     }
+}
+
+fn parse_score_eval_run_request(body: &Bytes) -> Result<ScoreEvalRunRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(ScoreEvalRunRequest { input: None });
+    }
+    serde_json::from_slice(body).map_err(|error| format!("invalid score request body: {error}"))
 }
 
 pub async fn get_eval_quality_snapshot(
