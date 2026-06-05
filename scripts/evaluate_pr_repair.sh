@@ -13,9 +13,9 @@ Options:
   --project-root PATH     Local project root sent to POST /tasks. Default: current directory.
   --output DIR            Report directory. Default: docs/pr-repair-evals/<timestamp>-<repo>-pr<N>
   --collect-only          Collect GitHub baseline only; do not submit a Harness task.
-  --wait-secs N           Eval wait guidance included in the task prompt. Default: 10
-  --max-rounds N          Eval round guidance included in the task prompt. Default: 2
-  --max-turns N           Eval turn guidance included in the task prompt. Default: 6
+  --wait-secs N           Structured Harness wait bound and task prompt guidance. Default: 10
+  --max-rounds N          Structured Harness round bound and task prompt guidance. Default: 2
+  --max-turns N           Structured Harness turn bound and task prompt guidance. Default: 6
   --max-budget-usd N      Optional Harness max budget in USD.
   --poll-secs N           Poll interval for GET /tasks/{id}. Default: 30
   --timeout-secs N        Overall task poll timeout. Default: 7200
@@ -181,10 +181,31 @@ query($owner:String!, $name:String!, $pr:Int!, $threadsCursor:String) {
   }
 }'
 
+GRAPHQL_FILES_QUERY='
+query($owner:String!, $name:String!, $pr:Int!, $filesCursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$pr) {
+      files(first: 100, after: $filesCursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          path
+          additions
+          deletions
+          changeType
+        }
+      }
+    }
+  }
+}'
+
 collect_snapshot() {
   local out="$1"
   local page
   local cursor=""
+  local files_cursor=""
   local tmp
   tmp="$(mktemp)"
 
@@ -261,8 +282,80 @@ else:
     print("")
 PY
 )"
+	    rm -f "$page"
+	    [[ -z "$cursor" ]] && break
+	  done
+
+  while :; do
+    page="$(mktemp)"
+    if [[ -n "$files_cursor" ]]; then
+      gh api graphql \
+        -f owner="$OWNER" \
+        -f name="$NAME" \
+        -F pr="$PR" \
+        -f filesCursor="$files_cursor" \
+        -f query="$GRAPHQL_FILES_QUERY" > "$page"
+    else
+      gh api graphql \
+        -f owner="$OWNER" \
+        -f name="$NAME" \
+        -F pr="$PR" \
+        -f query="$GRAPHQL_FILES_QUERY" > "$page"
+    fi
+
+    python3 - "$tmp" "$page" <<'PY'
+import json
+import sys
+
+tmp_path, page_path = sys.argv[1:]
+with open(page_path, "r", encoding="utf-8") as fh:
+    page = json.load(fh)
+
+pr = ((page.get("data") or {}).get("repository") or {}).get("pullRequest")
+if not pr:
+    raise SystemExit("GitHub GraphQL response did not include pullRequest")
+
+incoming_files = pr.get("files") or {}
+incoming_nodes = list(incoming_files.get("nodes") or [])
+incoming_page_info = incoming_files.get("pageInfo") or {}
+try:
+    with open(tmp_path, "r", encoding="utf-8") as fh:
+        existing = json.load(fh)
+except (FileNotFoundError, json.JSONDecodeError):
+    existing = {}
+
+existing_files = existing.setdefault("files", {})
+existing_files.setdefault("nodes", []).extend(incoming_nodes)
+existing_files["pageInfo"] = incoming_page_info
+
+with open(tmp_path, "w", encoding="utf-8") as fh:
+    json.dump(existing, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+
+    files_cursor="$(python3 - "$page" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except json.JSONDecodeError:
+    print("")
+    raise SystemExit(0)
+
+page_info = (
+    (((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {})
+    .get("files") or {}
+).get("pageInfo") or {}
+if page_info.get("hasNextPage"):
+    print(page_info.get("endCursor") or "")
+else:
+    print("")
+PY
+)"
     rm -f "$page"
-    [[ -z "$cursor" ]] && break
+    [[ -z "$files_cursor" ]] && break
   done
 
   mv "$tmp" "$out"
@@ -293,12 +386,13 @@ with open(sys.argv[1], "r", encoding="utf-8") as fh:
     pr = json.load(fh)
 
 threads = (((pr.get("reviewThreads") or {}).get("nodes")) or [])
+files = (((pr.get("files") or {}).get("nodes")) or [])
 active = [
     t for t in threads
     if not t.get("isResolved", False) and not t.get("isOutdated", False)
 ]
 status = (pr.get("statusCheckRollup") or {}).get("state") or "UNKNOWN"
-print(f"pr={pr.get('number')} head={pr.get('headRefOid')} merge={pr.get('mergeStateStatus')} checks={status} unresolved_threads={len(active)}")
+print(f"pr={pr.get('number')} head={pr.get('headRefOid')} merge={pr.get('mergeStateStatus')} checks={status} unresolved_threads={len(active)} changed_files={len(files)}")
 PY
 }
 
@@ -396,6 +490,7 @@ def load(path):
 
 def facts(pr):
     threads = (((pr.get("reviewThreads") or {}).get("nodes")) or [])
+    files = list(((pr.get("files") or {}).get("nodes")) or [])
     active = [
         t for t in threads
         if not t.get("isResolved", False) and not t.get("isOutdated", False)
@@ -405,7 +500,35 @@ def facts(pr):
         "merge": pr.get("mergeStateStatus") or "UNKNOWN",
         "checks": (pr.get("statusCheckRollup") or {}).get("state") or "UNKNOWN",
         "unresolved": len(active),
+        "files_collected": "files" in pr,
+        "changed_files": files,
+        "changed_file_paths": sorted({
+            f.get("path")
+            for f in files
+            if isinstance(f, dict) and f.get("path")
+        }),
     }
+
+def markdown_cell(value):
+    return str(value).replace("|", "\\|")
+
+def file_rows(files):
+    rows = []
+    for item in sorted(files, key=lambda f: f.get("path") or ""):
+        path = item.get("path") or "UNKNOWN"
+        change_type = item.get("changeType") or "UNKNOWN"
+        additions = item.get("additions", 0)
+        deletions = item.get("deletions", 0)
+        rows.append((path, change_type, additions, deletions))
+    return rows
+
+def limited_path_list(paths):
+    if not paths:
+        return ""
+    shown = ", ".join(paths[:5])
+    if len(paths) > 5:
+        return f"{shown}, ... ({len(paths)} total)"
+    return shown
 
 baseline = load(baseline_path)
 final = load(final_path)
@@ -414,6 +537,8 @@ task_detail = load(task_detail_path)
 before = facts(baseline)
 after = facts(final)
 head_changed = before["head"] != after["head"]
+new_changed_paths = sorted(set(after["changed_file_paths"]) - set(before["changed_file_paths"]))
+removed_changed_paths = sorted(set(before["changed_file_paths"]) - set(after["changed_file_paths"]))
 task_status = task_detail.get("status") or task_detail.get("workflow", {}).get("state") or submission.get("status") or "unknown"
 workflow_id = submission.get("workflow_id") or task_detail.get("workflow", {}).get("id")
 task_id = submission.get("task_id") or task_detail.get("id")
@@ -438,8 +563,20 @@ if candidate in ("review_feedback_repair", "ci_repair") and not head_changed:
     blockers.append("PR head did not change for a repair candidate")
 if candidate == "ready_noop" and head_changed:
     blockers.append("ready/no-op control changed the PR head")
-if candidate == "mergeability_repair" and after["merge"] != "CLEAN":
+if after["merge"] != "CLEAN":
     blockers.append(f"final mergeStateStatus is {after['merge']}, not CLEAN")
+if head_changed and not after["files_collected"]:
+    blockers.append("final PR head changed but changed files were not collected")
+if new_changed_paths:
+    blockers.append(
+        "final PR changed files outside the baseline diff: "
+        + limited_path_list(new_changed_paths)
+    )
+if removed_changed_paths:
+    blockers.append(
+        "final PR dropped baseline changed files: "
+        + limited_path_list(removed_changed_paths)
+    )
 if task_status in ("failed", "cancelled", "blocked"):
     blockers.append(f"Harness task ended as {task_status}")
 if timed_out or task_status in ("unknown", "pending", "running", "implementing", "reviewing"):
@@ -448,6 +585,8 @@ if timed_out or task_status in ("unknown", "pending", "running", "implementing",
 if not blockers:
     grade = "A"
 elif candidate == "ready_noop" and head_changed:
+    grade = "C"
+elif new_changed_paths or removed_changed_paths or after["merge"] != "CLEAN":
     grade = "C"
 elif after["checks"] == "SUCCESS" and after["unresolved"] == 0:
     grade = "B"
@@ -489,7 +628,25 @@ print(f"| `headRefOid` | `{before['head']}` | `{after['head']}` |")
 print(f"| `mergeStateStatus` | `{before['merge']}` | `{after['merge']}` |")
 print(f"| `statusCheckRollup.state` | `{before['checks']}` | `{after['checks']}` |")
 print(f"| active unresolved review threads | `{before['unresolved']}` | `{after['unresolved']}` |")
+print(f"| changed files | `{len(before['changed_files'])}` | `{len(after['changed_files'])}` |")
 print(f"| head changed | `false` | `{str(head_changed).lower()}` |")
+print()
+print("## Changed File Scope")
+print()
+print("| Field | Value |")
+print("|---|---|")
+print(f"| new changed paths | `{limited_path_list(new_changed_paths) or 'none'}` |")
+print(f"| removed changed paths | `{limited_path_list(removed_changed_paths) or 'none'}` |")
+print()
+print("## Final Changed Files")
+print()
+if after["changed_files"]:
+    print("| Path | Change | + | - |")
+    print("|---|---|---:|---:|")
+    for path, change_type, additions, deletions in file_rows(after["changed_files"]):
+        print(f"| `{markdown_cell(path)}` | `{markdown_cell(change_type)}` | `{additions}` | `{deletions}` |")
+else:
+    print("- None collected")
 print()
 print("## Blockers")
 print()
