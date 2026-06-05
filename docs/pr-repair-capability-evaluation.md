@@ -24,20 +24,15 @@ This document defines a repeatable PR repair evaluation. The companion script is
 | Stale-head protection | Any review, validation, or approval is tied to the final `headRefOid`. | Harness reuses approval/check evidence from an older head SHA. |
 | Cost control | Turns, runtime age, and budget stay within the configured envelope. | Repeated same-error retries, low-priority work running while repair is blocked, or no usage attribution. |
 
-## Current Live Candidate Baseline
+## Live Candidate Selection
 
-Collected with GitHub GraphQL on 2026-06-05.
+Candidate PRs must be selected from fresh GitHub GraphQL data immediately before
+each run. Do not reuse candidate tables from previous sessions: head SHAs,
+checks, mergeability, and active review threads can change within minutes.
 
-| PR | Purpose | Head SHA | Merge state | Checks | Unresolved active review threads |
-|---|---|---|---|---|---:|
-| `#1232` | Ready/no-op control | `79441c8ecfd634c758b9230161dfae706de3d685` | `CLEAN` | `SUCCESS` | 0 |
-| `#1233` | CI repair candidate | `fde22abe509554d2203a0642c4eb9be902a3da0e` | `BLOCKED` | `FAILURE` | 0 |
-| `#1234` | Review feedback repair candidate | `05d82602cbb668d42aa13f9aa3d9d281f15fc2c0` | `CLEAN` | `SUCCESS` | 4 |
-| `#1235` | Review feedback repair candidate | `3018aecca5e5352c27964850152bed714293b2c7` | `CLEAN` | `SUCCESS` | 4 |
-
-`CLEAN` and green checks are not enough for `#1234` or `#1235` because unresolved
-review threads remain. `#1233` is the best CI repair candidate. `#1232` is the
-control that should not receive a speculative change.
+Use collect-only mode to record the live baseline before every repair eval. A
+good candidate set has exactly one ready/no-op control, one CI repair candidate,
+and one review-feedback repair candidate.
 
 ## Evaluation Levels
 

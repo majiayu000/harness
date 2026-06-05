@@ -139,7 +139,7 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 GRAPHQL_QUERY='
-query($owner:String!, $name:String!, $pr:Int!) {
+query($owner:String!, $name:String!, $pr:Int!, $threadsCursor:String) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$pr) {
       number
@@ -154,7 +154,11 @@ query($owner:String!, $name:String!, $pr:Int!) {
       statusCheckRollup {
         state
       }
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $threadsCursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           id
           isResolved
@@ -179,12 +183,103 @@ query($owner:String!, $name:String!, $pr:Int!) {
 
 collect_snapshot() {
   local out="$1"
-  gh api graphql \
-    -f owner="$OWNER" \
-    -f name="$NAME" \
-    -F pr="$PR" \
-    -f query="$GRAPHQL_QUERY" \
-    --jq '.data.repository.pullRequest' > "$out"
+  local page
+  local cursor=""
+  local tmp
+  tmp="$(mktemp)"
+
+  while :; do
+    page="$(mktemp)"
+    if [[ -n "$cursor" ]]; then
+      gh api graphql \
+        -f owner="$OWNER" \
+        -f name="$NAME" \
+        -F pr="$PR" \
+        -f threadsCursor="$cursor" \
+        -f query="$GRAPHQL_QUERY" > "$page"
+    else
+      gh api graphql \
+        -f owner="$OWNER" \
+        -f name="$NAME" \
+        -F pr="$PR" \
+        -f query="$GRAPHQL_QUERY" > "$page"
+    fi
+
+    python3 - "$tmp" "$page" <<'PY'
+import json
+import sys
+
+tmp_path, page_path = sys.argv[1:]
+with open(page_path, "r", encoding="utf-8") as fh:
+    page = json.load(fh)
+
+pr = ((page.get("data") or {}).get("repository") or {}).get("pullRequest")
+if not pr:
+    raise SystemExit("GitHub GraphQL response did not include pullRequest")
+
+existing = None
+try:
+    with open(tmp_path, "r", encoding="utf-8") as fh:
+        existing = json.load(fh)
+except (FileNotFoundError, json.JSONDecodeError):
+    existing = None
+
+if existing is None:
+    existing = pr
+    existing.setdefault("reviewThreads", {})["nodes"] = []
+
+existing_threads = existing.setdefault("reviewThreads", {})
+incoming_threads = pr.get("reviewThreads") or {}
+existing_threads.setdefault("nodes", []).extend(incoming_threads.get("nodes") or [])
+existing_threads["pageInfo"] = incoming_threads.get("pageInfo") or {}
+
+with open(tmp_path, "w", encoding="utf-8") as fh:
+    json.dump(existing, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+
+    cursor="$(python3 - "$page" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except json.JSONDecodeError:
+    print("")
+    raise SystemExit(0)
+
+page_info = (
+    (((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {})
+    .get("reviewThreads") or {}
+).get("pageInfo") or {}
+if page_info.get("hasNextPage"):
+    print(page_info.get("endCursor") or "")
+else:
+    print("")
+PY
+)"
+    rm -f "$page"
+    [[ -z "$cursor" ]] && break
+  done
+
+  mv "$tmp" "$out"
+}
+
+task_status_from_json() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    print("unknown")
+    raise SystemExit(0)
+
+print(data.get("status") or data.get("workflow", {}).get("state") or "unknown")
+PY
 }
 
 snapshot_summary() {
@@ -267,12 +362,13 @@ write_final_report() {
   local final="$2"
   local submission="$3"
   local task_detail="$4"
+  local timed_out="$5"
   local report="$OUTPUT_DIR/summary.md"
-  python3 - "$baseline" "$final" "$submission" "$task_detail" "$RUN_ID" "$REPO" "$PR" "$SERVER_URL" <<'PY' > "$report"
+  python3 - "$baseline" "$final" "$submission" "$task_detail" "$RUN_ID" "$REPO" "$PR" "$SERVER_URL" "$timed_out" <<'PY' > "$report"
 import json
 import sys
 
-baseline_path, final_path, submission_path, task_detail_path, run_id, repo, pr_number, server_url = sys.argv[1:]
+baseline_path, final_path, submission_path, task_detail_path, run_id, repo, pr_number, server_url, timed_out_arg = sys.argv[1:]
 
 def load(path):
     try:
@@ -304,6 +400,7 @@ head_changed = before["head"] != after["head"]
 task_status = task_detail.get("status") or task_detail.get("workflow", {}).get("state") or submission.get("status") or "unknown"
 workflow_id = submission.get("workflow_id") or task_detail.get("workflow", {}).get("id")
 task_id = submission.get("task_id") or task_detail.get("id")
+timed_out = timed_out_arg == "1"
 
 if before["unresolved"] > 0:
     candidate = "review_feedback_repair"
@@ -324,6 +421,8 @@ if candidate in ("review_feedback_repair", "ci_repair") and not head_changed:
     blockers.append("PR head did not change for a repair candidate")
 if task_status in ("failed", "cancelled", "blocked"):
     blockers.append(f"Harness task ended as {task_status}")
+if timed_out or task_status in ("unknown", "pending", "running", "implementing", "reviewing"):
+    blockers.append("Harness task did not reach a terminal state before the evaluation timeout")
 
 if not blockers:
     grade = "A" if candidate != "ready_noop" or not head_changed else "B"
@@ -346,6 +445,7 @@ print(f"- Candidate class: `{candidate}`")
 print(f"- Task ID: `{task_id}`")
 print(f"- Workflow ID: `{workflow_id}`")
 print(f"- Task status: `{task_status}`")
+print(f"- Timed out: `{str(timed_out).lower()}`")
 print(f"- Grade: `{grade}`")
 print()
 print("## Baseline vs Final")
@@ -403,18 +503,17 @@ project_root, repo, pr, wait_secs, max_rounds, max_turns, max_budget = sys.argv[
 body = {
     "project": project_root,
     "repo": repo,
-    "pr": int(pr),
     "source": "pr_repair_eval",
     "external_id": f"pr-repair-eval:{repo}#{pr}",
     "wait_secs": int(wait_secs),
     "max_rounds": int(max_rounds),
     "max_turns": int(max_turns),
     "prompt": (
-        "PR repair capability evaluation. Inspect the current PR feedback, "
-        "status checks, mergeability, and head SHA. Address actionable review "
-        "feedback or failing checks with the smallest safe change. Commit and "
-        "push only to the existing PR branch. Do not create a new PR. Report "
-        "the validation commands and final PR evidence."
+        f"PR repair capability evaluation for {repo}#{pr}. Inspect the current "
+        "PR feedback, status checks, mergeability, and head SHA. Address "
+        "actionable review feedback or failing checks with the smallest safe "
+        "change. Commit and push only to the existing PR branch. Do not create "
+        "a new PR. Report the validation commands and final PR evidence."
     ),
 }
 if max_budget:
@@ -431,8 +530,13 @@ curl "${curl_args[@]}" \
 TASK_ID="$(python3 - "$SUBMISSION_JSON" <<'PY'
 import json
 import sys
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    data = json.load(fh)
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except json.JSONDecodeError:
+    data = {}
+
 print(data.get("task_id") or data.get("submission_id") or "")
 PY
 )"
@@ -445,28 +549,30 @@ echo "Submitted task_id=$TASK_ID"
 ENCODED_TASK_ID="$(url_encode_path_segment "$TASK_ID")"
 deadline=$(( $(date +%s) + TIMEOUT_SECS ))
 status="unknown"
+timed_out=0
 while [[ "$(date +%s)" -lt "$deadline" ]]; do
   if curl "${curl_args[@]}" "$SERVER_URL/tasks/$ENCODED_TASK_ID" > "$TASK_DETAIL_JSON"; then
-    status="$(python3 - "$TASK_DETAIL_JSON" <<'PY'
-import json
-import sys
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    data = json.load(fh)
-print(data.get("status") or data.get("workflow", {}).get("state") or "unknown")
-PY
-)"
+    status="$(task_status_from_json "$TASK_DETAIL_JSON")"
     echo "task status: $status"
     case "$status" in
-      done|failed|cancelled|blocked|ready_to_merge)
+      done|passed|failed|cancelled|blocked|ready_to_merge)
         break
         ;;
     esac
   fi
   sleep "$POLL_SECS"
 done
+case "$status" in
+  done|passed|failed|cancelled|blocked|ready_to_merge)
+    ;;
+  *)
+    timed_out=1
+    echo "task status did not reach a terminal state before timeout"
+    ;;
+esac
 
 echo "Collecting final PR snapshot"
 collect_snapshot "$FINAL_JSON"
 snapshot_summary "$FINAL_JSON"
-write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON"
+write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$timed_out"
 echo "Evaluation report: $OUTPUT_DIR/summary.md"
