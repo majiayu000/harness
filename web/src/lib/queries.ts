@@ -73,6 +73,42 @@ export function useTasks(params: TaskListParams = { active: true, limit: 200 }) 
   });
 }
 
+async function fetchAllTaskPages(params: TaskListParams, signal?: AbortSignal): Promise<TaskListResponse> {
+  const seenCursors = new Set<string>();
+  const rows: TaskListResponse["data"] = [];
+  let cursor = params.cursor;
+  let latest: TaskListResponse | null = null;
+
+  for (;;) {
+    latest = await apiJson<TaskListResponse>(taskListPath({ ...params, cursor }), { signal });
+    rows.push(...latest.data);
+    const nextCursor = latest.page.next_cursor ?? null;
+    if (!latest.page.has_more || !nextCursor) break;
+    if (seenCursors.has(nextCursor)) {
+      throw new Error("Task pagination returned a repeated cursor");
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+
+  if (!latest) {
+    throw new Error("Task pagination returned no response");
+  }
+
+  return {
+    ...latest,
+    data: rows,
+    page: { ...latest.page, has_more: false, next_cursor: null },
+  };
+}
+
+export function useAllTasks(params: TaskListParams = { limit: 200 }) {
+  return useQuery<TaskListResponse, Error>({
+    queryKey: ["tasks", "all-pages", params],
+    queryFn: ({ signal }) => fetchAllTaskPages(params, signal),
+  });
+}
+
 export function useWorkflowRuntimeTree(projectId?: string | null) {
   return useQuery<WorkflowRuntimeTreePayload, Error>({
     queryKey: ["workflow-runtime-tree", projectId ?? null],

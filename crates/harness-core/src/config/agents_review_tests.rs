@@ -88,6 +88,22 @@ fn review_config_maps_legacy_fallback_chain_to_explicit_advisory_providers() {
 }
 
 #[test]
+fn review_config_normalizes_legacy_fallback_chain_case_and_whitespace(
+) -> Result<(), toml::de::Error> {
+    let toml_str = r#"
+        enabled = true
+        fallback_chain = [" Gemini ", "CODEX", " custom_provider "]
+    "#;
+    let config: AgentReviewConfig = toml::from_str(toml_str)?;
+
+    assert_eq!(
+        config.advisory_providers,
+        vec!["gemini_github_bot", "codex_github_bot", "custom_provider"]
+    );
+    Ok(())
+}
+
+#[test]
 fn review_config_partial_external_provider_inherits_provider_defaults() {
     let toml_str = r#"
         enabled = true
