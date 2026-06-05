@@ -1,0 +1,11 @@
+[package]
+name = "harness-eval"
+version.workspace = true
+edition.workspace = true
+description = "Pure evaluation models and deterministic scoring for Harness runs"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }

@@ -1300,6 +1300,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-eval"
+version = "0.6.34"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "harness-exec"
 version = "0.6.34"
 dependencies = [
