@@ -44,6 +44,37 @@ fn activity_result_schema_describes_issue_implementation_terminal_evidence_contr
 }
 
 #[test]
+fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "address_pr_feedback"
+        }),
+    );
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "addressing_feedback",
+        WorkflowSubject::new("issue", "issue:123"),
+    )
+    .with_id("issue-123");
+
+    let schema = activity_result_schema(&job, Some(&workflow));
+
+    assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
+        "local_review_gate"
+    );
+    assert!(schema["agent_summary_contract"]["must_include"]
+        .as_array()
+        .is_some_and(
+            |items| items.contains(&json!("fresh PR state checked before final response"))
+        ));
+}
+
+#[test]
 fn activity_result_schema_describes_quality_gate_contract() {
     let job = RuntimeJob::pending(
         "command-1",

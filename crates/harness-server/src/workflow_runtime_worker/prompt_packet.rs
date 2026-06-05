@@ -499,7 +499,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_not_include": ["direct workflow state changes"],
         }),
         ("github_issue_pr", "address_pr_feedback") => json!({
-            "must_include": ["review feedback addressed", "changed files", "validation commands"],
+            "must_include": ["review feedback addressed", "changed files", "validation commands", "fresh PR state checked before final response"],
             "must_not_include": ["claiming review approval without a fresh review signal"],
         }),
         ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({
