@@ -92,7 +92,7 @@ fn review_config_normalizes_legacy_fallback_chain_case_and_whitespace(
 ) -> Result<(), toml::de::Error> {
     let toml_str = r#"
         enabled = true
-        fallback_chain = [" Gemini ", "CODEX", " custom_provider "]
+        fallback_chain = [" Gemini ", "CODEX", " Custom_Provider "]
     "#;
     let config: AgentReviewConfig = toml::from_str(toml_str)?;
 

@@ -283,7 +283,10 @@ fn fenced_report_payload(raw_output: &str) -> Option<&str> {
     let after_marker = &raw_output[start + marker.len()..];
     let after_newline = after_marker.strip_prefix('\n').unwrap_or(after_marker);
     let end = after_newline.match_indices("```").find_map(|(index, _)| {
-        (index == 0 || after_newline[..index].ends_with('\n')).then_some(index)
+        let prefix_ok = index == 0 || after_newline[..index].ends_with('\n');
+        let suffix = &after_newline[index + 3..];
+        let suffix_ok = suffix.is_empty() || suffix.starts_with('\n') || suffix.starts_with("\r\n");
+        (prefix_ok && suffix_ok).then_some(index)
     })?;
     Some(after_newline[..end].trim())
 }
@@ -409,6 +412,16 @@ mod tests {
             .evidence
             .as_deref()
             .is_some_and(|evidence| evidence.contains("```rust")));
+    }
+
+    #[test]
+    fn fenced_review_report_requires_closing_fence_on_own_line() {
+        assert_eq!(
+            fenced_report_payload(
+                "```harness-review-report\n{\"summary\":\"first\"}\n``` not closed\n{\"summary\":\"second\"}\n```\n",
+            ),
+            Some("{\"summary\":\"first\"}\n``` not closed\n{\"summary\":\"second\"}")
+        );
     }
 
     #[test]

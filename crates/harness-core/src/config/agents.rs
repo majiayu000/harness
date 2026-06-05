@@ -524,7 +524,7 @@ fn normalize_external_bot_chain(chain: &[String]) -> Vec<String> {
             Some(match normalized.as_str() {
                 "gemini" | "gemini_github_bot" => "gemini_github_bot".to_string(),
                 "codex" | "codex_github_bot" => "codex_github_bot".to_string(),
-                _ => trimmed.to_string(),
+                _ => normalized,
             })
         })
         .collect()
