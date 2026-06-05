@@ -17,4 +17,13 @@ EOF
 fi
 
 RUST_TEST_THREADS=1 cargo test -p harness-server --lib "$@"
-RUST_TEST_THREADS=1 cargo test -p harness-server --tests "$@"
+
+for test_file in crates/harness-server/tests/*.rs; do
+  test_name="${test_file##*/}"
+  test_name="${test_name%.rs}"
+  if [[ "$test_name" == "common" ]]; then
+    continue
+  fi
+
+  RUST_TEST_THREADS=1 cargo test -p harness-server --test "$test_name" "$@"
+done
