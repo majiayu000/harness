@@ -285,7 +285,10 @@ fn fenced_report_payload(raw_output: &str) -> Option<&str> {
     let end = after_newline.match_indices("```").find_map(|(index, _)| {
         let prefix_ok = index == 0 || after_newline[..index].ends_with('\n');
         let suffix = &after_newline[index + 3..];
-        let suffix_ok = suffix.is_empty() || suffix.starts_with('\n') || suffix.starts_with("\r\n");
+        let suffix_after_whitespace = suffix.trim_start_matches([' ', '\t']);
+        let suffix_ok = suffix_after_whitespace.is_empty()
+            || suffix_after_whitespace.starts_with('\n')
+            || suffix_after_whitespace.starts_with("\r\n");
         (prefix_ok && suffix_ok).then_some(index)
     })?;
     Some(after_newline[..end].trim())
@@ -422,6 +425,26 @@ mod tests {
             ),
             Some("{\"summary\":\"first\"}\n``` not closed\n{\"summary\":\"second\"}")
         );
+    }
+
+    #[test]
+    fn parses_fenced_review_report_with_trailing_whitespace_on_closing_fence() {
+        let report = parse_review_report(
+            "codex_cli_review",
+            ReviewProviderKind::LocalCli,
+            concat!(
+                "```harness-review-report\n",
+                "{\"decision\":\"approved\",\"summary\":\"No blocking issues.\",\"findings\":[]}\n",
+                "```   \n",
+                "Ignored trailing markdown."
+            ),
+            started(),
+            completed(),
+        );
+
+        assert_eq!(report.decision, ReviewDecision::Approved);
+        assert_eq!(report.summary, "No blocking issues.");
+        assert!(report.findings.is_empty());
     }
 
     #[test]
