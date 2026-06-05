@@ -8,9 +8,12 @@
 //!
 //! The reap rule is conservative (only a definitively-missing owner parent
 //! directory counts as orphaned; transient IO errors keep the schema), so a live
-//! store is never dropped. Gated by `storage.orphan_reaper_enabled` and paced by
-//! `storage.orphan_reaper_interval_secs` in `WORKFLOW.md`.
+//! store is never dropped. The server passes its configured workspace root so
+//! legacy rows that recorded the workspace directory itself can be classified
+//! after that directory is removed. Gated by `storage.orphan_reaper_enabled` and
+//! paced by `storage.orphan_reaper_interval_secs` in `WORKFLOW.md`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::http::AppState;
@@ -56,7 +59,15 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
                     "orphan schema reaper disabled by config; re-checking next interval"
                 );
             } else if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-                match harness_core::db::reap_orphaned_path_schemas(store.pool(), true).await {
+                let workspace_roots =
+                    workspace_roots_for_reaper(state.concurrency.workspace_mgr.as_ref());
+                match harness_core::db::reap_orphaned_path_schemas_with_workspace_roots(
+                    store.pool(),
+                    true,
+                    &workspace_roots,
+                )
+                .await
+                {
                     Ok(report) if !report.orphans.is_empty() => {
                         tracing::info!(
                             scanned = report.scanned,
@@ -77,4 +88,40 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+fn workspace_roots_for_reaper(
+    workspace_mgr: Option<&Arc<crate::workspace::WorkspaceManager>>,
+) -> Vec<PathBuf> {
+    workspace_mgr
+        .map(|manager| vec![manager.config.root.clone()])
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::config::misc::WorkspaceConfig;
+
+    #[test]
+    fn workspace_roots_for_reaper_includes_configured_workspace_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let workspace_root = dir.path().join("workspaces");
+        let config = WorkspaceConfig {
+            root: workspace_root.clone(),
+            ..WorkspaceConfig::default()
+        };
+        let manager = Arc::new(crate::workspace::WorkspaceManager::new(config)?);
+
+        assert_eq!(
+            workspace_roots_for_reaper(Some(&manager)),
+            vec![workspace_root]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_roots_for_reaper_allows_missing_workspace_manager() {
+        assert!(workspace_roots_for_reaper(None).is_empty());
+    }
 }
