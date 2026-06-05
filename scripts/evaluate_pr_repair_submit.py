@@ -27,6 +27,16 @@ def write_json(path: str, data: dict[str, object]) -> None:
         fh.write("\n")
 
 
+def write_failed_submission(path: str, mode: str, error: object) -> None:
+    data = {
+        "error": str(error),
+        "eval_submission_mode": mode,
+        "http_status": "000",
+        "status": "failed",
+    }
+    write_json(path, data)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server-url", required=True)
@@ -55,14 +65,8 @@ def main() -> int:
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         status = exc.code
-    except urllib.error.URLError as exc:
-        data = {
-            "error": str(exc.reason),
-            "eval_submission_mode": args.mode,
-            "http_status": "000",
-            "status": "failed",
-        }
-        write_json(args.output, data)
+    except (urllib.error.URLError, OSError) as exc:
+        write_failed_submission(args.output, args.mode, getattr(exc, "reason", exc))
         return 7
 
     data = load_response(raw)
