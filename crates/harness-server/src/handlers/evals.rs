@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -25,7 +26,7 @@ pub async fn create_eval_run(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateEvalRun>,
 ) -> (StatusCode, Json<Value>) {
-    let store = match open_eval_store(&state).await {
+    let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
     };
@@ -39,7 +40,7 @@ pub async fn list_eval_runs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<EvalListQuery>,
 ) -> (StatusCode, Json<Value>) {
-    let store = match open_eval_store(&state).await {
+    let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
     };
@@ -53,7 +54,7 @@ pub async fn get_eval_run(
     State(state): State<Arc<AppState>>,
     Path(run_id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    let store = match open_eval_store(&state).await {
+    let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
     };
@@ -67,16 +68,16 @@ pub async fn get_eval_run(
 pub async fn add_eval_artifact(
     State(state): State<Arc<AppState>>,
     Path(run_id): Path<String>,
-    Json(req): Json<AddEvalArtifact>,
+    Json(mut req): Json<AddEvalArtifact>,
 ) -> (StatusCode, Json<Value>) {
-    let artifact_type = req.artifact_type.trim();
-    if artifact_type.is_empty() {
+    req.artifact_type = req.artifact_type.trim().to_string();
+    if req.artifact_type.is_empty() {
         return bad_request("artifact_type must not be empty");
     }
     if req.body.is_empty() {
         return bad_request("body must not be empty");
     }
-    let store = match open_eval_store(&state).await {
+    let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
     };
@@ -91,7 +92,7 @@ pub async fn list_eval_artifacts(
     State(state): State<Arc<AppState>>,
     Path(run_id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    let store = match open_eval_store(&state).await {
+    let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
     };
@@ -111,10 +112,15 @@ pub async fn score_eval_run(
     Path(run_id): Path<String>,
     Json(req): Json<ScoreEvalRunRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let store = match open_eval_store(&state).await {
+    let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
     };
+    match store.get_run(&run_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found("eval run not found"),
+        Err(error) => return internal_error("failed to get eval run", error),
+    }
     let input = match req.input {
         Some(input) => input,
         None => match load_input_artifact(&store, &run_id).await {
@@ -140,7 +146,7 @@ pub async fn get_eval_quality_snapshot(
     State(state): State<Arc<AppState>>,
     Path(snapshot_id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    let store = match open_eval_store(&state).await {
+    let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
     };
@@ -159,7 +165,7 @@ pub async fn list_eval_quality_snapshots_for_pr(
     Path((owner, repo, pr_number)): Path<(String, String, u64)>,
     Query(query): Query<EvalListQuery>,
 ) -> (StatusCode, Json<Value>) {
-    let store = match open_eval_store(&state).await {
+    let store = match eval_store(&state).await {
         Ok(store) => store,
         Err(response) => return response,
     };
@@ -176,7 +182,7 @@ pub async fn list_eval_quality_snapshots_for_pr(
     }
 }
 
-async fn open_eval_store(state: &Arc<AppState>) -> Result<EvalStore, (StatusCode, Json<Value>)> {
+async fn eval_store(state: &Arc<AppState>) -> Result<Arc<EvalStore>, (StatusCode, Json<Value>)> {
     if let Some(status) = state
         .startup_statuses
         .iter()
@@ -190,22 +196,38 @@ async fn open_eval_store(state: &Arc<AppState>) -> Result<EvalStore, (StatusCode
             })),
         ));
     }
-    let data_dir = crate::http::init::expand_tilde(&state.core.server.config.server.data_dir);
-    let db_path = harness_core::config::dirs::default_db_path(&data_dir, "evals");
-    EvalStore::open_with_database_url(
-        &db_path,
-        state.core.server.config.server.database_url.as_deref(),
-    )
-    .await
-    .map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "failed to open eval store",
-                "message": error.to_string(),
-            })),
+    #[cfg(not(test))]
+    {
+        state.core.eval_store.clone().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "eval store unavailable",
+                    "message": "eval store is not initialized",
+                })),
+            )
+        })
+    }
+    #[cfg(test)]
+    {
+        let data_dir = crate::http::init::expand_tilde(&state.core.server.config.server.data_dir);
+        let db_path = harness_core::config::dirs::default_db_path(&data_dir, "evals");
+        EvalStore::open_with_database_url(
+            &db_path,
+            state.core.server.config.server.database_url.as_deref(),
         )
-    })
+        .await
+        .map(Arc::new)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "failed to open eval store",
+                    "message": error.to_string(),
+                })),
+            )
+        })
+    }
 }
 
 async fn load_input_artifact(
@@ -220,7 +242,8 @@ async fn load_input_artifact(
     else {
         return Ok(None);
     };
-    let input = serde_json::from_str(&artifact.body)?;
+    let input = serde_json::from_str(&artifact.body)
+        .with_context(|| "failed to parse pr_repair_eval_input artifact")?;
     Ok(Some(input))
 }
 
@@ -228,6 +251,7 @@ fn is_request_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("eval input scenario and target")
         || message.contains("PR repair scoring requires a pull request target")
+        || message.contains("failed to parse pr_repair_eval_input artifact")
         || message.contains("missing field")
         || message.contains("unknown variant")
 }

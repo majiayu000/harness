@@ -272,6 +272,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root,
             home_dir,
             tasks,
+            #[cfg(not(test))]
+            eval_store: storage.eval_store,
             thread_db: Some(
                 registry
                     .thread_db

@@ -49,17 +49,7 @@ async fn eval_routes_persist_score_and_pr_lookup() -> anyhow::Result<()> {
     .await?;
     let app = evals_app(state);
 
-    let create_body = serde_json::json!({
-        "scenario": "pr_repair",
-        "target": {
-            "kind": "pull_request",
-            "repo": "owner/repo",
-            "pr_number": 7,
-            "base_ref": "main",
-            "head_ref": "fix/review"
-        },
-        "source_task_id": "task-7"
-    });
+    let create_body = pr_repair_run_body();
     let create = app
         .clone()
         .oneshot(
@@ -75,7 +65,7 @@ async fn eval_routes_persist_score_and_pr_lookup() -> anyhow::Result<()> {
     let run_id = created["run"]["id"].as_str().expect("run id").to_string();
 
     let artifact_body = serde_json::json!({
-        "artifact_type": "pr_repair_eval_input",
+        "artifact_type": " pr_repair_eval_input ",
         "label": "canonical input",
         "content_type": "application/json",
         "body": pr_repair_input().to_string()
@@ -91,6 +81,11 @@ async fn eval_routes_persist_score_and_pr_lookup() -> anyhow::Result<()> {
         )
         .await?;
     assert_eq!(artifact.status(), axum::http::StatusCode::CREATED);
+    let artifact_json = response_json(artifact).await?;
+    assert_eq!(
+        artifact_json["artifact"]["artifact_type"],
+        "pr_repair_eval_input"
+    );
 
     let score_body = serde_json::json!({});
     let score = app
@@ -140,6 +135,117 @@ async fn eval_routes_persist_score_and_pr_lookup() -> anyhow::Result<()> {
     let pr_lookup_json = response_json(pr_lookup).await?;
     assert_eq!(pr_lookup_json["quality_snapshots"][0]["id"], snapshot_id);
     Ok(())
+}
+
+#[tokio::test]
+async fn score_missing_eval_run_returns_not_found_before_artifact_fallback() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.data_dir = dir.path().to_path_buf();
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = evals_app(state);
+
+    let score = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/evals/runs/missing-run/score")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))?,
+        )
+        .await?;
+    assert_eq!(score.status(), axum::http::StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn score_malformed_eval_input_artifact_returns_bad_request() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.data_dir = dir.path().to_path_buf();
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = evals_app(state);
+    let run_id = create_pr_repair_run(app.clone()).await?;
+
+    let artifact_body = serde_json::json!({
+        "artifact_type": "pr_repair_eval_input",
+        "body": "{not-json"
+    });
+    let artifact = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/evals/runs/{run_id}/artifacts"))
+                .header("content-type", "application/json")
+                .body(Body::from(artifact_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(artifact.status(), axum::http::StatusCode::CREATED);
+
+    let score = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/evals/runs/{run_id}/score"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))?,
+        )
+        .await?;
+    assert_eq!(score.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body = response_json(score).await?;
+    assert!(body["error"]
+        .as_str()
+        .expect("error message")
+        .contains("failed to parse pr_repair_eval_input artifact"));
+    Ok(())
+}
+
+async fn create_pr_repair_run(app: Router) -> anyhow::Result<String> {
+    let create = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/evals/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(pr_repair_run_body().to_string()))?,
+        )
+        .await?;
+    assert_eq!(create.status(), axum::http::StatusCode::CREATED);
+    let created = response_json(create).await?;
+    Ok(created["run"]["id"].as_str().expect("run id").to_string())
+}
+
+fn pr_repair_run_body() -> serde_json::Value {
+    serde_json::json!({
+        "scenario": "pr_repair",
+        "target": {
+            "kind": "pull_request",
+            "repo": "owner/repo",
+            "pr_number": 7,
+            "base_ref": "main",
+            "head_ref": "fix/review"
+        },
+        "source_task_id": "task-7"
+    })
 }
 
 fn pr_repair_input() -> serde_json::Value {

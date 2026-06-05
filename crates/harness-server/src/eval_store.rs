@@ -39,7 +39,8 @@ static EVAL_MIGRATIONS: &[Migration] = &[
             content_type  TEXT,
             body          TEXT NOT NULL,
             data          TEXT NOT NULL,
-            created_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (run_id) REFERENCES eval_runs(id) ON DELETE CASCADE
         )",
     },
     Migration {
@@ -54,7 +55,8 @@ static EVAL_MIGRATIONS: &[Migration] = &[
             final_score      BIGINT NOT NULL,
             final_grade      TEXT NOT NULL,
             data             TEXT NOT NULL,
-            created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (run_id) REFERENCES eval_runs(id) ON DELETE CASCADE
         )",
     },
     Migration {

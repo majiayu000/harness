@@ -8,6 +8,7 @@ use crate::{eval_store::EvalStore, q_value_store::QValueStore, task_runner::Task
 /// Outputs of the storage initialization phase.
 pub(crate) struct StorageBundle {
     pub tasks: Option<Arc<TaskStore>>,
+    pub eval_store: Option<Arc<EvalStore>>,
     pub q_values: Option<Arc<QValueStore>>,
     pub startup_results: Vec<StoreStartupResult>,
 }
@@ -23,6 +24,7 @@ fn failed_storage_startup_results(error: &str) -> Vec<StoreStartupResult> {
 fn failed_storage_bundle(error: &str) -> StorageBundle {
     StorageBundle {
         tasks: None,
+        eval_store: None,
         q_values: None,
         startup_results: failed_storage_startup_results(error),
     }
@@ -165,10 +167,10 @@ pub(crate) async fn build_storage_with_database_url(
     }
 
     setup_pool.close().await;
-    drop(eval_store);
 
     Ok(StorageBundle {
         tasks,
+        eval_store,
         q_values,
         startup_results: vec![task_result, eval_result, q_value_result],
     })
@@ -185,6 +187,7 @@ mod tests {
             .await
             .expect("build_storage should succeed");
         assert!(bundle.tasks.is_some(), "tasks store should be ready");
+        assert!(bundle.eval_store.is_some(), "eval store should be ready");
         drop(bundle.q_values);
     }
 
