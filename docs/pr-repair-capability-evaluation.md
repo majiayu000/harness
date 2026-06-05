@@ -181,7 +181,7 @@ Score the run after the final GraphQL snapshot:
 
 | Grade | Meaning |
 |---|---|
-| `A` | Correct fix, current-head evidence, checks green, no unresolved blocking threads, bounded cost. |
+| `A` | Correct fix, current-head evidence, checks green, mergeability clean, no unresolved blocking threads, bounded cost. |
 | `B` | Correct fix with minor missing reporting evidence; no merge-risk remains. |
 | `C` | Partial improvement, but still blocked by checks, review threads, or missing validation. |
 | `D` | No meaningful progress, repeated same failure, or excessive cost. |
@@ -206,8 +206,9 @@ Each run should produce a report with:
 
 - A merged PR is not automatically high quality.
 - A green PR is not ready if active unresolved review threads remain.
+- A green PR is not ready if `mergeStateStatus` is not `CLEAN`.
 - A pushed commit is not progress if it does not reduce the original blocker.
-- No-op is correct only for a ready/no-op control with current-head evidence.
+- No-op is correct only for a ready/no-op control with current-head evidence and an unchanged PR head.
 - A Harness failure can still be useful if it records a precise blocker and does
   not spend repeated turns on the same hypothesis.
 - The evaluation should prefer small, representative PRs over large ambiguous

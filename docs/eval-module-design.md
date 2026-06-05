@@ -270,13 +270,15 @@ grade is capped even when other score dimensions look strong.
 | No unrelated PR creation | collector PR list or runtime artifacts | `F` |
 | Head freshness | final evidence head vs final PR head | `C` |
 | Required checks | final check state for final head | `C` |
+| Mergeability clean | final merge state for final head | `C` |
 | Review-thread closure | final active unresolved threads | `C` |
 | Runtime artifact completeness | task/workflow/job snapshots | `B` |
 | Reviewer judgment freshness | reviewer head vs final PR head | `C`, or `B` when absent |
 | No destructive/unrelated scope | changed files and risk scanner | `F` |
 
-Ready/no-op control cases are exempt from the "head changed" expectation. A
-correct no-op must still prove current-head checks and review threads.
+Ready/no-op control cases invert the "head changed" expectation. A correct no-op
+must keep the PR head unchanged while proving current-head checks,
+mergeability, and review threads.
 
 ## Scorecard
 

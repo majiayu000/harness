@@ -1,7 +1,7 @@
 use crate::model::{
     CheckState, Confidence, EvalGrade, EvalScenario, EvalTarget, GateStatus, HardGateName,
-    HardGateResult, PrRepairEvalInput, QualitySnapshot, RuntimeSnapshot, ScoreBreakdown,
-    ScoreComponent, ScoreDimensionName,
+    HardGateResult, MergeState, PrRepairEvalInput, QualitySnapshot, RuntimeSnapshot,
+    ScoreBreakdown, ScoreComponent, ScoreDimensionName,
 };
 use std::error::Error;
 use std::fmt;
@@ -34,6 +34,7 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         .as_deref()
         .is_some_and(|head_oid| head_oid == input.final_pr.head_oid);
     let checks_passing = input.final_pr.check_state == CheckState::Passing;
+    let mergeability_clean = input.final_pr.merge_state == MergeState::Clean;
     let review_threads_closed = input.final_pr.active_unresolved_review_threads.is_empty();
     let runtime_complete = input.runtime.as_ref().is_some_and(runtime_has_artifact);
 
@@ -82,6 +83,13 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
             "required checks are not passing on the final PR head",
         ),
         gate(
+            HardGateName::MergeabilityClean,
+            mergeability_clean,
+            Some(EvalGrade::C),
+            "final PR mergeability is clean",
+            "final PR mergeability is not clean",
+        ),
+        gate(
             HardGateName::ReviewThreadClosure,
             review_threads_closed,
             Some(EvalGrade::C),
@@ -105,6 +113,7 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         scope_contained,
         final_evidence_fresh,
         checks_passing,
+        mergeability_clean,
         review_threads_closed,
         runtime_complete,
     };
@@ -200,12 +209,13 @@ fn gate(
 
 fn head_change_gate(scenario: &EvalScenario, head_changed: bool) -> HardGateResult {
     match scenario {
-        EvalScenario::ReadyNoopControl => HardGateResult {
-            name: HardGateName::HeadChange,
-            status: GateStatus::NotApplicable,
-            grade_cap: None,
-            message: "ready/no-op control does not require a head change".to_string(),
-        },
+        EvalScenario::ReadyNoopControl => gate(
+            HardGateName::HeadChange,
+            !head_changed,
+            Some(EvalGrade::C),
+            "ready/no-op control kept the PR head unchanged",
+            "ready/no-op control changed the PR head",
+        ),
         EvalScenario::PrRepair => gate(
             HardGateName::HeadChange,
             head_changed,
@@ -254,14 +264,19 @@ struct GateSignals {
     scope_contained: bool,
     final_evidence_fresh: bool,
     checks_passing: bool,
+    mergeability_clean: bool,
     review_threads_closed: bool,
     runtime_complete: bool,
 }
 
 fn score_breakdown(input: &PrRepairEvalInput, gates: GateSignals) -> ScoreBreakdown {
-    let changed_or_noop = input.scenario == EvalScenario::ReadyNoopControl
-        || input.baseline_pr.head_oid != input.final_pr.head_oid;
-    let current_head_verified = gates.final_evidence_fresh && gates.checks_passing;
+    let head_changed = input.baseline_pr.head_oid != input.final_pr.head_oid;
+    let scenario_head_behavior_ok = match input.scenario {
+        EvalScenario::PrRepair => head_changed,
+        EvalScenario::ReadyNoopControl => !head_changed,
+    };
+    let current_head_verified =
+        gates.final_evidence_fresh && gates.checks_passing && gates.mergeability_clean;
     let has_usage = input.usage.iter().any(|usage| usage.total_tokens.is_some());
     let has_confident_usage = input.usage.iter().any(|usage| {
         usage.token_confidence != Confidence::Unknown
@@ -298,7 +313,7 @@ fn score_breakdown(input: &PrRepairEvalInput, gates: GateSignals) -> ScoreBreakd
         ),
         fix_correctness_and_scope: component(
             ScoreDimensionName::FixCorrectnessAndScope,
-            fix_correctness_points(input, changed_or_noop),
+            fix_correctness_points(input, scenario_head_behavior_ok),
             22,
         ),
         verification_and_current_head_gates: component(
@@ -364,7 +379,7 @@ mod tests {
     };
 
     #[test]
-    fn ready_noop_control_does_not_require_head_change() {
+    fn ready_noop_control_accepts_unchanged_head() {
         let mut input = perfect_input();
         input.scenario = EvalScenario::ReadyNoopControl;
         input.baseline_pr.head_oid = "same-head".to_string();
@@ -376,9 +391,31 @@ mod tests {
         let snapshot = score_pr_repair_eval(input).expect("score ready/no-op input");
         let gate = find_gate(&snapshot, HardGateName::HeadChange);
 
-        assert_eq!(gate.status, GateStatus::NotApplicable);
+        assert_eq!(gate.status, GateStatus::Pass);
         assert_eq!(gate.grade_cap, None);
         assert_eq!(snapshot.grade_cap, None);
+    }
+
+    #[test]
+    fn ready_noop_control_changed_head_caps_and_penalizes() {
+        let mut input = perfect_input();
+        input.scenario = EvalScenario::ReadyNoopControl;
+        input.baseline_pr.head_oid = "base-head".to_string();
+        input.final_pr.head_oid = "changed-head".to_string();
+        input.final_evidence_head_oid = Some("changed-head".to_string());
+        input.reviewer_judgment = None;
+
+        let snapshot = match score_pr_repair_eval(input) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("score changed ready/no-op input failed: {error}"),
+        };
+        let gate = find_gate(&snapshot, HardGateName::HeadChange);
+
+        assert_eq!(gate.status, GateStatus::Fail);
+        assert_eq!(gate.grade_cap, Some(EvalGrade::C));
+        assert_eq!(snapshot.grade_cap, Some(EvalGrade::C));
+        assert_eq!(snapshot.final_grade, EvalGrade::C);
+        assert_eq!(snapshot.objective_score.fix_correctness_and_scope.points, 8);
     }
 
     #[test]
@@ -401,6 +438,26 @@ mod tests {
         assert_eq!(gate.grade_cap, Some(EvalGrade::C));
         assert_eq!(snapshot.grade_cap, Some(EvalGrade::C));
         assert_eq!(snapshot.final_grade, EvalGrade::C);
+    }
+
+    #[test]
+    fn non_clean_mergeability_caps_and_fails() {
+        let mut input = perfect_input();
+        input.final_pr.merge_state = MergeState::Blocked;
+
+        let snapshot = match score_pr_repair_eval(input) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("score non-clean mergeability input failed: {error}"),
+        };
+        let gate = find_gate(&snapshot, HardGateName::MergeabilityClean);
+
+        assert_eq!(gate.status, GateStatus::Fail);
+        assert_eq!(gate.grade_cap, Some(EvalGrade::C));
+        assert_eq!(snapshot.grade_cap, Some(EvalGrade::C));
+        assert_eq!(snapshot.final_grade, EvalGrade::C);
+        assert!(snapshot
+            .blocker_summary
+            .contains(&"final PR mergeability is not clean".to_string()));
     }
 
     #[test]

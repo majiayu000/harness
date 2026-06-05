@@ -188,6 +188,7 @@ pub enum HardGateName {
     HeadChange,
     HeadFreshness,
     RequiredChecks,
+    MergeabilityClean,
     ReviewThreadClosure,
     RuntimeArtifactCompleteness,
     ReviewerJudgmentFreshness,
