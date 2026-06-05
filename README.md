@@ -158,7 +158,7 @@ is configured.
 
 ```bash
 # Routine server work: fast module and lightweight route path.
-scripts/test-server-fast.sh
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-fast.sh
 
 # Full server DB, startup, recovery, route, and workflow profile.
 HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh
@@ -168,9 +168,10 @@ HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness cargo tes
 ```
 
 `scripts/test-server-fast.sh` is the warm local feedback path for routine
-`harness-server` changes. `scripts/test-server-db.sh` runs the full server suite
-single-threaded so DB-backed startup, recovery, full `AppState`, route, and
-workflow-runtime coverage remains explicit and stable.
+`harness-server` changes once a test database URL is configured.
+`scripts/test-server-db.sh` runs the full server suite single-threaded so
+DB-backed startup, recovery, full `AppState`, route, and workflow-runtime
+coverage remains explicit and stable.
 
 ### Run
 

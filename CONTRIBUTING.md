@@ -23,7 +23,7 @@ full DB profile for final handoff or changes that touch startup, recovery,
 full `AppState`, route persistence, or workflow runtime behavior:
 
 ```bash
-scripts/test-server-fast.sh
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-fast.sh
 HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh
 ```
 
