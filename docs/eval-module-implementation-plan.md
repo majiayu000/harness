@@ -1,6 +1,6 @@
 # Eval Module Implementation Plan
 
-Status: Draft
+Status: In progress
 Date: 2026-06-05
 Related spec: [`docs/eval-module-design.md`](eval-module-design.md)
 
@@ -63,7 +63,8 @@ Scope:
 - Add migrations for `eval_runs`, `eval_artifacts`, and `quality_snapshots`.
 - Add API routes for run creation, artifact upload, scoring, snapshot lookup, and
   latest snapshot by PR.
-- Score only from already-ingested artifacts.
+- Score from a canonical `PrRepairEvalInput` request or the latest uploaded
+  `pr_repair_eval_input` artifact.
 
 Out of scope:
 
@@ -76,6 +77,14 @@ Acceptance:
 - API tests cover creating a run, uploading baseline/final artifacts, scoring a
   run, and fetching the latest snapshot for a PR.
 - Raw prompt text is not stored.
+
+Implementation status:
+
+- Added optional `eval_store` startup validation and migrations for
+  `eval_runs`, `eval_artifacts`, and `quality_snapshots`.
+- Added `/api/evals/*` routes for run lifecycle, artifacts, deterministic
+  scoring, snapshot lookup, and PR-scoped snapshot history.
+- Added route coverage for artifact-first scoring and PR lookup.
 
 ### Issue 4: Join usage attribution into eval snapshots
 

@@ -216,13 +216,15 @@ Each run should produce a report with:
 
 ## Next Implementation Targets
 
-The current script can evaluate live PR repair from outside the server. The next
-Harness-owned implementation should persist this same report shape as a
-`QualitySnapshot`. The module-level design is in
+The current script can evaluate live PR repair from outside the server. The
+Harness-owned implementation now has a server-side persistence path for this
+same report shape as a `QualitySnapshot`. The module-level design is in
 [`docs/eval-module-design.md`](eval-module-design.md):
 
-1. Add a read-only `/api/quality/pr/{repo}/{pr}` endpoint.
-2. Store PR repair eval reports under workflow runtime events.
+1. Use `/api/evals/runs`, `/api/evals/runs/{run_id}/artifacts`,
+   `/api/evals/runs/{run_id}/score`, and `/api/evals/pr/{owner}/{repo}/{pr}` as
+   the durable eval contract.
+2. Store PR repair eval reports as `quality_snapshots` linked to eval runs.
 3. Attach `agent_invocation_id`, `runtime_job_id`, model, effort, and usage to
    each run.
 4. Block ready-to-merge when the report has stale head SHA, failing checks, or
