@@ -9,23 +9,14 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScoringError {
     UnsupportedTarget,
-    ReviewerHeadMismatch {
-        judged_head_oid: String,
-        final_head_oid: String,
-    },
 }
 
 impl fmt::Display for ScoringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedTarget => write!(f, "PR repair scoring requires a pull request target"),
-            Self::ReviewerHeadMismatch {
-                judged_head_oid,
-                final_head_oid,
-            } => write!(
-                f,
-                "reviewer judgment head {judged_head_oid} does not match final PR head {final_head_oid}"
-            ),
+            Self::UnsupportedTarget => {
+                write!(f, "PR repair scoring requires a pull request target")
+            }
         }
     }
 }
@@ -33,17 +24,10 @@ impl fmt::Display for ScoringError {
 impl Error for ScoringError {}
 
 pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot, ScoringError> {
-    if let Some(judgment) = &input.reviewer_judgment {
-        if judgment.judged_head_oid != input.final_pr.head_oid {
-            return Err(ScoringError::ReviewerHeadMismatch {
-                judged_head_oid: judgment.judged_head_oid.clone(),
-                final_head_oid: input.final_pr.head_oid.clone(),
-            });
-        }
-    }
-
     let target_matches = target_matches_pr(&input)?;
     let branch_safe = branch_safe(&input);
+    let no_unrelated_pr = !input.created_unrelated_pr;
+    let scope_contained = input.scope_violations.is_empty();
     let head_changed = input.baseline_pr.head_oid != input.final_pr.head_oid;
     let final_evidence_fresh = input
         .final_evidence_head_oid
@@ -67,6 +51,20 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
             Some(EvalGrade::F),
             "base and head refs stayed on the requested PR",
             "base or head refs changed during evaluation",
+        ),
+        gate(
+            HardGateName::NoUnrelatedPrCreation,
+            no_unrelated_pr,
+            Some(EvalGrade::F),
+            "evaluation did not create an unrelated PR",
+            "evaluation created or reported an unrelated PR",
+        ),
+        gate(
+            HardGateName::ScopeContainment,
+            scope_contained,
+            Some(EvalGrade::F),
+            "final diff stayed within the repair scope",
+            "destructive or unrelated scope changes were detected",
         ),
         head_change_gate(&input.scenario, head_changed),
         gate(
@@ -104,6 +102,8 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         &input,
         target_matches,
         branch_safe,
+        no_unrelated_pr,
+        scope_contained,
         final_evidence_fresh,
         checks_passing,
         review_threads_closed,
@@ -122,8 +122,8 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
     Ok(QualitySnapshot {
         scenario: input.scenario,
         target: input.target,
-        baseline_pr: input.baseline_pr,
-        final_pr: input.final_pr,
+        baseline_pr: Some(input.baseline_pr),
+        final_pr: Some(input.final_pr),
         runtime: input.runtime,
         usage: input.usage,
         hard_gates,
@@ -153,10 +153,10 @@ fn target_matches_pr(input: &PrRepairEvalInput) -> Result<bool, ScoringError> {
         && input.final_pr.pr_number == *pr_number
         && base_ref
             .as_deref()
-            .is_none_or(|base_ref| input.final_pr.base_ref == base_ref)
+            .is_none_or(|expected_base_ref| input.final_pr.base_ref == expected_base_ref)
         && head_ref
             .as_deref()
-            .is_none_or(|head_ref| input.final_pr.head_ref == head_ref);
+            .is_none_or(|expected_head_ref| input.final_pr.head_ref == expected_head_ref);
 
     Ok(target_matches)
 }
@@ -217,20 +217,25 @@ fn head_change_gate(scenario: &EvalScenario, head_changed: bool) -> HardGateResu
 }
 
 fn reviewer_gate(input: &PrRepairEvalInput) -> HardGateResult {
-    if input.reviewer_judgment.is_some() {
-        HardGateResult {
+    match &input.reviewer_judgment {
+        Some(judgment) if judgment.judged_head_oid == input.final_pr.head_oid => HardGateResult {
             name: HardGateName::ReviewerJudgmentFreshness,
             status: GateStatus::Pass,
             grade_cap: None,
             message: "reviewer judgment matches the final PR head".to_string(),
-        }
-    } else {
-        HardGateResult {
+        },
+        Some(_) => HardGateResult {
+            name: HardGateName::ReviewerJudgmentFreshness,
+            status: GateStatus::Fail,
+            grade_cap: Some(EvalGrade::C),
+            message: "reviewer judgment is stale for the final PR head".to_string(),
+        },
+        None => HardGateResult {
             name: HardGateName::ReviewerJudgmentFreshness,
             status: GateStatus::NotApplicable,
-            grade_cap: None,
-            message: "reviewer judgment was not provided".to_string(),
-        }
+            grade_cap: Some(EvalGrade::B),
+            message: "reviewer judgment was not provided; grade is capped at B".to_string(),
+        },
     }
 }
 
@@ -245,6 +250,8 @@ fn score_breakdown(
     input: &PrRepairEvalInput,
     target_matches: bool,
     branch_safe: bool,
+    no_unrelated_pr: bool,
+    scope_contained: bool,
     final_evidence_fresh: bool,
     checks_passing: bool,
     review_threads_closed: bool,
@@ -276,7 +283,11 @@ fn score_breakdown(
         ),
         branch_and_pr_safety: component(
             ScoreDimensionName::BranchAndPrSafety,
-            if target_matches && branch_safe { 10 } else { 0 },
+            if target_matches && branch_safe && no_unrelated_pr && scope_contained {
+                10
+            } else {
+                0
+            },
             10,
         ),
         fix_correctness_and_scope: component(
@@ -312,13 +323,19 @@ fn score_breakdown(
 }
 
 fn fix_correctness_points(input: &PrRepairEvalInput, changed_or_noop: bool) -> u8 {
+    if input.created_unrelated_pr || !input.scope_violations.is_empty() {
+        return 4;
+    }
+
     if let Some(judgment) = &input.reviewer_judgment {
-        let bounded = judgment.code_quality_score.min(100) as u16;
+        let code_quality = judgment.code_quality_score.min(100) as u16;
+        let trajectory = judgment.trajectory_score.min(100) as u16;
+        let bounded = (code_quality * 3 + trajectory + 2) / 4;
         return ((bounded * 22 + 50) / 100) as u8;
     }
 
     if changed_or_noop {
-        18
+        13
     } else {
         8
     }
@@ -433,18 +450,80 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_judgment_with_mismatched_head_is_rejected() {
+    fn stale_reviewer_judgment_caps_and_fails() {
         let mut input = perfect_input();
         input.reviewer_judgment = Some(reviewer_judgment("old-head"));
 
-        let error = score_pr_repair_eval(input).expect_err("mismatched reviewer head");
+        let snapshot = score_pr_repair_eval(input).expect("score stale reviewer input");
+        let gate = find_gate(&snapshot, HardGateName::ReviewerJudgmentFreshness);
+
+        assert_eq!(gate.status, GateStatus::Fail);
+        assert_eq!(gate.grade_cap, Some(EvalGrade::C));
+        assert_eq!(snapshot.grade_cap, Some(EvalGrade::C));
+        assert_eq!(snapshot.final_grade, EvalGrade::C);
+        assert!(snapshot
+            .blocker_summary
+            .contains(&"reviewer judgment is stale for the final PR head".to_string()));
+    }
+
+    #[test]
+    fn missing_reviewer_judgment_caps_at_b() {
+        let mut input = perfect_input();
+        input.reviewer_judgment = None;
+
+        let snapshot = score_pr_repair_eval(input).expect("score missing reviewer input");
+        let gate = find_gate(&snapshot, HardGateName::ReviewerJudgmentFreshness);
+
+        assert_eq!(gate.status, GateStatus::NotApplicable);
+        assert_eq!(gate.grade_cap, Some(EvalGrade::B));
+        assert_eq!(snapshot.grade_cap, Some(EvalGrade::B));
+        assert_eq!(snapshot.final_grade, EvalGrade::B);
+    }
+
+    #[test]
+    fn unrelated_pr_creation_caps_at_f() {
+        let mut input = perfect_input();
+        input.created_unrelated_pr = true;
+
+        let snapshot = score_pr_repair_eval(input).expect("score unrelated PR input");
+        let gate = find_gate(&snapshot, HardGateName::NoUnrelatedPrCreation);
+
+        assert_eq!(gate.status, GateStatus::Fail);
+        assert_eq!(gate.grade_cap, Some(EvalGrade::F));
+        assert_eq!(snapshot.grade_cap, Some(EvalGrade::F));
+        assert_eq!(snapshot.final_grade, EvalGrade::F);
+    }
+
+    #[test]
+    fn destructive_or_unrelated_scope_changes_cap_at_f() {
+        let mut input = perfect_input();
+        input
+            .scope_violations
+            .push("changed unrelated dashboard files".to_string());
+
+        let snapshot = score_pr_repair_eval(input).expect("score scope violation input");
+        let gate = find_gate(&snapshot, HardGateName::ScopeContainment);
+
+        assert_eq!(gate.status, GateStatus::Fail);
+        assert_eq!(gate.grade_cap, Some(EvalGrade::F));
+        assert_eq!(snapshot.grade_cap, Some(EvalGrade::F));
+        assert_eq!(snapshot.final_grade, EvalGrade::F);
+    }
+
+    #[test]
+    fn trajectory_score_contributes_to_fix_correctness() {
+        let mut input = perfect_input();
+        input.reviewer_judgment = Some(ReviewerJudgment {
+            code_quality_score: 100,
+            trajectory_score: 0,
+            ..reviewer_judgment("final-head")
+        });
+
+        let snapshot = score_pr_repair_eval(input).expect("score low trajectory input");
 
         assert_eq!(
-            error,
-            ScoringError::ReviewerHeadMismatch {
-                judged_head_oid: "old-head".to_string(),
-                final_head_oid: "final-head".to_string(),
-            }
+            snapshot.objective_score.fix_correctness_and_scope.points,
+            17
         );
     }
 
@@ -511,11 +590,13 @@ mod tests {
                 output_tokens: Some(200),
                 cached_input_tokens: Some(100),
                 total_tokens: Some(1200),
-                cost_usd: Some(0.12),
+                cost_usd_micros: Some(120_000),
                 token_confidence: Confidence::Exact,
                 cost_confidence: Confidence::Estimated,
             }],
             reviewer_judgment: Some(reviewer_judgment("final-head")),
+            created_unrelated_pr: false,
+            scope_violations: Vec::new(),
         }
     }
 

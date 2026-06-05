@@ -227,14 +227,15 @@ pub struct UsageSnapshot {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
-    pub cost_usd: Option<Decimal>,
+    pub cost_usd_micros: Option<u64>,
     pub token_confidence: Confidence,
     pub cost_confidence: Confidence,
 }
 ```
 
 The eval module only consumes usage summaries. Price catalog loading remains in
-the usage/cost module.
+the usage/cost module. Monetary values use integer micro-USD units so the pure
+eval crate does not need a decimal dependency and never rounds with floats.
 
 ### `QualitySnapshot`
 
@@ -271,7 +272,8 @@ grade is capped even when other score dimensions look strong.
 | Required checks | final check state for final head | `C` |
 | Review-thread closure | final active unresolved threads | `C` |
 | Runtime artifact completeness | task/workflow/job snapshots | `B` |
-| No destructive/unrelated scope | changed files and risk scanner | `C` |
+| Reviewer judgment freshness | reviewer head vs final PR head | `C`, or `B` when absent |
+| No destructive/unrelated scope | changed files and risk scanner | `F` |
 
 Ready/no-op control cases are exempt from the "head changed" expectation. A
 correct no-op must still prove current-head checks and review threads.
@@ -335,6 +337,8 @@ Rules:
 - It can subtract subjective points.
 - It cannot override failed hard gates.
 - It cannot approve stale-head evidence.
+- A missing reviewer judgment caps the grade at `B`; a stale reviewer judgment
+  fails the freshness gate and caps the grade at `C`.
 
 ## Storage Design
 
@@ -489,8 +493,11 @@ Every failed or weak run should classify the first meaningful failure:
 - cap grade at `C` for unresolved active review threads
 - cap grade at `C` for stale-head validation
 - cap grade at `B` for missing runtime artifact
+- cap grade at `B` when reviewer judgment is missing
+- cap grade at `C` when reviewer judgment is stale
+- cap grade at `F` for unrelated PR creation or destructive scope changes
 - calculate score breakdown deterministically
-- reject reviewer judgment when `judged_head_oid` differs from final head
+- include both code-quality and trajectory scores in the subjective subscore
 - preserve cost confidence labels
 
 `harness-server` should have API tests:
@@ -532,4 +539,3 @@ The first complete implementation is done when:
 - usage is attributed or explicitly marked unknown
 - dashboard can show the latest eval for a PR
 - `cargo test -p harness-eval` and relevant server API tests pass
-

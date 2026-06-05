@@ -125,7 +125,7 @@ pub struct UsageSnapshot {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
-    pub cost_usd: Option<f64>,
+    pub cost_usd_micros: Option<u64>,
     pub token_confidence: Confidence,
     pub cost_confidence: Confidence,
 }
@@ -174,6 +174,8 @@ pub struct PrRepairEvalInput {
     pub runtime: Option<RuntimeSnapshot>,
     pub usage: Vec<UsageSnapshot>,
     pub reviewer_judgment: Option<ReviewerJudgment>,
+    pub created_unrelated_pr: bool,
+    pub scope_violations: Vec<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +183,8 @@ pub struct PrRepairEvalInput {
 pub enum HardGateName {
     TargetCorrectness,
     BranchSafety,
+    NoUnrelatedPrCreation,
+    ScopeContainment,
     HeadChange,
     HeadFreshness,
     RequiredChecks,
@@ -304,8 +308,8 @@ impl ScoreBreakdown {
 pub struct QualitySnapshot {
     pub scenario: EvalScenario,
     pub target: EvalTarget,
-    pub baseline_pr: PullRequestSnapshot,
-    pub final_pr: PullRequestSnapshot,
+    pub baseline_pr: Option<PullRequestSnapshot>,
+    pub final_pr: Option<PullRequestSnapshot>,
     pub runtime: Option<RuntimeSnapshot>,
     pub usage: Vec<UsageSnapshot>,
     pub hard_gates: Vec<HardGateResult>,

@@ -22,7 +22,8 @@ Scope:
 - Implement deterministic hard gate evaluation.
 - Implement deterministic score aggregation and grade caps.
 - Add fixture tests for ready/no-op, unresolved review threads, stale head,
-  missing runtime artifact, reviewer head mismatch, and score totals.
+  missing runtime artifact, stale reviewer judgment, missing reviewer judgment,
+  unrelated PR creation, scope containment, and score totals.
 
 Out of scope:
 
@@ -124,4 +125,3 @@ Do not include unrelated usage dashboard, README, or AGENTS changes in this PR.
 5. Run one live PR repair eval and produce `quality_snapshot.json`.
 6. Add server persistence and APIs.
 7. Add dashboard visibility.
-

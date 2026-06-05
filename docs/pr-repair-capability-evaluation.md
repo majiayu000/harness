@@ -70,6 +70,9 @@ some useful work.
 | Blocking feedback | Final active, non-outdated unresolved `reviewThreads` count is zero, or every remaining thread has an explicit justified rejection. | The original blocker remains. |
 | Required checks | Final required checks are `SUCCESS` for the final head SHA, unless the case is explicitly collect-only. | CI still blocks merge. |
 | Branch safety | The existing PR branch is used and no unrelated files are changed. | Cross-branch mutation, broad cleanup, or dirty-state dependence. |
+| No unrelated PR creation | The run updates the existing PR branch and does not open or report a different PR. | The evaluation target was replaced by a new PR. |
+| Scope containment | The final diff avoids destructive or unrelated changes outside the repair. | The run created hidden merge risk even if checks are green. |
+| Reviewer judgment freshness | Optional LLM or human judgment names the final `headRefOid`; missing judgment caps the grade at `B`. | Subjective code-quality evidence is stale or absent. |
 | Runtime artifact | The report includes `task_id`, `workflow_id`, runtime terminal state, and final PR snapshot. | The result cannot be audited later. |
 
 Ready/no-op controls are exempt from the "head changed" expectation. For those
