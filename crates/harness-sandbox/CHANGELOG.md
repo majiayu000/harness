@@ -1,0 +1,25 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.6.34](https://github.com/majiayu000/harness/releases/tag/harness-sandbox-v0.6.34) - 2026-06-05
+
+### Added
+
+- *(security)* CapabilityToken for parallel_dispatch write isolation ([#826](https://github.com/majiayu000/harness/pull/826))
+
+### Fixed
+
+- *(review)* make hosted bots advisory by default
+- address OS sandbox rework feedback ([#156](https://github.com/majiayu000/harness/pull/156))
+
+### Other
+
+- *(release)* v0.6.34 ([#1196](https://github.com/majiayu000/harness/pull/1196))
+- checkpoint current harness workspace state
+- consolidate error types into single hierarchy
