@@ -168,7 +168,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         )
         .await;
     } else {
-        tracing::debug!("startup reconciliation disabled by config");
+        tracing::info!("startup reconciliation disabled by config");
     }
 
     // Re-dispatch tasks that were recovered to pending after server restart.
