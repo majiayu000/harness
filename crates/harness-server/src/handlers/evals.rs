@@ -151,7 +151,18 @@ fn parse_score_eval_run_request(body: &Bytes) -> Result<ScoreEvalRunRequest, Str
     if body.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Ok(ScoreEvalRunRequest { input: None });
     }
-    serde_json::from_slice(body).map_err(|error| format!("invalid score request body: {error}"))
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("invalid score request body: {error}"))?;
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(ScoreEvalRunRequest { input: None });
+    }
+    if value.get("input").is_some() {
+        return serde_json::from_value(value)
+            .map_err(|error| format!("invalid score request body: {error}"));
+    }
+    serde_json::from_value(value)
+        .map(|input| ScoreEvalRunRequest { input: Some(input) })
+        .map_err(|error| format!("invalid score request body: {error}"))
 }
 
 pub async fn get_eval_quality_snapshot(

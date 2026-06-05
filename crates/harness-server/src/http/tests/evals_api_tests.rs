@@ -218,6 +218,43 @@ async fn score_malformed_eval_input_artifact_returns_bad_request() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+async fn score_accepts_unwrapped_eval_input_body() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.data_dir = dir.path().to_path_buf();
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = evals_app(state);
+    let run_id = create_pr_repair_run(app.clone()).await?;
+
+    let score = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/evals/runs/{run_id}/score"))
+                .header("content-type", "application/json")
+                .body(Body::from(pr_repair_input().to_string()))?,
+        )
+        .await?;
+    assert_eq!(score.status(), axum::http::StatusCode::OK);
+    let scored = response_json(score).await?;
+    assert_eq!(scored["run"]["status"], "scored");
+    assert_eq!(
+        scored["quality_snapshot"]["snapshot"]["target"]["pr_number"],
+        7
+    );
+    Ok(())
+}
+
 async fn create_pr_repair_run(app: Router) -> anyhow::Result<String> {
     let create = app
         .oneshot(
