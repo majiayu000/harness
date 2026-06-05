@@ -99,6 +99,8 @@ PR feedback flow:
 1. Inspect top-level PR comments, inline review comments, review states, checks, and mergeability.
 2. Treat actionable feedback as blocking until it is fixed or explicitly answered with a justified response.
 3. Re-run validation after feedback-driven changes.
+4. Before the final response, refresh the PR state from GitHub again, including review threads, review states, checks, mergeability, and the current head commit.
+5. If any actionable review thread, requested change, failed check, or mergeability blocker remains, report the activity status as blocked instead of succeeded.
 
 Final response:
 
