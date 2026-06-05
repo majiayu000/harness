@@ -217,6 +217,9 @@ pr = ((page.get("data") or {}).get("repository") or {}).get("pullRequest")
 if not pr:
     raise SystemExit("GitHub GraphQL response did not include pullRequest")
 
+incoming_threads = pr.get("reviewThreads") or {}
+incoming_nodes = list(incoming_threads.get("nodes") or [])
+incoming_page_info = incoming_threads.get("pageInfo") or {}
 existing = None
 try:
     with open(tmp_path, "r", encoding="utf-8") as fh:
@@ -229,9 +232,8 @@ if existing is None:
     existing.setdefault("reviewThreads", {})["nodes"] = []
 
 existing_threads = existing.setdefault("reviewThreads", {})
-incoming_threads = pr.get("reviewThreads") or {}
-existing_threads.setdefault("nodes", []).extend(incoming_threads.get("nodes") or [])
-existing_threads["pageInfo"] = incoming_threads.get("pageInfo") or {}
+existing_threads.setdefault("nodes", []).extend(incoming_nodes)
+existing_threads["pageInfo"] = incoming_page_info
 
 with open(tmp_path, "w", encoding="utf-8") as fh:
     json.dump(existing, fh, indent=2, sort_keys=True)
