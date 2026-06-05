@@ -199,7 +199,7 @@ fn available_summary(
     let mut model_names = BTreeSet::new();
     let mut period_count = 0;
     for row in rows {
-        match row.overlaps_window(since, until) {
+        match row.is_fully_within_window(since, until) {
             Ok(true) => {
                 total.add_session(&row);
                 period_count += 1;
@@ -288,7 +288,11 @@ fn format_window_timestamp(timestamp: DateTime<Utc>) -> String {
 }
 
 impl CcstatsSessionRow {
-    fn overlaps_window(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<bool, String> {
+    fn is_fully_within_window(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<bool, String> {
         let Some(first_timestamp) = self.first_timestamp else {
             return Err("ccstats session row was missing first_timestamp".to_string());
         };
@@ -300,7 +304,15 @@ impl CcstatsSessionRow {
                 "ccstats session row had last_timestamp before first_timestamp".to_string(),
             );
         }
-        Ok(last_timestamp >= since && first_timestamp <= until)
+        if last_timestamp < since || first_timestamp > until {
+            return Ok(false);
+        }
+        if first_timestamp < since || last_timestamp > until {
+            return Err(
+                "ccstats session row crossed the requested window boundary; session-level totals cannot be trimmed safely".to_string(),
+            );
+        }
+        Ok(true)
     }
 }
 
@@ -453,6 +465,30 @@ mod tests {
         assert_eq!(summary.estimated_cost_usd, Some(0.6235));
         assert_eq!(summary.model_count, 2);
         assert!(summary.models.is_empty());
+    }
+
+    #[test]
+    fn available_summary_rejects_boundary_crossing_session_totals() {
+        let since = utc_timestamp("2026-06-03T14:00:00Z");
+        let until = utc_timestamp("2026-06-04T14:00:00Z");
+        let mut boundary_crossing = fake_session_row();
+        boundary_crossing.first_timestamp = Some(utc_timestamp("2026-06-03T13:55:00Z"));
+        boundary_crossing.last_timestamp = Some(utc_timestamp("2026-06-03T14:05:00Z"));
+
+        let summary = available_summary(
+            LOCAL_USAGE_SOURCES[0],
+            since,
+            until,
+            vec![boundary_crossing],
+            12.0,
+        );
+
+        assert_eq!(summary.status, "unavailable");
+        assert_eq!(summary.total_tokens, 0);
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("crossed the requested window boundary")));
     }
 
     #[test]
