@@ -60,7 +60,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
                 );
             } else if let Some(store) = state.core.workflow_runtime_store.as_ref() {
                 let workspace_roots =
-                    workspace_roots_for_reaper(state.concurrency.workspace_mgr.as_ref());
+                    workspace_roots_for_reaper(state.concurrency.workspace_mgr.as_deref());
                 match harness_core::db::reap_orphaned_path_schemas_with_workspace_roots(
                     store.pool(),
                     true,
@@ -91,7 +91,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
 }
 
 fn workspace_roots_for_reaper(
-    workspace_mgr: Option<&Arc<crate::workspace::WorkspaceManager>>,
+    workspace_mgr: Option<&crate::workspace::WorkspaceManager>,
 ) -> Vec<PathBuf> {
     workspace_mgr
         .map(|manager| vec![manager.config.root.clone()])
@@ -114,7 +114,7 @@ mod tests {
         let manager = Arc::new(crate::workspace::WorkspaceManager::new(config)?);
 
         assert_eq!(
-            workspace_roots_for_reaper(Some(&manager)),
+            workspace_roots_for_reaper(Some(&*manager)),
             vec![workspace_root]
         );
         Ok(())
