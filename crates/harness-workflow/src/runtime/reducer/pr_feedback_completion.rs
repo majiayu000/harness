@@ -1,6 +1,6 @@
 use super::support::{
-    event_field_string, has_signal, optional_data_string, result_signal_string, result_signal_u64,
-    runtime_completion_evidence,
+    event_field_string, has_signal, json_value_u64, optional_data_string, result_signal_string,
+    result_signal_u64, runtime_completion_evidence,
 };
 use super::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::model::{ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowInstance};
@@ -68,7 +68,7 @@ pub(super) fn pr_feedback_success_contract_error(
     }
 
     if result.activity == "address_pr_feedback" && instance.state == "addressing_feedback" {
-        if repair_snapshot_proves_action(result) {
+        if repair_snapshot_proves_action(instance, result) {
             return None;
         }
         return Some(
@@ -80,7 +80,7 @@ pub(super) fn pr_feedback_success_contract_error(
         if pr_feedback_outcome_from_signals(result) == Some(PrFeedbackOutcome::BlockingFeedback) {
             return None;
         }
-        if ready_snapshot_proves_pr_ready(result) {
+        if ready_snapshot_proves_pr_ready(instance, result) {
             return None;
         }
         return Some(
@@ -249,10 +249,10 @@ fn github_issue_pr_feedback_activity_matches(
     )
 }
 
-fn repair_snapshot_proves_action(result: &ActivityResult) -> bool {
+fn repair_snapshot_proves_action(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
     result.artifacts.iter().any(|artifact| {
         artifact.artifact_type == PR_REPAIR_SNAPSHOT_ARTIFACT
-            && snapshot_has_pr_identity(&artifact.artifact)
+            && snapshot_has_pr_identity(instance, result, &artifact.artifact)
             && snapshot_has_head_identity(&artifact.artifact)
             && snapshot_has_observation_time(&artifact.artifact)
             && snapshot_has_repair_action(&artifact.artifact)
@@ -272,7 +272,7 @@ fn structured_ready_decision(decision: &WorkflowDecision) -> bool {
     decision.next_state == "ready_to_merge" || decision.decision == "mark_ready_to_merge"
 }
 
-fn ready_snapshot_proves_pr_ready(result: &ActivityResult) -> bool {
+fn ready_snapshot_proves_pr_ready(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
     result
         .artifacts
         .iter()
@@ -283,7 +283,7 @@ fn ready_snapshot_proves_pr_ready(result: &ActivityResult) -> bool {
             )
         })
         .any(|artifact| {
-            snapshot_has_pr_identity(&artifact.artifact)
+            snapshot_has_pr_identity(instance, result, &artifact.artifact)
                 && snapshot_has_head_identity(&artifact.artifact)
                 && snapshot_has_observation_time(&artifact.artifact)
                 && snapshot_check_state_allows_ready(&artifact.artifact)
@@ -294,9 +294,46 @@ fn ready_snapshot_proves_pr_ready(result: &ActivityResult) -> bool {
         })
 }
 
-fn snapshot_has_pr_identity(snapshot: &Value) -> bool {
-    field_u64(snapshot, &["pr_number", "prNumber"]).is_some()
-        && non_empty_string(snapshot, &["pr_url", "prUrl", "url"])
+fn snapshot_has_pr_identity(
+    instance: &WorkflowInstance,
+    result: &ActivityResult,
+    snapshot: &Value,
+) -> bool {
+    let Some(snapshot_number) = field_u64(snapshot, &["pr_number", "prNumber"]) else {
+        return false;
+    };
+    let Some(snapshot_url) = string_field(snapshot, &["pr_url", "prUrl", "url"]) else {
+        return false;
+    };
+
+    if let Some(expected_number) = expected_pr_number(instance, result) {
+        if snapshot_number != expected_number {
+            return false;
+        }
+    }
+    if let Some(expected_url) = expected_pr_url(instance, result) {
+        if normalize_pr_url(snapshot_url) != normalize_pr_url(expected_url.as_str()) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn expected_pr_number(instance: &WorkflowInstance, result: &ActivityResult) -> Option<u64> {
+    instance
+        .data
+        .get("pr_number")
+        .and_then(json_value_u64)
+        .or_else(|| result_signal_u64(result, "pr_number"))
+}
+
+fn expected_pr_url(instance: &WorkflowInstance, result: &ActivityResult) -> Option<String> {
+    optional_data_string(instance, "pr_url").or_else(|| result_signal_string(result, "pr_url"))
+}
+
+fn normalize_pr_url(value: &str) -> &str {
+    value.trim().trim_end_matches('/')
 }
 
 fn snapshot_has_head_identity(snapshot: &Value) -> bool {
@@ -435,6 +472,14 @@ fn non_empty_string(value: &Value, fields: &[&str]) -> bool {
         field_value(value, field)
             .and_then(Value::as_str)
             .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+fn string_field<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a str> {
+    fields.iter().find_map(|field| {
+        field_value(value, field)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
     })
 }
 
