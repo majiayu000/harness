@@ -83,7 +83,7 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
     );
     assert_eq!(
         schema["activity_contract"]["success_requires"],
-        "pr_repair_snapshot_with_action_and_validation_or_closed_issue_evidence"
+        "pr_repair_snapshot_with_action_and_passing_validation_or_closed_issue_evidence"
     );
     assert!(
         schema["transition_contract"]["on_succeeded"]["success_requires"]
@@ -117,6 +117,12 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
     assert!(snapshot_fields.contains(&json!("no_code_change_reason")));
     assert!(!snapshot_fields.contains(&json!("head_sha_or_head_oid")));
     assert!(!snapshot_fields.contains(&json!("action_taken_or_no_code_change_reason")));
+    assert!(
+        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["field_contract"]
+            ["validation_commands"]
+            .as_str()
+            .is_some_and(|value| value.contains("successful status"))
+    );
 }
 
 #[test]

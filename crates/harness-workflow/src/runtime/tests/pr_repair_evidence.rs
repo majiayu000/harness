@@ -200,6 +200,42 @@ fn address_pr_feedback_success_with_repair_snapshot_requests_local_review() {
 }
 
 #[test]
+fn address_pr_feedback_snapshot_with_failed_validation_blocks() {
+    let instance = pr_workflow_state("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Runtime agent reported a repair with failed validation.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_sha": "def456",
+            "observed_at": "2026-06-06T00:05:00Z",
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "action_taken": "pushed_commit",
+            "validation_commands": [
+                {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "failed"}
+            ]
+        }),
+    ))
+    .with_validation(ValidationRecord::new(
+        "cargo test -p harness-workflow pr_repair_evidence",
+        "failed",
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("failed validation evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR repair evidence is missing"));
+}
+
+#[test]
 fn address_pr_feedback_snapshot_for_different_pr_blocks() {
     let instance = pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(

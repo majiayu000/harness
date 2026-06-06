@@ -3,7 +3,9 @@ use super::support::{
     result_signal_u64, runtime_completion_evidence,
 };
 use super::GITHUB_ISSUE_PR_DEFINITION_ID;
-use crate::runtime::model::{ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowInstance};
+use crate::runtime::model::{
+    ActivityResult, ValidationRecord, WorkflowDecision, WorkflowEvent, WorkflowInstance,
+};
 use crate::runtime::pr_feedback::{
     build_local_review_completed_decision, build_pr_feedback_decision, LocalReviewCompletedInput,
     LocalReviewOutcome, PrFeedbackDecisionInput, PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY,
@@ -443,12 +445,43 @@ fn snapshot_has_validation_evidence(result: &ActivityResult, snapshot: &Value) -
     result
         .validation
         .iter()
-        .any(|record| !record.command.trim().is_empty())
-        || non_empty_array(
+        .any(validation_record_allows_success)
+        || validation_array_has_success(
             snapshot,
             &["validation", "validation_records", "validationRecords"],
         )
-        || non_empty_array(snapshot, &["validation_commands", "validationCommands"])
+        || validation_array_has_success(snapshot, &["validation_commands", "validationCommands"])
+}
+
+fn validation_record_allows_success(record: &ValidationRecord) -> bool {
+    !record.command.trim().is_empty() && validation_status_allows_success(&record.status)
+}
+
+fn validation_array_has_success(value: &Value, fields: &[&str]) -> bool {
+    fields.iter().any(|field| {
+        field_value(value, field)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(validation_value_allows_success))
+    })
+}
+
+fn validation_value_allows_success(value: &Value) -> bool {
+    let has_command = non_empty_string(value, &["command", "cmd", "name"])
+        || non_empty_array(value, &["commands"]);
+    let has_success_status = string_field(value, &["status", "outcome", "result"])
+        .is_some_and(validation_status_allows_success)
+        || matches!(
+            field_bool(value, &["passed", "success", "succeeded"]),
+            Some(true)
+        );
+    has_command && has_success_status
+}
+
+fn validation_status_allows_success(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "passed" | "pass" | "success" | "succeeded" | "ok"
+    )
 }
 
 fn non_empty_array(value: &Value, fields: &[&str]) -> bool {

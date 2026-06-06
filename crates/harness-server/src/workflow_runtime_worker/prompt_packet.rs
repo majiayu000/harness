@@ -316,7 +316,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         ("github_issue_pr", "address_pr_feedback") => json!({
             "on_succeeded": {
                 "reducer_next_state": "local_review_gate",
-                "success_requires": "A succeeded address_pr_feedback result MUST include pr_repair_snapshot with final head, observed_at, action proof, and validation evidence, unless IssueClosed/IssueAlreadyResolved or issue_state proves the issue or PR is already closed/resolved.",
+                "success_requires": "A succeeded address_pr_feedback result MUST include pr_repair_snapshot with final head, observed_at, action proof, and passing validation evidence, unless IssueClosed/IssueAlreadyResolved or issue_state proves the issue or PR is already closed/resolved.",
                 "required_summary": "Describe addressed review feedback, pushed/no-code action, validation evidence, or closed issue evidence. Harness will run local review before remote feedback unless terminal closed evidence finishes the workflow."
             },
             "on_failed": {
@@ -511,7 +511,10 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 "pr_repair_snapshot": {
                     "required_when": "Feedback repair was performed, review-thread action was taken, or a no-code-change repair conclusion is returned.",
                     "required_unless": "IssueClosed/IssueAlreadyResolved signal or issue_state artifact proves the issue or PR is already closed/resolved.",
-                    "fields": ["pr_number", "pr_url", "head_sha", "head_oid", "observed_at", "changed_files", "action_taken", "no_code_change_reason", "validation_commands"]
+                    "fields": ["pr_number", "pr_url", "head_sha", "head_oid", "observed_at", "changed_files", "action_taken", "no_code_change_reason", "validation_commands"],
+                    "field_contract": {
+                        "validation_commands": "Array of validation records with command and a successful status such as passed, success, succeeded, or ok. Failed, blocked, or not_run records do not satisfy successful repair evidence."
+                    }
                 },
                 "issue_state": {
                     "required_when": "No repair is needed because the issue or PR is already closed/resolved.",
