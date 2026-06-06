@@ -204,7 +204,9 @@ snapshot must also record whether `reviewThreads` and changed-file enumeration
 was complete. Raw GitHub evidence proves completeness with
 `pageInfo.hasNextPage=false`; server-normalized evidence must carry explicit
 `review_threads_complete=true` and `changed_files_complete=true`. Incomplete or
-missing completeness evidence is not valid merge-readiness evidence.
+missing completeness evidence is not valid merge-readiness evidence. Direct
+`PrRepairEvalInput` artifacts that omit the completeness fields are treated as
+incomplete, not as legacy-complete evidence.
 
 ### `RuntimeSnapshot`
 

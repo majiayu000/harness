@@ -82,16 +82,12 @@ pub struct PullRequestSnapshot {
     pub check_state: CheckState,
     pub review_decision: Option<ReviewDecision>,
     pub active_unresolved_review_threads: Vec<ReviewThreadSnapshot>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub review_threads_complete: bool,
     pub changed_files: Vec<ChangedFileSnapshot>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub changed_files_complete: bool,
     pub collected_at: String,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

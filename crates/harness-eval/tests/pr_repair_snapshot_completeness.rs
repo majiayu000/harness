@@ -89,6 +89,41 @@ fn missing_server_normalized_completeness_flags_fail_evidence_gates() {
 }
 
 #[test]
+fn direct_eval_input_missing_completeness_flags_fail_evidence_gates() {
+    let baseline = github_pr_snapshot_from_value(
+        "owner/repo",
+        "2026-06-06T00:00:00Z",
+        &server_normalized_snapshot("base-head", true, true),
+    );
+    let final_pr = github_pr_snapshot_from_value(
+        "owner/repo",
+        "2026-06-06T00:01:00Z",
+        &server_normalized_snapshot("final-head", true, true),
+    );
+    let mut input = serde_json::to_value(eval_input(baseline, final_pr)).expect("serialize input");
+    let final_pr = input
+        .get_mut("final_pr")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("final PR object");
+    final_pr.remove("review_threads_complete");
+    final_pr.remove("changed_files_complete");
+    let input: PrRepairEvalInput = serde_json::from_value(input).expect("deserialize input");
+
+    let snapshot = score_pr_repair_eval(input).expect("score direct incomplete input");
+    let gate = snapshot_gate(&snapshot.hard_gates, HardGateName::ReviewThreadClosure);
+
+    assert_eq!(gate.status, GateStatus::Fail);
+    assert_eq!(snapshot.grade_cap, Some(EvalGrade::C));
+    assert_eq!(
+        snapshot
+            .objective_score
+            .verification_and_current_head_gates
+            .points,
+        4
+    );
+}
+
+#[test]
 fn missing_raw_changed_files_page_info_penalizes_current_head_verification() {
     let baseline = raw_pr_snapshot("base-head", false);
     let final_pr = raw_pr_snapshot_without_files_page_info("final-head");
