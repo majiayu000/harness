@@ -220,11 +220,10 @@ fn failed_hard_gates(gates: &[HardGateResult]) -> Vec<HardGateName> {
 }
 
 fn rounded_div(numerator: u64, denominator: u64) -> u64 {
-    if denominator == 0 {
-        0
-    } else {
-        (numerator + denominator / 2) / denominator
-    }
+    numerator
+        .saturating_add(denominator / 2)
+        .checked_div(denominator)
+        .unwrap_or(0)
 }
 
 fn confidence_for_case_count(case_count: u64) -> BenchmarkConfidence {
