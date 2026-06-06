@@ -443,6 +443,45 @@ fn ready_to_merge_snapshot_with_required_review_blocks() {
 }
 
 #[test]
+fn ready_to_merge_snapshot_with_unresolved_thread_array_blocks_even_when_count_zero() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent reported contradictory unresolved review-thread evidence.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads_count": 0,
+            "active_unresolved_review_threads": [
+                {"id": "thread-1", "path": "src/lib.rs", "line": 10}
+            ],
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("contradictory unresolved-thread evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+}
+
+#[test]
 fn child_pr_feedback_ready_signal_without_snapshot_blocks() {
     let instance = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,

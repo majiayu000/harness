@@ -398,6 +398,16 @@ fn snapshot_draft_state_allows_ready(snapshot: &Value) -> bool {
 }
 
 fn snapshot_review_threads_allow_ready(snapshot: &Value) -> bool {
+    let thread_array_fields = &[
+        "active_unresolved_review_threads",
+        "activeUnresolvedReviewThreads",
+        "unresolved_review_threads",
+        "unresolvedReviewThreads",
+    ];
+    if non_empty_array(snapshot, thread_array_fields) {
+        return false;
+    }
+
     if let Some(count) = field_u64(
         snapshot,
         &[
@@ -413,15 +423,7 @@ fn snapshot_review_threads_allow_ready(snapshot: &Value) -> bool {
         return count == 0;
     }
 
-    empty_array(
-        snapshot,
-        &[
-            "active_unresolved_review_threads",
-            "activeUnresolvedReviewThreads",
-            "unresolved_review_threads",
-            "unresolvedReviewThreads",
-        ],
-    )
+    empty_array(snapshot, thread_array_fields)
 }
 
 fn snapshot_has_repair_action(snapshot: &Value) -> bool {
