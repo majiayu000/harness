@@ -44,7 +44,7 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["status"], "planning");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(state.core.tasks.count(), before_count);
     assert_runtime_issue_submission(
@@ -575,7 +575,7 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let resp = response_json(response).await?;
     assert!(resp["task_id"].is_string());
-    assert_eq!(resp["status"], "implementing");
+    assert_eq!(resp["status"], "planning");
     assert_eq!(resp["execution_path"], "workflow_runtime");
     let task_id = task_runner::TaskId::from_str(resp["task_id"].as_str().unwrap());
     assert!(state
@@ -602,12 +602,12 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
         .get_instance(&workflow_id)
         .await?
         .expect("runtime workflow should be persisted");
-    assert_eq!(instance.state, "implementing");
+    assert_eq!(instance.state, "planning");
     assert_eq!(instance.data["task_id"], task_id.0);
     assert_eq!(instance.data["execution_path"], "workflow_runtime");
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
-    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     Ok(())
 }

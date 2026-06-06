@@ -197,5 +197,5 @@ fn pr_feedback_contract(workflow_definition: &str, activity: &str) -> ActivityCo
             PR_FEEDBACK_SNAPSHOT_ARTIFACT,
         ])
         .with_explicit_noop_signals(vec!["NoFeedbackFound"])
-        .requires("at_least_one_feedback_outcome_signal")
+        .requires("at_least_one_feedback_outcome_signal; ready_to_merge_requires_current_pr_readiness_snapshot")
 }

@@ -227,6 +227,41 @@ fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
 }
 
 #[test]
+fn issue_submission_decision_releases_dependencies_to_planning() {
+    let labels = Vec::new();
+    let instance = issue_instance("awaiting_dependencies");
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-4",
+            repo: Some("owner/repo"),
+            issue_number: 126,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+        },
+    );
+
+    assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
+    assert_eq!(output.decision.next_state, "planning");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("plan_issue")
+    );
+    let validation = DecisionValidator::github_issue_pr().validate(
+        &instance,
+        &output.decision,
+        &ValidationContext::new("workflow-policy", Utc::now()),
+    );
+    assert!(
+        validation.is_ok(),
+        "dependency release should allow planning: {validation:?}"
+    );
+}
+
+#[test]
 fn prompt_submission_decision_starts_runtime_implementation() {
     let instance = prompt_task_instance("submitted");
     let output = build_prompt_submission_decision(

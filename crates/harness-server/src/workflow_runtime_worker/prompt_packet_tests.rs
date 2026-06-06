@@ -364,6 +364,10 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
         "FeedbackFound"
     );
     assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][1],
+        PR_FEEDBACK_SNAPSHOT_ARTIFACT
+    );
+    assert_eq!(
         schema["transition_contract"]["on_succeeded"]["parent_propagation"],
         "The same activity result is propagated to the parent github_issue_pr workflow."
     );

@@ -193,14 +193,14 @@ async fn runtime_job_worker_auto_submits_repo_backlog_child_workflow() -> anyhow
         .get_instance(&child_id)
         .await?
         .expect("child workflow should be created");
-    assert_eq!(child.state, "implementing");
+    assert_eq!(child.state, "planning");
     assert_eq!(child.data["source"], "github");
     assert_eq!(child.data["external_id"], "127");
     let child_commands = store.commands_for(&child_id).await?;
     assert_eq!(child_commands.len(), 1);
     assert_eq!(
         child_commands[0].command.activity_name(),
-        Some("implement_issue")
+        Some("plan_issue")
     );
     let completed = store
         .get_runtime_job(&runtime_job.id)

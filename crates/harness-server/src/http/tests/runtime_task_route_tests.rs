@@ -95,7 +95,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     let canonical_project_root = project_root.canonicalize()?;
 
     assert_eq!(runtime_task["task_kind"], "issue");
-    assert_eq!(runtime_task["status"], "implementing");
+    assert_eq!(runtime_task["status"], "waiting");
     assert_eq!(runtime_task["external_id"], "issue:52");
     assert_eq!(runtime_task["repo"], "owner/repo");
     assert_eq!(runtime_task["description"], "issue #52");
@@ -103,12 +103,12 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         runtime_task["project"],
         canonical_project_root.to_string_lossy().as_ref()
     );
-    assert_eq!(runtime_task["scheduler"]["authority_state"], "running");
+    assert_eq!(runtime_task["scheduler"]["authority_state"], "queued");
     assert!(runtime_task["workflow"]["id"]
         .as_str()
         .is_some_and(|id| id.ends_with("::repo:owner/repo::issue:52")));
     assert_eq!(runtime_task["workflow"]["definition_id"], "github_issue_pr");
-    assert_eq!(runtime_task["workflow"]["state"], "implementing");
+    assert_eq!(runtime_task["workflow"]["state"], "planning");
     assert_eq!(runtime_task["workflow"]["issue_number"], 52);
     Ok(())
 }

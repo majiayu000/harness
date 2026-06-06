@@ -179,7 +179,7 @@ async fn create_tasks_batch_with_issues_returns_runtime_submissions() -> anyhow:
         .expect("batch response should be an array");
     assert_eq!(entries.len(), 2);
     for (entry, issue_number) in entries.iter().zip([42_u64, 43]) {
-        assert_eq!(entry["status"], "implementing");
+        assert_eq!(entry["status"], "planning");
         assert_eq!(entry["execution_path"], "workflow_runtime");
         let workflow_id = assert_runtime_issue_submission(
             &state,

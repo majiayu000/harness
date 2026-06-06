@@ -107,6 +107,7 @@ impl TransitionAllowlist {
                 "scheduled",
                 [EnqueueActivity, Wait],
             )
+            .allow("awaiting_dependencies", "planning", [EnqueueActivity, Wait])
             .allow(
                 "awaiting_dependencies",
                 "implementing",

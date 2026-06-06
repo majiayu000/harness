@@ -329,12 +329,20 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
         "FeedbackFound"
     );
     assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][1],
+        PR_FEEDBACK_SNAPSHOT_ARTIFACT
+    );
+    assert_eq!(
         schema["transition_contract"]["on_succeeded"]["parent_propagation"],
         "The same activity result is propagated to the parent github_issue_pr workflow."
     );
     assert_eq!(
         schema["agent_summary_contract"]["signals"]["PrReadyToMerge"],
-        "Use only when review, checks, and mergeability are all ready."
+        "Use only when review, checks, and mergeability are all ready, and include a current pr_feedback_snapshot or pr_repair_snapshot artifact."
+    );
+    assert_eq!(
+        schema["agent_summary_contract"]["artifacts"]["pr_feedback_snapshot"]["required_when"],
+        "PrReadyToMerge signal or mark_ready_to_merge workflow_decision is emitted."
     );
     assert!(schema["workflow_decision_contract"]["allowed_transitions"]
         .as_array()

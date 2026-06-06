@@ -770,7 +770,7 @@ mod tests {
         let commands = runtime_store.commands_for(&workflow_id).await?;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
-        assert_eq!(commands[0].command.command["activity"], "implement_issue");
+        assert_eq!(commands[0].command.command["activity"], "plan_issue");
         assert!(
             commands[0].id != task_id.0,
             "runtime command id should be independent of the cancelled legacy task"
