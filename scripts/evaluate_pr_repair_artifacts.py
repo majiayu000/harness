@@ -79,31 +79,40 @@ def write_preflight_failure(args: argparse.Namespace) -> int:
         "stage": "project_registry_preflight",
         "status": "failed",
     }
-    write_json(args.submission, submission)
-    write_json(args.task_detail, task_detail)
+    write_json(str(args.submission), submission)
+    write_json(str(args.task_detail), task_detail)
     return 0
 
 
 def pr_facts(pr: JsonObject) -> JsonObject:
-    threads = (((pr.get("reviewThreads") or {}).get("nodes")) or [])
-    files = list(((pr.get("files") or {}).get("nodes")) or [])
+    review_threads = pr.get("reviewThreads")
+    thread_nodes = review_threads.get("nodes") if isinstance(review_threads, dict) else None
+    threads = [thread for thread in (thread_nodes or []) if isinstance(thread, dict)]
+    files_container = pr.get("files")
+    file_nodes = files_container.get("nodes") if isinstance(files_container, dict) else None
+    files = [item for item in (file_nodes or []) if isinstance(item, dict)]
+    status_check_rollup = pr.get("statusCheckRollup")
     active_threads = [
         thread
         for thread in threads
-        if not thread.get("isResolved", False) and not thread.get("isOutdated", False)
+        if not thread.get("isResolved", False)
+        and not thread.get("isOutdated", False)
     ]
     return {
         "head": pr.get("headRefOid"),
         "merge": pr.get("mergeStateStatus") or "UNKNOWN",
-        "checks": (pr.get("statusCheckRollup") or {}).get("state") or "UNKNOWN",
+        "checks": (
+            status_check_rollup.get("state") if isinstance(status_check_rollup, dict) else None
+        )
+        or "UNKNOWN",
         "unresolved": len(active_threads),
-        "files_collected": "files" in pr,
+        "files_collected": isinstance(files_container, dict),
         "changed_files": files,
         "changed_file_paths": sorted(
             {
                 item.get("path")
                 for item in files
-                if isinstance(item, dict) and item.get("path")
+                if item.get("path")
             }
         ),
     }
@@ -177,7 +186,11 @@ def quality_fields(quality: JsonObject) -> tuple[Any, Any, Any, list[Any]]:
 
 def write_collect_report(args: argparse.Namespace) -> int:
     baseline = read_json(args.baseline)
+    if not isinstance(baseline, dict):
+        baseline = {}
     quality = read_json(args.quality)
+    if not isinstance(quality, dict):
+        quality = {}
     grade, score, grade_cap, blockers = quality_fields(quality)
     task_class = candidate_class(pr_facts(baseline))
 
@@ -209,10 +222,20 @@ def write_collect_report(args: argparse.Namespace) -> int:
 
 def write_final_report(args: argparse.Namespace) -> int:
     baseline = read_json(args.baseline)
+    if not isinstance(baseline, dict):
+        baseline = {}
     final = read_json(args.final)
+    if not isinstance(final, dict):
+        final = {}
     submission = read_json(args.submission, required=False)
+    if not isinstance(submission, dict):
+        submission = {}
     task_detail = read_json(args.task_detail, required=False)
+    if not isinstance(task_detail, dict):
+        task_detail = {}
     quality = read_json(args.quality)
+    if not isinstance(quality, dict):
+        quality = {}
 
     before = pr_facts(baseline)
     after = pr_facts(final)
@@ -221,13 +244,15 @@ def write_final_report(args: argparse.Namespace) -> int:
     removed_changed_paths = sorted(
         set(before["changed_file_paths"]) - set(after["changed_file_paths"])
     )
+    workflow = task_detail.get("workflow")
+    workflow_dict = workflow if isinstance(workflow, dict) else {}
     task_status = (
         task_detail.get("status")
-        or (task_detail.get("workflow") or {}).get("state")
+        or workflow_dict.get("state")
         or submission.get("status")
         or "unknown"
     )
-    workflow_id = submission.get("workflow_id") or (task_detail.get("workflow") or {}).get("id")
+    workflow_id = submission.get("workflow_id") or workflow_dict.get("id")
     task_id = submission.get("task_id") or task_detail.get("id")
     submission_mode = submission.get("eval_submission_mode") or "unknown"
     submission_http_status = submission.get("http_status") or task_detail.get("http_status")

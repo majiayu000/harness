@@ -146,6 +146,59 @@ class ArtifactHelperTests(unittest.TestCase):
             self.assertIn("- Timed out: `false`", text)
             self.assertIn("- quality blocker", text)
 
+    def test_final_report_tolerates_non_object_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            baseline = tmp_path / "baseline.json"
+            final = tmp_path / "final.json"
+            quality = tmp_path / "quality_snapshot.json"
+            submission = tmp_path / "submission.json"
+            task_detail = tmp_path / "task_detail_final.json"
+            report = tmp_path / "summary.md"
+
+            baseline.write_text(json.dumps(None), encoding="utf-8")
+            final.write_text(
+                json.dumps(
+                    {
+                        "headRefOid": "b",
+                        "mergeStateStatus": "CLEAN",
+                        "statusCheckRollup": {"state": "SUCCESS"},
+                        "reviewThreads": {"nodes": ["unexpected"]},
+                        "files": "unexpected",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            quality.write_text(json.dumps(["unexpected"]), encoding="utf-8")
+            submission.write_text(json.dumps(["unexpected"]), encoding="utf-8")
+            task_detail.write_text(json.dumps({"workflow": "unexpected"}), encoding="utf-8")
+
+            MODULE.write_final_report(
+                argparse.Namespace(
+                    baseline=baseline,
+                    final=final,
+                    submission=submission,
+                    task_detail=task_detail,
+                    quality=quality,
+                    output=report,
+                    run_id="run-1",
+                    repo="owner/repo",
+                    pr="7",
+                    server_url="http://127.0.0.1:9800",
+                    timed_out="0",
+                    wait_secs="10",
+                    max_rounds="2",
+                    max_turns="6",
+                    max_budget_usd="",
+                    timeout_secs="7200",
+                )
+            )
+
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("| `statusCheckRollup.state` | `UNKNOWN` | `SUCCESS` |", text)
+            self.assertIn("| changed-file evidence | `missing` |", text)
+            self.assertIn("- None", text)
+
 
 if __name__ == "__main__":
     unittest.main()

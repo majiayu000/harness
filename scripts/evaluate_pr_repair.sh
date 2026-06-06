@@ -10,7 +10,7 @@ Options:
   --repo OWNER/REPO       GitHub repository slug.
   --pr N                  Pull request number to evaluate.
   --server-url URL        Harness HTTP server URL. Default: http://127.0.0.1:9800
-  --project-root PATH     Local project root sent to POST /tasks. Default: current directory.
+  --project-root PROJECT  Project root, registry id, or name sent to POST /tasks. Must be registered for live mode.
   --output DIR            Report directory. Default: docs/pr-repair-evals/<timestamp>-<repo>-pr<N>
   --collect-only          Collect GitHub baseline only; do not submit a Harness task.
   --wait-secs N           Structured Harness wait bound and task prompt guidance. Default: 10
@@ -129,11 +129,6 @@ require_cmd curl
 require_cmd python3
 require_cmd date
 require_cmd cargo
-
-if ! PROJECT_ROOT="$(cd "$PROJECT_ROOT" 2>/dev/null && pwd -P)"; then
-  echo "--project-root must be an existing directory: $PROJECT_ROOT" >&2
-  exit 2
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -453,18 +448,6 @@ write_final_report() {
     --timeout-secs "$TIMEOUT_SECS"
 }
 
-preflight_project_registry() {
-  local projects_json="$1"
-  if ! curl "${curl_args[@]}" "$SERVER_URL/projects" > "$projects_json"; then
-    echo "project registry preflight failed: unable to fetch $SERVER_URL/projects"
-    return 2
-  fi
-
-  python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" preflight-project-registry \
-    --project-root "$PROJECT_ROOT" \
-    --projects-json "$projects_json"
-}
-
 write_preflight_failure_artifacts() {
   local error="$1"
   python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" write-preflight-failure \
@@ -473,6 +456,22 @@ write_preflight_failure_artifacts() {
     --project-root "$PROJECT_ROOT" \
     --server-url "$SERVER_URL" \
     --error "$error"
+}
+
+write_live_preflight_failure_report() {
+  local reason="$1"
+  local exit_code="$2"
+  write_preflight_failure_artifacts "$reason"
+  echo "$reason" >&2
+  echo "Collecting final PR snapshot"
+  FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  collect_snapshot "$FINAL_JSON"
+  snapshot_summary "$FINAL_JSON"
+  write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
+  echo "Evaluation report: $OUTPUT_DIR/summary.md"
+  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
+  exit "$exit_code"
 }
 
 BASELINE_JSON="$OUTPUT_DIR/baseline_pr.json"
@@ -538,25 +537,30 @@ if [[ -n "${HARNESS_API_TOKEN:-}" ]]; then
 fi
 
 if ! curl "${curl_args[@]}" "$SERVER_URL/health" > "$HEALTH_JSON"; then
-  echo "Harness server is not reachable at $SERVER_URL; baseline was saved to $OUTPUT_DIR" >&2
-  exit 3
+  write_live_preflight_failure_report \
+    "Harness server is not reachable at $SERVER_URL/health" \
+    3
 fi
 
-if ! preflight_error="$(preflight_project_registry "$PROJECTS_JSON" 2>&1)"; then
-  write_preflight_failure_artifacts "$preflight_error"
-  echo "$preflight_error" >&2
-  echo "Collecting final PR snapshot"
-  FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  collect_snapshot "$FINAL_JSON"
-  snapshot_summary "$FINAL_JSON"
-  write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
-  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
-  echo "Evaluation report: $OUTPUT_DIR/summary.md"
-  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
-  exit 4
+echo "Checking Harness project registry for $PROJECT_ROOT"
+if ! curl "${curl_args[@]}" "$SERVER_URL/projects" > "$PROJECTS_JSON"; then
+  write_live_preflight_failure_report \
+    "Harness project registry is not reachable at $SERVER_URL/projects" \
+    5
 fi
 
-python3 - "$PROJECT_ROOT" "$REPO" "$PR" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" <<'PY' > "$TASK_BODY_JSON"
+PREFLIGHT_ERROR="$OUTPUT_DIR/project_preflight_error.txt"
+if ! registered_project="$(python3 "$SCRIPT_DIR/evaluate_pr_repair_preflight.py" check-project --project-root "$PROJECT_ROOT" --projects-json "$PROJECTS_JSON" 2>"$PREFLIGHT_ERROR")"; then
+  reason="$(tr '\n' ' ' < "$PREFLIGHT_ERROR")"
+  if [[ -z "$reason" ]]; then
+    reason="Harness project root is not registered for live eval: $PROJECT_ROOT"
+  fi
+  echo "Register the project with POST /projects or pass a registered --project-root." >&2
+  write_live_preflight_failure_report "$reason" 5
+fi
+echo "Registered project: $registered_project"
+
+python3 - "$registered_project" "$REPO" "$PR" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" <<'PY' > "$TASK_BODY_JSON"
 import json
 import sys
 
