@@ -7,12 +7,19 @@ import { Active } from "./dashboard/Active";
 import { History } from "./dashboard/History";
 import { Channels } from "./dashboard/Channels";
 import { Submit } from "./dashboard/Submit";
+import { Evals } from "./dashboard/Evals";
 import { useDashboard } from "@/lib/queries";
 
-type Tab = "board" | "history" | "channels" | "submit";
+type Tab = "board" | "history" | "channels" | "evals" | "submit";
 
 function parseTab(value: string | null): Tab | null {
-  if (value === "board" || value === "history" || value === "channels" || value === "submit") {
+  if (
+    value === "board" ||
+    value === "history" ||
+    value === "channels" ||
+    value === "evals" ||
+    value === "submit"
+  ) {
     return value;
   }
   return null;
@@ -41,6 +48,7 @@ export function Dashboard() {
         { id: "board", label: "Active", active: tab === "board" },
         { id: "history", label: "History", active: tab === "history" },
         { id: "channels", label: "Channels", active: tab === "channels" },
+        { id: "evals", label: "Evals", active: tab === "evals" },
         { id: "submit", label: "Submit", active: tab === "submit" },
       ],
     },
@@ -74,6 +82,7 @@ export function Dashboard() {
           {tab === "board" && <Active projectFilter={projectFilter} />}
           {tab === "history" && <History projectFilter={projectFilter} />}
           {tab === "channels" && <Channels projectFilter={projectFilter} />}
+          {tab === "evals" && <Evals />}
           {tab === "submit" && <Submit projectFilter={projectFilter} />}
         </div>
       </main>

@@ -136,6 +136,15 @@ Acceptance:
 - Operators can tell whether a PR repair succeeded, why it failed, and what it
   cost without reading raw logs.
 
+Implementation status:
+
+- Added a dashboard `Evals` tab backed by `/api/evals/runs` and
+  `/api/evals/quality-snapshots/{snapshot_id}`.
+- The view shows run status, scenario, target PR, score, grade, hard-gate pass
+  count, blockers, and usage totals when a quality snapshot exists.
+- Remaining work: add benchmark summary history and richer trend charts once
+  enough live-run samples exist.
+
 ### Issue 6: Add PR repair benchmark summaries
 
 Scope:

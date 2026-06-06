@@ -2,6 +2,36 @@ export interface EvalQualitySnapshotsResponse {
   quality_snapshots: QualitySnapshotRecord[];
 }
 
+export interface EvalQualitySnapshotResponse {
+  quality_snapshot: QualitySnapshotRecord;
+}
+
+export interface EvalRunsResponse {
+  runs: EvalRun[];
+}
+
+export interface EvalDashboardResponse {
+  rows: EvalDashboardRow[];
+}
+
+export interface EvalDashboardRow {
+  run: EvalRun;
+  quality_snapshot: QualitySnapshotRecord | null;
+  quality_snapshot_error: string | null;
+}
+
+export interface EvalRun {
+  id: string;
+  scenario: string;
+  target: EvalTarget;
+  source_task_id: string | null;
+  status: string;
+  quality_snapshot_id: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
 export interface QualitySnapshotRecord {
   id: string;
   run_id: string;
@@ -21,6 +51,7 @@ export interface QualitySnapshot {
   final_grade: string;
   grade_cap: string | null;
   blocker_summary: string[];
+  usage?: UsageSnapshot[];
 }
 
 export type EvalTarget =
@@ -74,6 +105,21 @@ export interface RuntimeSnapshot {
   latest_activity: string | null;
   terminal_state: string | null;
   collected_at: string;
+}
+
+export interface UsageSnapshot {
+  agent_invocation_id: string | null;
+  runtime_job_id: string | null;
+  workflow_id: string | null;
+  model: string | null;
+  reasoning_effort: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_input_tokens: number | null;
+  total_tokens: number | null;
+  cost_usd_micros: number | null;
+  token_confidence: string;
+  cost_confidence: string;
 }
 
 export interface HardGateResult {
