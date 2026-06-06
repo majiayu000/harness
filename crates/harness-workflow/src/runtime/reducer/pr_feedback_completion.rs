@@ -327,7 +327,16 @@ fn expected_pr_number(instance: &WorkflowInstance, result: &ActivityResult) -> O
         .data
         .get("pr_number")
         .and_then(json_value_u64)
+        .or_else(|| pr_number_from_subject(instance))
         .or_else(|| result_signal_u64(result, "pr_number"))
+}
+
+fn pr_number_from_subject(instance: &WorkflowInstance) -> Option<u64> {
+    instance
+        .subject
+        .subject_key
+        .strip_prefix("pr:")
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 fn expected_pr_url(instance: &WorkflowInstance, result: &ActivityResult) -> Option<String> {

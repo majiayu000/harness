@@ -438,3 +438,53 @@ fn child_pr_feedback_ready_signal_without_snapshot_blocks() {
         )
         .expect("child missing snapshot block should validate");
 }
+
+#[test]
+fn child_pr_feedback_ready_snapshot_for_different_subject_pr_blocks() {
+    let instance = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "inspecting",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child-1");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "inspecting",
+        "record_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the child PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime child workflow attached ready evidence copied from another PR.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 88,
+            "pr_url": "https://github.com/owner/repo/pull/88",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads_count": 0,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
+        }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("wrong child PR ready evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+}
