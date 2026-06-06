@@ -25,18 +25,16 @@ pub fn github_pr_snapshot_from_value(
     collected_at: &str,
     value: &Value,
 ) -> PullRequestSnapshot {
-    let review_threads = value
-        .pointer("/reviewThreads/nodes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    let review_threads = review_thread_values(value)
         .filter(|thread| {
             !thread
                 .get("isResolved")
+                .or_else(|| thread.get("is_resolved"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
                 && !thread
                     .get("isOutdated")
+                    .or_else(|| thread.get("is_outdated"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
         })
@@ -45,47 +43,100 @@ pub fn github_pr_snapshot_from_value(
             path: optional_string_field(thread, "path"),
             is_resolved: thread
                 .get("isResolved")
+                .or_else(|| thread.get("is_resolved"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             is_outdated: thread
                 .get("isOutdated")
+                .or_else(|| thread.get("is_outdated"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         })
         .collect();
 
-    let changed_files = value
-        .pointer("/files/nodes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    let changed_files = changed_file_values(value)
         .map(|file| ChangedFileSnapshot {
             path: string_field(file, "path"),
             additions: u64_field(file, "additions"),
             deletions: u64_field(file, "deletions"),
-            status: string_field(file, "changeType"),
+            status: string_field(file, "changeType").or_else_empty(|| string_field(file, "status")),
         })
         .collect();
 
     PullRequestSnapshot {
         repo: repo.to_string(),
-        pr_number: u64_field(value, "number"),
-        url: optional_string_field(value, "url"),
+        pr_number: u64_field(value, "number").or_else_zero(|| u64_field(value, "pr_number")),
+        url: optional_string_field(value, "url").or_else(|| optional_string_field(value, "pr_url")),
         title: optional_string_field(value, "title"),
-        base_ref: string_field(value, "baseRefName"),
-        head_ref: string_field(value, "headRefName"),
-        head_oid: string_field(value, "headRefOid"),
+        base_ref: string_field(value, "baseRefName")
+            .or_else_empty(|| string_field(value, "base_ref")),
+        head_ref: string_field(value, "headRefName")
+            .or_else_empty(|| string_field(value, "head_ref")),
+        head_oid: string_field(value, "headRefOid")
+            .or_else_empty(|| string_field(value, "head_oid")),
         is_draft: value
             .get("isDraft")
+            .or_else(|| value.get("is_draft"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        merge_state: merge_state_from_github(value.get("mergeStateStatus")),
-        check_state: check_state_from_github(value.pointer("/statusCheckRollup/state")),
-        review_decision: review_decision_from_github(value.get("reviewDecision")),
+        merge_state: merge_state_from_github(
+            value
+                .get("mergeStateStatus")
+                .or_else(|| value.get("merge_state_status")),
+        ),
+        check_state: check_state_from_github(
+            value
+                .pointer("/statusCheckRollup/state")
+                .or_else(|| value.get("status_check_rollup_state"))
+                .or_else(|| value.get("statusCheckRollupState")),
+        ),
+        review_decision: review_decision_from_github(
+            value
+                .get("reviewDecision")
+                .or_else(|| value.get("review_decision")),
+        ),
         active_unresolved_review_threads: review_threads,
+        review_threads_complete: connection_complete(
+            value,
+            "reviewThreads",
+            "review_threads_complete",
+        ),
         changed_files,
+        changed_files_complete: connection_complete(value, "files", "changed_files_complete"),
         collected_at: collected_at.to_string(),
     }
+}
+
+fn review_thread_values(value: &Value) -> impl Iterator<Item = &Value> {
+    value
+        .pointer("/reviewThreads/nodes")
+        .or_else(|| value.get("active_unresolved_review_threads"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn changed_file_values(value: &Value) -> impl Iterator<Item = &Value> {
+    value
+        .pointer("/files/nodes")
+        .or_else(|| value.get("changed_files"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn connection_complete(value: &Value, raw_field: &str, normalized_field: &str) -> bool {
+    if let Some(complete) = value.get(normalized_field).and_then(Value::as_bool) {
+        return complete;
+    }
+    if let Some(connection) = value.get(raw_field) {
+        return connection
+            .get("pageInfo")
+            .and_then(|page_info| page_info.get("hasNextPage"))
+            .and_then(Value::as_bool)
+            .is_some_and(|has_next_page| !has_next_page);
+    }
+    false
 }
 
 pub fn runtime_snapshot_from_values(
@@ -189,6 +240,7 @@ fn scenario_from_baseline(snapshot: &PullRequestSnapshot) -> EvalScenario {
     if !snapshot.is_draft
         && review_decision_allows_noop(snapshot.review_decision.as_ref())
         && snapshot.active_unresolved_review_threads.is_empty()
+        && snapshot.review_threads_complete
         && snapshot.check_state == CheckState::Passing
         && snapshot.merge_state == MergeState::Clean
     {
@@ -337,6 +389,25 @@ impl NonEmptyStringExt for String {
     }
 }
 
+trait NonZeroU64Ext {
+    fn or_else_zero<F>(self, fallback: F) -> u64
+    where
+        F: FnOnce() -> u64;
+}
+
+impl NonZeroU64Ext for u64 {
+    fn or_else_zero<F>(self, fallback: F) -> u64
+    where
+        F: FnOnce() -> u64,
+    {
+        if self == 0 {
+            fallback()
+        } else {
+            self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,8 +462,14 @@ mod tests {
             "isDraft": false,
             "mergeStateStatus": "CLEAN",
             "statusCheckRollup": {"state": "SUCCESS"},
-            "reviewThreads": {"nodes": []},
-            "files": {"nodes": []}
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": false},
+                "nodes": []
+            },
+            "files": {
+                "pageInfo": {"hasNextPage": false},
+                "nodes": []
+            }
         });
 
         let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
@@ -409,6 +486,41 @@ mod tests {
 
         assert_eq!(input.scenario, EvalScenario::ReadyNoopControl);
         assert!(input.runtime.is_none());
+    }
+
+    #[test]
+    fn incomplete_baseline_review_threads_is_pr_repair() {
+        let pr = json!({
+            "number": 7,
+            "headRefName": "ready",
+            "headRefOid": "same",
+            "baseRefName": "main",
+            "isDraft": false,
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": {"state": "SUCCESS"},
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": true},
+                "nodes": []
+            },
+            "files": {
+                "pageInfo": {"hasNextPage": false},
+                "nodes": []
+            }
+        });
+
+        let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+            repo: "owner/repo",
+            pr_number: 7,
+            baseline_collected_at: "2026-06-06T00:00:00Z",
+            final_collected_at: "2026-06-06T00:01:00Z",
+            baseline: &pr,
+            final_pr: &pr,
+            submission: None,
+            task_detail: None,
+            reviewer_judgment: None,
+        });
+
+        assert_eq!(input.scenario, EvalScenario::PrRepair);
     }
 
     #[test]

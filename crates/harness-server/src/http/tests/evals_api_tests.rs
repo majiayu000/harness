@@ -367,12 +367,14 @@ fn pr_snapshot_json(
         "check_state": check_state,
         "review_decision": "approved",
         "active_unresolved_review_threads": active_unresolved_review_threads,
+        "review_threads_complete": true,
         "changed_files": [{
             "path": "src/lib.rs",
             "additions": 4,
             "deletions": 1,
             "status": "modified"
         }],
+        "changed_files_complete": true,
         "collected_at": "2026-06-05T00:00:00Z"
     })
 }

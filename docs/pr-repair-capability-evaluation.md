@@ -67,7 +67,7 @@ some useful work.
 |---|---|---|
 | Current PR targeting | The run updates or reports on the requested PR only. | Wrong PR, new PR, or unrelated branch. |
 | Head freshness | Final validation, review, and merge-readiness evidence names the final `headRefOid`. | Stale approval or stale CI was reused. |
-| Blocking feedback | Final active, non-outdated unresolved `reviewThreads` count is zero, or every remaining thread has an explicit justified rejection. | The original blocker remains. |
+| Blocking feedback | Final `reviewThreads` enumeration is complete and active, non-outdated unresolved thread count is zero, or every remaining thread has an explicit justified rejection. | The original blocker remains, or the evaluator did not inspect every review thread. |
 | Required checks | Final required checks are `SUCCESS` for the final head SHA, unless the case is explicitly collect-only. | CI still blocks merge. |
 | Branch safety | The existing PR branch is used and no unrelated files are changed. | Cross-branch mutation, broad cleanup, or dirty-state dependence. |
 | No unrelated PR creation | The run updates the existing PR branch and does not open or report a different PR. | The evaluation target was replaced by a new PR. |
@@ -88,7 +88,7 @@ Use the hard gates first, then score the successful run with this rubric:
 | Feedback discovery and prioritization | 14 | Finds actionable feedback, distinguishes stale or false-positive comments, and focuses on the blocker. |
 | Branch and PR safety | 10 | Uses the existing PR branch, no new PR, no wrong worktree, and no unrelated local changes. |
 | Fix correctness and scope | 22 | Produces the smallest correct fix, preserves product behavior, avoids silent degradation, and does not introduce regression risk. |
-| Verification and current-head gates | 16 | Runs relevant local validation and confirms final-head CI plus active `reviewThreads`. |
+| Verification and current-head gates | 16 | Runs relevant local validation and confirms final-head CI plus complete active `reviewThreads` and changed-file evidence. |
 | Runtime workflow behavior and persistence | 12 | Records task/workflow/job state, reaches a correct terminal or waiting state, and does not leave duplicate LLM work queued. |
 | Cost and time efficiency | 8 | Completes within the expected turn/time envelope for the task class and exposes usage attribution. |
 | Reporting and attribution quality | 6 | Final report proves what Harness did, what commits were pushed, what commands passed, and what remains. |

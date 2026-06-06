@@ -148,8 +148,10 @@ pub enum EvalScenario {
 }
 ```
 
-`PrRepair` is the first scenario to implement. The other variants reserve the
-schema for future benchmark suites.
+`PrRepair` is the first scenario to implement. `ReadyNoopControl` requires a
+complete baseline `reviewThreads` enumeration; incomplete baseline review
+pagination is treated as repair work, not as a clean no-op control. The other
+variants reserve the schema for future benchmark suites.
 
 ### `EvalTarget`
 
@@ -189,13 +191,22 @@ pub struct PullRequestSnapshot {
     pub check_state: CheckState,
     pub review_decision: Option<ReviewDecision>,
     pub active_unresolved_review_threads: Vec<ReviewThreadSnapshot>,
+    pub review_threads_complete: bool,
     pub changed_files: Vec<ChangedFileSnapshot>,
+    pub changed_files_complete: bool,
     pub collected_at: DateTime<Utc>,
 }
 ```
 
 `reviewThreads` must come from GraphQL or an equivalent API surface that can
-distinguish active unresolved threads from outdated or resolved threads.
+distinguish active unresolved threads from outdated or resolved threads. The
+snapshot must also record whether `reviewThreads` and changed-file enumeration
+was complete. Raw GitHub evidence proves completeness with
+`pageInfo.hasNextPage=false`; server-normalized evidence must carry explicit
+`review_threads_complete=true` and `changed_files_complete=true`. Incomplete or
+missing completeness evidence is not valid merge-readiness evidence. Direct
+`PrRepairEvalInput` artifacts that omit the completeness fields are treated as
+incomplete, not as legacy-complete evidence.
 
 ### `RuntimeSnapshot`
 
@@ -271,7 +282,7 @@ grade is capped even when other score dimensions look strong.
 | Head freshness | final evidence head vs final PR head | `C` |
 | Required checks | final check state for final head | `C` |
 | Mergeability clean | final merge state for final head | `C` |
-| Review-thread closure | final active unresolved threads | `C` |
+| Review-thread closure | final active unresolved threads plus required thread enumeration completeness | `C` |
 | Runtime artifact completeness | task/workflow/job snapshots | `B` |
 | Reviewer judgment freshness | reviewer head vs final PR head | `C`, or `B` when absent |
 | No destructive/unrelated scope | changed files and risk scanner | `F` |
@@ -567,6 +578,7 @@ Every failed or weak run should classify the first meaningful failure:
 `harness-eval` should have fixture-based unit tests:
 
 - score ready/no-op control without requiring a head change
+- fail ready/no-op control when baseline review-thread completeness is missing
 - fail wrong-target final snapshot
 - cap grade at `C` for unresolved active review threads
 - cap grade at `C` for stale-head validation

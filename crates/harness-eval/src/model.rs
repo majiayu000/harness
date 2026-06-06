@@ -82,7 +82,11 @@ pub struct PullRequestSnapshot {
     pub check_state: CheckState,
     pub review_decision: Option<ReviewDecision>,
     pub active_unresolved_review_threads: Vec<ReviewThreadSnapshot>,
+    #[serde(default)]
+    pub review_threads_complete: bool,
     pub changed_files: Vec<ChangedFileSnapshot>,
+    #[serde(default)]
+    pub changed_files_complete: bool,
     pub collected_at: String,
 }
 
