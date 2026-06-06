@@ -26,8 +26,8 @@ Options:
 Environment:
   HARNESS_API_TOKEN       Optional Bearer token for Harness HTTP routes.
 
-The script never starts `harness serve`; start the server from a standalone
-terminal before a live evaluation.
+The script never starts `harness serve`; start the server before a live
+evaluation. Live evaluations persist the final score through `/api/evals`.
 EOF
 }
 
@@ -496,6 +496,9 @@ TASK_DETAIL_JSON="$OUTPUT_DIR/task_detail_final.json"
 TASK_BODY_JSON="$OUTPUT_DIR/task_body.json"
 PR_REPAIR_EVAL_INPUT_JSON="$OUTPUT_DIR/pr_repair_eval_input.json"
 QUALITY_SNAPSHOT_JSON="$OUTPUT_DIR/quality_snapshot.json"
+EVAL_RUN_JSON="$OUTPUT_DIR/eval_run.json"
+EVAL_ARTIFACT_JSON="$OUTPUT_DIR/eval_artifact_pr_repair_input.json"
+EVAL_SCORE_JSON="$OUTPUT_DIR/eval_score.json"
 HEALTH_JSON="$OUTPUT_DIR/health.json"
 PROJECTS_JSON="$OUTPUT_DIR/projects.json"
 TASKS_PREFLIGHT_JSON="$OUTPUT_DIR/tasks_preflight.json"
@@ -505,6 +508,7 @@ RUNTIME_TREE_FINAL_ERROR="$OUTPUT_DIR/runtime_tree_final_error.txt"
 EVAL_TARGET_ID="pr-repair-eval:$REPO#$PR"
 EVAL_EXTERNAL_ID="$EVAL_TARGET_ID:run:$RUN_ID"
 QUALITY_RUN_MODE="collect_only"
+EVAL_PERSIST_FAILED=0
 
 write_quality_snapshot() {
   local baseline="$1"
@@ -544,6 +548,42 @@ write_quality_snapshot() {
     args+=(--reviewer-judgment "$REVIEWER_JUDGMENT_JSON")
   fi
   cargo "${args[@]}"
+}
+
+ensure_eval_run_record() {
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_persist.py" ensure-run \
+    --server-url "$SERVER_URL" \
+    --input "$PR_REPAIR_EVAL_INPUT_JSON" \
+    --source-task-id "$TASK_ID" \
+    --output "$EVAL_RUN_JSON"
+}
+
+persist_eval_score_record() {
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_persist.py" persist-score \
+    --server-url "$SERVER_URL" \
+    --input "$PR_REPAIR_EVAL_INPUT_JSON" \
+    --run "$EVAL_RUN_JSON" \
+    --artifact-output "$EVAL_ARTIFACT_JSON" \
+    --score-output "$EVAL_SCORE_JSON"
+}
+
+score_snapshot_id() {
+  python3 - "$EVAL_SCORE_JSON" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    data = {}
+
+snapshot = data.get("quality_snapshot") if isinstance(data, dict) else {}
+if isinstance(snapshot, dict):
+    print(snapshot.get("id") or "")
+else:
+    print("")
+PY
 }
 
 collect_runtime_tree_artifact() {
@@ -708,6 +748,11 @@ fi
 
 QUALITY_RUN_MODE="live_run"
 echo "Submitted task_id=$TASK_ID"
+if eval_run_id="$(ensure_eval_run_record)"; then
+  echo "Eval run: $eval_run_id"
+else
+  echo "Eval run persistence will be retried after final snapshot; see $EVAL_RUN_JSON" >&2
+fi
 WORKFLOW_ID="$(python3 - "$SUBMISSION_JSON" <<'PY'
 import json
 import sys
@@ -771,5 +816,18 @@ fi
 collect_runtime_tree_artifact "$registered_project" "$WORKFLOW_ID" "$TASK_ID"
 write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
 write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$timed_out" "$QUALITY_SNAPSHOT_JSON"
+if eval_run_id="$(ensure_eval_run_record)" && persist_eval_score_record; then
+  echo "Server eval run: $eval_run_id"
+  snapshot_id="$(score_snapshot_id)"
+  if [[ -n "$snapshot_id" ]]; then
+    echo "Server quality snapshot: $snapshot_id"
+  fi
+else
+  EVAL_PERSIST_FAILED=1
+  echo "Eval persistence failed; local artifacts are still available in $OUTPUT_DIR" >&2
+fi
 echo "Evaluation report: $OUTPUT_DIR/summary.md"
 echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
+if [[ "$EVAL_PERSIST_FAILED" -eq 1 ]]; then
+  exit 6
+fi
