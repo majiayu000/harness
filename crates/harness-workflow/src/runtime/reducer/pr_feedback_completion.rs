@@ -274,6 +274,9 @@ fn structured_ready_decision(decision: &WorkflowDecision) -> bool {
 }
 
 fn ready_snapshot_proves_pr_ready(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+    if result.activity != PR_FEEDBACK_INSPECT_ACTIVITY {
+        return false;
+    }
     result
         .artifacts
         .iter()

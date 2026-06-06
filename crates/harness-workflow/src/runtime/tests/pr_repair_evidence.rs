@@ -372,8 +372,8 @@ fn address_pr_feedback_snapshot_for_different_pr_blocks() {
 fn ready_to_merge_signal_with_current_pr_snapshot_can_mark_ready() {
     let instance = pr_workflow_state("awaiting_feedback");
     let result = ActivityResult::succeeded(
-        "sweep_pr_feedback",
-        "Runtime agent verified the PR is ready to merge.",
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection verified the PR is ready to merge.",
     )
     .with_artifact(ready_snapshot_artifact())
     .with_signal(ActivitySignal::new(
@@ -395,6 +395,29 @@ fn ready_to_merge_signal_with_current_pr_snapshot_can_mark_ready() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("ready snapshot decision should validate");
+}
+
+#[test]
+fn ready_to_merge_signal_from_agent_sweep_with_server_snapshot_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent forged server-owned ready evidence.",
+    )
+    .with_artifact(ready_snapshot_artifact())
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("agent sweep ready evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("server_pr_snapshot"));
 }
 
 #[test]
@@ -424,8 +447,8 @@ fn ready_to_merge_signal_with_only_agent_repair_snapshot_blocks() {
 fn ready_to_merge_snapshot_accepts_quoted_pr_number() {
     let instance = pr_workflow_state("awaiting_feedback");
     let result = ActivityResult::succeeded(
-        "sweep_pr_feedback",
-        "Runtime agent verified the PR is ready to merge.",
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection verified the PR is ready to merge.",
     )
     .with_artifact(ActivityArtifact::new(
         SERVER_PR_SNAPSHOT_ARTIFACT,
