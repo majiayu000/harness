@@ -11,10 +11,9 @@ use crate::runtime::pr_feedback::{
     LocalReviewOutcome, PrFeedbackDecisionInput, PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY,
     LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::Value;
-
-const PR_FEEDBACK_SNAPSHOT_ARTIFACT: &str = "pr_feedback_snapshot";
 
 pub(super) fn pr_feedback_sweep_decision_from_activity_result(
     instance: &WorkflowInstance,
@@ -86,7 +85,7 @@ pub(super) fn pr_feedback_success_contract_error(
             return None;
         }
         return Some(
-            "PR readiness evidence is missing: ready-to-merge output requires a current pr_repair_snapshot with head, checks, mergeability, and zero active unresolved review threads".to_string(),
+            "PR readiness evidence is missing: ready-to-merge output requires a current server_pr_snapshot with head, checks, mergeability, and zero active unresolved review threads".to_string(),
         );
     }
 
@@ -275,17 +274,16 @@ fn structured_ready_decision(decision: &WorkflowDecision) -> bool {
 }
 
 fn ready_snapshot_proves_pr_ready(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+    if result.activity != PR_FEEDBACK_INSPECT_ACTIVITY {
+        return false;
+    }
     result
         .artifacts
         .iter()
-        .filter(|artifact| {
-            matches!(
-                artifact.artifact_type.as_str(),
-                PR_REPAIR_SNAPSHOT_ARTIFACT | PR_FEEDBACK_SNAPSHOT_ARTIFACT
-            )
-        })
+        .filter(|artifact| artifact.artifact_type == SERVER_PR_SNAPSHOT_ARTIFACT)
         .any(|artifact| {
-            snapshot_has_pr_identity(instance, result, &artifact.artifact)
+            snapshot_has_server_source(&artifact.artifact)
+                && snapshot_has_pr_identity(instance, result, &artifact.artifact)
                 && snapshot_has_head_identity(&artifact.artifact)
                 && snapshot_has_observation_time(&artifact.artifact)
                 && snapshot_check_state_allows_ready(&artifact.artifact)
@@ -293,7 +291,16 @@ fn ready_snapshot_proves_pr_ready(instance: &WorkflowInstance, result: &Activity
                 && snapshot_review_state_allows_ready(&artifact.artifact)
                 && snapshot_draft_state_allows_ready(&artifact.artifact)
                 && snapshot_review_threads_allow_ready(&artifact.artifact)
+                && snapshot_review_threads_are_complete(&artifact.artifact)
         })
+}
+
+fn snapshot_has_server_source(snapshot: &Value) -> bool {
+    string_field_matches(
+        snapshot,
+        &["snapshot_source", "snapshotSource"],
+        &["server_github_graphql"],
+    )
 }
 
 fn snapshot_has_pr_identity(
@@ -424,6 +431,16 @@ fn snapshot_review_threads_allow_ready(snapshot: &Value) -> bool {
     }
 
     empty_array(snapshot, thread_array_fields)
+}
+
+fn snapshot_review_threads_are_complete(snapshot: &Value) -> bool {
+    !matches!(
+        field_bool(
+            snapshot,
+            &["review_threads_complete", "reviewThreadsComplete"]
+        ),
+        Some(false)
+    )
 }
 
 fn snapshot_has_repair_action(snapshot: &Value) -> bool {

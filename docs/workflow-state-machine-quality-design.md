@@ -299,10 +299,10 @@ github_issue_pr:
 ### PR Repair Evidence Gate
 
 The immediate quality fix is a server-enforced evidence gate for PR repair and
-readiness. The first slice validates a machine-readable GitHub snapshot returned
-by the runtime activity. A later slice should replace this with a server-owned
-GitHub snapshot collector so the reducer no longer trusts agent-produced PR
-metadata. The gate is intentionally narrower than a full state-machine rewrite.
+readiness. The first slice validated a machine-readable GitHub snapshot returned
+by the runtime activity. The next slice makes remote PR inspection server-owned:
+Harness collects GitHub GraphQL PR facts itself, stores them as runtime
+artifacts, and lets the reducer consume only those facts for readiness.
 
 Affected activities:
 
@@ -313,6 +313,26 @@ Affected activities:
 `run_local_review` stays in the existing loop for Phase 1. It already requires a
 local-review outcome signal; head/diff review evidence can be added later as a
 separate local-review quality gate.
+
+Server-owned snapshot artifacts:
+
+- `server_pr_snapshot`: the authoritative GitHub GraphQL snapshot collected by
+  the Harness server. Ready-to-merge transitions must use this artifact.
+- `pr_feedback_snapshot`: a reducer/eval-friendly normalized view of the same
+  server-collected snapshot. It is useful for reports and compatibility, but it
+  is not authoritative by itself for readiness.
+
+Collection boundary:
+
+- Network calls happen in the server runtime worker activity boundary, never in
+  the reducer.
+- `inspect_pr_feedback` is a server-owned read-only activity and must not start
+  an agent turn.
+- The reducer remains deterministic by consuming only persisted
+  `ActivityResult` artifacts.
+- GitHub collection failures return a failed activity with
+  `external_dependency` error kind and a diagnostic artifact; they do not allow
+  readiness.
 
 Required snapshot fields:
 
@@ -333,9 +353,9 @@ Reducer rule:
 
 - Parse domain evidence before considering an agent `workflow_decision`.
 - Block successful PR feedback/readiness outputs that lack a current snapshot.
-- Accept `PrReadyToMerge` only when the snapshot proves final-head checks,
-  mergeability, review approval, non-draft state, and active review-thread
-  gates.
+- Accept `PrReadyToMerge` only when `server_pr_snapshot` proves final-head
+  checks, mergeability, review approval, non-draft state, and active
+  review-thread gates.
 - Accept `address_pr_feedback` success only when the activity proves a pushed
   head, a reply/resolution action, or an explicit no-op reason plus validation.
 

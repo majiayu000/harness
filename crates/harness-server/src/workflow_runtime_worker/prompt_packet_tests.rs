@@ -1,6 +1,7 @@
 use super::*;
 use harness_workflow::runtime::{
     RuntimeKind, WorkflowSubject, PR_REPAIR_SNAPSHOT_ARTIFACT, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 
 #[test]
@@ -323,12 +324,12 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     assert!(
         schema["transition_contract"]["on_succeeded"]["success_requires"]
             .as_str()
-            .is_some_and(|value| value.contains("next_state=ready_to_merge"))
+            .is_some_and(|value| value.contains("server_pr_snapshot"))
     );
     assert!(
         schema["transition_contract"]["structured_decision"]["description"]
             .as_str()
-            .is_some_and(|value| value.contains("same pr_repair_snapshot evidence"))
+            .is_some_and(|value| value.contains("same server_pr_snapshot evidence"))
     );
     assert_eq!(
         schema["activity_contract"]["child_outcome_contract"],
@@ -336,19 +337,24 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     );
     assert_eq!(
         schema["agent_summary_contract"]["signals"]["PrReadyToMerge"],
-        "Use only with pr_repair_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads for the final head."
+        "Use only with server_pr_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads for the final head."
     );
     assert_eq!(
-        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required_when"],
+        schema["agent_summary_contract"]["artifacts"]["server_pr_snapshot"]["required_when"],
         "Using PrReadyToMerge or mark_ready_to_merge."
     );
-    let snapshot_fields = schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]
+    assert_eq!(schema["agent_summary_contract"]["server_owned"], true);
+    assert_eq!(
+        schema["activity_contract"]["accepted_artifacts"][1],
+        SERVER_PR_SNAPSHOT_ARTIFACT
+    );
+    let snapshot_fields = schema["agent_summary_contract"]["artifacts"]["server_pr_snapshot"]
         ["fields"]
         .as_array()
-        .expect("pr_repair_snapshot fields should be an array");
-    assert!(snapshot_fields.contains(&json!("head_sha")));
+        .expect("server_pr_snapshot fields should be an array");
+    assert!(snapshot_fields.contains(&json!("snapshot_source")));
     assert!(snapshot_fields.contains(&json!("head_oid")));
-    assert!(!snapshot_fields.contains(&json!("head_sha_or_head_oid")));
+    assert!(snapshot_fields.contains(&json!("review_threads_complete")));
     assert!(schema["workflow_decision_contract"]["allowed_transitions"]
         .as_array()
         .expect("allowed transitions should be an array")

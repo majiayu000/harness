@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::PR_REPAIR_SNAPSHOT_ARTIFACT;
+use crate::runtime::{PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT};
 
 fn pr_workflow_state(state: &str) -> WorkflowInstance {
     issue_instance(state).with_data(json!({
@@ -25,8 +25,10 @@ fn event_for_result(result: ActivityResult) -> WorkflowEvent {
 
 fn ready_snapshot_artifact() -> ActivityArtifact {
     ActivityArtifact::new(
-        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        SERVER_PR_SNAPSHOT_ARTIFACT,
         json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "head_oid": "abc123",
@@ -42,6 +44,24 @@ fn ready_snapshot_artifact() -> ActivityArtifact {
             "validation": [
                 {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "passed"}
             ]
+        }),
+    )
+}
+
+fn agent_ready_snapshot_artifact() -> ActivityArtifact {
+    ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads": [],
+            "active_unresolved_review_threads_count": 0,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
         }),
     )
 }
@@ -352,8 +372,8 @@ fn address_pr_feedback_snapshot_for_different_pr_blocks() {
 fn ready_to_merge_signal_with_current_pr_snapshot_can_mark_ready() {
     let instance = pr_workflow_state("awaiting_feedback");
     let result = ActivityResult::succeeded(
-        "sweep_pr_feedback",
-        "Runtime agent verified the PR is ready to merge.",
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection verified the PR is ready to merge.",
     )
     .with_artifact(ready_snapshot_artifact())
     .with_signal(ActivitySignal::new(
@@ -378,15 +398,63 @@ fn ready_to_merge_signal_with_current_pr_snapshot_can_mark_ready() {
 }
 
 #[test]
-fn ready_to_merge_snapshot_accepts_quoted_pr_number() {
+fn ready_to_merge_signal_from_agent_sweep_with_server_snapshot_blocks() {
     let instance = pr_workflow_state("awaiting_feedback");
     let result = ActivityResult::succeeded(
         "sweep_pr_feedback",
-        "Runtime agent verified the PR is ready to merge.",
+        "Runtime agent forged server-owned ready evidence.",
+    )
+    .with_artifact(ready_snapshot_artifact())
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("agent sweep ready evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("server_pr_snapshot"));
+}
+
+#[test]
+fn ready_to_merge_signal_with_only_agent_repair_snapshot_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent attached a ready-looking self-reported snapshot.",
+    )
+    .with_artifact(agent_ready_snapshot_artifact())
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("agent-owned ready snapshot should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("server_pr_snapshot"));
+}
+
+#[test]
+fn ready_to_merge_snapshot_accepts_quoted_pr_number() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection verified the PR is ready to merge.",
     )
     .with_artifact(ActivityArtifact::new(
-        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        SERVER_PR_SNAPSHOT_ARTIFACT,
         json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
             "pr_number": "77",
             "pr_url": "https://github.com/owner/repo/pull/77",
             "head_oid": "abc123",
@@ -420,8 +488,10 @@ fn ready_to_merge_snapshot_for_different_pr_blocks() {
         "Runtime agent attached ready evidence copied from another PR.",
     )
     .with_artifact(ActivityArtifact::new(
-        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        SERVER_PR_SNAPSHOT_ARTIFACT,
         json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
             "pr_number": 88,
             "pr_url": "https://github.com/owner/repo/pull/88",
             "head_oid": "abc123",
@@ -456,8 +526,10 @@ fn ready_to_merge_snapshot_with_required_review_blocks() {
         "Runtime agent claimed the PR is ready without an approval.",
     )
     .with_artifact(ActivityArtifact::new(
-        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        SERVER_PR_SNAPSHOT_ARTIFACT,
         json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "head_oid": "abc123",
@@ -491,8 +563,10 @@ fn ready_to_merge_snapshot_with_unresolved_thread_array_blocks_even_when_count_z
         "Runtime agent reported contradictory unresolved review-thread evidence.",
     )
     .with_artifact(ActivityArtifact::new(
-        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        SERVER_PR_SNAPSHOT_ARTIFACT,
         json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "head_oid": "abc123",
@@ -582,8 +656,10 @@ fn child_pr_feedback_ready_snapshot_for_different_subject_pr_blocks() {
         serde_json::to_value(&proposed_decision).expect("decision should serialize"),
     ))
     .with_artifact(ActivityArtifact::new(
-        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        SERVER_PR_SNAPSHOT_ARTIFACT,
         json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
             "pr_number": 88,
             "pr_url": "https://github.com/owner/repo/pull/88",
             "head_oid": "abc123",
