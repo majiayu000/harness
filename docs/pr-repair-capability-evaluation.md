@@ -60,11 +60,14 @@ does not accept common false positives.
 `QualitySnapshot` records a `run_mode`. Collect-only snapshots must use
 `collect_only`; live Harness repair runs use `live_run` only after Harness
 returns a non-empty `task_id` from `POST /tasks`. Server health failures, project
-registry failures, duplicate-task preflight failures, POST failures, and missing
-task IDs are still diagnostic reports, but they are tagged `collect_only`
-because no Harness repair attempt exists. Benchmark inputs must include an
-explicit `run_mode=live_run`; missing `run_mode` is rejected because older
-collect-only artifacts did not have this field.
+registry failures, eval API preflight failures, duplicate-task preflight
+failures, POST failures, and missing task IDs are still diagnostic reports, but
+they are tagged `collect_only` because no Harness repair attempt exists. The
+eval API preflight must happen before `POST /tasks`; a server that is too old to
+serve `/api/evals/runs` can otherwise spend agent tokens without producing a
+dashboard quality record. Benchmark inputs must include an explicit
+`run_mode=live_run`; missing `run_mode` is rejected because older collect-only
+artifacts did not have this field.
 
 The `score_pr_repair` CLI must be invoked with an explicit
 `--run-mode live_run|collect_only` whenever it writes a new `QualitySnapshot`.

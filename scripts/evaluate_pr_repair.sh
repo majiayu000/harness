@@ -465,22 +465,25 @@ write_final_report() {
 
 write_preflight_failure_artifacts() {
   local error="$1"
+  local stage="${2:-project_registry_preflight}"
   python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" write-preflight-failure \
     --submission "$SUBMISSION_JSON" \
     --task-detail "$TASK_DETAIL_JSON" \
     --project-root "$PROJECT_ROOT" \
     --server-url "$SERVER_URL" \
-    --error "$error"
+    --error "$error" \
+    --stage "$stage"
 }
 
 write_live_preflight_failure_report() {
   local reason="$1"
   local exit_code="$2"
-  write_preflight_failure_artifacts "$reason"
+  local stage="${3:-project_registry_preflight}"
+  write_preflight_failure_artifacts "$reason" "$stage"
   echo "$reason" >&2
-  echo "Collecting final PR snapshot"
-  FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  collect_snapshot "$FINAL_JSON"
+  echo "Using baseline PR snapshot as final snapshot because no Harness task was submitted"
+  cp "$BASELINE_JSON" "$FINAL_JSON"
+  FINAL_COLLECTED_AT="$BASELINE_COLLECTED_AT"
   snapshot_summary "$FINAL_JSON"
   write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
   write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
@@ -503,6 +506,8 @@ HEALTH_JSON="$OUTPUT_DIR/health.json"
 PROJECTS_JSON="$OUTPUT_DIR/projects.json"
 TASKS_PREFLIGHT_JSON="$OUTPUT_DIR/tasks_preflight.json"
 TASKS_PREFLIGHT_ERROR="$OUTPUT_DIR/tasks_preflight_error.txt"
+EVAL_API_PREFLIGHT_JSON="$OUTPUT_DIR/eval_api_preflight.json"
+EVAL_API_PREFLIGHT_ERROR="$OUTPUT_DIR/eval_api_preflight_error.txt"
 RUNTIME_TREE_FINAL_JSON="$OUTPUT_DIR/runtime_tree_final.json"
 RUNTIME_TREE_FINAL_ERROR="$OUTPUT_DIR/runtime_tree_final_error.txt"
 EVAL_TARGET_ID="pr-repair-eval:$REPO#$PR"
@@ -632,14 +637,23 @@ fi
 if ! curl "${curl_args[@]}" "$SERVER_URL/health" > "$HEALTH_JSON"; then
   write_live_preflight_failure_report \
     "Harness server is not reachable at $SERVER_URL/health" \
-    3
+    3 \
+    "server_health_preflight"
+fi
+
+if ! curl "${curl_args[@]}" "$SERVER_URL/api/evals/runs?limit=1" > "$EVAL_API_PREFLIGHT_JSON" 2>"$EVAL_API_PREFLIGHT_ERROR"; then
+  write_live_preflight_failure_report \
+    "Harness eval API is not reachable at $SERVER_URL/api/evals/runs?limit=1; see $EVAL_API_PREFLIGHT_ERROR" \
+    5 \
+    "eval_api_preflight"
 fi
 
 echo "Checking Harness project registry for $PROJECT_ROOT"
 if ! curl "${curl_args[@]}" "$SERVER_URL/projects" > "$PROJECTS_JSON"; then
   write_live_preflight_failure_report \
     "Harness project registry is not reachable at $SERVER_URL/projects" \
-    5
+    5 \
+    "project_registry_preflight"
 fi
 
 PREFLIGHT_ERROR="$OUTPUT_DIR/project_preflight_error.txt"
@@ -649,7 +663,7 @@ if ! registered_project="$(python3 "$SCRIPT_DIR/evaluate_pr_repair_preflight.py"
     reason="Harness project root is not registered for live eval: $PROJECT_ROOT"
   fi
   echo "Register the project with POST /projects or pass a registered --project-root." >&2
-  write_live_preflight_failure_report "$reason" 5
+  write_live_preflight_failure_report "$reason" 5 "project_registry_preflight"
 fi
 echo "Registered project: $registered_project"
 
@@ -661,14 +675,15 @@ if ! curl "${curl_args[@]}" --get \
   "$SERVER_URL/tasks" > "$TASKS_PREFLIGHT_JSON" 2>"$TASKS_PREFLIGHT_ERROR"; then
   write_live_preflight_failure_report \
     "Harness task list is not reachable at $SERVER_URL/tasks; see $TASKS_PREFLIGHT_ERROR" \
-    5
+    5 \
+    "duplicate_task_preflight"
 fi
 if ! duplicate_error="$(python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" check-conflicts \
   --tasks-json "$TASKS_PREFLIGHT_JSON" \
   --project-root "$registered_project" \
   --external-id "$EVAL_EXTERNAL_ID" \
   --target-prefix "$EVAL_TARGET_ID" 2>&1)"; then
-  write_live_preflight_failure_report "$duplicate_error" 5
+  write_live_preflight_failure_report "$duplicate_error" 5 "duplicate_task_preflight"
 fi
 
 python3 - "$registered_project" "$REPO" "$PR" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" "$EVAL_EXTERNAL_ID" <<'PY' > "$TASK_BODY_JSON"

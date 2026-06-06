@@ -77,6 +77,7 @@ class ArtifactHelperTests(unittest.TestCase):
                     project_root="/tmp/project",
                     server_url="http://127.0.0.1:9800",
                     error="project registry preflight failed",
+                    stage="project_registry_preflight",
                 )
             )
 
@@ -85,6 +86,26 @@ class ArtifactHelperTests(unittest.TestCase):
                 json.loads(task_detail.read_text())["stage"],
                 "project_registry_preflight",
             )
+
+    def test_preflight_failure_artifacts_record_custom_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            submission = tmp_path / "submission.json"
+            task_detail = tmp_path / "task_detail_final.json"
+
+            MODULE.write_preflight_failure(
+                argparse.Namespace(
+                    submission=submission,
+                    task_detail=task_detail,
+                    project_root="/tmp/project",
+                    server_url="http://127.0.0.1:9800",
+                    error="eval API unavailable",
+                    stage="eval_api_preflight",
+                )
+            )
+
+            self.assertEqual(json.loads(submission.read_text())["stage"], "eval_api_preflight")
+            self.assertEqual(json.loads(task_detail.read_text())["stage"], "eval_api_preflight")
 
     def test_conflicting_eval_tasks_only_flags_active_matching_external_id(self) -> None:
         response = {

@@ -84,19 +84,20 @@ def project_registry_preflight(args: argparse.Namespace) -> int:
 
 
 def write_preflight_failure(args: argparse.Namespace) -> int:
+    stage = args.stage or "project_registry_preflight"
     submission = {
         "error": args.error,
         "eval_submission_mode": "prompt_task",
         "http_status": "preflight",
         "project_root": args.project_root,
         "server_url": args.server_url,
-        "stage": "project_registry_preflight",
+        "stage": stage,
         "status": "failed",
     }
     task_detail = {
         "error": args.error,
         "project_root": args.project_root,
-        "stage": "project_registry_preflight",
+        "stage": stage,
         "status": "failed",
     }
     write_json(str(args.submission), submission)
@@ -635,6 +636,7 @@ def build_parser() -> argparse.ArgumentParser:
     failure.add_argument("--project-root", required=True)
     failure.add_argument("--server-url", required=True)
     failure.add_argument("--error", required=True)
+    failure.add_argument("--stage", default="project_registry_preflight")
     failure.set_defaults(func=write_preflight_failure)
 
     conflicts = sub.add_parser("check-conflicts")
