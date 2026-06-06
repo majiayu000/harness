@@ -512,6 +512,12 @@ def facts(pr):
 def markdown_cell(value):
     return str(value).replace("|", "\\|")
 
+def compact(value, limit=240):
+    text = str(value).replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 3]}..."
+
 def file_rows(files):
     rows = []
     for item in sorted(files, key=lambda f: f.get("path") or ""):
@@ -542,6 +548,15 @@ removed_changed_paths = sorted(set(before["changed_file_paths"]) - set(after["ch
 task_status = task_detail.get("status") or task_detail.get("workflow", {}).get("state") or submission.get("status") or "unknown"
 workflow_id = submission.get("workflow_id") or task_detail.get("workflow", {}).get("id")
 task_id = submission.get("task_id") or task_detail.get("id")
+submission_mode = submission.get("eval_submission_mode") or "unknown"
+submission_http_status = submission.get("http_status") or task_detail.get("http_status")
+submission_error = (
+    submission.get("error")
+    or submission.get("message")
+    or submission.get("detail")
+    or submission.get("raw_response")
+    or task_detail.get("error")
+)
 timed_out = timed_out_arg == "1"
 
 if before["unresolved"] > 0:
@@ -597,6 +612,11 @@ print(f"- Candidate class: `{candidate}`")
 print(f"- Task ID: `{task_id}`")
 print(f"- Workflow ID: `{workflow_id}`")
 print(f"- Task status: `{task_status}`")
+print(f"- Submission mode: `{submission_mode}`")
+if submission_http_status:
+    print(f"- Submission HTTP status: `{submission_http_status}`")
+if submission_error:
+    print(f"- Submission error: `{markdown_cell(compact(submission_error))}`")
 print(f"- Timed out: `{str(timed_out).lower()}`")
 print(f"- Grade: `{grade}`")
 print()
@@ -710,10 +730,16 @@ print(json.dumps(body, indent=2))
 PY
 
 echo "Submitting Harness PR repair task"
-curl "${curl_args[@]}" \
-  -X POST "$SERVER_URL/tasks" \
-  -H "Content-Type: application/json" \
-  --data @"$TASK_BODY_JSON" > "$SUBMISSION_JSON"
+if ! python3 "$(dirname "$0")/evaluate_pr_repair_submit.py" --server-url "$SERVER_URL" --body "$TASK_BODY_JSON" --output "$SUBMISSION_JSON" --mode prompt_task; then
+  printf '{"status":"failed"}\n' > "$TASK_DETAIL_JSON"
+  echo "POST /tasks failed; see $SUBMISSION_JSON" >&2
+  echo "Collecting final PR snapshot"
+  collect_snapshot "$FINAL_JSON"
+  snapshot_summary "$FINAL_JSON"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0"
+  echo "Evaluation report: $OUTPUT_DIR/summary.md"
+  exit 4
+fi
 
 TASK_ID="$(python3 - "$SUBMISSION_JSON" <<'PY'
 import json
@@ -729,7 +755,13 @@ print(data.get("task_id") or data.get("submission_id") or "")
 PY
 )"
 if [[ -z "$TASK_ID" ]]; then
+  printf '{"status":"failed"}\n' > "$TASK_DETAIL_JSON"
   echo "POST /tasks did not return task_id; see $SUBMISSION_JSON" >&2
+  echo "Collecting final PR snapshot"
+  collect_snapshot "$FINAL_JSON"
+  snapshot_summary "$FINAL_JSON"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0"
+  echo "Evaluation report: $OUTPUT_DIR/summary.md"
   exit 4
 fi
 
