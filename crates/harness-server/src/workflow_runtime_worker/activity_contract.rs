@@ -136,8 +136,13 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
         }
         (GITHUB_ISSUE_PR_DEFINITION_ID, "address_pr_feedback") => {
             ActivityContract::new(workflow_definition, activity)
-                .with_accepted_artifacts(vec!["workflow_decision", PR_REPAIR_SNAPSHOT_ARTIFACT])
-                .requires("pr_repair_snapshot_with_action_and_validation")
+                .with_accepted_signals(vec![ISSUE_CLOSED_SIGNAL, ISSUE_ALREADY_RESOLVED_SIGNAL])
+                .with_accepted_artifacts(vec![
+                    "workflow_decision",
+                    PR_REPAIR_SNAPSHOT_ARTIFACT,
+                    ISSUE_STATE_ARTIFACT,
+                ])
+                .requires("pr_repair_snapshot_with_action_and_validation_or_closed_issue_evidence")
         }
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)

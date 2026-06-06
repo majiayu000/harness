@@ -316,8 +316,8 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         ("github_issue_pr", "address_pr_feedback") => json!({
             "on_succeeded": {
                 "reducer_next_state": "local_review_gate",
-                "success_requires": "A succeeded address_pr_feedback result MUST include pr_repair_snapshot with final head, observed_at, action proof, and validation evidence.",
-                "required_summary": "Describe addressed review feedback, pushed/no-code action, and validation evidence. Harness will run local review before remote feedback."
+                "success_requires": "A succeeded address_pr_feedback result MUST include pr_repair_snapshot with final head, observed_at, action proof, and validation evidence, unless IssueClosed/IssueAlreadyResolved or issue_state proves the issue or PR is already closed/resolved.",
+                "required_summary": "Describe addressed review feedback, pushed/no-code action, validation evidence, or closed issue evidence. Harness will run local review before remote feedback unless terminal closed evidence finishes the workflow."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -505,13 +505,22 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_not_include": ["direct workflow state changes"],
         }),
         ("github_issue_pr", "address_pr_feedback") => json!({
-            "must_include": ["review feedback addressed or explicit no-code reason", "changed files or explicit no-code-change reason", "validation commands", "fresh PR state checked before final response", "final PR head"],
+            "must_include": ["review feedback addressed or explicit no-code reason", "changed files or explicit no-code-change reason", "validation commands or closed issue evidence", "fresh PR state checked before final response", "final PR head or closed issue evidence"],
             "must_not_include": ["claiming review approval without a fresh review signal", "marking review threads resolved without current GitHub evidence"],
             "artifacts": {
                 "pr_repair_snapshot": {
-                    "required": true,
+                    "required_when": "Feedback repair was performed, review-thread action was taken, or a no-code-change repair conclusion is returned.",
+                    "required_unless": "IssueClosed/IssueAlreadyResolved signal or issue_state artifact proves the issue or PR is already closed/resolved.",
                     "fields": ["pr_number", "pr_url", "head_sha", "head_oid", "observed_at", "changed_files", "action_taken", "no_code_change_reason", "validation_commands"]
+                },
+                "issue_state": {
+                    "required_when": "No repair is needed because the issue or PR is already closed/resolved.",
+                    "fields": ["issue_number", "state", "issue_url"]
                 }
+            },
+            "signals": {
+                "IssueClosed": "Use when the issue or PR is confirmed closed and no feedback repair is needed. Include state=closed or state=resolved plus issue_number or issue_url.",
+                "IssueAlreadyResolved": "Use when the feedback task is already resolved before repair. Include state=closed or state=resolved plus issue_number or issue_url."
             }
         }),
         ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({

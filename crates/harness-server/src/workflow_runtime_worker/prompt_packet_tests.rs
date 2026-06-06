@@ -74,8 +74,21 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         PR_REPAIR_SNAPSHOT_ARTIFACT
     );
     assert_eq!(
+        schema["activity_contract"]["accepted_artifacts"][2],
+        ISSUE_STATE_ARTIFACT
+    );
+    assert_eq!(
+        schema["activity_contract"]["accepted_signals"][0],
+        ISSUE_CLOSED_SIGNAL
+    );
+    assert_eq!(
         schema["activity_contract"]["success_requires"],
-        "pr_repair_snapshot_with_action_and_validation"
+        "pr_repair_snapshot_with_action_and_validation_or_closed_issue_evidence"
+    );
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("IssueClosed"))
     );
     assert!(schema["agent_summary_contract"]["must_include"]
         .as_array()
@@ -83,8 +96,16 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
             |items| items.contains(&json!("fresh PR state checked before final response"))
         ));
     assert_eq!(
-        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required"],
-        true
+        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required_unless"],
+        "IssueClosed/IssueAlreadyResolved signal or issue_state artifact proves the issue or PR is already closed/resolved."
+    );
+    assert_eq!(
+        schema["agent_summary_contract"]["artifacts"]["issue_state"]["required_when"],
+        "No repair is needed because the issue or PR is already closed/resolved."
+    );
+    assert_eq!(
+        schema["agent_summary_contract"]["signals"]["IssueClosed"],
+        "Use when the issue or PR is confirmed closed and no feedback repair is needed. Include state=closed or state=resolved plus issue_number or issue_url."
     );
     let snapshot_fields = schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]
         ["fields"]
