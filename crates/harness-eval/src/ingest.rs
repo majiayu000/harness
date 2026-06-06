@@ -136,7 +136,7 @@ fn connection_complete(value: &Value, raw_field: &str, normalized_field: &str) -
             .and_then(Value::as_bool)
             .is_some_and(|has_next_page| !has_next_page);
     }
-    true
+    false
 }
 
 pub fn runtime_snapshot_from_values(

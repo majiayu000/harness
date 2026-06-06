@@ -61,6 +61,34 @@ fn incomplete_server_normalized_review_threads_fail_closure_gate() {
 }
 
 #[test]
+fn missing_server_normalized_completeness_flags_fail_evidence_gates() {
+    let baseline = server_normalized_snapshot("base-head", true, true);
+    let mut final_pr = server_normalized_snapshot("final-head", true, true);
+    let fields = final_pr
+        .as_object_mut()
+        .expect("normalized snapshot object");
+    fields.remove("review_threads_complete");
+    fields.remove("changed_files_complete");
+    let input = eval_input(
+        github_pr_snapshot_from_value("owner/repo", "2026-06-06T00:00:00Z", &baseline),
+        github_pr_snapshot_from_value("owner/repo", "2026-06-06T00:01:00Z", &final_pr),
+    );
+
+    let snapshot = score_pr_repair_eval(input).expect("score incomplete server snapshot");
+    let gate = snapshot_gate(&snapshot.hard_gates, HardGateName::ReviewThreadClosure);
+
+    assert_eq!(gate.status, GateStatus::Fail);
+    assert_eq!(snapshot.grade_cap, Some(EvalGrade::C));
+    assert_eq!(
+        snapshot
+            .objective_score
+            .verification_and_current_head_gates
+            .points,
+        4
+    );
+}
+
+#[test]
 fn missing_raw_changed_files_page_info_penalizes_current_head_verification() {
     let baseline = raw_pr_snapshot("base-head", false);
     let final_pr = raw_pr_snapshot_without_files_page_info("final-head");

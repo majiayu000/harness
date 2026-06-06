@@ -201,7 +201,10 @@ pub struct PullRequestSnapshot {
 `reviewThreads` must come from GraphQL or an equivalent API surface that can
 distinguish active unresolved threads from outdated or resolved threads. The
 snapshot must also record whether `reviewThreads` and changed-file enumeration
-was complete; incomplete pagination is not valid merge-readiness evidence.
+was complete. Raw GitHub evidence proves completeness with
+`pageInfo.hasNextPage=false`; server-normalized evidence must carry explicit
+`review_threads_complete=true` and `changed_files_complete=true`. Incomplete or
+missing completeness evidence is not valid merge-readiness evidence.
 
 ### `RuntimeSnapshot`
 
