@@ -20,8 +20,8 @@ use self::pr_feedback_completion::{
     pr_feedback_sweep_decision_from_activity_result,
 };
 use self::quality_gate_completion::{
-    quality_gate_activity_matches, quality_gate_success_contract_error,
-    quality_gate_success_decision,
+    parent_quality_gate_pass_decision, quality_gate_activity_matches,
+    quality_gate_success_contract_error, quality_gate_success_decision,
 };
 use self::repo_backlog_completion::{
     repo_backlog_child_dispatch_still_active, repo_backlog_invalid_success_decision,
@@ -125,6 +125,10 @@ fn reduce_success(
         .filter(|decision| structured_decision_validates(instance, event, result, decision))
         .cloned()
     {
+        return Some(decision);
+    }
+
+    if let Some(decision) = parent_quality_gate_pass_decision(instance, event, result) {
         return Some(decision);
     }
 

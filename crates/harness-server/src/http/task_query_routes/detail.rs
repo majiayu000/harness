@@ -317,7 +317,11 @@ pub(crate) fn proof_from_runtime_workflow(
     }) || accepted_decisions.iter().any(|record| {
         matches!(
             record.decision.decision.as_str(),
-            "mark_ready_to_merge" | "approve_merge" | "record_pr_merged" | "quality_passed"
+            "mark_ready_to_merge"
+                | "quality_gate_passed"
+                | "approve_merge"
+                | "record_pr_merged"
+                | "quality_passed"
         )
     }) || workflow.state == "passed";
     let changes_requested = events
@@ -361,6 +365,8 @@ pub(crate) fn proof_from_runtime_workflow(
                 "address_pr_feedback"
                     | "wait_for_pr_feedback"
                     | "mark_ready_to_merge"
+                    | "start_quality_gate"
+                    | "quality_gate_passed"
                     | "quality_passed"
             )
         })

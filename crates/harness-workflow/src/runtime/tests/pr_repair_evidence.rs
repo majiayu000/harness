@@ -143,6 +143,37 @@ fn structured_ready_decision_without_current_pr_snapshot_blocks() {
 }
 
 #[test]
+fn structured_ready_decision_with_snapshot_without_ready_signal_blocks_quality_gate_bypass() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "awaiting_feedback",
+        "mark_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted a direct ready workflow decision.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_artifact(ready_snapshot_artifact());
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("direct ready decision should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("quality_gate"));
+}
+
+#[test]
 fn structured_ready_decision_with_blocking_signal_uses_blocking_feedback() {
     let instance = pr_workflow_state("awaiting_feedback");
     let proposed_decision = WorkflowDecision::new(
@@ -369,7 +400,7 @@ fn address_pr_feedback_snapshot_for_different_pr_blocks() {
 }
 
 #[test]
-fn ready_to_merge_signal_with_current_pr_snapshot_can_mark_ready() {
+fn ready_to_merge_signal_with_current_pr_snapshot_starts_quality_gate() {
     let instance = pr_workflow_state("awaiting_feedback");
     let result = ActivityResult::succeeded(
         PR_FEEDBACK_INSPECT_ACTIVITY,
@@ -386,15 +417,25 @@ fn ready_to_merge_signal_with_current_pr_snapshot_can_mark_ready() {
         .expect("event should parse")
         .expect("valid snapshot should reduce");
 
-    assert_eq!(decision.decision, "mark_ready_to_merge");
-    assert_eq!(decision.next_state, "ready_to_merge");
+    assert_eq!(decision.decision, "start_quality_gate");
+    assert_eq!(decision.next_state, "quality_gate_pending");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(
+        decision.commands[0].command["definition_id"],
+        QUALITY_GATE_DEFINITION_ID
+    );
+    assert_eq!(decision.commands[0].command["subject_key"], "pr:77");
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
             &decision,
             &ValidationContext::new("runtime-1", Utc::now()),
         )
-        .expect("ready snapshot decision should validate");
+        .expect("ready snapshot quality gate decision should validate");
 }
 
 #[test]
@@ -476,8 +517,8 @@ fn ready_to_merge_snapshot_accepts_quoted_pr_number() {
         .expect("event should parse")
         .expect("quoted snapshot PR number should reduce");
 
-    assert_eq!(decision.decision, "mark_ready_to_merge");
-    assert_eq!(decision.next_state, "ready_to_merge");
+    assert_eq!(decision.decision, "start_quality_gate");
+    assert_eq!(decision.next_state, "quality_gate_pending");
 }
 
 #[test]

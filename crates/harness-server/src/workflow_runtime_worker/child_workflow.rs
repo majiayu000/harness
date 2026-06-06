@@ -1,10 +1,11 @@
 use crate::http::AppState;
 use crate::task_runner::TaskId;
 use harness_workflow::runtime::{
-    build_pr_feedback_inspect_decision, ActivityArtifact, ActivityErrorKind, ActivityResult,
-    DecisionValidator, PrFeedbackInspectDecisionInput, RuntimeJob, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
-    PR_FEEDBACK_DEFINITION_ID,
+    build_pr_feedback_inspect_decision, build_quality_gate_run_decision, ActivityArtifact,
+    ActivityErrorKind, ActivityResult, DecisionValidator, PrFeedbackInspectDecisionInput,
+    QualityGateDecisionInput, RuntimeJob, WorkflowDecisionRecord, WorkflowDefinition,
+    WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
+    QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -38,6 +39,10 @@ pub(super) async fn execute_start_child_workflow(
     }
     if definition_id == PROMPT_TASK_DEFINITION_ID {
         return execute_start_prompt_task_child_workflow(state, job, parent, command, subject_key)
+            .await;
+    }
+    if definition_id == QUALITY_GATE_DEFINITION_ID {
+        return execute_start_quality_gate_child_workflow(state, job, parent, command, subject_key)
             .await;
     }
     if definition_id != "github_issue_pr" {
@@ -262,6 +267,175 @@ async fn execute_start_prompt_task_child_workflow(
             "decision_id": submission.decision_id,
             "command_ids": submission.command_ids,
             "rejection_reason": submission.rejection_reason,
+        }),
+    )))
+}
+
+async fn execute_start_quality_gate_child_workflow(
+    state: &Arc<AppState>,
+    job: &RuntimeJob,
+    parent: Option<&WorkflowInstance>,
+    command: &Value,
+    subject_key: &str,
+) -> anyhow::Result<ActivityResult> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        anyhow::bail!("workflow runtime store is unavailable");
+    };
+    let parent =
+        parent.ok_or_else(|| anyhow::anyhow!("quality_gate child workflow requires a parent"))?;
+    let project_id = parent
+        .data
+        .get("project_id")
+        .and_then(Value::as_str)
+        .or_else(|| job.input.get("project_id").and_then(Value::as_str))
+        .ok_or_else(|| anyhow::anyhow!("quality_gate child workflow project_id is missing"))?;
+    let repo = command
+        .get("repo")
+        .and_then(Value::as_str)
+        .or_else(|| parent.data.get("repo").and_then(Value::as_str));
+    let pr_number = command
+        .get("pr_number")
+        .and_then(Value::as_u64)
+        .or_else(|| parent.data.get("pr_number").and_then(Value::as_u64));
+    let pr_url = optional_string(command, "pr_url").or_else(|| {
+        parent
+            .data
+            .get("pr_url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+    let validation_commands = string_vec(command, "validation_commands");
+    let child_id = format!("{}::quality-gate:{}", parent.id, job.command_id);
+    store
+        .upsert_definition(&WorkflowDefinition::new(
+            QUALITY_GATE_DEFINITION_ID,
+            1,
+            "Quality gate workflow",
+        ))
+        .await?;
+    let mut child = match store.get_instance(&child_id).await? {
+        Some(instance) => instance,
+        None => WorkflowInstance::new(
+            QUALITY_GATE_DEFINITION_ID,
+            1,
+            "pending",
+            WorkflowSubject::new("quality_gate", subject_key),
+        )
+        .with_id(child_id.clone()),
+    };
+    if child.parent_workflow_id.is_none() {
+        child.parent_workflow_id = Some(parent.id.clone());
+    }
+    merge_json_object(
+        &mut child.data,
+        json!({
+            "project_id": project_id,
+            "repo": repo,
+            "pr_number": pr_number,
+            "pr_url": pr_url.clone(),
+            "parent_workflow_id": parent.id.as_str(),
+            "runtime_job_id": job.id.as_str(),
+            "command_id": job.command_id.as_str(),
+            "started_by_runtime_job_id": job.id.as_str(),
+            "started_by_command_id": job.command_id.as_str(),
+            "validation_commands": validation_commands.clone(),
+        }),
+    );
+    store.upsert_instance(&child).await?;
+    store
+        .append_event(
+            &child.id,
+            "ChildWorkflowStarted",
+            "workflow_runtime_worker",
+            json!({
+                "parent_workflow_id": parent.id.as_str(),
+                "runtime_job_id": job.id.as_str(),
+                "command_id": job.command_id.as_str(),
+                "definition_id": QUALITY_GATE_DEFINITION_ID,
+                "subject_key": subject_key,
+            }),
+        )
+        .await?;
+
+    let child_command_ids = if child.state == "pending" {
+        let event = store
+            .append_event(
+                &child.id,
+                "QualityGateRequested",
+                "workflow_runtime_worker",
+                json!({
+                    "parent_workflow_id": parent.id.as_str(),
+                    "pr_number": pr_number,
+                    "pr_url": pr_url.clone(),
+                    "repo": repo,
+                }),
+            )
+            .await?;
+        let output = build_quality_gate_run_decision(
+            &child,
+            QualityGateDecisionInput {
+                reason: "Parent PR workflow requested a quality gate before ready_to_merge.",
+                validation_commands: &validation_commands,
+            },
+        );
+        let validation = DecisionValidator::quality_gate().validate(
+            &child,
+            &output.decision,
+            &harness_workflow::runtime::ValidationContext::new(
+                "workflow_runtime_worker",
+                chrono::Utc::now(),
+            ),
+        );
+        let record = match validation {
+            Ok(()) => WorkflowDecisionRecord::accepted(output.decision.clone(), Some(event.id)),
+            Err(error) => {
+                let record = WorkflowDecisionRecord::rejected(
+                    output.decision,
+                    Some(event.id),
+                    error.to_string(),
+                );
+                store.record_decision(&record).await?;
+                return Ok(ActivityResult::failed(
+                    activity_name(job),
+                    "Quality gate child workflow request was rejected.",
+                    error.to_string(),
+                )
+                .with_error_kind(ActivityErrorKind::Configuration));
+            }
+        };
+        store.record_decision(&record).await?;
+        let mut command_ids = Vec::new();
+        for command in &output.decision.commands {
+            let command_id = store
+                .enqueue_command(&child.id, Some(&record.id), command)
+                .await?;
+            command_ids.push(command_id);
+        }
+        child.state = output.decision.next_state;
+        child.version = child.version.saturating_add(1);
+        store.upsert_instance(&child).await?;
+        command_ids
+    } else {
+        Vec::new()
+    };
+
+    Ok(ActivityResult::succeeded(
+        activity_name(job),
+        format!("Quality gate child workflow `{}` started.", child.id),
+    )
+    .with_artifact(ActivityArtifact::new(
+        "child_workflow",
+        json!({
+            "workflow_id": child.id,
+            "definition_id": child.definition_id,
+            "state": child.state,
+            "subject_key": child.subject.subject_key,
+        }),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "child_commands",
+        json!({
+            "command_ids": child_command_ids,
         }),
     )))
 }

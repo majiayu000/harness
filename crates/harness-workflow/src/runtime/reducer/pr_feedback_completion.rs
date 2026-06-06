@@ -81,7 +81,16 @@ pub(super) fn pr_feedback_success_contract_error(
         if pr_feedback_outcome_from_signals(result) == Some(PrFeedbackOutcome::BlockingFeedback) {
             return None;
         }
-        if ready_snapshot_proves_pr_ready(instance, result) {
+        let ready_snapshot = ready_snapshot_proves_pr_ready(instance, result);
+        if structured_decision.is_some_and(structured_ready_decision)
+            && !has_signal(result, "PrReadyToMerge")
+            && ready_snapshot
+        {
+            return Some(
+                "PR readiness workflow_decision is no longer accepted directly: emit PrReadyToMerge with a current server_pr_snapshot so the parent workflow starts quality_gate before ready_to_merge".to_string(),
+            );
+        }
+        if ready_snapshot {
             return None;
         }
         return Some(

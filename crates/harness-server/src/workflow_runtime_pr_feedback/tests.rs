@@ -183,11 +183,18 @@ async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
         .get_instance(&workflow_id)
         .await?
         .expect("workflow instance should be persisted");
-    assert_eq!(instance.state, "ready_to_merge");
+    assert_eq!(instance.state, "quality_gate_pending");
     let events = store.events_for(&workflow_id).await?;
     assert!(events
         .iter()
         .any(|event| event.event_type == "PrReadyToMerge"));
+    let commands = store.commands_for(&workflow_id).await?;
+    assert!(commands.iter().any(|command| {
+        command.command.command_type
+            == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+            && command.command.command["definition_id"]
+                == harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID
+    }));
     Ok(())
 }
 
