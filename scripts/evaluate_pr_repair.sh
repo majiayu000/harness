@@ -483,6 +483,12 @@ PR_REPAIR_EVAL_INPUT_JSON="$OUTPUT_DIR/pr_repair_eval_input.json"
 QUALITY_SNAPSHOT_JSON="$OUTPUT_DIR/quality_snapshot.json"
 HEALTH_JSON="$OUTPUT_DIR/health.json"
 PROJECTS_JSON="$OUTPUT_DIR/projects.json"
+TASKS_PREFLIGHT_JSON="$OUTPUT_DIR/tasks_preflight.json"
+TASKS_PREFLIGHT_ERROR="$OUTPUT_DIR/tasks_preflight_error.txt"
+RUNTIME_TREE_FINAL_JSON="$OUTPUT_DIR/runtime_tree_final.json"
+RUNTIME_TREE_FINAL_ERROR="$OUTPUT_DIR/runtime_tree_final_error.txt"
+EVAL_TARGET_ID="pr-repair-eval:$REPO#$PR"
+EVAL_EXTERNAL_ID="$EVAL_TARGET_ID:run:$RUN_ID"
 
 write_quality_snapshot() {
   local baseline="$1"
@@ -514,6 +520,29 @@ write_quality_snapshot() {
     args+=(--task-detail "$task_detail")
   fi
   cargo "${args[@]}"
+}
+
+collect_runtime_tree_artifact() {
+  local project_root="$1"
+  local workflow_id="$2"
+  local task_id="$3"
+  if [[ -z "$project_root" || -z "$workflow_id" ]]; then
+    return 0
+  fi
+  if curl "${curl_args[@]}" --get \
+    --data-urlencode "project_id=$project_root" \
+    --data-urlencode "limit=100" \
+    --data-urlencode "job_limit=5" \
+    "$SERVER_URL/api/workflows/runtime/tree" \
+    > "$RUNTIME_TREE_FINAL_JSON" 2>"$RUNTIME_TREE_FINAL_ERROR"; then
+    python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" merge-runtime-tree \
+      --task-detail "$TASK_DETAIL_JSON" \
+      --runtime-tree "$RUNTIME_TREE_FINAL_JSON" \
+      --workflow-id "$workflow_id" \
+      --task-id "$task_id"
+  else
+    echo "Runtime tree collection failed; see $RUNTIME_TREE_FINAL_ERROR" >&2
+  fi
 }
 
 echo "Collecting baseline for $REPO#$PR"
@@ -560,11 +589,29 @@ if ! registered_project="$(python3 "$SCRIPT_DIR/evaluate_pr_repair_preflight.py"
 fi
 echo "Registered project: $registered_project"
 
-python3 - "$registered_project" "$REPO" "$PR" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" <<'PY' > "$TASK_BODY_JSON"
+echo "Checking for active duplicate PR repair eval tasks"
+if ! curl "${curl_args[@]}" --get \
+  --data-urlencode "source=pr_repair_eval" \
+  --data-urlencode "kind=prompt" \
+  --data-urlencode "limit=500" \
+  "$SERVER_URL/tasks" > "$TASKS_PREFLIGHT_JSON" 2>"$TASKS_PREFLIGHT_ERROR"; then
+  write_live_preflight_failure_report \
+    "Harness task list is not reachable at $SERVER_URL/tasks; see $TASKS_PREFLIGHT_ERROR" \
+    5
+fi
+if ! duplicate_error="$(python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" check-conflicts \
+  --tasks-json "$TASKS_PREFLIGHT_JSON" \
+  --project-root "$registered_project" \
+  --external-id "$EVAL_EXTERNAL_ID" \
+  --target-prefix "$EVAL_TARGET_ID" 2>&1)"; then
+  write_live_preflight_failure_report "$duplicate_error" 5
+fi
+
+python3 - "$registered_project" "$REPO" "$PR" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" "$EVAL_EXTERNAL_ID" <<'PY' > "$TASK_BODY_JSON"
 import json
 import sys
 
-project_root, repo, pr, wait_secs, max_rounds, max_turns, max_budget = sys.argv[1:]
+project_root, repo, pr, wait_secs, max_rounds, max_turns, max_budget, external_id = sys.argv[1:]
 wait_secs_value = int(wait_secs)
 max_rounds_value = int(max_rounds)
 max_turns_value = int(max_turns)
@@ -572,7 +619,7 @@ body = {
     "project": project_root,
     "repo": repo,
     "source": "pr_repair_eval",
-    "external_id": f"pr-repair-eval:{repo}#{pr}",
+    "external_id": external_id,
     "wait_secs": wait_secs_value,
     "max_rounds": max_rounds_value,
     "max_turns": max_turns_value,
@@ -615,7 +662,7 @@ import sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as fh:
         data = json.load(fh)
-except json.JSONDecodeError:
+except (OSError, json.JSONDecodeError):
     data = {}
 
 print(data.get("task_id") or data.get("submission_id") or "")
@@ -636,6 +683,19 @@ if [[ -z "$TASK_ID" ]]; then
 fi
 
 echo "Submitted task_id=$TASK_ID"
+WORKFLOW_ID="$(python3 - "$SUBMISSION_JSON" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    data = {}
+
+print(data.get("workflow_id") or "")
+PY
+)"
 ENCODED_TASK_ID="$(url_encode_path_segment "$TASK_ID")"
 deadline=$(( $(date +%s) + TIMEOUT_SECS ))
 status="unknown"
@@ -665,6 +725,25 @@ echo "Collecting final PR snapshot"
 FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 collect_snapshot "$FINAL_JSON"
 snapshot_summary "$FINAL_JSON"
+if [[ -z "$WORKFLOW_ID" ]]; then
+  WORKFLOW_ID="$(python3 - "$TASK_DETAIL_JSON" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    data = {}
+
+workflow = data.get("workflow") if isinstance(data, dict) else {}
+if not isinstance(workflow, dict):
+    workflow = {}
+print(workflow.get("id") or data.get("workflow_id") or "")
+PY
+)"
+fi
+collect_runtime_tree_artifact "$registered_project" "$WORKFLOW_ID" "$TASK_ID"
 write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
 write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$timed_out" "$QUALITY_SNAPSHOT_JSON"
 echo "Evaluation report: $OUTPUT_DIR/summary.md"
