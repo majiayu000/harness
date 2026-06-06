@@ -365,6 +365,10 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     );
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][1],
+        SERVER_PR_SNAPSHOT_ARTIFACT
+    );
+    assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][2],
         PR_FEEDBACK_SNAPSHOT_ARTIFACT
     );
     assert_eq!(

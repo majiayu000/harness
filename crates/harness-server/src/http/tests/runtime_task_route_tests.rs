@@ -83,6 +83,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     assert_eq!(state.core.tasks.count(), before_count);
 
     let list_response = app
+        .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
     assert_eq!(list_response.status(), StatusCode::OK);
@@ -95,7 +96,8 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     let canonical_project_root = project_root.canonicalize()?;
 
     assert_eq!(runtime_task["task_kind"], "issue");
-    assert_eq!(runtime_task["status"], "waiting");
+    assert_eq!(runtime_task["status"], "planning");
+    assert_eq!(runtime_task["phase"], "plan");
     assert_eq!(runtime_task["external_id"], "issue:52");
     assert_eq!(runtime_task["repo"], "owner/repo");
     assert_eq!(runtime_task["description"], "issue #52");
@@ -103,13 +105,30 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         runtime_task["project"],
         canonical_project_root.to_string_lossy().as_ref()
     );
-    assert_eq!(runtime_task["scheduler"]["authority_state"], "queued");
+    assert_eq!(runtime_task["scheduler"]["authority_state"], "running");
     assert!(runtime_task["workflow"]["id"]
         .as_str()
         .is_some_and(|id| id.ends_with("::repo:owner/repo::issue:52")));
     assert_eq!(runtime_task["workflow"]["definition_id"], "github_issue_pr");
     assert_eq!(runtime_task["workflow"]["state"], "planning");
     assert_eq!(runtime_task["workflow"]["issue_number"], 52);
+
+    let planning_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks?status=planning")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(planning_response.status(), StatusCode::OK);
+    let planning_listed = response_json(planning_response).await?;
+    let planning_tasks = planning_listed["data"]
+        .as_array()
+        .expect("planning-filtered tasks should be an array");
+    assert!(
+        planning_tasks.iter().any(|task| task["id"] == task_id),
+        "status=planning should include runtime-backed planning workflows"
+    );
     Ok(())
 }
 

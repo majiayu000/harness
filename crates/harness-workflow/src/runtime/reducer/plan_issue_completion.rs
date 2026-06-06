@@ -30,7 +30,8 @@ pub(super) fn issue_plan_decision_from_activity_result(
     }
 
     let Some(issue_plan) = issue_plan_payload(result) else {
-        let reason = "plan_issue succeeded without an issue_plan artifact or IssuePlanReady signal";
+        let reason =
+            "plan_issue succeeded without a valid issue_plan artifact or IssuePlanReady signal";
         return Some(invalid_agent_output_blocked_decision(
             instance, event, result, reason,
         ));
@@ -72,14 +73,51 @@ fn issue_plan_payload(result: &ActivityResult) -> Option<Value> {
         .artifacts
         .iter()
         .find(|artifact| artifact.artifact_type == ISSUE_PLAN_ARTIFACT)
-        .map(|artifact| artifact.artifact.clone())
+        .and_then(|artifact| valid_issue_plan_payload(&artifact.artifact))
         .or_else(|| {
             result
                 .signals
                 .iter()
                 .find(|signal| signal.signal_type == ISSUE_PLAN_READY_SIGNAL)
-                .map(|signal| signal.signal.clone())
+                .and_then(|signal| valid_issue_plan_payload(&signal.signal))
         })
+}
+
+fn valid_issue_plan_payload(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if object.is_empty()
+        || issue_plan_summary(value).is_none()
+        || !non_empty_string_field(value, "task_class")
+        || !non_empty_string_array(value, "target_files")
+        || !non_empty_string_array(value, "validation_plan")
+        || !array_field_exists(value, "blockers")
+    {
+        return None;
+    }
+    Some(value.clone())
+}
+
+fn non_empty_string_field(value: &Value, field: &str) -> bool {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
+}
+
+fn non_empty_string_array(value: &Value, field: &str) -> bool {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            !items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|text| !text.trim().is_empty()))
+        })
+}
+
+fn array_field_exists(value: &Value, field: &str) -> bool {
+    value.get(field).and_then(Value::as_array).is_some()
 }
 
 fn issue_plan_summary(issue_plan: &Value) -> Option<String> {

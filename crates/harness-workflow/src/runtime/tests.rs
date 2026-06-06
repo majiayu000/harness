@@ -22,10 +22,9 @@ use super::{
     RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowDecisionTransition,
     WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
     PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL,
-    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
-    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
+    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
+    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -112,20 +111,6 @@ fn runtime_completion_event(
     }))
 }
 
-fn pr_repair_snapshot_artifact(payload: serde_json::Value) -> ActivityArtifact {
-    ActivityArtifact::new(PR_REPAIR_SNAPSHOT_ARTIFACT, payload)
-}
-
-fn changed_files_pr_repair_snapshot_artifact() -> ActivityArtifact {
-    pr_repair_snapshot_artifact(json!({
-        "pr_number": 77,
-        "pr_url": "https://github.com/owner/repo/pull/77",
-        "head_oid": "head-after-repair",
-        "changed_files": ["src/lib.rs"],
-        "validation_commands": ["cargo test -p harness-workflow pr_repair_evidence"]
-    }))
-}
-
 #[test]
 fn issue_submission_decision_starts_discovered_issue_planning() {
     let labels = vec!["bug".to_string(), "p1".to_string()];
@@ -194,6 +179,43 @@ fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
             &ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen(),
         )
         .expect("explicit issue submission should reopen failed workflows");
+}
+
+#[test]
+fn issue_submission_decision_can_reopen_terminal_issue_for_planning() {
+    let labels = Vec::new();
+    for state in ["failed", "cancelled"] {
+        let instance = issue_instance(state);
+        let output = build_issue_submission_decision(
+            &instance,
+            IssueSubmissionDecisionInput {
+                task_id: "task-terminal",
+                repo: Some("owner/repo"),
+                issue_number: 124,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        );
+
+        assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
+        assert_eq!(output.decision.next_state, "planning");
+        assert_eq!(
+            output.decision.commands[0].activity_name(),
+            Some("plan_issue")
+        );
+        let validation = DecisionValidator::github_issue_pr().validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen(),
+        );
+        assert!(
+            validation.is_ok(),
+            "terminal issue in {state} should reopen for planning: {validation:?}"
+        );
+    }
 }
 
 #[test]

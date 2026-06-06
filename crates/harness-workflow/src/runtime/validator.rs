@@ -118,8 +118,10 @@ impl TransitionAllowlist {
             .allow("discovered", "implementing", [EnqueueActivity, Wait])
             .allow("scheduled", "scheduled", [EnqueueActivity, Wait])
             .allow("failed", "scheduled", [EnqueueActivity, Wait])
+            .allow("failed", "planning", [EnqueueActivity, Wait])
             .allow("failed", "implementing", [EnqueueActivity, Wait])
             .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
+            .allow("cancelled", "planning", [EnqueueActivity, Wait])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])
             .allow("scheduled", "planning", [EnqueueActivity, Wait])
             .allow(

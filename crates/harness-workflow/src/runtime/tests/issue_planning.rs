@@ -144,6 +144,83 @@ fn issue_plan_empty_success_blocks_as_invalid_agent_output() {
 }
 
 #[test]
+fn issue_plan_invalid_payload_blocks_as_missing_plan_evidence() {
+    let invalid_results = vec![
+        ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Null issue plan.")
+            .with_artifact(ActivityArtifact::new(
+                super::super::ISSUE_PLAN_ARTIFACT,
+                json!(null),
+            )),
+        ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Empty issue plan.")
+            .with_artifact(ActivityArtifact::new(
+                super::super::ISSUE_PLAN_ARTIFACT,
+                json!({}),
+            )),
+        ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "String issue plan.")
+            .with_artifact(ActivityArtifact::new(
+                super::super::ISSUE_PLAN_ARTIFACT,
+                json!("plan ready"),
+            )),
+        ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Array issue plan.")
+            .with_artifact(ActivityArtifact::new(
+                super::super::ISSUE_PLAN_ARTIFACT,
+                json!([]),
+            )),
+        ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Summary-only issue plan.")
+            .with_artifact(ActivityArtifact::new(
+                super::super::ISSUE_PLAN_ARTIFACT,
+                json!({"summary": "done"}),
+            )),
+        ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Unknown-field issue plan.")
+            .with_artifact(ActivityArtifact::new(
+                super::super::ISSUE_PLAN_ARTIFACT,
+                json!({"foo": "bar"}),
+            )),
+        ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Missing blockers issue plan.")
+            .with_artifact(ActivityArtifact::new(
+                super::super::ISSUE_PLAN_ARTIFACT,
+                json!({
+                    "summary": "Patch the reducer.",
+                    "task_class": "standard_code",
+                    "target_files": ["crates/harness-workflow/src/runtime/reducer/plan_issue_completion.rs"],
+                    "validation_plan": ["cargo test -p harness-workflow issue_planning"]
+                }),
+            )),
+        ActivityResult::succeeded(
+            super::super::ISSUE_PLAN_ACTIVITY,
+            "Missing task_class issue plan.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            super::super::ISSUE_PLAN_ARTIFACT,
+            json!({
+                    "summary": "Patch the reducer.",
+                    "target_files": ["crates/harness-workflow/src/runtime/reducer/plan_issue_completion.rs"],
+                    "validation_plan": ["cargo test -p harness-workflow issue_planning"],
+                    "blockers": []
+            }),
+        )),
+        ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Null issue plan signal.")
+            .with_signal(ActivitySignal::new(
+                super::super::ISSUE_PLAN_READY_SIGNAL,
+                json!(null),
+            )),
+    ];
+
+    for result in invalid_results {
+        let instance = issue_instance("planning");
+        let event = runtime_completion_event(&instance, super::super::ISSUE_PLAN_ACTIVITY, result);
+
+        let decision = reduce_runtime_job_completed(&instance, &event)
+            .expect("event should parse")
+            .expect("invalid issue plan payload should block");
+
+        assert_eq!(decision.decision, "block_invalid_agent_output");
+        assert_eq!(decision.next_state, "blocked");
+        assert!(decision.reason.contains("plan_issue succeeded without"));
+    }
+}
+
+#[test]
 fn runtime_completion_reducer_retries_issue_plan_failure_when_policy_allows() {
     let instance = issue_instance("planning").with_data(json!({
         "runtime_retry_policy": {
