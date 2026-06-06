@@ -408,69 +408,17 @@ print(quote(sys.argv[1], safe=""))
 PY
 }
 
-classify_snapshot() {
-  python3 - "$1" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    pr = json.load(fh)
-
-threads = (((pr.get("reviewThreads") or {}).get("nodes")) or [])
-unresolved = len([
-    t for t in threads
-    if not t.get("isResolved", False) and not t.get("isOutdated", False)
-])
-checks = (pr.get("statusCheckRollup") or {}).get("state") or "UNKNOWN"
-merge = pr.get("mergeStateStatus") or "UNKNOWN"
-if unresolved > 0:
-    print("review_feedback_repair")
-elif checks != "SUCCESS":
-    print("ci_repair")
-elif merge == "CLEAN" and checks == "SUCCESS":
-    print("ready_noop")
-else:
-    print("mergeability_repair")
-PY
-}
-
-snapshot_scenario() {
-  local fallback="$1"
-  python3 - "$QUALITY_SNAPSHOT_JSON" "$fallback" <<'PY'
-import json
-import sys
-
-snapshot_path, fallback = sys.argv[1:]
-try:
-    with open(snapshot_path, "r", encoding="utf-8") as fh:
-        snapshot = json.load(fh)
-except (OSError, json.JSONDecodeError):
-    snapshot = {}
-
-print(snapshot.get("scenario") or fallback)
-PY
-}
-
 write_collect_report() {
   local baseline="$1"
+  local quality="$2"
   local report="$OUTPUT_DIR/summary.md"
-  local task_class
-  task_class="$(snapshot_scenario "$(classify_snapshot "$baseline")")"
-  {
-    echo "# PR Repair Evaluation"
-    echo
-    echo "- Run ID: \`$RUN_ID\`"
-    echo "- Repo: \`$REPO\`"
-    echo "- PR: \`#$PR\`"
-    echo "- Mode: collect-only"
-    echo "- Scenario: \`$task_class\`"
-    echo
-    echo "## Baseline"
-    echo
-    echo "\`\`\`text"
-    snapshot_summary "$baseline"
-    echo "\`\`\`"
-  } > "$report"
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" write-collect-report \
+    --baseline "$baseline" \
+    --quality "$quality" \
+    --output "$report" \
+    --run-id "$RUN_ID" \
+    --repo "$REPO" \
+    --pr "$PR"
 }
 
 write_final_report() {
@@ -479,23 +427,20 @@ write_final_report() {
   local submission="$3"
   local task_detail="$4"
   local timed_out="$5"
+  local quality="$6"
   local report="$OUTPUT_DIR/summary.md"
-  local timed_out_flag=()
-  if [[ "$timed_out" == "1" ]]; then
-    timed_out_flag=(--timed-out)
-  fi
-  python3 "$SCRIPT_DIR/evaluate_pr_repair_render_report.py" \
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" write-final-report \
     --baseline "$baseline" \
     --final "$final" \
     --submission "$submission" \
     --task-detail "$task_detail" \
-    --quality-snapshot "$QUALITY_SNAPSHOT_JSON" \
+    --quality "$quality" \
     --output "$report" \
     --run-id "$RUN_ID" \
     --repo "$REPO" \
     --pr "$PR" \
     --server-url "$SERVER_URL" \
-    "${timed_out_flag[@]}" \
+    --timed-out "$timed_out" \
     --wait-secs "$WAIT_SECS" \
     --max-rounds "$MAX_ROUNDS" \
     --max-turns "$MAX_TURNS" \
@@ -503,20 +448,27 @@ write_final_report() {
     --timeout-secs "$TIMEOUT_SECS"
 }
 
+write_preflight_failure_artifacts() {
+  local error="$1"
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" write-preflight-failure \
+    --submission "$SUBMISSION_JSON" \
+    --task-detail "$TASK_DETAIL_JSON" \
+    --project-root "$PROJECT_ROOT" \
+    --server-url "$SERVER_URL" \
+    --error "$error"
+}
+
 write_live_preflight_failure_report() {
   local reason="$1"
   local exit_code="$2"
-  python3 "$SCRIPT_DIR/evaluate_pr_repair_preflight.py" write-failure \
-    --submission "$SUBMISSION_JSON" \
-    --task-detail "$TASK_DETAIL_JSON" \
-    --reason "$reason"
+  write_preflight_failure_artifacts "$reason"
   echo "$reason" >&2
   echo "Collecting final PR snapshot"
   FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   collect_snapshot "$FINAL_JSON"
   snapshot_summary "$FINAL_JSON"
   write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
-  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
   echo "Evaluation report: $OUTPUT_DIR/summary.md"
   echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
   exit "$exit_code"
@@ -571,7 +523,7 @@ snapshot_summary "$BASELINE_JSON"
 cp "$BASELINE_JSON" "$FINAL_JSON"
 FINAL_COLLECTED_AT="$BASELINE_COLLECTED_AT"
 write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
-write_collect_report "$BASELINE_JSON"
+write_collect_report "$BASELINE_JSON" "$QUALITY_SNAPSHOT_JSON"
 
 if [[ "$COLLECT_ONLY" -eq 1 ]]; then
   echo "Collect-only report: $OUTPUT_DIR/summary.md"
@@ -650,7 +602,7 @@ if ! python3 "$SCRIPT_DIR/evaluate_pr_repair_submit.py" --server-url "$SERVER_UR
   collect_snapshot "$FINAL_JSON"
   snapshot_summary "$FINAL_JSON"
   write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
-  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
   echo "Evaluation report: $OUTPUT_DIR/summary.md"
   echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
   exit 4
@@ -677,7 +629,7 @@ if [[ -z "$TASK_ID" ]]; then
   collect_snapshot "$FINAL_JSON"
   snapshot_summary "$FINAL_JSON"
   write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
-  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
   echo "Evaluation report: $OUTPUT_DIR/summary.md"
   echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
   exit 4
@@ -714,6 +666,6 @@ FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 collect_snapshot "$FINAL_JSON"
 snapshot_summary "$FINAL_JSON"
 write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
-write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$timed_out"
+write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$timed_out" "$QUALITY_SNAPSHOT_JSON"
 echo "Evaluation report: $OUTPUT_DIR/summary.md"
 echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
