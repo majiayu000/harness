@@ -107,17 +107,21 @@ impl TransitionAllowlist {
                 "scheduled",
                 [EnqueueActivity, Wait],
             )
+            .allow("awaiting_dependencies", "planning", [EnqueueActivity, Wait])
             .allow(
                 "awaiting_dependencies",
                 "implementing",
                 [EnqueueActivity, Wait],
             )
             .allow("discovered", "scheduled", [EnqueueActivity, Wait])
+            .allow("discovered", "planning", [EnqueueActivity, Wait])
             .allow("discovered", "implementing", [EnqueueActivity, Wait])
             .allow("scheduled", "scheduled", [EnqueueActivity, Wait])
             .allow("failed", "scheduled", [EnqueueActivity, Wait])
+            .allow("failed", "planning", [EnqueueActivity, Wait])
             .allow("failed", "implementing", [EnqueueActivity, Wait])
             .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
+            .allow("cancelled", "planning", [EnqueueActivity, Wait])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])
             .allow("scheduled", "planning", [EnqueueActivity, Wait])
             .allow(
@@ -131,6 +135,7 @@ impl TransitionAllowlist {
                 [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
             )
             .allow("planning", "implementing", [EnqueueActivity, MarkBlocked])
+            .allow("planning", "planning", [EnqueueActivity, Wait])
             .allow(
                 "implementing",
                 "implementing",

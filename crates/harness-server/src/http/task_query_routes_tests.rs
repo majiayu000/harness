@@ -256,6 +256,9 @@ fn runtime_workflow_scheduler_state_only_marks_executing_states_running() {
         implementing.authority_state,
         SchedulerAuthorityState::Running
     );
+
+    let planning = runtime_workflow_scheduler_state("planning", &TaskStatus::Planning);
+    assert_eq!(planning.authority_state, SchedulerAuthorityState::Running);
 }
 
 #[test]

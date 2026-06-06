@@ -687,6 +687,7 @@ pub(super) fn runtime_workflow_state_to_task_status(state: &str) -> TaskStatus {
     match state {
         "awaiting_dependencies" => TaskStatus::AwaitingDeps,
         "scheduled" | "discovered" => TaskStatus::Pending,
+        "planning" => TaskStatus::Planning,
         "implementing" | "replanning" | "addressing_feedback" => TaskStatus::Implementing,
         "pr_open" | "local_review_gate" | "awaiting_feedback" | "ready_to_merge" | "blocked" => {
             TaskStatus::Waiting
@@ -704,7 +705,7 @@ fn runtime_workflow_state_to_task_phase(state: &str) -> TaskPhase {
         "pr_open" | "local_review_gate" | "awaiting_feedback" | "ready_to_merge" => {
             TaskPhase::Review
         }
-        "replanning" | "blocked" => TaskPhase::Plan,
+        "planning" | "replanning" | "blocked" => TaskPhase::Plan,
         _ => TaskPhase::Implement,
     }
 }
@@ -713,7 +714,7 @@ fn runtime_workflow_scheduler_state(state: &str, status: &TaskStatus) -> TaskSch
     match state {
         "awaiting_dependencies" => TaskSchedulerState::awaiting_dependencies(),
         "scheduled" | "discovered" => TaskSchedulerState::queued(),
-        "implementing" | "replanning" | "addressing_feedback" => TaskSchedulerState {
+        "planning" | "implementing" | "replanning" | "addressing_feedback" => TaskSchedulerState {
             authority_state: SchedulerAuthorityState::Running,
             owner: None,
             run_generation: 0,

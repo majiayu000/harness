@@ -1,6 +1,7 @@
 use super::*;
 use harness_workflow::runtime::{
-    RuntimeKind, WorkflowSubject, PR_REPAIR_SNAPSHOT_ARTIFACT, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    RuntimeKind, WorkflowSubject, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT,
+    ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 
@@ -124,6 +125,51 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
             .as_str()
             .is_some_and(|value| value.contains("successful status"))
     );
+}
+
+#[test]
+fn activity_result_schema_describes_issue_planning_contract() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": ISSUE_PLAN_ACTIVITY
+        }),
+    );
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "planning",
+        WorkflowSubject::new("issue", "issue:123"),
+    )
+    .with_id("issue-123");
+
+    let schema = activity_result_schema(&job, Some(&workflow));
+
+    assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
+        "implementing"
+    );
+    assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][0],
+        ISSUE_PLAN_ARTIFACT
+    );
+    assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
+        ISSUE_PLAN_READY_SIGNAL
+    );
+    assert_eq!(
+        schema["activity_contract"]["success_requires"],
+        "issue_plan_artifact_or_ready_signal"
+    );
+    assert_eq!(
+        schema["agent_summary_contract"]["artifacts"]["issue_plan"]["required"],
+        true
+    );
+    assert!(schema["agent_summary_contract"]["must_not_include"]
+        .as_array()
+        .is_some_and(|items| items.contains(&json!("repository code changes"))));
 }
 
 #[test]
@@ -316,6 +362,14 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
         "FeedbackFound"
+    );
+    assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][1],
+        SERVER_PR_SNAPSHOT_ARTIFACT
+    );
+    assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][2],
+        PR_FEEDBACK_SNAPSHOT_ARTIFACT
     );
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["parent_propagation"],

@@ -757,11 +757,11 @@ async fn issue_submission_waits_for_dependencies_then_releases_runtime_command(
         .get_instance(&result.workflow_id)
         .await?
         .expect("workflow should remain persisted");
-    assert_eq!(workflow.state, "implementing");
+    assert_eq!(workflow.state, "planning");
     assert_eq!(workflow.data["dependencies_blocked"], false);
     let commands = store.commands_for(&result.workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
-    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     Ok(())
 }

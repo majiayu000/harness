@@ -1,5 +1,9 @@
 use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, WorkflowInstance};
 
+pub const ISSUE_PLAN_ACTIVITY: &str = "plan_issue";
+pub const ISSUE_PLAN_ARTIFACT: &str = "issue_plan";
+pub const ISSUE_PLAN_READY_SIGNAL: &str = "IssuePlanReady";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanIssueWorkflowAction {
     RunReplan,

@@ -300,13 +300,13 @@ pub(super) async fn assert_runtime_issue_submission(
         .get_instance(&workflow_id)
         .await?
         .expect("runtime workflow should be persisted");
-    assert_eq!(instance.state, "implementing");
+    assert_eq!(instance.state, "planning");
     assert_eq!(instance.data["task_id"], task_id.0);
     assert_eq!(instance.data["execution_path"], "workflow_runtime");
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
-    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
 
     let get_response = task_app(state.clone())
         .oneshot(
@@ -319,7 +319,7 @@ pub(super) async fn assert_runtime_issue_submission(
     assert_eq!(get_response.status(), StatusCode::OK);
     let runtime_task = response_json(get_response).await?;
     assert_eq!(runtime_task["task_id"], task_id.0);
-    assert_eq!(runtime_task["status"], "implementing");
+    assert_eq!(runtime_task["status"], "planning");
     assert_eq!(runtime_task["execution_path"], "workflow_runtime");
     assert_eq!(runtime_task["workflow_id"], workflow_id);
     Ok(workflow_id)

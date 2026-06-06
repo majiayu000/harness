@@ -35,6 +35,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+mod issue_planning;
 mod local_review;
 mod p1_followups;
 mod pr_repair_evidence;
@@ -91,8 +92,27 @@ fn project_issue_instance(project_id: &str, issue_number: u64, state: &str) -> W
     }))
 }
 
+fn runtime_completion_event(
+    instance: &WorkflowInstance,
+    activity: &str,
+    activity_result: ActivityResult,
+) -> WorkflowEvent {
+    WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": WorkflowCommand::enqueue_activity(activity, "activity-1"),
+        "runtime_job_id": "job-1",
+        "activity_result": activity_result,
+    }))
+}
+
 #[test]
-fn issue_submission_decision_starts_discovered_issue_implementation() {
+fn issue_submission_decision_starts_discovered_issue_planning() {
     let labels = vec!["bug".to_string(), "p1".to_string()];
     let instance = issue_instance("discovered");
     let output = build_issue_submission_decision(
@@ -109,20 +129,17 @@ fn issue_submission_decision_starts_discovered_issue_implementation() {
         },
     );
 
-    assert_eq!(
-        output.action,
-        IssueSubmissionWorkflowAction::RunImplementation
-    );
+    assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
     assert_eq!(output.decision.decision, "submit_issue");
-    assert_eq!(output.decision.next_state, "implementing");
+    assert_eq!(output.decision.next_state, "planning");
     assert_eq!(output.decision.commands.len(), 1);
     assert_eq!(
         output.decision.commands[0].activity_name(),
-        Some("implement_issue")
+        Some("plan_issue")
     );
     assert_eq!(
         output.decision.commands[0].dedupe_key,
-        "issue-submit:owner/repo:issue:123:task:task-1:implement"
+        "issue-submit:owner/repo:issue:123:task:task-1:plan"
     );
     assert_eq!(
         output.decision.commands[0].command["additional_prompt"],
@@ -165,6 +182,43 @@ fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
 }
 
 #[test]
+fn issue_submission_decision_can_reopen_terminal_issue_for_planning() {
+    let labels = Vec::new();
+    for state in ["failed", "cancelled"] {
+        let instance = issue_instance(state);
+        let output = build_issue_submission_decision(
+            &instance,
+            IssueSubmissionDecisionInput {
+                task_id: "task-terminal",
+                repo: Some("owner/repo"),
+                issue_number: 124,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        );
+
+        assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
+        assert_eq!(output.decision.next_state, "planning");
+        assert_eq!(
+            output.decision.commands[0].activity_name(),
+            Some("plan_issue")
+        );
+        let validation = DecisionValidator::github_issue_pr().validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen(),
+        );
+        assert!(
+            validation.is_ok(),
+            "terminal issue in {state} should reopen for planning: {validation:?}"
+        );
+    }
+}
+
+#[test]
 fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
     let labels = Vec::new();
     let depends_on = vec!["task-upstream".to_string()];
@@ -192,6 +246,41 @@ fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("blocked issue submission should validate without dispatching");
+}
+
+#[test]
+fn issue_submission_decision_releases_dependencies_to_planning() {
+    let labels = Vec::new();
+    let instance = issue_instance("awaiting_dependencies");
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-4",
+            repo: Some("owner/repo"),
+            issue_number: 126,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+        },
+    );
+
+    assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
+    assert_eq!(output.decision.next_state, "planning");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("plan_issue")
+    );
+    let validation = DecisionValidator::github_issue_pr().validate(
+        &instance,
+        &output.decision,
+        &ValidationContext::new("workflow-policy", Utc::now()),
+    );
+    assert!(
+        validation.is_ok(),
+        "dependency release should allow planning: {validation:?}"
+    );
 }
 
 #[test]
