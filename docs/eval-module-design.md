@@ -472,6 +472,15 @@ scripts/evaluate_pr_repair.sh
   8. write local JSON and Markdown reports
 ```
 
+Live mode must verify that `--project-root` resolves to an active project in the
+running Harness server before submitting `POST /tasks`. An unregistered local
+worktree can otherwise produce a workflow handle that no runtime worker will
+execute, which creates false-negative quality data. When that preflight fails,
+the collector should fail fast but still emit `submission.json`,
+`task_detail_final.json`, `quality_snapshot.json`, and `summary.md`. The Markdown
+report must render grade, score, grade cap, hard gates, and blockers from
+`quality_snapshot.json`; it must not maintain an independent grading heuristic.
+
 Later, add a CLI wrapper:
 
 ```text
