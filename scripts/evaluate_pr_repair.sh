@@ -128,7 +128,10 @@ require_cmd gh
 require_cmd curl
 require_cmd python3
 require_cmd date
+require_cmd cargo
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -674,15 +677,54 @@ FINAL_JSON="$OUTPUT_DIR/final_pr.json"
 SUBMISSION_JSON="$OUTPUT_DIR/submission.json"
 TASK_DETAIL_JSON="$OUTPUT_DIR/task_detail_final.json"
 TASK_BODY_JSON="$OUTPUT_DIR/task_body.json"
+PR_REPAIR_EVAL_INPUT_JSON="$OUTPUT_DIR/pr_repair_eval_input.json"
+QUALITY_SNAPSHOT_JSON="$OUTPUT_DIR/quality_snapshot.json"
 HEALTH_JSON="$OUTPUT_DIR/health.json"
 
+write_quality_snapshot() {
+  local baseline="$1"
+  local final="$2"
+  local submission="$3"
+  local task_detail="$4"
+  local baseline_collected_at="$5"
+  local final_collected_at="$6"
+  local args=(
+    run
+    --quiet
+    --manifest-path "$REPO_ROOT/Cargo.toml"
+    -p harness-eval
+    --bin score_pr_repair
+    --
+    --repo "$REPO"
+    --pr "$PR"
+    --baseline "$baseline"
+    --final "$final"
+    --baseline-collected-at "$baseline_collected_at"
+    --final-collected-at "$final_collected_at"
+    --input-output "$PR_REPAIR_EVAL_INPUT_JSON"
+    --snapshot-output "$QUALITY_SNAPSHOT_JSON"
+  )
+  if [[ -s "$submission" ]]; then
+    args+=(--submission "$submission")
+  fi
+  if [[ -s "$task_detail" ]]; then
+    args+=(--task-detail "$task_detail")
+  fi
+  cargo "${args[@]}"
+}
+
 echo "Collecting baseline for $REPO#$PR"
+BASELINE_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 collect_snapshot "$BASELINE_JSON"
 snapshot_summary "$BASELINE_JSON"
+cp "$BASELINE_JSON" "$FINAL_JSON"
+FINAL_COLLECTED_AT="$BASELINE_COLLECTED_AT"
+write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
 write_collect_report "$BASELINE_JSON"
 
 if [[ "$COLLECT_ONLY" -eq 1 ]]; then
   echo "Collect-only report: $OUTPUT_DIR/summary.md"
+  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
   exit 0
 fi
 
@@ -730,14 +772,17 @@ print(json.dumps(body, indent=2))
 PY
 
 echo "Submitting Harness PR repair task"
-if ! python3 "$(dirname "$0")/evaluate_pr_repair_submit.py" --server-url "$SERVER_URL" --body "$TASK_BODY_JSON" --output "$SUBMISSION_JSON" --mode prompt_task; then
+if ! python3 "$SCRIPT_DIR/evaluate_pr_repair_submit.py" --server-url "$SERVER_URL" --body "$TASK_BODY_JSON" --output "$SUBMISSION_JSON" --mode prompt_task; then
   printf '{"status":"failed"}\n' > "$TASK_DETAIL_JSON"
   echo "POST /tasks failed; see $SUBMISSION_JSON" >&2
   echo "Collecting final PR snapshot"
+  FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   collect_snapshot "$FINAL_JSON"
   snapshot_summary "$FINAL_JSON"
+  write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
   write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0"
   echo "Evaluation report: $OUTPUT_DIR/summary.md"
+  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
   exit 4
 fi
 
@@ -758,10 +803,13 @@ if [[ -z "$TASK_ID" ]]; then
   printf '{"status":"failed"}\n' > "$TASK_DETAIL_JSON"
   echo "POST /tasks did not return task_id; see $SUBMISSION_JSON" >&2
   echo "Collecting final PR snapshot"
+  FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   collect_snapshot "$FINAL_JSON"
   snapshot_summary "$FINAL_JSON"
+  write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
   write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0"
   echo "Evaluation report: $OUTPUT_DIR/summary.md"
+  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
   exit 4
 fi
 
@@ -792,7 +840,10 @@ case "$status" in
 esac
 
 echo "Collecting final PR snapshot"
+FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 collect_snapshot "$FINAL_JSON"
 snapshot_summary "$FINAL_JSON"
+write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
 write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$timed_out"
 echo "Evaluation report: $OUTPUT_DIR/summary.md"
+echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
