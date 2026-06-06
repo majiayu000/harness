@@ -232,13 +232,21 @@ Each run must also write machine-readable eval artifacts:
   `harness-eval` and `/api/evals/runs/{run_id}/score`.
 - `quality_snapshot.json`: deterministic `QualitySnapshot` with hard gates,
   score breakdown, grade caps, blocker summary, runtime evidence, and PR facts.
+- `eval_run.json`: the server eval run created for a successfully submitted
+  live Harness repair task.
+- `eval_artifact_pr_repair_input.json`: the server artifact upload response for
+  the final canonical input.
+- `eval_score.json`: the server-side scoring response that links the eval run
+  to the stored `quality_snapshot`.
 
-Both artifacts include `run_mode`. Operators may archive collect-only artifacts
-next to live-run artifacts, but only `live_run` snapshots are valid inputs for
-the capability benchmark. A snapshot is `live_run` only after a Harness task was
-successfully submitted for the target PR; live-mode preflight failures remain
-`collect_only`. The benchmark CLI rejects missing `run_mode` rather than
-defaulting old snapshots to live runs.
+The canonical input and local quality snapshot include `run_mode`. Operators
+may archive collect-only artifacts next to live-run artifacts, but only
+`live_run` snapshots are valid inputs for the capability benchmark. A snapshot
+is `live_run` only after a Harness task was successfully submitted for the
+target PR; live-mode preflight failures remain `collect_only`. The benchmark CLI
+rejects missing `run_mode` rather than defaulting old snapshots to live runs.
+Collect-only runs and live preflight failures are local-only; the script
+persists to `/api/evals` only after the live Harness task has a `task_id`.
 
 The Markdown summary is an operator convenience layer. It must not be the source
 of truth for eval scoring, dashboards, or merge readiness.
