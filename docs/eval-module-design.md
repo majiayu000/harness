@@ -298,6 +298,54 @@ After hard gates, the score is calculated from eight dimensions:
 The scorecard should expose each dimension separately. A single merged/not
 merged status is not enough.
 
+## Benchmark Suites
+
+A single `QualitySnapshot` proves one run. It is not enough to claim Harness PR
+repair quality is "10/10", because one easy or lucky PR can hide regressions in
+harder cases. Benchmark suites aggregate multiple snapshots into a capability
+summary.
+
+```rust
+pub struct PrRepairBenchmarkInput {
+    pub suite: String,
+    pub cases: Vec<PrRepairBenchmarkCase>,
+}
+
+pub struct PrRepairBenchmarkSummary {
+    pub suite: String,
+    pub case_count: u64,
+    pub confidence: BenchmarkConfidence,
+    pub status: BenchmarkStatus,
+    pub capability_score: u8, // 0..10
+    pub average_effective_score: u8,
+    pub min_effective_score: u8,
+    pub excellent_cases: u64,
+    pub acceptable_cases: u64,
+    pub blocked_cases: u64,
+    pub hard_gate_failures: Vec<HardGateFailureCount>,
+}
+```
+
+The benchmark uses an effective score, not the raw final score alone. If a run
+is grade-capped by missing reviewer judgment, stale evidence, failed checks, or
+unresolved review threads, the effective score is capped by the final grade.
+This prevents a high raw score with a failed hard gate from looking like a
+10/10 outcome.
+
+Confidence is sample-size based for the first release:
+
+| Case count | Confidence |
+|---:|---|
+| 0 | `none` |
+| 1-2 | `low` |
+| 3-4 | `medium` |
+| 5+ | `high` |
+
+`excellent` requires at least medium confidence, a 10/10 capability score, all
+cases graded `A`, and no blocked cases. A one-case perfect run can score 10, but
+it remains `needs_review` because the benchmark does not have enough evidence to
+claim system-level quality.
+
 ## Code Quality Subscore
 
 The `Fix correctness and scope` dimension is split into objective and subjective
@@ -435,6 +483,20 @@ harness eval cases --suite pr-repair-smoke
 The CLI is optional product surface. The durable contract is the server API and
 the persisted eval records; a CLI should only be a thin wrapper around those
 APIs after the storage path is stable.
+
+The first benchmark CLI is intentionally file-based:
+
+```text
+score_pr_repair_benchmark \
+  --suite pr-repair-smoke \
+  --case pr-1233=docs/pr-repair-evals/.../quality_snapshot.json \
+  --case pr-1254=docs/pr-repair-evals/.../quality_snapshot.json \
+  --output benchmark_summary.json
+```
+
+It reads existing `quality_snapshot.json` artifacts and writes a deterministic
+benchmark summary. It does not fetch GitHub, start Harness, or grade code with an
+LLM.
 
 ## Dashboard Design
 

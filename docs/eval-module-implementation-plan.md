@@ -127,6 +127,35 @@ Acceptance:
 - Operators can tell whether a PR repair succeeded, why it failed, and what it
   cost without reading raw logs.
 
+### Issue 6: Add PR repair benchmark summaries
+
+Scope:
+
+- Aggregate multiple `quality_snapshot.json` artifacts into a deterministic
+  benchmark summary.
+- Report a 0-10 capability score, confidence, status, grade distribution,
+  blocked-case count, and hard-gate failure counts.
+- Cap the effective per-case score by the final grade so hard-gate failures do
+  not look like 10/10 wins.
+- Add a file-based `score_pr_repair_benchmark` binary for local benchmark runs.
+
+Out of scope:
+
+- Selecting live GitHub PRs automatically.
+- Starting Harness tasks.
+- Running LLM or human code-quality reviewers.
+- Dashboard rendering.
+
+Acceptance:
+
+- `cargo test -p harness-eval benchmark` passes.
+- A single perfect case produces 10/10 with low confidence and `needs_review`.
+- Three clean `A` cases produce `excellent`.
+- A failed hard gate increments the matching failure count and blocks the
+  benchmark status.
+- The benchmark binary reads multiple quality snapshots and writes
+  `benchmark_summary.json`.
+
 ## First PR Scope
 
 The first PR should include only:
