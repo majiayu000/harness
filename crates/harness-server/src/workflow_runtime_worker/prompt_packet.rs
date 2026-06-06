@@ -557,8 +557,8 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 }
             },
             "signals": {
-                "FeedbackFound": "Use when actionable feedback, requested changes, or failed checks require a fix round.",
-                "NoFeedbackFound": "Use when no actionable feedback is present yet.",
+                "FeedbackFound": "Use when actionable feedback, requested changes, failed checks, or incomplete server-owned reviewThread evidence require a fix round.",
+                "NoFeedbackFound": "Use only when complete server-owned evidence shows no actionable feedback is present yet.",
                 "PrReadyToMerge": "Use only with server_pr_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads for the final head."
             }
         }),
