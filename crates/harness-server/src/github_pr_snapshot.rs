@@ -331,6 +331,9 @@ fn pr_feedback_signal_type(snapshot: &Value) -> &'static str {
     if snapshot_allows_ready(snapshot) {
         return "PrReadyToMerge";
     }
+    if snapshot_review_threads_incomplete(snapshot) {
+        return "FeedbackFound";
+    }
     if string_eq(snapshot, "review_decision", "CHANGES_REQUESTED") {
         return "ChangesRequested";
     }
@@ -363,6 +366,13 @@ fn snapshot_allows_ready(snapshot: &Value) -> bool {
             .unwrap_or(true)
 }
 
+fn snapshot_review_threads_incomplete(snapshot: &Value) -> bool {
+    snapshot
+        .get("review_threads_complete")
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
 fn snapshot_check_failed(snapshot: &Value) -> bool {
     ["FAILURE", "ERROR"].iter().any(|state| {
         string_eq(snapshot, "status_check_rollup_state", state)
@@ -393,7 +403,13 @@ fn pr_feedback_summary(signal_type: &str, snapshot: &Value) -> String {
             format!("Server-owned PR snapshot shows changes requested for PR #{pr_number}.")
         }
         "FeedbackFound" => {
-            format!("Server-owned PR snapshot found active review feedback on PR #{pr_number}.")
+            if snapshot_review_threads_incomplete(snapshot) {
+                format!(
+                    "Server-owned PR snapshot could not fully enumerate review threads on PR #{pr_number}."
+                )
+            } else {
+                format!("Server-owned PR snapshot found active review feedback on PR #{pr_number}.")
+            }
         }
         "ChecksFailed" => {
             format!("Server-owned PR snapshot found failing checks on PR #{pr_number}.")
@@ -533,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_review_thread_page_does_not_emit_ready() {
+    fn incomplete_review_thread_page_emits_blocking_feedback() {
         let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
         let mut pr = ready_pr();
         pr["reviewThreads"]["pageInfo"]["hasNextPage"] = json!(true);
@@ -542,7 +558,7 @@ mod tests {
         let signal = pr_feedback_signal_for_snapshot(&snapshot);
 
         assert_eq!(snapshot["review_threads_complete"], false);
-        assert_eq!(signal.signal_type, "NoFeedbackFound");
+        assert_eq!(signal.signal_type, "FeedbackFound");
     }
 
     #[test]
