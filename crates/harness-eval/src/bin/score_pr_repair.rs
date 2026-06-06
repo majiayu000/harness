@@ -1,4 +1,4 @@
-use harness_eval::{pr_repair_eval_input_from_values, score_pr_repair_eval};
+use harness_eval::{pr_repair_eval_input_from_values, score_pr_repair_eval, PrRepairEvalIngest};
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -31,16 +31,16 @@ fn run() -> Result<(), String> {
     let final_pr = read_json(&args.final_pr)?;
     let submission = args.submission.as_ref().map(read_json).transpose()?;
     let task_detail = args.task_detail.as_ref().map(read_json).transpose()?;
-    let input = pr_repair_eval_input_from_values(
-        &args.repo,
-        args.pr_number,
-        &args.baseline_collected_at,
-        &args.final_collected_at,
-        &baseline,
-        &final_pr,
-        submission.as_ref(),
-        task_detail.as_ref(),
-    );
+    let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+        repo: &args.repo,
+        pr_number: args.pr_number,
+        baseline_collected_at: &args.baseline_collected_at,
+        final_collected_at: &args.final_collected_at,
+        baseline: &baseline,
+        final_pr: &final_pr,
+        submission: submission.as_ref(),
+        task_detail: task_detail.as_ref(),
+    });
     let snapshot = score_pr_repair_eval(input.clone()).map_err(|err| err.to_string())?;
 
     if let Some(path) = args.input_output {

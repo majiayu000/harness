@@ -4,6 +4,17 @@ use crate::model::{
 };
 use serde_json::Value;
 
+pub struct PrRepairEvalIngest<'a> {
+    pub repo: &'a str,
+    pub pr_number: u64,
+    pub baseline_collected_at: &'a str,
+    pub final_collected_at: &'a str,
+    pub baseline: &'a Value,
+    pub final_pr: &'a Value,
+    pub submission: Option<&'a Value>,
+    pub task_detail: Option<&'a Value>,
+}
+
 pub fn github_pr_snapshot_from_value(
     repo: &str,
     collected_at: &str,
@@ -110,22 +121,15 @@ pub fn runtime_snapshot_from_values(
     })
 }
 
-pub fn pr_repair_eval_input_from_values(
-    repo: &str,
-    pr_number: u64,
-    baseline_collected_at: &str,
-    final_collected_at: &str,
-    baseline: &Value,
-    final_pr: &Value,
-    submission: Option<&Value>,
-    task_detail: Option<&Value>,
-) -> PrRepairEvalInput {
-    let baseline_pr = github_pr_snapshot_from_value(repo, baseline_collected_at, baseline);
-    let final_pr_snapshot = github_pr_snapshot_from_value(repo, final_collected_at, final_pr);
+pub fn pr_repair_eval_input_from_values(input: PrRepairEvalIngest<'_>) -> PrRepairEvalInput {
+    let baseline_pr =
+        github_pr_snapshot_from_value(input.repo, input.baseline_collected_at, input.baseline);
+    let final_pr_snapshot =
+        github_pr_snapshot_from_value(input.repo, input.final_collected_at, input.final_pr);
     let scenario = scenario_from_baseline(&baseline_pr);
-    let runtime = match (submission, task_detail) {
+    let runtime = match (input.submission, input.task_detail) {
         (Some(submission), Some(task_detail)) => {
-            runtime_snapshot_from_values(submission, task_detail, final_collected_at)
+            runtime_snapshot_from_values(submission, task_detail, input.final_collected_at)
         }
         _ => None,
     };
@@ -133,8 +137,8 @@ pub fn pr_repair_eval_input_from_values(
     PrRepairEvalInput {
         scenario,
         target: EvalTarget::PullRequest {
-            repo: repo.to_string(),
-            pr_number,
+            repo: input.repo.to_string(),
+            pr_number: input.pr_number,
             base_ref: Some(baseline_pr.base_ref.clone()),
             head_ref: Some(baseline_pr.head_ref.clone()),
         },
@@ -321,16 +325,16 @@ mod tests {
             "files": {"nodes": []}
         });
 
-        let input = pr_repair_eval_input_from_values(
-            "owner/repo",
-            7,
-            "2026-06-06T00:00:00Z",
-            "2026-06-06T00:01:00Z",
-            &pr,
-            &pr,
-            None,
-            None,
-        );
+        let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+            repo: "owner/repo",
+            pr_number: 7,
+            baseline_collected_at: "2026-06-06T00:00:00Z",
+            final_collected_at: "2026-06-06T00:01:00Z",
+            baseline: &pr,
+            final_pr: &pr,
+            submission: None,
+            task_detail: None,
+        });
 
         assert_eq!(input.scenario, EvalScenario::ReadyNoopControl);
         assert!(input.runtime.is_none());
