@@ -453,19 +453,32 @@ fn snapshot_has_repair_action(snapshot: &Value) -> bool {
 }
 
 fn snapshot_has_validation_evidence(result: &ActivityResult, snapshot: &Value) -> bool {
+    let validation_fields = &["validation", "validation_records", "validationRecords"];
+    let validation_command_fields = &["validation_commands", "validationCommands"];
+    if result
+        .validation
+        .iter()
+        .any(validation_record_reports_failure)
+        || validation_array_has_failure(snapshot, validation_fields)
+        || validation_array_has_failure(snapshot, validation_command_fields)
+    {
+        return false;
+    }
+
     result
         .validation
         .iter()
         .any(validation_record_allows_success)
-        || validation_array_has_success(
-            snapshot,
-            &["validation", "validation_records", "validationRecords"],
-        )
-        || validation_array_has_success(snapshot, &["validation_commands", "validationCommands"])
+        || validation_array_has_success(snapshot, validation_fields)
+        || validation_array_has_success(snapshot, validation_command_fields)
 }
 
 fn validation_record_allows_success(record: &ValidationRecord) -> bool {
     !record.command.trim().is_empty() && validation_status_allows_success(&record.status)
+}
+
+fn validation_record_reports_failure(record: &ValidationRecord) -> bool {
+    !record.command.trim().is_empty() && !validation_status_allows_success(&record.status)
 }
 
 fn validation_array_has_success(value: &Value, fields: &[&str]) -> bool {
@@ -473,6 +486,14 @@ fn validation_array_has_success(value: &Value, fields: &[&str]) -> bool {
         field_value(value, field)
             .and_then(Value::as_array)
             .is_some_and(|items| items.iter().any(validation_value_allows_success))
+    })
+}
+
+fn validation_array_has_failure(value: &Value, fields: &[&str]) -> bool {
+    fields.iter().any(|field| {
+        field_value(value, field)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(validation_value_reports_failure))
     })
 }
 
@@ -486,6 +507,18 @@ fn validation_value_allows_success(value: &Value) -> bool {
             Some(true)
         );
     has_command && has_success_status
+}
+
+fn validation_value_reports_failure(value: &Value) -> bool {
+    let has_command = non_empty_string(value, &["command", "cmd", "name"])
+        || non_empty_array(value, &["commands"]);
+    let has_failure_status = string_field(value, &["status", "outcome", "result"])
+        .is_some_and(|status| !validation_status_allows_success(status))
+        || matches!(
+            field_bool(value, &["passed", "success", "succeeded"]),
+            Some(false)
+        );
+    has_command && has_failure_status
 }
 
 fn validation_status_allows_success(status: &str) -> bool {
