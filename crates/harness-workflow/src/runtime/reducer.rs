@@ -98,15 +98,15 @@ fn reduce_success(
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
     let structured_decision = workflow_decision_from_activity_result(event, result);
-    let has_closed_issue_evidence = closed_issue_evidence_from_activity_result(result).is_some();
-    if !has_closed_issue_evidence {
-        if let Some(reason) =
-            pr_feedback_success_contract_error(instance, result, structured_decision.as_ref())
-        {
-            return Some(invalid_agent_output_blocked_decision(
-                instance, event, result, &reason,
-            ));
-        }
+    if let Some(decision) = github_issue_closed_decision(instance, event, result) {
+        return Some(decision);
+    }
+    if let Some(reason) =
+        pr_feedback_success_contract_error(instance, result, structured_decision.as_ref())
+    {
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, &reason,
+        ));
     }
     let pr_feedback_blocker_overrides_structured_ready =
         pr_feedback_blocking_signal_overrides_structured_ready(
@@ -157,10 +157,6 @@ fn reduce_success(
     }
 
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
-        return Some(decision);
-    }
-
-    if let Some(decision) = github_issue_closed_decision(instance, event, result) {
         return Some(decision);
     }
 

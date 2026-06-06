@@ -156,6 +156,43 @@ fn structured_ready_decision_with_blocking_signal_uses_blocking_feedback() {
 }
 
 #[test]
+fn closed_issue_evidence_wins_over_structured_ready_decision() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "awaiting_feedback",
+        "mark_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted both terminal closed evidence and a ready decision.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 77,
+            "issue_url": "https://github.com/owner/repo/issues/77",
+            "state": "closed"
+        }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue evidence should finish workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+}
+
+#[test]
 fn address_pr_feedback_success_without_repair_evidence_blocks() {
     let instance = pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(
