@@ -504,6 +504,7 @@ RUNTIME_TREE_FINAL_JSON="$OUTPUT_DIR/runtime_tree_final.json"
 RUNTIME_TREE_FINAL_ERROR="$OUTPUT_DIR/runtime_tree_final_error.txt"
 EVAL_TARGET_ID="pr-repair-eval:$REPO#$PR"
 EVAL_EXTERNAL_ID="$EVAL_TARGET_ID:run:$RUN_ID"
+QUALITY_RUN_MODE="collect_only"
 
 write_quality_snapshot() {
   local baseline="$1"
@@ -528,6 +529,11 @@ write_quality_snapshot() {
     --input-output "$PR_REPAIR_EVAL_INPUT_JSON"
     --snapshot-output "$QUALITY_SNAPSHOT_JSON"
   )
+  if [[ "$COLLECT_ONLY" -eq 1 || "$QUALITY_RUN_MODE" == "collect_only" ]]; then
+    args+=(--run-mode collect_only)
+  else
+    args+=(--run-mode live_run)
+  fi
   if [[ -s "$submission" ]]; then
     args+=(--submission "$submission")
   fi
@@ -700,6 +706,7 @@ if [[ -z "$TASK_ID" ]]; then
   exit 4
 fi
 
+QUALITY_RUN_MODE="live_run"
 echo "Submitted task_id=$TASK_ID"
 WORKFLOW_ID="$(python3 - "$SUBMISSION_JSON" <<'PY'
 import json

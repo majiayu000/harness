@@ -304,6 +304,7 @@ fn eval_input(
     let final_head_oid = final_pr.head_oid.clone();
     PrRepairEvalInput {
         scenario: EvalScenario::PrRepair,
+        run_mode: harness_eval::EvalRunMode::LiveRun,
         target: EvalTarget::PullRequest {
             repo: "owner/repo".to_string(),
             pr_number: 42,

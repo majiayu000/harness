@@ -107,7 +107,6 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         ),
         reviewer_gate(&input),
     ];
-
     let gate_signals = GateSignals {
         target_matches,
         branch_safe,
@@ -133,6 +132,7 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
 
     Ok(QualitySnapshot {
         scenario: input.scenario,
+        run_mode: input.run_mode,
         target: input.target,
         baseline_pr: Some(input.baseline_pr),
         final_pr: Some(input.final_pr),
@@ -711,10 +711,10 @@ mod tests {
             .find(|gate| gate.name == name)
             .expect("gate should exist")
     }
-
     fn perfect_input() -> PrRepairEvalInput {
         PrRepairEvalInput {
             scenario: EvalScenario::PrRepair,
+            run_mode: crate::model::EvalRunMode::LiveRun,
             target: EvalTarget::PullRequest {
                 repo: "owner/repo".to_string(),
                 pr_number: 42,

@@ -255,6 +255,105 @@ async fn score_accepts_unwrapped_eval_input_body() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn score_rejects_unwrapped_eval_input_without_run_mode() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.data_dir = dir.path().to_path_buf();
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = evals_app(state);
+    let run_id = create_pr_repair_run(app.clone()).await?;
+    let mut input = pr_repair_input();
+    input
+        .as_object_mut()
+        .expect("PR repair input object")
+        .remove("run_mode");
+
+    let score = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/evals/runs/{run_id}/score"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))?,
+        )
+        .await?;
+    assert_eq!(score.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body = response_json(score).await?;
+    assert!(body["error"]
+        .as_str()
+        .expect("error message")
+        .contains("run_mode"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn score_rejects_eval_input_artifact_without_run_mode() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.data_dir = dir.path().to_path_buf();
+    let state = make_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = evals_app(state);
+    let run_id = create_pr_repair_run(app.clone()).await?;
+    let mut input = pr_repair_input();
+    input
+        .as_object_mut()
+        .expect("PR repair input object")
+        .remove("run_mode");
+
+    let artifact_body = serde_json::json!({
+        "artifact_type": "pr_repair_eval_input",
+        "label": "missing run mode",
+        "content_type": "application/json",
+        "body": input.to_string()
+    });
+    let artifact = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/evals/runs/{run_id}/artifacts"))
+                .header("content-type", "application/json")
+                .body(Body::from(artifact_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(artifact.status(), axum::http::StatusCode::CREATED);
+
+    let score = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/evals/runs/{run_id}/score"))
+                .header("content-type", "application/json")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(score.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body = response_json(score).await?;
+    let message = body["error"].as_str().expect("error message");
+    assert!(message.contains("failed to parse pr_repair_eval_input artifact"));
+    assert!(message.contains("run_mode"));
+    Ok(())
+}
+
 async fn create_pr_repair_run(app: Router) -> anyhow::Result<String> {
     let create = app
         .oneshot(
@@ -287,6 +386,7 @@ fn pr_repair_run_body() -> serde_json::Value {
 fn pr_repair_input() -> serde_json::Value {
     serde_json::json!({
         "scenario": "pr_repair",
+        "run_mode": "live_run",
         "target": {
             "kind": "pull_request",
             "repo": "owner/repo",

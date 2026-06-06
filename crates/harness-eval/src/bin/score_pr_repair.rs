@@ -1,12 +1,13 @@
 use harness_eval::{
-    pr_repair_eval_input_from_values, score_pr_repair_eval, PrRepairEvalIngest, ReviewerJudgment,
+    pr_repair_eval_input_from_values, score_pr_repair_eval, EvalRunMode, PrRepairEvalIngest,
+    ReviewerJudgment,
 };
 use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Args {
     repo: String,
     pr_number: u64,
@@ -16,6 +17,7 @@ struct Args {
     task_detail: Option<PathBuf>,
     baseline_collected_at: String,
     final_collected_at: String,
+    run_mode: Option<EvalRunMode>,
     reviewer_judgment: Option<PathBuf>,
     input_output: Option<PathBuf>,
     snapshot_output: PathBuf,
@@ -48,6 +50,9 @@ fn run() -> Result<(), String> {
         final_collected_at: &args.final_collected_at,
         baseline: &baseline,
         final_pr: &final_pr,
+        run_mode: args
+            .run_mode
+            .ok_or_else(|| "--run-mode is required".to_string())?,
         submission: submission.as_ref(),
         task_detail: task_detail.as_ref(),
         reviewer_judgment,
@@ -98,6 +103,9 @@ where
             "--final-collected-at" => {
                 parsed.final_collected_at = required_value(&mut args, "--final-collected-at")?;
             }
+            "--run-mode" => {
+                parsed.run_mode = Some(parse_run_mode(&required_value(&mut args, "--run-mode")?)?);
+            }
             "--reviewer-judgment" => {
                 parsed.reviewer_judgment = Some(PathBuf::from(required_value(
                     &mut args,
@@ -125,12 +133,21 @@ where
         || parsed.final_pr.as_os_str().is_empty()
         || parsed.baseline_collected_at.is_empty()
         || parsed.final_collected_at.is_empty()
+        || parsed.run_mode.is_none()
         || parsed.snapshot_output.as_os_str().is_empty()
     {
         return Err(usage());
     }
 
     Ok(parsed)
+}
+
+fn parse_run_mode(value: &str) -> Result<EvalRunMode, String> {
+    match value {
+        "live_run" => Ok(EvalRunMode::LiveRun),
+        "collect_only" => Ok(EvalRunMode::CollectOnly),
+        _ => Err("--run-mode must be live_run or collect_only".to_string()),
+    }
 }
 
 fn required_value<I>(args: &mut I, flag: &str) -> Result<String, String>
@@ -159,7 +176,7 @@ fn write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "Usage: score_pr_repair --repo OWNER/REPO --pr N --baseline baseline_pr.json --final final_pr.json --baseline-collected-at RFC3339 --final-collected-at RFC3339 --snapshot-output quality_snapshot.json [--submission submission.json --task-detail task_detail_final.json --reviewer-judgment reviewer_judgment.json --input-output pr_repair_eval_input.json]".to_string()
+    "Usage: score_pr_repair --repo OWNER/REPO --pr N --baseline baseline_pr.json --final final_pr.json --baseline-collected-at RFC3339 --final-collected-at RFC3339 --run-mode live_run|collect_only --snapshot-output quality_snapshot.json [--submission submission.json --task-detail task_detail_final.json --reviewer-judgment reviewer_judgment.json --input-output pr_repair_eval_input.json]".to_string()
 }
 
 #[cfg(test)]
@@ -182,6 +199,8 @@ mod tests {
                 "2026-06-06T00:00:00Z",
                 "--final-collected-at",
                 "2026-06-06T00:01:00Z",
+                "--run-mode",
+                "live_run",
                 "--snapshot-output",
                 "quality.json",
                 "--reviewer-judgment",
@@ -196,5 +215,33 @@ mod tests {
             args.reviewer_judgment,
             Some(PathBuf::from("reviewer_judgment.json"))
         );
+        assert_eq!(args.run_mode, Some(EvalRunMode::LiveRun));
+    }
+
+    #[test]
+    fn parse_args_requires_run_mode() {
+        let err = parse_args(
+            [
+                "--repo",
+                "owner/repo",
+                "--pr",
+                "7",
+                "--baseline",
+                "baseline.json",
+                "--final",
+                "final.json",
+                "--baseline-collected-at",
+                "2026-06-06T00:00:00Z",
+                "--final-collected-at",
+                "2026-06-06T00:01:00Z",
+                "--snapshot-output",
+                "quality.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect_err("args without --run-mode should fail");
+
+        assert!(err.contains("--run-mode live_run|collect_only"));
     }
 }
