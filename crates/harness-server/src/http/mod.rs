@@ -126,11 +126,69 @@ pub(crate) fn parse_pr_num_from_url(url: &str) -> Option<u64> {
 }
 
 pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Result<()> {
-    tracing::info!("harness: HTTP server listening on {addr}");
     // Record true server start time before accepting any connections.
     crate::handlers::dashboard::SERVER_START.get_or_init(std::time::Instant::now);
 
     let state = Arc::new(build_app_state(server.clone()).await?);
+    let app = http_router::build_router(state.clone());
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("harness: HTTP server listening on {addr}");
+    let ws_shutdown_tx = state.notifications.ws_shutdown_tx.clone();
+    let shutdown_cfg = state.core.server.config.server.shutdown.clone();
+
+    // Fan the first SIGINT/SIGTERM out to two consumers:
+    //   (a) the with_graceful_shutdown future, so Axum stops accepting new
+    //       connections the instant the signal lands (P1 fix);
+    //   (b) the force-watcher task, so the hard-deadline timer starts at
+    //       signal time, not at server startup (P0 fix).
+    // A watch channel lets a single signal handler notify both consumers
+    // without racing on which side runs first.
+    let (first_signal_tx, first_signal_rx_serve) = tokio::sync::watch::channel(false);
+    let first_signal_rx_force = first_signal_tx.subscribe();
+    tokio::spawn(async move {
+        wait_first_termination_signal().await;
+        if first_signal_tx.send(true).is_err() {
+            tracing::debug!("shutdown signal had no active HTTP receivers");
+        }
+    });
+
+    let serve_future = axum::serve(listener, app).with_graceful_shutdown(
+        axum_graceful_shutdown_signal(first_signal_rx_serve, shutdown_cfg.clone()),
+    );
+
+    let force_watcher_cfg = shutdown_cfg.clone();
+    let force_watcher_events = state.observability.events.clone();
+    let force_watcher_ws_tx = ws_shutdown_tx.clone();
+    let force_watcher = tokio::spawn(async move {
+        let Some(reason) = wait_for_first_signal_then_drain_or_force(
+            first_signal_rx_force,
+            force_watcher_cfg.clone(),
+            wait_second_termination_signal(),
+        )
+        .await
+        else {
+            return;
+        };
+        tracing::info!(
+            ?reason,
+            "shutdown: drain phase ended, force-closing long-lived connections"
+        );
+        force_watcher_ws_tx.send(()).ok();
+
+        // Phase 3: hard deadline. If the serve future has not resolved within
+        // the force-grace window, exit forcefully.
+        tokio::time::sleep(Duration::from_secs(force_watcher_cfg.force_grace_secs)).await;
+        tracing::error!(
+            force_grace_secs = force_watcher_cfg.force_grace_secs,
+            "shutdown: force grace exceeded — process::exit(1)"
+        );
+        force_watcher_events.shutdown().await;
+        std::process::exit(1);
+    });
+
+    let serve_handle = tokio::spawn(async move { serve_future.await });
+    tokio::task::yield_now().await;
 
     // Startup summary — one clean line instead of scattered logs.
     {
@@ -151,7 +209,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     // Run one reconciliation tick against GitHub before any recovery so that
     // recovery decisions are made on fresh GitHub truth.
-    {
+    if state.core.server.config.reconciliation.enabled {
         let max_calls = state
             .core
             .server
@@ -167,6 +225,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
             state.core.server.config.server.github_token.as_deref(),
         )
         .await;
+    } else {
+        tracing::debug!("startup reconciliation skipped because reconciliation.enabled=false");
     }
 
     // Re-dispatch tasks that were recovered to pending after server restart.
@@ -244,61 +304,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     )
     .start(state.clone());
 
-    let app = http_router::build_router(state.clone());
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let ws_shutdown_tx = state.notifications.ws_shutdown_tx.clone();
-    let shutdown_cfg = state.core.server.config.server.shutdown.clone();
-
-    // Fan the first SIGINT/SIGTERM out to two consumers:
-    //   (a) the with_graceful_shutdown future, so Axum stops accepting new
-    //       connections the instant the signal lands (P1 fix);
-    //   (b) the force-watcher task, so the hard-deadline timer starts at
-    //       signal time, not at server startup (P0 fix).
-    // A watch channel lets a single signal handler notify both consumers
-    // without racing on which side runs first.
-    let (first_signal_tx, first_signal_rx_serve) = tokio::sync::watch::channel(false);
-    let first_signal_rx_force = first_signal_tx.subscribe();
-    tokio::spawn(async move {
-        wait_first_termination_signal().await;
-        let _ = first_signal_tx.send(true);
-    });
-
-    let serve_future = axum::serve(listener, app).with_graceful_shutdown(
-        axum_graceful_shutdown_signal(first_signal_rx_serve, shutdown_cfg.clone()),
-    );
-
-    let force_watcher_cfg = shutdown_cfg.clone();
-    let force_watcher_events = state.observability.events.clone();
-    let force_watcher_ws_tx = ws_shutdown_tx.clone();
-    let force_watcher = tokio::spawn(async move {
-        let Some(reason) = wait_for_first_signal_then_drain_or_force(
-            first_signal_rx_force,
-            force_watcher_cfg.clone(),
-            wait_second_termination_signal(),
-        )
+    let serve_result = serve_handle
         .await
-        else {
-            return;
-        };
-        tracing::info!(
-            ?reason,
-            "shutdown: drain phase ended, force-closing long-lived connections"
-        );
-        force_watcher_ws_tx.send(()).ok();
-
-        // Phase 3: hard deadline. If the serve future has not resolved within
-        // the force-grace window, exit forcefully.
-        tokio::time::sleep(Duration::from_secs(force_watcher_cfg.force_grace_secs)).await;
-        tracing::error!(
-            force_grace_secs = force_watcher_cfg.force_grace_secs,
-            "shutdown: force grace exceeded — process::exit(1)"
-        );
-        force_watcher_events.shutdown().await;
-        std::process::exit(1);
-    });
-
-    let serve_result = serve_future.await;
+        .map_err(|error| anyhow::anyhow!("HTTP server task failed: {error}"))?;
     tracing::info!("server shutting down");
     ws_shutdown_tx.send(()).ok();
     state.observability.events.shutdown().await;
