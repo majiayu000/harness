@@ -93,9 +93,9 @@ pub fn runtime_snapshot_from_values(
         .or_else(|| optional_string_field(task_detail, "id"));
     let workflow_id = optional_string_field(submission, "workflow_id")
         .or_else(|| optional_string_at_pointer(task_detail, "/workflow/id"));
-    let terminal_state = optional_string_field(task_detail, "status")
-        .or_else(|| optional_string_at_pointer(task_detail, "/workflow/state"))
-        .or_else(|| optional_string_field(submission, "status"));
+    let terminal_state = terminal_string_field(task_detail, "status")
+        .or_else(|| terminal_string_at_pointer(task_detail, "/workflow/state"))
+        .or_else(|| terminal_string_field(submission, "status"));
     let workflow_state = optional_string_at_pointer(task_detail, "/workflow/state");
     let latest_activity = optional_string_field(task_detail, "latest_activity")
         .or_else(|| optional_string_at_pointer(task_detail, "/workflow/latest_activity"));
@@ -193,8 +193,9 @@ fn runtime_jobs_from_value(value: &Value) -> Vec<RuntimeJobSnapshot> {
                 .or_else(|| job.get("artifactCount"))
                 .and_then(json_u64)
                 .unwrap_or(0),
-            terminal_state: optional_string_field(job, "terminal_state")
-                .or_else(|| optional_string_field(job, "terminalState")),
+            terminal_state: terminal_string_field(job, "terminal_state")
+                .or_else(|| terminal_string_field(job, "terminalState"))
+                .or_else(|| terminal_string_field(job, "status")),
         })
         .collect()
 }
@@ -233,6 +234,32 @@ fn optional_string_at_pointer(value: &Value, pointer: &str) -> Option<String> {
 
 fn optional_string_field(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(json_string)
+}
+
+fn terminal_string_at_pointer(value: &Value, pointer: &str) -> Option<String> {
+    optional_string_at_pointer(value, pointer).filter(|state| is_terminal_state(state))
+}
+
+fn terminal_string_field(value: &Value, field: &str) -> Option<String> {
+    optional_string_field(value, field).filter(|state| is_terminal_state(state))
+}
+
+fn is_terminal_state(state: &str) -> bool {
+    matches!(
+        state.trim().to_ascii_lowercase().as_str(),
+        "done"
+            | "completed"
+            | "succeeded"
+            | "success"
+            | "passed"
+            | "failed"
+            | "cancelled"
+            | "canceled"
+            | "timed_out"
+            | "timeout"
+            | "errored"
+            | "error"
+    )
 }
 
 fn string_field(value: &Value, field: &str) -> String {
@@ -409,5 +436,47 @@ mod tests {
         });
 
         assert_eq!(input.scenario, EvalScenario::PrRepair);
+    }
+
+    #[test]
+    fn running_runtime_status_is_not_terminal_evidence() {
+        let submission = json!({
+            "task_id": "task-1",
+            "workflow_id": "workflow-1",
+            "status": "implementing"
+        });
+        let task_detail = json!({
+            "id": "task-1",
+            "status": "running",
+            "workflow": {
+                "id": "workflow-1",
+                "state": "addressing_feedback",
+                "latest_activity": "implementing"
+            },
+            "runtime_jobs": [
+                {
+                    "id": "job-1",
+                    "state": "running",
+                    "status": "running",
+                    "artifact_count": 0
+                }
+            ]
+        });
+
+        let Some(snapshot) =
+            runtime_snapshot_from_values(&submission, &task_detail, "2026-06-06T00:01:00Z")
+        else {
+            panic!("runtime identity should still produce a runtime snapshot");
+        };
+
+        assert_eq!(snapshot.task_id.as_deref(), Some("task-1"));
+        assert_eq!(snapshot.workflow_id.as_deref(), Some("workflow-1"));
+        assert_eq!(
+            snapshot.workflow_state.as_deref(),
+            Some("addressing_feedback")
+        );
+        assert_eq!(snapshot.terminal_state, None);
+        assert_eq!(snapshot.runtime_jobs.len(), 1);
+        assert_eq!(snapshot.runtime_jobs[0].terminal_state, None);
     }
 }
