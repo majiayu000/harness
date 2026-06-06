@@ -198,11 +198,18 @@ impl TransitionAllowlist {
             )
             .allow(
                 "awaiting_feedback",
+                "quality_gate_pending",
+                [StartChildWorkflow, Wait],
+            )
+            .allow(
+                "quality_gate_pending",
                 "ready_to_merge",
-                [EnqueueActivity, StartChildWorkflow, Wait],
+                std::iter::empty::<WorkflowCommandType>(),
             )
             .allow("awaiting_feedback", "done", [MarkDone])
             .allow("addressing_feedback", "done", [MarkDone])
+            .allow("quality_gate_pending", "done", [MarkDone])
+            .allow("quality_gate_pending", "quality_gate_pending", [Wait])
             .allow("ready_to_merge", "ready_to_merge", [Wait])
             .allow("ready_to_merge", "done", [MarkDone])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])

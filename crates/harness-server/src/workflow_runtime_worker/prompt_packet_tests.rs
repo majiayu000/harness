@@ -373,7 +373,7 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     );
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["parent_propagation"],
-        "The same activity result is propagated to the parent github_issue_pr workflow."
+        "The same activity result is propagated to the parent github_issue_pr workflow; the parent starts quality_gate before ready_to_merge."
     );
     assert!(
         schema["transition_contract"]["on_succeeded"]["success_requires"]
@@ -395,7 +395,7 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     );
     assert_eq!(
         schema["agent_summary_contract"]["artifacts"]["server_pr_snapshot"]["required_when"],
-        "Using PrReadyToMerge or mark_ready_to_merge."
+        "Using PrReadyToMerge."
     );
     assert_eq!(schema["agent_summary_contract"]["server_owned"], true);
     assert_eq!(
