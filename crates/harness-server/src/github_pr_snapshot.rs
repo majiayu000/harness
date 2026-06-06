@@ -345,6 +345,9 @@ fn pr_feedback_signal_type(snapshot: &Value) -> &'static str {
     {
         return "FeedbackFound";
     }
+    if snapshot_merge_state_requires_repair(snapshot) {
+        return "FeedbackFound";
+    }
     if snapshot_check_failed(snapshot) {
         return "ChecksFailed";
     }
@@ -384,6 +387,12 @@ fn snapshot_check_failed(snapshot: &Value) -> bool {
     })
 }
 
+fn snapshot_merge_state_requires_repair(snapshot: &Value) -> bool {
+    ["DIRTY", "BEHIND"]
+        .iter()
+        .any(|state| string_eq(snapshot, "merge_state_status", state))
+}
+
 fn string_eq(value: &Value, field: &str, expected: &str) -> bool {
     value
         .get(field)
@@ -406,6 +415,10 @@ fn pr_feedback_summary(signal_type: &str, snapshot: &Value) -> String {
             if snapshot_review_threads_incomplete(snapshot) {
                 format!(
                     "Server-owned PR snapshot could not fully enumerate review threads on PR #{pr_number}."
+                )
+            } else if snapshot_merge_state_requires_repair(snapshot) {
+                format!(
+                    "Server-owned PR snapshot found mergeability repair is needed on PR #{pr_number}."
                 )
             } else {
                 format!("Server-owned PR snapshot found active review feedback on PR #{pr_number}.")
@@ -558,6 +571,19 @@ mod tests {
         let signal = pr_feedback_signal_for_snapshot(&snapshot);
 
         assert_eq!(snapshot["review_threads_complete"], false);
+        assert_eq!(signal.signal_type, "FeedbackFound");
+    }
+
+    #[test]
+    fn dirty_merge_state_emits_blocking_feedback() {
+        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
+        let mut pr = ready_pr();
+        pr["mergeStateStatus"] = json!("DIRTY");
+        let snapshot = normalize_github_pr_snapshot(&target, &pr).unwrap();
+
+        let signal = pr_feedback_signal_for_snapshot(&snapshot);
+
+        assert_eq!(snapshot["merge_state_status"], "DIRTY");
         assert_eq!(signal.signal_type, "FeedbackFound");
     }
 
