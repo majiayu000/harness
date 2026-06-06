@@ -2,6 +2,29 @@ use super::super::{
     build_local_review_completed_decision, LocalReviewCompletedInput, LocalReviewOutcome,
 };
 use super::*;
+use crate::runtime::PR_REPAIR_SNAPSHOT_ARTIFACT;
+
+fn address_pr_feedback_result(summary: &str) -> ActivityResult {
+    ActivityResult::succeeded("address_pr_feedback", summary)
+        .with_artifact(ActivityArtifact::new(
+            PR_REPAIR_SNAPSHOT_ARTIFACT,
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+                "head_sha": "repair-head-sha",
+                "observed_at": "2026-06-06T00:00:00Z",
+                "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+                "action_taken": "pushed_commit",
+                "validation_commands": [
+                    {"command": "cargo test -p harness-workflow local_review", "status": "passed"}
+                ]
+            }),
+        ))
+        .with_validation(ValidationRecord::new(
+            "cargo test -p harness-workflow local_review",
+            "passed",
+        ))
+}
 
 #[test]
 fn local_review_changes_requested_command_carries_review_findings() {
@@ -54,7 +77,7 @@ fn local_review_changes_requested_command_carries_review_findings() {
 fn local_review_after_rework_uses_completion_command_dedupe_key() {
     let instance = issue_instance("addressing_feedback");
     let command = WorkflowCommand::enqueue_activity("address_pr_feedback", "feedback-1");
-    let result = ActivityResult::succeeded("address_pr_feedback", "Feedback addressed.");
+    let result = address_pr_feedback_result("Feedback addressed.");
     let first_event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -77,10 +100,7 @@ fn local_review_after_rework_uses_completion_command_dedupe_key() {
         "command_id": "command-2",
         "command": WorkflowCommand::enqueue_activity("address_pr_feedback", "feedback-2"),
         "runtime_job_id": "job-2",
-        "activity_result": ActivityResult::succeeded(
-            "address_pr_feedback",
-            "Feedback addressed again."
-        ),
+        "activity_result": address_pr_feedback_result("Feedback addressed again."),
     }));
 
     let first_decision = reduce_runtime_job_completed(&instance, &first_event)
@@ -246,10 +266,7 @@ fn local_review_after_rework_replay_keeps_command_dedupe_key() {
         "command_id": "command-1",
         "command": WorkflowCommand::enqueue_activity("address_pr_feedback", "feedback-1"),
         "runtime_job_id": "job-1",
-        "activity_result": ActivityResult::succeeded(
-            "address_pr_feedback",
-            "Feedback addressed."
-        ),
+        "activity_result": address_pr_feedback_result("Feedback addressed."),
     });
     let first_event = WorkflowEvent::new(
         &instance.id,

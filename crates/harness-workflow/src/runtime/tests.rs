@@ -37,6 +37,7 @@ use std::sync::{
 
 mod local_review;
 mod p1_followups;
+mod pr_repair_evidence;
 mod replay_determinism;
 mod retry;
 

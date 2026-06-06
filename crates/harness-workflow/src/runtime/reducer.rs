@@ -13,7 +13,7 @@ use self::github_issue_completion::{
 };
 use self::pr_feedback_completion::{
     local_review_decision_from_activity_result, pr_feedback_child_decision_from_activity_result,
-    pr_feedback_sweep_decision_from_activity_result,
+    pr_feedback_success_contract_error, pr_feedback_sweep_decision_from_activity_result,
 };
 use self::quality_gate_completion::{
     quality_gate_activity_matches, quality_gate_success_contract_error,
@@ -96,6 +96,13 @@ fn reduce_success(
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
     let structured_decision = workflow_decision_from_activity_result(event, result);
+    if let Some(reason) =
+        pr_feedback_success_contract_error(instance, result, structured_decision.as_ref())
+    {
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, &reason,
+        ));
+    }
     if let Some(decision) = structured_decision
         .as_ref()
         .filter(|decision| structured_decision_validates(instance, event, result, decision))

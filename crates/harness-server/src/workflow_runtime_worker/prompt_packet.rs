@@ -3,8 +3,9 @@ use harness_workflow::runtime::{
     ActivityArtifact, DecisionValidator, RuntimeJob, RuntimeProfile, WorkflowInstance,
     ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT,
     PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
+    PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -315,7 +316,8 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         ("github_issue_pr", "address_pr_feedback") => json!({
             "on_succeeded": {
                 "reducer_next_state": "local_review_gate",
-                "required_summary": "Describe addressed review feedback and validation evidence. Harness will run local review before remote feedback."
+                "success_requires": "A succeeded address_pr_feedback result MUST include pr_repair_snapshot with final head, observed_at, action proof, and validation evidence.",
+                "required_summary": "Describe addressed review feedback, pushed/no-code action, and validation evidence. Harness will run local review before remote feedback."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -342,7 +344,9 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "derived_from_structured_decision_or_signals",
                 "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
-                "required_summary": "Describe inspected PR feedback, review state, checks, and mergeability."
+                "accepted_artifacts": ["workflow_decision", PR_REPAIR_SNAPSHOT_ARTIFACT],
+                "success_requires": "PrReadyToMerge or mark_ready_to_merge requires pr_repair_snapshot with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads.",
+                "required_summary": "Describe inspected PR feedback, review state, checks, mergeability, draft state, unresolved review threads, and next action."
             },
             "structured_decision": {
                 "preferred": true,
@@ -357,6 +361,8 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "feedback_found_or_no_actionable_feedback_or_ready_to_merge_from_signals",
                 "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
+                "accepted_artifacts": ["workflow_decision", PR_REPAIR_SNAPSHOT_ARTIFACT],
+                "success_requires": "PrReadyToMerge requires pr_repair_snapshot with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads.",
                 "parent_propagation": "The same activity result is propagated to the parent github_issue_pr workflow."
             },
             "structured_decision": {
@@ -499,8 +505,14 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_not_include": ["direct workflow state changes"],
         }),
         ("github_issue_pr", "address_pr_feedback") => json!({
-            "must_include": ["review feedback addressed", "changed files", "validation commands", "fresh PR state checked before final response"],
-            "must_not_include": ["claiming review approval without a fresh review signal"],
+            "must_include": ["review feedback addressed or explicit no-code reason", "changed files or explicit no-code-change reason", "validation commands", "fresh PR state checked before final response", "final PR head"],
+            "must_not_include": ["claiming review approval without a fresh review signal", "marking review threads resolved without current GitHub evidence"],
+            "artifacts": {
+                "pr_repair_snapshot": {
+                    "required": true,
+                    "fields": ["pr_number", "pr_url", "head_sha_or_head_oid", "observed_at", "changed_files", "action_taken_or_no_code_change_reason", "validation_commands"]
+                }
+            }
         }),
         ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({
             "must_include": ["PR diff reviewed", "blocking findings or explicit approval", "validation evidence checked", "next workflow action"],
@@ -520,12 +532,16 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 "workflow_decision": {
                     "preferred": true,
                     "allowed_decisions": ["address_pr_feedback", "wait_for_pr_feedback", "mark_ready_to_merge"]
+                },
+                "pr_repair_snapshot": {
+                    "required_when": "Using PrReadyToMerge or mark_ready_to_merge.",
+                    "fields": ["pr_number", "pr_url", "head_sha_or_head_oid", "observed_at", "active_unresolved_review_threads_count", "status_check_rollup_state", "merge_state_status", "review_decision", "is_draft"]
                 }
             },
             "signals": {
                 "FeedbackFound": "Use when actionable feedback, requested changes, or failed checks require a fix round.",
                 "NoFeedbackFound": "Use when no actionable feedback is present yet.",
-                "PrReadyToMerge": "Use only when review, checks, and mergeability are all ready."
+                "PrReadyToMerge": "Use only with pr_repair_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads for the final head."
             }
         }),
         ("repo_backlog", "poll_repo_backlog") => json!({

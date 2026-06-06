@@ -8,8 +8,11 @@ use crate::runtime::pr_feedback::{
     build_local_review_completed_decision, build_pr_feedback_decision, LocalReviewCompletedInput,
     LocalReviewOutcome, PrFeedbackDecisionInput, PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY,
     LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT,
 };
+use serde_json::Value;
+
+const PR_FEEDBACK_SNAPSHOT_ARTIFACT: &str = "pr_feedback_snapshot";
 
 pub(super) fn pr_feedback_sweep_decision_from_activity_result(
     instance: &WorkflowInstance,
@@ -53,6 +56,38 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
         .decision
         .with_evidence(runtime_completion_evidence(event, result)),
     )
+}
+
+pub(super) fn pr_feedback_success_contract_error(
+    instance: &WorkflowInstance,
+    result: &ActivityResult,
+    structured_decision: Option<&WorkflowDecision>,
+) -> Option<String> {
+    if !github_issue_pr_feedback_activity_matches(instance, result) {
+        return None;
+    }
+
+    if result.activity == "address_pr_feedback" && instance.state == "addressing_feedback" {
+        if repair_snapshot_proves_action(result) {
+            return None;
+        }
+        return Some(
+            "PR repair evidence is missing: address_pr_feedback succeeded without a pr_repair_snapshot proving pushed changes, review-thread action, or an explicit no-code-change reason plus validation".to_string(),
+        );
+    }
+
+    if readiness_claimed(result, structured_decision)
+        && pr_feedback_outcome_from_signals(result) != Some(PrFeedbackOutcome::BlockingFeedback)
+    {
+        if ready_snapshot_proves_pr_ready(result) {
+            return None;
+        }
+        return Some(
+            "PR readiness evidence is missing: ready-to-merge output requires a current pr_repair_snapshot with head, checks, mergeability, and zero active unresolved review threads".to_string(),
+        );
+    }
+
+    None
 }
 
 pub(super) fn local_review_decision_from_activity_result(
@@ -171,4 +206,247 @@ fn local_review_outcome_from_signals(result: &ActivityResult) -> Option<LocalRev
         return Some(LocalReviewOutcome::Passed);
     }
     None
+}
+
+fn github_issue_pr_feedback_activity_matches(
+    instance: &WorkflowInstance,
+    result: &ActivityResult,
+) -> bool {
+    matches!(
+        (
+            instance.definition_id.as_str(),
+            instance.state.as_str(),
+            result.activity.as_str()
+        ),
+        (
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "addressing_feedback",
+            "address_pr_feedback"
+        ) | (
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "awaiting_feedback",
+            "sweep_pr_feedback"
+        ) | (
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "awaiting_feedback",
+            PR_FEEDBACK_INSPECT_ACTIVITY
+        ) | (
+            PR_FEEDBACK_DEFINITION_ID,
+            "inspecting",
+            PR_FEEDBACK_INSPECT_ACTIVITY
+        )
+    )
+}
+
+fn repair_snapshot_proves_action(result: &ActivityResult) -> bool {
+    result.artifacts.iter().any(|artifact| {
+        artifact.artifact_type == PR_REPAIR_SNAPSHOT_ARTIFACT
+            && snapshot_has_pr_identity(&artifact.artifact)
+            && snapshot_has_head_identity(&artifact.artifact)
+            && snapshot_has_observation_time(&artifact.artifact)
+            && snapshot_has_repair_action(&artifact.artifact)
+            && snapshot_has_validation_evidence(result, &artifact.artifact)
+    })
+}
+
+fn readiness_claimed(
+    result: &ActivityResult,
+    structured_decision: Option<&WorkflowDecision>,
+) -> bool {
+    has_signal(result, "PrReadyToMerge")
+        || structured_decision.is_some_and(|decision| {
+            decision.next_state == "ready_to_merge" || decision.decision == "mark_ready_to_merge"
+        })
+}
+
+fn ready_snapshot_proves_pr_ready(result: &ActivityResult) -> bool {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            matches!(
+                artifact.artifact_type.as_str(),
+                PR_REPAIR_SNAPSHOT_ARTIFACT | PR_FEEDBACK_SNAPSHOT_ARTIFACT
+            )
+        })
+        .any(|artifact| {
+            snapshot_has_pr_identity(&artifact.artifact)
+                && snapshot_has_head_identity(&artifact.artifact)
+                && snapshot_has_observation_time(&artifact.artifact)
+                && snapshot_check_state_allows_ready(&artifact.artifact)
+                && snapshot_merge_state_allows_ready(&artifact.artifact)
+                && snapshot_review_state_allows_ready(&artifact.artifact)
+                && snapshot_draft_state_allows_ready(&artifact.artifact)
+                && snapshot_review_threads_allow_ready(&artifact.artifact)
+        })
+}
+
+fn snapshot_has_pr_identity(snapshot: &Value) -> bool {
+    field_u64(snapshot, &["pr_number", "prNumber"]).is_some()
+        && non_empty_string(snapshot, &["pr_url", "prUrl", "url"])
+}
+
+fn snapshot_has_head_identity(snapshot: &Value) -> bool {
+    non_empty_string(snapshot, &["head_oid", "head_sha", "headOid", "headSha"])
+}
+
+fn snapshot_has_observation_time(snapshot: &Value) -> bool {
+    non_empty_string(snapshot, &["observed_at", "observedAt"])
+}
+
+fn snapshot_check_state_allows_ready(snapshot: &Value) -> bool {
+    string_field_matches(
+        snapshot,
+        &[
+            "status_check_rollup_state",
+            "statusCheckRollupState",
+            "statusCheckRollup.state",
+            "check_state",
+            "checkState",
+        ],
+        &["SUCCESS", "PASSING", "PASSED"],
+    )
+}
+
+fn snapshot_merge_state_allows_ready(snapshot: &Value) -> bool {
+    string_field_matches(
+        snapshot,
+        &[
+            "merge_state_status",
+            "mergeStateStatus",
+            "merge_state",
+            "mergeState",
+        ],
+        &["CLEAN"],
+    )
+}
+
+fn snapshot_review_state_allows_ready(snapshot: &Value) -> bool {
+    string_field_matches(
+        snapshot,
+        &["review_decision", "reviewDecision"],
+        &["APPROVED"],
+    )
+}
+
+fn snapshot_draft_state_allows_ready(snapshot: &Value) -> bool {
+    matches!(
+        field_bool(snapshot, &["is_draft", "isDraft", "draft"]),
+        Some(false)
+    )
+}
+
+fn snapshot_review_threads_allow_ready(snapshot: &Value) -> bool {
+    if let Some(count) = field_u64(
+        snapshot,
+        &[
+            "active_unresolved_review_threads_count",
+            "activeUnresolvedReviewThreadsCount",
+            "active_unresolved_review_thread_count",
+            "unresolved_review_threads_count",
+            "unresolvedReviewThreadsCount",
+            "unresolved_threads",
+            "unresolvedThreads",
+        ],
+    ) {
+        return count == 0;
+    }
+
+    empty_array(
+        snapshot,
+        &[
+            "active_unresolved_review_threads",
+            "activeUnresolvedReviewThreads",
+            "unresolved_review_threads",
+            "unresolvedReviewThreads",
+        ],
+    )
+}
+
+fn snapshot_has_repair_action(snapshot: &Value) -> bool {
+    non_empty_string(
+        snapshot,
+        &[
+            "pushed_head_sha",
+            "pushedHeadSha",
+            "pushed_head_oid",
+            "pushedHeadOid",
+            "action_taken",
+            "actionTaken",
+            "no_code_change_reason",
+            "noCodeChangeReason",
+        ],
+    ) || non_empty_array(
+        snapshot,
+        &[
+            "changed_files",
+            "changedFiles",
+            "review_thread_actions",
+            "reviewThreadActions",
+            "resolved_review_thread_ids",
+            "resolvedReviewThreadIds",
+        ],
+    )
+}
+
+fn snapshot_has_validation_evidence(result: &ActivityResult, snapshot: &Value) -> bool {
+    result
+        .validation
+        .iter()
+        .any(|record| !record.command.trim().is_empty())
+        || non_empty_array(
+            snapshot,
+            &["validation", "validation_records", "validationRecords"],
+        )
+        || non_empty_array(snapshot, &["validation_commands", "validationCommands"])
+}
+
+fn non_empty_array(value: &Value, fields: &[&str]) -> bool {
+    fields.iter().any(|field| {
+        field_value(value, field)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    })
+}
+
+fn empty_array(value: &Value, fields: &[&str]) -> bool {
+    fields.iter().any(|field| {
+        field_value(value, field)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    })
+}
+
+fn non_empty_string(value: &Value, fields: &[&str]) -> bool {
+    fields.iter().any(|field| {
+        field_value(value, field)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+fn string_field_matches(value: &Value, fields: &[&str], expected: &[&str]) -> bool {
+    fields.iter().any(|field| {
+        field_value(value, field)
+            .and_then(Value::as_str)
+            .is_some_and(|text| expected.iter().any(|item| text.eq_ignore_ascii_case(item)))
+    })
+}
+
+fn field_bool(value: &Value, fields: &[&str]) -> Option<bool> {
+    fields
+        .iter()
+        .find_map(|field| field_value(value, field).and_then(Value::as_bool))
+}
+
+fn field_u64(value: &Value, fields: &[&str]) -> Option<u64> {
+    fields
+        .iter()
+        .find_map(|field| field_value(value, field).and_then(Value::as_u64))
+}
+
+fn field_value<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+    field
+        .split('.')
+        .try_fold(value, |current, part| current.get(part))
 }

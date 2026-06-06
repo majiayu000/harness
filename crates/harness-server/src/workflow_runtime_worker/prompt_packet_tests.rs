@@ -1,5 +1,7 @@
 use super::*;
-use harness_workflow::runtime::{RuntimeKind, WorkflowSubject, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY};
+use harness_workflow::runtime::{
+    RuntimeKind, WorkflowSubject, PR_REPAIR_SNAPSHOT_ARTIFACT, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+};
 
 #[test]
 fn activity_result_schema_describes_issue_implementation_terminal_evidence_contract() {
@@ -67,11 +69,23 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
         "local_review_gate"
     );
+    assert_eq!(
+        schema["activity_contract"]["accepted_artifacts"][1],
+        PR_REPAIR_SNAPSHOT_ARTIFACT
+    );
+    assert_eq!(
+        schema["activity_contract"]["success_requires"],
+        "pr_repair_snapshot_with_action_and_validation"
+    );
     assert!(schema["agent_summary_contract"]["must_include"]
         .as_array()
         .is_some_and(
             |items| items.contains(&json!("fresh PR state checked before final response"))
         ));
+    assert_eq!(
+        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required"],
+        true
+    );
 }
 
 #[test]
@@ -275,7 +289,11 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     );
     assert_eq!(
         schema["agent_summary_contract"]["signals"]["PrReadyToMerge"],
-        "Use only when review, checks, and mergeability are all ready."
+        "Use only with pr_repair_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads for the final head."
+    );
+    assert_eq!(
+        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required_when"],
+        "Using PrReadyToMerge or mark_ready_to_merge."
     );
     assert!(schema["workflow_decision_contract"]["allowed_transitions"]
         .as_array()

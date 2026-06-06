@@ -1,10 +1,10 @@
 use harness_workflow::runtime::{
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
     ISSUE_STATE_ARTIFACT, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
-    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
-    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID,
+    REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -136,7 +136,8 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
         }
         (GITHUB_ISSUE_PR_DEFINITION_ID, "address_pr_feedback") => {
             ActivityContract::new(workflow_definition, activity)
-                .with_accepted_artifacts(vec!["workflow_decision"])
+                .with_accepted_artifacts(vec!["workflow_decision", PR_REPAIR_SNAPSHOT_ARTIFACT])
+                .requires("pr_repair_snapshot_with_action_and_validation")
         }
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)
@@ -177,6 +178,7 @@ fn pr_feedback_contract(workflow_definition: &str, activity: &str) -> ActivityCo
             "ChangesRequested",
             "ChecksFailed",
         ])
+        .with_accepted_artifacts(vec!["workflow_decision", PR_REPAIR_SNAPSHOT_ARTIFACT])
         .with_explicit_noop_signals(vec!["NoFeedbackFound"])
         .requires("at_least_one_feedback_outcome_signal")
 }
