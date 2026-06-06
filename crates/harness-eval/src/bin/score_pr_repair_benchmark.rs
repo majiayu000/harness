@@ -2,6 +2,7 @@ use harness_eval::{
     summarize_pr_repair_benchmark, PrRepairBenchmarkCase, PrRepairBenchmarkInput, QualitySnapshot,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,13 +25,14 @@ fn main() {
 fn run() -> Result<(), String> {
     let args = parse_args(env::args().skip(1))?;
     let mut cases = Vec::new();
+    let mut seen_case_ids = HashSet::new();
 
     for path in args.snapshots {
         let case_id = case_id_from_path(&path)?;
-        cases.push(read_case(case_id, &path)?);
+        push_case(&mut cases, &mut seen_case_ids, case_id, &path)?;
     }
     for (case_id, path) in args.cases {
-        cases.push(read_case(case_id, &path)?);
+        push_case(&mut cases, &mut seen_case_ids, case_id, &path)?;
     }
 
     let summary = summarize_pr_repair_benchmark(PrRepairBenchmarkInput {
@@ -79,7 +81,9 @@ fn parse_case(value: &str) -> Result<(String, PathBuf), String> {
     let Some((case_id, path)) = value.split_once('=') else {
         return Err("--case must use CASE_ID=PATH".to_string());
     };
-    if case_id.trim().is_empty() || path.trim().is_empty() {
+    let case_id = case_id.trim();
+    let path = path.trim();
+    if case_id.is_empty() || path.is_empty() {
         return Err("--case must use non-empty CASE_ID=PATH".to_string());
     }
     Ok((case_id.to_string(), PathBuf::from(path)))
@@ -107,8 +111,28 @@ fn read_case(case_id: String, path: &Path) -> Result<PrRepairBenchmarkCase, Stri
     })
 }
 
+fn push_case(
+    cases: &mut Vec<PrRepairBenchmarkCase>,
+    seen_case_ids: &mut HashSet<String>,
+    case_id: String,
+    path: &Path,
+) -> Result<(), String> {
+    if !seen_case_ids.insert(case_id.clone()) {
+        return Err(format!("duplicate case ID: {case_id}"));
+    }
+    cases.push(read_case(case_id, path)?);
+    Ok(())
+}
+
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     let body = serde_json::to_string_pretty(value).map_err(|err| err.to_string())?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create directory {}: {err}", parent.display()))?;
+    }
     fs::write(path, format!("{body}\n"))
         .map_err(|err| format!("failed to write {}: {err}", path.display()))
 }

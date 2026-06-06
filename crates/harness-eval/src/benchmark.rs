@@ -180,8 +180,9 @@ pub fn summarize_pr_repair_benchmark(input: PrRepairBenchmarkInput) -> PrRepairB
         acceptable_cases,
         blocked_cases,
         grade_counts: grade_counts
-            .into_values()
-            .map(|(grade, count)| GradeCount { grade, count })
+            .into_iter()
+            .rev()
+            .map(|(_, (grade, count))| GradeCount { grade, count })
             .collect(),
         hard_gate_failures: hard_gate_failures
             .into_values()
@@ -339,6 +340,26 @@ mod tests {
                 count: 1,
             }]
         );
+    }
+
+    #[test]
+    fn grade_counts_sort_high_to_low() {
+        let summary = summarize_pr_repair_benchmark(PrRepairBenchmarkInput {
+            suite: "grades".to_string(),
+            cases: vec![
+                case("case-1", snapshot(49, EvalGrade::F, Vec::new())),
+                case("case-2", snapshot(89, EvalGrade::B, Vec::new())),
+                case("case-3", snapshot(100, EvalGrade::A, Vec::new())),
+            ],
+        });
+
+        let grades: Vec<_> = summary
+            .grade_counts
+            .into_iter()
+            .map(|count| count.grade)
+            .collect();
+
+        assert_eq!(grades, vec![EvalGrade::A, EvalGrade::B, EvalGrade::F]);
     }
 
     fn case(case_id: &str, snapshot: QualitySnapshot) -> PrRepairBenchmarkCase {
