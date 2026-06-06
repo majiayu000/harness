@@ -189,13 +189,17 @@ pub struct PullRequestSnapshot {
     pub check_state: CheckState,
     pub review_decision: Option<ReviewDecision>,
     pub active_unresolved_review_threads: Vec<ReviewThreadSnapshot>,
+    pub review_threads_complete: bool,
     pub changed_files: Vec<ChangedFileSnapshot>,
+    pub changed_files_complete: bool,
     pub collected_at: DateTime<Utc>,
 }
 ```
 
 `reviewThreads` must come from GraphQL or an equivalent API surface that can
-distinguish active unresolved threads from outdated or resolved threads.
+distinguish active unresolved threads from outdated or resolved threads. The
+snapshot must also record whether `reviewThreads` and changed-file enumeration
+was complete; incomplete pagination is not valid merge-readiness evidence.
 
 ### `RuntimeSnapshot`
 

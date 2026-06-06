@@ -3,8 +3,7 @@ use crate::model::{
     HardGateResult, MergeState, PrRepairEvalInput, QualitySnapshot, RuntimeSnapshot,
     ScoreBreakdown, ScoreComponent, ScoreDimensionName,
 };
-use std::error::Error;
-use std::fmt;
+use std::{error::Error, fmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScoringError {
@@ -15,14 +14,13 @@ impl fmt::Display for ScoringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedTarget => {
-                write!(f, "PR repair scoring requires a pull request target")
+                f.write_str("PR repair scoring requires a pull request target")
             }
         }
     }
 }
 
 impl Error for ScoringError {}
-
 pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot, ScoringError> {
     let target_matches = target_matches_pr(&input)?;
     let branch_safe = branch_safe(&input);
@@ -35,7 +33,10 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         .is_some_and(|head_oid| head_oid == input.final_pr.head_oid);
     let checks_passing = input.final_pr.check_state == CheckState::Passing;
     let mergeability_clean = input.final_pr.merge_state == MergeState::Clean;
-    let review_threads_closed = input.final_pr.active_unresolved_review_threads.is_empty();
+    let review_threads_closed = input.final_pr.active_unresolved_review_threads.is_empty()
+        && input.final_pr.review_threads_complete;
+    let final_remote_evidence_complete =
+        input.final_pr.review_threads_complete && input.final_pr.changed_files_complete;
     let runtime_complete = input.runtime.as_ref().is_some_and(runtime_has_artifact);
 
     let hard_gates = vec![
@@ -93,8 +94,8 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
             HardGateName::ReviewThreadClosure,
             review_threads_closed,
             Some(EvalGrade::C),
-            "no active unresolved review threads remain",
-            "active unresolved review threads remain",
+            "review threads were fully enumerated and no active unresolved review threads remain",
+            "active unresolved review threads remain or review thread enumeration is incomplete",
         ),
         gate(
             HardGateName::RuntimeArtifactCompleteness,
@@ -115,6 +116,7 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         checks_passing,
         mergeability_clean,
         review_threads_closed,
+        final_remote_evidence_complete,
         runtime_complete,
     };
     let objective_score = score_breakdown(&input, gate_signals);
@@ -289,6 +291,7 @@ struct GateSignals {
     checks_passing: bool,
     mergeability_clean: bool,
     review_threads_closed: bool,
+    final_remote_evidence_complete: bool,
     runtime_complete: bool,
 }
 
@@ -298,8 +301,10 @@ fn score_breakdown(input: &PrRepairEvalInput, gates: GateSignals) -> ScoreBreakd
         EvalScenario::PrRepair => head_changed,
         EvalScenario::ReadyNoopControl => !head_changed,
     };
-    let current_head_verified =
-        gates.final_evidence_fresh && gates.checks_passing && gates.mergeability_clean;
+    let current_head_verified = gates.final_evidence_fresh
+        && gates.checks_passing
+        && gates.mergeability_clean
+        && gates.final_remote_evidence_complete;
     let has_usage = input.usage.iter().any(|usage| usage.total_tokens.is_some());
     let has_confident_usage = input.usage.iter().any(|usage| {
         usage.token_confidence != Confidence::Unknown
@@ -775,7 +780,9 @@ mod tests {
             check_state: CheckState::Passing,
             review_decision: Some(crate::model::ReviewDecision::Approved),
             active_unresolved_review_threads: Vec::new(),
+            review_threads_complete: true,
             changed_files,
+            changed_files_complete: true,
             collected_at: "2026-06-05T00:00:00Z".to_string(),
         }
     }
