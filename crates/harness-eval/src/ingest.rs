@@ -5,6 +5,9 @@ use crate::model::{
 };
 use serde_json::Value;
 
+mod usage_ingest;
+use usage_ingest::usage_snapshots_from_values;
+
 pub struct PrRepairEvalIngest<'a> {
     pub repo: &'a str,
     pub pr_number: u64,
@@ -94,6 +97,8 @@ pub fn runtime_snapshot_from_values(
         .or_else(|| optional_string_field(submission, "submission_id"))
         .or_else(|| optional_string_field(task_detail, "id"));
     let workflow_id = optional_string_field(submission, "workflow_id")
+        .or_else(|| optional_string_field(submission, "workflowId"))
+        .or_else(|| task_detail_workflow_id(task_detail))
         .or_else(|| optional_string_at_pointer(task_detail, "/workflow/id"));
     let terminal_state = terminal_string_field(task_detail, "status")
         .or_else(|| terminal_string_at_pointer(task_detail, "/workflow/state"))
@@ -135,6 +140,26 @@ pub fn pr_repair_eval_input_from_values(input: PrRepairEvalIngest<'_>) -> PrRepa
         }
         _ => None,
     };
+    let usage_workflow_id = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.workflow_id.clone())
+        .or_else(|| {
+            input.submission.and_then(|submission| {
+                optional_string_field(submission, "workflow_id")
+                    .or_else(|| optional_string_field(submission, "workflowId"))
+            })
+        })
+        .or_else(|| input.task_detail.and_then(task_detail_workflow_id))
+        .or_else(|| {
+            input
+                .task_detail
+                .and_then(|task_detail| optional_string_at_pointer(task_detail, "/workflow/id"))
+        });
+    let usage = usage_snapshots_from_values(
+        input.submission,
+        input.task_detail,
+        usage_workflow_id.as_deref(),
+    );
 
     PrRepairEvalInput {
         scenario,
@@ -148,11 +173,16 @@ pub fn pr_repair_eval_input_from_values(input: PrRepairEvalIngest<'_>) -> PrRepa
         baseline_pr,
         final_pr: final_pr_snapshot,
         runtime,
-        usage: Vec::new(),
+        usage,
         reviewer_judgment: input.reviewer_judgment,
         created_unrelated_pr: false,
         scope_violations: Vec::new(),
     }
+}
+
+fn task_detail_workflow_id(task_detail: &Value) -> Option<String> {
+    optional_string_field(task_detail, "workflow_id")
+        .or_else(|| optional_string_field(task_detail, "workflowId"))
 }
 
 fn scenario_from_baseline(snapshot: &PullRequestSnapshot) -> EvalScenario {
@@ -448,6 +478,92 @@ mod tests {
         });
 
         assert_eq!(input.reviewer_judgment, Some(judgment));
+    }
+
+    #[test]
+    fn preserves_usage_from_ingest_artifacts() {
+        let pr = json!({
+            "number": 7,
+            "headRefName": "feature",
+            "headRefOid": "abc123",
+            "baseRefName": "main",
+            "isDraft": false,
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": {"state": "SUCCESS"},
+            "reviewThreads": {"nodes": []},
+            "files": {"nodes": []}
+        });
+        let submission = json!({"task_id": "task-1", "workflow_id": "workflow-1"});
+        let task_detail = json!({
+            "id": "task-1",
+            "status": "done",
+            "usage": [{
+                "runtime_job_id": "job-1",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "token_confidence": "exact"
+            }]
+        });
+
+        let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+            repo: "owner/repo",
+            pr_number: 7,
+            baseline_collected_at: "2026-06-06T00:00:00Z",
+            final_collected_at: "2026-06-06T00:01:00Z",
+            baseline: &pr,
+            final_pr: &pr,
+            submission: Some(&submission),
+            task_detail: Some(&task_detail),
+            reviewer_judgment: None,
+        });
+
+        assert_eq!(input.usage.len(), 1);
+        assert_eq!(input.usage[0].runtime_job_id.as_deref(), Some("job-1"));
+        assert_eq!(input.usage[0].workflow_id.as_deref(), Some("workflow-1"));
+        assert_eq!(input.usage[0].total_tokens, Some(150));
+    }
+
+    #[test]
+    fn uses_task_detail_workflow_id_as_usage_fallback() {
+        let pr = json!({
+            "number": 7,
+            "headRefName": "feature",
+            "headRefOid": "abc123",
+            "baseRefName": "main",
+            "isDraft": false,
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": {"state": "SUCCESS"},
+            "reviewThreads": {"nodes": []},
+            "files": {"nodes": []}
+        });
+        let task_detail = json!({
+            "id": "task-1",
+            "workflow_id": "workflow-from-task-detail",
+            "status": "done",
+            "usage": [{
+                "runtime_job_id": "job-1",
+                "input_tokens": 20,
+                "output_tokens": 5
+            }]
+        });
+
+        let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+            repo: "owner/repo",
+            pr_number: 7,
+            baseline_collected_at: "2026-06-06T00:00:00Z",
+            final_collected_at: "2026-06-06T00:01:00Z",
+            baseline: &pr,
+            final_pr: &pr,
+            submission: None,
+            task_detail: Some(&task_detail),
+            reviewer_judgment: None,
+        });
+
+        assert_eq!(input.usage.len(), 1);
+        assert_eq!(
+            input.usage[0].workflow_id.as_deref(),
+            Some("workflow-from-task-detail")
+        );
     }
 
     #[test]

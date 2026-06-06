@@ -114,6 +114,15 @@ Acceptance:
 - Eval snapshots show exact, estimated, observed, or unknown confidence.
 - Missing price catalog leaves cost fields null with diagnostics.
 
+Implementation status:
+
+- Added `harness-eval` ingestion for canonical `usage` / `usage_snapshots`
+  arrays and Harness `llm_usage` event-style payload arrays.
+- The pure eval crate still does not load prices or call server APIs; it only
+  preserves token/cost fields and confidence labels supplied by artifacts.
+- Remaining work: collect and attach usage artifacts from server-side event
+  storage or external evaluator scripts.
+
 ### Issue 5: Add the dashboard eval view
 
 Scope:
