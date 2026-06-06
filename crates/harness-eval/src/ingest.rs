@@ -129,13 +129,14 @@ fn connection_complete(value: &Value, raw_field: &str, normalized_field: &str) -
     if let Some(complete) = value.get(normalized_field).and_then(Value::as_bool) {
         return complete;
     }
-    value
-        .get(raw_field)
-        .and_then(|connection| connection.get("pageInfo"))
-        .and_then(|page_info| page_info.get("hasNextPage"))
-        .and_then(Value::as_bool)
-        .map(|has_next_page| !has_next_page)
-        .unwrap_or(true)
+    if let Some(connection) = value.get(raw_field) {
+        return connection
+            .get("pageInfo")
+            .and_then(|page_info| page_info.get("hasNextPage"))
+            .and_then(Value::as_bool)
+            .is_some_and(|has_next_page| !has_next_page);
+    }
+    true
 }
 
 pub fn runtime_snapshot_from_values(

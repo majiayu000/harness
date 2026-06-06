@@ -29,6 +29,22 @@ fn incomplete_raw_review_threads_fail_closure_gate() {
 }
 
 #[test]
+fn missing_raw_review_thread_page_info_fails_closure_gate() {
+    let baseline = raw_pr_snapshot("base-head", false);
+    let final_pr = raw_pr_snapshot_without_review_thread_page_info("final-head");
+    let input = eval_input(
+        github_pr_snapshot_from_value("owner/repo", "2026-06-06T00:00:00Z", &baseline),
+        github_pr_snapshot_from_value("owner/repo", "2026-06-06T00:01:00Z", &final_pr),
+    );
+
+    let snapshot = score_pr_repair_eval(input).expect("score missing review page info");
+    let gate = snapshot_gate(&snapshot.hard_gates, HardGateName::ReviewThreadClosure);
+
+    assert_eq!(gate.status, GateStatus::Fail);
+    assert_eq!(snapshot.grade_cap, Some(EvalGrade::C));
+}
+
+#[test]
 fn incomplete_server_normalized_review_threads_fail_closure_gate() {
     let baseline = server_normalized_snapshot("base-head", true, true);
     let final_pr = server_normalized_snapshot("final-head", false, true);
@@ -42,6 +58,27 @@ fn incomplete_server_normalized_review_threads_fail_closure_gate() {
 
     assert_eq!(gate.status, GateStatus::Fail);
     assert_eq!(snapshot.grade_cap, Some(EvalGrade::C));
+}
+
+#[test]
+fn missing_raw_changed_files_page_info_penalizes_current_head_verification() {
+    let baseline = raw_pr_snapshot("base-head", false);
+    let final_pr = raw_pr_snapshot_without_files_page_info("final-head");
+    let input = eval_input(
+        github_pr_snapshot_from_value("owner/repo", "2026-06-06T00:00:00Z", &baseline),
+        github_pr_snapshot_from_value("owner/repo", "2026-06-06T00:01:00Z", &final_pr),
+    );
+
+    let snapshot = score_pr_repair_eval(input).expect("score missing files page info");
+
+    assert_eq!(snapshot.grade_cap, None);
+    assert_eq!(
+        snapshot
+            .objective_score
+            .verification_and_current_head_gates
+            .points,
+        4
+    );
 }
 
 #[test]
@@ -84,6 +121,52 @@ fn raw_pr_snapshot(head_oid: &str, review_threads_has_next_page: bool) -> serde_
         },
         "files": {
             "pageInfo": {"hasNextPage": false},
+            "nodes": [
+                {"path": "src/lib.rs", "additions": 3, "deletions": 1, "changeType": "MODIFIED"}
+            ]
+        }
+    })
+}
+
+fn raw_pr_snapshot_without_review_thread_page_info(head_oid: &str) -> serde_json::Value {
+    json!({
+        "number": 42,
+        "url": "https://github.com/owner/repo/pull/42",
+        "title": "Fix PR repair",
+        "baseRefName": "main",
+        "headRefName": "fix/pr-42",
+        "headRefOid": head_oid,
+        "isDraft": false,
+        "mergeStateStatus": "CLEAN",
+        "reviewDecision": "APPROVED",
+        "statusCheckRollup": {"state": "SUCCESS"},
+        "reviewThreads": {"nodes": []},
+        "files": {
+            "pageInfo": {"hasNextPage": false},
+            "nodes": [
+                {"path": "src/lib.rs", "additions": 3, "deletions": 1, "changeType": "MODIFIED"}
+            ]
+        }
+    })
+}
+
+fn raw_pr_snapshot_without_files_page_info(head_oid: &str) -> serde_json::Value {
+    json!({
+        "number": 42,
+        "url": "https://github.com/owner/repo/pull/42",
+        "title": "Fix PR repair",
+        "baseRefName": "main",
+        "headRefName": "fix/pr-42",
+        "headRefOid": head_oid,
+        "isDraft": false,
+        "mergeStateStatus": "CLEAN",
+        "reviewDecision": "APPROVED",
+        "statusCheckRollup": {"state": "SUCCESS"},
+        "reviewThreads": {
+            "pageInfo": {"hasNextPage": false},
+            "nodes": []
+        },
+        "files": {
             "nodes": [
                 {"path": "src/lib.rs", "additions": 3, "deletions": 1, "changeType": "MODIFIED"}
             ]
