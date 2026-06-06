@@ -1,10 +1,13 @@
 import { workflowLabel } from "@/lib/format";
-import type { FullTask, TaskArtifact, TaskPrompt } from "@/types";
+import type { FullTask, QualitySnapshotRecord, TaskArtifact, TaskPrompt } from "@/types";
 
 interface Props {
   task: FullTask;
   prompts: TaskPrompt[] | undefined;
   artifacts: TaskArtifact[] | undefined;
+  qualitySnapshot?: QualitySnapshotRecord;
+  qualitySnapshotLoading?: boolean;
+  qualitySnapshotError?: boolean;
 }
 
 function reviewerVerdict(state: string): string {
@@ -26,7 +29,28 @@ function elapsedTime(createdAt: string | null, completedAt: string | undefined):
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
-export function ProofOfWorkCard({ task, prompts, artifacts }: Props) {
+function formatLabel(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function shortSha(value: string | null | undefined): string {
+  if (!value) return "N/A";
+  return value.length > 12 ? value.slice(0, 12) : value;
+}
+
+export function ProofOfWorkCard({
+  task,
+  prompts,
+  artifacts,
+  qualitySnapshot,
+  qualitySnapshotLoading,
+  qualitySnapshotError,
+}: Props) {
+  const snapshot = qualitySnapshot?.snapshot;
+  const passedGates = snapshot?.hard_gates.filter((gate) => gate.status === "pass").length ?? 0;
+  const totalGates = snapshot?.hard_gates.length ?? 0;
+  const failedGates = snapshot?.hard_gates.filter((gate) => gate.status === "fail") ?? [];
+
   return (
     <div
       className="mt-4 border border-line bg-bg p-3 flex flex-col gap-3 font-mono text-[11px]"
@@ -54,6 +78,48 @@ export function ProofOfWorkCard({ task, prompts, artifacts }: Props) {
           <span className="text-ink-3">No PR</span>
         )}
       </section>
+
+      {task.pr_url && (
+        <section>
+          <div className="text-ink-3 mb-1 uppercase tracking-[0.08em]">Quality Snapshot</div>
+          {qualitySnapshotLoading ? (
+            <span className="text-ink-3">Loading quality snapshot…</span>
+          ) : qualitySnapshotError ? (
+            <span className="text-rust">Failed to load quality snapshot</span>
+          ) : snapshot ? (
+            <div className="flex flex-col gap-2 text-ink">
+              <div className="flex flex-wrap gap-2">
+                <span className="border border-line bg-bg-1 px-1.5 py-[1px] text-[10px]">
+                  Grade {snapshot.final_grade}
+                </span>
+                <span>Score: {snapshot.final_score}/100</span>
+                <span>Run: {formatLabel(snapshot.run_mode)}</span>
+              </div>
+              <div className="flex flex-wrap gap-2 text-ink-2">
+                <span>Head: {shortSha(snapshot.final_pr?.head_oid)}</span>
+                <span>Gates: {passedGates}/{totalGates}</span>
+                <span>Recorded: {qualitySnapshot.created_at}</span>
+              </div>
+              {snapshot.blocker_summary.length > 0 && (
+                <div className="border border-line bg-bg-1 p-2 text-rust">
+                  {snapshot.blocker_summary[0]}
+                </div>
+              )}
+              {failedGates.length > 0 && (
+                <div className="flex flex-col gap-1 text-ink-2">
+                  {failedGates.slice(0, 3).map((gate) => (
+                    <div key={gate.name}>
+                      {formatLabel(gate.name)}: {gate.message}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <span className="text-ink-3">No quality snapshot recorded</span>
+          )}
+        </section>
+      )}
 
       <section>
         <div className="text-ink-3 mb-1 uppercase tracking-[0.08em]">Rounds / Elapsed</div>
