@@ -1,6 +1,6 @@
 use crate::model::{
-    ChangedFileSnapshot, CheckState, EvalScenario, EvalTarget, MergeState, PrRepairEvalInput,
-    PullRequestSnapshot, ReviewDecision, ReviewThreadSnapshot, ReviewerJudgment,
+    ChangedFileSnapshot, CheckState, EvalRunMode, EvalScenario, EvalTarget, MergeState,
+    PrRepairEvalInput, PullRequestSnapshot, ReviewDecision, ReviewThreadSnapshot, ReviewerJudgment,
     RuntimeJobSnapshot, RuntimeSnapshot,
 };
 use serde_json::Value;
@@ -15,6 +15,7 @@ pub struct PrRepairEvalIngest<'a> {
     pub final_collected_at: &'a str,
     pub baseline: &'a Value,
     pub final_pr: &'a Value,
+    pub run_mode: EvalRunMode,
     pub submission: Option<&'a Value>,
     pub task_detail: Option<&'a Value>,
     pub reviewer_judgment: Option<ReviewerJudgment>,
@@ -214,6 +215,7 @@ pub fn pr_repair_eval_input_from_values(input: PrRepairEvalIngest<'_>) -> PrRepa
 
     PrRepairEvalInput {
         scenario,
+        run_mode: input.run_mode,
         target: EvalTarget::PullRequest {
             repo: input.repo.to_string(),
             pr_number: input.pr_number,
@@ -479,6 +481,7 @@ mod tests {
             final_collected_at: "2026-06-06T00:01:00Z",
             baseline: &pr,
             final_pr: &pr,
+            run_mode: EvalRunMode::LiveRun,
             submission: None,
             task_detail: None,
             reviewer_judgment: None,
@@ -515,6 +518,7 @@ mod tests {
             final_collected_at: "2026-06-06T00:01:00Z",
             baseline: &pr,
             final_pr: &pr,
+            run_mode: EvalRunMode::LiveRun,
             submission: None,
             task_detail: None,
             reviewer_judgment: None,
@@ -547,6 +551,7 @@ mod tests {
             final_collected_at: "2026-06-06T00:01:00Z",
             baseline: &pr,
             final_pr: &pr,
+            run_mode: EvalRunMode::LiveRun,
             submission: None,
             task_detail: None,
             reviewer_judgment: None,
@@ -584,6 +589,7 @@ mod tests {
             final_collected_at: "2026-06-06T00:01:00Z",
             baseline: &pr,
             final_pr: &pr,
+            run_mode: EvalRunMode::LiveRun,
             submission: None,
             task_detail: None,
             reviewer_judgment: Some(judgment.clone()),
@@ -624,6 +630,7 @@ mod tests {
             final_collected_at: "2026-06-06T00:01:00Z",
             baseline: &pr,
             final_pr: &pr,
+            run_mode: EvalRunMode::LiveRun,
             submission: Some(&submission),
             task_detail: Some(&task_detail),
             reviewer_judgment: None,
@@ -666,6 +673,7 @@ mod tests {
             final_collected_at: "2026-06-06T00:01:00Z",
             baseline: &pr,
             final_pr: &pr,
+            run_mode: EvalRunMode::LiveRun,
             submission: None,
             task_detail: Some(&task_detail),
             reviewer_judgment: None,
@@ -702,6 +710,7 @@ mod tests {
             final_collected_at: "2026-06-06T00:01:00Z",
             baseline: &pr,
             final_pr: &pr,
+            run_mode: EvalRunMode::LiveRun,
             submission: None,
             task_detail: None,
             reviewer_judgment: None,

@@ -1,4 +1,3 @@
-use anyhow::Context as _;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -265,8 +264,9 @@ async fn load_input_artifact(
     else {
         return Ok(None);
     };
-    let input = serde_json::from_str(&artifact.body)
-        .with_context(|| "failed to parse pr_repair_eval_input artifact")?;
+    let input = serde_json::from_str(&artifact.body).map_err(|error| {
+        anyhow::anyhow!("failed to parse pr_repair_eval_input artifact: {error}")
+    })?;
     Ok(Some(input))
 }
 

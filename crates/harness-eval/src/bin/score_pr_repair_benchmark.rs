@@ -1,5 +1,6 @@
 use harness_eval::{
-    summarize_pr_repair_benchmark, PrRepairBenchmarkCase, PrRepairBenchmarkInput, QualitySnapshot,
+    summarize_pr_repair_benchmark, EvalRunMode, PrRepairBenchmarkCase, PrRepairBenchmarkInput,
+    QualitySnapshot,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -101,8 +102,37 @@ where
 fn read_case(case_id: String, path: &Path) -> Result<PrRepairBenchmarkCase, String> {
     let body = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    let snapshot: QualitySnapshot = serde_json::from_str(&body)
+    let raw_snapshot: Value = serde_json::from_str(&body)
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    match raw_snapshot.get("run_mode").and_then(Value::as_str) {
+        Some("live_run") => {}
+        Some("collect_only") => {
+            return Err(format!(
+                "collect-only snapshot {} cannot be used as a live PR repair benchmark case",
+                path.display()
+            ));
+        }
+        Some(value) => {
+            return Err(format!(
+                "snapshot {} has unsupported run_mode {value:?}; expected live_run",
+                path.display()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "snapshot {} must include explicit run_mode=\"live_run\" for live PR repair benchmarks",
+                path.display()
+            ));
+        }
+    }
+    let snapshot: QualitySnapshot = serde_json::from_value(raw_snapshot)
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    if snapshot.run_mode != EvalRunMode::LiveRun {
+        return Err(format!(
+            "snapshot {} must use run_mode=\"live_run\" for live PR repair benchmarks",
+            path.display()
+        ));
+    }
     Ok(PrRepairBenchmarkCase {
         case_id,
         tags: Vec::new(),

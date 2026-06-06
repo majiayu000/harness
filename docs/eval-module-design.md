@@ -125,6 +125,7 @@ One invocation of an evaluation scenario.
 pub struct EvalRun {
     pub run_id: EvalRunId,
     pub scenario: EvalScenario,
+    pub run_mode: EvalRunMode,
     pub target: EvalTarget,
     pub status: EvalRunStatus,
     pub started_at: DateTime<Utc>,
@@ -136,6 +137,17 @@ pub struct EvalRun {
     pub artifacts: Vec<EvalArtifactRef>,
 }
 ```
+
+```rust
+pub enum EvalRunMode {
+    LiveRun,
+    CollectOnly,
+}
+```
+
+`CollectOnly` means the evaluator only collected GitHub truth and did not submit
+or observe a Harness repair task. These artifacts are useful baselines, but they
+are not live capability benchmark cases.
 
 ### `EvalScenario`
 
@@ -255,6 +267,7 @@ The final persisted report for a run.
 ```rust
 pub struct QualitySnapshot {
     pub run: EvalRun,
+    pub run_mode: EvalRunMode,
     pub baseline_pr: Option<PullRequestSnapshot>,
     pub final_pr: Option<PullRequestSnapshot>,
     pub runtime: RuntimeSnapshot,
@@ -488,9 +501,19 @@ running Harness server before submitting `POST /tasks`. An unregistered local
 worktree can otherwise produce a workflow handle that no runtime worker will
 execute, which creates false-negative quality data. When that preflight fails,
 the collector should fail fast but still emit `submission.json`,
-`task_detail_final.json`, `quality_snapshot.json`, and `summary.md`. The Markdown
-report must render grade, score, grade cap, hard gates, and blockers from
-`quality_snapshot.json`; it must not maintain an independent grading heuristic.
+`task_detail_final.json`, `quality_snapshot.json`, and `summary.md` with
+`run_mode=collect_only` because no Harness repair task exists yet. After
+`POST /tasks` returns a non-empty `task_id`, subsequent snapshots are tagged
+`run_mode=live_run` even if the task later fails, blocks, or times out. The
+`score_pr_repair` CLI requires explicit `--run-mode live_run|collect_only` for
+every invocation that writes a new snapshot; compatibility defaults are reserved
+for deserializing older stored artifacts, not for producing new live evidence.
+The server `/api/evals/runs/{run_id}/score` input contract also requires
+explicit `run_mode` for direct request bodies and `pr_repair_eval_input`
+artifacts.
+The Markdown report must render grade, score, grade cap, hard gates, and blockers
+from `quality_snapshot.json`; it must not maintain an independent grading
+heuristic.
 
 Later, add a CLI wrapper:
 
@@ -516,7 +539,11 @@ score_pr_repair_benchmark \
 
 It reads existing `quality_snapshot.json` artifacts and writes a deterministic
 benchmark summary. It does not fetch GitHub, start Harness, or grade code with an
-LLM.
+LLM. It accepts only snapshots with explicit `run_mode=live_run`; it rejects
+`collect_only` and missing `run_mode` snapshots so baseline collection cannot be
+misreported as live repair capability. Live-mode preflight failures are also
+tagged `collect_only`; only snapshots for successfully submitted Harness tasks
+are benchmarkable live cases.
 
 ## Dashboard Design
 
@@ -602,6 +629,7 @@ The script should have shell or integration tests for:
 
 - URL-encoding task IDs that contain `/`
 - collect-only baseline mode
+- live-mode preflight failures remaining `collect_only`
 - final snapshot generation after task polling resumes
 
 ## Rollout Plan

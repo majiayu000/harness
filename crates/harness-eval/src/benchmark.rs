@@ -378,6 +378,7 @@ mod tests {
     ) -> QualitySnapshot {
         QualitySnapshot {
             scenario: EvalScenario::PrRepair,
+            run_mode: crate::model::EvalRunMode::LiveRun,
             target: EvalTarget::PullRequest {
                 repo: "owner/repo".to_string(),
                 pr_number: 7,

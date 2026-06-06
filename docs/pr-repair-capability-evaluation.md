@@ -57,6 +57,20 @@ This checks existing local-review completion gates:
 Level 0 does not prove an agent can fix a real PR. It proves that the local gate
 does not accept common false positives.
 
+`QualitySnapshot` records a `run_mode`. Collect-only snapshots must use
+`collect_only`; live Harness repair runs use `live_run` only after Harness
+returns a non-empty `task_id` from `POST /tasks`. Server health failures, project
+registry failures, duplicate-task preflight failures, POST failures, and missing
+task IDs are still diagnostic reports, but they are tagged `collect_only`
+because no Harness repair attempt exists. Benchmark inputs must include an
+explicit `run_mode=live_run`; missing `run_mode` is rejected because older
+collect-only artifacts did not have this field.
+
+The `score_pr_repair` CLI must be invoked with an explicit
+`--run-mode live_run|collect_only` whenever it writes a new `QualitySnapshot`.
+Server scoring input for `/api/evals/runs/{run_id}/score` must also include
+`run_mode`. Neither path may default direct/manual scoring to `live_run`.
+
 ## Hard Gates
 
 A run must pass every hard gate before the numeric score can be interpreted as a
@@ -140,6 +154,16 @@ This records the PR `headRefOid`, `mergeStateStatus`, `statusCheckRollup`,
 `reviewDecision`, active unresolved `reviewThreads`, and a recommended task
 class. Use this before every live repair run.
 
+Collect-only reports still write `pr_repair_eval_input.json` and
+`quality_snapshot.json`, but those snapshots are tagged `run_mode=collect_only`.
+The benchmark CLI rejects them because no Harness repair, runtime artifact, or
+usage attribution exists yet.
+
+Live-mode preflight failures use the same `collect_only` tag until the script
+successfully submits a Harness task and records its `task_id`. This keeps
+environment/setup failures out of the live repair capability benchmark while
+still preserving enough evidence to debug why no repair attempt started.
+
 ### Level 2: Harness Live PR Repair
 
 Start Harness from a standalone terminal, not from a Codex session:
@@ -208,6 +232,13 @@ Each run must also write machine-readable eval artifacts:
   `harness-eval` and `/api/evals/runs/{run_id}/score`.
 - `quality_snapshot.json`: deterministic `QualitySnapshot` with hard gates,
   score breakdown, grade caps, blocker summary, runtime evidence, and PR facts.
+
+Both artifacts include `run_mode`. Operators may archive collect-only artifacts
+next to live-run artifacts, but only `live_run` snapshots are valid inputs for
+the capability benchmark. A snapshot is `live_run` only after a Harness task was
+successfully submitted for the target PR; live-mode preflight failures remain
+`collect_only`. The benchmark CLI rejects missing `run_mode` rather than
+defaulting old snapshots to live runs.
 
 The Markdown summary is an operator convenience layer. It must not be the source
 of truth for eval scoring, dashboards, or merge readiness.

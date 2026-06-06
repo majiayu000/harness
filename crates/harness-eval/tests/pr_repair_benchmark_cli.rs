@@ -1,6 +1,6 @@
 use harness_eval::{
-    EvalGrade, EvalScenario, EvalTarget, GateStatus, HardGateName, HardGateResult, QualitySnapshot,
-    ScoreBreakdown, ScoreComponent, ScoreDimensionName,
+    EvalGrade, EvalRunMode, EvalScenario, EvalTarget, GateStatus, HardGateName, HardGateResult,
+    QualitySnapshot, ScoreBreakdown, ScoreComponent, ScoreDimensionName,
 };
 use serde_json::Value;
 use std::ffi::OsString;
@@ -67,6 +67,77 @@ fn benchmark_cli_aggregates_snapshot_cases() {
     assert_eq!(summary["hard_gate_failures"][0]["count"], 1);
 }
 
+#[test]
+fn benchmark_cli_rejects_collect_only_snapshots() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-collect-only");
+    let snapshot_path = temp_dir.path().join("collect_only.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+    let mut snapshot = fixture_snapshot("collect-only", 100, EvalGrade::A, None);
+    snapshot.run_mode = EvalRunMode::CollectOnly;
+    write_snapshot(&snapshot_path, &snapshot);
+
+    let output_status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--suite")
+        .arg("collect-only")
+        .arg("--snapshot")
+        .arg(&snapshot_path)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("run benchmark binary");
+
+    assert!(
+        !output_status.status.success(),
+        "benchmark binary should reject collect-only snapshots"
+    );
+    let stderr = String::from_utf8_lossy(&output_status.stderr);
+    assert!(stderr.contains("collect-only snapshot"));
+    assert!(
+        !output.exists(),
+        "rejected benchmark should not write output"
+    );
+}
+
+#[test]
+fn benchmark_cli_rejects_missing_run_mode_snapshots() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-missing-run-mode");
+    let snapshot_path = temp_dir.path().join("missing_run_mode.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+    let mut snapshot = serde_json::to_value(fixture_snapshot(
+        "missing-run-mode",
+        100,
+        EvalGrade::A,
+        None,
+    ))
+    .expect("serialize snapshot");
+    snapshot
+        .as_object_mut()
+        .expect("snapshot should be an object")
+        .remove("run_mode");
+    write_json_value(&snapshot_path, &snapshot);
+
+    let output_status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--suite")
+        .arg("missing-run-mode")
+        .arg("--snapshot")
+        .arg(&snapshot_path)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("run benchmark binary");
+
+    assert!(
+        !output_status.status.success(),
+        "benchmark binary should reject missing run_mode snapshots"
+    );
+    let stderr = String::from_utf8_lossy(&output_status.stderr);
+    assert!(stderr.contains("must include explicit run_mode"));
+    assert!(
+        !output.exists(),
+        "rejected benchmark should not write output"
+    );
+}
+
 struct TempDir {
     path: PathBuf,
 }
@@ -105,7 +176,12 @@ fn case_arg(case_id: &str, path: &Path) -> OsString {
 }
 
 fn write_snapshot(path: &Path, snapshot: &QualitySnapshot) {
-    let body = serde_json::to_string_pretty(snapshot).expect("serialize snapshot");
+    let value = serde_json::to_value(snapshot).expect("serialize snapshot");
+    write_json_value(path, &value);
+}
+
+fn write_json_value(path: &Path, value: &Value) {
+    let body = serde_json::to_string_pretty(value).expect("serialize snapshot");
     fs::write(path, format!("{body}\n")).expect("write snapshot");
 }
 
@@ -117,6 +193,7 @@ fn fixture_snapshot(
 ) -> QualitySnapshot {
     QualitySnapshot {
         scenario: EvalScenario::PrRepair,
+        run_mode: EvalRunMode::LiveRun,
         target: EvalTarget::PullRequest {
             repo: "owner/repo".to_string(),
             pr_number: 42,
