@@ -101,7 +101,7 @@ function row(id: string, quality: QualitySnapshot | null, error: string | null =
           head_ref: "fix/review",
         },
       source_task_id: "task-7",
-      status: quality ? "scored" : "created",
+      status: quality ? "Scored" : "Created",
       quality_snapshot_id: quality ? `snapshot-${id}` : null,
       created_at: "2026-06-06T00:00:00Z",
       updated_at: "2026-06-06T00:02:00Z",

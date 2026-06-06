@@ -64,6 +64,7 @@ function rowMatchesQuery(row: EvalDashboardRow, query: string): boolean {
     row.run.id,
     row.run.scenario,
     row.run.status,
+    normalizedStatus(row.run.status),
     row.run.source_task_id,
     targetLabel(row.run.target),
     snapshot?.final_grade,
@@ -81,8 +82,20 @@ function gradeClass(grade: string | null | undefined): string {
 
 function evalStatusClass(run: EvalRun, blocked: boolean): string {
   if (blocked) return "border-rust/40 bg-rust/10 text-rust";
-  if (run.status === "scored") return "border-ok/40 bg-ok/10 text-ok";
+  if (runIsScored(run)) return "border-ok/40 bg-ok/10 text-ok";
   return "border-line bg-bg text-ink-3";
+}
+
+function normalizedStatus(status: string): string {
+  return status
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[\s-]+/g, "_")
+    .toLowerCase();
+}
+
+function runIsScored(run: EvalRun): boolean {
+  return normalizedStatus(run.status) === "scored";
 }
 
 function usageTotals(usage: UsageSnapshot[] | undefined): { tokens: number | null; micros: number | null } {
@@ -128,7 +141,7 @@ export function Evals() {
     );
   }, [data?.rows, filter, query]);
 
-  const scored = (data?.rows ?? []).filter((row) => row.run.status === "scored").length;
+  const scored = (data?.rows ?? []).filter((row) => runIsScored(row.run)).length;
   const blocked = (data?.rows ?? []).filter((row) => blockerCount(row) > 0 || row.quality_snapshot_error).length;
   const live = (data?.rows ?? []).filter((row) => rowRunMode(row) === "live_run").length;
   const visibleSnapshots = rows
@@ -261,7 +274,7 @@ function EvalRow({ row }: { row: EvalDashboardRow }) {
       </td>
       <td className="px-3 py-2">
         <span className={`inline-block border px-1.5 py-[1px] font-mono text-[10px] ${evalStatusClass(row.run, blocked)}`}>
-          {blocked ? "blocked" : formatSnakeLabel(row.run.status)}
+          {blocked ? "blocked" : formatSnakeLabel(normalizedStatus(row.run.status))}
         </span>
         {row.run.source_task_id ? (
           <div className="mt-1 truncate font-mono text-[10px] text-ink-4" title={row.run.source_task_id}>
