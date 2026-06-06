@@ -404,8 +404,9 @@ GET  /api/evals/pr/{owner}/{repo}/{pr_number}
 ```
 
 `POST /api/evals/runs/{run_id}/score` runs deterministic scoring inside
-`harness-eval` from already-ingested artifacts. It should not fetch GitHub or
-start an agent.
+`harness-eval`. The request may include a canonical `PrRepairEvalInput`
+directly, or omit it and score from the latest uploaded
+`pr_repair_eval_input` artifact. It should not fetch GitHub or start an agent.
 
 ## CLI and Script Flow
 
@@ -430,6 +431,10 @@ harness eval pr-repair --repo OWNER/REPO --pr N --server-url URL
 harness eval report --run-id UUID
 harness eval cases --suite pr-repair-smoke
 ```
+
+The CLI is optional product surface. The durable contract is the server API and
+the persisted eval records; a CLI should only be a thin wrapper around those
+APIs after the storage path is stable.
 
 ## Dashboard Design
 

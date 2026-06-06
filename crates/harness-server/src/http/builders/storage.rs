@@ -3,11 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::http::state::StoreStartupResult;
-use crate::{q_value_store::QValueStore, task_runner::TaskStore};
+use crate::{eval_store::EvalStore, q_value_store::QValueStore, task_runner::TaskStore};
 
 /// Outputs of the storage initialization phase.
 pub(crate) struct StorageBundle {
     pub tasks: Option<Arc<TaskStore>>,
+    pub eval_store: Option<Arc<EvalStore>>,
     pub q_values: Option<Arc<QValueStore>>,
     pub startup_results: Vec<StoreStartupResult>,
 }
@@ -15,6 +16,7 @@ pub(crate) struct StorageBundle {
 fn failed_storage_startup_results(error: &str) -> Vec<StoreStartupResult> {
     vec![
         StoreStartupResult::critical("tasks").failed(error),
+        StoreStartupResult::optional("eval_store").failed(error),
         StoreStartupResult::optional("q_value_store").failed(error),
     ]
 }
@@ -22,6 +24,7 @@ fn failed_storage_startup_results(error: &str) -> Vec<StoreStartupResult> {
 fn failed_storage_bundle(error: &str) -> StorageBundle {
     StorageBundle {
         tasks: None,
+        eval_store: None,
         q_values: None,
         startup_results: failed_storage_startup_results(error),
     }
@@ -65,6 +68,8 @@ pub(crate) async fn build_storage_with_database_url(
     tracing::debug!("task db: {}", db_path.display());
     let q_values_db_path = harness_core::config::dirs::default_db_path(data_dir, "q_values");
     tracing::debug!("q_value db: {}", q_values_db_path.display());
+    let eval_db_path = harness_core::config::dirs::default_db_path(data_dir, "evals");
+    tracing::debug!("eval db: {}", eval_db_path.display());
 
     let database_url = match harness_core::db::resolve_database_url(configured_database_url) {
         Ok(database_url) => database_url,
@@ -91,6 +96,33 @@ pub(crate) async fn build_storage_with_database_url(
                 StoreStartupResult::critical("tasks").failed(error.to_string()),
             ),
         },
+    };
+
+    let (eval_store, eval_result) = match super::forced_startup_error("eval_store") {
+        Some(error) => (
+            None,
+            StoreStartupResult::optional("eval_store").failed(error),
+        ),
+        None => {
+            match harness_core::db::PgStoreContext::from_path(&eval_db_path, Some(&database_url)) {
+                Ok(eval_context) => {
+                    match EvalStore::open_with_context(&eval_context, &setup_pool).await {
+                        Ok(store) => (
+                            Some(Arc::new(store)),
+                            StoreStartupResult::optional("eval_store"),
+                        ),
+                        Err(error) => (
+                            None,
+                            StoreStartupResult::optional("eval_store").failed(error.to_string()),
+                        ),
+                    }
+                }
+                Err(error) => (
+                    None,
+                    StoreStartupResult::optional("eval_store").failed(error.to_string()),
+                ),
+            }
+        }
     };
 
     let (q_values, q_value_result) = match super::forced_startup_error("q_value_store") {
@@ -127,13 +159,20 @@ pub(crate) async fn build_storage_with_database_url(
             "q_value store init failed, rule utility tracking will be disabled: {error}"
         );
     }
+    if let Some(error) = eval_result.error.as_deref() {
+        tracing::warn!(
+            path = %eval_db_path.display(),
+            "eval store init failed, eval persistence APIs will be disabled: {error}"
+        );
+    }
 
     setup_pool.close().await;
 
     Ok(StorageBundle {
         tasks,
+        eval_store,
         q_values,
-        startup_results: vec![task_result, q_value_result],
+        startup_results: vec![task_result, eval_result, q_value_result],
     })
 }
 
@@ -148,6 +187,7 @@ mod tests {
             .await
             .expect("build_storage should succeed");
         assert!(bundle.tasks.is_some(), "tasks store should be ready");
+        assert!(bundle.eval_store.is_some(), "eval store should be ready");
         drop(bundle.q_values);
     }
 
@@ -171,22 +211,26 @@ mod tests {
             bundle.q_values.is_none(),
             "optional q_value store should stay disabled"
         );
-        assert_eq!(bundle.startup_results.len(), 2);
+        assert_eq!(bundle.startup_results.len(), 3);
         assert!(bundle.startup_results[0].ready);
-        assert!(!bundle.startup_results[1].ready);
-        assert!(!bundle.startup_results[1].is_critical());
+        assert!(bundle.startup_results[1].ready);
+        assert!(!bundle.startup_results[2].ready);
+        assert!(!bundle.startup_results[2].is_critical());
     }
 
     #[test]
     fn bootstrap_failure_records_all_storage_statuses() {
         let statuses = failed_storage_startup_results("database unavailable");
-        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses.len(), 3);
         assert_eq!(statuses[0].name, "tasks");
         assert!(statuses[0].is_critical());
         assert!(!statuses[0].ready);
-        assert_eq!(statuses[1].name, "q_value_store");
+        assert_eq!(statuses[1].name, "eval_store");
         assert!(!statuses[1].is_critical());
         assert!(!statuses[1].ready);
+        assert_eq!(statuses[2].name, "q_value_store");
+        assert!(!statuses[2].is_critical());
+        assert!(!statuses[2].ready);
     }
 
     #[cfg(unix)]

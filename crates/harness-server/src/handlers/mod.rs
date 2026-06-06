@@ -2,6 +2,7 @@ pub mod classify;
 pub mod cross_review;
 pub mod dashboard;
 pub mod error;
+pub mod evals;
 pub mod exec;
 pub mod gc;
 pub mod health;
