@@ -12,8 +12,10 @@ use self::github_issue_completion::{
     github_issue_closed_decision, issue_implementation_missing_result_decision,
 };
 use self::pr_feedback_completion::{
-    local_review_decision_from_activity_result, pr_feedback_child_decision_from_activity_result,
-    pr_feedback_success_contract_error, pr_feedback_sweep_decision_from_activity_result,
+    local_review_decision_from_activity_result,
+    pr_feedback_blocking_signal_overrides_structured_ready,
+    pr_feedback_child_decision_from_activity_result, pr_feedback_success_contract_error,
+    pr_feedback_sweep_decision_from_activity_result,
 };
 use self::quality_gate_completion::{
     quality_gate_activity_matches, quality_gate_success_contract_error,
@@ -103,8 +105,15 @@ fn reduce_success(
             instance, event, result, &reason,
         ));
     }
+    let pr_feedback_blocker_overrides_structured_ready =
+        pr_feedback_blocking_signal_overrides_structured_ready(
+            instance,
+            result,
+            structured_decision.as_ref(),
+        );
     if let Some(decision) = structured_decision
         .as_ref()
+        .filter(|_| !pr_feedback_blocker_overrides_structured_ready)
         .filter(|decision| structured_decision_validates(instance, event, result, decision))
         .cloned()
     {

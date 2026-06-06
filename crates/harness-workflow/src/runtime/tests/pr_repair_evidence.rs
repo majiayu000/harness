@@ -123,6 +123,39 @@ fn structured_ready_decision_without_current_pr_snapshot_blocks() {
 }
 
 #[test]
+fn structured_ready_decision_with_blocking_signal_uses_blocking_feedback() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "awaiting_feedback",
+        "mark_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted both ready and blocking feedback.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_signal(ActivitySignal::new(
+        "FeedbackFound",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("blocking signal should override structured ready output");
+
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+}
+
+#[test]
 fn address_pr_feedback_success_without_repair_evidence_blocks() {
     let instance = pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(

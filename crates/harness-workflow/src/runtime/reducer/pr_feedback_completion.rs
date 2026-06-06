@@ -76,9 +76,10 @@ pub(super) fn pr_feedback_success_contract_error(
         );
     }
 
-    if readiness_claimed(result, structured_decision)
-        && pr_feedback_outcome_from_signals(result) != Some(PrFeedbackOutcome::BlockingFeedback)
-    {
+    if readiness_claimed(result, structured_decision) {
+        if pr_feedback_outcome_from_signals(result) == Some(PrFeedbackOutcome::BlockingFeedback) {
+            return None;
+        }
         if ready_snapshot_proves_pr_ready(result) {
             return None;
         }
@@ -88,6 +89,16 @@ pub(super) fn pr_feedback_success_contract_error(
     }
 
     None
+}
+
+pub(super) fn pr_feedback_blocking_signal_overrides_structured_ready(
+    instance: &WorkflowInstance,
+    result: &ActivityResult,
+    structured_decision: Option<&WorkflowDecision>,
+) -> bool {
+    github_issue_pr_feedback_activity_matches(instance, result)
+        && pr_feedback_outcome_from_signals(result) == Some(PrFeedbackOutcome::BlockingFeedback)
+        && structured_decision.is_some_and(structured_ready_decision)
 }
 
 pub(super) fn local_review_decision_from_activity_result(
@@ -254,9 +265,11 @@ fn readiness_claimed(
     structured_decision: Option<&WorkflowDecision>,
 ) -> bool {
     has_signal(result, "PrReadyToMerge")
-        || structured_decision.is_some_and(|decision| {
-            decision.next_state == "ready_to_merge" || decision.decision == "mark_ready_to_merge"
-        })
+        || structured_decision.is_some_and(structured_ready_decision)
+}
+
+fn structured_ready_decision(decision: &WorkflowDecision) -> bool {
+    decision.next_state == "ready_to_merge" || decision.decision == "mark_ready_to_merge"
 }
 
 fn ready_snapshot_proves_pr_ready(result: &ActivityResult) -> bool {
