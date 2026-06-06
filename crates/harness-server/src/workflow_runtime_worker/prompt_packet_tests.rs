@@ -1,5 +1,7 @@
 use super::*;
-use harness_workflow::runtime::{RuntimeKind, WorkflowSubject, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY};
+use harness_workflow::runtime::{
+    RuntimeKind, WorkflowSubject, PR_REPAIR_SNAPSHOT_ARTIFACT, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+};
 
 #[test]
 fn activity_result_schema_describes_issue_implementation_terminal_evidence_contract() {
@@ -67,11 +69,60 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
         "local_review_gate"
     );
+    assert_eq!(
+        schema["activity_contract"]["accepted_artifacts"][1],
+        PR_REPAIR_SNAPSHOT_ARTIFACT
+    );
+    assert_eq!(
+        schema["activity_contract"]["accepted_artifacts"][2],
+        ISSUE_STATE_ARTIFACT
+    );
+    assert_eq!(
+        schema["activity_contract"]["accepted_signals"][0],
+        ISSUE_CLOSED_SIGNAL
+    );
+    assert_eq!(
+        schema["activity_contract"]["success_requires"],
+        "pr_repair_snapshot_with_action_and_passing_validation_or_closed_issue_evidence"
+    );
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("IssueClosed"))
+    );
     assert!(schema["agent_summary_contract"]["must_include"]
         .as_array()
         .is_some_and(
             |items| items.contains(&json!("fresh PR state checked before final response"))
         ));
+    assert_eq!(
+        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required_unless"],
+        "IssueClosed/IssueAlreadyResolved signal or issue_state artifact proves the issue or PR is already closed/resolved."
+    );
+    assert_eq!(
+        schema["agent_summary_contract"]["artifacts"]["issue_state"]["required_when"],
+        "No repair is needed because the issue or PR is already closed/resolved."
+    );
+    assert_eq!(
+        schema["agent_summary_contract"]["signals"]["IssueClosed"],
+        "Use when the issue or PR is confirmed closed and no feedback repair is needed. Include state=closed or state=resolved plus issue_number or issue_url."
+    );
+    let snapshot_fields = schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]
+        ["fields"]
+        .as_array()
+        .expect("pr_repair_snapshot fields should be an array");
+    assert!(snapshot_fields.contains(&json!("head_sha")));
+    assert!(snapshot_fields.contains(&json!("head_oid")));
+    assert!(snapshot_fields.contains(&json!("action_taken")));
+    assert!(snapshot_fields.contains(&json!("no_code_change_reason")));
+    assert!(!snapshot_fields.contains(&json!("head_sha_or_head_oid")));
+    assert!(!snapshot_fields.contains(&json!("action_taken_or_no_code_change_reason")));
+    assert!(
+        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["field_contract"]
+            ["validation_commands"]
+            .as_str()
+            .is_some_and(|value| value.contains("successful status"))
+    );
 }
 
 #[test]
@@ -269,14 +320,35 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
         schema["transition_contract"]["on_succeeded"]["parent_propagation"],
         "The same activity result is propagated to the parent github_issue_pr workflow."
     );
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("next_state=ready_to_merge"))
+    );
+    assert!(
+        schema["transition_contract"]["structured_decision"]["description"]
+            .as_str()
+            .is_some_and(|value| value.contains("same pr_repair_snapshot evidence"))
+    );
     assert_eq!(
         schema["activity_contract"]["child_outcome_contract"],
         "pr_feedback_outcome"
     );
     assert_eq!(
         schema["agent_summary_contract"]["signals"]["PrReadyToMerge"],
-        "Use only when review, checks, and mergeability are all ready."
+        "Use only with pr_repair_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads for the final head."
     );
+    assert_eq!(
+        schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required_when"],
+        "Using PrReadyToMerge or mark_ready_to_merge."
+    );
+    let snapshot_fields = schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]
+        ["fields"]
+        .as_array()
+        .expect("pr_repair_snapshot fields should be an array");
+    assert!(snapshot_fields.contains(&json!("head_sha")));
+    assert!(snapshot_fields.contains(&json!("head_oid")));
+    assert!(!snapshot_fields.contains(&json!("head_sha_or_head_oid")));
     assert!(schema["workflow_decision_contract"]["allowed_transitions"]
         .as_array()
         .expect("allowed transitions should be an array")

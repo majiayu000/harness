@@ -37,6 +37,7 @@ use std::sync::{
 
 mod local_review;
 mod p1_followups;
+mod pr_repair_evidence;
 mod replay_determinism;
 mod retry;
 
@@ -935,6 +936,52 @@ fn runtime_completion_reducer_finishes_feedback_closed_issue_signal_without_pr()
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("feedback closed issue completion should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_finishes_succeeded_feedback_closed_issue_signal_without_pr() {
+    let instance = issue_instance("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Issue was closed while addressing PR feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue signal from successful feedback work should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkDone
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("successful feedback closed issue completion should validate");
 }
 
 #[test]

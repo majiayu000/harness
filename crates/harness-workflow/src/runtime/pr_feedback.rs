@@ -4,6 +4,7 @@ use super::model::{
 
 pub const PR_FEEDBACK_DEFINITION_ID: &str = "pr_feedback";
 pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
+pub const PR_REPAIR_SNAPSHOT_ARTIFACT: &str = "pr_repair_snapshot";
 pub const LOCAL_REVIEW_ACTIVITY: &str = "run_local_review";
 pub const LOCAL_REVIEW_PASSED_SIGNAL: &str = "LocalReviewPassed";
 pub const LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL: &str = "LocalReviewChangesRequested";
