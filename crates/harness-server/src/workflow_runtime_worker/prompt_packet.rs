@@ -510,7 +510,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "artifacts": {
                 "pr_repair_snapshot": {
                     "required": true,
-                    "fields": ["pr_number", "pr_url", "head_sha_or_head_oid", "observed_at", "changed_files", "action_taken_or_no_code_change_reason", "validation_commands"]
+                    "fields": ["pr_number", "pr_url", "head_sha", "head_oid", "observed_at", "changed_files", "action_taken", "no_code_change_reason", "validation_commands"]
                 }
             }
         }),
@@ -535,7 +535,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 },
                 "pr_repair_snapshot": {
                     "required_when": "Using PrReadyToMerge or mark_ready_to_merge.",
-                    "fields": ["pr_number", "pr_url", "head_sha_or_head_oid", "observed_at", "active_unresolved_review_threads_count", "status_check_rollup_state", "merge_state_status", "review_decision", "is_draft"]
+                    "fields": ["pr_number", "pr_url", "head_sha", "head_oid", "observed_at", "active_unresolved_review_threads_count", "status_check_rollup_state", "merge_state_status", "review_decision", "is_draft"]
                 }
             },
             "signals": {

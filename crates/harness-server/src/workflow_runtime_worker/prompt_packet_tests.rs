@@ -86,6 +86,16 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required"],
         true
     );
+    let snapshot_fields = schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]
+        ["fields"]
+        .as_array()
+        .expect("pr_repair_snapshot fields should be an array");
+    assert!(snapshot_fields.contains(&json!("head_sha")));
+    assert!(snapshot_fields.contains(&json!("head_oid")));
+    assert!(snapshot_fields.contains(&json!("action_taken")));
+    assert!(snapshot_fields.contains(&json!("no_code_change_reason")));
+    assert!(!snapshot_fields.contains(&json!("head_sha_or_head_oid")));
+    assert!(!snapshot_fields.contains(&json!("action_taken_or_no_code_change_reason")));
 }
 
 #[test]
@@ -295,6 +305,13 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
         schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required_when"],
         "Using PrReadyToMerge or mark_ready_to_merge."
     );
+    let snapshot_fields = schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]
+        ["fields"]
+        .as_array()
+        .expect("pr_repair_snapshot fields should be an array");
+    assert!(snapshot_fields.contains(&json!("head_sha")));
+    assert!(snapshot_fields.contains(&json!("head_oid")));
+    assert!(!snapshot_fields.contains(&json!("head_sha_or_head_oid")));
     assert!(schema["workflow_decision_contract"]["allowed_transitions"]
         .as_array()
         .expect("allowed transitions should be an array")
