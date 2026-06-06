@@ -202,6 +202,16 @@ Each run should produce a report with:
 - validation commands observed in task rounds or PR comments
 - final grade and blocker summary
 
+Each run must also write machine-readable eval artifacts:
+
+- `pr_repair_eval_input.json`: canonical `PrRepairEvalInput` consumed by
+  `harness-eval` and `/api/evals/runs/{run_id}/score`.
+- `quality_snapshot.json`: deterministic `QualitySnapshot` with hard gates,
+  score breakdown, grade caps, blocker summary, runtime evidence, and PR facts.
+
+The Markdown summary is an operator convenience layer. It must not be the source
+of truth for eval scoring, dashboards, or merge readiness.
+
 ## Interpretation Rules
 
 - A merged PR is not automatically high quality.

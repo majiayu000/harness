@@ -53,7 +53,21 @@ Acceptance:
 
 - `bash -n scripts/evaluate_pr_repair.sh` passes.
 - A task ID containing `/` is encoded as a single URL path segment.
-- Collect-only mode still writes the baseline report.
+- Collect-only mode writes `baseline_pr.json`, `final_pr.json`,
+  `pr_repair_eval_input.json`, `quality_snapshot.json`, and `summary.md`
+  without requiring a Harness server.
+- Live mode writes the same machine-readable eval input and quality snapshot
+  after terminal, failed-submission, missing-task-id, or timeout outcomes.
+- The quality snapshot is produced by `harness-eval`, not the Markdown report
+  heuristic.
+
+Implementation status:
+
+- Added `evaluate_pr_repair_submit.py` so non-2xx submission responses and
+  network errors are preserved as artifacts.
+- Added `score_pr_repair` ingestion in `harness-eval` so external GitHub
+  snapshots can be converted into canonical `PrRepairEvalInput` and scored
+  into `QualitySnapshot`.
 
 ### Issue 3: Persist eval runs in `harness-server`
 
