@@ -1,0 +1,20 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.6.34](https://github.com/majiayu000/harness/releases/tag/harness-eval-v0.6.34) - 2026-06-06
+
+### Added
+
+- *(eval)* summarize PR repair benchmarks ([#1256](https://github.com/majiayu000/harness/pull/1256))
+- *(eval)* emit PR repair quality snapshots ([#1253](https://github.com/majiayu000/harness/pull/1253))
+- *(eval)* add PR repair quality snapshots ([#1237](https://github.com/majiayu000/harness/pull/1237))
+
+### Other
+
+- Ingest PR repair reviewer judgments in eval scoring
