@@ -252,6 +252,8 @@ fn is_terminal_state(state: &str) -> bool {
             | "succeeded"
             | "success"
             | "passed"
+            | "ready_to_merge"
+            | "blocked"
             | "failed"
             | "cancelled"
             | "canceled"
@@ -478,5 +480,31 @@ mod tests {
         assert_eq!(snapshot.terminal_state, None);
         assert_eq!(snapshot.runtime_jobs.len(), 1);
         assert_eq!(snapshot.runtime_jobs[0].terminal_state, None);
+    }
+
+    #[test]
+    fn pr_repair_terminal_workflow_states_are_runtime_evidence() {
+        for state in ["ready_to_merge", "blocked"] {
+            let submission = json!({
+                "task_id": "task-1",
+                "workflow_id": "workflow-1"
+            });
+            let task_detail = json!({
+                "id": "task-1",
+                "status": state,
+                "workflow": {
+                    "id": "workflow-1",
+                    "state": state
+                }
+            });
+
+            let Some(snapshot) =
+                runtime_snapshot_from_values(&submission, &task_detail, "2026-06-06T00:01:00Z")
+            else {
+                panic!("runtime identity should produce a runtime snapshot");
+            };
+
+            assert_eq!(snapshot.terminal_state.as_deref(), Some(state));
+        }
     }
 }
