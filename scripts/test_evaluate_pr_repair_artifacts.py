@@ -86,6 +86,105 @@ class ArtifactHelperTests(unittest.TestCase):
                 "project_registry_preflight",
             )
 
+    def test_conflicting_eval_tasks_only_flags_active_matching_external_id(self) -> None:
+        response = {
+            "data": [
+                {
+                    "id": "active-other",
+                    "external_id": "pr-repair-eval:owner/repo#7:run:20260606T000000Z",
+                    "project": "/repo-a",
+                    "status": "waiting",
+                    "phase": "plan",
+                    "scheduler": {"authority_state": "queued"},
+                },
+                {
+                    "id": "terminal-same",
+                    "external_id": "pr-repair-eval:owner/repo#7:run:20260606T000100Z",
+                    "project": "/repo-b",
+                    "status": "cancelled",
+                    "phase": "terminal",
+                    "scheduler": {"authority_state": "cancelled"},
+                },
+                {
+                    "id": "terminal-workflow-same",
+                    "external_id": "pr-repair-eval:owner/repo#7:run:20260606T000150Z",
+                    "project": "/repo-b",
+                    "status": "waiting",
+                    "phase": "implement",
+                    "workflow": {"state": "ready_to_merge"},
+                    "scheduler": {"authority_state": "queued"},
+                },
+                {
+                    "id": "active-different",
+                    "external_id": "pr-repair-eval:owner/repo#8",
+                    "project": "/repo-c",
+                    "status": "waiting",
+                    "phase": "plan",
+                    "scheduler": {"authority_state": "queued"},
+                },
+            ]
+        }
+
+        conflicts = MODULE.conflicting_eval_tasks(
+            response,
+            external_id="pr-repair-eval:owner/repo#7:run:20260606T000200Z",
+            target_prefix="pr-repair-eval:owner/repo#7",
+        )
+
+        self.assertEqual([task["id"] for task in conflicts], ["active-other"])
+
+    def test_merge_runtime_tree_adds_runtime_jobs_to_task_detail(self) -> None:
+        task_detail = {
+            "id": "task-1",
+            "status": "done",
+            "workflow": {"id": "workflow-1", "state": "done"},
+        }
+        runtime_tree = {
+            "workflows": [
+                {
+                    "workflow": {
+                        "id": "workflow-1",
+                        "state": "done",
+                        "project_id": "/repo",
+                        "data": {"task_id": "task-1", "task_ids": ["task-1"]},
+                    },
+                    "commands": [
+                        {
+                            "runtime_jobs": {
+                                "id": "malformed-job-container",
+                            }
+                        },
+                        {
+                            "runtime_jobs": [
+                                {
+                                    "id": "job-1",
+                                    "status": "succeeded",
+                                    "output": {
+                                        "activity": "implement_prompt",
+                                        "artifacts": [{"artifact_type": "runtime_turn"}],
+                                    },
+                                }
+                            ]
+                        }
+                    ],
+                    "children": [],
+                }
+            ]
+        }
+
+        merged = MODULE.merge_runtime_tree_data(
+            task_detail,
+            runtime_tree,
+            workflow_id="workflow-1",
+            task_id="task-1",
+        )
+
+        self.assertEqual(merged["runtime_tree_artifact"]["status"], "matched")
+        self.assertEqual(merged["runtime_jobs"][0]["runtime_job_id"], "job-1")
+        self.assertEqual(merged["runtime_jobs"][0]["artifact_count"], 1)
+        self.assertEqual(merged["runtime_jobs"][0]["terminal_state"], "succeeded")
+        self.assertEqual(merged["latest_activity"], "implement_prompt")
+
     def test_final_report_uses_quality_snapshot_grade_and_blockers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

@@ -13,6 +13,26 @@ from evaluate_pr_repair_submit import write_json
 
 JsonObject = dict[str, Any]
 
+TERMINAL_TASK_STATES = {
+    "blocked",
+    "cancelled",
+    "canceled",
+    "done",
+    "failed",
+    "passed",
+    "ready_to_merge",
+    "success",
+    "succeeded",
+}
+
+ACTIVE_SCHEDULER_STATES = {
+    "awaiting_dependencies",
+    "dispatching",
+    "pending",
+    "queued",
+    "running",
+}
+
 
 def read_json(path: Path, *, required: bool = True) -> Any:
     try:
@@ -81,6 +101,119 @@ def write_preflight_failure(args: argparse.Namespace) -> int:
     }
     write_json(str(args.submission), submission)
     write_json(str(args.task_detail), task_detail)
+    return 0
+
+
+def normalized_state(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def terminal_state_from_task(task: JsonObject) -> str:
+    workflow = task.get("workflow")
+    workflow_state = ""
+    if isinstance(workflow, dict):
+        workflow_state = normalized_state(workflow.get("state") or workflow.get("status"))
+    candidates = [
+        workflow_state,
+        normalized_state(task.get("workflow_state")),
+        normalized_state(task.get("workflowStatus")),
+        normalized_state(task.get("status")),
+        normalized_state(task.get("state")),
+    ]
+    for candidate in candidates:
+        if candidate in TERMINAL_TASK_STATES:
+            return candidate
+    if normalized_state(task.get("phase")) == "terminal":
+        return "terminal"
+    return ""
+
+
+def task_is_active(task: JsonObject) -> bool:
+    if terminal_state_from_task(task):
+        return False
+
+    scheduler = task.get("scheduler")
+    scheduler_state = ""
+    if isinstance(scheduler, dict):
+        scheduler_state = normalized_state(scheduler.get("authority_state"))
+    if scheduler_state in ACTIVE_SCHEDULER_STATES:
+        return True
+    if scheduler_state in TERMINAL_TASK_STATES:
+        return False
+
+    phase = normalized_state(task.get("phase"))
+    return phase != "terminal"
+
+
+def conflicting_eval_tasks(
+    tasks_response: Any,
+    *,
+    external_id: str,
+    target_prefix: str | None = None,
+    task_id: str | None = None,
+    workflow_id: str | None = None,
+) -> list[JsonObject]:
+    tasks = tasks_response.get("data") if isinstance(tasks_response, dict) else None
+    if not isinstance(tasks, list):
+        raise SystemExit("Harness task list response is missing a data array")
+
+    conflicts = []
+    for item in tasks:
+        if not isinstance(item, dict):
+            continue
+        item_external_id = item.get("external_id")
+        target_matches = item_external_id == external_id
+        if target_prefix:
+            target_matches = target_matches or item_external_id == target_prefix
+            target_matches = target_matches or (
+                isinstance(item_external_id, str)
+                and item_external_id.startswith(f"{target_prefix}:")
+            )
+        if not target_matches:
+            continue
+        if task_id and item.get("id") == task_id:
+            continue
+        if workflow_id and item.get("workflow_id") == workflow_id:
+            continue
+        if task_is_active(item):
+            conflicts.append(item)
+    return conflicts
+
+
+def conflict_message(conflicts: list[JsonObject], project_root: str, external_id: str) -> str:
+    rows = []
+    for task in conflicts[:8]:
+        scheduler = task.get("scheduler")
+        scheduler_state = (
+            scheduler.get("authority_state") if isinstance(scheduler, dict) else "<unknown>"
+        )
+        rows.append(
+            "task_id={task_id} project={project} status={status} scheduler={scheduler} workflow={workflow}".format(
+                task_id=task.get("id") or task.get("task_id") or "<unknown>",
+                project=task.get("project") or "<unknown>",
+                status=task.get("status") or "<unknown>",
+                scheduler=scheduler_state,
+                workflow=task.get("workflow_id") or "<unknown>",
+            )
+        )
+    suffix = "; ".join(rows)
+    return (
+        f"Conflicting active PR repair eval already exists for {external_id}; "
+        f"target project={project_root}; conflicts: {suffix}"
+    )
+
+
+def check_conflicts(args: argparse.Namespace) -> int:
+    conflicts = conflicting_eval_tasks(
+        read_json(args.tasks_json),
+        external_id=args.external_id,
+        target_prefix=args.target_prefix or None,
+    )
+    if conflicts:
+        print(conflict_message(conflicts, args.project_root, args.external_id))
+        return 1
     return 0
 
 
@@ -340,6 +473,153 @@ def write_final_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def iter_workflow_nodes(node: Any):
+    if not isinstance(node, dict):
+        return
+    yield node
+    children = node.get("children")
+    if isinstance(children, list):
+        for child in children:
+            yield from iter_workflow_nodes(child)
+
+
+def find_workflow_node(
+    runtime_tree: Any,
+    workflow_id: str | None,
+    task_id: str | None,
+) -> JsonObject | None:
+    workflows = runtime_tree.get("workflows") if isinstance(runtime_tree, dict) else None
+    if not isinstance(workflows, list):
+        return None
+    for root in workflows:
+        for node in iter_workflow_nodes(root):
+            workflow = node.get("workflow")
+            if not isinstance(workflow, dict):
+                continue
+            workflow_data = workflow.get("data") if isinstance(workflow.get("data"), dict) else {}
+            task_ids = (
+                workflow_data.get("task_ids")
+                if isinstance(workflow_data.get("task_ids"), list)
+                else []
+            )
+            if workflow_id and workflow.get("id") == workflow_id:
+                return node
+            if task_id and (
+                workflow_data.get("task_id") == task_id
+                or workflow_data.get("submission_id") == task_id
+                or task_id in task_ids
+            ):
+                return node
+    return None
+
+
+def artifact_count(job: JsonObject) -> int:
+    output = job.get("output")
+    if isinstance(output, dict):
+        artifacts = output.get("artifacts")
+        if isinstance(artifacts, list):
+            return len(artifacts)
+    return 0
+
+
+def activity_from_job(job: JsonObject) -> str | None:
+    output = job.get("output")
+    if isinstance(output, dict) and isinstance(output.get("activity"), str):
+        return output["activity"]
+    input_value = job.get("input")
+    if isinstance(input_value, dict) and isinstance(input_value.get("activity"), str):
+        return input_value["activity"]
+    return None
+
+
+def runtime_jobs_from_node(node: JsonObject) -> tuple[list[JsonObject], str | None]:
+    jobs = []
+    latest_activity = None
+    commands = node.get("commands")
+    if not isinstance(commands, list):
+        return jobs, latest_activity
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        runtime_jobs = command.get("runtime_jobs")
+        if not isinstance(runtime_jobs, list):
+            continue
+        for job in runtime_jobs:
+            if not isinstance(job, dict):
+                continue
+            latest_activity = activity_from_job(job) or latest_activity
+            status = job.get("status") if isinstance(job.get("status"), str) else ""
+            jobs.append(
+                {
+                    "artifact_count": artifact_count(job),
+                    "id": job.get("id") or "",
+                    "runtime_job_id": job.get("id") or "",
+                    "state": status,
+                    "status": status,
+                    "terminal_state": (
+                        status if normalized_state(status) in TERMINAL_TASK_STATES else None
+                    ),
+                }
+            )
+    return jobs, latest_activity
+
+
+def merge_runtime_tree_data(
+    task_detail: JsonObject,
+    runtime_tree: Any,
+    *,
+    workflow_id: str | None,
+    task_id: str | None,
+) -> JsonObject:
+    node = find_workflow_node(runtime_tree, workflow_id, task_id)
+    artifact = {
+        "source": "workflow_runtime_tree",
+        "workflow_id": workflow_id,
+        "task_id": task_id,
+        "status": "workflow_not_found",
+        "runtime_job_count": 0,
+    }
+    if node is None:
+        task_detail["runtime_tree_artifact"] = artifact
+        return task_detail
+
+    workflow = node.get("workflow") if isinstance(node.get("workflow"), dict) else {}
+    jobs, latest_activity = runtime_jobs_from_node(node)
+    artifact["status"] = "matched"
+    artifact["runtime_job_count"] = len(jobs)
+    task_detail["runtime_tree_artifact"] = artifact
+    task_detail["runtime_jobs"] = jobs
+    if latest_activity and not task_detail.get("latest_activity"):
+        task_detail["latest_activity"] = latest_activity
+
+    detail_workflow = task_detail.get("workflow")
+    if not isinstance(detail_workflow, dict):
+        detail_workflow = {}
+    if workflow.get("id") and not detail_workflow.get("id"):
+        detail_workflow["id"] = workflow.get("id")
+    if workflow.get("state") and not detail_workflow.get("state"):
+        detail_workflow["state"] = workflow.get("state")
+    if workflow.get("project_id") and not detail_workflow.get("project_id"):
+        detail_workflow["project_id"] = workflow.get("project_id")
+    if detail_workflow:
+        task_detail["workflow"] = detail_workflow
+    return task_detail
+
+
+def merge_runtime_tree(args: argparse.Namespace) -> int:
+    raw_task_detail = read_json(args.task_detail, required=False)
+    task_detail = raw_task_detail if isinstance(raw_task_detail, dict) else {}
+    runtime_tree = read_json(args.runtime_tree)
+    merged = merge_runtime_tree_data(
+        task_detail,
+        runtime_tree,
+        workflow_id=args.workflow_id or None,
+        task_id=args.task_id or None,
+    )
+    write_json(str(args.task_detail), merged)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -356,6 +636,20 @@ def build_parser() -> argparse.ArgumentParser:
     failure.add_argument("--server-url", required=True)
     failure.add_argument("--error", required=True)
     failure.set_defaults(func=write_preflight_failure)
+
+    conflicts = sub.add_parser("check-conflicts")
+    conflicts.add_argument("--tasks-json", required=True, type=Path)
+    conflicts.add_argument("--project-root", required=True)
+    conflicts.add_argument("--external-id", required=True)
+    conflicts.add_argument("--target-prefix", default="")
+    conflicts.set_defaults(func=check_conflicts)
+
+    runtime_tree = sub.add_parser("merge-runtime-tree")
+    runtime_tree.add_argument("--task-detail", required=True, type=Path)
+    runtime_tree.add_argument("--runtime-tree", required=True, type=Path)
+    runtime_tree.add_argument("--workflow-id", default="")
+    runtime_tree.add_argument("--task-id", default="")
+    runtime_tree.set_defaults(func=merge_runtime_tree)
 
     collect = sub.add_parser("write-collect-report")
     collect.add_argument("--baseline", type=Path, required=True)
