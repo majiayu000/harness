@@ -500,7 +500,7 @@ fn field_bool(value: &Value, fields: &[&str]) -> Option<bool> {
 fn field_u64(value: &Value, fields: &[&str]) -> Option<u64> {
     fields
         .iter()
-        .find_map(|field| field_value(value, field).and_then(Value::as_u64))
+        .find_map(|field| field_value(value, field).and_then(json_value_u64))
 }
 
 fn field_value<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {

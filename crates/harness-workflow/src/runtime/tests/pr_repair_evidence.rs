@@ -264,6 +264,41 @@ fn ready_to_merge_signal_with_current_pr_snapshot_can_mark_ready() {
 }
 
 #[test]
+fn ready_to_merge_snapshot_accepts_quoted_pr_number() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent verified the PR is ready to merge.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": "77",
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads_count": 0,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quoted snapshot PR number should reduce");
+
+    assert_eq!(decision.decision, "mark_ready_to_merge");
+    assert_eq!(decision.next_state, "ready_to_merge");
+}
+
+#[test]
 fn ready_to_merge_snapshot_for_different_pr_blocks() {
     let instance = pr_workflow_state("awaiting_feedback");
     let result = ActivityResult::succeeded(
