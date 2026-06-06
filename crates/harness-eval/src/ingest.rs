@@ -1,6 +1,7 @@
 use crate::model::{
     ChangedFileSnapshot, CheckState, EvalScenario, EvalTarget, MergeState, PrRepairEvalInput,
-    PullRequestSnapshot, ReviewDecision, ReviewThreadSnapshot, RuntimeJobSnapshot, RuntimeSnapshot,
+    PullRequestSnapshot, ReviewDecision, ReviewThreadSnapshot, ReviewerJudgment,
+    RuntimeJobSnapshot, RuntimeSnapshot,
 };
 use serde_json::Value;
 
@@ -13,6 +14,7 @@ pub struct PrRepairEvalIngest<'a> {
     pub final_pr: &'a Value,
     pub submission: Option<&'a Value>,
     pub task_detail: Option<&'a Value>,
+    pub reviewer_judgment: Option<ReviewerJudgment>,
 }
 
 pub fn github_pr_snapshot_from_value(
@@ -147,7 +149,7 @@ pub fn pr_repair_eval_input_from_values(input: PrRepairEvalIngest<'_>) -> PrRepa
         final_pr: final_pr_snapshot,
         runtime,
         usage: Vec::new(),
-        reviewer_judgment: None,
+        reviewer_judgment: input.reviewer_judgment,
         created_unrelated_pr: false,
         scope_violations: Vec::new(),
     }
@@ -372,6 +374,7 @@ mod tests {
             final_pr: &pr,
             submission: None,
             task_detail: None,
+            reviewer_judgment: None,
         });
 
         assert_eq!(input.scenario, EvalScenario::ReadyNoopControl);
@@ -404,9 +407,47 @@ mod tests {
             final_pr: &pr,
             submission: None,
             task_detail: None,
+            reviewer_judgment: None,
         });
 
         assert_eq!(input.scenario, EvalScenario::PrRepair);
+    }
+
+    #[test]
+    fn preserves_reviewer_judgment_from_ingest() {
+        let pr = json!({
+            "number": 7,
+            "headRefName": "feature",
+            "headRefOid": "abc123",
+            "baseRefName": "main",
+            "isDraft": false,
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": {"state": "SUCCESS"},
+            "reviewThreads": {"nodes": []},
+            "files": {"nodes": []}
+        });
+        let judgment = ReviewerJudgment {
+            reviewer_kind: crate::model::ReviewerKind::Llm,
+            judged_head_oid: "abc123".to_string(),
+            code_quality_score: 92,
+            trajectory_score: 88,
+            findings: Vec::new(),
+            residual_risks: Vec::new(),
+        };
+
+        let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+            repo: "owner/repo",
+            pr_number: 7,
+            baseline_collected_at: "2026-06-06T00:00:00Z",
+            final_collected_at: "2026-06-06T00:01:00Z",
+            baseline: &pr,
+            final_pr: &pr,
+            submission: None,
+            task_detail: None,
+            reviewer_judgment: Some(judgment.clone()),
+        });
+
+        assert_eq!(input.reviewer_judgment, Some(judgment));
     }
 
     #[test]
@@ -435,6 +476,7 @@ mod tests {
             final_pr: &pr,
             submission: None,
             task_detail: None,
+            reviewer_judgment: None,
         });
 
         assert_eq!(input.scenario, EvalScenario::PrRepair);

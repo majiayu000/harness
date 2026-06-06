@@ -1,4 +1,6 @@
-use harness_eval::{pr_repair_eval_input_from_values, score_pr_repair_eval, PrRepairEvalIngest};
+use harness_eval::{
+    pr_repair_eval_input_from_values, score_pr_repair_eval, PrRepairEvalIngest, ReviewerJudgment,
+};
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -14,6 +16,7 @@ struct Args {
     task_detail: Option<PathBuf>,
     baseline_collected_at: String,
     final_collected_at: String,
+    reviewer_judgment: Option<PathBuf>,
     input_output: Option<PathBuf>,
     snapshot_output: PathBuf,
 }
@@ -31,6 +34,13 @@ fn run() -> Result<(), String> {
     let final_pr = read_json(&args.final_pr)?;
     let submission = args.submission.as_ref().map(read_json).transpose()?;
     let task_detail = args.task_detail.as_ref().map(read_json).transpose()?;
+    let reviewer_judgment = args
+        .reviewer_judgment
+        .as_ref()
+        .map(read_json)
+        .transpose()?
+        .map(parse_reviewer_judgment)
+        .transpose()?;
     let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
         repo: &args.repo,
         pr_number: args.pr_number,
@@ -40,6 +50,7 @@ fn run() -> Result<(), String> {
         final_pr: &final_pr,
         submission: submission.as_ref(),
         task_detail: task_detail.as_ref(),
+        reviewer_judgment,
     });
     let snapshot = score_pr_repair_eval(input.clone()).map_err(|err| err.to_string())?;
 
@@ -87,6 +98,12 @@ where
             "--final-collected-at" => {
                 parsed.final_collected_at = required_value(&mut args, "--final-collected-at")?;
             }
+            "--reviewer-judgment" => {
+                parsed.reviewer_judgment = Some(PathBuf::from(required_value(
+                    &mut args,
+                    "--reviewer-judgment",
+                )?));
+            }
             "--input-output" => {
                 parsed.input_output =
                     Some(PathBuf::from(required_value(&mut args, "--input-output")?));
@@ -131,6 +148,10 @@ fn read_json(path: &PathBuf) -> Result<Value, String> {
     serde_json::from_str(&body).map_err(|err| format!("failed to parse {}: {err}", path.display()))
 }
 
+fn parse_reviewer_judgment(value: Value) -> Result<ReviewerJudgment, String> {
+    serde_json::from_value(value).map_err(|err| format!("failed to parse reviewer judgment: {err}"))
+}
+
 fn write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
     let body = serde_json::to_string_pretty(value).map_err(|err| err.to_string())?;
     fs::write(path, format!("{body}\n"))
@@ -138,5 +159,42 @@ fn write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "Usage: score_pr_repair --repo OWNER/REPO --pr N --baseline baseline_pr.json --final final_pr.json --baseline-collected-at RFC3339 --final-collected-at RFC3339 --snapshot-output quality_snapshot.json [--submission submission.json --task-detail task_detail_final.json --input-output pr_repair_eval_input.json]".to_string()
+    "Usage: score_pr_repair --repo OWNER/REPO --pr N --baseline baseline_pr.json --final final_pr.json --baseline-collected-at RFC3339 --final-collected-at RFC3339 --snapshot-output quality_snapshot.json [--submission submission.json --task-detail task_detail_final.json --reviewer-judgment reviewer_judgment.json --input-output pr_repair_eval_input.json]".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_accepts_reviewer_judgment_path() {
+        let args = parse_args(
+            [
+                "--repo",
+                "owner/repo",
+                "--pr",
+                "7",
+                "--baseline",
+                "baseline.json",
+                "--final",
+                "final.json",
+                "--baseline-collected-at",
+                "2026-06-06T00:00:00Z",
+                "--final-collected-at",
+                "2026-06-06T00:01:00Z",
+                "--snapshot-output",
+                "quality.json",
+                "--reviewer-judgment",
+                "reviewer_judgment.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap_or_else(|err| panic!("args should parse: {err}"));
+
+        assert_eq!(
+            args.reviewer_judgment,
+            Some(PathBuf::from("reviewer_judgment.json"))
+        );
+    }
 }

@@ -17,6 +17,8 @@ Options:
   --max-rounds N          Structured Harness round bound and task prompt guidance. Default: 2
   --max-turns N           Structured Harness turn bound and task prompt guidance. Default: 6
   --max-budget-usd N      Optional Harness max budget in USD.
+  --reviewer-judgment PATH
+                          Optional ReviewerJudgment JSON for the final PR head.
   --poll-secs N           Poll interval for GET /tasks/{id}. Default: 30
   --timeout-secs N        Overall task poll timeout. Default: 7200
   -h, --help              Show this help.
@@ -46,6 +48,7 @@ WAIT_SECS=10
 MAX_ROUNDS=2
 MAX_TURNS=6
 MAX_BUDGET_USD=""
+REVIEWER_JUDGMENT_JSON=""
 POLL_SECS=30
 TIMEOUT_SECS=7200
 
@@ -89,6 +92,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --max-budget-usd)
       MAX_BUDGET_USD="${2:-}"
+      shift 2
+      ;;
+    --reviewer-judgment)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --reviewer-judgment requires a file path" >&2
+        exit 2
+      fi
+      if [[ ! -f "$2" ]]; then
+        echo "Error: reviewer judgment file does not exist: $2" >&2
+        exit 2
+      fi
+      REVIEWER_JUDGMENT_JSON="$2"
       shift 2
       ;;
     --poll-secs)
@@ -518,6 +533,9 @@ write_quality_snapshot() {
   fi
   if [[ -s "$task_detail" ]]; then
     args+=(--task-detail "$task_detail")
+  fi
+  if [[ -n "$REVIEWER_JUDGMENT_JSON" ]]; then
+    args+=(--reviewer-judgment "$REVIEWER_JUDGMENT_JSON")
   fi
   cargo "${args[@]}"
 }
