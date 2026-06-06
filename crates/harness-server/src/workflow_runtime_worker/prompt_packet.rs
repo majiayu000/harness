@@ -1,11 +1,12 @@
 use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
     ActivityArtifact, DecisionValidator, RuntimeJob, RuntimeProfile, WorkflowInstance,
-    ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT,
-    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL,
-    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
+    ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT,
+    ISSUE_PLAN_READY_SIGNAL, ISSUE_STATE_ARTIFACT, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
+    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -303,6 +304,20 @@ fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionVali
 
 fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Value {
     match (workflow_definition, activity) {
+        ("github_issue_pr", ISSUE_PLAN_ACTIVITY) => json!({
+            "on_succeeded": {
+                "reducer_next_state": "implementing",
+                "accepted_signals": [ISSUE_PLAN_READY_SIGNAL],
+                "accepted_artifacts": [ISSUE_PLAN_ARTIFACT],
+                "success_requires": "A succeeded plan_issue result MUST include an issue_plan artifact or IssuePlanReady signal. Empty success is blocked.",
+                "required_summary": "Describe the planned repair slice, target files, validation plan, and blockers without editing repository files."
+            },
+            "follow_up_event": "Harness enqueues implement_issue with the issue_plan payload after this activity succeeds.",
+            "on_failed": {
+                "reducer_next_state": "failed_or_retry",
+                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+            }
+        }),
         ("github_issue_pr", "replan_issue") => json!({
             "on_succeeded": {
                 "reducer_next_state": "implementing",
@@ -472,6 +487,19 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
 
 fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
     match (workflow_definition, activity) {
+        ("github_issue_pr", ISSUE_PLAN_ACTIVITY) => json!({
+            "must_include": ["task classification", "minimal implementation slice", "target files or explicit unknown", "validation plan", "blockers or explicit none"],
+            "must_not_include": ["repository code changes", "workflow table mutations", "PR creation", "merge readiness claims"],
+            "artifacts": {
+                "issue_plan": {
+                    "required": true,
+                    "fields": ["summary", "task_class", "target_files", "validation_plan", "blockers"]
+                }
+            },
+            "signals": {
+                "IssuePlanReady": "Use when the issue has a coherent implementation plan. Include summary, task_class, target_files, validation_plan, and blockers if any."
+            }
+        }),
         ("github_issue_pr", "implement_issue") => json!({
             "must_include": ["changed files", "validation commands", "PR URL, closed issue evidence, or blocker"],
             "must_not_include": ["workflow table mutations", "unverified merge claims"],

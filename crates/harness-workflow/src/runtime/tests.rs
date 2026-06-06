@@ -22,9 +22,10 @@ use super::{
     RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowDecisionTransition,
     WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
     PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
-    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
+    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -35,6 +36,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+mod issue_planning;
 mod local_review;
 mod p1_followups;
 mod pr_repair_evidence;
@@ -91,8 +93,41 @@ fn project_issue_instance(project_id: &str, issue_number: u64, state: &str) -> W
     }))
 }
 
+fn runtime_completion_event(
+    instance: &WorkflowInstance,
+    activity: &str,
+    activity_result: ActivityResult,
+) -> WorkflowEvent {
+    WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": WorkflowCommand::enqueue_activity(activity, "activity-1"),
+        "runtime_job_id": "job-1",
+        "activity_result": activity_result,
+    }))
+}
+
+fn pr_repair_snapshot_artifact(payload: serde_json::Value) -> ActivityArtifact {
+    ActivityArtifact::new(PR_REPAIR_SNAPSHOT_ARTIFACT, payload)
+}
+
+fn changed_files_pr_repair_snapshot_artifact() -> ActivityArtifact {
+    pr_repair_snapshot_artifact(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "head_oid": "head-after-repair",
+        "changed_files": ["src/lib.rs"],
+        "validation_commands": ["cargo test -p harness-workflow pr_repair_evidence"]
+    }))
+}
+
 #[test]
-fn issue_submission_decision_starts_discovered_issue_implementation() {
+fn issue_submission_decision_starts_discovered_issue_planning() {
     let labels = vec!["bug".to_string(), "p1".to_string()];
     let instance = issue_instance("discovered");
     let output = build_issue_submission_decision(
@@ -109,20 +144,17 @@ fn issue_submission_decision_starts_discovered_issue_implementation() {
         },
     );
 
-    assert_eq!(
-        output.action,
-        IssueSubmissionWorkflowAction::RunImplementation
-    );
+    assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
     assert_eq!(output.decision.decision, "submit_issue");
-    assert_eq!(output.decision.next_state, "implementing");
+    assert_eq!(output.decision.next_state, "planning");
     assert_eq!(output.decision.commands.len(), 1);
     assert_eq!(
         output.decision.commands[0].activity_name(),
-        Some("implement_issue")
+        Some("plan_issue")
     );
     assert_eq!(
         output.decision.commands[0].dedupe_key,
-        "issue-submit:owner/repo:issue:123:task:task-1:implement"
+        "issue-submit:owner/repo:issue:123:task:task-1:plan"
     );
     assert_eq!(
         output.decision.commands[0].command["additional_prompt"],

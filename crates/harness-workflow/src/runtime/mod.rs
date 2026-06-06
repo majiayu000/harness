@@ -36,7 +36,7 @@ pub use model::{
 };
 pub use plan_issue::{
     build_plan_issue_decision, PlanIssueDecisionInput, PlanIssueDecisionOutput,
-    PlanIssueWorkflowAction,
+    PlanIssueWorkflowAction, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL,
 };
 pub use pr_feedback::{
     build_local_review_completed_decision, build_local_review_request_decision,

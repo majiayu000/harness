@@ -1,4 +1,5 @@
 mod github_issue_completion;
+mod plan_issue_completion;
 mod pr_feedback_completion;
 mod quality_gate_completion;
 mod repo_backlog_candidates;
@@ -11,6 +12,7 @@ use self::github_issue_completion::{
     closed_issue_evidence_from_activity_result_value, closed_issue_evidence_from_value,
     github_issue_closed_decision, issue_implementation_missing_result_decision,
 };
+use self::plan_issue_completion::issue_plan_decision_from_activity_result;
 use self::pr_feedback_completion::{
     local_review_decision_from_activity_result,
     pr_feedback_blocking_signal_overrides_structured_ready,
@@ -99,6 +101,9 @@ fn reduce_success(
 ) -> Option<WorkflowDecision> {
     let structured_decision = workflow_decision_from_activity_result(event, result);
     if let Some(decision) = github_issue_closed_decision(instance, event, result) {
+        return Some(decision);
+    }
+    if let Some(decision) = issue_plan_decision_from_activity_result(instance, event, result) {
         return Some(decision);
     }
     if let Some(reason) =
