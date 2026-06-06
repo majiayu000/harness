@@ -362,12 +362,12 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "reducer_next_state": "feedback_found_or_no_actionable_feedback_or_ready_to_merge_from_signals",
                 "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
                 "accepted_artifacts": ["workflow_decision", PR_REPAIR_SNAPSHOT_ARTIFACT],
-                "success_requires": "PrReadyToMerge requires pr_repair_snapshot with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads.",
+                "success_requires": "PrReadyToMerge or any workflow_decision with next_state=ready_to_merge requires pr_repair_snapshot with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads.",
                 "parent_propagation": "The same activity result is propagated to the parent github_issue_pr workflow."
             },
             "structured_decision": {
                 "optional": true,
-                "description": "A workflow_decision artifact may update the pr_feedback child workflow, but signals are sufficient."
+                "description": "A workflow_decision artifact may update the pr_feedback child workflow, but ready_to_merge workflow_decisions still require the same pr_repair_snapshot evidence as PrReadyToMerge signals."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",

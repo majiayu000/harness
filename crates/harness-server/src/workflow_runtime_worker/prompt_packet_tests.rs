@@ -320,6 +320,16 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
         schema["transition_contract"]["on_succeeded"]["parent_propagation"],
         "The same activity result is propagated to the parent github_issue_pr workflow."
     );
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("next_state=ready_to_merge"))
+    );
+    assert!(
+        schema["transition_contract"]["structured_decision"]["description"]
+            .as_str()
+            .is_some_and(|value| value.contains("same pr_repair_snapshot evidence"))
+    );
     assert_eq!(
         schema["activity_contract"]["child_outcome_contract"],
         "pr_feedback_outcome"
