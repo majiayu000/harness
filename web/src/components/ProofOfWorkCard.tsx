@@ -1,4 +1,4 @@
-import { workflowLabel } from "@/lib/format";
+import { formatSnakeLabel, shortSha, workflowLabel } from "@/lib/format";
 import type { FullTask, QualitySnapshotRecord, TaskArtifact, TaskPrompt } from "@/types";
 
 interface Props {
@@ -27,15 +27,6 @@ function elapsedTime(createdAt: string | null, completedAt: string | undefined):
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-}
-
-function formatLabel(value: string): string {
-  return value.replaceAll("_", " ");
-}
-
-function shortSha(value: string | null | undefined): string {
-  if (!value) return "N/A";
-  return value.length > 12 ? value.slice(0, 12) : value;
 }
 
 export function ProofOfWorkCard({
@@ -93,7 +84,7 @@ export function ProofOfWorkCard({
                   Grade {snapshot.final_grade}
                 </span>
                 <span>Score: {snapshot.final_score}/100</span>
-                <span>Run: {formatLabel(snapshot.run_mode)}</span>
+                <span>Run: {formatSnakeLabel(snapshot.run_mode)}</span>
               </div>
               <div className="flex flex-wrap gap-2 text-ink-2">
                 <span>Head: {shortSha(snapshot.final_pr?.head_oid)}</span>
@@ -109,7 +100,7 @@ export function ProofOfWorkCard({
                 <div className="flex flex-col gap-1 text-ink-2">
                   {failedGates.slice(0, 3).map((gate) => (
                     <div key={gate.name}>
-                      {formatLabel(gate.name)}: {gate.message}
+                      {formatSnakeLabel(gate.name)}: {gate.message}
                     </div>
                   ))}
                 </div>
