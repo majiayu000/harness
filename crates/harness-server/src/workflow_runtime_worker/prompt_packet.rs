@@ -3,9 +3,9 @@ use harness_workflow::runtime::{
     ActivityArtifact, DecisionValidator, RuntimeJob, RuntimeProfile, WorkflowInstance,
     ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT,
     PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL,
+    PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL,
     QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL,
+    QUALITY_PASSED_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -344,9 +344,9 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "derived_from_structured_decision_or_signals",
                 "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
-                "accepted_artifacts": ["workflow_decision", PR_REPAIR_SNAPSHOT_ARTIFACT],
-                "success_requires": "PrReadyToMerge or mark_ready_to_merge requires pr_repair_snapshot with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads.",
-                "required_summary": "Describe inspected PR feedback, review state, checks, mergeability, draft state, unresolved review threads, and next action."
+                "accepted_artifacts": ["workflow_decision", SERVER_PR_SNAPSHOT_ARTIFACT, PR_FEEDBACK_SNAPSHOT_ARTIFACT],
+                "success_requires": "PrReadyToMerge or mark_ready_to_merge requires server_pr_snapshot collected by Harness with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads.",
+                "required_summary": "Describe inspected PR feedback, review state, checks, mergeability, draft state, unresolved review threads, snapshot source, and next action."
             },
             "structured_decision": {
                 "preferred": true,
@@ -361,13 +361,13 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "feedback_found_or_no_actionable_feedback_or_ready_to_merge_from_signals",
                 "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
-                "accepted_artifacts": ["workflow_decision", PR_REPAIR_SNAPSHOT_ARTIFACT],
-                "success_requires": "PrReadyToMerge or any workflow_decision with next_state=ready_to_merge requires pr_repair_snapshot with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads.",
+                "accepted_artifacts": ["workflow_decision", SERVER_PR_SNAPSHOT_ARTIFACT, PR_FEEDBACK_SNAPSHOT_ARTIFACT],
+                "success_requires": "PrReadyToMerge or any workflow_decision with next_state=ready_to_merge requires server_pr_snapshot collected by Harness with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads.",
                 "parent_propagation": "The same activity result is propagated to the parent github_issue_pr workflow."
             },
             "structured_decision": {
                 "optional": true,
-                "description": "A workflow_decision artifact may update the pr_feedback child workflow, but ready_to_merge workflow_decisions still require the same pr_repair_snapshot evidence as PrReadyToMerge signals."
+                "description": "A workflow_decision artifact may update the pr_feedback child workflow, but ready_to_merge workflow_decisions still require the same server_pr_snapshot evidence as PrReadyToMerge signals."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -538,22 +538,28 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
         ("github_issue_pr", "sweep_pr_feedback")
         | ("github_issue_pr", PR_FEEDBACK_INSPECT_ACTIVITY)
         | (PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY) => json!({
-            "must_include": ["PR comments reviewed", "review states", "check status", "mergeability", "next workflow action"],
+            "server_owned": true,
+            "must_include": ["server-owned PR snapshot", "review states", "check status", "mergeability", "next workflow action"],
             "must_not_include": ["repository code changes", "workflow table mutations", "unverified approval claims"],
             "artifacts": {
                 "workflow_decision": {
-                    "preferred": true,
+                    "optional": true,
                     "allowed_decisions": ["address_pr_feedback", "wait_for_pr_feedback", "mark_ready_to_merge"]
                 },
-                "pr_repair_snapshot": {
+                "server_pr_snapshot": {
                     "required_when": "Using PrReadyToMerge or mark_ready_to_merge.",
-                    "fields": ["pr_number", "pr_url", "head_sha", "head_oid", "observed_at", "active_unresolved_review_threads_count", "status_check_rollup_state", "merge_state_status", "review_decision", "is_draft"]
+                    "source": "Harness server GitHub GraphQL collector",
+                    "fields": ["schema", "snapshot_source", "pr_number", "pr_url", "head_oid", "observed_at", "active_unresolved_review_threads", "active_unresolved_review_threads_count", "review_threads_complete", "status_check_rollup_state", "merge_state_status", "review_decision", "is_draft", "changed_files"]
+                },
+                "pr_feedback_snapshot": {
+                    "required_when": "Harness server emits normalized PR feedback evidence.",
+                    "source": "Normalized view of server_pr_snapshot."
                 }
             },
             "signals": {
                 "FeedbackFound": "Use when actionable feedback, requested changes, or failed checks require a fix round.",
                 "NoFeedbackFound": "Use when no actionable feedback is present yet.",
-                "PrReadyToMerge": "Use only with pr_repair_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, and zero active unresolved review threads for the final head."
+                "PrReadyToMerge": "Use only with server_pr_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads for the final head."
             }
         }),
         ("repo_backlog", "poll_repo_backlog") => json!({

@@ -3,6 +3,7 @@ mod activity_result;
 mod child_workflow;
 mod data_helpers;
 mod executor;
+mod pr_feedback_inspection;
 mod prompt_packet;
 mod runtime_profile;
 mod workspace;

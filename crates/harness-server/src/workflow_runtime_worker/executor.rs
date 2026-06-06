@@ -19,6 +19,9 @@ use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
     prompt_task_request_for_job, PromptTaskRequest,
 };
+use super::pr_feedback_inspection::{
+    execute_pr_feedback_inspection, is_server_owned_pr_feedback_inspection,
+};
 use super::prompt_packet::{
     build_runtime_job_prompt, build_runtime_prompt_packet, prompt_packet_digest,
 };
@@ -55,7 +58,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             }
         }
         if let Some(result) = self
-            .execute_builtin_lifecycle_activity(&job, workflow.as_ref())
+            .execute_server_owned_activity(&job, workflow.as_ref())
             .await?
         {
             return Ok(result);
@@ -215,7 +218,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         store.get_instance(workflow_id).await
     }
 
-    async fn execute_builtin_lifecycle_activity(
+    async fn execute_server_owned_activity(
         &self,
         job: &RuntimeJob,
         parent: Option<&WorkflowInstance>,
@@ -230,6 +233,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             "recover_issue_workflow" => Ok(Some(
                 execute_recover_issue_workflow(self.state, job, parent).await?,
             )),
+            activity if activity == harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY => Ok(
+                Some(execute_pr_feedback_inspection(self.state, job, parent).await),
+            ),
             _ => Ok(None),
         }
     }
@@ -300,7 +306,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
-        !is_builtin_lifecycle_activity(job)
+        !is_builtin_lifecycle_activity(job) && !is_server_owned_pr_feedback_inspection(job)
     }
 
     async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
