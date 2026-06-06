@@ -95,7 +95,15 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --reviewer-judgment)
-      REVIEWER_JUDGMENT_JSON="${2:-}"
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --reviewer-judgment requires a file path" >&2
+        exit 2
+      fi
+      if [[ ! -f "$2" ]]; then
+        echo "Error: reviewer judgment file does not exist: $2" >&2
+        exit 2
+      fi
+      REVIEWER_JUDGMENT_JSON="$2"
       shift 2
       ;;
     --poll-secs)
