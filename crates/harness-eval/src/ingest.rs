@@ -154,7 +154,9 @@ pub fn pr_repair_eval_input_from_values(input: PrRepairEvalIngest<'_>) -> PrRepa
 }
 
 fn scenario_from_baseline(snapshot: &PullRequestSnapshot) -> EvalScenario {
-    if snapshot.active_unresolved_review_threads.is_empty()
+    if !snapshot.is_draft
+        && review_decision_allows_noop(snapshot.review_decision.as_ref())
+        && snapshot.active_unresolved_review_threads.is_empty()
         && snapshot.check_state == CheckState::Passing
         && snapshot.merge_state == MergeState::Clean
     {
@@ -162,6 +164,13 @@ fn scenario_from_baseline(snapshot: &PullRequestSnapshot) -> EvalScenario {
     } else {
         EvalScenario::PrRepair
     }
+}
+
+fn review_decision_allows_noop(review_decision: Option<&ReviewDecision>) -> bool {
+    !matches!(
+        review_decision,
+        Some(ReviewDecision::ChangesRequested | ReviewDecision::ReviewRequired)
+    )
 }
 
 fn runtime_jobs_from_value(value: &Value) -> Vec<RuntimeJobSnapshot> {
@@ -338,5 +347,67 @@ mod tests {
 
         assert_eq!(input.scenario, EvalScenario::ReadyNoopControl);
         assert!(input.runtime.is_none());
+    }
+
+    #[test]
+    fn review_required_baseline_is_pr_repair() {
+        let pr = json!({
+            "number": 7,
+            "url": "https://github.com/owner/repo/pull/7",
+            "title": "Example",
+            "baseRefName": "main",
+            "headRefName": "feature",
+            "headRefOid": "abc123",
+            "isDraft": false,
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": {"state": "SUCCESS"},
+            "reviewDecision": "CHANGES_REQUESTED",
+            "reviewThreads": {"nodes": []},
+            "files": {"nodes": []}
+        });
+
+        let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+            repo: "owner/repo",
+            pr_number: 7,
+            baseline_collected_at: "2026-06-06T00:00:00Z",
+            final_collected_at: "2026-06-06T00:01:00Z",
+            baseline: &pr,
+            final_pr: &pr,
+            submission: None,
+            task_detail: None,
+        });
+
+        assert_eq!(input.scenario, EvalScenario::PrRepair);
+    }
+
+    #[test]
+    fn draft_baseline_is_pr_repair() {
+        let pr = json!({
+            "number": 7,
+            "url": "https://github.com/owner/repo/pull/7",
+            "title": "Example",
+            "baseRefName": "main",
+            "headRefName": "feature",
+            "headRefOid": "abc123",
+            "isDraft": true,
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": {"state": "SUCCESS"},
+            "reviewDecision": "APPROVED",
+            "reviewThreads": {"nodes": []},
+            "files": {"nodes": []}
+        });
+
+        let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+            repo: "owner/repo",
+            pr_number: 7,
+            baseline_collected_at: "2026-06-06T00:00:00Z",
+            final_collected_at: "2026-06-06T00:01:00Z",
+            baseline: &pr,
+            final_pr: &pr,
+            submission: None,
+            task_detail: None,
+        });
+
+        assert_eq!(input.scenario, EvalScenario::PrRepair);
     }
 }
