@@ -148,8 +148,10 @@ pub enum EvalScenario {
 }
 ```
 
-`PrRepair` is the first scenario to implement. The other variants reserve the
-schema for future benchmark suites.
+`PrRepair` is the first scenario to implement. `ReadyNoopControl` requires a
+complete baseline `reviewThreads` enumeration; incomplete baseline review
+pagination is treated as repair work, not as a clean no-op control. The other
+variants reserve the schema for future benchmark suites.
 
 ### `EvalTarget`
 

@@ -240,6 +240,7 @@ fn scenario_from_baseline(snapshot: &PullRequestSnapshot) -> EvalScenario {
     if !snapshot.is_draft
         && review_decision_allows_noop(snapshot.review_decision.as_ref())
         && snapshot.active_unresolved_review_threads.is_empty()
+        && snapshot.review_threads_complete
         && snapshot.check_state == CheckState::Passing
         && snapshot.merge_state == MergeState::Clean
     {
@@ -461,8 +462,14 @@ mod tests {
             "isDraft": false,
             "mergeStateStatus": "CLEAN",
             "statusCheckRollup": {"state": "SUCCESS"},
-            "reviewThreads": {"nodes": []},
-            "files": {"nodes": []}
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": false},
+                "nodes": []
+            },
+            "files": {
+                "pageInfo": {"hasNextPage": false},
+                "nodes": []
+            }
         });
 
         let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
@@ -479,6 +486,41 @@ mod tests {
 
         assert_eq!(input.scenario, EvalScenario::ReadyNoopControl);
         assert!(input.runtime.is_none());
+    }
+
+    #[test]
+    fn incomplete_baseline_review_threads_is_pr_repair() {
+        let pr = json!({
+            "number": 7,
+            "headRefName": "ready",
+            "headRefOid": "same",
+            "baseRefName": "main",
+            "isDraft": false,
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": {"state": "SUCCESS"},
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": true},
+                "nodes": []
+            },
+            "files": {
+                "pageInfo": {"hasNextPage": false},
+                "nodes": []
+            }
+        });
+
+        let input = pr_repair_eval_input_from_values(PrRepairEvalIngest {
+            repo: "owner/repo",
+            pr_number: 7,
+            baseline_collected_at: "2026-06-06T00:00:00Z",
+            final_collected_at: "2026-06-06T00:01:00Z",
+            baseline: &pr,
+            final_pr: &pr,
+            submission: None,
+            task_detail: None,
+            reviewer_judgment: None,
+        });
+
+        assert_eq!(input.scenario, EvalScenario::PrRepair);
     }
 
     #[test]
