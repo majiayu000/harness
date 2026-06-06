@@ -100,8 +100,8 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
             HardGateName::RuntimeArtifactCompleteness,
             runtime_complete,
             Some(EvalGrade::B),
-            "runtime task, workflow, or job artifact is present",
-            "runtime artifact is missing or empty",
+            "usable runtime task, workflow, or job artifact is present",
+            "runtime artifact is missing, failed, or empty",
         ),
         reviewer_gate(&input),
     ];
@@ -179,13 +179,36 @@ fn branch_safe(input: &PrRepairEvalInput) -> bool {
 
 fn runtime_has_artifact(runtime: &RuntimeSnapshot) -> bool {
     let has_runtime_identity = runtime.task_id.is_some() && runtime.workflow_id.is_some();
+    if !has_runtime_identity || runtime_has_failed_terminal_state(runtime) {
+        return false;
+    }
+
     let has_terminal_or_job_evidence = runtime.terminal_state.is_some()
         || runtime
             .runtime_jobs
             .iter()
             .any(|job| job.artifact_count > 0 || job.terminal_state.is_some());
 
-    has_runtime_identity && has_terminal_or_job_evidence
+    has_terminal_or_job_evidence
+}
+
+fn runtime_has_failed_terminal_state(runtime: &RuntimeSnapshot) -> bool {
+    runtime
+        .terminal_state
+        .as_deref()
+        .is_some_and(is_failed_runtime_terminal_state)
+        || runtime.runtime_jobs.iter().any(|job| {
+            job.terminal_state
+                .as_deref()
+                .is_some_and(is_failed_runtime_terminal_state)
+        })
+}
+
+fn is_failed_runtime_terminal_state(state: &str) -> bool {
+    matches!(
+        state.trim().to_ascii_lowercase().as_str(),
+        "failed" | "cancelled" | "canceled" | "timed_out" | "timeout" | "errored" | "error"
+    )
 }
 
 fn gate(
@@ -510,6 +533,81 @@ mod tests {
         assert_eq!(gate.status, GateStatus::Fail);
         assert_eq!(gate.grade_cap, Some(EvalGrade::B));
         assert_eq!(snapshot.grade_cap, Some(EvalGrade::B));
+    }
+
+    #[test]
+    fn failed_runtime_terminal_states_cap_at_b() {
+        for state in [
+            "failed",
+            "cancelled",
+            "canceled",
+            "timed_out",
+            "timeout",
+            "errored",
+            "error",
+        ] {
+            let mut input = perfect_input();
+            let Some(runtime) = input.runtime.as_mut() else {
+                panic!("runtime should exist");
+            };
+            runtime.terminal_state = Some(state.to_string());
+            runtime.runtime_jobs[0].artifact_count = 1;
+            runtime.runtime_jobs[0].terminal_state = Some("succeeded".to_string());
+
+            let snapshot = match score_pr_repair_eval(input) {
+                Ok(snapshot) => snapshot,
+                Err(error) => panic!("score failed runtime input failed: {error}"),
+            };
+            let gate = find_gate(&snapshot, HardGateName::RuntimeArtifactCompleteness);
+
+            assert_eq!(gate.status, GateStatus::Fail);
+            assert_eq!(gate.grade_cap, Some(EvalGrade::B));
+            assert_eq!(snapshot.grade_cap, Some(EvalGrade::B));
+            assert_eq!(snapshot.final_grade, EvalGrade::B);
+        }
+    }
+
+    #[test]
+    fn failed_runtime_job_terminal_state_caps_at_b_even_with_artifacts() {
+        let mut input = perfect_input();
+        let Some(runtime) = input.runtime.as_mut() else {
+            panic!("runtime should exist");
+        };
+        runtime.terminal_state = Some("succeeded".to_string());
+        runtime.runtime_jobs[0].artifact_count = 1;
+        runtime.runtime_jobs[0].terminal_state = Some("failed".to_string());
+
+        let snapshot = match score_pr_repair_eval(input) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("score failed job runtime input failed: {error}"),
+        };
+        let gate = find_gate(&snapshot, HardGateName::RuntimeArtifactCompleteness);
+
+        assert_eq!(gate.status, GateStatus::Fail);
+        assert_eq!(gate.grade_cap, Some(EvalGrade::B));
+        assert_eq!(snapshot.grade_cap, Some(EvalGrade::B));
+    }
+
+    #[test]
+    fn auditable_runtime_terminal_states_count_as_runtime_evidence() {
+        for state in ["ready_to_merge", "blocked"] {
+            let mut input = perfect_input();
+            let Some(runtime) = input.runtime.as_mut() else {
+                panic!("runtime should exist");
+            };
+            runtime.terminal_state = Some(state.to_string());
+            runtime.runtime_jobs.clear();
+
+            let snapshot = match score_pr_repair_eval(input) {
+                Ok(snapshot) => snapshot,
+                Err(error) => panic!("score auditable runtime input failed: {error}"),
+            };
+            let gate = find_gate(&snapshot, HardGateName::RuntimeArtifactCompleteness);
+
+            assert_eq!(gate.status, GateStatus::Pass);
+            assert_eq!(gate.grade_cap, None);
+            assert_eq!(snapshot.grade_cap, None);
+        }
     }
 
     #[test]
