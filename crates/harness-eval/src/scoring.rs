@@ -34,7 +34,8 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
     let checks_passing = input.final_pr.check_state == CheckState::Passing;
     let mergeability_clean = input.final_pr.merge_state == MergeState::Clean;
     let review_threads_closed = input.final_pr.active_unresolved_review_threads.is_empty()
-        && input.final_pr.review_threads_complete;
+        && input.final_pr.review_threads_complete
+        && (input.scenario == EvalScenario::PrRepair || input.baseline_pr.review_threads_complete);
     let final_remote_evidence_complete =
         input.final_pr.review_threads_complete && input.final_pr.changed_files_complete;
     let runtime_complete = input.runtime.as_ref().is_some_and(runtime_has_artifact);
@@ -146,7 +147,6 @@ pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot,
         blocker_summary,
     })
 }
-
 fn target_matches_pr(input: &PrRepairEvalInput) -> Result<bool, ScoringError> {
     let EvalTarget::PullRequest {
         repo,

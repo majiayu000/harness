@@ -282,7 +282,7 @@ grade is capped even when other score dimensions look strong.
 | Head freshness | final evidence head vs final PR head | `C` |
 | Required checks | final check state for final head | `C` |
 | Mergeability clean | final merge state for final head | `C` |
-| Review-thread closure | final active unresolved threads | `C` |
+| Review-thread closure | final active unresolved threads plus required thread enumeration completeness | `C` |
 | Runtime artifact completeness | task/workflow/job snapshots | `B` |
 | Reviewer judgment freshness | reviewer head vs final PR head | `C`, or `B` when absent |
 | No destructive/unrelated scope | changed files and risk scanner | `F` |
@@ -578,6 +578,7 @@ Every failed or weak run should classify the first meaningful failure:
 `harness-eval` should have fixture-based unit tests:
 
 - score ready/no-op control without requiring a head change
+- fail ready/no-op control when baseline review-thread completeness is missing
 - fail wrong-target final snapshot
 - cap grade at `C` for unresolved active review threads
 - cap grade at `C` for stale-head validation
