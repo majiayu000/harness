@@ -321,8 +321,10 @@ fn eval_input(
             runtime_jobs: vec![RuntimeJobSnapshot {
                 runtime_job_id: "job-1".to_string(),
                 state: "completed".to_string(),
+                activity: Some("implement_issue".to_string()),
                 artifact_count: 1,
                 terminal_state: Some("succeeded".to_string()),
+                error_kind: None,
             }],
             latest_activity: Some("completed".to_string()),
             terminal_state: Some("succeeded".to_string()),

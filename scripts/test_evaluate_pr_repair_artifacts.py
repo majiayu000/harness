@@ -180,6 +180,9 @@ class ArtifactHelperTests(unittest.TestCase):
                                 {
                                     "id": "job-1",
                                     "status": "succeeded",
+                                    "activity_result_envelope": {
+                                        "final_result": {"error_kind": "configuration"}
+                                    },
                                     "output": {
                                         "activity": "implement_prompt",
                                         "artifacts": [{"artifact_type": "runtime_turn"}],
@@ -202,7 +205,9 @@ class ArtifactHelperTests(unittest.TestCase):
 
         self.assertEqual(merged["runtime_tree_artifact"]["status"], "matched")
         self.assertEqual(merged["runtime_jobs"][0]["runtime_job_id"], "job-1")
+        self.assertEqual(merged["runtime_jobs"][0]["activity"], "implement_prompt")
         self.assertEqual(merged["runtime_jobs"][0]["artifact_count"], 1)
+        self.assertEqual(merged["runtime_jobs"][0]["error_kind"], "configuration")
         self.assertEqual(merged["runtime_jobs"][0]["terminal_state"], "succeeded")
         self.assertEqual(merged["latest_activity"], "implement_prompt")
 
