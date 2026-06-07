@@ -274,6 +274,7 @@ fn runtime_jobs_from_value(value: &Value) -> Vec<RuntimeJobSnapshot> {
                 .or_else_empty(|| string_field(job, "runtimeJobId"))
                 .or_else_empty(|| string_field(job, "id")),
             state: string_field(job, "state").or_else_empty(|| string_field(job, "status")),
+            activity: optional_string_field(job, "activity"),
             artifact_count: job
                 .get("artifact_count")
                 .or_else(|| job.get("artifactCount"))
@@ -282,6 +283,11 @@ fn runtime_jobs_from_value(value: &Value) -> Vec<RuntimeJobSnapshot> {
             terminal_state: terminal_string_field(job, "terminal_state")
                 .or_else(|| terminal_string_field(job, "terminalState"))
                 .or_else(|| terminal_string_field(job, "status")),
+            error_kind: job
+                .get("error_kind")
+                .or_else(|| job.get("errorKind"))
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
         })
         .collect()
 }

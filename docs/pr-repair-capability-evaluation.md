@@ -107,7 +107,7 @@ Use the hard gates first, then score the successful run with this rubric:
 | Fix correctness and scope | 22 | Produces the smallest correct fix, preserves product behavior, avoids silent degradation, and does not introduce regression risk. |
 | Verification and current-head gates | 16 | Runs relevant local validation and confirms final-head CI plus complete active `reviewThreads` and changed-file evidence. |
 | Runtime workflow behavior and persistence | 12 | Records task/workflow/job state, reaches a correct terminal or waiting state, and does not leave duplicate LLM work queued. |
-| Cost and time efficiency | 8 | Completes within the expected turn/time envelope for the task class and exposes usage attribution. |
+| Cost and time efficiency | 8 | Completes within the expected turn/time envelope for the task class, exposes usage attribution, and avoids repeated failed runtime jobs, including `expired` jobs. Repeated non-retryable runtime failures such as `configuration` or `fatal` errors receive zero points for this dimension. |
 | Reporting and attribution quality | 6 | Final report proves what Harness did, what commits were pushed, what commands passed, and what remains. |
 
 ### Code Quality Subscore
@@ -224,6 +224,7 @@ Each run should produce a report with:
 - baseline and final `statusCheckRollup.state`
 - baseline and final active unresolved review-thread count
 - Harness `task_id`, `workflow_id`, and terminal state when available
+- Runtime job `activity`, terminal state, artifact count, and `error_kind` when available
 - elapsed time and configured turn/budget limits
 - changed files from the final PR diff
 - validation commands observed in task rounds or PR comments

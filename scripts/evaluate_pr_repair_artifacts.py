@@ -18,6 +18,7 @@ TERMINAL_TASK_STATES = {
     "cancelled",
     "canceled",
     "done",
+    "expired",
     "failed",
     "passed",
     "ready_to_merge",
@@ -533,6 +534,25 @@ def activity_from_job(job: JsonObject) -> str | None:
     return None
 
 
+def error_kind_from_job(job: JsonObject) -> str | None:
+    for key in ("error_kind", "errorKind"):
+        value = job.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    output = job.get("output")
+    if isinstance(output, dict):
+        value = output.get("error_kind") or output.get("errorKind")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    envelope = job.get("activity_result_envelope")
+    final_result = envelope.get("final_result") if isinstance(envelope, dict) else None
+    if isinstance(final_result, dict):
+        value = final_result.get("error_kind") or final_result.get("errorKind")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def runtime_jobs_from_node(node: JsonObject) -> tuple[list[JsonObject], str | None]:
     jobs = []
     latest_activity = None
@@ -548,11 +568,14 @@ def runtime_jobs_from_node(node: JsonObject) -> tuple[list[JsonObject], str | No
         for job in runtime_jobs:
             if not isinstance(job, dict):
                 continue
-            latest_activity = activity_from_job(job) or latest_activity
+            activity = activity_from_job(job)
+            latest_activity = activity or latest_activity
             status = job.get("status") if isinstance(job.get("status"), str) else ""
             jobs.append(
                 {
+                    "activity": activity,
                     "artifact_count": artifact_count(job),
+                    "error_kind": error_kind_from_job(job),
                     "id": job.get("id") or "",
                     "runtime_job_id": job.get("id") or "",
                     "state": status,

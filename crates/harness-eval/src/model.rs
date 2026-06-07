@@ -102,8 +102,23 @@ pub struct PullRequestSnapshot {
 pub struct RuntimeJobSnapshot {
     pub runtime_job_id: String,
     pub state: String,
+    #[serde(default)]
+    pub activity: Option<String>,
     pub artifact_count: u64,
     pub terminal_state: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<RuntimeErrorKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeErrorKind {
+    Retryable,
+    Timeout,
+    Fatal,
+    Configuration,
+    ExternalDependency,
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
