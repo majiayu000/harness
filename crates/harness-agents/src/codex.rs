@@ -224,6 +224,53 @@ fn codex_spawn_failure_message(
     )
 }
 
+fn codex_structured_error_from_stdout(stdout: &str) -> Option<String> {
+    parse_codex_exec_output(stdout).ok()?.structured_error
+}
+
+fn codex_structured_error(message: impl Into<String>) -> harness_core::error::HarnessError {
+    let message = format!("codex structured error: {}", message.into());
+    if harness_core::error::is_billing_failure_message(&message) {
+        return harness_core::error::HarnessError::BillingFailed(message);
+    }
+    if harness_core::error::is_quota_failure_message(&message) {
+        return harness_core::error::HarnessError::QuotaExhausted(message);
+    }
+    harness_core::error::HarnessError::AgentExecution(message)
+}
+
+fn codex_nonzero_exit_error(
+    status: std::process::ExitStatus,
+    stderr: &str,
+    structured_error: Option<&str>,
+) -> harness_core::error::HarnessError {
+    if let Some(message) = structured_error {
+        let mut error = codex_structured_error(format!("exit {status}: {message}"));
+        if matches!(error, harness_core::error::HarnessError::AgentExecution(_))
+            && !stderr.trim().is_empty()
+        {
+            error = harness_core::error::HarnessError::AgentExecution(format!(
+                "{error}; stderr=[{stderr}]"
+            ));
+        }
+        return error;
+    }
+
+    if harness_core::error::is_billing_failure_message(stderr) {
+        return harness_core::error::HarnessError::BillingFailed(format!(
+            "codex billing failure (exit {status}): {stderr}"
+        ));
+    }
+    if harness_core::error::is_quota_failure_message(stderr) {
+        return harness_core::error::HarnessError::QuotaExhausted(format!(
+            "codex quota exhausted (exit {status}): {stderr}"
+        ));
+    }
+    harness_core::error::HarnessError::AgentExecution(format!(
+        "codex exited with {status}: {stderr}"
+    ))
+}
+
 #[async_trait]
 impl CodeAgent for CodexAgent {
     fn name(&self) -> &str {
@@ -313,27 +360,17 @@ impl CodeAgent for CodexAgent {
         log_captured_stderr_diagnostics(&stderr, self.name());
 
         if !output.status.success() {
-            if harness_core::error::is_billing_failure_message(&stderr) {
-                return Err(harness_core::error::HarnessError::BillingFailed(format!(
-                    "codex billing failure (exit {}): {stderr}",
-                    output.status
-                )));
-            }
-            if harness_core::error::is_quota_failure_message(&stderr) {
-                return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
-                    "codex quota exhausted (exit {}): {stderr}",
-                    output.status
-                )));
-            }
-            return Err(harness_core::error::HarnessError::AgentExecution(format!(
-                "codex exited with {}: {stderr}",
-                output.status
-            )));
+            let structured_error = codex_structured_error_from_stdout(&stdout);
+            return Err(codex_nonzero_exit_error(
+                output.status,
+                &stderr,
+                structured_error.as_deref(),
+            ));
         }
 
         let parsed = parse_codex_exec_output(&stdout)?;
         if let Some(message) = parsed.structured_error {
-            return Err(harness_core::error::HarnessError::AgentExecution(message));
+            return Err(codex_structured_error(message));
         }
         for warning in &parsed.warnings {
             tracing::warn!(agent = self.name(), "{warning}");
@@ -479,27 +516,14 @@ impl CodeAgent for CodexAgent {
         })?;
         if !status.success() {
             let stderr = captured_stderr_tail(&stderr_capture);
-            if !stderr.is_empty() {
-                if harness_core::error::is_billing_failure_message(&stderr) {
-                    return Err(harness_core::error::HarnessError::BillingFailed(format!(
-                        "codex billing failure (streamed exit): {stderr}"
-                    )));
-                }
-                if harness_core::error::is_quota_failure_message(&stderr) {
-                    return Err(harness_core::error::HarnessError::QuotaExhausted(format!(
-                        "codex quota exhausted (streamed exit): {stderr}"
-                    )));
-                }
-            }
-            return Err(enrich_stream_exit_error(
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "codex exited with {status}"
-                )),
+            return Err(codex_nonzero_exit_error(
+                status,
                 &stderr,
+                parsed.structured_error.as_deref(),
             ));
         }
         if let Some(message) = parsed.structured_error {
-            return Err(harness_core::error::HarnessError::AgentExecution(message));
+            return Err(codex_structured_error(message));
         }
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
@@ -587,3 +611,7 @@ mod approval_policy_arg_tests {
 #[cfg(test)]
 #[path = "codex_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codex_failure_tests.rs"]
+mod failure_tests;

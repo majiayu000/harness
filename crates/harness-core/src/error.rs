@@ -242,6 +242,7 @@ pub fn is_quota_failure_message(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("quota exhausted")
         || lower.contains("hit your limit")
+        || lower.contains("usage limit")
         || lower.contains("rate limit exceeded")
         || lower.contains("rate_limit_exceeded")
         || lower.contains("too many requests")
