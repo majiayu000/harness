@@ -18,6 +18,7 @@ TERMINAL_TASK_STATES = {
     "cancelled",
     "canceled",
     "done",
+    "expired",
     "failed",
     "passed",
     "ready_to_merge",

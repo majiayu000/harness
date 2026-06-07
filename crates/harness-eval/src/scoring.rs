@@ -201,17 +201,20 @@ fn runtime_has_failed_terminal_state(runtime: &RuntimeSnapshot) -> bool {
         .terminal_state
         .as_deref()
         .is_some_and(is_failed_runtime_terminal_state)
-        || runtime.runtime_jobs.iter().any(|job| {
-            job.terminal_state
-                .as_deref()
-                .is_some_and(is_failed_runtime_terminal_state)
-        })
+        || runtime.runtime_jobs.iter().any(runtime_job_failed)
 }
 
 fn is_failed_runtime_terminal_state(state: &str) -> bool {
     matches!(
         state.trim().to_ascii_lowercase().as_str(),
-        "failed" | "cancelled" | "canceled" | "timed_out" | "timeout" | "errored" | "error"
+        "failed"
+            | "cancelled"
+            | "canceled"
+            | "timed_out"
+            | "timeout"
+            | "errored"
+            | "error"
+            | "expired"
     )
 }
 
@@ -406,6 +409,7 @@ fn runtime_job_failed(job: &RuntimeJobSnapshot) -> bool {
     job.terminal_state
         .as_deref()
         .is_some_and(is_failed_runtime_terminal_state)
+        || is_failed_runtime_terminal_state(&job.state)
 }
 
 fn runtime_job_error_is_non_retryable(job: &RuntimeJobSnapshot) -> bool {

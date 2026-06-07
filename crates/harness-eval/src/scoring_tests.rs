@@ -148,6 +148,7 @@ fn failed_runtime_terminal_states_cap_at_b() {
         "timeout",
         "errored",
         "error",
+        "expired",
     ] {
         let mut input = perfect_input();
         let Some(runtime) = input.runtime.as_mut() else {
@@ -183,6 +184,28 @@ fn failed_runtime_job_terminal_state_caps_at_b_even_with_artifacts() {
     let snapshot = match score_pr_repair_eval(input) {
         Ok(snapshot) => snapshot,
         Err(error) => panic!("score failed job runtime input failed: {error}"),
+    };
+    let gate = find_gate(&snapshot, HardGateName::RuntimeArtifactCompleteness);
+
+    assert_eq!(gate.status, GateStatus::Fail);
+    assert_eq!(gate.grade_cap, Some(EvalGrade::B));
+    assert_eq!(snapshot.grade_cap, Some(EvalGrade::B));
+}
+
+#[test]
+fn expired_runtime_job_state_caps_at_b_when_terminal_state_is_missing() {
+    let mut input = perfect_input();
+    let Some(runtime) = input.runtime.as_mut() else {
+        panic!("runtime should exist");
+    };
+    runtime.terminal_state = Some("succeeded".to_string());
+    runtime.runtime_jobs[0].artifact_count = 1;
+    runtime.runtime_jobs[0].state = "expired".to_string();
+    runtime.runtime_jobs[0].terminal_state = None;
+
+    let snapshot = match score_pr_repair_eval(input) {
+        Ok(snapshot) => snapshot,
+        Err(error) => panic!("score expired job runtime input failed: {error}"),
     };
     let gate = find_gate(&snapshot, HardGateName::RuntimeArtifactCompleteness);
 
@@ -238,6 +261,23 @@ fn single_failed_runtime_job_partially_penalizes_cost_efficiency() {
     runtime.runtime_jobs = vec![failed_job("job-1", RuntimeErrorKind::Timeout)];
 
     let snapshot = score_pr_repair_eval(input).expect("score single failed runtime job");
+
+    assert_eq!(snapshot.objective_score.cost_and_time_efficiency.points, 6);
+}
+
+#[test]
+fn expired_runtime_job_state_partially_penalizes_cost_efficiency() {
+    let mut input = perfect_input();
+    let Some(runtime) = input.runtime.as_mut() else {
+        panic!("runtime should exist");
+    };
+    runtime.runtime_jobs[0].state = "expired".to_string();
+    runtime.runtime_jobs[0].terminal_state = None;
+
+    let snapshot = match score_pr_repair_eval(input) {
+        Ok(snapshot) => snapshot,
+        Err(error) => panic!("score expired runtime job failed: {error}"),
+    };
 
     assert_eq!(snapshot.objective_score.cost_and_time_efficiency.points, 6);
 }

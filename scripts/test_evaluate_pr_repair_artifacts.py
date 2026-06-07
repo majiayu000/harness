@@ -187,6 +187,10 @@ class ArtifactHelperTests(unittest.TestCase):
                                         "activity": "implement_prompt",
                                         "artifacts": [{"artifact_type": "runtime_turn"}],
                                     },
+                                },
+                                {
+                                    "id": "job-2",
+                                    "status": "expired",
                                 }
                             ]
                         }
@@ -209,6 +213,8 @@ class ArtifactHelperTests(unittest.TestCase):
         self.assertEqual(merged["runtime_jobs"][0]["artifact_count"], 1)
         self.assertEqual(merged["runtime_jobs"][0]["error_kind"], "configuration")
         self.assertEqual(merged["runtime_jobs"][0]["terminal_state"], "succeeded")
+        self.assertEqual(merged["runtime_jobs"][1]["runtime_job_id"], "job-2")
+        self.assertEqual(merged["runtime_jobs"][1]["terminal_state"], "expired")
         self.assertEqual(merged["latest_activity"], "implement_prompt")
 
     def test_final_report_uses_quality_snapshot_grade_and_blockers(self) -> None:
