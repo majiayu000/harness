@@ -68,6 +68,117 @@ fn benchmark_cli_aggregates_snapshot_cases() {
 }
 
 #[test]
+fn benchmark_cli_aggregates_manifest_cases_with_metadata() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-manifest");
+    let snapshot_dir = temp_dir.path().join("snapshots");
+    fs::create_dir_all(&snapshot_dir).expect("create snapshot dir");
+    let ready_noop = snapshot_dir.join("ready_noop.json");
+    let blocked_threads = snapshot_dir.join("blocked_threads.json");
+    let manifest = temp_dir.path().join("suite.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+
+    write_snapshot(
+        &ready_noop,
+        &fixture_snapshot("ready-noop", 100, EvalGrade::A, None),
+    );
+    write_snapshot(
+        &blocked_threads,
+        &fixture_snapshot(
+            "blocked-threads",
+            75,
+            EvalGrade::C,
+            Some(HardGateName::ReviewThreadClosure),
+        ),
+    );
+    write_json_value(
+        &manifest,
+        &serde_json::json!({
+            "suite": "manifest-suite",
+            "cases": [
+                {
+                    "case_id": "ready-noop",
+                    "snapshot": "snapshots/ready_noop.json",
+                    "tags": ["ready_noop", "no_change"],
+                    "weight": 2
+                },
+                {
+                    "id": "blocked-threads",
+                    "path": "snapshots/blocked_threads.json",
+                    "tags": ["review_threads"],
+                    "weight": 3
+                }
+            ]
+        }),
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .status()
+        .expect("run benchmark binary");
+    assert!(status.success(), "benchmark binary should succeed");
+
+    let summary: Value = serde_json::from_str(&fs::read_to_string(&output).expect("read summary"))
+        .expect("parse summary");
+
+    assert_eq!(summary["suite"], "manifest-suite");
+    assert_eq!(summary["case_count"], 2);
+    assert_eq!(summary["weighted_case_count"], 5);
+    assert_eq!(summary["capability_score"], 9);
+    assert_eq!(summary["status"], "failing");
+    assert_eq!(summary["cases"][0]["case_id"], "ready-noop");
+    assert_eq!(summary["cases"][0]["weight"], 2);
+    assert_eq!(summary["cases"][0]["tags"][0], "ready_noop");
+    assert_eq!(summary["cases"][1]["case_id"], "blocked-threads");
+    assert_eq!(summary["cases"][1]["weight"], 3);
+    assert_eq!(summary["cases"][1]["tags"][0], "review_threads");
+}
+
+#[test]
+fn benchmark_cli_rejects_duplicate_manifest_case_ids() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-duplicate-manifest");
+    let snapshot_path = temp_dir.path().join("snapshot.json");
+    let manifest = temp_dir.path().join("suite.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+
+    write_snapshot(
+        &snapshot_path,
+        &fixture_snapshot("duplicate", 100, EvalGrade::A, None),
+    );
+    write_json_value(
+        &manifest,
+        &serde_json::json!({
+            "suite": "duplicate-suite",
+            "cases": [
+                {"case_id": "duplicate", "snapshot": "snapshot.json"},
+                {"case_id": "duplicate", "snapshot": "snapshot.json"}
+            ]
+        }),
+    );
+
+    let output_status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("run benchmark binary");
+
+    assert!(
+        !output_status.status.success(),
+        "benchmark binary should reject duplicate manifest case ids"
+    );
+    let stderr = String::from_utf8_lossy(&output_status.stderr);
+    assert!(stderr.contains("duplicate case ID: duplicate"));
+    assert!(
+        !output.exists(),
+        "rejected benchmark should not write output"
+    );
+}
+
+#[test]
 fn benchmark_cli_rejects_collect_only_snapshots() {
     let temp_dir = TempDir::new("pr-repair-benchmark-collect-only");
     let snapshot_path = temp_dir.path().join("collect_only.json");

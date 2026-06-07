@@ -338,11 +338,13 @@ pub struct PrRepairBenchmarkInput {
 pub struct PrRepairBenchmarkSummary {
     pub suite: String,
     pub case_count: u64,
+    pub weighted_case_count: u64,
     pub confidence: BenchmarkConfidence,
     pub status: BenchmarkStatus,
     pub capability_score: u8, // 0..10
     pub average_effective_score: u8,
     pub min_effective_score: u8,
+    pub max_effective_score: u8,
     pub excellent_cases: u64,
     pub acceptable_cases: u64,
     pub blocked_cases: u64,
@@ -536,6 +538,38 @@ score_pr_repair_benchmark \
   --case pr-1254=docs/pr-repair-evals/.../quality_snapshot.json \
   --output benchmark_summary.json
 ```
+
+For repeatable suites, prefer a manifest:
+
+```json
+{
+  "suite": "pr-repair-smoke",
+  "cases": [
+    {
+      "case_id": "ready-noop-control",
+      "snapshot": "ready-noop/quality_snapshot.json",
+      "tags": ["ready_noop"],
+      "weight": 1
+    },
+    {
+      "case_id": "review-thread-repair",
+      "snapshot": "review-thread/quality_snapshot.json",
+      "tags": ["review_threads"],
+      "weight": 2
+    }
+  ]
+}
+```
+
+```text
+score_pr_repair_benchmark \
+  --manifest docs/pr-repair-evals/pr-repair-smoke.json \
+  --output benchmark_summary.json
+```
+
+Manifest snapshot paths are resolved relative to the manifest file. `--suite`
+may override the manifest suite name for ad hoc comparisons, but a committed
+regression suite should keep the suite name in the manifest.
 
 It reads existing `quality_snapshot.json` artifacts and writes a deterministic
 benchmark summary. It does not fetch GitHub, start Harness, or grade code with an

@@ -214,6 +214,47 @@ Score the run after the final GraphQL snapshot:
 | `D` | No meaningful progress, repeated same failure, or excessive cost. |
 | `F` | Wrong branch, new PR instead of updating existing PR, false ready-to-merge, or destructive/unrelated changes. |
 
+After the three snapshots exist, pin them in a benchmark manifest so future
+changes can rerun the same suite:
+
+```json
+{
+  "suite": "pr-repair-smoke",
+  "cases": [
+    {
+      "case_id": "ready-noop-control",
+      "snapshot": "ready-noop/quality_snapshot.json",
+      "tags": ["ready_noop"],
+      "weight": 1
+    },
+    {
+      "case_id": "ci-repair",
+      "snapshot": "ci-repair/quality_snapshot.json",
+      "tags": ["ci_repair"],
+      "weight": 1
+    },
+    {
+      "case_id": "review-thread-repair",
+      "snapshot": "review-thread/quality_snapshot.json",
+      "tags": ["review_threads"],
+      "weight": 2
+    }
+  ]
+}
+```
+
+Run the suite with:
+
+```bash
+score_pr_repair_benchmark \
+  --manifest docs/pr-repair-evals/pr-repair-smoke.json \
+  --output docs/pr-repair-evals/pr-repair-smoke-summary.json
+```
+
+Manifest snapshot paths are relative to the manifest file. Use weights to make
+harder or more important PR repair classes count more heavily without hiding
+per-case hard-gate failures.
+
 ## Report Fields
 
 Each run should produce a report with:

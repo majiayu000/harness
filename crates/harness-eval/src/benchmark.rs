@@ -52,6 +52,8 @@ pub struct HardGateFailureCount {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrRepairBenchmarkCaseSummary {
     pub case_id: String,
+    pub tags: Vec<String>,
+    pub weight: u32,
     pub final_score: u8,
     pub effective_score: u8,
     pub final_grade: EvalGrade,
@@ -145,6 +147,8 @@ pub fn summarize_pr_repair_benchmark(input: PrRepairBenchmarkInput) -> PrRepairB
 
         case_summaries.push(PrRepairBenchmarkCaseSummary {
             case_id: case.case_id,
+            tags: case.tags,
+            weight: weight as u32,
             final_score: case.snapshot.final_score,
             effective_score,
             final_grade,

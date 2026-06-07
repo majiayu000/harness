@@ -2,6 +2,7 @@ use harness_eval::{
     summarize_pr_repair_benchmark, EvalRunMode, PrRepairBenchmarkCase, PrRepairBenchmarkInput,
     QualitySnapshot,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
@@ -11,9 +12,28 @@ use std::path::{Path, PathBuf};
 #[derive(Default)]
 struct Args {
     suite: String,
+    manifests: Vec<PathBuf>,
     snapshots: Vec<PathBuf>,
     cases: Vec<(String, PathBuf)>,
     output: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct BenchmarkManifest {
+    suite: Option<String>,
+    cases: Vec<BenchmarkManifestCase>,
+}
+
+#[derive(Deserialize)]
+struct BenchmarkManifestCase {
+    #[serde(alias = "id")]
+    case_id: String,
+    #[serde(alias = "path", alias = "snapshot_path")]
+    snapshot: PathBuf,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default = "default_manifest_case_weight")]
+    weight: u32,
 }
 
 fn main() {
@@ -27,6 +47,25 @@ fn run() -> Result<(), String> {
     let args = parse_args(env::args().skip(1))?;
     let mut cases = Vec::new();
     let mut seen_case_ids = HashSet::new();
+    let mut manifest_suite = None::<String>;
+
+    for path in args.manifests {
+        let manifest = read_manifest(&path)?;
+        if args.suite.is_empty() {
+            merge_manifest_suite(&mut manifest_suite, manifest.suite.as_deref(), &path)?;
+        }
+        for case in manifest.cases {
+            let snapshot_path = resolve_manifest_snapshot_path(&path, &case.snapshot);
+            push_case_with_metadata(
+                &mut cases,
+                &mut seen_case_ids,
+                case.case_id,
+                &snapshot_path,
+                case.tags,
+                case.weight,
+            )?;
+        }
+    }
 
     for path in args.snapshots {
         let case_id = case_id_from_path(&path)?;
@@ -36,10 +75,14 @@ fn run() -> Result<(), String> {
         push_case(&mut cases, &mut seen_case_ids, case_id, &path)?;
     }
 
-    let summary = summarize_pr_repair_benchmark(PrRepairBenchmarkInput {
-        suite: args.suite,
-        cases,
-    });
+    let suite = if args.suite.is_empty() {
+        manifest_suite
+            .ok_or_else(|| "--suite is required when no manifest suite is provided".to_string())?
+    } else {
+        args.suite
+    };
+
+    let summary = summarize_pr_repair_benchmark(PrRepairBenchmarkInput { suite, cases });
     write_json(
         &args.output,
         &serde_json::to_value(summary).map_err(|err| err.to_string())?,
@@ -54,6 +97,9 @@ where
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--suite" => parsed.suite = required_value(&mut args, "--suite")?,
+            "--manifest" | "--suite-manifest" => parsed
+                .manifests
+                .push(PathBuf::from(required_value(&mut args, "--manifest")?)),
             "--snapshot" => {
                 parsed
                     .snapshots
@@ -68,9 +114,8 @@ where
         }
     }
 
-    if parsed.suite.is_empty()
-        || parsed.output.as_os_str().is_empty()
-        || (parsed.snapshots.is_empty() && parsed.cases.is_empty())
+    if parsed.output.as_os_str().is_empty()
+        || (parsed.manifests.is_empty() && parsed.snapshots.is_empty() && parsed.cases.is_empty())
     {
         return Err(usage());
     }
@@ -99,7 +144,51 @@ where
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
-fn read_case(case_id: String, path: &Path) -> Result<PrRepairBenchmarkCase, String> {
+fn read_manifest(path: &Path) -> Result<BenchmarkManifest, String> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read manifest {}: {err}", path.display()))?;
+    serde_json::from_str(&body)
+        .map_err(|err| format!("failed to parse manifest {}: {err}", path.display()))
+}
+
+fn merge_manifest_suite(
+    current: &mut Option<String>,
+    suite: Option<&str>,
+    path: &Path,
+) -> Result<(), String> {
+    let Some(suite) = suite.map(str::trim).filter(|suite| !suite.is_empty()) else {
+        return Ok(());
+    };
+    match current {
+        Some(existing) if existing != suite => Err(format!(
+            "manifest {} uses suite {suite:?}, which conflicts with suite {existing:?}",
+            path.display()
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *current = Some(suite.to_string());
+            Ok(())
+        }
+    }
+}
+
+fn resolve_manifest_snapshot_path(manifest_path: &Path, snapshot: &Path) -> PathBuf {
+    if snapshot.is_absolute() {
+        return snapshot.to_path_buf();
+    }
+    manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(snapshot)
+}
+
+fn read_case(
+    case_id: String,
+    path: &Path,
+    tags: Vec<String>,
+    weight: u32,
+) -> Result<PrRepairBenchmarkCase, String> {
     let body = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let raw_snapshot: Value = serde_json::from_str(&body)
@@ -135,8 +224,8 @@ fn read_case(case_id: String, path: &Path) -> Result<PrRepairBenchmarkCase, Stri
     }
     Ok(PrRepairBenchmarkCase {
         case_id,
-        tags: Vec::new(),
-        weight: 1,
+        tags,
+        weight,
         snapshot,
     })
 }
@@ -147,10 +236,21 @@ fn push_case(
     case_id: String,
     path: &Path,
 ) -> Result<(), String> {
+    push_case_with_metadata(cases, seen_case_ids, case_id, path, Vec::new(), 1)
+}
+
+fn push_case_with_metadata(
+    cases: &mut Vec<PrRepairBenchmarkCase>,
+    seen_case_ids: &mut HashSet<String>,
+    case_id: String,
+    path: &Path,
+    tags: Vec<String>,
+    weight: u32,
+) -> Result<(), String> {
     if !seen_case_ids.insert(case_id.clone()) {
         return Err(format!("duplicate case ID: {case_id}"));
     }
-    cases.push(read_case(case_id, path)?);
+    cases.push(read_case(case_id, path, tags, weight)?);
     Ok(())
 }
 
@@ -176,5 +276,9 @@ fn case_id_from_path(path: &Path) -> Result<String, String> {
 }
 
 fn usage() -> String {
-    "Usage: score_pr_repair_benchmark --suite NAME (--snapshot quality_snapshot.json | --case CASE_ID=quality_snapshot.json)... --output benchmark_summary.json".to_string()
+    "Usage: score_pr_repair_benchmark [--suite NAME] (--manifest suite.json | --snapshot quality_snapshot.json | --case CASE_ID=quality_snapshot.json)... --output benchmark_summary.json".to_string()
+}
+
+fn default_manifest_case_weight() -> u32 {
+    1
 }
