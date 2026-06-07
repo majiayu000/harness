@@ -156,6 +156,9 @@ Scope:
 - Cap the effective per-case score by the final grade so hard-gate failures do
   not look like 10/10 wins.
 - Add a file-based `score_pr_repair_benchmark` binary for local benchmark runs.
+- Add manifest-backed benchmark suites so stable regression cases can define
+  suite name, case id, snapshot path, tags, and weight without long CLI command
+  lines.
 
 Out of scope:
 
@@ -173,6 +176,14 @@ Acceptance:
   benchmark status.
 - The benchmark binary reads multiple quality snapshots and writes
   `benchmark_summary.json`.
+- A manifest can drive a benchmark suite with relative snapshot paths, tags,
+  weights, and duplicate case-id protection.
+
+Implementation status:
+
+- Added deterministic summary aggregation and a file-based benchmark CLI.
+- Added manifest input for stable PR repair regression suites while preserving
+  `--snapshot` and `--case` ad hoc inputs.
 
 ## First PR Scope
 
