@@ -20,6 +20,7 @@ fn gc_adopt_task_request(
         max_rounds: Some(gc_config.adopt_max_rounds),
         turn_timeout_secs: gc_config.adopt_turn_timeout_secs,
         max_budget_usd: Some(gc_config.budget_per_signal_usd),
+        source: Some("gc_adopt".to_string()),
         ..Default::default()
     }
 }

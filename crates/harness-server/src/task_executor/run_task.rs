@@ -567,8 +567,9 @@ pub(crate) async fn run_task(
     let mut agent_pushed_commit = false;
     let mut local_review_head_approved: Option<Result<String, String>> = None;
     let mut local_review_reports = Vec::new();
-    let enforce_provider_gate =
-        review_config.enabled && review_config.strategy != ReviewStrategy::LegacyHostedBot;
+    let enforce_provider_gate = review_config.enabled
+        && req.source.as_deref() != Some("gc_adopt")
+        && review_config.strategy != ReviewStrategy::LegacyHostedBot;
     if enforce_provider_gate
         && !skip_agent_review
         && agent_review_provider_gate::should_run_codex_agent_review(review_config)
