@@ -30,10 +30,12 @@ jobs:
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'scripts/test-server-*.sh'
             server:
               - 'crates/harness-server/**'
               - 'crates/harness-core/**'
               - 'crates/harness-workflow/**'
+              - 'scripts/test-server-*.sh'
             agents:
               - 'crates/harness-agents/**'
               - 'crates/harness-core/**'
@@ -126,7 +128,15 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run build
-      - run: cargo test --workspace
+      - run: cargo test --workspace --exclude harness-server
+        env:
+          HARNESS_DATABASE_URL: postgres://postgres:postgres@localhost:5432/harness_test
+      - name: Harness-server fast profile
+        run: scripts/test-server-fast.sh
+        env:
+          HARNESS_DATABASE_URL: postgres://postgres:postgres@localhost:5432/harness_test
+      - name: Harness-server full DB profile
+        run: scripts/test-server-db.sh
         env:
           HARNESS_DATABASE_URL: postgres://postgres:postgres@localhost:5432/harness_test
 
