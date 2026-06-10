@@ -24,6 +24,80 @@ fn cleanup_state(
     state
 }
 
+fn agent_response(output: &str) -> harness_core::agent::AgentResponse {
+    harness_core::agent::AgentResponse {
+        output: output.to_string(),
+        stderr: String::new(),
+        items: vec![],
+        token_usage: harness_core::types::TokenUsage::default(),
+        model: "mock".into(),
+        exit_code: Some(0),
+    }
+}
+
+#[test]
+fn subtask_empty_output_marks_parent_failed() {
+    let mut state = TaskState::new(tid("parallel-parent"));
+    let run_result = crate::parallel_dispatch::ParallelRunResult {
+        results: vec![
+            crate::parallel_dispatch::SubtaskResult {
+                index: 0,
+                response: Some(agent_response("")),
+                error: None,
+            },
+            crate::parallel_dispatch::SubtaskResult {
+                index: 1,
+                response: Some(agent_response("finished work")),
+                error: None,
+            },
+        ],
+        is_sequential: false,
+    };
+
+    record_parallel_subtask_results(&mut state, &run_result);
+
+    assert_eq!(state.status, TaskStatus::Failed);
+    assert_eq!(state.error.as_deref(), Some("1/2 parallel subtasks failed"));
+    assert_eq!(state.rounds.len(), 2);
+    assert_eq!(state.rounds[0].result, "failed");
+    assert_eq!(
+        state.rounds[0].detail.as_deref(),
+        Some("agent returned empty output")
+    );
+    assert_eq!(state.rounds[1].result, "success");
+    assert_eq!(state.rounds[1].detail.as_deref(), Some("finished work"));
+}
+
+#[test]
+fn subtask_non_empty_outputs_mark_parent_done() {
+    let mut state = TaskState::new(tid("parallel-parent"));
+    let run_result = crate::parallel_dispatch::ParallelRunResult {
+        results: vec![
+            crate::parallel_dispatch::SubtaskResult {
+                index: 0,
+                response: Some(agent_response("first result")),
+                error: None,
+            },
+            crate::parallel_dispatch::SubtaskResult {
+                index: 1,
+                response: Some(agent_response("second result")),
+                error: None,
+            },
+        ],
+        is_sequential: false,
+    };
+
+    record_parallel_subtask_results(&mut state, &run_result);
+
+    assert_eq!(state.status, TaskStatus::Done);
+    assert_eq!(state.error, None);
+    assert_eq!(state.rounds.len(), 2);
+    assert!(state
+        .rounds
+        .iter()
+        .all(|round| round.result == "success" && round.detail.is_some()));
+}
+
 #[test]
 fn workspace_cleanup_keeps_inflight_issue_workspace() {
     let state = cleanup_state(
