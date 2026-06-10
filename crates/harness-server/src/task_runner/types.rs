@@ -185,19 +185,43 @@ pub enum TaskFailureKind {
     WorkspaceLifecycle,
 }
 
-const TERMINAL_TASK_STATUSES: &[&str] = &["done", "failed", "cancelled"];
-const RESUMABLE_TASK_STATUSES: &[&str] = &[
-    "triaging",
-    "planning",
-    "implementing",
-    "review_generating",
-    "review_waiting",
-    "planner_generating",
-    "planner_waiting",
-    "agent_review",
-    "waiting",
-    "reviewing",
+const TERMINAL_TASK_STATUSES: &[&str] = &[
+    task_status_tag(&TaskStatus::Done),
+    task_status_tag(&TaskStatus::Failed),
+    task_status_tag(&TaskStatus::Cancelled),
 ];
+const RESUMABLE_TASK_STATUSES: &[&str] = &[
+    task_status_tag(&TaskStatus::Triaging),
+    task_status_tag(&TaskStatus::Planning),
+    task_status_tag(&TaskStatus::Implementing),
+    task_status_tag(&TaskStatus::ReviewGenerating),
+    task_status_tag(&TaskStatus::ReviewWaiting),
+    task_status_tag(&TaskStatus::PlannerGenerating),
+    task_status_tag(&TaskStatus::PlannerWaiting),
+    task_status_tag(&TaskStatus::AgentReview),
+    task_status_tag(&TaskStatus::Waiting),
+    task_status_tag(&TaskStatus::Reviewing),
+];
+
+const fn task_status_tag(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::AwaitingDeps => "awaiting_deps",
+        TaskStatus::Triaging => "triaging",
+        TaskStatus::Planning => "planning",
+        TaskStatus::Implementing => "implementing",
+        TaskStatus::ReviewGenerating => "review_generating",
+        TaskStatus::ReviewWaiting => "review_waiting",
+        TaskStatus::PlannerGenerating => "planner_generating",
+        TaskStatus::PlannerWaiting => "planner_waiting",
+        TaskStatus::AgentReview => "agent_review",
+        TaskStatus::Waiting => "waiting",
+        TaskStatus::Reviewing => "reviewing",
+        TaskStatus::Done => "done",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
 
 impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
@@ -247,23 +271,7 @@ impl TaskStatus {
 
 impl AsRef<str> for TaskStatus {
     fn as_ref(&self) -> &str {
-        match self {
-            TaskStatus::Pending => "pending",
-            TaskStatus::AwaitingDeps => "awaiting_deps",
-            TaskStatus::Triaging => "triaging",
-            TaskStatus::Planning => "planning",
-            TaskStatus::Implementing => "implementing",
-            TaskStatus::ReviewGenerating => "review_generating",
-            TaskStatus::ReviewWaiting => "review_waiting",
-            TaskStatus::PlannerGenerating => "planner_generating",
-            TaskStatus::PlannerWaiting => "planner_waiting",
-            TaskStatus::AgentReview => "agent_review",
-            TaskStatus::Waiting => "waiting",
-            TaskStatus::Reviewing => "reviewing",
-            TaskStatus::Done => "done",
-            TaskStatus::Failed => "failed",
-            TaskStatus::Cancelled => "cancelled",
-        }
+        task_status_tag(self)
     }
 }
 
