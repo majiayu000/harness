@@ -58,7 +58,6 @@ pub struct WorkflowRejectedDecisionTransition<'a> {
     pub decision: &'a WorkflowDecision,
     pub reason: &'a str,
 }
-
 type WorkflowCommandRecordRow = (
     String,
     String,
@@ -346,7 +345,11 @@ impl WorkflowRuntimeStore {
             .bind(&record.id)
             .bind(&command_type)
             .bind(&command.dedupe_key)
-            .bind(transition.command_status)
+            .bind(if command.requires_runtime_job() {
+                transition.command_status
+            } else {
+                COMMAND_STATUS_HANDLED_INLINE
+            })
             .bind(&command_data)
             .execute(&mut *tx)
             .await?;

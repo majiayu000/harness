@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { relativeAgo } from "@/lib/format";
-import { useDashboard, useTasks } from "@/lib/queries";
+import { useAllTasks, useDashboard } from "@/lib/queries";
 import type { Task } from "@/types";
 
 interface Props {
@@ -64,7 +64,7 @@ export function History({ projectFilter }: Props) {
   const resolvedRoot = projectFilter
     ? (dashboard?.projects.find((p) => p.id === projectFilter)?.root ?? projectFilter)
     : null;
-  const { data, isLoading, isError } = useTasks({
+  const { data, isLoading, isError } = useAllTasks({
     status: "done,failed,cancelled",
     limit: 500,
     project_id: resolvedRoot ?? undefined,
