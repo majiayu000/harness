@@ -111,6 +111,12 @@ pub(crate) async fn notify_runtime_submission_terminal_workflow(
         &instance,
     )
     .await?;
+    if let Err(error) = workspace::cleanup_terminal_runtime_workspace(state, &instance).await {
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            "terminal runtime workspace cleanup failed: {error}"
+        );
+    }
     let Some(callback) = state.intake.completion_callback.as_ref() else {
         return Ok(false);
     };

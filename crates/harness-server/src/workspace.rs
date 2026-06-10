@@ -363,6 +363,21 @@ impl WorkspaceManager {
             .await
     }
 
+    pub(crate) fn workspace_path_for(
+        &self,
+        task_id: &TaskId,
+        source_repo: &Path,
+        external_id: Option<&str>,
+        repo: Option<&str>,
+    ) -> PathBuf {
+        self.config.root.join(derive_workspace_key(
+            task_id,
+            external_id,
+            repo,
+            Some(source_repo),
+        ))
+    }
+
     /// Return the workspace path for the given task if it is active.
     pub fn get_workspace(&self, task_id: &TaskId) -> Option<PathBuf> {
         self.active.get(task_id).map(|e| e.workspace_path.clone())

@@ -5,6 +5,49 @@ pub(super) fn init_fake_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) fn init_worktree_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)?;
+    run_git(root, &["init"])?;
+    run_git(root, &["config", "user.email", "test@harness.test"])?;
+    run_git(root, &["config", "user.name", "Harness Test"])?;
+    run_git(root, &["commit", "--allow-empty", "-m", "init"])?;
+    run_git(root, &["branch", "-M", "main"])?;
+    Ok(())
+}
+
+fn run_git(root: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
+    let git_bin = std::env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string());
+    let mut command = std::process::Command::new(git_bin);
+    for key in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command.arg("-C").arg(root).args(args).output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn task_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))

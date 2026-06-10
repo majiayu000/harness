@@ -349,6 +349,65 @@ async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "failed",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1299"),
+    )
+    .with_id("issue-1299")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 1299,
+        "task_id": "runtime-task-1299",
+        "task_ids": ["runtime-task-1299"],
+        "failure_reason": "WorktreeCollision: workspace path is managed by another harness session",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let app = Router::new()
+        .route("/tasks/{id}", get(get_task))
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/runtime-task-1299")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "failed");
+    assert_eq!(
+        body["error"],
+        "WorktreeCollision: workspace path is managed by another harness session"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
