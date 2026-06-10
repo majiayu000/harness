@@ -51,6 +51,7 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
             skipped_terminal = report.skipped_terminal,
             transitions = report.transitions.len(),
             workflow_transitions = report.workflow_transitions.len(),
+            workflow_alerts = report.workflow_alerts.len(),
             "reconciliation: tick complete"
         );
         sleep(interval).await;

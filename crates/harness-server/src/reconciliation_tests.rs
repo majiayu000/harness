@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
+#[path = "reconciliation_ready_to_merge_tests.rs"]
+mod ready_to_merge_tests;
+
 fn make_task(
     id: &str,
     status: TaskStatus,
