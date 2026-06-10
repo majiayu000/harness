@@ -5,7 +5,8 @@
 //! `queries_tasks.rs` under the project's per-file line ceiling.
 
 use crate::http::parse_pr_num_from_url;
-use crate::task_runner::TaskStatus;
+use crate::task_runner::{TaskSchedulerState, TaskStatus};
+use harness_core::error::TaskDbDecodeError;
 
 use super::types::{RecoveryResult, RecoveryRow};
 use super::TaskDb;
@@ -27,11 +28,7 @@ impl TaskDb {
             let Some((scheduler_state, expected_version)) = scheduler_state_row else {
                 return Ok(());
             };
-            let mut scheduler = Some(scheduler_state)
-                .and_then(|value| {
-                    serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&value).ok()
-                })
-                .unwrap_or_default();
+            let mut scheduler = decode_scheduler_state(task_id, &scheduler_state)?;
             if let Ok(task_status) = status.parse::<TaskStatus>() {
                 scheduler.mark_terminal(&task_status);
             }
@@ -101,10 +98,7 @@ impl TaskDb {
         let mut result = RecoveryResult::default();
 
         for row in rows {
-            let mut scheduler = serde_json::from_str::<crate::task_runner::TaskSchedulerState>(
-                &row.scheduler_state,
-            )
-            .unwrap_or_default();
+            let mut scheduler = decode_scheduler_state(&row.id, &row.scheduler_state)?;
             let effective_pr_url = row
                 .task_pr_url
                 .as_deref()
@@ -213,9 +207,7 @@ impl TaskDb {
         .fetch_all(&self.pool)
         .await?;
         for (id, error, scheduler_state, expected_version) in &transient_failed_rows {
-            let mut scheduler =
-                serde_json::from_str::<crate::task_runner::TaskSchedulerState>(scheduler_state)
-                    .unwrap_or_default();
+            let mut scheduler = decode_scheduler_state(id, scheduler_state)?;
             scheduler.mark_terminal(&TaskStatus::Failed);
             let scheduler_json = serde_json::to_string(&scheduler)?;
             let err = format!(
@@ -243,4 +235,16 @@ impl TaskDb {
         result.transient_failed = transient_failed;
         Ok(result)
     }
+}
+
+fn decode_scheduler_state(
+    task_id: &str,
+    scheduler_state: &str,
+) -> Result<TaskSchedulerState, TaskDbDecodeError> {
+    serde_json::from_str::<TaskSchedulerState>(scheduler_state).map_err(|source| {
+        TaskDbDecodeError::SchedulerStateDeserialize {
+            task_id: task_id.to_string(),
+            source,
+        }
+    })
 }

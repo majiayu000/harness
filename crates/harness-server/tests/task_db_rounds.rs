@@ -160,3 +160,99 @@ async fn summaries_do_not_default_corrupted_scheduler_state() -> anyhow::Result<
     std::mem::forget(tmp);
     Ok(())
 }
+
+#[tokio::test]
+async fn apply_replayed_state_rejects_corrupted_scheduler_state() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut task = make_task("task-corrupted-replay-scheduler");
+    task.status = TaskStatus::Implementing;
+    db.insert(&task).await?;
+    db.overwrite_scheduler_state_for_test(
+        "task-corrupted-replay-scheduler",
+        r#"{"authority_state":"not_a_real_state"}"#,
+    )
+    .await?;
+
+    let result = db
+        .apply_replayed_state("task-corrupted-replay-scheduler", None, Some("done"))
+        .await;
+    let err =
+        result.expect_err("event replay must reject corrupted scheduler_state, not default it");
+
+    let is_scheduler_err = err
+        .downcast_ref::<TaskDbDecodeError>()
+        .is_some_and(|e| matches!(e, TaskDbDecodeError::SchedulerStateDeserialize { .. }));
+    assert!(
+        is_scheduler_err,
+        "error must be TaskDbDecodeError::SchedulerStateDeserialize; got: {err}"
+    );
+
+    std::mem::forget(tmp);
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_recovery_rejects_corrupted_scheduler_state() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut task = make_task("task-corrupted-recovery-scheduler");
+    task.status = TaskStatus::Implementing;
+    db.insert(&task).await?;
+    db.overwrite_scheduler_state_for_test(
+        "task-corrupted-recovery-scheduler",
+        r#"{"authority_state":"not_a_real_state"}"#,
+    )
+    .await?;
+
+    let result = db.recover_in_progress().await;
+    let err =
+        result.expect_err("startup recovery must reject corrupted scheduler_state, not default it");
+
+    let is_scheduler_err = err
+        .downcast_ref::<TaskDbDecodeError>()
+        .is_some_and(|e| matches!(e, TaskDbDecodeError::SchedulerStateDeserialize { .. }));
+    assert!(
+        is_scheduler_err,
+        "error must be TaskDbDecodeError::SchedulerStateDeserialize; got: {err}"
+    );
+
+    std::mem::forget(tmp);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transient_retry_recovery_rejects_corrupted_scheduler_state() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut task = make_task("task-corrupted-transient-scheduler");
+    task.error = Some("retrying after transient failure (attempt 2)".to_string());
+    db.insert(&task).await?;
+    db.overwrite_scheduler_state_for_test(
+        "task-corrupted-transient-scheduler",
+        r#"{"authority_state":"not_a_real_state"}"#,
+    )
+    .await?;
+
+    let result = db.recover_in_progress().await;
+    let err = result.expect_err(
+        "transient retry recovery must reject corrupted scheduler_state, not default it",
+    );
+
+    let is_scheduler_err = err
+        .downcast_ref::<TaskDbDecodeError>()
+        .is_some_and(|e| matches!(e, TaskDbDecodeError::SchedulerStateDeserialize { .. }));
+    assert!(
+        is_scheduler_err,
+        "error must be TaskDbDecodeError::SchedulerStateDeserialize; got: {err}"
+    );
+
+    std::mem::forget(tmp);
+    Ok(())
+}
