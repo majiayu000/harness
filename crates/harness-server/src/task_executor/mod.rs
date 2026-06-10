@@ -1,4 +1,5 @@
 pub(crate) mod agent_review;
+mod agent_review_provider_gate;
 #[cfg(test)]
 mod agent_review_tests;
 pub(crate) mod conflict_resolver;

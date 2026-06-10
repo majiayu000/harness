@@ -17,11 +17,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
-#[path = "agent_review_provider_gate.rs"]
-mod provider_gate;
 #[path = "agent_review_workspace_snapshot.rs"]
 mod workspace_snapshot;
-use provider_gate::{local_review_provider_report, AgentReviewGateReport};
+use super::agent_review_provider_gate::{local_review_provider_report, AgentReviewGateReport};
 use workspace_snapshot::WorkspaceSnapshot;
 
 /// Compute Jaccard word-similarity between two strings.

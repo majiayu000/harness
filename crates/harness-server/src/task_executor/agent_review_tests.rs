@@ -218,7 +218,7 @@ async fn reviewer_request_uses_read_only_network_sandbox() -> anyhow::Result<()>
         provider_report
             .as_ref()
             .map(|report| report.report.provider_id.as_str()),
-        Some("codex_cli_review")
+        Some("codex_agent_review")
     );
     assert_eq!(
         approved_head

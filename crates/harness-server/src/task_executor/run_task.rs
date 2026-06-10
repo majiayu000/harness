@@ -6,7 +6,8 @@ use super::local_review_completion::{
 };
 use super::pr_detection::{detect_repo_slug, find_existing_pr_for_issue_with_token};
 use super::{
-    agent_review, gates, implement_pipeline, non_implementation, review_loop, triage_pipeline,
+    agent_review, agent_review_provider_gate, gates, implement_pipeline, non_implementation,
+    review_loop, triage_pipeline,
 };
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, TaskId, TaskKind, TaskStatus, TaskStore,
@@ -563,10 +564,12 @@ pub(crate) async fn run_task(
 
     // Agent review loop (if enabled and reviewer available, and not skipped by triage complexity)
     let mut agent_pushed_commit = false;
-    let mut local_review_approved = false;
     let mut local_review_head_approved: Option<Result<String, String>> = None;
     let mut local_review_reports = Vec::new();
-    if review_config.enabled && !skip_agent_review {
+    if review_config.enabled
+        && !skip_agent_review
+        && agent_review_provider_gate::should_run_codex_agent_review(review_config)
+    {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
             let review_head_probe =
@@ -603,40 +606,33 @@ pub(crate) async fn run_task(
             if !review_ok {
                 return Ok(());
             }
-            local_review_approved = true;
-            crate::workflow_runtime_pr_feedback::record_local_review_passed(
-                workflow_runtime_store.as_deref(),
-                crate::workflow_runtime_pr_feedback::LocalReviewPassedRuntimeContext {
-                    project_root: &project_root,
-                    repo: req.repo.as_deref(),
-                    issue_number: req.issue,
-                    task_id,
-                    pr_number: pr_num,
-                    pr_url: pr_url.as_deref(),
-                    summary: "Local agent review approved the PR.",
-                },
-            )
-            .await;
             agent_pushed_commit = fix_requires_pr_head_advance;
-            if !review_config.review_bot_auto_trigger {
-                local_review_head_approved = approved_review_head;
-            }
+            local_review_head_approved = approved_review_head;
         } else {
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
     }
-    let local_fix_requires_pr_head_advance = agent_pushed_commit;
-    agent_pushed_commit |= implementation_pushed_commit;
-
-    let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
-
-    // Skip hosted review bot wait when auto-trigger is disabled, but keep a
-    // validation gate so local review cannot mark a red PR complete.
-    if !review_config.review_bot_auto_trigger {
-        if !local_review_approved {
-            fail_missing_local_review_gate(store, task_id, turns_used, pr_url.as_deref()).await?;
-            return Ok(());
-        }
+    if review_config.enabled
+        && agent_review_provider_gate::should_run_codex_cli_review(review_config)
+    {
+        let provider_report = agent_review_provider_gate::run_codex_cli_review_provider(
+            store,
+            task_id,
+            agent_review_provider_gate::CodexCliReviewProviderRequest {
+                review_config,
+                context_items: &context_items,
+                project: &project,
+                pr_url: pr_url.as_deref().unwrap_or(""),
+                project_type: project_config.review_type.as_str(),
+                cargo_env: &cargo_env,
+            },
+            &mut turns_used,
+        )
+        .await?;
+        local_review_reports.push(provider_report);
+        *turns_used_acc = turns_used;
+    }
+    if review_config.enabled {
         let review_gate = evaluate_review_gate(
             &local_review_reports,
             &review_config.required_providers,
@@ -646,6 +642,45 @@ pub(crate) async fn run_task(
         if review_gate.decision != ReviewGateDecision::Approved {
             fail_review_provider_gate(store, task_id, turns_used, pr_url.as_deref(), &review_gate)
                 .await?;
+            return Ok(());
+        }
+        if !review_config.review_bot_auto_trigger
+            && local_review_head_approved.is_none()
+            && should_probe_pr_head
+        {
+            local_review_head_approved = Some(
+                review_loop::fetch_pr_head_sha_for_gate(
+                    &repo_slug_for_review,
+                    pr_num,
+                    server_config.server.github_token.as_deref(),
+                )
+                .await,
+            );
+        }
+        crate::workflow_runtime_pr_feedback::record_local_review_passed(
+            workflow_runtime_store.as_deref(),
+            crate::workflow_runtime_pr_feedback::LocalReviewPassedRuntimeContext {
+                project_root: &project_root,
+                repo: req.repo.as_deref(),
+                issue_number: req.issue,
+                task_id,
+                pr_number: pr_num,
+                pr_url: pr_url.as_deref(),
+                summary: "Configured local review providers approved the PR.",
+            },
+        )
+        .await;
+    }
+    let local_fix_requires_pr_head_advance = agent_pushed_commit;
+    agent_pushed_commit |= implementation_pushed_commit;
+
+    let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
+
+    // Skip hosted review bot wait when auto-trigger is disabled, but keep a
+    // validation gate so local review cannot mark a red PR complete.
+    if !review_config.review_bot_auto_trigger {
+        if !review_config.enabled {
+            fail_missing_local_review_gate(store, task_id, turns_used, pr_url.as_deref()).await?;
             return Ok(());
         }
         let (before_review_sha, before_review_error) = match local_review_head_before.as_ref() {
