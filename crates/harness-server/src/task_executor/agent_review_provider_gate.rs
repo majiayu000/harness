@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::config::agents::{AgentReviewConfig, SandboxMode};
 use harness_core::review::{
-    parse_review_report, ReviewDecision, ReviewGateProviderReport, ReviewProviderKind,
-    ReviewProviderRole, ReviewReport,
+    evaluate_review_gate, parse_review_report, ReviewDecision, ReviewGateProviderReport,
+    ReviewGateResult, ReviewProviderKind, ReviewProviderRole, ReviewReport,
 };
 use harness_core::types::{ContextItem, ExecutionPhase};
 use std::collections::HashMap;
@@ -33,6 +33,22 @@ pub(crate) fn should_run_codex_cli_review(review_config: &AgentReviewConfig) -> 
 pub(crate) fn should_run_codex_agent_review(review_config: &AgentReviewConfig) -> bool {
     review_config.codex_agent_review.enabled
         || provider_policy_references(review_config, CODEX_AGENT_REVIEW_PROVIDER_ID)
+}
+
+pub(crate) fn requires_hosted_review_loop(review_config: &AgentReviewConfig) -> bool {
+    review_config.review_bot_auto_trigger
+}
+
+pub(crate) fn evaluate_configured_review_gate(
+    reports: &[ReviewGateProviderReport],
+    review_config: &AgentReviewConfig,
+) -> ReviewGateResult {
+    evaluate_review_gate(
+        reports,
+        &review_config.required_providers,
+        &review_config.advisory_providers,
+        review_config.external_required,
+    )
 }
 
 pub(crate) fn codex_agent_review_config(review_config: &AgentReviewConfig) -> AgentReviewConfig {
@@ -408,6 +424,50 @@ mod tests {
         assert!(!should_run_codex_agent_review(&config));
         config.codex_agent_review.enabled = true;
         assert!(should_run_codex_agent_review(&config));
+    }
+
+    #[test]
+    fn external_required_does_not_enable_legacy_hosted_review_loop() {
+        let mut config = AgentReviewConfig {
+            external_required: true,
+            ..AgentReviewConfig::default()
+        };
+
+        assert!(!requires_hosted_review_loop(&config));
+        config.review_bot_auto_trigger = true;
+        assert!(requires_hosted_review_loop(&config));
+    }
+
+    #[test]
+    fn configured_gate_blocks_missing_external_required_report() {
+        let mut config = AgentReviewConfig {
+            external_required: true,
+            ..AgentReviewConfig::default()
+        };
+        config.required_providers = vec![CODEX_CLI_REVIEW_PROVIDER_ID.to_string()];
+        config.advisory_providers = vec!["gemini_github_bot".to_string()];
+        let now = Utc::now();
+        let local_report = ReviewGateProviderReport {
+            role: ReviewProviderRole::Required,
+            report: parse_review_report(
+                CODEX_CLI_REVIEW_PROVIDER_ID,
+                ReviewProviderKind::LocalCli,
+                "APPROVED",
+                now,
+                now,
+            ),
+        };
+
+        let result = evaluate_configured_review_gate(&[local_report], &config);
+
+        assert_eq!(
+            result.decision,
+            harness_core::review::ReviewGateDecision::Blocked
+        );
+        assert_eq!(
+            result.blocking_provider_id.as_deref(),
+            Some("gemini_github_bot")
+        );
     }
 
     #[test]

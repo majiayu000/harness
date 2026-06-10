@@ -15,7 +15,7 @@ use crate::task_runner::{
 use anyhow::Context;
 use harness_core::agent::CodeAgent;
 use harness_core::config::agents::ReviewStrategy;
-use harness_core::review::{evaluate_review_gate, ReviewGateDecision};
+use harness_core::review::ReviewGateDecision;
 use harness_core::{config::project::load_project_config, prompts};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -553,7 +553,7 @@ pub(crate) async fn run_task(
 
     let repo_slug_for_review = review_repo_slug(pr_url.as_deref(), &repo_slug);
     let requires_hosted_review =
-        review_config.review_bot_auto_trigger || review_config.external_required;
+        agent_review_provider_gate::requires_hosted_review_loop(review_config);
     let should_probe_pr_head = !requires_hosted_review && pr_num > 0;
     let local_review_head_before = if should_probe_pr_head {
         Some(
@@ -644,13 +644,9 @@ pub(crate) async fn run_task(
         *turns_used_acc = turns_used;
     }
     if enforce_provider_gate {
-        // External provider evidence is produced by the hosted review loop below.
-        // The local gate only evaluates reports from providers run in this phase.
-        let review_gate = evaluate_review_gate(
+        let review_gate = agent_review_provider_gate::evaluate_configured_review_gate(
             &local_review_reports,
-            &review_config.required_providers,
-            &[],
-            false,
+            review_config,
         );
         if review_gate.decision != ReviewGateDecision::Approved {
             fail_review_provider_gate(store, task_id, turns_used, pr_url.as_deref(), &review_gate)
