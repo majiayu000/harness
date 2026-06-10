@@ -14,6 +14,7 @@ use crate::task_runner::{
 };
 use anyhow::Context;
 use harness_core::agent::CodeAgent;
+use harness_core::config::agents::ReviewStrategy;
 use harness_core::review::{evaluate_review_gate, ReviewGateDecision};
 use harness_core::{config::project::load_project_config, prompts};
 use std::collections::HashMap;
@@ -566,7 +567,9 @@ pub(crate) async fn run_task(
     let mut agent_pushed_commit = false;
     let mut local_review_head_approved: Option<Result<String, String>> = None;
     let mut local_review_reports = Vec::new();
-    if review_config.enabled
+    let enforce_provider_gate =
+        review_config.enabled && review_config.strategy != ReviewStrategy::LegacyHostedBot;
+    if enforce_provider_gate
         && !skip_agent_review
         && agent_review_provider_gate::should_run_codex_agent_review(review_config)
     {
@@ -612,7 +615,7 @@ pub(crate) async fn run_task(
             tracing::warn!("agent review enabled but no reviewer agent configured; skipping");
         }
     }
-    if review_config.enabled
+    if enforce_provider_gate
         && agent_review_provider_gate::should_run_codex_cli_review(review_config)
     {
         let provider_report = agent_review_provider_gate::run_codex_cli_review_provider(
@@ -632,7 +635,7 @@ pub(crate) async fn run_task(
         local_review_reports.push(provider_report);
         *turns_used_acc = turns_used;
     }
-    if review_config.enabled {
+    if enforce_provider_gate {
         let review_gate = evaluate_review_gate(
             &local_review_reports,
             &review_config.required_providers,
@@ -679,7 +682,7 @@ pub(crate) async fn run_task(
     // Skip hosted review bot wait when auto-trigger is disabled, but keep a
     // validation gate so local review cannot mark a red PR complete.
     if !review_config.review_bot_auto_trigger {
-        if !review_config.enabled {
+        if !enforce_provider_gate {
             fail_missing_local_review_gate(store, task_id, turns_used, pr_url.as_deref()).await?;
             return Ok(());
         }
