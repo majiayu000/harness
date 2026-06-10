@@ -51,6 +51,18 @@ pub(crate) fn evaluate_configured_review_gate(
     )
 }
 
+pub(crate) fn evaluate_configured_local_review_gate(
+    reports: &[ReviewGateProviderReport],
+    review_config: &AgentReviewConfig,
+) -> ReviewGateResult {
+    evaluate_review_gate(
+        reports,
+        &review_config.required_providers,
+        &review_config.advisory_providers,
+        false,
+    )
+}
+
 pub(crate) fn codex_agent_review_config(review_config: &AgentReviewConfig) -> AgentReviewConfig {
     let mut config = review_config.clone();
     config.max_rounds = review_config.codex_agent_review.max_rounds;
@@ -467,6 +479,35 @@ mod tests {
         assert_eq!(
             result.blocking_provider_id.as_deref(),
             Some("gemini_github_bot")
+        );
+    }
+
+    #[test]
+    fn local_review_gate_defers_external_required_to_hosted_loop() {
+        let mut config = AgentReviewConfig {
+            external_required: true,
+            review_bot_auto_trigger: true,
+            ..AgentReviewConfig::default()
+        };
+        config.required_providers = vec![CODEX_CLI_REVIEW_PROVIDER_ID.to_string()];
+        config.advisory_providers = vec!["gemini_github_bot".to_string()];
+        let now = Utc::now();
+        let local_report = ReviewGateProviderReport {
+            role: ReviewProviderRole::Required,
+            report: parse_review_report(
+                CODEX_CLI_REVIEW_PROVIDER_ID,
+                ReviewProviderKind::LocalCli,
+                "APPROVED",
+                now,
+                now,
+            ),
+        };
+
+        let result = evaluate_configured_local_review_gate(&[local_report], &config);
+
+        assert_eq!(
+            result.decision,
+            harness_core::review::ReviewGateDecision::Approved
         );
     }
 

@@ -644,10 +644,17 @@ pub(crate) async fn run_task(
         *turns_used_acc = turns_used;
     }
     if enforce_provider_gate {
-        let review_gate = agent_review_provider_gate::evaluate_configured_review_gate(
-            &local_review_reports,
-            review_config,
-        );
+        let review_gate = if requires_hosted_review {
+            agent_review_provider_gate::evaluate_configured_local_review_gate(
+                &local_review_reports,
+                review_config,
+            )
+        } else {
+            agent_review_provider_gate::evaluate_configured_review_gate(
+                &local_review_reports,
+                review_config,
+            )
+        };
         if review_gate.decision != ReviewGateDecision::Approved {
             fail_review_provider_gate(store, task_id, turns_used, pr_url.as_deref(), &review_gate)
                 .await?;
