@@ -210,17 +210,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Run one reconciliation tick against GitHub before any recovery so that
     // recovery decisions are made on fresh GitHub truth.
     if state.core.server.config.reconciliation.enabled {
-        let max_calls = state
-            .core
-            .server
-            .config
-            .reconciliation
-            .max_gh_calls_per_minute;
-        crate::reconciliation::run_once_with_runtime_token(
+        crate::reconciliation::run_once_with_runtime_config(
             &state.core.tasks,
             state.core.workflow_runtime_store.as_deref(),
             state.core.issue_workflow_store.as_deref(),
-            max_calls,
+            &state.core.server.config.reconciliation,
             false,
             state.core.server.config.server.github_token.as_deref(),
         )
