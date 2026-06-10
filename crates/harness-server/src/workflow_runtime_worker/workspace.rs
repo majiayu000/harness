@@ -243,10 +243,13 @@ pub(super) async fn cleanup_terminal_runtime_workspace(
                 );
             }
         }
+        workspace_mgr
+            .cleanup_workspace_for_retry(&task_id, &source_project_root, Some(&workspace_path))
+            .await
+    } else {
+        workspace_mgr.release_workspace(&task_id);
+        Ok(())
     }
-    workspace_mgr
-        .cleanup_workspace_for_retry(&task_id, &source_project_root, Some(&workspace_path))
-        .await
 }
 
 fn validate_workspace_cleanup_policy(cleanup: &str) -> anyhow::Result<()> {
