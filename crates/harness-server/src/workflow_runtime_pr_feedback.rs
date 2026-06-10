@@ -15,6 +15,15 @@ use std::path::Path;
 
 const DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS: u64 = 24 * 60 * 60;
 
+mod pr_lifecycle_persist;
+use pr_lifecycle_persist::{
+    issue_workflow_id, persist_pr_lifecycle_with_retry, pr_lifecycle_workflow_id,
+};
+#[cfg(test)]
+use pr_lifecycle_persist::{
+    set_pr_lifecycle_persist_test_failures, PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS,
+};
+
 pub(crate) struct PrDetectedRuntimeContext<'a> {
     pub project_root: &'a Path,
     pub repo: Option<&'a str>,
@@ -142,14 +151,39 @@ pub(crate) async fn record_pr_detected(
     ctx: PrDetectedRuntimeContext<'_>,
 ) {
     let Some(store) = store else {
-        return;
-    };
-    if let Err(error) = persist_pr_detected(store, &ctx).await {
-        tracing::warn!(
+        tracing::error!(
             issue = ctx.issue_number,
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
-            "workflow runtime PR detection write failed: {error}"
+            "workflow runtime PR detection write skipped because the runtime store is unavailable"
+        );
+        return;
+    };
+    let workflow_id = issue_workflow_id(ctx.project_root, ctx.repo, ctx.issue_number);
+    let failure_payload = json!({
+        "issue_number": ctx.issue_number,
+        "repo": ctx.repo,
+        "task_id": ctx.task_id.as_str(),
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+    });
+    if let Err(error) = persist_pr_lifecycle_with_retry(
+        store,
+        &workflow_id,
+        "record_pr_detected",
+        ctx.task_id,
+        ctx.pr_number,
+        failure_payload,
+        || persist_pr_detected(store, &ctx),
+    )
+    .await
+    {
+        tracing::error!(
+            workflow_id = %workflow_id,
+            issue = ctx.issue_number,
+            pr = ctx.pr_number,
+            task_id = %ctx.task_id.0,
+            "workflow runtime PR detection write failed after retries: {error}"
         );
     }
 }
@@ -159,13 +193,42 @@ pub(crate) async fn record_pr_feedback(
     ctx: PrFeedbackRuntimeContext<'_>,
 ) {
     let Some(store) = store else {
-        return;
-    };
-    if let Err(error) = persist_pr_feedback(store, &ctx).await {
-        tracing::warn!(
+        tracing::error!(
+            issue = ?ctx.issue_number,
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
-            "workflow runtime PR feedback write failed: {error}"
+            "workflow runtime PR feedback write skipped because the runtime store is unavailable"
+        );
+        return;
+    };
+    let workflow_id =
+        pr_lifecycle_workflow_id(ctx.project_root, ctx.repo, ctx.issue_number, ctx.pr_number);
+    let failure_payload = json!({
+        "issue_number": ctx.issue_number,
+        "repo": ctx.repo,
+        "task_id": ctx.task_id.as_str(),
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+        "outcome": outcome_label(ctx.outcome),
+        "summary": ctx.summary,
+    });
+    if let Err(error) = persist_pr_lifecycle_with_retry(
+        store,
+        &workflow_id,
+        "record_pr_feedback",
+        ctx.task_id,
+        ctx.pr_number,
+        failure_payload,
+        || persist_pr_feedback(store, &ctx),
+    )
+    .await
+    {
+        tracing::error!(
+            workflow_id = %workflow_id,
+            issue = ?ctx.issue_number,
+            pr = ctx.pr_number,
+            task_id = %ctx.task_id.0,
+            "workflow runtime PR feedback write failed after retries: {error}"
         );
     }
 }
@@ -191,13 +254,41 @@ pub(crate) async fn record_pr_merged(
     ctx: PrMergedRuntimeContext<'_>,
 ) {
     let Some(store) = store else {
-        return;
-    };
-    if let Err(error) = persist_pr_merged(store, &ctx).await {
-        tracing::warn!(
+        tracing::error!(
+            issue = ?ctx.issue_number,
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
-            "workflow runtime PR merge write failed: {error}"
+            "workflow runtime PR merge write skipped because the runtime store is unavailable"
+        );
+        return;
+    };
+    let workflow_id =
+        pr_lifecycle_workflow_id(ctx.project_root, ctx.repo, ctx.issue_number, ctx.pr_number);
+    let failure_payload = json!({
+        "issue_number": ctx.issue_number,
+        "repo": ctx.repo,
+        "task_id": ctx.task_id.as_str(),
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+        "summary": ctx.summary,
+    });
+    if let Err(error) = persist_pr_lifecycle_with_retry(
+        store,
+        &workflow_id,
+        "record_pr_merged",
+        ctx.task_id,
+        ctx.pr_number,
+        failure_payload,
+        || persist_pr_merged(store, &ctx),
+    )
+    .await
+    {
+        tracing::error!(
+            workflow_id = %workflow_id,
+            issue = ?ctx.issue_number,
+            pr = ctx.pr_number,
+            task_id = %ctx.task_id.0,
+            "workflow runtime PR merge write failed after retries: {error}"
         );
     }
 }
