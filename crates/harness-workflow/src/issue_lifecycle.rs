@@ -5,7 +5,7 @@ use std::path::Path;
 
 /// Re-exported to preserve the `harness_workflow::issue_lifecycle::IssueWorkflowStore` path
 /// used by callers outside this crate.
-pub use crate::issue_workflow_store::IssueWorkflowStore;
+pub use crate::issue_workflow_store::{IssueMergeApprovalOutcome, IssueWorkflowStore};
 
 const ISSUE_WORKFLOW_SCHEMA_VERSION: u32 = 1;
 pub const FEEDBACK_CLAIM_TASK_PREFIX: &str = "claim:";

@@ -1,4 +1,5 @@
 use super::*;
+use harness_workflow::issue_lifecycle::IssueLifecycleState;
 
 #[tokio::test]
 async fn list_tasks_marks_runtime_submission_summaries_degraded_when_store_failed(
@@ -201,6 +202,136 @@ async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()>
         commands[0].command.command_type,
         harness_workflow::runtime::WorkflowCommandType::MarkDone
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_task_reports_legacy_workflow_actual_state_when_not_ready() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_issue_workflows(dir.path()).await?;
+    let task_id = task_runner::TaskId::from_str("legacy-done-task-56");
+    let project_id = dir.path().to_string_lossy().into_owned();
+    let repo = "owner/repo";
+    let pr_number = 127;
+    let mut task = task_runner::TaskState::new(task_id.clone());
+    task.task_kind = task_runner::TaskKind::Issue;
+    task.pr_url = Some(format!("https://github.com/{repo}/pull/{pr_number}"));
+    task.project_root = Some(dir.path().to_path_buf());
+    task.repo = Some(repo.to_string());
+    state.core.tasks.insert(&task).await;
+
+    let workflows = state
+        .core
+        .issue_workflow_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("issue workflow store should be configured"))?;
+    workflows
+        .record_issue_scheduled(&project_id, Some(repo), 56, task_id.as_str(), &[], false)
+        .await?;
+    workflows
+        .record_pr_detected(
+            &project_id,
+            Some(repo),
+            56,
+            task_id.as_str(),
+            pr_number,
+            &format!("https://github.com/{repo}/pull/{pr_number}"),
+        )
+        .await?;
+    workflows
+        .record_terminal_for_issue(&project_id, Some(repo), 56, IssueLifecycleState::Done, None)
+        .await?;
+    let app = Router::new()
+        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{}/merge", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "workflow not in ready_to_merge state");
+    assert_eq!(body["state"], "done");
+    let workflow = workflows
+        .get_by_pr(&project_id, Some(repo), pr_number)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow should still exist"))?;
+    assert_eq!(workflow.state, IssueLifecycleState::Done);
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_task_approves_legacy_ready_workflow() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_issue_workflows(dir.path()).await?;
+    let task_id = task_runner::TaskId::from_str("legacy-ready-task-57");
+    let project_id = dir.path().to_string_lossy().into_owned();
+    let repo = "owner/repo";
+    let pr_number = 128;
+    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
+    let mut task = task_runner::TaskState::new(task_id.clone());
+    task.task_kind = task_runner::TaskKind::Issue;
+    task.pr_url = Some(pr_url.clone());
+    task.project_root = Some(dir.path().to_path_buf());
+    task.repo = Some(repo.to_string());
+    state.core.tasks.insert(&task).await;
+
+    let workflows = state
+        .core
+        .issue_workflow_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("issue workflow store should be configured"))?;
+    workflows
+        .record_issue_scheduled(&project_id, Some(repo), 57, task_id.as_str(), &[], false)
+        .await?;
+    workflows
+        .record_pr_detected(
+            &project_id,
+            Some(repo),
+            57,
+            task_id.as_str(),
+            pr_number,
+            &pr_url,
+        )
+        .await?;
+    workflows
+        .record_terminal_for_pr(&project_id, Some(repo), pr_number, true, false, None)
+        .await?;
+    let app = Router::new()
+        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{}/merge", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "merge_approved");
+    let workflow = workflows
+        .get_by_pr(&project_id, Some(repo), pr_number)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow should still exist"))?;
+    assert_eq!(workflow.state, IssueLifecycleState::Done);
     Ok(())
 }
 
