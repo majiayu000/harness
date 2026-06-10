@@ -17,11 +17,11 @@ pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig
     let store = harness_server::task_runner::TaskStore::open(&db_path).await?;
     let (runtime_store, issue_workflow_store) = open_workflow_stores(config).await;
 
-    let report = harness_server::reconciliation::run_once_with_runtime_token(
+    let report = harness_server::reconciliation::run_once_with_runtime_config(
         &store,
         runtime_store.as_ref(),
         issue_workflow_store.as_ref(),
-        config.reconciliation.max_gh_calls_per_minute,
+        &config.reconciliation,
         dry_run,
         config.server.github_token.as_deref(),
     )
