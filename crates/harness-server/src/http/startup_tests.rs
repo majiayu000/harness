@@ -20,7 +20,7 @@ fn http_listener_starts_before_background_work() {
     let Some(serve_task_index) = source.find("let serve_handle = tokio::spawn") else {
         panic!("serve should start Axum before background work");
     };
-    let Some(reconciliation_index) = source.find("run_once_with_runtime_token") else {
+    let Some(reconciliation_index) = source.find("run_once_with_runtime_config") else {
         panic!("serve should still run startup reconciliation");
     };
     let Some(reconciliation_gate_index) =
