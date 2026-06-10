@@ -458,8 +458,10 @@ fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
-    let candidate = runtime_candidate_from_instance(&active).expect("candidate");
+    let row_updated_at = active.updated_at + chrono::Duration::seconds(60);
+    let candidate = runtime_candidate_from_instance(&active, row_updated_at).expect("candidate");
     assert_eq!(candidate.workflow_id, "workflow-1");
+    assert_eq!(candidate.row_updated_at, row_updated_at);
     assert_eq!(candidate.pr_number, 77);
     assert_eq!(candidate.repo.as_deref(), Some("owner/repo"));
 
@@ -470,7 +472,7 @@ fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
     .with_data(json!({ "pr_number": 77 }));
-    assert!(runtime_candidate_from_instance(&terminal).is_none());
+    assert!(runtime_candidate_from_instance(&terminal, chrono::Utc::now()).is_none());
 
     let missing_pr = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
@@ -478,7 +480,27 @@ fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
         "pr_open",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     );
-    assert!(runtime_candidate_from_instance(&missing_pr).is_none());
+    assert!(runtime_candidate_from_instance(&missing_pr, chrono::Utc::now()).is_none());
+}
+
+#[test]
+fn ready_to_merge_open_alert_uses_row_age() {
+    let now = chrono::Utc::now();
+    let candidate = RuntimeWorkflowCandidate {
+        workflow_id: "workflow-1".to_string(),
+        state: "ready_to_merge".to_string(),
+        row_updated_at: now,
+        repo: Some("owner/repo".to_string()),
+        project_root: None,
+        issue_number: Some(42),
+        pr_number: 77,
+        pr_url: Some("https://github.com/owner/repo/pull/77".to_string()),
+    };
+    let settings = RuntimeWorkflowReconciliationSettings {
+        ready_to_merge_min_age_secs: 0,
+        ready_to_merge_alert_ttl_secs: 60,
+    };
+    assert!(ready_to_merge_open_alert(&candidate, GitHubState::Open, settings, now).is_none());
 }
 
 #[tokio::test]
@@ -669,7 +691,7 @@ async fn ready_to_merge_reconciliation_waits_for_configured_age() -> anyhow::Res
         return Ok(());
     };
     let (_, workflow_id) =
-        persist_ready_to_merge_runtime(&stores, "project-young", 44, "task-3", 99, 0, false)
+        persist_ready_to_merge_runtime(&stores, "project-young", 44, "task-3", 99, 120, false)
             .await?;
     let report = run_once_with_runtime_config(
         &stores.task_store,
@@ -714,7 +736,7 @@ async fn ready_to_merge_reconciliation_marks_merged_pr_done() -> anyhow::Result<
         &stores.task_store,
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
-        &ready_to_merge_config(60, 3600),
+        &ready_to_merge_config(0, 3600),
         false,
         None,
     )
@@ -735,7 +757,7 @@ async fn ready_to_merge_reconciliation_marks_merged_pr_done() -> anyhow::Result<
 }
 
 #[tokio::test]
-async fn ready_to_merge_reconciliation_alerts_for_old_open_pr() -> anyhow::Result<()> {
+async fn ready_to_merge_reconciliation_alerts_for_open_pr_after_ttl() -> anyhow::Result<()> {
     let _env_guard = async_env_lock().lock().await;
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -755,7 +777,7 @@ async fn ready_to_merge_reconciliation_alerts_for_old_open_pr() -> anyhow::Resul
         &stores.task_store,
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
-        &ready_to_merge_config(60, 60),
+        &ready_to_merge_config(0, 0),
         false,
         None,
     )
@@ -765,36 +787,4 @@ async fn ready_to_merge_reconciliation_alerts_for_old_open_pr() -> anyhow::Resul
     assert_eq!(report.workflow_alerts[0].pr_number, 101);
     assert_eq!(report.workflow_alerts[0].state, "ready_to_merge");
     Ok(())
-}
-
-#[test]
-fn reconciliation_payload_has_no_workspace_paths() {
-    let report = ReconciliationReport {
-        candidates: 3,
-        skipped_terminal: 1,
-        transitions: vec![ReconciliationTransition {
-            task_id: "task-abc123".to_string(),
-            from: "implementing".to_string(),
-            to: "done".to_string(),
-            reason: "PR merged".to_string(),
-            applied: true,
-        }],
-        workflow_transitions: vec![WorkflowReconciliationTransition {
-            workflow_id: "project::repo:owner/repo::issue:42".to_string(),
-            from: "pr_open".to_string(),
-            to: "done".to_string(),
-            reason: "PR merged".to_string(),
-            applied: true,
-            repo: Some("owner/repo".to_string()),
-            issue_number: Some(42),
-            pr_number: 77,
-            pr_url: Some("https://github.com/owner/repo/pull/77".to_string()),
-        }],
-        workflow_alerts: vec![],
-    };
-    let json = serde_json::to_string(&report).expect("ReconciliationReport must serialise to JSON");
-    assert!(
-        !json.contains("/workspaces/"),
-        "ReconciliationReport JSON must not contain a workspace path, got: {json}"
-    );
 }

@@ -21,6 +21,8 @@ mod reconciliation_github;
 mod reconciliation_legacy;
 #[path = "reconciliation_periodic.rs"]
 mod reconciliation_periodic;
+#[path = "reconciliation_runtime.rs"]
+mod reconciliation_runtime;
 
 use self::reconciliation_github::fetch_pr_state_by_url;
 #[cfg(test)]
@@ -31,6 +33,9 @@ pub(crate) use self::reconciliation_github::{
     fetch_issue_state_with_token, fetch_pr_state_by_slug_with_token, GitHubState,
 };
 use self::reconciliation_legacy::{apply_transition, resolve_github_state};
+#[cfg(test)]
+use self::reconciliation_runtime::runtime_candidate_from_instance;
+use self::reconciliation_runtime::{collect_runtime_candidates, resolve_runtime_github_state};
 pub use reconciliation_periodic::start;
 
 /// One candidate task for reconciliation check.
@@ -49,7 +54,7 @@ struct Candidate {
 struct RuntimeWorkflowCandidate {
     workflow_id: String,
     state: String,
-    updated_at: chrono::DateTime<chrono::Utc>,
+    row_updated_at: chrono::DateTime<chrono::Utc>,
     repo: Option<String>,
     project_root: Option<PathBuf>,
     issue_number: Option<u64>,
@@ -206,51 +211,6 @@ fn collect_candidates(store: &TaskStore) -> (Vec<Candidate>, usize) {
         }
     }
     (candidates, skipped_terminal)
-}
-
-fn runtime_candidate_from_instance(
-    instance: &WorkflowInstance,
-) -> Option<RuntimeWorkflowCandidate> {
-    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || instance.is_terminal() {
-        return None;
-    }
-    let pr_number = instance
-        .data
-        .get("pr_number")
-        .and_then(serde_json::Value::as_u64)?;
-    Some(RuntimeWorkflowCandidate {
-        workflow_id: instance.id.clone(),
-        state: instance.state.clone(),
-        updated_at: instance.updated_at,
-        repo: optional_json_string(&instance.data, "repo"),
-        project_root: optional_json_string(&instance.data, "project_id").map(PathBuf::from),
-        issue_number: instance
-            .data
-            .get("issue_number")
-            .and_then(serde_json::Value::as_u64),
-        pr_number,
-        pr_url: optional_json_string(&instance.data, "pr_url"),
-    })
-}
-
-async fn collect_runtime_candidates(
-    store: &WorkflowRuntimeStore,
-) -> anyhow::Result<(Vec<RuntimeWorkflowCandidate>, usize)> {
-    let mut candidates = Vec::new();
-    let mut skipped_terminal = 0usize;
-    for instance in store
-        .list_instances_by_definition(GITHUB_ISSUE_PR_DEFINITION_ID, None, None)
-        .await?
-    {
-        if instance.is_terminal() {
-            skipped_terminal += 1;
-            continue;
-        }
-        if let Some(candidate) = runtime_candidate_from_instance(&instance) {
-            candidates.push(candidate);
-        }
-    }
-    Ok((candidates, skipped_terminal))
 }
 
 fn optional_json_string(data: &serde_json::Value, key: &str) -> Option<String> {
@@ -520,7 +480,7 @@ fn runtime_candidate_age_secs(
     candidate: &RuntimeWorkflowCandidate,
     now: chrono::DateTime<chrono::Utc>,
 ) -> u64 {
-    now.signed_duration_since(candidate.updated_at)
+    now.signed_duration_since(candidate.row_updated_at)
         .num_seconds()
         .max(0) as u64
 }
@@ -549,27 +509,6 @@ fn ready_to_merge_open_alert(
         pr_number: candidate.pr_number,
         pr_url: candidate.pr_url.clone(),
     })
-}
-
-async fn resolve_runtime_github_state(
-    candidate: &RuntimeWorkflowCandidate,
-    rate: &mut RateLimiter,
-    github_token: Option<&str>,
-) -> GitHubState {
-    if let Some(pr_url) = candidate.pr_url.as_deref() {
-        rate.acquire().await;
-        return fetch_pr_state_by_url(pr_url, github_token).await;
-    }
-    if let Some(repo) = candidate.repo.as_deref() {
-        rate.acquire().await;
-        return fetch_pr_state_by_slug_with_token(repo, candidate.pr_number, github_token).await;
-    }
-    tracing::debug!(
-        workflow_id = %candidate.workflow_id,
-        pr = candidate.pr_number,
-        "workflow runtime GitHub state check skipped because repository slug is unavailable"
-    );
-    GitHubState::Unknown
 }
 
 async fn apply_runtime_workflow_transition(
@@ -785,6 +724,9 @@ async fn record_runtime_issue_side_effects(
     }
 }
 
+#[cfg(test)]
+#[path = "reconciliation_payload_tests.rs"]
+mod payload_tests;
 #[cfg(test)]
 #[path = "reconciliation_tests.rs"]
 mod tests;
