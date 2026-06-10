@@ -69,6 +69,33 @@ fn subtask_empty_output_marks_parent_failed() {
 }
 
 #[test]
+fn sequential_subtask_whitespace_output_marks_parent_failed() {
+    let mut state = TaskState::new(tid("sequential-parent"));
+    let run_result = crate::parallel_dispatch::ParallelRunResult {
+        results: vec![crate::parallel_dispatch::SubtaskResult {
+            index: 0,
+            response: Some(agent_response(" \n\t")),
+            error: None,
+        }],
+        is_sequential: true,
+    };
+
+    record_parallel_subtask_results(&mut state, &run_result);
+
+    assert_eq!(state.status, TaskStatus::Failed);
+    assert_eq!(
+        state.error.as_deref(),
+        Some("1/1 sequential subtasks failed; remaining steps were skipped")
+    );
+    assert_eq!(state.rounds.len(), 1);
+    assert_eq!(state.rounds[0].result, "failed");
+    assert_eq!(
+        state.rounds[0].detail.as_deref(),
+        Some("agent returned empty output")
+    );
+}
+
+#[test]
 fn subtask_non_empty_outputs_mark_parent_done() {
     let mut state = TaskState::new(tid("parallel-parent"));
     let run_result = crate::parallel_dispatch::ParallelRunResult {
