@@ -2,6 +2,7 @@ use super::{review_loop, run_test_gate};
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, RoundResult, TaskId, TaskStatus, TaskStore,
 };
+use harness_core::review::{ReviewGateDecision, ReviewGateResult};
 use harness_core::validation::ShellValidationExecutor;
 use harness_workflow::runtime::PrFeedbackOutcome;
 use std::collections::HashMap;
@@ -678,6 +679,53 @@ pub(crate) async fn fail_missing_local_review_gate(
             "review_gate_config",
             "failed",
             Some(format!("pr={}", pr_url.unwrap_or(""))),
+            None,
+            None,
+        ));
+    })
+    .await?;
+    store.log_event(crate::event_replay::TaskEvent::Failed {
+        task_id: task_id.0.clone(),
+        ts: crate::event_replay::now_ts(),
+        reason: error,
+    });
+    Ok(())
+}
+
+pub(crate) async fn fail_review_provider_gate(
+    store: &TaskStore,
+    task_id: &TaskId,
+    turns_used: u32,
+    pr_url: Option<&str>,
+    gate: &ReviewGateResult,
+) -> anyhow::Result<()> {
+    let provider = gate.blocking_provider_id.as_deref().unwrap_or("unknown");
+    let error = match gate.decision {
+        ReviewGateDecision::ChangesRequested => {
+            format!(
+                "Review provider gate requested changes from {provider}: {}",
+                gate.summary
+            )
+        }
+        ReviewGateDecision::Blocked => {
+            format!(
+                "Review provider gate blocked completion for {provider}: {}",
+                gate.summary
+            )
+        }
+        ReviewGateDecision::Approved => {
+            "Review provider gate was unexpectedly failed after approval.".to_string()
+        }
+    };
+    mutate_and_persist(store, task_id, |s| {
+        s.status = TaskStatus::Failed;
+        s.turn = turns_used;
+        s.error = Some(error.clone());
+        s.rounds.push(RoundResult::new(
+            turns_used,
+            "review_provider_gate",
+            "failed",
+            Some(format!("provider={provider}; pr={}", pr_url.unwrap_or(""))),
             None,
             None,
         ));

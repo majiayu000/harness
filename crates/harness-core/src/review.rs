@@ -171,32 +171,11 @@ pub fn parse_review_report(
 
 pub fn evaluate_review_gate(
     reports: &[ReviewGateProviderReport],
+    required_provider_ids: &[String],
+    advisory_provider_ids: &[String],
     external_required: bool,
 ) -> ReviewGateResult {
-    let mut saw_required = false;
-    for input in reports {
-        if input.role == ReviewProviderRole::Required {
-            saw_required = true;
-            match input.report.decision {
-                ReviewDecision::ChangesRequested => {
-                    return gate_result(
-                        ReviewGateDecision::ChangesRequested,
-                        &input.report,
-                        "Required review provider requested changes.",
-                    );
-                }
-                ReviewDecision::Failed | ReviewDecision::TimedOut | ReviewDecision::Skipped => {
-                    return gate_result(
-                        ReviewGateDecision::Blocked,
-                        &input.report,
-                        "Required review provider did not complete successfully.",
-                    );
-                }
-                ReviewDecision::Approved => {}
-            }
-        }
-    }
-    if !saw_required {
+    if required_provider_ids.is_empty() {
         return ReviewGateResult {
             decision: ReviewGateDecision::Blocked,
             blocking_provider_id: None,
@@ -204,36 +183,69 @@ pub fn evaluate_review_gate(
         };
     }
 
-    if external_required {
-        let mut saw_advisory = false;
-        for input in reports {
-            if input.role == ReviewProviderRole::Advisory {
-                saw_advisory = true;
-                match input.report.decision {
-                    ReviewDecision::ChangesRequested => {
-                        return gate_result(
-                            ReviewGateDecision::ChangesRequested,
-                            &input.report,
-                            "External review provider requested changes.",
-                        );
-                    }
-                    ReviewDecision::Failed | ReviewDecision::TimedOut | ReviewDecision::Skipped => {
-                        return gate_result(
-                            ReviewGateDecision::Blocked,
-                            &input.report,
-                            "External review provider is required and did not approve.",
-                        );
-                    }
-                    ReviewDecision::Approved => {}
-                }
+    for provider_id in required_provider_ids {
+        let Some(input) = reports.iter().find(|input| {
+            input.role == ReviewProviderRole::Required && input.report.provider_id == *provider_id
+        }) else {
+            return missing_provider_result(
+                provider_id,
+                "Required review provider did not produce a report.",
+            );
+        };
+        match input.report.decision {
+            ReviewDecision::ChangesRequested => {
+                return gate_result(
+                    ReviewGateDecision::ChangesRequested,
+                    &input.report,
+                    "Required review provider requested changes.",
+                );
             }
+            ReviewDecision::Failed | ReviewDecision::TimedOut | ReviewDecision::Skipped => {
+                return gate_result(
+                    ReviewGateDecision::Blocked,
+                    &input.report,
+                    "Required review provider did not complete successfully.",
+                );
+            }
+            ReviewDecision::Approved => {}
         }
-        if !saw_advisory {
+    }
+
+    if external_required {
+        if advisory_provider_ids.is_empty() {
             return ReviewGateResult {
                 decision: ReviewGateDecision::Blocked,
                 blocking_provider_id: None,
                 summary: "No external review provider report was available.".to_string(),
             };
+        }
+        for provider_id in advisory_provider_ids {
+            let Some(input) = reports.iter().find(|input| {
+                input.role == ReviewProviderRole::Advisory
+                    && input.report.provider_id == *provider_id
+            }) else {
+                return missing_provider_result(
+                    provider_id,
+                    "External review provider did not produce a report.",
+                );
+            };
+            match input.report.decision {
+                ReviewDecision::ChangesRequested => {
+                    return gate_result(
+                        ReviewGateDecision::ChangesRequested,
+                        &input.report,
+                        "External review provider requested changes.",
+                    );
+                }
+                ReviewDecision::Failed | ReviewDecision::TimedOut | ReviewDecision::Skipped => {
+                    return gate_result(
+                        ReviewGateDecision::Blocked,
+                        &input.report,
+                        "External review provider is required and did not approve.",
+                    );
+                }
+                ReviewDecision::Approved => {}
+            }
         }
     }
 
@@ -241,6 +253,14 @@ pub fn evaluate_review_gate(
         decision: ReviewGateDecision::Approved,
         blocking_provider_id: None,
         summary: "All required review providers approved.".to_string(),
+    }
+}
+
+fn missing_provider_result(provider_id: &str, summary: &str) -> ReviewGateResult {
+    ReviewGateResult {
+        decision: ReviewGateDecision::Blocked,
+        blocking_provider_id: Some(provider_id.to_string()),
+        summary: summary.to_string(),
     }
 }
 
@@ -379,6 +399,10 @@ mod tests {
         }
     }
 
+    fn provider_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
     #[test]
     fn parses_fenced_review_report_json() {
         let report = parse_review_report(
@@ -509,6 +533,8 @@ mod tests {
                 "codex_cli_review",
                 ReviewProviderRole::Required,
             )],
+            &provider_ids(&["codex_cli_review"]),
+            &[],
             false,
         );
 
@@ -520,7 +546,8 @@ mod tests {
         let mut failed = approved_report("codex_cli_review", ReviewProviderRole::Required);
         failed.report.decision = ReviewDecision::Failed;
 
-        let result = evaluate_review_gate(&[failed], false);
+        let result =
+            evaluate_review_gate(&[failed], &provider_ids(&["codex_cli_review"]), &[], false);
 
         assert_eq!(result.decision, ReviewGateDecision::Blocked);
         assert_eq!(
@@ -536,11 +563,16 @@ mod tests {
                 "gemini_github_bot",
                 ReviewProviderRole::Advisory,
             )],
+            &provider_ids(&["codex_cli_review"]),
+            &[],
             false,
         );
 
         assert_eq!(result.decision, ReviewGateDecision::Blocked);
-        assert_eq!(result.blocking_provider_id, None);
+        assert_eq!(
+            result.blocking_provider_id.as_deref(),
+            Some("codex_cli_review")
+        );
     }
 
     #[test]
@@ -553,6 +585,8 @@ mod tests {
                 approved_report("codex_cli_review", ReviewProviderRole::Required),
                 failed,
             ],
+            &provider_ids(&["codex_cli_review"]),
+            &provider_ids(&["gemini_github_bot"]),
             false,
         );
 
@@ -566,11 +600,16 @@ mod tests {
                 "codex_cli_review",
                 ReviewProviderRole::Required,
             )],
+            &provider_ids(&["codex_cli_review"]),
+            &provider_ids(&["gemini_github_bot"]),
             true,
         );
 
         assert_eq!(result.decision, ReviewGateDecision::Blocked);
-        assert_eq!(result.blocking_provider_id, None);
+        assert_eq!(
+            result.blocking_provider_id.as_deref(),
+            Some("gemini_github_bot")
+        );
     }
 
     #[test]
@@ -583,6 +622,8 @@ mod tests {
                 approved_report("codex_cli_review", ReviewProviderRole::Required),
                 failed,
             ],
+            &provider_ids(&["codex_cli_review"]),
+            &provider_ids(&["gemini_github_bot"]),
             true,
         );
 

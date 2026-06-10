@@ -27,7 +27,8 @@ use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskStat
 #[cfg(test)]
 use local_review_completion::{
     complete_after_local_review_without_hosted_bot, fail_missing_local_review_gate,
-    LocalReviewPrChecks, LocalReviewPrHead, LocalReviewPrState, LocalReviewReadyToMergeFeedback,
+    fail_review_provider_gate, LocalReviewPrChecks, LocalReviewPrHead, LocalReviewPrState,
+    LocalReviewReadyToMergeFeedback,
 };
 #[cfg(test)]
 use pr_detection::{

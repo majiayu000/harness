@@ -1,7 +1,8 @@
 use super::helpers::update_status;
 use super::local_review_completion::{
     complete_after_local_review_without_hosted_bot, fail_missing_local_review_gate,
-    LocalReviewPrChecks, LocalReviewPrHead, LocalReviewPrState, LocalReviewReadyToMergeFeedback,
+    fail_review_provider_gate, LocalReviewPrChecks, LocalReviewPrHead, LocalReviewPrState,
+    LocalReviewReadyToMergeFeedback,
 };
 use super::pr_detection::{detect_repo_slug, find_existing_pr_for_issue_with_token};
 use super::{
@@ -12,6 +13,7 @@ use crate::task_runner::{
 };
 use anyhow::Context;
 use harness_core::agent::CodeAgent;
+use harness_core::review::{evaluate_review_gate, ReviewGateDecision};
 use harness_core::{config::project::load_project_config, prompts};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -563,6 +565,7 @@ pub(crate) async fn run_task(
     let mut agent_pushed_commit = false;
     let mut local_review_approved = false;
     let mut local_review_head_approved: Option<Result<String, String>> = None;
+    let mut local_review_reports = Vec::new();
     if review_config.enabled && !skip_agent_review {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
@@ -572,7 +575,7 @@ pub(crate) async fn run_task(
                     pr_num,
                     github_token: server_config.server.github_token.as_deref(),
                 });
-            let (review_ok, fix_requires_pr_head_advance, approved_review_head) =
+            let (review_ok, fix_requires_pr_head_advance, approved_review_head, provider_report) =
                 agent_review::run_agent_review(
                     store,
                     task_id,
@@ -593,6 +596,9 @@ pub(crate) async fn run_task(
                     &mut turns_used,
                 )
                 .await?;
+            if let Some(report) = provider_report {
+                local_review_reports.push(report);
+            }
             *turns_used_acc = turns_used;
             if !review_ok {
                 return Ok(());
@@ -629,6 +635,17 @@ pub(crate) async fn run_task(
     if !review_config.review_bot_auto_trigger {
         if !local_review_approved {
             fail_missing_local_review_gate(store, task_id, turns_used, pr_url.as_deref()).await?;
+            return Ok(());
+        }
+        let review_gate = evaluate_review_gate(
+            &local_review_reports,
+            &review_config.required_providers,
+            &review_config.advisory_providers,
+            review_config.external_required,
+        );
+        if review_gate.decision != ReviewGateDecision::Approved {
+            fail_review_provider_gate(store, task_id, turns_used, pr_url.as_deref(), &review_gate)
+                .await?;
             return Ok(());
         }
         let (before_review_sha, before_review_error) = match local_review_head_before.as_ref() {

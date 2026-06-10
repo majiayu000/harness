@@ -17,8 +17,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
+#[path = "agent_review_provider_gate.rs"]
+mod provider_gate;
 #[path = "agent_review_workspace_snapshot.rs"]
 mod workspace_snapshot;
+use provider_gate::{local_review_provider_report, AgentReviewGateReport};
 use workspace_snapshot::WorkspaceSnapshot;
 
 /// Compute Jaccard word-similarity between two strings.
@@ -142,7 +145,12 @@ pub(crate) async fn run_agent_review(
     effective_max_turns: Option<u32>,
     review_head_probe: Option<ReviewHeadProbe<'_>>,
     turns_used: &mut u32,
-) -> anyhow::Result<(bool, bool, Option<Result<String, String>>)> {
+) -> anyhow::Result<(
+    bool,
+    bool,
+    Option<Result<String, String>>,
+    AgentReviewGateReport,
+)> {
     let max_rounds = review_config.max_rounds;
     // (normalized_issues, consecutive_count): tracks how many consecutive rounds produced identical issues.
     let mut impasse_tracker: Option<(Vec<String>, u32)> = None;
@@ -150,6 +158,7 @@ pub(crate) async fn run_agent_review(
     let mut fix_requires_pr_head_advance = false;
     let mut approved_review = false;
     let mut approved_review_head: Option<Result<String, String>> = None;
+    let mut latest_provider_report: AgentReviewGateReport = None;
     let mut last_issues: Vec<String> = Vec::new();
     for agent_round in 1..=max_rounds {
         update_status(store, task_id, TaskStatus::AgentReview, agent_round).await?;
@@ -276,7 +285,7 @@ pub(crate) async fn run_agent_review(
                     if let Err(error) = events.log(&event).await {
                         tracing::warn!("failed to log agent_review event: {error}");
                     }
-                    return Ok((false, false, approved_review_head));
+                    return Ok((false, false, approved_review_head, None));
                 }
                 run_on_error(interceptors, &review_req, &failure.error.to_string()).await;
                 mutate_and_persist(store, task_id, |s| {
@@ -365,6 +374,12 @@ pub(crate) async fn run_agent_review(
         let approved = prompts::is_approved(&output);
         let issues = prompts::extract_review_issues(&output);
         let review_detail = output;
+        latest_provider_report = Some(local_review_provider_report(
+            review_config,
+            &review_detail,
+            review_started_at,
+            Utc::now(),
+        ));
         last_issues = issues.clone();
 
         mutate_and_persist(store, task_id, |s| {
@@ -432,7 +447,12 @@ pub(crate) async fn run_agent_review(
                 Some(review_detail),
             )
             .await?;
-            return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+            return Ok((
+                false,
+                fix_requires_pr_head_advance,
+                approved_review_head,
+                latest_provider_report,
+            ));
         }
 
         // Detect impasse: track how many consecutive rounds produced identical issues.
@@ -463,7 +483,7 @@ pub(crate) async fn run_agent_review(
                 ));
             })
             .await?;
-            return Ok((false, false, approved_review_head));
+            return Ok((false, false, approved_review_head, latest_provider_report));
         }
 
         // 3+ consecutive rounds with identical issues → use the intervention prompt.
@@ -500,7 +520,12 @@ pub(crate) async fn run_agent_review(
                     None,
                 )
                 .await?;
-                return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                return Ok((
+                    false,
+                    fix_requires_pr_head_advance,
+                    approved_review_head,
+                    latest_provider_report,
+                ));
             }
         };
         let fix_prompt_built_at = Utc::now();
@@ -563,7 +588,12 @@ pub(crate) async fn run_agent_review(
                             Some(r.output.clone()),
                         )
                         .await?;
-                        return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                        return Ok((
+                            false,
+                            fix_requires_pr_head_advance,
+                            approved_review_head,
+                            latest_provider_report,
+                        ));
                     }
                     Err(error) => {
                         let error = format!(
@@ -579,7 +609,12 @@ pub(crate) async fn run_agent_review(
                             Some(r.output.clone()),
                         )
                         .await?;
-                        return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                        return Ok((
+                            false,
+                            fix_requires_pr_head_advance,
+                            approved_review_head,
+                            latest_provider_report,
+                        ));
                     }
                 };
                 if let Some(val_err) = run_post_execute(interceptors, &fix_req, &r).await {
@@ -602,7 +637,12 @@ pub(crate) async fn run_agent_review(
                             Some(r.output.clone()),
                         )
                         .await?;
-                        return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                        return Ok((
+                            false,
+                            fix_requires_pr_head_advance,
+                            approved_review_head,
+                            latest_provider_report,
+                        ));
                     }
                 };
                 if workspace_changed && !pushed_marker {
@@ -619,7 +659,12 @@ pub(crate) async fn run_agent_review(
                         Some(r.output.clone()),
                     )
                     .await?;
-                    return Ok((false, fix_requires_pr_head_advance, approved_review_head));
+                    return Ok((
+                        false,
+                        fix_requires_pr_head_advance,
+                        approved_review_head,
+                        latest_provider_report,
+                    ));
                 }
                 if workspace_changed || pushed_marker {
                     fix_requires_pr_head_advance = true;
@@ -685,7 +730,12 @@ pub(crate) async fn run_agent_review(
     }
 
     if approved_review {
-        return Ok((true, fix_requires_pr_head_advance, approved_review_head));
+        return Ok((
+            true,
+            fix_requires_pr_head_advance,
+            approved_review_head,
+            latest_provider_report,
+        ));
     }
 
     let detail = if last_issues.is_empty() {
@@ -702,5 +752,10 @@ pub(crate) async fn run_agent_review(
         format!("Agent review exhausted {max_rounds} rounds without approval.")
     };
     fail_agent_review(store, events, task_id, max_rounds, pr_url, error, detail).await?;
-    Ok((false, fix_requires_pr_head_advance, approved_review_head))
+    Ok((
+        false,
+        fix_requires_pr_head_advance,
+        approved_review_head,
+        latest_provider_report,
+    ))
 }
