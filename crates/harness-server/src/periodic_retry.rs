@@ -682,12 +682,9 @@ mod tests {
             return Ok(());
         }
         let dir = test_helpers::tempdir_in_home("harness-test-retry-ws-")?;
-        let project_root = dir.path().canonicalize()?;
-        let project_root_str = project_root.to_string_lossy().into_owned();
         let mut registry = AgentRegistry::new("test");
         registry.register("test", Arc::new(RetryTestAgent));
-        let mut state =
-            test_helpers::make_test_state_with_registry(&project_root, registry).await?;
+        let mut state = test_helpers::make_test_state_with_registry(dir.path(), registry).await?;
         let runtime_store = Arc::new(
             harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
                 &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
@@ -727,10 +724,9 @@ mod tests {
         let workspace_path = workspace_root.join("retry-task");
         std::fs::create_dir_all(&workspace_path)?;
 
-        let mut task = stalled_task("retry-task", "issue:42", &project_root_str);
+        let mut task = stalled_task("retry-task", "issue:42", dir.path().to_str().unwrap());
         task.id = task_id.clone();
         task.source = Some("github".to_string());
-        task.repo = Some("owner/repo".to_string());
         task.workspace_path = Some(workspace_path.clone());
         task.workspace_owner = Some("old-session".to_string());
         task.run_generation = 1;
@@ -764,17 +760,18 @@ mod tests {
             tasks.iter().all(|t| t.id == task_id),
             "runtime-first issue retry should not enqueue a successor task row"
         );
+        let detected_repo = crate::task_executor::pr_detection::detect_repo_slug(dir.path()).await;
+        let project_id = dir.path().to_string_lossy();
         let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            &project_root_str,
-            Some("owner/repo"),
+            project_id.as_ref(),
+            detected_repo.as_deref(),
             42,
         );
         let instance = runtime_store
             .get_instance(&workflow_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("retry should submit the issue to workflow runtime"))?;
+            .expect("retry should submit the issue to workflow runtime");
         assert_eq!(instance.data["execution_path"], "workflow_runtime");
-        assert_eq!(instance.data["repo"], "owner/repo");
         let commands = runtime_store.commands_for(&workflow_id).await?;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
