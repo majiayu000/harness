@@ -1,5 +1,5 @@
-//! Regression tests: corrupted `rounds` column must surface as a distinguishable
-//! error rather than silently defaulting to an empty list (issue #62).
+//! Regression tests: corrupted JSON columns must surface as distinguishable
+//! errors rather than silently defaulting to empty or queued values.
 
 use harness_core::error::TaskDbDecodeError;
 use harness_core::types::TaskId as CoreTaskId;
@@ -69,6 +69,92 @@ async fn get_distinguishes_missing_task_from_corrupted_rounds() -> anyhow::Resul
     assert!(
         is_rounds_err,
         "error must be TaskDbDecodeError::RoundsDeserialize; got: {err}"
+    );
+
+    std::mem::forget(tmp);
+    Ok(())
+}
+
+/// A corrupted `scheduler_state` column must return a typed decode error, not
+/// `Ok(Some(_))` with a default queued scheduler authority.
+#[tokio::test]
+async fn get_rejects_corrupted_scheduler_state() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    db.insert(&make_task("task-corrupted-scheduler")).await?;
+    db.overwrite_scheduler_state_for_test(
+        "task-corrupted-scheduler",
+        r#"{"authority_state":"not_a_real_state"}"#,
+    )
+    .await?;
+
+    let result = db.get("task-corrupted-scheduler").await;
+    let err = result.expect_err("corrupted scheduler_state must return Err, not Ok(Some(_))");
+
+    let is_scheduler_err = err
+        .downcast_ref::<TaskDbDecodeError>()
+        .is_some_and(|e| matches!(e, TaskDbDecodeError::SchedulerStateDeserialize { .. }));
+    assert!(
+        is_scheduler_err,
+        "error must be TaskDbDecodeError::SchedulerStateDeserialize; got: {err}"
+    );
+
+    std::mem::forget(tmp);
+    Ok(())
+}
+
+#[tokio::test]
+async fn valid_scheduler_state_round_trips_unchanged() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut task = make_task("task-valid-scheduler");
+    task.scheduler.claim_scheduler("test-scheduler");
+    db.insert(&task).await?;
+
+    let fetched = db
+        .get("task-valid-scheduler")
+        .await?
+        .expect("valid task must exist");
+    assert_eq!(fetched.scheduler, task.scheduler);
+
+    std::mem::forget(tmp);
+    Ok(())
+}
+
+#[tokio::test]
+async fn summaries_do_not_default_corrupted_scheduler_state() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut valid = make_task("task-valid-summary-scheduler");
+    valid.scheduler.claim_scheduler("summary-scheduler");
+    db.insert(&valid).await?;
+    db.insert(&make_task("task-corrupted-summary-scheduler"))
+        .await?;
+    db.overwrite_scheduler_state_for_test(
+        "task-corrupted-summary-scheduler",
+        r#"{"authority_state":"not_a_real_state"}"#,
+    )
+    .await?;
+
+    let summaries = db.list_summaries().await?;
+    assert!(
+        summaries
+            .iter()
+            .any(|summary| summary.id.0 == "task-valid-summary-scheduler"
+                && summary.scheduler == valid.scheduler),
+        "valid scheduler_state summary must decode unchanged"
+    );
+    assert!(
+        !summaries
+            .iter()
+            .any(|summary| summary.id.0 == "task-corrupted-summary-scheduler"),
+        "corrupted scheduler_state summary must not be returned as default queued state"
     );
 
     std::mem::forget(tmp);
