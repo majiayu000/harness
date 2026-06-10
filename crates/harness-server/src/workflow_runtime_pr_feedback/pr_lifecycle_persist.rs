@@ -45,7 +45,8 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<()>>,
 {
-    for attempt in 1..=PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         let result = match maybe_inject_pr_lifecycle_persist_failure_for_test(task_id) {
             Ok(()) => persist().await,
             Err(error) => Err(error),
@@ -75,6 +76,7 @@ where
                     "workflow runtime PR lifecycle write failed; retrying: {error}"
                 );
                 tokio::time::sleep(PR_LIFECYCLE_PERSIST_RETRY_BACKOFF).await;
+                attempt += 1;
             }
             Err(error) => {
                 record_pr_lifecycle_persist_failure(
@@ -92,7 +94,6 @@ where
             }
         }
     }
-    anyhow::bail!("workflow runtime PR lifecycle write exhausted retry attempts")
 }
 
 async fn record_pr_lifecycle_persist_failure(
@@ -135,14 +136,37 @@ static PR_LIFECYCLE_PERSIST_TEST_FAILURES: std::sync::Mutex<
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(test)]
-pub(super) fn set_pr_lifecycle_persist_test_failures(task_id: &str, failures: usize) {
+pub(super) struct PrLifecyclePersistTestFailuresGuard {
+    task_id: String,
+}
+
+#[cfg(test)]
+impl Drop for PrLifecyclePersistTestFailuresGuard {
+    fn drop(&mut self) {
+        if let Ok(mut plans) = PR_LIFECYCLE_PERSIST_TEST_FAILURES.lock() {
+            plans.remove(&self.task_id);
+        }
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+pub(super) fn set_pr_lifecycle_persist_test_failures(
+    task_id: &str,
+    failures: usize,
+) -> PrLifecyclePersistTestFailuresGuard {
     let Ok(mut plans) = PR_LIFECYCLE_PERSIST_TEST_FAILURES.lock() else {
-        return;
+        return PrLifecyclePersistTestFailuresGuard {
+            task_id: task_id.to_string(),
+        };
     };
     if failures == 0 {
         plans.remove(task_id);
     } else {
         plans.insert(task_id.to_string(), failures);
+    }
+    PrLifecyclePersistTestFailuresGuard {
+        task_id: task_id.to_string(),
     }
 }
 

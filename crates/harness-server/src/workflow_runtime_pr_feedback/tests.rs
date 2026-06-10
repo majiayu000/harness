@@ -60,7 +60,7 @@ async fn transient_pr_lifecycle_persist_failure_is_retried_and_converges() -> an
     let project_root = dir.path().join("project");
     std::fs::create_dir(&project_root)?;
     let task_id = TaskId::from_str("transient-pr-lifecycle-persist-failure");
-    set_pr_lifecycle_persist_test_failures(task_id.as_str(), 2);
+    let _guard = set_pr_lifecycle_persist_test_failures(task_id.as_str(), 2);
 
     record_pr_detected(
         Some(&store),
@@ -107,7 +107,8 @@ async fn persistent_pr_lifecycle_persist_failure_records_operator_event() -> any
     let project_root = dir.path().join("project");
     std::fs::create_dir(&project_root)?;
     let task_id = TaskId::from_str("persistent-pr-lifecycle-persist-failure");
-    set_pr_lifecycle_persist_test_failures(task_id.as_str(), PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS);
+    let _guard =
+        set_pr_lifecycle_persist_test_failures(task_id.as_str(), PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS);
 
     record_pr_detected(
         Some(&store),
