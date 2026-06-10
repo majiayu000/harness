@@ -320,6 +320,9 @@ pub(crate) async fn run_task(
     let effective_max_rounds = hosted_review_max_rounds;
     let mut effective_review_config = resolved.review.clone();
     effective_review_config.max_rounds = agent_review_max_rounds;
+    if let Some(max_rounds) = req.max_rounds {
+        effective_review_config.codex_agent_review.max_rounds = max_rounds;
+    }
     let review_config = &effective_review_config;
     // max_turns: per-request override wins; global config is the fallback.
     // Counts every agent API call (impl + validation retries + review rounds).
@@ -549,7 +552,9 @@ pub(crate) async fn run_task(
     }
 
     let repo_slug_for_review = review_repo_slug(pr_url.as_deref(), &repo_slug);
-    let should_probe_pr_head = !review_config.review_bot_auto_trigger && pr_num > 0;
+    let requires_hosted_review =
+        review_config.review_bot_auto_trigger || review_config.external_required;
+    let should_probe_pr_head = !requires_hosted_review && pr_num > 0;
     let local_review_head_before = if should_probe_pr_head {
         Some(
             review_loop::fetch_pr_head_sha_for_gate(
@@ -576,6 +581,8 @@ pub(crate) async fn run_task(
     {
         if let Some(reviewer) = reviewer {
             tracing::info!(pr_url = %pr_url.as_deref().unwrap_or(""), "starting agent review");
+            let codex_agent_review_config =
+                agent_review_provider_gate::codex_agent_review_config(review_config);
             let review_head_probe =
                 should_probe_pr_head.then_some(agent_review::ReviewHeadProbe::GitHub {
                     repo_slug: &repo_slug_for_review,
@@ -588,7 +595,7 @@ pub(crate) async fn run_task(
                     task_id,
                     agent,
                     reviewer,
-                    review_config,
+                    &codex_agent_review_config,
                     &context_items,
                     &project,
                     interceptors.as_ref(),
@@ -637,21 +644,20 @@ pub(crate) async fn run_task(
         *turns_used_acc = turns_used;
     }
     if enforce_provider_gate {
+        // External provider evidence is produced by the hosted review loop below.
+        // The local gate only evaluates reports from providers run in this phase.
         let review_gate = evaluate_review_gate(
             &local_review_reports,
             &review_config.required_providers,
-            &review_config.advisory_providers,
-            review_config.external_required,
+            &[],
+            false,
         );
         if review_gate.decision != ReviewGateDecision::Approved {
             fail_review_provider_gate(store, task_id, turns_used, pr_url.as_deref(), &review_gate)
                 .await?;
             return Ok(());
         }
-        if !review_config.review_bot_auto_trigger
-            && local_review_head_approved.is_none()
-            && should_probe_pr_head
-        {
+        if !requires_hosted_review && local_review_head_approved.is_none() && should_probe_pr_head {
             local_review_head_approved = Some(
                 review_loop::fetch_pr_head_sha_for_gate(
                     &repo_slug_for_review,
@@ -682,7 +688,7 @@ pub(crate) async fn run_task(
 
     // Skip hosted review bot wait when auto-trigger is disabled, but keep a
     // validation gate so local review cannot mark a red PR complete.
-    if !review_config.review_bot_auto_trigger {
+    if !requires_hosted_review {
         if !enforce_provider_gate {
             fail_missing_local_review_gate(store, task_id, turns_used, pr_url.as_deref()).await?;
             return Ok(());

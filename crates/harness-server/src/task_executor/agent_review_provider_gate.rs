@@ -35,6 +35,12 @@ pub(crate) fn should_run_codex_agent_review(review_config: &AgentReviewConfig) -
         || provider_policy_references(review_config, CODEX_AGENT_REVIEW_PROVIDER_ID)
 }
 
+pub(crate) fn codex_agent_review_config(review_config: &AgentReviewConfig) -> AgentReviewConfig {
+    let mut config = review_config.clone();
+    config.max_rounds = review_config.codex_agent_review.max_rounds;
+    config
+}
+
 pub(crate) fn local_review_provider_report(
     review_config: &AgentReviewConfig,
     raw_output: &str,
@@ -167,8 +173,8 @@ fn codex_cli_review_prompt(
     output_format: &str,
 ) -> String {
     let json_format = if output_format.eq_ignore_ascii_case("json") {
-        "\nReturn exactly one fenced `review_report` JSON block with this shape:\n\
-         ```review_report\n\
+        "\nReturn exactly one fenced `harness-review-report` JSON block with this shape:\n\
+         ```harness-review-report\n\
          {\"decision\":\"approved|changes_requested|failed|timed_out|skipped\",\
          \"summary\":\"concise summary\",\
          \"findings\":[{\"severity\":\"critical|high|medium|low\",\
@@ -384,10 +390,40 @@ mod tests {
     }
 
     #[test]
+    fn codex_cli_review_prompt_uses_parseable_report_fence() {
+        let prompt = codex_cli_review_prompt(
+            "https://github.com/owner/repo/pull/1",
+            "rust",
+            "origin/main",
+            "json",
+        );
+
+        assert!(prompt.contains("```harness-review-report"));
+        assert!(!prompt.contains("```review_report"));
+    }
+
+    #[test]
     fn codex_agent_review_runs_only_when_configured_or_referenced() {
         let mut config = AgentReviewConfig::default();
         assert!(!should_run_codex_agent_review(&config));
         config.codex_agent_review.enabled = true;
         assert!(should_run_codex_agent_review(&config));
+    }
+
+    #[test]
+    fn codex_agent_review_config_uses_provider_round_limit() {
+        let mut config = AgentReviewConfig {
+            max_rounds: 8,
+            ..AgentReviewConfig::default()
+        };
+        config.codex_agent_review.max_rounds = 2;
+
+        let provider_config = codex_agent_review_config(&config);
+
+        assert_eq!(provider_config.max_rounds, 2);
+        assert_eq!(
+            provider_config.required_providers,
+            config.required_providers
+        );
     }
 }
