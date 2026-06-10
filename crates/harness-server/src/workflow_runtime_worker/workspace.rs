@@ -188,6 +188,67 @@ pub(super) async fn finish_runtime_workspace(
     hook_result
 }
 
+pub(super) async fn cleanup_terminal_runtime_workspace(
+    state: &AppState,
+    workflow: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    if !workflow.is_terminal() {
+        return Ok(());
+    }
+    let Some(workspace_mgr) = state.concurrency.workspace_mgr.as_ref() else {
+        return Ok(());
+    };
+    let Some(project_id) = workflow
+        .data
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let source_project_root = PathBuf::from(project_id);
+    let workflow_document =
+        harness_core::config::workflow::load_workflow_document(&source_project_root)?;
+    if workflow_document.config.workspace.strategy != "worktree"
+        || workflow_document.config.workspace.cleanup != "on_terminal"
+    {
+        return Ok(());
+    }
+
+    let task_id = stable_runtime_workspace_task_id_for_workflow(workflow);
+    let repo = workflow
+        .data
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .or(workflow_document.config.source.repo.as_deref());
+    let workspace_path = workspace_mgr.workspace_path_for(
+        &task_id,
+        &source_project_root,
+        Some(workflow.subject.subject_key.as_str()),
+        repo,
+    );
+    if workspace_path.exists() {
+        if let Some(hook) = workflow_document.config.hooks.before_remove.as_deref() {
+            if let Err(error) = run_workflow_hook(
+                "before_remove",
+                hook,
+                &workspace_path,
+                workflow_document.config.hooks.timeout_secs,
+            )
+            .await
+            {
+                tracing::warn!(
+                    workflow_id = %workflow.id,
+                    workspace_path = %workspace_path.display(),
+                    "before_remove hook failed during terminal runtime workspace cleanup: {error}"
+                );
+            }
+        }
+    }
+    workspace_mgr
+        .cleanup_workspace_for_retry(&task_id, &source_project_root, Some(&workspace_path))
+        .await
+}
+
 fn validate_workspace_cleanup_policy(cleanup: &str) -> anyhow::Result<()> {
     match cleanup {
         "after_run" | "on_terminal" => Ok(()),
@@ -235,13 +296,17 @@ pub(super) fn stable_runtime_workspace_task_id(
     workflow: Option<&WorkflowInstance>,
 ) -> TaskId {
     if let Some(workflow) = workflow {
-        let definition = sanitize_workspace_id_component(&workflow.definition_id);
-        return TaskId::from_str(&format!(
-            "runtime-wf-{definition}-{}",
-            stable_hash_8(&workflow.id)
-        ));
+        return stable_runtime_workspace_task_id_for_workflow(workflow);
     }
     TaskId::from_str(&format!("runtime-job-{}", stable_hash_8(&job.id)))
+}
+
+fn stable_runtime_workspace_task_id_for_workflow(workflow: &WorkflowInstance) -> TaskId {
+    let definition = sanitize_workspace_id_component(&workflow.definition_id);
+    TaskId::from_str(&format!(
+        "runtime-wf-{definition}-{}",
+        stable_hash_8(&workflow.id)
+    ))
 }
 
 fn sanitize_workspace_id_component(value: &str) -> String {

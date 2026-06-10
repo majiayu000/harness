@@ -27,6 +27,8 @@ struct RuntimeTaskResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     issue: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workflow: Option<TaskWorkflowSummary>,
 }
 
@@ -123,6 +125,7 @@ async fn runtime_task_response_by_handle(
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned),
         issue,
+        error: runtime_string_field(&workflow.data, "failure_reason"),
         workflow: Some(TaskWorkflowSummary::from_runtime(&workflow)),
     }))
 }
