@@ -204,12 +204,22 @@ fn parse_ccstats_daily_rows(stdout: &[u8]) -> Result<Vec<CcstatsDailyRow>, Strin
     let stdout = std::str::from_utf8(stdout)
         .map_err(|error| format!("ccstats stdout was not UTF-8: {error}"))?
         .trim();
-    if stdout.is_empty() || (stdout.starts_with("No ") && stdout.ends_with(" data found.")) {
+    if is_ccstats_no_data_output(stdout) {
         return Ok(Vec::new());
     }
 
     serde_json::from_str::<Vec<CcstatsDailyRow>>(stdout)
         .map_err(|error| format!("failed to parse ccstats JSON: {error}"))
+}
+
+fn is_ccstats_no_data_output(stdout: &str) -> bool {
+    let Some(first_line) = stdout.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return true;
+    };
+
+    first_line.starts_with("No ")
+        && (first_line.ends_with(" data found.")
+            || first_line.ends_with(" usage data found in the selected date range."))
 }
 
 fn source_from_rows(
@@ -419,6 +429,13 @@ mod tests {
     fn parse_ccstats_daily_rows_treats_no_data_output_as_empty_usage() {
         assert_eq!(
             parse_ccstats_daily_rows(b"No codex data found.\n").map(|rows| rows.len()),
+            Ok(0)
+        );
+        assert_eq!(
+            parse_ccstats_daily_rows(
+                b"No codex usage data found in the selected date range.\nRun ccstats without --offline to refresh cached pricing.\n",
+            )
+            .map(|rows| rows.len()),
             Ok(0)
         );
         assert_eq!(parse_ccstats_daily_rows(b"").map(|rows| rows.len()), Ok(0));
