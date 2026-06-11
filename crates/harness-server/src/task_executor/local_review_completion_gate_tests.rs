@@ -1,4 +1,5 @@
 use super::*;
+use harness_core::review::{ReviewGateDecision, ReviewGateResult};
 
 #[tokio::test]
 async fn hosted_bot_disabled_completion_blocks_pr_ci_failure() -> anyhow::Result<()> {
@@ -464,5 +465,46 @@ async fn hosted_bot_disabled_requires_local_review_approval() -> anyhow::Result<
         .rounds
         .iter()
         .any(|round| round.action == "review_gate_config" && round.result == "failed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_bot_disabled_blocks_missing_required_provider_report() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store
+        .insert(&crate::task_runner::TaskState::new(task_id.clone()))
+        .await;
+    let gate = ReviewGateResult {
+        decision: ReviewGateDecision::Blocked,
+        blocking_provider_id: Some("codex_cli_review".to_string()),
+        summary: "Required review provider did not produce a report.".to_string(),
+    };
+
+    fail_review_provider_gate(
+        &store,
+        &task_id,
+        4,
+        Some("https://github.com/owner/repo/pull/1"),
+        &gate,
+    )
+    .await?;
+
+    let state = store.get(&task_id).expect("task state should be present");
+    assert_eq!(state.status, TaskStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("codex_cli_review"),
+        "unexpected error: {:?}",
+        state.error
+    );
+    assert!(state
+        .rounds
+        .iter()
+        .any(|round| round.action == "review_provider_gate" && round.result == "failed"));
     Ok(())
 }
