@@ -440,7 +440,7 @@ because the operator owns the process lifetime directly.
 ./target/release/harness serve --transport http --port 9800 --project-root /path/to/project
 
 # Multi-project via config file (recommended)
-./target/release/harness serve --transport http --port 9800 --config config/default.toml
+./target/release/harness --config config/default.toml serve --transport http --port 9800
 
 # Multi-project via CLI flags
 ./target/release/harness serve --transport http --port 9800 \
@@ -448,7 +448,7 @@ because the operator owns the process lifetime directly.
   --project litellm=/path/to/litellm
 
 # With GitHub token for auto-review
-GITHUB_TOKEN=ghp_xxx ./target/release/harness serve --transport http --port 9800 --config config/default.toml
+GITHUB_TOKEN=ghp_xxx ./target/release/harness --config config/default.toml serve --transport http --port 9800
 ```
 
 ## Task Execution Flow

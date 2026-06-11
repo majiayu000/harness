@@ -94,10 +94,9 @@ max_concurrent = 1
 Start with:
 
 ```bash
-./target/release/harness serve \
+./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ### Multi-Project via CLI Flags
@@ -118,10 +117,9 @@ CLI `--project` flags merge with config `[[projects]]` entries. CLI overrides co
 Enable auto-review bot comments on PRs:
 
 ```bash
-GITHUB_TOKEN=ghp_xxx ./target/release/harness serve \
+GITHUB_TOKEN=ghp_xxx ./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ### With Anthropic API Key
@@ -129,10 +127,9 @@ GITHUB_TOKEN=ghp_xxx ./target/release/harness serve \
 Enable the direct Anthropic API agent:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-xxx ./target/release/harness serve \
+ANTHROPIC_API_KEY=sk-ant-xxx ./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ## Submitting Tasks
@@ -630,7 +627,7 @@ RuleEngine / SkillStore (permanently prevents recurrence)
 
 ```bash
 # Start server
-harness serve --transport http --port 9800 --config config/default.toml
+harness --config config/default.toml serve --transport http --port 9800
 
 # One-shot execution
 harness exec "Fix the failing test in src/lib.rs"
