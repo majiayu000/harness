@@ -181,6 +181,35 @@ pub(super) struct ReviewFallbackState {
     pub(super) active_bot: Option<ReviewBotKey>,
 }
 
+impl ReviewFallbackState {
+    pub(super) fn is_terminal(&self) -> bool {
+        self.tier == harness_workflow::issue_lifecycle::ReviewFallbackTier::C
+    }
+
+    pub(super) fn detail(&self) -> String {
+        format!(
+            "Review fallback tier {} via {}",
+            match self.tier {
+                harness_workflow::issue_lifecycle::ReviewFallbackTier::A => "A",
+                harness_workflow::issue_lifecycle::ReviewFallbackTier::B => "B",
+                harness_workflow::issue_lifecycle::ReviewFallbackTier::C => "C",
+            },
+            match self.trigger {
+                harness_workflow::issue_lifecycle::ReviewFallbackTrigger::GeminiQuota => {
+                    "gemini_quota"
+                }
+                harness_workflow::issue_lifecycle::ReviewFallbackTrigger::CodexQuota => {
+                    "codex_quota"
+                }
+                harness_workflow::issue_lifecycle::ReviewFallbackTrigger::AllBotsQuota => {
+                    "all_bots_quota"
+                }
+                harness_workflow::issue_lifecycle::ReviewFallbackTrigger::Silence => "silence",
+            }
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ReviewLoopDecision {
     pub(super) active_bot: ReviewBotDescriptor,

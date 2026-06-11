@@ -169,32 +169,19 @@ pub(crate) async fn run_review_loop(
                         tracing::warn!("failed to log pr_review_fallback event: {error}");
                     }
                 }
-                if decision.fallback.as_ref().is_some_and(|fallback| {
-                    fallback.tier == harness_workflow::issue_lifecycle::ReviewFallbackTier::C
-                }) {
+                if review_wait_budget
+                    .fail_terminal_fallback_if_exceeded(&decision, store, task_id, round)
+                    .await?
+                {
+                    return Ok(());
+                }
+                if decision
+                    .fallback
+                    .as_ref()
+                    .is_some_and(ReviewFallbackState::is_terminal)
+                {
                     let fallback = decision.fallback.expect("tier C fallback");
-                    let detail = format!(
-                        "Review fallback tier {} via {}",
-                        match fallback.tier {
-                            harness_workflow::issue_lifecycle::ReviewFallbackTier::A => "A",
-                            harness_workflow::issue_lifecycle::ReviewFallbackTier::B => "B",
-                            harness_workflow::issue_lifecycle::ReviewFallbackTier::C => "C",
-                        },
-                        match fallback.trigger {
-                            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::GeminiQuota => {
-                                "gemini_quota"
-                            }
-                            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::CodexQuota => {
-                                "codex_quota"
-                            }
-                            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::AllBotsQuota => {
-                                "all_bots_quota"
-                            }
-                            harness_workflow::issue_lifecycle::ReviewFallbackTrigger::Silence => {
-                                "silence"
-                            }
-                        }
-                    );
+                    let detail = fallback.detail();
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Done;
                         s.turn = round;

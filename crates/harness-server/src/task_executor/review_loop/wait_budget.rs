@@ -1,3 +1,4 @@
+use super::signals::{ReviewFallbackState, ReviewLoopDecision};
 use crate::task_runner::{mutate_and_persist, TaskId, TaskStatus, TaskStore};
 use tokio::time::{Duration, Instant};
 
@@ -39,6 +40,23 @@ impl ReviewWaitBudget {
         })
         .await?;
         Ok(true)
+    }
+
+    pub(super) async fn fail_terminal_fallback_if_exceeded(
+        &self,
+        decision: &ReviewLoopDecision,
+        store: &TaskStore,
+        task_id: &TaskId,
+        round: u32,
+    ) -> anyhow::Result<bool> {
+        if decision
+            .fallback
+            .as_ref()
+            .is_some_and(ReviewFallbackState::is_terminal)
+        {
+            return self.fail_if_exceeded(store, task_id, round).await;
+        }
+        Ok(false)
     }
 
     pub(super) fn sleep_duration(&self, wait_secs: u64) -> Duration {

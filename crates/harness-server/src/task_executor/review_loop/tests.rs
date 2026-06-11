@@ -3,8 +3,8 @@ use super::runtime_feedback::resolve_runtime_feedback_issue_number;
 use super::signals::{
     bot_fallback_chain, classify_bot, classify_pr_check_rollup_state, record_bot_comment_signal,
     review_bot_key_for_author, BotClassification, BotSignals, PrCheckRollupState,
-    PullRequestSignals, ReviewBotDescriptor, ReviewBotKey, CODEX_REVIEWER_NAME,
-    CODEX_REVIEW_COMMAND,
+    PullRequestSignals, ReviewBotDescriptor, ReviewBotKey, ReviewFallbackState, ReviewLoopDecision,
+    CODEX_REVIEWER_NAME, CODEX_REVIEW_COMMAND,
 };
 use super::wait_budget::ReviewWaitBudget;
 use crate::task_runner::{TaskId, TaskState, TaskStatus, TaskStore};
@@ -75,6 +75,45 @@ async fn review_wait_budget_zero_disables_failure() -> anyhow::Result<()> {
         .get(&task_id)
         .ok_or_else(|| anyhow::anyhow!("task state should exist"))?;
     assert_ne!(state.status, TaskStatus::Failed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_fallback_fails_when_wait_budget_exceeded() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store.insert(&TaskState::new(task_id.clone())).await;
+    let budget = ReviewWaitBudget::new(Instant::now() - Duration::from_secs(5), 1);
+    let decision = ReviewLoopDecision {
+        active_bot: descriptor(ReviewBotKey::Codex),
+        fallback: Some(ReviewFallbackState {
+            tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::C,
+            trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger::AllBotsQuota,
+            active_bot: Some(ReviewBotKey::Codex),
+        }),
+        wait_for_bot: false,
+    };
+
+    let exceeded = budget
+        .fail_terminal_fallback_if_exceeded(&decision, store.as_ref(), &task_id, 2)
+        .await?;
+
+    assert!(exceeded);
+    let state = store
+        .get(&task_id)
+        .ok_or_else(|| anyhow::anyhow!("task state should exist"))?;
+    assert_eq!(state.status, TaskStatus::Failed);
+    assert_eq!(state.turn, 2);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("review wait budget exceeded"),
+        "unexpected error: {:?}",
+        state.error
+    );
     Ok(())
 }
 
