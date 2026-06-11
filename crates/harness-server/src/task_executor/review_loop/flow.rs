@@ -292,7 +292,7 @@ pub(crate) async fn run_review_loop(
                         waiting_count = 0;
                     }
                     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
-                    sleep(Duration::from_secs(wait_secs)).await;
+                    sleep(review_wait_budget.sleep_duration(wait_secs)).await;
                     continue;
                 }
                 waiting_on_bot = None;
@@ -596,7 +596,7 @@ pub(crate) async fn run_review_loop(
                 .await;
                 waiting_count += 1;
                 update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
-                sleep(Duration::from_secs(wait_secs)).await;
+                sleep(review_wait_budget.sleep_duration(wait_secs)).await;
                 continue;
             }
         }
@@ -736,7 +736,7 @@ pub(crate) async fn run_review_loop(
             }
             waiting_count += 1;
             update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
-            sleep(Duration::from_secs(wait_secs)).await;
+            sleep(review_wait_budget.sleep_duration(wait_secs)).await;
         }
         round += 1;
     }

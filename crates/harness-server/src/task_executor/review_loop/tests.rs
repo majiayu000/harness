@@ -78,6 +78,20 @@ async fn review_wait_budget_zero_disables_failure() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn review_wait_budget_caps_sleep_to_remaining_budget() {
+    let budget = ReviewWaitBudget::new(Instant::now() - Duration::from_secs(50), 60);
+
+    assert_eq!(budget.sleep_duration(300), Duration::from_secs(10));
+}
+
+#[test]
+fn review_wait_budget_zero_leaves_sleep_uncapped() {
+    let budget = ReviewWaitBudget::new(Instant::now() - Duration::from_secs(3600), 0);
+
+    assert_eq!(budget.sleep_duration(300), Duration::from_secs(300));
+}
+
 async fn open_issue_workflow_test_store(
 ) -> anyhow::Result<Option<harness_workflow::issue_lifecycle::IssueWorkflowStore>> {
     if std::env::var("DATABASE_URL").is_err() {

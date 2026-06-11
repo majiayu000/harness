@@ -1,5 +1,5 @@
 use crate::task_runner::{mutate_and_persist, TaskId, TaskStatus, TaskStore};
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 
 pub(super) struct ReviewWaitBudget {
     started_at: Instant,
@@ -39,5 +39,14 @@ impl ReviewWaitBudget {
         })
         .await?;
         Ok(true)
+    }
+
+    pub(super) fn sleep_duration(&self, wait_secs: u64) -> Duration {
+        if self.budget_secs == 0 {
+            return Duration::from_secs(wait_secs);
+        }
+
+        let elapsed_secs = self.started_at.elapsed().as_secs();
+        Duration::from_secs(wait_secs.min(self.budget_secs.saturating_sub(elapsed_secs)))
     }
 }
