@@ -4,9 +4,9 @@ use harness_workflow::runtime::{
     build_repo_backlog_poll_decision, build_stale_active_workflow_decision,
     repo_backlog_workflow_id, DecisionValidator, MergedPrDecisionInput, OpenIssueDecisionInput,
     RepoBacklogPollDecisionInput, StaleWorkflowDecisionInput, ValidationContext,
-    WorkflowCommandRecord, WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition,
-    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, REPO_BACKLOG_DEFINITION_ID,
-    REPO_BACKLOG_POLL_ACTIVITY,
+    WorkflowCommandRecord, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -408,8 +408,10 @@ fn repo_backlog_validation_context(
 fn has_active_repo_backlog_poll_command(commands: &[WorkflowCommandRecord]) -> bool {
     commands.iter().any(|record| {
         matches!(
-            record.status.as_str(),
-            "pending" | "dispatching" | "dispatched"
+            record.status,
+            WorkflowCommandStatus::Pending
+                | WorkflowCommandStatus::Dispatching
+                | WorkflowCommandStatus::Dispatched
         ) && is_repo_backlog_poll_command(record)
     })
 }
@@ -460,7 +462,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use harness_core::db::resolve_database_url;
     use harness_workflow::issue_lifecycle::IssueLifecycleState;
-    use harness_workflow::runtime::WorkflowCommand;
+    use harness_workflow::runtime::{WorkflowCommand, WorkflowCommandStatus};
 
     async fn open_runtime_store(dir: &Path) -> anyhow::Result<WorkflowRuntimeStore> {
         let database_url = resolve_database_url(None)?;
@@ -565,7 +567,9 @@ mod tests {
                 state: "scanning".to_string()
             }
         );
-        store.mark_command_status(&commands[0].id, "failed").await?;
+        store
+            .mark_command_status(&commands[0].id, WorkflowCommandStatus::Failed)
+            .await?;
         let mut failed_instance = store
             .get_instance(&workflow_id)
             .await?
@@ -599,20 +603,21 @@ mod tests {
 
     #[test]
     fn repo_backlog_poll_active_command_includes_dispatching() {
-        let command = repo_backlog_poll_command_record("dispatching", Utc::now());
+        let command =
+            repo_backlog_poll_command_record(WorkflowCommandStatus::Dispatching, Utc::now());
 
         assert!(has_active_repo_backlog_poll_command(&[command]));
     }
 
     fn repo_backlog_poll_command_record(
-        status: impl Into<String>,
+        status: WorkflowCommandStatus,
         updated_at: DateTime<Utc>,
     ) -> WorkflowCommandRecord {
         WorkflowCommandRecord {
             id: "command-1".to_string(),
             workflow_id: "repo-backlog".to_string(),
             decision_id: None,
-            status: status.into(),
+            status,
             dispatch_owner: None,
             dispatch_lease_expires_at: None,
             command: WorkflowCommand::enqueue_activity(REPO_BACKLOG_POLL_ACTIVITY, "dedupe"),

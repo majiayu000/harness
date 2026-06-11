@@ -1,14 +1,14 @@
 use crate::task_runner::TaskId;
 use harness_workflow::runtime::{
     build_plan_issue_decision, DecisionValidator, PlanIssueDecisionInput, PlanIssueWorkflowAction,
-    ValidationContext, WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject,
+    ValidationContext, WorkflowCommandStatus, WorkflowDecisionRecord, WorkflowDefinition,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
 };
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 
-const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
+const COMMAND_STATUS_HANDLED_INLINE: WorkflowCommandStatus = WorkflowCommandStatus::HandledInline;
 
 pub(crate) enum PlanIssueRuntimeAction {
     RunReplan,

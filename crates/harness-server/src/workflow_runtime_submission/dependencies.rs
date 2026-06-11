@@ -43,18 +43,50 @@ pub(crate) async fn resolve_issue_dependency_status(
     tasks: &TaskStore,
     task_id: &TaskId,
 ) -> anyhow::Result<RuntimeDependencyStatus> {
-    match tasks.dep_status(task_id).await {
-        Some(TaskStatus::Done) => return Ok(RuntimeDependencyStatus::Done),
-        Some(TaskStatus::Failed) => return Ok(RuntimeDependencyStatus::Failed),
-        Some(TaskStatus::Cancelled) => return Ok(RuntimeDependencyStatus::Cancelled),
-        Some(_) => return Ok(RuntimeDependencyStatus::Waiting),
-        None => {}
+    resolve_issue_dependency_status_by_exact_id(store, tasks, task_id)
+        .await
+        .map(|status| status.unwrap_or(RuntimeDependencyStatus::Waiting))
+}
+
+async fn resolve_issue_dependency_status_by_exact_id(
+    store: Option<&WorkflowRuntimeStore>,
+    tasks: &TaskStore,
+    task_id: &TaskId,
+) -> anyhow::Result<Option<RuntimeDependencyStatus>> {
+    if let Some(status) = tasks.dep_status(task_id).await {
+        return Ok(Some(match status {
+            TaskStatus::Done => RuntimeDependencyStatus::Done,
+            TaskStatus::Failed => RuntimeDependencyStatus::Failed,
+            TaskStatus::Cancelled => RuntimeDependencyStatus::Cancelled,
+            _ => RuntimeDependencyStatus::Waiting,
+        }));
     }
 
     let Some(store) = store else {
-        return Ok(RuntimeDependencyStatus::Waiting);
+        return Ok(None);
     };
     let Some(instance) = store.get_instance_by_task_id(task_id.as_str()).await? else {
+        return Ok(None);
+    };
+    runtime_dependency_status_from_instance(store, &instance)
+        .await
+        .map(Some)
+}
+
+async fn resolve_issue_dependency_status_for_instance(
+    store: &WorkflowRuntimeStore,
+    tasks: &TaskStore,
+    waiting_instance: &WorkflowInstance,
+    task_id: &TaskId,
+) -> anyhow::Result<RuntimeDependencyStatus> {
+    if let Some(status) =
+        resolve_issue_dependency_status_by_exact_id(Some(store), tasks, task_id).await?
+    {
+        return Ok(status);
+    }
+    let Some(instance) =
+        canonical_repo_backlog_issue_dependency_instance(store, waiting_instance, task_id).await?
+    else {
         return Ok(RuntimeDependencyStatus::Waiting);
     };
     runtime_dependency_status_from_instance(store, &instance).await
@@ -109,6 +141,44 @@ fn runtime_event_has_closed_issue_evidence(event: &WorkflowEvent) -> bool {
         .is_some_and(activity_result_value_has_closed_issue_evidence)
 }
 
+async fn canonical_repo_backlog_issue_dependency_instance(
+    store: &WorkflowRuntimeStore,
+    waiting_instance: &WorkflowInstance,
+    task_id: &TaskId,
+) -> anyhow::Result<Option<WorkflowInstance>> {
+    let Some((dependency_repo, issue_number)) =
+        parse_repo_backlog_issue_dependency(task_id.as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(project_id) = waiting_instance
+        .data
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let repo = waiting_instance
+        .data
+        .get("repo")
+        .and_then(serde_json::Value::as_str);
+    if dependency_repo != repo.unwrap_or("<none>") {
+        return Ok(None);
+    }
+    let workflow_id =
+        harness_workflow::issue_lifecycle::workflow_id(project_id, repo, issue_number);
+    store.get_instance(&workflow_id).await
+}
+
+fn parse_repo_backlog_issue_dependency(task_id: &str) -> Option<(&str, u64)> {
+    let rest = task_id.strip_prefix("repo-backlog:")?;
+    let (repo_key, issue_number) = rest.rsplit_once(":issue:")?;
+    if repo_key.is_empty() {
+        return None;
+    }
+    Some((repo_key, issue_number.parse().ok()?))
+}
+
 pub(crate) async fn release_ready_issue_dependencies(
     store: &WorkflowRuntimeStore,
     tasks: &TaskStore,
@@ -138,7 +208,9 @@ pub(crate) async fn release_ready_issue_dependencies(
         let mut all_done = true;
         let mut terminal_failure: Option<(TaskId, &'static str)> = None;
         for dep_id in &depends_on {
-            match resolve_issue_dependency_status(Some(store), tasks, dep_id).await? {
+            match resolve_issue_dependency_status_for_instance(store, tasks, &instance, dep_id)
+                .await?
+            {
                 RuntimeDependencyStatus::Done => {}
                 RuntimeDependencyStatus::Failed => {
                     terminal_failure = Some((dep_id.clone(), "failed"));

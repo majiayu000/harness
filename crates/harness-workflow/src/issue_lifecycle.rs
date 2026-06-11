@@ -21,7 +21,6 @@ pub enum IssueLifecycleState {
     FeedbackClaimed,
     AddressingFeedback,
     ReadyToMerge,
-    Blocked,
     Done,
     Failed,
     Cancelled,

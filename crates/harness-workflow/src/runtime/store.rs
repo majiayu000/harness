@@ -9,6 +9,7 @@ use super::prompt_task::PROMPT_TASK_DEFINITION_ID;
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use super::reducer::{reduce_runtime_job_completed, GITHUB_ISSUE_PR_DEFINITION_ID};
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
+use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
 use super::validator::{DecisionValidator, ValidationContext};
 use anyhow::Context;
@@ -20,7 +21,6 @@ use sqlx::postgres::PgPool;
 use std::collections::BTreeMap;
 use std::path::Path;
 use uuid::Uuid;
-const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
 }
@@ -48,7 +48,7 @@ pub struct WorkflowDecisionTransition<'a> {
     pub payload: Value,
     pub decision: &'a WorkflowDecision,
     pub final_instance: &'a WorkflowInstance,
-    pub command_status: &'a str,
+    pub command_status: WorkflowCommandStatus,
 }
 pub struct WorkflowRejectedDecisionTransition<'a> {
     pub expected_state: &'a str,
@@ -70,14 +70,12 @@ type WorkflowCommandRecordRow = (
     DateTime<Utc>,
     DateTime<Utc>,
 );
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeJobEnqueueOutcome {
     Enqueued(RuntimeJob),
     AlreadyExists(RuntimeJob),
-    CommandNotPending { status: String },
+    CommandNotPending { status: WorkflowCommandStatus },
 }
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeActivityCompletion {
     pub runtime_job: RuntimeJob,
@@ -85,7 +83,6 @@ pub struct RuntimeActivityCompletion {
     pub workflow_event: Option<WorkflowEvent>,
     pub decision: Option<WorkflowDecisionRecord>,
 }
-
 fn workflow_command_record_from_row(
     (
         id,
@@ -103,7 +100,7 @@ fn workflow_command_record_from_row(
         id,
         workflow_id,
         decision_id,
-        status,
+        status: WorkflowCommandStatus::try_from(status.as_str())?,
         dispatch_owner,
         dispatch_lease_expires_at,
         command: serde_json::from_str(&data)?,
@@ -111,12 +108,10 @@ fn workflow_command_record_from_row(
         updated_at,
     })
 }
-
 impl WorkflowRuntimeStore {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_database_url(path, None).await
     }
-
     pub async fn open_with_database_url(
         path: &Path,
         configured_database_url: Option<&str>,
@@ -127,7 +122,6 @@ impl WorkflowRuntimeStore {
             .await?;
         Ok(Self { pool })
     }
-
     pub async fn open_with_database_url_and_schema(
         configured_database_url: Option<&str>,
         schema: &str,
@@ -138,7 +132,6 @@ impl WorkflowRuntimeStore {
             .await?;
         Ok(Self { pool })
     }
-
     pub async fn open_with_context(
         context: &PgStoreContext,
         setup_pool: &PgPool,
@@ -148,11 +141,9 @@ impl WorkflowRuntimeStore {
             .await?;
         Ok(Self { pool })
     }
-
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
-
     pub async fn upsert_definition(&self, definition: &WorkflowDefinition) -> anyhow::Result<()> {
         let data = to_jsonb_string(definition)?;
         sqlx::query(
@@ -189,7 +180,6 @@ impl WorkflowRuntimeStore {
             .transpose()
             .map_err(Into::into)
     }
-
     pub async fn upsert_prompt_payload(
         &self,
         prompt_ref: &str,
@@ -211,7 +201,6 @@ impl WorkflowRuntimeStore {
         .await?;
         Ok(())
     }
-
     pub async fn get_prompt_payload(&self, prompt_ref: &str) -> anyhow::Result<Option<String>> {
         if prompt_ref.trim().is_empty() {
             return Ok(None);
@@ -347,9 +336,9 @@ impl WorkflowRuntimeStore {
             .bind(&command_type)
             .bind(&command.dedupe_key)
             .bind(if command.requires_runtime_job() {
-                transition.command_status
+                transition.command_status.as_str()
             } else {
-                COMMAND_STATUS_HANDLED_INLINE
+                WorkflowCommandStatus::HandledInline.as_str()
             })
             .bind(&command_data)
             .execute(&mut *tx)
@@ -846,8 +835,13 @@ impl WorkflowRuntimeStore {
         decision_id: Option<&str>,
         command: &WorkflowCommand,
     ) -> anyhow::Result<String> {
-        self.enqueue_command_with_status(workflow_id, decision_id, command, "pending")
-            .await
+        self.enqueue_command_with_status(
+            workflow_id,
+            decision_id,
+            command,
+            WorkflowCommandStatus::Pending,
+        )
+        .await
     }
 
     pub async fn enqueue_command_with_status(
@@ -855,7 +849,7 @@ impl WorkflowRuntimeStore {
         workflow_id: &str,
         decision_id: Option<&str>,
         command: &WorkflowCommand,
-        status: &str,
+        status: WorkflowCommandStatus,
     ) -> anyhow::Result<String> {
         let data = to_jsonb_string(command)?;
         let command_type = enum_str(&command.command_type)?;
@@ -881,7 +875,7 @@ impl WorkflowRuntimeStore {
         .bind(decision_id)
         .bind(&command_type)
         .bind(&command.dedupe_key)
-        .bind(status)
+        .bind(status.as_str())
         .bind(&data)
         .fetch_one(&self.pool)
         .await?;
@@ -1014,7 +1008,11 @@ impl WorkflowRuntimeStore {
         Ok(records)
     }
 
-    pub async fn mark_command_status(&self, command_id: &str, status: &str) -> anyhow::Result<()> {
+    pub async fn mark_command_status(
+        &self,
+        command_id: &str,
+        status: WorkflowCommandStatus,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE workflow_commands
              SET status = $1,
@@ -1023,7 +1021,7 @@ impl WorkflowRuntimeStore {
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $2",
         )
-        .bind(status)
+        .bind(status.as_str())
         .bind(command_id)
         .execute(&self.pool)
         .await?;
@@ -1033,7 +1031,7 @@ impl WorkflowRuntimeStore {
     pub async fn mark_pending_command_status(
         &self,
         command_id: &str,
-        status: &str,
+        status: WorkflowCommandStatus,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE workflow_commands
@@ -1043,7 +1041,7 @@ impl WorkflowRuntimeStore {
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $2 AND status = 'pending'",
         )
-        .bind(status)
+        .bind(status.as_str())
         .bind(command_id)
         .execute(&self.pool)
         .await?;
@@ -1160,12 +1158,14 @@ impl WorkflowRuntimeStore {
         let Some((command_status, command_dispatch_owner)) = command_row else {
             anyhow::bail!("workflow command not found: {command_id}");
         };
+        let command_status = WorkflowCommandStatus::try_from(command_status.as_str())?;
 
         let eligible = match dispatch_owner {
             Some(owner) => {
-                command_status == "dispatching" && command_dispatch_owner.as_deref() == Some(owner)
+                command_status == WorkflowCommandStatus::Dispatching
+                    && command_dispatch_owner.as_deref() == Some(owner)
             }
-            None => command_status == "pending",
+            None => command_status == WorkflowCommandStatus::Pending,
         };
 
         if !eligible {
@@ -1483,11 +1483,11 @@ impl WorkflowRuntimeStore {
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $2",
         )
-        .bind(command_status)
+        .bind(command_status.as_str())
         .bind(&command.id)
         .execute(&mut *tx)
         .await?;
-        command.status = command_status.to_string();
+        command.status = command_status;
         command.dispatch_owner = None;
         command.dispatch_lease_expires_at = None;
 
@@ -1590,9 +1590,9 @@ impl WorkflowRuntimeStore {
                         if record.accepted {
                             for followup in &record.decision.commands {
                                 let status = if followup.requires_runtime_job() {
-                                    "pending"
+                                    WorkflowCommandStatus::Pending
                                 } else {
-                                    COMMAND_STATUS_HANDLED_INLINE
+                                    WorkflowCommandStatus::HandledInline
                                 };
                                 insert_workflow_command_tx(
                                     &mut tx,
@@ -1841,13 +1841,13 @@ impl WorkflowRuntimeStore {
             "SELECT job.command_id, job.data
              FROM unnest($1::text[]) AS selected(command_id)
              JOIN LATERAL (
-                 SELECT command_id, data::text AS data, created_at, id
+                 SELECT command_id, data::text AS data, created_at, (data->>'created_at')::timestamptz AS job_created_at
                  FROM runtime_jobs
                  WHERE command_id = selected.command_id
-                 ORDER BY created_at DESC, id DESC
+                 ORDER BY created_at DESC, (data->>'created_at')::timestamptz DESC
                  LIMIT $2
              ) AS job ON true
-             ORDER BY job.command_id ASC, job.created_at ASC, job.id ASC",
+             ORDER BY job.command_id ASC, job.created_at ASC, job.job_created_at ASC",
         )
         .bind(command_ids)
         .bind(per_command_limit)
@@ -1916,7 +1916,7 @@ async fn runtime_job_for_command_tx(
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT data::text FROM runtime_jobs
          WHERE command_id = $1
-         ORDER BY created_at ASC
+         ORDER BY created_at DESC, (data->>'created_at')::timestamptz DESC
          LIMIT 1",
     )
     .bind(command_id)
@@ -1957,7 +1957,7 @@ async fn insert_workflow_command_tx(
     workflow_id: &str,
     decision_id: Option<&str>,
     command: &WorkflowCommand,
-    status: &str,
+    status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
     let data = to_jsonb_string(command)?;
     let command_type = enum_str(&command.command_type)?;
@@ -1983,7 +1983,7 @@ async fn insert_workflow_command_tx(
     .bind(decision_id)
     .bind(&command_type)
     .bind(&command.dedupe_key)
-    .bind(status)
+    .bind(status.as_str())
     .bind(&data)
     .fetch_one(&mut **tx)
     .await?;
@@ -2188,12 +2188,12 @@ fn apply_mark_done_side_effect(
     Ok(())
 }
 
-fn command_status_for_activity(status: ActivityStatus) -> &'static str {
+fn command_status_for_activity(status: ActivityStatus) -> WorkflowCommandStatus {
     match status {
-        ActivityStatus::Succeeded => "completed",
-        ActivityStatus::Failed => "failed",
-        ActivityStatus::Blocked => "blocked",
-        ActivityStatus::Cancelled => "cancelled",
+        ActivityStatus::Succeeded => WorkflowCommandStatus::Completed,
+        ActivityStatus::Failed => WorkflowCommandStatus::Failed,
+        ActivityStatus::Blocked => WorkflowCommandStatus::Blocked,
+        ActivityStatus::Cancelled => WorkflowCommandStatus::Cancelled,
     }
 }
 

@@ -126,7 +126,10 @@ async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyho
         .enqueue_command(&child.id, None, &child_command)
         .await?;
     store
-        .mark_command_status(&child_command_id, "failed")
+        .mark_command_status(
+            &child_command_id,
+            harness_workflow::runtime::WorkflowCommandStatus::Failed,
+        )
         .await?;
 
     assert!(
@@ -205,7 +208,10 @@ async fn explicit_pr_feedback_request_starts_local_review_before_remote_suppress
         .enqueue_command(&child.id, None, &child_command)
         .await?;
     store
-        .mark_command_status(&child_command_id, "failed")
+        .mark_command_status(
+            &child_command_id,
+            harness_workflow::runtime::WorkflowCommandStatus::Failed,
+        )
         .await?;
 
     let outcome = request_pr_feedback_sweep_for_pr(
@@ -293,7 +299,10 @@ async fn failed_pr_feedback_child_respects_disabled_suppression_window() -> anyh
         .enqueue_command(&child.id, None, &child_command)
         .await?;
     store
-        .mark_command_status(&child_command_id, "failed")
+        .mark_command_status(
+            &child_command_id,
+            harness_workflow::runtime::WorkflowCommandStatus::Failed,
+        )
         .await?;
 
     assert!(
@@ -405,7 +414,10 @@ async fn orphan_pending_child_does_not_block_next_feedback_sweep() -> anyhow::Re
     );
 
     store
-        .mark_command_status(&child_command_id, "completed")
+        .mark_command_status(
+            &child_command_id,
+            harness_workflow::runtime::WorkflowCommandStatus::Completed,
+        )
         .await?;
     assert!(
         !has_active_pr_feedback_command(

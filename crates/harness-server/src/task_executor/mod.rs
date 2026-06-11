@@ -1,4 +1,5 @@
 pub(crate) mod agent_review;
+mod agent_review_provider_gate;
 #[cfg(test)]
 mod agent_review_tests;
 pub(crate) mod conflict_resolver;
@@ -13,6 +14,8 @@ mod local_review_completion_tests;
 pub(crate) mod non_implementation;
 pub(crate) mod pr_detection;
 pub(crate) mod review_loop;
+#[cfg(test)]
+mod review_loop_wait_budget_tests;
 mod run_task;
 pub(crate) mod triage_pipeline;
 pub(crate) mod turn_lifecycle;
@@ -27,7 +30,8 @@ use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskStat
 #[cfg(test)]
 use local_review_completion::{
     complete_after_local_review_without_hosted_bot, fail_missing_local_review_gate,
-    LocalReviewPrChecks, LocalReviewPrHead, LocalReviewPrState, LocalReviewReadyToMergeFeedback,
+    fail_review_provider_gate, LocalReviewPrChecks, LocalReviewPrHead, LocalReviewPrState,
+    LocalReviewReadyToMergeFeedback,
 };
 #[cfg(test)]
 use pr_detection::{
@@ -36,7 +40,8 @@ use pr_detection::{
 #[cfg(test)]
 use run_task::{
     effective_agent_review_round_limit, effective_hosted_review_round_limit,
-    local_review_pr_check_timeout_secs, review_repo_slug, should_run_issue_triage,
+    initial_hosted_review_wait_secs, local_review_pr_check_timeout_secs, review_repo_slug,
+    should_run_issue_triage,
 };
 #[cfg(test)]
 use std::collections::HashMap;

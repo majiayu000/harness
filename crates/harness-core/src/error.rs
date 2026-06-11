@@ -112,6 +112,12 @@ pub enum TaskDbDecodeError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to deserialize scheduler_state for task `{task_id}`")]
+    SchedulerStateDeserialize {
+        task_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 pub type Error = HarnessError;

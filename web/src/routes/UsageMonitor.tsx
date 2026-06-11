@@ -303,9 +303,9 @@ export function UsageMonitor() {
           <div className="grid grid-cols-6 border-b border-line">
             <KpiCard label="Tokens" value={fmtTokens(data?.summary.total_tokens)} delta={`${fmtInt(data?.summary.request_count)} requests`} />
             <KpiCard
-              label="Est. cost"
+              label="Harness cost"
               value={fmtCost(data?.summary.estimated_cost_usd)}
-              delta={data?.cost.configured ? `${data.cost.currency} catalog` : "price unavailable"}
+              delta={data?.cost.configured ? `${data.cost.currency} catalog` : "see local totals"}
             />
             <KpiCard
               label="Active leases"

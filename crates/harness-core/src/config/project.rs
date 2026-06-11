@@ -59,6 +59,9 @@ pub struct ProjectReviewConfig {
     /// Override maximum review bot rounds for this project.
     #[serde(default)]
     pub review_max_rounds: Option<u32>,
+    /// Override total wall-clock seconds allowed for hosted review waiting.
+    #[serde(default)]
+    pub review_wait_budget_secs: Option<u64>,
 }
 
 /// Per-project concurrency configuration overrides.
