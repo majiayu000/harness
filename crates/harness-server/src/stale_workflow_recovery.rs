@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use harness_workflow::runtime::{
-    RuntimeJobStatus, WorkflowCommandRecord, WorkflowRuntimeStore, REPO_BACKLOG_POLL_ACTIVITY,
+    RuntimeJobStatus, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowRuntimeStore,
+    REPO_BACKLOG_POLL_ACTIVITY,
 };
 
 use crate::http::AppState;
@@ -162,9 +163,9 @@ async fn workflow_has_active_repo_backlog_work(
 ) -> anyhow::Result<bool> {
     let commands = store.commands_for(workflow_id).await?;
     for command in commands.iter().rev().filter(is_repo_backlog_poll_command) {
-        match command.status.as_str() {
-            "pending" | "dispatching" => return Ok(true),
-            "dispatched" => {
+        match command.status {
+            WorkflowCommandStatus::Pending | WorkflowCommandStatus::Dispatching => return Ok(true),
+            WorkflowCommandStatus::Dispatched => {
                 let jobs = store.runtime_jobs_for_command(&command.id).await?;
                 if jobs.iter().any(|job| {
                     matches!(
@@ -230,7 +231,7 @@ mod tests {
     use super::*;
     use harness_core::db::resolve_database_url;
     use harness_workflow::runtime::{
-        RuntimeKind, WorkflowCommand, WorkflowInstance, WorkflowSubject,
+        RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowInstance, WorkflowSubject,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -440,7 +441,9 @@ mod tests {
                 json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
             )
             .await?;
-        store.mark_command_status(&command_id, "dispatched").await?;
+        store
+            .mark_command_status(&command_id, WorkflowCommandStatus::Dispatched)
+            .await?;
 
         let tick = run_stale_workflow_recovery_tick(&store, 300).await?;
 

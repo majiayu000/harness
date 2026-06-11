@@ -81,7 +81,10 @@ async fn runtime_job_worker_requeues_pr_feedback_child_inspect_after_stale_dedup
         .enqueue_command(&child_id, None, &stale_command)
         .await?;
     store
-        .mark_command_status(&stale_command_id, "completed")
+        .mark_command_status(
+            &stale_command_id,
+            harness_workflow::runtime::WorkflowCommandStatus::Completed,
+        )
         .await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(

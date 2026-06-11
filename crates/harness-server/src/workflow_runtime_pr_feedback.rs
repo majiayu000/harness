@@ -4,11 +4,11 @@ use harness_workflow::runtime::{
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
     DecisionValidator, LocalReviewCompletedInput, LocalReviewDecisionInput, LocalReviewOutcome,
     PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
-    PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandType,
-    WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
-    WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY,
+    PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
+    WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -1032,7 +1032,7 @@ async fn commit_runtime_decision(
             payload: event_payload,
             decision: &decision,
             final_instance: &final_instance,
-            command_status: "pending",
+            command_status: WorkflowCommandStatus::Pending,
         })
         .await?;
     Ok(match record {
@@ -1041,8 +1041,13 @@ async fn commit_runtime_decision(
     })
 }
 
-fn is_active_pr_feedback_command_status(status: &str) -> bool {
-    matches!(status, "pending" | "dispatching" | "dispatched")
+fn is_active_pr_feedback_command_status(status: WorkflowCommandStatus) -> bool {
+    matches!(
+        status,
+        WorkflowCommandStatus::Pending
+            | WorkflowCommandStatus::Dispatching
+            | WorkflowCommandStatus::Dispatched
+    )
 }
 
 async fn has_active_local_review_command(
@@ -1054,7 +1059,7 @@ async fn has_active_local_review_command(
         .await?
         .into_iter()
         .any(|record| {
-            is_active_pr_feedback_command_status(record.status.as_str())
+            is_active_pr_feedback_command_status(record.status)
                 && record.command.activity_name() == Some(LOCAL_REVIEW_ACTIVITY)
         }))
 }
@@ -1086,12 +1091,12 @@ async fn has_active_pr_feedback_command_with_activity(
             .await?
             .into_iter()
             .any(|record| {
-                is_active_pr_feedback_command_status(record.status.as_str())
+                is_active_pr_feedback_command_status(record.status)
                     && matches!(
                         record.command.activity_name(),
                         Some("sweep_pr_feedback" | "address_pr_feedback")
                     )
-                    || is_active_pr_feedback_command_status(record.status.as_str())
+                    || is_active_pr_feedback_command_status(record.status)
                         && record.command.command_type
                             == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
                         && record
@@ -1150,8 +1155,10 @@ async fn has_recent_failed_child_pr_feedback_command(
         .await?
         .into_iter()
         .any(|record| {
-            matches!(record.status.as_str(), "failed" | "blocked")
-                && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
+            matches!(
+                record.status,
+                WorkflowCommandStatus::Failed | WorkflowCommandStatus::Blocked
+            ) && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
                 && record.updated_at >= cutoff
                 && failed_child_suppression_still_applies(record.updated_at, latest_pr_activity_at)
         }))
@@ -1189,7 +1196,7 @@ async fn has_active_child_pr_feedback_command(
         .await?
         .into_iter()
         .any(|record| {
-            is_active_pr_feedback_command_status(record.status.as_str())
+            is_active_pr_feedback_command_status(record.status)
                 && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
         }))
 }

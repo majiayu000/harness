@@ -185,4 +185,35 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
             updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
+    Migration {
+        version: 11,
+        description: "constrain workflow runtime status vocabularies",
+        sql: "DO $$
+              BEGIN
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'workflow_commands_status_check'
+                    AND conrelid = 'workflow_commands'::regclass
+                ) THEN
+                  ALTER TABLE workflow_commands
+                    ADD CONSTRAINT workflow_commands_status_check
+                    CHECK (status IN (
+                      'pending', 'dispatching', 'dispatched', 'handled_inline',
+                      'completed', 'failed', 'blocked', 'cancelled', 'skipped'
+                    ));
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'runtime_jobs_status_check'
+                    AND conrelid = 'runtime_jobs'::regclass
+                ) THEN
+                  ALTER TABLE runtime_jobs
+                    ADD CONSTRAINT runtime_jobs_status_check
+                    CHECK (status IN (
+                      'pending', 'running', 'succeeded',
+                      'failed', 'cancelled', 'expired'
+                    ));
+                END IF;
+              END $$",
+    },
 ];

@@ -326,7 +326,12 @@ async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() ->
         "issue-230-bind-pr-80",
     );
     store
-        .enqueue_command_with_status(&workflow.id, None, &bind_pr, "skipped")
+        .enqueue_command_with_status(
+            &workflow.id,
+            None,
+            &bind_pr,
+            harness_workflow::runtime::WorkflowCommandStatus::Skipped,
+        )
         .await?;
 
     let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;

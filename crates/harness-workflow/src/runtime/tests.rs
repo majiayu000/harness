@@ -19,12 +19,13 @@ use super::{
     PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PromptSubmissionDecisionInput,
     QualityGateDecisionInput, QualityGateWorkflowAction, RepoBacklogPollDecisionInput,
     RepoBacklogWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
-    RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowDecisionTransition,
-    WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
-    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
-    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowCommandStatus,
+    WorkflowDecisionTransition, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
+    LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
+    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -41,6 +42,7 @@ mod p1_followups;
 mod pr_repair_evidence;
 mod replay_determinism;
 mod retry;
+mod runtime_store;
 
 fn issue_instance(state: &str) -> WorkflowInstance {
     WorkflowInstance::new(
@@ -4362,7 +4364,7 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
     assert_eq!(completed.id, job.id);
     assert_eq!(
         store.commands_for(&workflow.id).await?[0].status,
-        "completed"
+        WorkflowCommandStatus::Completed
     );
     let workflow_events = store.events_for(&workflow.id).await?;
     let event = workflow_events
@@ -4451,12 +4453,12 @@ async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> any
 
     let commands = store.commands_for(&workflow.id).await?;
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].status, "completed");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
     assert_eq!(
         commands[1].command.command_type,
         WorkflowCommandType::BindPr
     );
-    assert_ne!(commands[1].status, "pending");
+    assert_ne!(commands[1].status, WorkflowCommandStatus::Pending);
     Ok(())
 }
 
@@ -4528,7 +4530,7 @@ async fn runtime_worker_blocks_invalid_inline_bind_pr_before_persisting_command(
     }));
     assert!(commands.iter().any(|record| {
         record.command.command_type == WorkflowCommandType::MarkBlocked
-            && record.status == "handled_inline"
+            && record.status == WorkflowCommandStatus::HandledInline
     }));
 
     let decisions = store.decisions_for(&workflow.id).await?;
@@ -4585,14 +4587,14 @@ async fn runtime_worker_blocks_implementation_success_without_pr_evidence() -> a
 
     let commands = store.commands_for(&workflow.id).await?;
     assert_eq!(commands[0].id, command_id);
-    assert_eq!(commands[0].status, "completed");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
     assert!(commands.iter().any(|record| {
         record.command.command_type == WorkflowCommandType::MarkBlocked
-            && record.status == "handled_inline"
+            && record.status == WorkflowCommandStatus::HandledInline
     }));
     assert!(commands.iter().any(|record| {
         record.command.command_type == WorkflowCommandType::RequestOperatorAttention
-            && record.status == "handled_inline"
+            && record.status == WorkflowCommandStatus::HandledInline
     }));
 
     let decisions = store.decisions_for(&workflow.id).await?;
@@ -4664,10 +4666,10 @@ async fn runtime_worker_finishes_closed_issue_success_without_pr() -> anyhow::Re
 
     let commands = store.commands_for(&workflow.id).await?;
     assert_eq!(commands[0].id, command_id);
-    assert_eq!(commands[0].status, "completed");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
     assert!(commands.iter().any(|record| {
         record.command.command_type == WorkflowCommandType::MarkDone
-            && record.status == "handled_inline"
+            && record.status == WorkflowCommandStatus::HandledInline
     }));
 
     let decisions = store.decisions_for(&workflow.id).await?;
@@ -4751,7 +4753,9 @@ async fn runtime_worker_keeps_repo_backlog_dispatching_until_child_starts_finish
     assert_eq!(final_update.state, "idle");
 
     let commands = store.commands_for(&workflow.id).await?;
-    assert!(commands.iter().all(|command| command.status == "completed"));
+    assert!(commands
+        .iter()
+        .all(|command| command.status == WorkflowCommandStatus::Completed));
     Ok(())
 }
 
@@ -4796,7 +4800,7 @@ async fn runtime_completion_counts_dispatching_sibling_as_active() -> anyhow::Re
         .await?;
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].id, second_command_id);
-    assert_eq!(claimed[0].status, "dispatching");
+    assert_eq!(claimed[0].status, WorkflowCommandStatus::Dispatching);
 
     let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
     let executor = StaticRuntimeExecutor {
@@ -5226,7 +5230,7 @@ async fn runtime_worker_does_not_propagate_retrying_pr_feedback_child() -> anyho
     );
     let child_commands = store.commands_for(&child.id).await?;
     assert!(child_commands.iter().any(|record| {
-        record.status == "pending"
+        record.status == WorkflowCommandStatus::Pending
             && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
             && record.command.command["retry_attempt"] == 1
     }));
@@ -5398,8 +5402,8 @@ async fn runtime_worker_blocks_when_profile_max_turns_is_exhausted() -> anyhow::
         .unwrap_or_default()
         .contains("exhausted max_turns"));
     let commands = store.commands_for(&workflow.id).await?;
-    assert_eq!(commands[0].status, "completed");
-    assert_eq!(commands[1].status, "blocked");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
+    assert_eq!(commands[1].status, WorkflowCommandStatus::Blocked);
     Ok(())
 }
 
@@ -5650,7 +5654,7 @@ async fn durable_store_apply_decision_transition_can_create_initial_instance() -
             }),
             decision: &decision,
             final_instance: &final_instance,
-            command_status: "pending",
+            command_status: WorkflowCommandStatus::Pending,
         })
         .await?
         .expect("missing initial instance should be created inside the transition");
@@ -5727,7 +5731,7 @@ async fn durable_store_apply_decision_transition_does_not_rewind_existing_instan
             }),
             decision: &decision,
             final_instance: &final_instance,
-            command_status: "pending",
+            command_status: WorkflowCommandStatus::Pending,
         })
         .await?;
 
@@ -5935,7 +5939,7 @@ async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() 
     );
     assert_eq!(
         store.commands_for(&instance.id).await?[0].status,
-        "dispatched"
+        WorkflowCommandStatus::Dispatched
     );
     assert!(dispatcher.dispatch_once().await?.is_none());
     Ok(())
@@ -5954,13 +5958,18 @@ async fn runtime_store_can_insert_non_pending_command_atomically() -> anyhow::Re
     let command =
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-inline");
     let command_id = store
-        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .enqueue_command_with_status(
+            &instance.id,
+            None,
+            &command,
+            WorkflowCommandStatus::HandledInline,
+        )
         .await?;
 
     let commands = store.commands_for(&instance.id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].id, command_id);
-    assert_eq!(commands[0].status, "handled_inline");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::HandledInline);
     assert!(
         store.pending_commands(10).await?.is_empty(),
         "inline commands must never be visible to the dispatcher as pending"
@@ -5982,13 +5991,18 @@ async fn runtime_store_non_pending_status_updates_existing_pending_command() -> 
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-inline");
     let pending_id = store.enqueue_command(&instance.id, None, &command).await?;
     let inline_id = store
-        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .enqueue_command_with_status(
+            &instance.id,
+            None,
+            &command,
+            WorkflowCommandStatus::HandledInline,
+        )
         .await?;
 
     assert_eq!(inline_id, pending_id);
     let commands = store.commands_for(&instance.id).await?;
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].status, "handled_inline");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::HandledInline);
     assert!(
         store.pending_commands(10).await?.is_empty(),
         "dedupe conflict must not leave an inline command visible as pending"
@@ -6021,13 +6035,18 @@ async fn runtime_store_dedupe_status_update_does_not_regress_dispatched_command(
     assert!(matches!(outcome, RuntimeJobEnqueueOutcome::Enqueued(_)));
 
     let duplicate_id = store
-        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .enqueue_command_with_status(
+            &instance.id,
+            None,
+            &command,
+            WorkflowCommandStatus::HandledInline,
+        )
         .await?;
 
     assert_eq!(duplicate_id, command_id);
     assert_eq!(
         store.commands_for(&instance.id).await?[0].status,
-        "dispatched"
+        WorkflowCommandStatus::Dispatched
     );
     Ok(())
 }
@@ -6101,7 +6120,7 @@ async fn runtime_store_pending_command_enqueue_is_idempotent_across_concurrent_c
     assert_eq!(jobs[0].id, first_job_id);
     assert_eq!(
         store.commands_for(&instance.id).await?[0].status,
-        "dispatched"
+        WorkflowCommandStatus::Dispatched
     );
     Ok(())
 }
@@ -6124,7 +6143,7 @@ async fn runtime_store_claims_pending_commands_with_dispatch_lease() -> anyhow::
         .await?;
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].id, command_id);
-    assert_eq!(claimed[0].status, "dispatching");
+    assert_eq!(claimed[0].status, WorkflowCommandStatus::Dispatching);
     assert_eq!(claimed[0].dispatch_owner.as_deref(), Some("dispatcher-a"));
     assert!(claimed[0].dispatch_lease_expires_at.is_some());
     assert!(store.pending_commands(10).await?.is_empty());
@@ -6415,7 +6434,10 @@ async fn runtime_command_dispatcher_skips_non_runtime_commands() -> anyhow::Resu
         .runtime_jobs_for_command(&command_id)
         .await?
         .is_empty());
-    assert_eq!(store.commands_for(&instance.id).await?[0].status, "skipped");
+    assert_eq!(
+        store.commands_for(&instance.id).await?[0].status,
+        WorkflowCommandStatus::Skipped
+    );
     Ok(())
 }
 
@@ -6457,7 +6479,7 @@ async fn runtime_command_dispatcher_skips_terminal_workflow_before_enqueue() -> 
         .is_empty());
     assert_eq!(
         store.commands_for(&instance.id).await?[0].status,
-        "cancelled"
+        WorkflowCommandStatus::Cancelled
     );
     Ok(())
 }
