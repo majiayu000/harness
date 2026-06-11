@@ -623,6 +623,7 @@ pub(crate) async fn run_task(
     agent_pushed_commit |= implementation_pushed_commit;
 
     let wait_secs = resolved.review_wait_secs.unwrap_or(req.wait_secs);
+    let review_wait_started_at = Instant::now();
 
     // Skip hosted review bot wait when auto-trigger is disabled, but keep a
     // validation gate so local review cannot mark a red PR complete.
@@ -725,6 +726,7 @@ pub(crate) async fn run_task(
         &mut turns_used,
         turns_used_acc,
         task_start,
+        review_wait_started_at,
         repo_slug_for_review,
         jaccard_threshold,
         server_config.server.github_token.as_deref(),

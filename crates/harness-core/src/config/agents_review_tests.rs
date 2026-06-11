@@ -24,6 +24,7 @@ fn review_config_defaults_to_local_first_provider_ids() {
         "gemini-code-assist[bot]"
     );
     assert_eq!(config.codex_github_bot.trigger_command, "@codex");
+    assert_eq!(config.review_wait_budget_secs, 3600);
 }
 
 #[test]
@@ -35,6 +36,7 @@ fn review_config_deserializes_provider_settings() {
         advisory_providers = ["gemini_github_bot"]
         external_required = true
         publish_local_review_comment = true
+        review_wait_budget_secs = 1800
 
         [codex_cli_review]
         enabled = true
@@ -60,6 +62,7 @@ fn review_config_deserializes_provider_settings() {
     assert_eq!(config.advisory_providers, vec!["gemini_github_bot"]);
     assert!(config.external_required);
     assert!(config.publish_local_review_comment);
+    assert_eq!(config.review_wait_budget_secs, 1800);
     assert_eq!(
         config.codex_cli_review.cli_path,
         PathBuf::from("/opt/bin/codex")

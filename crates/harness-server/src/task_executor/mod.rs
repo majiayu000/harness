@@ -13,6 +13,8 @@ mod local_review_completion_tests;
 pub(crate) mod non_implementation;
 pub(crate) mod pr_detection;
 pub(crate) mod review_loop;
+#[cfg(test)]
+mod review_loop_wait_budget_tests;
 mod run_task;
 pub(crate) mod triage_pipeline;
 pub(crate) mod turn_lifecycle;
