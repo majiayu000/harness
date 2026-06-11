@@ -123,6 +123,14 @@ listener_pid_for_port() {
   fi
 }
 
+require_listener_check_for_start() {
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "refusing to start harness server: lsof is required to verify port $PORT ownership" >&2
+    echo "install lsof or verify the port manually before starting from this wrapper" >&2
+    exit 4
+  fi
+}
+
 health_url="http://127.0.0.1:${PORT}/health"
 
 if [[ "$STOP" -eq 1 ]]; then
@@ -147,11 +155,15 @@ if [[ "$STATUS" -eq 1 ]]; then
     echo "$pid" > "$PID_FILE"
     echo "pid=$pid status=running log=$LOG_FILE"
   else
-    listener_pid="$(listener_pid_for_port)"
-    if [[ -n "$listener_pid" ]]; then
-      echo "pid=$listener_pid status=unmanaged_listener log=$LOG_FILE"
+    if command -v lsof >/dev/null 2>&1; then
+      listener_pid="$(listener_pid_for_port)"
+      if [[ -n "$listener_pid" ]]; then
+        echo "pid=$listener_pid status=unmanaged_listener log=$LOG_FILE"
+      else
+        echo "pid=${pid:-none} status=not_running log=$LOG_FILE"
+      fi
     else
-      echo "pid=${pid:-none} status=not_running log=$LOG_FILE"
+      echo "pid=${pid:-none} status=unknown listener_check=unavailable log=$LOG_FILE"
     fi
   fi
   if command -v curl >/dev/null 2>&1; then
@@ -163,6 +175,8 @@ if [[ "$STATUS" -eq 1 ]]; then
   fi
   exit 0
 fi
+
+require_listener_check_for_start
 
 pid="$(recorded_pid)"
 if pid_alive "$pid"; then
