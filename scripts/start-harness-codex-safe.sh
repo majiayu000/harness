@@ -131,6 +131,14 @@ require_listener_check_for_start() {
   fi
 }
 
+require_curl_for_background_start() {
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "refusing to start harness server in background: curl is required for /health readiness checks" >&2
+    echo "install curl or run with --foreground to manage readiness yourself" >&2
+    exit 4
+  fi
+}
+
 health_url="http://127.0.0.1:${PORT}/health"
 
 if [[ "$STOP" -eq 1 ]]; then
@@ -225,6 +233,10 @@ fi
 cmd+=(serve --transport http --port "$PORT")
 if [[ "$PROJECT_ROOT_EXPLICIT" -eq 1 ]]; then
   cmd+=(--project-root "$PROJECT_ROOT")
+fi
+
+if [[ "$FOREGROUND" -eq 0 ]]; then
+  require_curl_for_background_start
 fi
 
 echo "starting harness server on $health_url"
