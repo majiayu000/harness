@@ -422,9 +422,15 @@ fn combine_activity_result_with_runtime_workspace_finalization(
     finish_result: anyhow::Result<()>,
 ) -> anyhow::Result<ActivityResult> {
     match (activity_result, finish_result) {
-        (Ok(result), Err(error)) => Ok(activity_result_failed_by_runtime_workspace_finalization(
-            result, &error,
-        )),
+        (Ok(result), Err(error)) => {
+            if result.status == harness_workflow::runtime::ActivityStatus::Succeeded {
+                Ok(activity_result_failed_by_runtime_workspace_finalization(
+                    result, &error,
+                ))
+            } else {
+                Ok(result.with_artifact(runtime_workspace_finalization_warning_artifact(&error)))
+            }
+        }
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), Err(finish_error)) => Err(error.context(format!(
             "runtime workspace finalization also failed: {finish_error}"
@@ -629,6 +635,50 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "pull_request"));
+        let Some(warning) = result.artifacts.iter().find(|artifact| {
+            artifact.artifact_type == RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT
+        }) else {
+            panic!("finalization failure should preserve a diagnostic warning artifact");
+        };
+        assert_eq!(warning.artifact["error"], "after_run hook failed");
+    }
+
+    #[test]
+    fn runtime_workspace_finalization_failure_preserves_failed_activity_result() {
+        let result = ActivityResult::failed(
+            "address_pr_feedback",
+            "Structured output was invalid.",
+            "fatal",
+        )
+        .with_error_kind(harness_workflow::runtime::ActivityErrorKind::Fatal)
+        .with_artifact(ActivityArtifact::new(
+            "activity_result_parse_error",
+            json!({ "field": "status" }),
+        ));
+
+        let result = match combine_activity_result_with_runtime_workspace_finalization(
+            Ok(result),
+            Err(anyhow::anyhow!("after_run hook failed")),
+        ) {
+            Ok(result) => result,
+            Err(error) => panic!("failed activity result should be preserved: {error}"),
+        };
+
+        assert_eq!(result.activity, "address_pr_feedback");
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(result.summary, "Structured output was invalid.");
+        assert_eq!(result.error.as_deref(), Some("fatal"));
+        assert_eq!(
+            result.error_kind,
+            Some(harness_workflow::runtime::ActivityErrorKind::Fatal)
+        );
+        assert!(result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "activity_result_parse_error"));
         let Some(warning) = result.artifacts.iter().find(|artifact| {
             artifact.artifact_type == RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT
         }) else {
