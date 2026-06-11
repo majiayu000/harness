@@ -18,12 +18,13 @@ The binary is at `./target/release/harness`.
 
 ## Server Startup
 
-`harness serve` can be started from a normal terminal or from an agent session
-when product behavior needs live verification. Caller-side Codex/Claude
-environment cleanup is not required before startup; Harness owns the child
-agent environment boundary. For long-running manual dogfood sessions, a
-standalone terminal remains a convenient way for the operator to own the
-process lifetime directly.
+`harness serve` can be started directly from a normal terminal. When product
+behavior needs live verification from a Codex or Claude agent session, launch
+the server with a sanitized environment so spawned agents do not inherit wrapper
+variables from the parent process. Harness strips Claude-prefixed variables
+before spawning child agents, but Codex-prefixed variables still need caller-side
+cleanup. For long-running manual dogfood sessions, a standalone terminal remains
+a convenient way for the operator to own the process lifetime directly.
 
 ### Single Project
 
@@ -659,9 +660,10 @@ macOS Seatbelt sandbox blocks Claude Code syscalls. Set `sandbox_mode = "danger-
 ### Tasks fail with SIGTRAP
 
 Use a current Harness binary and inspect the server logs for the failing
-adapter command. Harness protects spawned child agents from wrapper-specific
-environment leakage; a SIGTRAP usually points to a stale binary, adapter
-configuration, or macOS sandbox setting rather than the parent shell alone.
+adapter command. Harness strips Claude-prefixed wrapper variables before
+spawning child agents, but Codex-prefixed parent variables still need to be
+removed by the launcher. A SIGTRAP can also point to a stale binary, adapter
+configuration, or macOS sandbox setting.
 
 ### Codex review shows "unexpected argument"
 
