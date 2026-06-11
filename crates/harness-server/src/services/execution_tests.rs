@@ -338,7 +338,7 @@ async fn enqueue_background_issue_submission_uses_workflow_runtime_without_task_
         .get_instance(&workflow_id)
         .await?
         .expect("runtime workflow should be recorded");
-    assert_eq!(instance.state, "implementing");
+    assert_eq!(instance.state, "planning");
     assert_eq!(instance.data["task_id"], task_id.0);
     assert_eq!(
         instance.data["additional_prompt"],
@@ -348,7 +348,7 @@ async fn enqueue_background_issue_submission_uses_workflow_runtime_without_task_
     let commands = runtime_store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
-    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     assert_eq!(
         commands[0].command.command["additional_prompt"],
         "preserve caller guidance"
@@ -539,7 +539,7 @@ async fn enqueue_background_pr_feedback_creates_pr_scoped_runtime_workflow() -> 
 
     assert_eq!(
         task_id.as_str(),
-        format!("repo-backlog:{project_id}:owner/repo:pr:77:feedback")
+        format!("repo-backlog::{project_id}::repo:owner/repo::pr:77:feedback")
     );
     assert!(
         task_store.get_with_db_fallback(&task_id).await?.is_none(),
@@ -865,7 +865,7 @@ async fn enqueue_background_issue_submission_uses_request_project_runtime_policy
         .get_instance(&workflow_id)
         .await?
         .expect("runtime workflow should be recorded for the request project");
-    assert_eq!(instance.state, "implementing");
+    assert_eq!(instance.state, "planning");
     assert_eq!(instance.data["task_id"], task_id.0);
     Ok(())
 }
@@ -1088,7 +1088,7 @@ async fn enqueue_background_issue_submission_accepts_completed_runtime_dependenc
         .get_instance(&dependent_workflow_id)
         .await?
         .expect("dependent workflow should be recorded");
-    assert_eq!(workflow.state, "implementing");
+    assert_eq!(workflow.state, "planning");
     assert_eq!(workflow.data["task_id"], dependent_id.0);
     assert_eq!(workflow.data["depends_on"], serde_json::json!([dep_handle]));
     assert_eq!(

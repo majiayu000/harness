@@ -25,6 +25,16 @@ export function workflowLabel(state: string): string {
   }
 }
 
+export function formatSnakeLabel(value: string | null | undefined): string {
+  if (!value) return "N/A";
+  return value.replaceAll("_", " ");
+}
+
+export function shortSha(value: string | null | undefined): string {
+  if (!value) return "N/A";
+  return value.length > 12 ? value.slice(0, 12) : value;
+}
+
 function isFiniteNumber(n: unknown): n is number {
   return typeof n === "number" && Number.isFinite(n);
 }

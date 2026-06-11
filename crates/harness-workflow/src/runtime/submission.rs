@@ -1,8 +1,11 @@
 use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, WorkflowInstance};
+use super::plan_issue::ISSUE_PLAN_ACTIVITY;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueSubmissionWorkflowAction {
+    RunPlanning,
     RunImplementation,
+    WaitForDependencies,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,15 +30,26 @@ pub fn build_issue_submission_decision(
     instance: &WorkflowInstance,
     input: IssueSubmissionDecisionInput<'_>,
 ) -> IssueSubmissionDecisionOutput {
+    let action = if input.dependencies_blocked {
+        IssueSubmissionWorkflowAction::WaitForDependencies
+    } else if input.force_execute {
+        IssueSubmissionWorkflowAction::RunImplementation
+    } else {
+        IssueSubmissionWorkflowAction::RunPlanning
+    };
     let next_state = if input.dependencies_blocked {
         "awaiting_dependencies"
-    } else {
+    } else if input.force_execute {
         "implementing"
+    } else {
+        "planning"
     };
     let reason = if input.dependencies_blocked {
         "operator submitted the GitHub issue and it is waiting for dependencies"
+    } else if input.force_execute {
+        "operator submitted the GitHub issue for forced implementation"
     } else {
-        "operator submitted the GitHub issue for implementation"
+        "operator submitted the GitHub issue for planning before implementation"
     };
     let mut decision = WorkflowDecision::new(
         &instance.id,
@@ -44,7 +58,7 @@ pub fn build_issue_submission_decision(
         next_state,
         reason,
     );
-    if !input.dependencies_blocked {
+    if !input.dependencies_blocked && input.force_execute {
         decision = decision.with_command(WorkflowCommand::new(
             super::model::WorkflowCommandType::EnqueueActivity,
             format!(
@@ -55,6 +69,20 @@ pub fn build_issue_submission_decision(
             ),
             serde_json::json!({
                 "activity": "implement_issue",
+                "additional_prompt": input.additional_prompt,
+            }),
+        ));
+    } else if !input.dependencies_blocked {
+        decision = decision.with_command(WorkflowCommand::new(
+            super::model::WorkflowCommandType::EnqueueActivity,
+            format!(
+                "issue-submit:{}:issue:{}:task:{}:plan",
+                repo_key(input.repo),
+                input.issue_number,
+                input.task_id
+            ),
+            serde_json::json!({
+                "activity": ISSUE_PLAN_ACTIVITY,
                 "additional_prompt": input.additional_prompt,
             }),
         ));
@@ -75,10 +103,7 @@ pub fn build_issue_submission_decision(
     ))
     .high_confidence();
 
-    IssueSubmissionDecisionOutput {
-        action: IssueSubmissionWorkflowAction::RunImplementation,
-        decision,
-    }
+    IssueSubmissionDecisionOutput { action, decision }
 }
 
 fn labels_summary(labels: &[String]) -> String {

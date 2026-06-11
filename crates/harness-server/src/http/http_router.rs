@@ -123,6 +123,32 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(crate::handlers::usage_monitor::usage_monitor),
         )
         .route(
+            "/api/evals/runs",
+            post(crate::handlers::evals::create_eval_run)
+                .get(crate::handlers::evals::list_eval_runs),
+        )
+        .route(
+            "/api/evals/runs/{run_id}",
+            get(crate::handlers::evals::get_eval_run),
+        )
+        .route(
+            "/api/evals/runs/{run_id}/artifacts",
+            post(crate::handlers::evals::add_eval_artifact)
+                .get(crate::handlers::evals::list_eval_artifacts),
+        )
+        .route(
+            "/api/evals/runs/{run_id}/score",
+            post(crate::handlers::evals::score_eval_run),
+        )
+        .route(
+            "/api/evals/quality-snapshots/{snapshot_id}",
+            get(crate::handlers::evals::get_eval_quality_snapshot),
+        )
+        .route(
+            "/api/evals/pr/{owner}/{repo}/{pr_number}",
+            get(crate::handlers::evals::list_eval_quality_snapshots_for_pr),
+        )
+        .route(
             "/webhook",
             post(github_webhook).layer(DefaultBodyLimit::max(
                 state.core.server.config.server.max_webhook_body_bytes,

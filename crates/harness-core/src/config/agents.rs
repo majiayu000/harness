@@ -515,10 +515,17 @@ fn default_review_fallback_chain() -> Vec<String> {
 fn normalize_external_bot_chain(chain: &[String]) -> Vec<String> {
     chain
         .iter()
-        .map(|provider| match provider.as_str() {
-            "gemini" | "gemini_github_bot" => "gemini_github_bot".to_string(),
-            "codex" | "codex_github_bot" => "codex_github_bot".to_string(),
-            _ => provider.clone(),
+        .filter_map(|provider| {
+            let trimmed = provider.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let normalized = trimmed.to_ascii_lowercase();
+            Some(match normalized.as_str() {
+                "gemini" | "gemini_github_bot" => "gemini_github_bot".to_string(),
+                "codex" | "codex_github_bot" => "codex_github_bot".to_string(),
+                _ => normalized,
+            })
         })
         .collect()
 }

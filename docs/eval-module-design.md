@@ -125,6 +125,7 @@ One invocation of an evaluation scenario.
 pub struct EvalRun {
     pub run_id: EvalRunId,
     pub scenario: EvalScenario,
+    pub run_mode: EvalRunMode,
     pub target: EvalTarget,
     pub status: EvalRunStatus,
     pub started_at: DateTime<Utc>,
@@ -137,6 +138,17 @@ pub struct EvalRun {
 }
 ```
 
+```rust
+pub enum EvalRunMode {
+    LiveRun,
+    CollectOnly,
+}
+```
+
+`CollectOnly` means the evaluator only collected GitHub truth and did not submit
+or observe a Harness repair task. These artifacts are useful baselines, but they
+are not live capability benchmark cases.
+
 ### `EvalScenario`
 
 ```rust
@@ -148,8 +160,10 @@ pub enum EvalScenario {
 }
 ```
 
-`PrRepair` is the first scenario to implement. The other variants reserve the
-schema for future benchmark suites.
+`PrRepair` is the first scenario to implement. `ReadyNoopControl` requires a
+complete baseline `reviewThreads` enumeration; incomplete baseline review
+pagination is treated as repair work, not as a clean no-op control. The other
+variants reserve the schema for future benchmark suites.
 
 ### `EvalTarget`
 
@@ -189,13 +203,22 @@ pub struct PullRequestSnapshot {
     pub check_state: CheckState,
     pub review_decision: Option<ReviewDecision>,
     pub active_unresolved_review_threads: Vec<ReviewThreadSnapshot>,
+    pub review_threads_complete: bool,
     pub changed_files: Vec<ChangedFileSnapshot>,
+    pub changed_files_complete: bool,
     pub collected_at: DateTime<Utc>,
 }
 ```
 
 `reviewThreads` must come from GraphQL or an equivalent API surface that can
-distinguish active unresolved threads from outdated or resolved threads.
+distinguish active unresolved threads from outdated or resolved threads. The
+snapshot must also record whether `reviewThreads` and changed-file enumeration
+was complete. Raw GitHub evidence proves completeness with
+`pageInfo.hasNextPage=false`; server-normalized evidence must carry explicit
+`review_threads_complete=true` and `changed_files_complete=true`. Incomplete or
+missing completeness evidence is not valid merge-readiness evidence. Direct
+`PrRepairEvalInput` artifacts that omit the completeness fields are treated as
+incomplete, not as legacy-complete evidence.
 
 ### `RuntimeSnapshot`
 
@@ -244,6 +267,7 @@ The final persisted report for a run.
 ```rust
 pub struct QualitySnapshot {
     pub run: EvalRun,
+    pub run_mode: EvalRunMode,
     pub baseline_pr: Option<PullRequestSnapshot>,
     pub final_pr: Option<PullRequestSnapshot>,
     pub runtime: RuntimeSnapshot,
@@ -271,7 +295,7 @@ grade is capped even when other score dimensions look strong.
 | Head freshness | final evidence head vs final PR head | `C` |
 | Required checks | final check state for final head | `C` |
 | Mergeability clean | final merge state for final head | `C` |
-| Review-thread closure | final active unresolved threads | `C` |
+| Review-thread closure | final active unresolved threads plus required thread enumeration completeness | `C` |
 | Runtime artifact completeness | task/workflow/job snapshots | `B` |
 | Reviewer judgment freshness | reviewer head vs final PR head | `C`, or `B` when absent |
 | No destructive/unrelated scope | changed files and risk scanner | `F` |
@@ -297,6 +321,56 @@ After hard gates, the score is calculated from eight dimensions:
 
 The scorecard should expose each dimension separately. A single merged/not
 merged status is not enough.
+
+## Benchmark Suites
+
+A single `QualitySnapshot` proves one run. It is not enough to claim Harness PR
+repair quality is "10/10", because one easy or lucky PR can hide regressions in
+harder cases. Benchmark suites aggregate multiple snapshots into a capability
+summary.
+
+```rust
+pub struct PrRepairBenchmarkInput {
+    pub suite: String,
+    pub cases: Vec<PrRepairBenchmarkCase>,
+}
+
+pub struct PrRepairBenchmarkSummary {
+    pub suite: String,
+    pub case_count: u64,
+    pub weighted_case_count: u64,
+    pub confidence: BenchmarkConfidence,
+    pub status: BenchmarkStatus,
+    pub capability_score: u8, // 0..10
+    pub average_effective_score: u8,
+    pub min_effective_score: u8,
+    pub max_effective_score: u8,
+    pub excellent_cases: u64,
+    pub acceptable_cases: u64,
+    pub blocked_cases: u64,
+    pub hard_gate_failures: Vec<HardGateFailureCount>,
+}
+```
+
+The benchmark uses an effective score, not the raw final score alone. If a run
+is grade-capped by missing reviewer judgment, stale evidence, failed checks, or
+unresolved review threads, the effective score is capped by the final grade.
+This prevents a high raw score with a failed hard gate from looking like a
+10/10 outcome.
+
+Confidence is sample-size based for the first release:
+
+| Case count | Confidence |
+|---:|---|
+| 0 | `none` |
+| 1-2 | `low` |
+| 3-4 | `medium` |
+| 5+ | `high` |
+
+`excellent` requires at least medium confidence, a 10/10 capability score, all
+cases graded `A`, and no blocked cases. A one-case perfect run can score 10, but
+it remains `needs_review` because the benchmark does not have enough evidence to
+claim system-level quality.
 
 ## Code Quality Subscore
 
@@ -404,8 +478,9 @@ GET  /api/evals/pr/{owner}/{repo}/{pr_number}
 ```
 
 `POST /api/evals/runs/{run_id}/score` runs deterministic scoring inside
-`harness-eval` from already-ingested artifacts. It should not fetch GitHub or
-start an agent.
+`harness-eval`. The request may include a canonical `PrRepairEvalInput`
+directly, or omit it and score from the latest uploaded
+`pr_repair_eval_input` artifact. It should not fetch GitHub or start an agent.
 
 ## CLI and Script Flow
 
@@ -423,6 +498,25 @@ scripts/evaluate_pr_repair.sh
   8. write local JSON and Markdown reports
 ```
 
+Live mode must verify that `--project-root` resolves to an active project in the
+running Harness server before submitting `POST /tasks`. An unregistered local
+worktree can otherwise produce a workflow handle that no runtime worker will
+execute, which creates false-negative quality data. When that preflight fails,
+the collector should fail fast but still emit `submission.json`,
+`task_detail_final.json`, `quality_snapshot.json`, and `summary.md` with
+`run_mode=collect_only` because no Harness repair task exists yet. After
+`POST /tasks` returns a non-empty `task_id`, subsequent snapshots are tagged
+`run_mode=live_run` even if the task later fails, blocks, or times out. The
+`score_pr_repair` CLI requires explicit `--run-mode live_run|collect_only` for
+every invocation that writes a new snapshot; compatibility defaults are reserved
+for deserializing older stored artifacts, not for producing new live evidence.
+The server `/api/evals/runs/{run_id}/score` input contract also requires
+explicit `run_mode` for direct request bodies and `pr_repair_eval_input`
+artifacts.
+The Markdown report must render grade, score, grade cap, hard gates, and blockers
+from `quality_snapshot.json`; it must not maintain an independent grading
+heuristic.
+
 Later, add a CLI wrapper:
 
 ```text
@@ -430,6 +524,60 @@ harness eval pr-repair --repo OWNER/REPO --pr N --server-url URL
 harness eval report --run-id UUID
 harness eval cases --suite pr-repair-smoke
 ```
+
+The CLI is optional product surface. The durable contract is the server API and
+the persisted eval records; a CLI should only be a thin wrapper around those
+APIs after the storage path is stable.
+
+The first benchmark CLI is intentionally file-based:
+
+```text
+score_pr_repair_benchmark \
+  --suite pr-repair-smoke \
+  --case pr-1233=docs/pr-repair-evals/.../quality_snapshot.json \
+  --case pr-1254=docs/pr-repair-evals/.../quality_snapshot.json \
+  --output benchmark_summary.json
+```
+
+For repeatable suites, prefer a manifest:
+
+```json
+{
+  "suite": "pr-repair-smoke",
+  "cases": [
+    {
+      "case_id": "ready-noop-control",
+      "snapshot": "ready-noop/quality_snapshot.json",
+      "tags": ["ready_noop"],
+      "weight": 1
+    },
+    {
+      "case_id": "review-thread-repair",
+      "snapshot": "review-thread/quality_snapshot.json",
+      "tags": ["review_threads"],
+      "weight": 2
+    }
+  ]
+}
+```
+
+```text
+score_pr_repair_benchmark \
+  --manifest docs/pr-repair-evals/pr-repair-smoke.json \
+  --output benchmark_summary.json
+```
+
+Manifest snapshot paths are resolved relative to the manifest file. `--suite`
+may override the manifest suite name for ad hoc comparisons, but a committed
+regression suite should keep the suite name in the manifest.
+
+It reads existing `quality_snapshot.json` artifacts and writes a deterministic
+benchmark summary. It does not fetch GitHub, start Harness, or grade code with an
+LLM. It accepts only snapshots with explicit `run_mode=live_run`; it rejects
+`collect_only` and missing `run_mode` snapshots so baseline collection cannot be
+misreported as live repair capability. Live-mode preflight failures are also
+tagged `collect_only`; only snapshots for successfully submitted Harness tasks
+are benchmarkable live cases.
 
 ## Dashboard Design
 
@@ -491,6 +639,7 @@ Every failed or weak run should classify the first meaningful failure:
 `harness-eval` should have fixture-based unit tests:
 
 - score ready/no-op control without requiring a head change
+- fail ready/no-op control when baseline review-thread completeness is missing
 - fail wrong-target final snapshot
 - cap grade at `C` for unresolved active review threads
 - cap grade at `C` for stale-head validation
@@ -514,6 +663,7 @@ The script should have shell or integration tests for:
 
 - URL-encoding task IDs that contain `/`
 - collect-only baseline mode
+- live-mode preflight failures remaining `collect_only`
 - final snapshot generation after task polling resumes
 
 ## Rollout Plan

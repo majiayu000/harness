@@ -1,6 +1,6 @@
 # Eval Module Implementation Plan
 
-Status: Draft
+Status: In progress
 Date: 2026-06-05
 Related spec: [`docs/eval-module-design.md`](eval-module-design.md)
 
@@ -53,7 +53,21 @@ Acceptance:
 
 - `bash -n scripts/evaluate_pr_repair.sh` passes.
 - A task ID containing `/` is encoded as a single URL path segment.
-- Collect-only mode still writes the baseline report.
+- Collect-only mode writes `baseline_pr.json`, `final_pr.json`,
+  `pr_repair_eval_input.json`, `quality_snapshot.json`, and `summary.md`
+  without requiring a Harness server.
+- Live mode writes the same machine-readable eval input and quality snapshot
+  after terminal, failed-submission, missing-task-id, or timeout outcomes.
+- The quality snapshot is produced by `harness-eval`, not the Markdown report
+  heuristic.
+
+Implementation status:
+
+- Added `evaluate_pr_repair_submit.py` so non-2xx submission responses and
+  network errors are preserved as artifacts.
+- Added `score_pr_repair` ingestion in `harness-eval` so external GitHub
+  snapshots can be converted into canonical `PrRepairEvalInput` and scored
+  into `QualitySnapshot`.
 
 ### Issue 3: Persist eval runs in `harness-server`
 
@@ -63,7 +77,8 @@ Scope:
 - Add migrations for `eval_runs`, `eval_artifacts`, and `quality_snapshots`.
 - Add API routes for run creation, artifact upload, scoring, snapshot lookup, and
   latest snapshot by PR.
-- Score only from already-ingested artifacts.
+- Score from a canonical `PrRepairEvalInput` request or the latest uploaded
+  `pr_repair_eval_input` artifact.
 
 Out of scope:
 
@@ -76,6 +91,14 @@ Acceptance:
 - API tests cover creating a run, uploading baseline/final artifacts, scoring a
   run, and fetching the latest snapshot for a PR.
 - Raw prompt text is not stored.
+
+Implementation status:
+
+- Added optional `eval_store` startup validation and migrations for
+  `eval_runs`, `eval_artifacts`, and `quality_snapshots`.
+- Added `/api/evals/*` routes for run lifecycle, artifacts, deterministic
+  scoring, snapshot lookup, and PR-scoped snapshot history.
+- Added route coverage for artifact-first scoring and PR lookup.
 
 ### Issue 4: Join usage attribution into eval snapshots
 
@@ -91,6 +114,15 @@ Acceptance:
 - Eval snapshots show exact, estimated, observed, or unknown confidence.
 - Missing price catalog leaves cost fields null with diagnostics.
 
+Implementation status:
+
+- Added `harness-eval` ingestion for canonical `usage` / `usage_snapshots`
+  arrays and Harness `llm_usage` event-style payload arrays.
+- The pure eval crate still does not load prices or call server APIs; it only
+  preserves token/cost fields and confidence labels supplied by artifacts.
+- Remaining work: collect and attach usage artifacts from server-side event
+  storage or external evaluator scripts.
+
 ### Issue 5: Add the dashboard eval view
 
 Scope:
@@ -103,6 +135,55 @@ Acceptance:
 
 - Operators can tell whether a PR repair succeeded, why it failed, and what it
   cost without reading raw logs.
+
+Implementation status:
+
+- Added a dashboard `Evals` tab backed by `/api/evals/runs` and
+  `/api/evals/quality-snapshots/{snapshot_id}`.
+- The view shows run status, scenario, target PR, score, grade, hard-gate pass
+  count, blockers, and usage totals when a quality snapshot exists.
+- Remaining work: add benchmark summary history and richer trend charts once
+  enough live-run samples exist.
+
+### Issue 6: Add PR repair benchmark summaries
+
+Scope:
+
+- Aggregate multiple `quality_snapshot.json` artifacts into a deterministic
+  benchmark summary.
+- Report a 0-10 capability score, confidence, status, grade distribution,
+  blocked-case count, and hard-gate failure counts.
+- Cap the effective per-case score by the final grade so hard-gate failures do
+  not look like 10/10 wins.
+- Add a file-based `score_pr_repair_benchmark` binary for local benchmark runs.
+- Add manifest-backed benchmark suites so stable regression cases can define
+  suite name, case id, snapshot path, tags, and weight without long CLI command
+  lines.
+
+Out of scope:
+
+- Selecting live GitHub PRs automatically.
+- Starting Harness tasks.
+- Running LLM or human code-quality reviewers.
+- Dashboard rendering.
+
+Acceptance:
+
+- `cargo test -p harness-eval benchmark` passes.
+- A single perfect case produces 10/10 with low confidence and `needs_review`.
+- Three clean `A` cases produce `excellent`.
+- A failed hard gate increments the matching failure count and blocks the
+  benchmark status.
+- The benchmark binary reads multiple quality snapshots and writes
+  `benchmark_summary.json`.
+- A manifest can drive a benchmark suite with relative snapshot paths, tags,
+  weights, and duplicate case-id protection.
+
+Implementation status:
+
+- Added deterministic summary aggregation and a file-based benchmark CLI.
+- Added manifest input for stable PR repair regression suites while preserving
+  `--snapshot` and `--case` ad hoc inputs.
 
 ## First PR Scope
 

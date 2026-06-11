@@ -3,7 +3,7 @@ use crate::workflow_runtime_submission::{
     RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
 };
 use axum::{extract::State, http::StatusCode, Json};
-use harness_workflow::issue_lifecycle::IssueLifecycleState;
+use harness_workflow::issue_lifecycle::IssueMergeApprovalOutcome;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -84,40 +84,24 @@ pub(super) async fn merge_task(
         }
     };
 
-    let workflow = match workflows
-        .get_by_pr(&project_id, task.repo.as_deref(), pr_num)
-        .await
-    {
-        Ok(Some(wf)) => wf,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "workflow not found for PR" })),
-            );
-        }
-        Err(e) => {
-            tracing::error!("merge_task: workflow lookup failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal server error" })),
-            );
-        }
-    };
-
-    if workflow.state != IssueLifecycleState::ReadyToMerge {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "workflow not in ready_to_merge state" })),
-        );
-    }
-
     match workflows
         .record_merge_approved(&project_id, task.repo.as_deref(), pr_num)
         .await
     {
-        Ok(_) => (
+        Ok(IssueMergeApprovalOutcome::Applied(_)) => (
             StatusCode::ACCEPTED,
             Json(json!({ "status": "merge_approved" })),
+        ),
+        Ok(IssueMergeApprovalOutcome::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "workflow not found for PR" })),
+        ),
+        Ok(IssueMergeApprovalOutcome::IgnoredWrongState { actual, .. }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "workflow not in ready_to_merge state",
+                "state": actual,
+            })),
         ),
         Err(e) => {
             tracing::error!("merge_task: record_merge_approved failed: {e}");

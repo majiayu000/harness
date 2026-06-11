@@ -26,6 +26,7 @@ use state_support::*;
 mod route_helpers;
 use route_helpers::*;
 
+mod evals_api_tests;
 mod health_route_tests;
 mod intake_auth_list_tests;
 mod recovery_followup_tests;
@@ -35,6 +36,7 @@ mod runtime_task_route_tests;
 mod runtime_tree_tests;
 mod runtime_worker_followup_tests;
 mod runtime_worker_tests;
+mod runtime_worker_workspace_tests;
 mod task_detail_sse_tests;
 mod webhook_runtime_tests;
 mod webhook_task_tests;

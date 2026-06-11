@@ -206,7 +206,16 @@ impl TaskSchedulerState {
             TaskStatus::Cancelled => SchedulerAuthorityState::Cancelled,
             TaskStatus::AwaitingDeps => SchedulerAuthorityState::AwaitingDependencies,
             TaskStatus::Pending => SchedulerAuthorityState::Queued,
-            _ => SchedulerAuthorityState::Running,
+            TaskStatus::Triaging
+            | TaskStatus::Planning
+            | TaskStatus::Implementing
+            | TaskStatus::ReviewGenerating
+            | TaskStatus::ReviewWaiting
+            | TaskStatus::PlannerGenerating
+            | TaskStatus::PlannerWaiting
+            | TaskStatus::AgentReview
+            | TaskStatus::Waiting
+            | TaskStatus::Reviewing => SchedulerAuthorityState::Running,
         };
     }
 

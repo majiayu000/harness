@@ -42,6 +42,9 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
     },
 ];
 
+mod merge_approval;
+pub use merge_approval::IssueMergeApprovalOutcome;
+
 pub struct IssueWorkflowStore {
     pool: PgPool,
 }
@@ -397,25 +400,6 @@ impl IssueWorkflowStore {
                 event = event.with_detail(detail.to_string());
             }
             workflow.apply_event(event);
-        })
-        .await
-    }
-
-    /// Transition a `ReadyToMerge` workflow to `Done` after human approval.
-    ///
-    /// Returns `None` if no workflow is found for the given PR.  The state
-    /// machine guard in `apply_event` silently discards the event when the
-    /// workflow is not in `ReadyToMerge` (e.g. already `Done`).
-    pub async fn record_merge_approved(
-        &self,
-        project_id: &str,
-        repo: Option<&str>,
-        pr_number: u64,
-    ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
-        self.update_by_pr(project_id, repo, pr_number, |workflow| {
-            workflow.apply_event(IssueLifecycleEvent::new(
-                IssueLifecycleEventKind::HumanMergeApproved,
-            ));
         })
         .await
     }

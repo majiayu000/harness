@@ -292,7 +292,7 @@ async fn hosted_bot_disabled_completion_records_ready_to_merge_feedback() -> any
         .get_instance(&workflow_id)
         .await?
         .expect("workflow instance should be recorded");
-    assert_eq!(instance.state, "ready_to_merge");
+    assert_eq!(instance.state, "quality_gate_pending");
     let events = runtime_store.events_for(&workflow_id).await?;
     assert!(events
         .iter()

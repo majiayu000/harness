@@ -185,21 +185,45 @@ pub enum TaskFailureKind {
     WorkspaceLifecycle,
 }
 
-const TERMINAL_TASK_STATUSES: &[&str] = &["done", "failed", "cancelled"];
+const TERMINAL_TASK_STATUSES: &[&str] = &[
+    TaskStatus::Done.as_str(),
+    TaskStatus::Failed.as_str(),
+    TaskStatus::Cancelled.as_str(),
+];
 const RESUMABLE_TASK_STATUSES: &[&str] = &[
-    "triaging",
-    "planning",
-    "implementing",
-    "review_generating",
-    "review_waiting",
-    "planner_generating",
-    "planner_waiting",
-    "agent_review",
-    "waiting",
-    "reviewing",
+    TaskStatus::Triaging.as_str(),
+    TaskStatus::Planning.as_str(),
+    TaskStatus::Implementing.as_str(),
+    TaskStatus::ReviewGenerating.as_str(),
+    TaskStatus::ReviewWaiting.as_str(),
+    TaskStatus::PlannerGenerating.as_str(),
+    TaskStatus::PlannerWaiting.as_str(),
+    TaskStatus::AgentReview.as_str(),
+    TaskStatus::Waiting.as_str(),
+    TaskStatus::Reviewing.as_str(),
 ];
 
 impl TaskStatus {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::AwaitingDeps => "awaiting_deps",
+            Self::Triaging => "triaging",
+            Self::Planning => "planning",
+            Self::Implementing => "implementing",
+            Self::ReviewGenerating => "review_generating",
+            Self::ReviewWaiting => "review_waiting",
+            Self::PlannerGenerating => "planner_generating",
+            Self::PlannerWaiting => "planner_waiting",
+            Self::AgentReview => "agent_review",
+            Self::Waiting => "waiting",
+            Self::Reviewing => "reviewing",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
@@ -247,23 +271,7 @@ impl TaskStatus {
 
 impl AsRef<str> for TaskStatus {
     fn as_ref(&self) -> &str {
-        match self {
-            TaskStatus::Pending => "pending",
-            TaskStatus::AwaitingDeps => "awaiting_deps",
-            TaskStatus::Triaging => "triaging",
-            TaskStatus::Planning => "planning",
-            TaskStatus::Implementing => "implementing",
-            TaskStatus::ReviewGenerating => "review_generating",
-            TaskStatus::ReviewWaiting => "review_waiting",
-            TaskStatus::PlannerGenerating => "planner_generating",
-            TaskStatus::PlannerWaiting => "planner_waiting",
-            TaskStatus::AgentReview => "agent_review",
-            TaskStatus::Waiting => "waiting",
-            TaskStatus::Reviewing => "reviewing",
-            TaskStatus::Done => "done",
-            TaskStatus::Failed => "failed",
-            TaskStatus::Cancelled => "cancelled",
-        }
+        self.as_str()
     }
 }
 

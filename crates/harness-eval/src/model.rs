@@ -7,6 +7,14 @@ pub enum EvalScenario {
     ReadyNoopControl,
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalRunMode {
+    #[default]
+    LiveRun,
+    CollectOnly,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvalTarget {
@@ -82,7 +90,11 @@ pub struct PullRequestSnapshot {
     pub check_state: CheckState,
     pub review_decision: Option<ReviewDecision>,
     pub active_unresolved_review_threads: Vec<ReviewThreadSnapshot>,
+    #[serde(default)]
+    pub review_threads_complete: bool,
     pub changed_files: Vec<ChangedFileSnapshot>,
+    #[serde(default)]
+    pub changed_files_complete: bool,
     pub collected_at: String,
 }
 
@@ -90,8 +102,23 @@ pub struct PullRequestSnapshot {
 pub struct RuntimeJobSnapshot {
     pub runtime_job_id: String,
     pub state: String,
+    #[serde(default)]
+    pub activity: Option<String>,
     pub artifact_count: u64,
     pub terminal_state: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<RuntimeErrorKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeErrorKind {
+    Retryable,
+    Timeout,
+    Fatal,
+    Configuration,
+    ExternalDependency,
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +194,7 @@ pub struct ReviewerJudgment {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PrRepairEvalInput {
     pub scenario: EvalScenario,
+    pub run_mode: EvalRunMode,
     pub target: EvalTarget,
     pub baseline_pr: PullRequestSnapshot,
     pub final_pr: PullRequestSnapshot,
@@ -308,6 +336,8 @@ impl ScoreBreakdown {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QualitySnapshot {
     pub scenario: EvalScenario,
+    #[serde(default)]
+    pub run_mode: EvalRunMode,
     pub target: EvalTarget,
     pub baseline_pr: Option<PullRequestSnapshot>,
     pub final_pr: Option<PullRequestSnapshot>,

@@ -53,7 +53,7 @@ impl Drop for ScopedEnvVar {
     }
 }
 
-fn write_executable_script(script_body: &str) -> (tempfile::TempDir, PathBuf) {
+pub(super) fn write_executable_script(script_body: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("create tempdir");
     let path = dir.path().join("mock-codex.sh");
     let script = format!("#!/bin/sh\nset -eu\n{script_body}\n");

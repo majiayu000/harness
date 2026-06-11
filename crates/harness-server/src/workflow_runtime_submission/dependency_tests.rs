@@ -260,8 +260,10 @@ async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> a
         .get_instance(&blocked.workflow_id)
         .await?
         .expect("dependent workflow should remain persisted");
-    assert_eq!(workflow.state, "implementing");
-    assert_eq!(store.commands_for(&blocked.workflow_id).await?.len(), 1);
+    assert_eq!(workflow.state, "planning");
+    let commands = store.commands_for(&blocked.workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     Ok(())
 }
 
@@ -401,8 +403,10 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_persisted_clo
         .get_instance(&blocked.workflow_id)
         .await?
         .expect("dependent workflow should remain persisted");
-    assert_eq!(workflow.state, "implementing");
-    assert_eq!(store.commands_for(&blocked.workflow_id).await?.len(), 1);
+    assert_eq!(workflow.state, "planning");
+    let commands = store.commands_for(&blocked.workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     Ok(())
 }
 
@@ -500,8 +504,10 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_closed_issue_
         .get_instance(&blocked.workflow_id)
         .await?
         .expect("dependent workflow should remain persisted");
-    assert_eq!(workflow.state, "implementing");
-    assert_eq!(store.commands_for(&blocked.workflow_id).await?.len(), 1);
+    assert_eq!(workflow.state, "planning");
+    let commands = store.commands_for(&blocked.workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     Ok(())
 }
 
@@ -574,6 +580,9 @@ async fn dependency_release_rotates_waiting_rows_to_prevent_starvation() -> anyh
         .get_instance(&ready.workflow_id)
         .await?
         .expect("ready workflow should remain persisted");
-    assert_eq!(workflow.state, "implementing");
+    assert_eq!(workflow.state, "planning");
+    let commands = store.commands_for(&ready.workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     Ok(())
 }

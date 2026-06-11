@@ -57,6 +57,23 @@ This checks existing local-review completion gates:
 Level 0 does not prove an agent can fix a real PR. It proves that the local gate
 does not accept common false positives.
 
+`QualitySnapshot` records a `run_mode`. Collect-only snapshots must use
+`collect_only`; live Harness repair runs use `live_run` only after Harness
+returns a non-empty `task_id` from `POST /tasks`. Server health failures, project
+registry failures, eval API preflight failures, duplicate-task preflight
+failures, POST failures, and missing task IDs are still diagnostic reports, but
+they are tagged `collect_only` because no Harness repair attempt exists. The
+eval API preflight must happen before `POST /tasks`; a server that is too old to
+serve `/api/evals/runs` can otherwise spend agent tokens without producing a
+dashboard quality record. Benchmark inputs must include an explicit
+`run_mode=live_run`; missing `run_mode` is rejected because older collect-only
+artifacts did not have this field.
+
+The `score_pr_repair` CLI must be invoked with an explicit
+`--run-mode live_run|collect_only` whenever it writes a new `QualitySnapshot`.
+Server scoring input for `/api/evals/runs/{run_id}/score` must also include
+`run_mode`. Neither path may default direct/manual scoring to `live_run`.
+
 ## Hard Gates
 
 A run must pass every hard gate before the numeric score can be interpreted as a
@@ -67,7 +84,7 @@ some useful work.
 |---|---|---|
 | Current PR targeting | The run updates or reports on the requested PR only. | Wrong PR, new PR, or unrelated branch. |
 | Head freshness | Final validation, review, and merge-readiness evidence names the final `headRefOid`. | Stale approval or stale CI was reused. |
-| Blocking feedback | Final active, non-outdated unresolved `reviewThreads` count is zero, or every remaining thread has an explicit justified rejection. | The original blocker remains. |
+| Blocking feedback | Final `reviewThreads` enumeration is complete and active, non-outdated unresolved thread count is zero, or every remaining thread has an explicit justified rejection. | The original blocker remains, or the evaluator did not inspect every review thread. |
 | Required checks | Final required checks are `SUCCESS` for the final head SHA, unless the case is explicitly collect-only. | CI still blocks merge. |
 | Branch safety | The existing PR branch is used and no unrelated files are changed. | Cross-branch mutation, broad cleanup, or dirty-state dependence. |
 | No unrelated PR creation | The run updates the existing PR branch and does not open or report a different PR. | The evaluation target was replaced by a new PR. |
@@ -88,9 +105,9 @@ Use the hard gates first, then score the successful run with this rubric:
 | Feedback discovery and prioritization | 14 | Finds actionable feedback, distinguishes stale or false-positive comments, and focuses on the blocker. |
 | Branch and PR safety | 10 | Uses the existing PR branch, no new PR, no wrong worktree, and no unrelated local changes. |
 | Fix correctness and scope | 22 | Produces the smallest correct fix, preserves product behavior, avoids silent degradation, and does not introduce regression risk. |
-| Verification and current-head gates | 16 | Runs relevant local validation and confirms final-head CI plus active `reviewThreads`. |
+| Verification and current-head gates | 16 | Runs relevant local validation and confirms final-head CI plus complete active `reviewThreads` and changed-file evidence. |
 | Runtime workflow behavior and persistence | 12 | Records task/workflow/job state, reaches a correct terminal or waiting state, and does not leave duplicate LLM work queued. |
-| Cost and time efficiency | 8 | Completes within the expected turn/time envelope for the task class and exposes usage attribution. |
+| Cost and time efficiency | 8 | Completes within the expected turn/time envelope for the task class, exposes usage attribution, and avoids repeated failed runtime jobs, including `expired` jobs. Repeated non-retryable runtime failures such as `configuration` or `fatal` errors receive zero points for this dimension. |
 | Reporting and attribution quality | 6 | Final report proves what Harness did, what commits were pushed, what commands passed, and what remains. |
 
 ### Code Quality Subscore
@@ -140,6 +157,16 @@ This records the PR `headRefOid`, `mergeStateStatus`, `statusCheckRollup`,
 `reviewDecision`, active unresolved `reviewThreads`, and a recommended task
 class. Use this before every live repair run.
 
+Collect-only reports still write `pr_repair_eval_input.json` and
+`quality_snapshot.json`, but those snapshots are tagged `run_mode=collect_only`.
+The benchmark CLI rejects them because no Harness repair, runtime artifact, or
+usage attribution exists yet.
+
+Live-mode preflight failures use the same `collect_only` tag until the script
+successfully submits a Harness task and records its `task_id`. This keeps
+environment/setup failures out of the live repair capability benchmark while
+still preserving enough evidence to debug why no repair attempt started.
+
 ### Level 2: Harness Live PR Repair
 
 Start or reuse a Harness server:
@@ -187,6 +214,47 @@ Score the run after the final GraphQL snapshot:
 | `D` | No meaningful progress, repeated same failure, or excessive cost. |
 | `F` | Wrong branch, new PR instead of updating existing PR, false ready-to-merge, or destructive/unrelated changes. |
 
+After the three snapshots exist, pin them in a benchmark manifest so future
+changes can rerun the same suite:
+
+```json
+{
+  "suite": "pr-repair-smoke",
+  "cases": [
+    {
+      "case_id": "ready-noop-control",
+      "snapshot": "ready-noop/quality_snapshot.json",
+      "tags": ["ready_noop"],
+      "weight": 1
+    },
+    {
+      "case_id": "ci-repair",
+      "snapshot": "ci-repair/quality_snapshot.json",
+      "tags": ["ci_repair"],
+      "weight": 1
+    },
+    {
+      "case_id": "review-thread-repair",
+      "snapshot": "review-thread/quality_snapshot.json",
+      "tags": ["review_threads"],
+      "weight": 2
+    }
+  ]
+}
+```
+
+Run the suite with:
+
+```bash
+score_pr_repair_benchmark \
+  --manifest docs/pr-repair-evals/pr-repair-smoke.json \
+  --output docs/pr-repair-evals/pr-repair-smoke-summary.json
+```
+
+Manifest snapshot paths are relative to the manifest file. Use weights to make
+harder or more important PR repair classes count more heavily without hiding
+per-case hard-gate failures.
+
 ## Report Fields
 
 Each run should produce a report with:
@@ -197,10 +265,36 @@ Each run should produce a report with:
 - baseline and final `statusCheckRollup.state`
 - baseline and final active unresolved review-thread count
 - Harness `task_id`, `workflow_id`, and terminal state when available
+- Runtime job `activity`, terminal state, artifact count, and `error_kind` when available
 - elapsed time and configured turn/budget limits
 - changed files from the final PR diff
 - validation commands observed in task rounds or PR comments
 - final grade and blocker summary
+
+Each run must also write machine-readable eval artifacts:
+
+- `pr_repair_eval_input.json`: canonical `PrRepairEvalInput` consumed by
+  `harness-eval` and `/api/evals/runs/{run_id}/score`.
+- `quality_snapshot.json`: deterministic `QualitySnapshot` with hard gates,
+  score breakdown, grade caps, blocker summary, runtime evidence, and PR facts.
+- `eval_run.json`: the server eval run created for a successfully submitted
+  live Harness repair task.
+- `eval_artifact_pr_repair_input.json`: the server artifact upload response for
+  the final canonical input.
+- `eval_score.json`: the server-side scoring response that links the eval run
+  to the stored `quality_snapshot`.
+
+The canonical input and local quality snapshot include `run_mode`. Operators
+may archive collect-only artifacts next to live-run artifacts, but only
+`live_run` snapshots are valid inputs for the capability benchmark. A snapshot
+is `live_run` only after a Harness task was successfully submitted for the
+target PR; live-mode preflight failures remain `collect_only`. The benchmark CLI
+rejects missing `run_mode` rather than defaulting old snapshots to live runs.
+Collect-only runs and live preflight failures are local-only; the script
+persists to `/api/evals` only after the live Harness task has a `task_id`.
+
+The Markdown summary is an operator convenience layer. It must not be the source
+of truth for eval scoring, dashboards, or merge readiness.
 
 ## Interpretation Rules
 
@@ -216,13 +310,15 @@ Each run should produce a report with:
 
 ## Next Implementation Targets
 
-The current script can evaluate live PR repair from outside the server. The next
-Harness-owned implementation should persist this same report shape as a
-`QualitySnapshot`. The module-level design is in
+The current script can evaluate live PR repair from outside the server. The
+Harness-owned implementation now has a server-side persistence path for this
+same report shape as a `QualitySnapshot`. The module-level design is in
 [`docs/eval-module-design.md`](eval-module-design.md):
 
-1. Add a read-only `/api/quality/pr/{repo}/{pr}` endpoint.
-2. Store PR repair eval reports under workflow runtime events.
+1. Use `/api/evals/runs`, `/api/evals/runs/{run_id}/artifacts`,
+   `/api/evals/runs/{run_id}/score`, and `/api/evals/pr/{owner}/{repo}/{pr}` as
+   the durable eval contract.
+2. Store PR repair eval reports as `quality_snapshots` linked to eval runs.
 3. Attach `agent_invocation_id`, `runtime_job_id`, model, effort, and usage to
    each run.
 4. Block ready-to-merge when the report has stale head SHA, failing checks, or

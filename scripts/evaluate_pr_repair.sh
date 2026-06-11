@@ -10,13 +10,15 @@ Options:
   --repo OWNER/REPO       GitHub repository slug.
   --pr N                  Pull request number to evaluate.
   --server-url URL        Harness HTTP server URL. Default: http://127.0.0.1:9800
-  --project-root PATH     Local project root sent to POST /tasks. Default: current directory.
+  --project-root PROJECT  Project root, registry id, or name sent to POST /tasks. Must be registered for live mode.
   --output DIR            Report directory. Default: docs/pr-repair-evals/<timestamp>-<repo>-pr<N>
   --collect-only          Collect GitHub baseline only; do not submit a Harness task.
   --wait-secs N           Structured Harness wait bound and task prompt guidance. Default: 10
   --max-rounds N          Structured Harness round bound and task prompt guidance. Default: 2
   --max-turns N           Structured Harness turn bound and task prompt guidance. Default: 6
   --max-budget-usd N      Optional Harness max budget in USD.
+  --reviewer-judgment PATH
+                          Optional ReviewerJudgment JSON for the final PR head.
   --poll-secs N           Poll interval for GET /tasks/{id}. Default: 30
   --timeout-secs N        Overall task poll timeout. Default: 7200
   -h, --help              Show this help.
@@ -25,7 +27,7 @@ Environment:
   HARNESS_API_TOKEN       Optional Bearer token for Harness HTTP routes.
 
 The script never starts `harness serve`; start or reuse a Harness server before
-a live evaluation.
+evaluation. Live evaluations persist the final score through `/api/evals`.
 EOF
 }
 
@@ -46,6 +48,7 @@ WAIT_SECS=10
 MAX_ROUNDS=2
 MAX_TURNS=6
 MAX_BUDGET_USD=""
+REVIEWER_JUDGMENT_JSON=""
 POLL_SECS=30
 TIMEOUT_SECS=7200
 
@@ -91,6 +94,18 @@ while [[ $# -gt 0 ]]; do
       MAX_BUDGET_USD="${2:-}"
       shift 2
       ;;
+    --reviewer-judgment)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --reviewer-judgment requires a file path" >&2
+        exit 2
+      fi
+      if [[ ! -f "$2" ]]; then
+        echo "Error: reviewer judgment file does not exist: $2" >&2
+        exit 2
+      fi
+      REVIEWER_JUDGMENT_JSON="$2"
+      shift 2
+      ;;
     --poll-secs)
       POLL_SECS="${2:-}"
       shift 2
@@ -128,7 +143,10 @@ require_cmd gh
 require_cmd curl
 require_cmd python3
 require_cmd date
+require_cmd cargo
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -405,52 +423,17 @@ print(quote(sys.argv[1], safe=""))
 PY
 }
 
-classify_snapshot() {
-  python3 - "$1" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    pr = json.load(fh)
-
-threads = (((pr.get("reviewThreads") or {}).get("nodes")) or [])
-unresolved = len([
-    t for t in threads
-    if not t.get("isResolved", False) and not t.get("isOutdated", False)
-])
-checks = (pr.get("statusCheckRollup") or {}).get("state") or "UNKNOWN"
-merge = pr.get("mergeStateStatus") or "UNKNOWN"
-if unresolved > 0:
-    print("review_feedback_repair")
-elif checks != "SUCCESS":
-    print("ci_repair")
-elif merge == "CLEAN" and checks == "SUCCESS":
-    print("ready_noop")
-else:
-    print("mergeability_repair")
-PY
-}
-
 write_collect_report() {
   local baseline="$1"
+  local quality="$2"
   local report="$OUTPUT_DIR/summary.md"
-  local task_class
-  task_class="$(classify_snapshot "$baseline")"
-  {
-    echo "# PR Repair Evaluation"
-    echo
-    echo "- Run ID: \`$RUN_ID\`"
-    echo "- Repo: \`$REPO\`"
-    echo "- PR: \`#$PR\`"
-    echo "- Mode: collect-only"
-    echo "- Candidate class: \`$task_class\`"
-    echo
-    echo "## Baseline"
-    echo
-    echo "\`\`\`text"
-    snapshot_summary "$baseline"
-    echo "\`\`\`"
-  } > "$report"
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" write-collect-report \
+    --baseline "$baseline" \
+    --quality "$quality" \
+    --output "$report" \
+    --run-id "$RUN_ID" \
+    --repo "$REPO" \
+    --pr "$PR"
 }
 
 write_final_report() {
@@ -459,194 +442,54 @@ write_final_report() {
   local submission="$3"
   local task_detail="$4"
   local timed_out="$5"
+  local quality="$6"
   local report="$OUTPUT_DIR/summary.md"
-  python3 - "$baseline" "$final" "$submission" "$task_detail" "$RUN_ID" "$REPO" "$PR" "$SERVER_URL" "$timed_out" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" "$TIMEOUT_SECS" <<'PY' > "$report"
-import json
-import sys
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" write-final-report \
+    --baseline "$baseline" \
+    --final "$final" \
+    --submission "$submission" \
+    --task-detail "$task_detail" \
+    --quality "$quality" \
+    --output "$report" \
+    --run-id "$RUN_ID" \
+    --repo "$REPO" \
+    --pr "$PR" \
+    --server-url "$SERVER_URL" \
+    --timed-out "$timed_out" \
+    --wait-secs "$WAIT_SECS" \
+    --max-rounds "$MAX_ROUNDS" \
+    --max-turns "$MAX_TURNS" \
+    --max-budget-usd "$MAX_BUDGET_USD" \
+    --timeout-secs "$TIMEOUT_SECS"
+}
 
-(
-    baseline_path,
-    final_path,
-    submission_path,
-    task_detail_path,
-    run_id,
-    repo,
-    pr_number,
-    server_url,
-    timed_out_arg,
-    wait_secs,
-    max_rounds,
-    max_turns,
-    max_budget,
-    timeout_secs,
-) = sys.argv[1:]
+write_preflight_failure_artifacts() {
+  local error="$1"
+  local stage="${2:-project_registry_preflight}"
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" write-preflight-failure \
+    --submission "$SUBMISSION_JSON" \
+    --task-detail "$TASK_DETAIL_JSON" \
+    --project-root "$PROJECT_ROOT" \
+    --server-url "$SERVER_URL" \
+    --error "$error" \
+    --stage "$stage"
+}
 
-def load(path):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return {}
-
-def facts(pr):
-    threads = (((pr.get("reviewThreads") or {}).get("nodes")) or [])
-    files = list(((pr.get("files") or {}).get("nodes")) or [])
-    active = [
-        t for t in threads
-        if not t.get("isResolved", False) and not t.get("isOutdated", False)
-    ]
-    return {
-        "head": pr.get("headRefOid"),
-        "merge": pr.get("mergeStateStatus") or "UNKNOWN",
-        "checks": (pr.get("statusCheckRollup") or {}).get("state") or "UNKNOWN",
-        "unresolved": len(active),
-        "files_collected": "files" in pr,
-        "changed_files": files,
-        "changed_file_paths": sorted({
-            f.get("path")
-            for f in files
-            if isinstance(f, dict) and f.get("path")
-        }),
-    }
-
-def markdown_cell(value):
-    return str(value).replace("|", "\\|")
-
-def file_rows(files):
-    rows = []
-    for item in sorted(files, key=lambda f: f.get("path") or ""):
-        path = item.get("path") or "UNKNOWN"
-        change_type = item.get("changeType") or "UNKNOWN"
-        additions = item.get("additions", 0)
-        deletions = item.get("deletions", 0)
-        rows.append((path, change_type, additions, deletions))
-    return rows
-
-def limited_path_list(paths):
-    if not paths:
-        return ""
-    shown = ", ".join(paths[:5])
-    if len(paths) > 5:
-        return f"{shown}, ... ({len(paths)} total)"
-    return shown
-
-baseline = load(baseline_path)
-final = load(final_path)
-submission = load(submission_path)
-task_detail = load(task_detail_path)
-before = facts(baseline)
-after = facts(final)
-head_changed = before["head"] != after["head"]
-new_changed_paths = sorted(set(after["changed_file_paths"]) - set(before["changed_file_paths"]))
-removed_changed_paths = sorted(set(before["changed_file_paths"]) - set(after["changed_file_paths"]))
-task_status = task_detail.get("status") or task_detail.get("workflow", {}).get("state") or submission.get("status") or "unknown"
-workflow_id = submission.get("workflow_id") or task_detail.get("workflow", {}).get("id")
-task_id = submission.get("task_id") or task_detail.get("id")
-timed_out = timed_out_arg == "1"
-
-if before["unresolved"] > 0:
-    candidate = "review_feedback_repair"
-elif before["checks"] != "SUCCESS":
-    candidate = "ci_repair"
-elif before["merge"] == "CLEAN" and before["checks"] == "SUCCESS":
-    candidate = "ready_noop"
-else:
-    candidate = "mergeability_repair"
-
-grade = "C"
-blockers = []
-if after["checks"] != "SUCCESS":
-    blockers.append(f"final checks are {after['checks']}")
-if after["unresolved"] > 0:
-    blockers.append(f"{after['unresolved']} active unresolved review threads remain")
-if candidate in ("review_feedback_repair", "ci_repair") and not head_changed:
-    blockers.append("PR head did not change for a repair candidate")
-if candidate == "ready_noop" and head_changed:
-    blockers.append("ready/no-op control changed the PR head")
-if after["merge"] != "CLEAN":
-    blockers.append(f"final mergeStateStatus is {after['merge']}, not CLEAN")
-if head_changed and not after["files_collected"]:
-    blockers.append("final PR head changed but changed files were not collected")
-if task_status in ("failed", "cancelled", "blocked"):
-    blockers.append(f"Harness task ended as {task_status}")
-if timed_out or task_status in ("unknown", "pending", "running", "implementing", "reviewing"):
-    blockers.append("Harness task did not reach a terminal state before the evaluation timeout")
-
-if not blockers:
-    grade = "A"
-elif candidate == "ready_noop" and head_changed:
-    grade = "C"
-elif after["merge"] != "CLEAN":
-    grade = "C"
-elif after["checks"] == "SUCCESS" and after["unresolved"] == 0:
-    grade = "B"
-elif head_changed or after["checks"] == "SUCCESS" or after["unresolved"] < before["unresolved"]:
-    grade = "C"
-elif task_status in ("failed", "cancelled", "blocked"):
-    grade = "D"
-else:
-    grade = "F"
-
-print("# PR Repair Evaluation")
-print()
-print(f"- Run ID: `{run_id}`")
-print(f"- Repo: `{repo}`")
-print(f"- PR: `#{pr_number}`")
-print(f"- Server URL: `{server_url}`")
-print(f"- Candidate class: `{candidate}`")
-print(f"- Task ID: `{task_id}`")
-print(f"- Workflow ID: `{workflow_id}`")
-print(f"- Task status: `{task_status}`")
-print(f"- Timed out: `{str(timed_out).lower()}`")
-print(f"- Grade: `{grade}`")
-print()
-print("## Eval Bounds")
-print()
-print("| Field | Value |")
-print("|---|---|")
-print(f"| `wait_secs` | `{wait_secs}` |")
-print(f"| `max_rounds` | `{max_rounds}` |")
-print(f"| `max_turns` | `{max_turns}` |")
-print(f"| `max_budget_usd` | `{max_budget or 'not set'}` |")
-print(f"| `timeout_secs` | `{timeout_secs}` |")
-print()
-print("## Baseline vs Final")
-print()
-print("| Field | Baseline | Final |")
-print("|---|---|---|")
-print(f"| `headRefOid` | `{before['head']}` | `{after['head']}` |")
-print(f"| `mergeStateStatus` | `{before['merge']}` | `{after['merge']}` |")
-print(f"| `statusCheckRollup.state` | `{before['checks']}` | `{after['checks']}` |")
-print(f"| active unresolved review threads | `{before['unresolved']}` | `{after['unresolved']}` |")
-print(f"| changed files | `{len(before['changed_files'])}` | `{len(after['changed_files'])}` |")
-print(f"| head changed | `false` | `{str(head_changed).lower()}` |")
-print()
-print("## Changed File Scope")
-print()
-print("| Field | Value |")
-print("|---|---|")
-print(f"| changed-file evidence | `{'collected' if after['files_collected'] else 'missing'}` |")
-print(f"| new changed paths | `{limited_path_list(new_changed_paths) or 'none'}` |")
-print(f"| removed changed paths | `{limited_path_list(removed_changed_paths) or 'none'}` |")
-print()
-print("## Final Changed Files")
-print()
-if after["changed_files"]:
-    print("| Path | Change | + | - |")
-    print("|---|---|---:|---:|")
-    for path, change_type, additions, deletions in file_rows(after["changed_files"]):
-        print(f"| `{markdown_cell(path)}` | `{markdown_cell(change_type)}` | `{additions}` | `{deletions}` |")
-else:
-    print("- None collected")
-print()
-print("## Blockers")
-print()
-if blockers:
-    for blocker in blockers:
-        print(f"- {blocker}")
-else:
-    print("- None")
-PY
+write_live_preflight_failure_report() {
+  local reason="$1"
+  local exit_code="$2"
+  local stage="${3:-project_registry_preflight}"
+  write_preflight_failure_artifacts "$reason" "$stage"
+  echo "$reason" >&2
+  echo "Using baseline PR snapshot as final snapshot because no Harness task was submitted"
+  cp "$BASELINE_JSON" "$FINAL_JSON"
+  FINAL_COLLECTED_AT="$BASELINE_COLLECTED_AT"
+  snapshot_summary "$FINAL_JSON"
+  write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
+  echo "Evaluation report: $OUTPUT_DIR/summary.md"
+  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
+  exit "$exit_code"
 }
 
 BASELINE_JSON="$OUTPUT_DIR/baseline_pr.json"
@@ -654,15 +497,135 @@ FINAL_JSON="$OUTPUT_DIR/final_pr.json"
 SUBMISSION_JSON="$OUTPUT_DIR/submission.json"
 TASK_DETAIL_JSON="$OUTPUT_DIR/task_detail_final.json"
 TASK_BODY_JSON="$OUTPUT_DIR/task_body.json"
+PR_REPAIR_EVAL_INPUT_JSON="$OUTPUT_DIR/pr_repair_eval_input.json"
+QUALITY_SNAPSHOT_JSON="$OUTPUT_DIR/quality_snapshot.json"
+EVAL_RUN_JSON="$OUTPUT_DIR/eval_run.json"
+EVAL_ARTIFACT_JSON="$OUTPUT_DIR/eval_artifact_pr_repair_input.json"
+EVAL_SCORE_JSON="$OUTPUT_DIR/eval_score.json"
 HEALTH_JSON="$OUTPUT_DIR/health.json"
+PROJECTS_JSON="$OUTPUT_DIR/projects.json"
+TASKS_PREFLIGHT_JSON="$OUTPUT_DIR/tasks_preflight.json"
+TASKS_PREFLIGHT_ERROR="$OUTPUT_DIR/tasks_preflight_error.txt"
+EVAL_API_PREFLIGHT_JSON="$OUTPUT_DIR/eval_api_preflight.json"
+EVAL_API_PREFLIGHT_ERROR="$OUTPUT_DIR/eval_api_preflight_error.txt"
+RUNTIME_TREE_FINAL_JSON="$OUTPUT_DIR/runtime_tree_final.json"
+RUNTIME_TREE_FINAL_ERROR="$OUTPUT_DIR/runtime_tree_final_error.txt"
+EVAL_TARGET_ID="pr-repair-eval:$REPO#$PR"
+EVAL_EXTERNAL_ID="$EVAL_TARGET_ID:run:$RUN_ID"
+QUALITY_RUN_MODE="collect_only"
+EVAL_PERSIST_FAILED=0
+
+write_quality_snapshot() {
+  local baseline="$1"
+  local final="$2"
+  local submission="$3"
+  local task_detail="$4"
+  local baseline_collected_at="$5"
+  local final_collected_at="$6"
+  local args=(
+    run
+    --quiet
+    --manifest-path "$REPO_ROOT/Cargo.toml"
+    -p harness-eval
+    --bin score_pr_repair
+    --
+    --repo "$REPO"
+    --pr "$PR"
+    --baseline "$baseline"
+    --final "$final"
+    --baseline-collected-at "$baseline_collected_at"
+    --final-collected-at "$final_collected_at"
+    --input-output "$PR_REPAIR_EVAL_INPUT_JSON"
+    --snapshot-output "$QUALITY_SNAPSHOT_JSON"
+  )
+  if [[ "$COLLECT_ONLY" -eq 1 || "$QUALITY_RUN_MODE" == "collect_only" ]]; then
+    args+=(--run-mode collect_only)
+  else
+    args+=(--run-mode live_run)
+  fi
+  if [[ -s "$submission" ]]; then
+    args+=(--submission "$submission")
+  fi
+  if [[ -s "$task_detail" ]]; then
+    args+=(--task-detail "$task_detail")
+  fi
+  if [[ -n "$REVIEWER_JUDGMENT_JSON" ]]; then
+    args+=(--reviewer-judgment "$REVIEWER_JUDGMENT_JSON")
+  fi
+  cargo "${args[@]}"
+}
+
+ensure_eval_run_record() {
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_persist.py" ensure-run \
+    --server-url "$SERVER_URL" \
+    --input "$PR_REPAIR_EVAL_INPUT_JSON" \
+    --source-task-id "$TASK_ID" \
+    --output "$EVAL_RUN_JSON"
+}
+
+persist_eval_score_record() {
+  python3 "$SCRIPT_DIR/evaluate_pr_repair_persist.py" persist-score \
+    --server-url "$SERVER_URL" \
+    --input "$PR_REPAIR_EVAL_INPUT_JSON" \
+    --run "$EVAL_RUN_JSON" \
+    --artifact-output "$EVAL_ARTIFACT_JSON" \
+    --score-output "$EVAL_SCORE_JSON"
+}
+
+score_snapshot_id() {
+  python3 - "$EVAL_SCORE_JSON" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    data = {}
+
+snapshot = data.get("quality_snapshot") if isinstance(data, dict) else {}
+if isinstance(snapshot, dict):
+    print(snapshot.get("id") or "")
+else:
+    print("")
+PY
+}
+
+collect_runtime_tree_artifact() {
+  local project_root="$1"
+  local workflow_id="$2"
+  local task_id="$3"
+  if [[ -z "$project_root" || -z "$workflow_id" ]]; then
+    return 0
+  fi
+  if curl "${curl_args[@]}" --get \
+    --data-urlencode "project_id=$project_root" \
+    --data-urlencode "limit=100" \
+    --data-urlencode "job_limit=5" \
+    "$SERVER_URL/api/workflows/runtime/tree" \
+    > "$RUNTIME_TREE_FINAL_JSON" 2>"$RUNTIME_TREE_FINAL_ERROR"; then
+    python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" merge-runtime-tree \
+      --task-detail "$TASK_DETAIL_JSON" \
+      --runtime-tree "$RUNTIME_TREE_FINAL_JSON" \
+      --workflow-id "$workflow_id" \
+      --task-id "$task_id"
+  else
+    echo "Runtime tree collection failed; see $RUNTIME_TREE_FINAL_ERROR" >&2
+  fi
+}
 
 echo "Collecting baseline for $REPO#$PR"
+BASELINE_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 collect_snapshot "$BASELINE_JSON"
 snapshot_summary "$BASELINE_JSON"
-write_collect_report "$BASELINE_JSON"
+cp "$BASELINE_JSON" "$FINAL_JSON"
+FINAL_COLLECTED_AT="$BASELINE_COLLECTED_AT"
+write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
+write_collect_report "$BASELINE_JSON" "$QUALITY_SNAPSHOT_JSON"
 
 if [[ "$COLLECT_ONLY" -eq 1 ]]; then
   echo "Collect-only report: $OUTPUT_DIR/summary.md"
+  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
   exit 0
 fi
 
@@ -672,15 +635,62 @@ if [[ -n "${HARNESS_API_TOKEN:-}" ]]; then
 fi
 
 if ! curl "${curl_args[@]}" "$SERVER_URL/health" > "$HEALTH_JSON"; then
-  echo "Harness server is not reachable at $SERVER_URL; baseline was saved to $OUTPUT_DIR" >&2
-  exit 3
+  write_live_preflight_failure_report \
+    "Harness server is not reachable at $SERVER_URL/health" \
+    3 \
+    "server_health_preflight"
 fi
 
-python3 - "$PROJECT_ROOT" "$REPO" "$PR" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" <<'PY' > "$TASK_BODY_JSON"
+if ! curl "${curl_args[@]}" "$SERVER_URL/api/evals/runs?limit=1" > "$EVAL_API_PREFLIGHT_JSON" 2>"$EVAL_API_PREFLIGHT_ERROR"; then
+  write_live_preflight_failure_report \
+    "Harness eval API is not reachable at $SERVER_URL/api/evals/runs?limit=1; see $EVAL_API_PREFLIGHT_ERROR" \
+    5 \
+    "eval_api_preflight"
+fi
+
+echo "Checking Harness project registry for $PROJECT_ROOT"
+if ! curl "${curl_args[@]}" "$SERVER_URL/projects" > "$PROJECTS_JSON"; then
+  write_live_preflight_failure_report \
+    "Harness project registry is not reachable at $SERVER_URL/projects" \
+    5 \
+    "project_registry_preflight"
+fi
+
+PREFLIGHT_ERROR="$OUTPUT_DIR/project_preflight_error.txt"
+if ! registered_project="$(python3 "$SCRIPT_DIR/evaluate_pr_repair_preflight.py" check-project --project-root "$PROJECT_ROOT" --projects-json "$PROJECTS_JSON" 2>"$PREFLIGHT_ERROR")"; then
+  reason="$(tr '\n' ' ' < "$PREFLIGHT_ERROR")"
+  if [[ -z "$reason" ]]; then
+    reason="Harness project root is not registered for live eval: $PROJECT_ROOT"
+  fi
+  echo "Register the project with POST /projects or pass a registered --project-root." >&2
+  write_live_preflight_failure_report "$reason" 5 "project_registry_preflight"
+fi
+echo "Registered project: $registered_project"
+
+echo "Checking for active duplicate PR repair eval tasks"
+if ! curl "${curl_args[@]}" --get \
+  --data-urlencode "source=pr_repair_eval" \
+  --data-urlencode "kind=prompt" \
+  --data-urlencode "limit=500" \
+  "$SERVER_URL/tasks" > "$TASKS_PREFLIGHT_JSON" 2>"$TASKS_PREFLIGHT_ERROR"; then
+  write_live_preflight_failure_report \
+    "Harness task list is not reachable at $SERVER_URL/tasks; see $TASKS_PREFLIGHT_ERROR" \
+    5 \
+    "duplicate_task_preflight"
+fi
+if ! duplicate_error="$(python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" check-conflicts \
+  --tasks-json "$TASKS_PREFLIGHT_JSON" \
+  --project-root "$registered_project" \
+  --external-id "$EVAL_EXTERNAL_ID" \
+  --target-prefix "$EVAL_TARGET_ID" 2>&1)"; then
+  write_live_preflight_failure_report "$duplicate_error" 5 "duplicate_task_preflight"
+fi
+
+python3 - "$registered_project" "$REPO" "$PR" "$WAIT_SECS" "$MAX_ROUNDS" "$MAX_TURNS" "$MAX_BUDGET_USD" "$EVAL_EXTERNAL_ID" <<'PY' > "$TASK_BODY_JSON"
 import json
 import sys
 
-project_root, repo, pr, wait_secs, max_rounds, max_turns, max_budget = sys.argv[1:]
+project_root, repo, pr, wait_secs, max_rounds, max_turns, max_budget, external_id = sys.argv[1:]
 wait_secs_value = int(wait_secs)
 max_rounds_value = int(max_rounds)
 max_turns_value = int(max_turns)
@@ -688,7 +698,7 @@ body = {
     "project": project_root,
     "repo": repo,
     "source": "pr_repair_eval",
-    "external_id": f"pr-repair-eval:{repo}#{pr}",
+    "external_id": external_id,
     "wait_secs": wait_secs_value,
     "max_rounds": max_rounds_value,
     "max_turns": max_turns_value,
@@ -710,10 +720,19 @@ print(json.dumps(body, indent=2))
 PY
 
 echo "Submitting Harness PR repair task"
-curl "${curl_args[@]}" \
-  -X POST "$SERVER_URL/tasks" \
-  -H "Content-Type: application/json" \
-  --data @"$TASK_BODY_JSON" > "$SUBMISSION_JSON"
+if ! python3 "$SCRIPT_DIR/evaluate_pr_repair_submit.py" --server-url "$SERVER_URL" --body "$TASK_BODY_JSON" --output "$SUBMISSION_JSON" --mode prompt_task; then
+  printf '{"status":"failed"}\n' > "$TASK_DETAIL_JSON"
+  echo "POST /tasks failed; see $SUBMISSION_JSON" >&2
+  echo "Collecting final PR snapshot"
+  FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  collect_snapshot "$FINAL_JSON"
+  snapshot_summary "$FINAL_JSON"
+  write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
+  echo "Evaluation report: $OUTPUT_DIR/summary.md"
+  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
+  exit 4
+fi
 
 TASK_ID="$(python3 - "$SUBMISSION_JSON" <<'PY'
 import json
@@ -722,18 +741,46 @@ import sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as fh:
         data = json.load(fh)
-except json.JSONDecodeError:
+except (OSError, json.JSONDecodeError):
     data = {}
 
 print(data.get("task_id") or data.get("submission_id") or "")
 PY
 )"
 if [[ -z "$TASK_ID" ]]; then
+  printf '{"status":"failed"}\n' > "$TASK_DETAIL_JSON"
   echo "POST /tasks did not return task_id; see $SUBMISSION_JSON" >&2
+  echo "Collecting final PR snapshot"
+  FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  collect_snapshot "$FINAL_JSON"
+  snapshot_summary "$FINAL_JSON"
+  write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
+  write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "0" "$QUALITY_SNAPSHOT_JSON"
+  echo "Evaluation report: $OUTPUT_DIR/summary.md"
+  echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
   exit 4
 fi
 
+QUALITY_RUN_MODE="live_run"
 echo "Submitted task_id=$TASK_ID"
+if eval_run_id="$(ensure_eval_run_record)"; then
+  echo "Eval run: $eval_run_id"
+else
+  echo "Eval run persistence will be retried after final snapshot; see $EVAL_RUN_JSON" >&2
+fi
+WORKFLOW_ID="$(python3 - "$SUBMISSION_JSON" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    data = {}
+
+print(data.get("workflow_id") or "")
+PY
+)"
 ENCODED_TASK_ID="$(url_encode_path_segment "$TASK_ID")"
 deadline=$(( $(date +%s) + TIMEOUT_SECS ))
 status="unknown"
@@ -760,7 +807,42 @@ case "$status" in
 esac
 
 echo "Collecting final PR snapshot"
+FINAL_COLLECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 collect_snapshot "$FINAL_JSON"
 snapshot_summary "$FINAL_JSON"
-write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$timed_out"
+if [[ -z "$WORKFLOW_ID" ]]; then
+  WORKFLOW_ID="$(python3 - "$TASK_DETAIL_JSON" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    data = {}
+
+workflow = data.get("workflow") if isinstance(data, dict) else {}
+if not isinstance(workflow, dict):
+    workflow = {}
+print(workflow.get("id") or data.get("workflow_id") or "")
+PY
+)"
+fi
+collect_runtime_tree_artifact "$registered_project" "$WORKFLOW_ID" "$TASK_ID"
+write_quality_snapshot "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$BASELINE_COLLECTED_AT" "$FINAL_COLLECTED_AT"
+write_final_report "$BASELINE_JSON" "$FINAL_JSON" "$SUBMISSION_JSON" "$TASK_DETAIL_JSON" "$timed_out" "$QUALITY_SNAPSHOT_JSON"
+if eval_run_id="$(ensure_eval_run_record)" && persist_eval_score_record; then
+  echo "Server eval run: $eval_run_id"
+  snapshot_id="$(score_snapshot_id)"
+  if [[ -n "$snapshot_id" ]]; then
+    echo "Server quality snapshot: $snapshot_id"
+  fi
+else
+  EVAL_PERSIST_FAILED=1
+  echo "Eval persistence failed; local artifacts are still available in $OUTPUT_DIR" >&2
+fi
 echo "Evaluation report: $OUTPUT_DIR/summary.md"
+echo "Quality snapshot: $QUALITY_SNAPSHOT_JSON"
+if [[ "$EVAL_PERSIST_FAILED" -eq 1 ]]; then
+  exit 6
+fi
