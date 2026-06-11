@@ -292,5 +292,7 @@ for _ in 1 2 3 4 5; do
   sleep 1
 done
 
-echo "harness server started pid=$server_pid, but health did not respond within 5s"
-echo "check: scripts/start-harness-codex-safe.sh --status --port $PORT"
+echo "harness server pid=$server_pid did not become healthy within 5s" >&2
+echo "check: scripts/start-harness-codex-safe.sh --status --port $PORT" >&2
+echo "inspect: tail -n 120 $LOG_FILE" >&2
+exit 4
