@@ -266,9 +266,10 @@ if command -v tmux >/dev/null 2>&1 && [[ -z "${HARNESS_STARTER_NO_TMUX:-}" ]]; t
     sleep 1
   done
 
-  echo "tmux session $TMUX_SESSION started, but health did not respond within 10s"
-  echo "check: scripts/start-harness-codex-safe.sh --status --port $PORT"
-  exit 0
+  echo "tmux session $TMUX_SESSION did not become healthy within 10s" >&2
+  echo "check: scripts/start-harness-codex-safe.sh --status --port $PORT" >&2
+  echo "inspect: tmux capture-pane -pt $TMUX_SESSION -S -120" >&2
+  exit 4
 fi
 
 nohup env "${unset_args[@]}" "${cmd[@]}" > "$LOG_FILE" 2>&1 &
