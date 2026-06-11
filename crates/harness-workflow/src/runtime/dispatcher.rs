@@ -1,5 +1,6 @@
 use super::model::{RuntimeJob, RuntimeKind, RuntimeProfile, WorkflowCommandRecord};
 use super::repo_backlog::REPO_BACKLOG_POLL_ACTIVITY;
+use super::status::WorkflowCommandStatus;
 use super::store::{RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
@@ -7,8 +8,8 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-const COMMAND_STATUS_SKIPPED: &str = "skipped";
-const COMMAND_STATUS_CANCELLED: &str = "cancelled";
+const COMMAND_STATUS_SKIPPED: WorkflowCommandStatus = WorkflowCommandStatus::Skipped;
+const COMMAND_STATUS_CANCELLED: WorkflowCommandStatus = WorkflowCommandStatus::Cancelled;
 const DEFAULT_REPO_BACKLOG_POLL_RUNTIME_PROFILE: &str = "codex-backlog-exec";
 const DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS: u64 = 3600;
 

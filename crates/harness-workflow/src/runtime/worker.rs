@@ -3,6 +3,7 @@ use super::model::{
     WorkflowCommandRecord, WorkflowCommandType, WorkflowInstance,
 };
 use super::reducer::reduce_runtime_job_completed;
+use super::status::WorkflowCommandStatus;
 use super::store::WorkflowRuntimeStore;
 use super::validator::{DecisionValidator, ValidationContext};
 use anyhow::Context;
@@ -11,7 +12,7 @@ use chrono::{Duration, Utc};
 use serde_json::{json, Value};
 use std::time::Duration as StdDuration;
 
-const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
+const COMMAND_STATUS_HANDLED_INLINE: WorkflowCommandStatus = WorkflowCommandStatus::HandledInline;
 
 #[async_trait]
 pub trait RuntimeJobExecutor: Send + Sync {

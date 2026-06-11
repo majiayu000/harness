@@ -15,6 +15,7 @@ pub mod prompt_task;
 pub mod quality_gate;
 pub mod reducer;
 pub mod repo_backlog;
+pub mod status;
 pub mod store;
 mod store_migrations;
 pub mod submission;
@@ -74,6 +75,7 @@ pub use repo_backlog::{
     StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
     REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
+pub use status::WorkflowCommandStatus;
 pub use store::{
     WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
 };

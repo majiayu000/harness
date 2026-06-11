@@ -243,7 +243,7 @@ impl RuntimeTaskSseCursor {
             let changed = self
                 .command_statuses
                 .get(&command.id)
-                .is_none_or(|status| status != &command.status);
+                .is_none_or(|status| status != command.status.as_str());
             if changed {
                 self.push_text(format!(
                     "[command] {} status={} activity={}",
@@ -252,7 +252,7 @@ impl RuntimeTaskSseCursor {
                     command.command.runtime_activity_key()
                 ));
                 self.command_statuses
-                    .insert(command.id.clone(), command.status.clone());
+                    .insert(command.id.clone(), command.status.to_string());
             }
         }
 

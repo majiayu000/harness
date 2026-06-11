@@ -2,9 +2,10 @@ use crate::http::AppState;
 use crate::task_runner::TaskId;
 use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
-    RuntimeJob, WorkflowCommandRecord, WorkflowInstance, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    RuntimeJob, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowInstance,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
+    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -353,8 +354,10 @@ async fn run_workflow_hook(
 }
 
 pub(super) fn is_active_pr_feedback_inspect_command(record: &WorkflowCommandRecord) -> bool {
-    matches!(record.status.as_str(), "pending" | "dispatched")
-        && is_pr_feedback_inspect_command(record)
+    matches!(
+        record.status,
+        WorkflowCommandStatus::Pending | WorkflowCommandStatus::Dispatched
+    ) && is_pr_feedback_inspect_command(record)
 }
 
 pub(super) fn is_pr_feedback_inspect_command(record: &WorkflowCommandRecord) -> bool {

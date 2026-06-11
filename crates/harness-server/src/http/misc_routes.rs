@@ -164,7 +164,7 @@ impl WorkflowRuntimeCommandNode {
             id: record.id,
             workflow_id: record.workflow_id,
             decision_id: record.decision_id,
-            status: record.status,
+            status: record.status.to_string(),
             command: record.command,
             runtime_job_count,
             runtime_jobs,

@@ -3,9 +3,9 @@ use crate::task_runner::{mutate_and_persist, TaskId, TaskStatus, TaskStore};
 use harness_core::config::misc::ReconciliationConfig;
 use harness_workflow::issue_lifecycle::IssueWorkflowStore;
 use harness_workflow::runtime::{
-    DecisionValidator, ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionTransition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
-    GITHUB_ISSUE_PR_DEFINITION_ID,
+    DecisionValidator, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
+    WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowEvidence,
+    WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -609,7 +609,7 @@ async fn apply_runtime_workflow_transition(
             payload: event_payload,
             decision: &decision,
             final_instance: &instance,
-            command_status: "completed",
+            command_status: WorkflowCommandStatus::Completed,
         })
         .await?
     else {
