@@ -43,11 +43,9 @@ pub(crate) async fn resolve_issue_dependency_status(
     tasks: &TaskStore,
     task_id: &TaskId,
 ) -> anyhow::Result<RuntimeDependencyStatus> {
-    Ok(
-        resolve_issue_dependency_status_by_exact_id(store, tasks, task_id)
-            .await?
-            .unwrap_or(RuntimeDependencyStatus::Waiting),
-    )
+    resolve_issue_dependency_status_by_exact_id(store, tasks, task_id)
+        .await
+        .map(|status| status.unwrap_or(RuntimeDependencyStatus::Waiting))
 }
 
 async fn resolve_issue_dependency_status_by_exact_id(
@@ -55,12 +53,13 @@ async fn resolve_issue_dependency_status_by_exact_id(
     tasks: &TaskStore,
     task_id: &TaskId,
 ) -> anyhow::Result<Option<RuntimeDependencyStatus>> {
-    match tasks.dep_status(task_id).await {
-        Some(TaskStatus::Done) => return Ok(Some(RuntimeDependencyStatus::Done)),
-        Some(TaskStatus::Failed) => return Ok(Some(RuntimeDependencyStatus::Failed)),
-        Some(TaskStatus::Cancelled) => return Ok(Some(RuntimeDependencyStatus::Cancelled)),
-        Some(_) => return Ok(Some(RuntimeDependencyStatus::Waiting)),
-        None => {}
+    if let Some(status) = tasks.dep_status(task_id).await {
+        return Ok(Some(match status {
+            TaskStatus::Done => RuntimeDependencyStatus::Done,
+            TaskStatus::Failed => RuntimeDependencyStatus::Failed,
+            TaskStatus::Cancelled => RuntimeDependencyStatus::Cancelled,
+            _ => RuntimeDependencyStatus::Waiting,
+        }));
     }
 
     let Some(store) = store else {
