@@ -23,6 +23,7 @@ pub(crate) mod http_router;
 pub(crate) mod init;
 pub(crate) mod misc_routes;
 mod orphan_reaper;
+pub(crate) mod pr_hygiene_background;
 pub(crate) mod rate_limit;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
@@ -239,6 +240,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Periodically sweep runtime issue workflows with attached PRs and emit
     // workflow command outbox rows.
     background::spawn_runtime_pr_feedback_sweeper(&state);
+
+    // Periodically inspect managed open PRs for stale DIRTY/BEHIND mergeability
+    // and route repair through workflow-owned PR feedback activities.
+    pr_hygiene_background::spawn_runtime_pr_hygiene_sweeper(&state);
 
     // Periodically ask repo backlog workflows to scan GitHub through runtime
     // jobs so GitHub intake becomes workflow-owned when the runtime is enabled.

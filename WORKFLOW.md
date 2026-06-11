@@ -23,6 +23,12 @@ pr_feedback:
   enabled: true
   sweep_interval_secs: 60
   claim_stale_after_secs: 300
+  hygiene_enabled: true
+  hygiene_interval_secs: 1800
+  dirty_age_to_repair_secs: 172800
+  dirty_age_to_comment_secs: 604800
+  rebase_needed_label: rebase-needed
+  hygiene_batch_limit: 25
 repo_backlog:
   enabled: true
   poll_interval_secs: 60

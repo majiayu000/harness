@@ -42,13 +42,13 @@ pub use plan_issue::{
 pub use pr_feedback::{
     build_local_review_completed_decision, build_local_review_request_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_inspect_decision,
-    build_pr_feedback_sweep_decision, LocalReviewCompletedInput, LocalReviewDecisionInput,
-    LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackDecisionOutput,
-    PrFeedbackInspectDecisionInput, PrFeedbackOutcome, PrFeedbackSweepDecisionInput,
-    PrFeedbackWorkflowAction, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL,
-    LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_REPAIR_SNAPSHOT_ARTIFACT,
-    SERVER_PR_SNAPSHOT_ARTIFACT,
+    build_pr_feedback_sweep_decision, build_pr_hygiene_repair_decision, LocalReviewCompletedInput,
+    LocalReviewDecisionInput, LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput,
+    PrFeedbackDecisionOutput, PrFeedbackInspectDecisionInput, PrFeedbackOutcome,
+    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PrHygieneRepairDecisionInput,
+    LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+    LOCAL_REVIEW_PASSED_SIGNAL, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 pub use prompt_task::{
     build_prompt_submission_decision, PromptSubmissionDecisionInput,
