@@ -255,7 +255,10 @@ impl TaskRow {
             })?;
         let decoded_scheduler =
             serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&scheduler_state)
-                .unwrap_or_default();
+                .map_err(|source| TaskDbDecodeError::SchedulerStateDeserialize {
+                    task_id: id.clone(),
+                    source,
+                })?;
 
         Ok(TaskState {
             id: harness_core::types::TaskId(id),
@@ -319,7 +322,10 @@ impl TaskSummaryRow {
         )?;
         let scheduler =
             serde_json::from_str::<crate::task_runner::TaskSchedulerState>(&self.scheduler_state)
-                .unwrap_or_default();
+                .map_err(|source| TaskDbDecodeError::SchedulerStateDeserialize {
+                task_id: self.id.clone(),
+                source,
+            })?;
         Ok(crate::task_runner::TaskSummary {
             id: TaskId(self.id),
             task_kind: decoded_task_kind,

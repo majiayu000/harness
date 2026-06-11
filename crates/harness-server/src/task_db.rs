@@ -2,6 +2,7 @@ mod migrations;
 mod queries_aux;
 mod queries_recovery;
 mod queries_tasks;
+mod raw_column_test_overrides;
 mod types;
 
 pub use types::{RecoveryResult, TaskArtifact, TaskCheckpoint, TaskPrompt};
