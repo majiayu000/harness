@@ -8,7 +8,7 @@ Usage:
 
 Options:
   --port N              HTTP port. Default: 9800
-  --project-root PATH   Project root passed to harness serve. Default: current directory
+  --project-root PATH   Project root passed to harness serve. If omitted, use config/default logic
   --config PATH         Optional Harness config file
   --bin PATH            Harness binary. Default: ./target/release/harness, then ./target/debug/harness
   --log-dir PATH        Log/PID directory. Default: .harness/local
@@ -35,7 +35,8 @@ require_value() {
 }
 
 PORT=9800
-PROJECT_ROOT="$(pwd -P)"
+PROJECT_ROOT=""
+PROJECT_ROOT_EXPLICIT=0
 CONFIG=""
 BIN="${HARNESS_BIN:-}"
 LOG_DIR=".harness/local"
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --project-root)
       require_value "$1" "${2:-}"
       PROJECT_ROOT="$2"
+      PROJECT_ROOT_EXPLICIT=1
       shift 2
       ;;
     --config)
@@ -193,7 +195,7 @@ fi
 unset_args=()
 while IFS='=' read -r name _; do
   case "$name" in
-    Codex|CODEX|CODEX_CI|CODEX_THREAD_ID|CODEX_SESSION_ID|CODEX_SANDBOX|CODEX_SANDBOX_NETWORK_DISABLED)
+    CODEX*|Codex*)
       unset_args+=("-u" "$name")
       ;;
     CLAUDECODE|CLAUDE_CODE|CLAUDE_CODE_ENTRYPOINT|CLAUDE_CODE_SESSION_ID|CLAUDE_SESSION_ID)
@@ -206,7 +208,10 @@ cmd=("$BIN")
 if [[ -n "$CONFIG" ]]; then
   cmd+=(--config "$CONFIG")
 fi
-cmd+=(serve --transport http --port "$PORT" --project-root "$PROJECT_ROOT")
+cmd+=(serve --transport http --port "$PORT")
+if [[ "$PROJECT_ROOT_EXPLICIT" -eq 1 ]]; then
+  cmd+=(--project-root "$PROJECT_ROOT")
+fi
 
 echo "starting harness server on $health_url"
 echo "log: $LOG_FILE"
@@ -226,11 +231,12 @@ if command -v tmux >/dev/null 2>&1 && [[ -z "${HARNESS_STARTER_NO_TMUX:-}" ]]; t
       "--foreground"
       "--port"
       "$PORT"
-      "--project-root"
-      "$PROJECT_ROOT"
       "--log-dir"
       "$LOG_DIR"
     )
+    if [[ "$PROJECT_ROOT_EXPLICIT" -eq 1 ]]; then
+      tmux_command+=("--project-root" "$PROJECT_ROOT")
+    fi
     if [[ -n "$CONFIG" ]]; then
       tmux_command+=("--config" "$CONFIG")
     fi
