@@ -367,10 +367,7 @@ fn snapshot_allows_ready(snapshot: &Value) -> bool {
 }
 
 fn snapshot_review_threads_incomplete(snapshot: &Value) -> bool {
-    snapshot
-        .get("review_threads_complete")
-        .and_then(Value::as_bool)
-        != Some(true)
+    !snapshot_review_threads_complete(snapshot)
 }
 
 fn snapshot_review_threads_complete(snapshot: &Value) -> bool {
