@@ -167,7 +167,7 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         version: 8,
         description: "index runtime job command pagination",
         sql: "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_command_created
-              ON runtime_jobs (command_id, created_at DESC, id DESC)",
+              ON runtime_jobs (command_id, created_at DESC)",
     },
     Migration {
         version: 9,

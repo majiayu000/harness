@@ -29,6 +29,19 @@ async fn dedupe_returns_latest_runtime_job_for_command() -> anyhow::Result<()> {
             json!({"attempt": 2}),
         )
         .await?;
+    let shared_db_created_at = older.created_at;
+    sqlx::query("UPDATE runtime_jobs SET id = $1, created_at = $2 WHERE id = $3")
+        .bind("ffffffff-ffff-4fff-bfff-ffffffffffff")
+        .bind(shared_db_created_at)
+        .bind(&older.id)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("UPDATE runtime_jobs SET id = $1, created_at = $2 WHERE id = $3")
+        .bind("00000000-0000-4000-8000-000000000000")
+        .bind(shared_db_created_at)
+        .bind(&newer.id)
+        .execute(store.pool())
+        .await?;
 
     let outcome = store
         .enqueue_runtime_job_for_pending_command(

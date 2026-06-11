@@ -47,17 +47,17 @@ impl TryFrom<&str> for WorkflowCommandStatus {
     type Error = anyhow::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Ok(match value {
-            "pending" => Self::Pending,
-            "dispatching" => Self::Dispatching,
-            "dispatched" => Self::Dispatched,
-            "handled_inline" => Self::HandledInline,
-            "completed" => Self::Completed,
-            "failed" => Self::Failed,
-            "blocked" => Self::Blocked,
-            "cancelled" => Self::Cancelled,
-            "skipped" => Self::Skipped,
+        match value {
+            "pending" => Ok(Self::Pending),
+            "dispatching" => Ok(Self::Dispatching),
+            "dispatched" => Ok(Self::Dispatched),
+            "handled_inline" => Ok(Self::HandledInline),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "blocked" => Ok(Self::Blocked),
+            "cancelled" => Ok(Self::Cancelled),
+            "skipped" => Ok(Self::Skipped),
             other => anyhow::bail!("unknown workflow command status: {other}"),
-        })
+        }
     }
 }
