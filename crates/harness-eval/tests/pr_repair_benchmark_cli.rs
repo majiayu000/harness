@@ -1,0 +1,397 @@
+use harness_eval::{
+    EvalGrade, EvalRunMode, EvalScenario, EvalTarget, GateStatus, HardGateName, HardGateResult,
+    QualitySnapshot, ScoreBreakdown, ScoreComponent, ScoreDimensionName,
+};
+use serde_json::Value;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[test]
+fn benchmark_cli_aggregates_snapshot_cases() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-cli");
+
+    let ready_noop = temp_dir.path().join("ready_noop.json");
+    let clean_fix = temp_dir.path().join("clean_fix.json");
+    let blocked_threads = temp_dir.path().join("blocked_threads.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+
+    write_snapshot(
+        &ready_noop,
+        &fixture_snapshot("ready-noop", 100, EvalGrade::A, None),
+    );
+    write_snapshot(
+        &clean_fix,
+        &fixture_snapshot("clean-fix", 95, EvalGrade::A, None),
+    );
+    write_snapshot(
+        &blocked_threads,
+        &fixture_snapshot(
+            "blocked-threads",
+            75,
+            EvalGrade::C,
+            Some(HardGateName::ReviewThreadClosure),
+        ),
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--suite")
+        .arg("three-case-smoke")
+        .arg("--case")
+        .arg(case_arg("ready-noop", &ready_noop))
+        .arg("--case")
+        .arg(case_arg("clean-fix", &clean_fix))
+        .arg("--snapshot")
+        .arg(&blocked_threads)
+        .arg("--output")
+        .arg(&output)
+        .status()
+        .expect("run benchmark binary");
+    assert!(status.success(), "benchmark binary should succeed");
+
+    let summary: Value = serde_json::from_str(&fs::read_to_string(&output).expect("read summary"))
+        .expect("parse summary");
+
+    assert_eq!(summary["suite"], "three-case-smoke");
+    assert_eq!(summary["case_count"], 3);
+    assert_eq!(summary["confidence"], "medium");
+    assert_eq!(summary["capability_score"], 9);
+    assert_eq!(summary["status"], "failing");
+    assert_eq!(summary["blocked_cases"], 1);
+    assert_eq!(
+        summary["hard_gate_failures"][0]["name"],
+        "review_thread_closure"
+    );
+    assert_eq!(summary["hard_gate_failures"][0]["count"], 1);
+}
+
+#[test]
+fn benchmark_cli_aggregates_manifest_cases_with_metadata() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-manifest");
+    let snapshot_dir = temp_dir.path().join("snapshots");
+    fs::create_dir_all(&snapshot_dir).expect("create snapshot dir");
+    let ready_noop = snapshot_dir.join("ready_noop.json");
+    let blocked_threads = snapshot_dir.join("blocked_threads.json");
+    let manifest = temp_dir.path().join("suite.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+
+    write_snapshot(
+        &ready_noop,
+        &fixture_snapshot("ready-noop", 100, EvalGrade::A, None),
+    );
+    write_snapshot(
+        &blocked_threads,
+        &fixture_snapshot(
+            "blocked-threads",
+            75,
+            EvalGrade::C,
+            Some(HardGateName::ReviewThreadClosure),
+        ),
+    );
+    write_json_value(
+        &manifest,
+        &serde_json::json!({
+            "suite": "manifest-suite",
+            "cases": [
+                {
+                    "case_id": "ready-noop",
+                    "snapshot": "snapshots/ready_noop.json",
+                    "tags": ["ready_noop", "no_change"],
+                    "weight": 2
+                },
+                {
+                    "id": "blocked-threads",
+                    "path": "snapshots/blocked_threads.json",
+                    "tags": ["review_threads"],
+                    "weight": 3
+                }
+            ]
+        }),
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .status()
+        .expect("run benchmark binary");
+    assert!(status.success(), "benchmark binary should succeed");
+
+    let summary: Value = serde_json::from_str(&fs::read_to_string(&output).expect("read summary"))
+        .expect("parse summary");
+
+    assert_eq!(summary["suite"], "manifest-suite");
+    assert_eq!(summary["case_count"], 2);
+    assert_eq!(summary["weighted_case_count"], 5);
+    assert_eq!(summary["capability_score"], 9);
+    assert_eq!(summary["status"], "failing");
+    assert_eq!(summary["cases"][0]["case_id"], "ready-noop");
+    assert_eq!(summary["cases"][0]["weight"], 2);
+    assert_eq!(summary["cases"][0]["tags"][0], "ready_noop");
+    assert_eq!(summary["cases"][1]["case_id"], "blocked-threads");
+    assert_eq!(summary["cases"][1]["weight"], 3);
+    assert_eq!(summary["cases"][1]["tags"][0], "review_threads");
+}
+
+#[test]
+fn benchmark_cli_rejects_duplicate_manifest_case_ids() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-duplicate-manifest");
+    let snapshot_path = temp_dir.path().join("snapshot.json");
+    let manifest = temp_dir.path().join("suite.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+
+    write_snapshot(
+        &snapshot_path,
+        &fixture_snapshot("duplicate", 100, EvalGrade::A, None),
+    );
+    write_json_value(
+        &manifest,
+        &serde_json::json!({
+            "suite": "duplicate-suite",
+            "cases": [
+                {"case_id": "duplicate", "snapshot": "snapshot.json"},
+                {"case_id": "duplicate", "snapshot": "snapshot.json"}
+            ]
+        }),
+    );
+
+    let output_status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("run benchmark binary");
+
+    assert!(
+        !output_status.status.success(),
+        "benchmark binary should reject duplicate manifest case ids"
+    );
+    let stderr = String::from_utf8_lossy(&output_status.stderr);
+    assert!(stderr.contains("duplicate case ID: duplicate"));
+    assert!(
+        !output.exists(),
+        "rejected benchmark should not write output"
+    );
+}
+
+#[test]
+fn benchmark_cli_rejects_collect_only_snapshots() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-collect-only");
+    let snapshot_path = temp_dir.path().join("collect_only.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+    let mut snapshot = fixture_snapshot("collect-only", 100, EvalGrade::A, None);
+    snapshot.run_mode = EvalRunMode::CollectOnly;
+    write_snapshot(&snapshot_path, &snapshot);
+
+    let output_status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--suite")
+        .arg("collect-only")
+        .arg("--snapshot")
+        .arg(&snapshot_path)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("run benchmark binary");
+
+    assert!(
+        !output_status.status.success(),
+        "benchmark binary should reject collect-only snapshots"
+    );
+    let stderr = String::from_utf8_lossy(&output_status.stderr);
+    assert!(stderr.contains("collect-only snapshot"));
+    assert!(
+        !output.exists(),
+        "rejected benchmark should not write output"
+    );
+}
+
+#[test]
+fn benchmark_cli_rejects_missing_run_mode_snapshots() {
+    let temp_dir = TempDir::new("pr-repair-benchmark-missing-run-mode");
+    let snapshot_path = temp_dir.path().join("missing_run_mode.json");
+    let output = temp_dir.path().join("benchmark_summary.json");
+    let mut snapshot = serde_json::to_value(fixture_snapshot(
+        "missing-run-mode",
+        100,
+        EvalGrade::A,
+        None,
+    ))
+    .expect("serialize snapshot");
+    snapshot
+        .as_object_mut()
+        .expect("snapshot should be an object")
+        .remove("run_mode");
+    write_json_value(&snapshot_path, &snapshot);
+
+    let output_status = Command::new(env!("CARGO_BIN_EXE_score_pr_repair_benchmark"))
+        .arg("--suite")
+        .arg("missing-run-mode")
+        .arg("--snapshot")
+        .arg(&snapshot_path)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("run benchmark binary");
+
+    assert!(
+        !output_status.status.success(),
+        "benchmark binary should reject missing run_mode snapshots"
+    );
+    let stderr = String::from_utf8_lossy(&output_status.stderr);
+    assert!(stderr.contains("must include explicit run_mode"));
+    assert!(
+        !output.exists(),
+        "rejected benchmark should not write output"
+    );
+}
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let path = unique_temp_path(name);
+        fs::create_dir_all(&path).expect("create temp dir");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn unique_temp_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
+}
+
+fn case_arg(case_id: &str, path: &Path) -> OsString {
+    let mut arg = OsString::from(case_id);
+    arg.push("=");
+    arg.push(path.as_os_str());
+    arg
+}
+
+fn write_snapshot(path: &Path, snapshot: &QualitySnapshot) {
+    let value = serde_json::to_value(snapshot).expect("serialize snapshot");
+    write_json_value(path, &value);
+}
+
+fn write_json_value(path: &Path, value: &Value) {
+    let body = serde_json::to_string_pretty(value).expect("serialize snapshot");
+    fs::write(path, format!("{body}\n")).expect("write snapshot");
+}
+
+fn fixture_snapshot(
+    suffix: &str,
+    final_score: u8,
+    final_grade: EvalGrade,
+    failed_gate: Option<HardGateName>,
+) -> QualitySnapshot {
+    QualitySnapshot {
+        scenario: EvalScenario::PrRepair,
+        run_mode: EvalRunMode::LiveRun,
+        target: EvalTarget::PullRequest {
+            repo: "owner/repo".to_string(),
+            pr_number: 42,
+            base_ref: Some("main".to_string()),
+            head_ref: Some(format!("repair-{suffix}")),
+        },
+        baseline_pr: None,
+        final_pr: None,
+        runtime: None,
+        usage: Vec::new(),
+        hard_gates: hard_gates(failed_gate),
+        objective_score: fixture_score_breakdown(final_score),
+        reviewer_judgment: None,
+        final_score,
+        final_grade,
+        grade_cap: failed_gate.map(|_| EvalGrade::C),
+        blocker_summary: failed_gate
+            .map(|gate| vec![format!("{gate:?} blocked readiness")])
+            .unwrap_or_default(),
+    }
+}
+
+fn hard_gates(failed_gate: Option<HardGateName>) -> Vec<HardGateResult> {
+    [
+        HardGateName::TargetCorrectness,
+        HardGateName::ReviewThreadClosure,
+    ]
+    .into_iter()
+    .map(|name| HardGateResult {
+        name,
+        status: if Some(name) == failed_gate {
+            GateStatus::Fail
+        } else {
+            GateStatus::Pass
+        },
+        grade_cap: if Some(name) == failed_gate {
+            Some(EvalGrade::C)
+        } else {
+            None
+        },
+        message: format!("{name:?} gate"),
+    })
+    .collect()
+}
+
+fn fixture_score_breakdown(final_score: u8) -> ScoreBreakdown {
+    let base = final_score / 8;
+    let remainder = final_score % 8;
+    let points = |index: u8| base + u8::from(index < remainder);
+
+    ScoreBreakdown {
+        task_classification_and_baseline_evidence: score_component(
+            ScoreDimensionName::TaskClassificationAndBaselineEvidence,
+            points(0),
+        ),
+        feedback_discovery_and_prioritization: score_component(
+            ScoreDimensionName::FeedbackDiscoveryAndPrioritization,
+            points(1),
+        ),
+        branch_and_pr_safety: score_component(ScoreDimensionName::BranchAndPrSafety, points(2)),
+        fix_correctness_and_scope: score_component(
+            ScoreDimensionName::FixCorrectnessAndScope,
+            points(3),
+        ),
+        verification_and_current_head_gates: score_component(
+            ScoreDimensionName::VerificationAndCurrentHeadGates,
+            points(4),
+        ),
+        runtime_workflow_behavior_and_persistence: score_component(
+            ScoreDimensionName::RuntimeWorkflowBehaviorAndPersistence,
+            points(5),
+        ),
+        cost_and_time_efficiency: score_component(
+            ScoreDimensionName::CostAndTimeEfficiency,
+            points(6),
+        ),
+        reporting_and_attribution_quality: score_component(
+            ScoreDimensionName::ReportingAndAttributionQuality,
+            points(7),
+        ),
+    }
+}
+
+fn score_component(name: ScoreDimensionName, points: u8) -> ScoreComponent {
+    ScoreComponent {
+        name,
+        points,
+        max_points: 100,
+    }
+}

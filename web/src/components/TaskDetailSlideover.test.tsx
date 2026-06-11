@@ -189,6 +189,9 @@ describe("TaskDetailSlideover", () => {
           { task_id: task.id, turn: 1, phase: "implement", prompt: "Write the fix", created_at: "2024-01-01T00:10:00Z" },
         ]);
       }
+      if (url.includes("/api/evals/pr/")) {
+        return Promise.resolve({ quality_snapshots: [] });
+      }
       return Promise.resolve([]);
     });
     wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
@@ -201,6 +204,102 @@ describe("TaskDetailSlideover", () => {
     expect(await screen.findByText(/implement/)).toBeInTheDocument();
     expect(card).toHaveTextContent("1 prompt recorded");
     expect(card).not.toHaveTextContent("Write the fix");
+    await waitFor(() => {
+      expect(card).toHaveTextContent("No quality snapshot recorded");
+    });
+    expect(mockApiJson).toHaveBeenCalledWith(
+      "/api/evals/pr/owner/repo/42?limit=1",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("renders the latest PR quality snapshot for terminal PR tasks", async () => {
+    const task = makeFullTask({
+      status: "done",
+      pr_url: "https://github.com/owner/repo/pull/42",
+      workflow: { state: "ready_to_merge", pr_number: 42 },
+      updated_at: "2024-01-01T01:00:00Z",
+    });
+    mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
+    mockApiJson.mockImplementation((url: string) => {
+      if (url.includes("/artifacts")) return Promise.resolve([]);
+      if (url.includes("/prompts")) return Promise.resolve([]);
+      if (url.includes("/api/evals/pr/")) {
+        return Promise.resolve({
+          quality_snapshots: [
+            {
+              id: "snapshot-1",
+              run_id: "run-1",
+              created_at: "2026-06-06T20:20:00Z",
+              snapshot: {
+                scenario: "pr_repair",
+                run_mode: "live_run",
+                target: {
+                  kind: "pull_request",
+                  repo: "owner/repo",
+                  pr_number: 42,
+                  base_ref: "main",
+                  head_ref: "fix/pr-42",
+                },
+                baseline_pr: null,
+                final_pr: {
+                  repo: "owner/repo",
+                  pr_number: 42,
+                  url: "https://github.com/owner/repo/pull/42",
+                  title: "Fix PR",
+                  base_ref: "main",
+                  head_ref: "fix/pr-42",
+                  head_oid: "abcdef1234567890",
+                  is_draft: false,
+                  merge_state: "clean",
+                  check_state: "passing",
+                  review_decision: "approved",
+                  active_unresolved_review_threads: [],
+                  review_threads_complete: true,
+                  changed_files: [],
+                  changed_files_complete: true,
+                  collected_at: "2026-06-06T20:19:00Z",
+                },
+                runtime: null,
+                hard_gates: [
+                  {
+                    name: "target_correctness",
+                    status: "pass",
+                    grade_cap: null,
+                    message: "Target matched",
+                  },
+                  {
+                    name: "review_thread_closure",
+                    status: "fail",
+                    grade_cap: "C",
+                    message: "One active thread remains",
+                  },
+                ],
+                final_score: 86,
+                final_grade: "B",
+                grade_cap: "C",
+                blocker_summary: ["One active thread remains"],
+              },
+            },
+          ],
+        });
+      }
+      return Promise.resolve([]);
+    });
+
+    wrap(<TaskDetailSlideover taskId={task.id} onClose={vi.fn()} />);
+
+    const card = await screen.findByTestId("proof-of-work-card");
+    await waitFor(() => {
+      expect(card).toHaveTextContent("Quality Snapshot");
+      expect(card).toHaveTextContent("Grade B");
+      expect(card).toHaveTextContent("Score: 86/100");
+      expect(card).toHaveTextContent("Run: live run");
+      expect(card).toHaveTextContent("Head: abcdef123456");
+      expect(card).toHaveTextContent("Gates: 1/2");
+      expect(card).toHaveTextContent("One active thread remains");
+      expect(card).toHaveTextContent("review thread closure");
+    });
   });
 
   it("does not render proof-of-work card for non-terminal task", () => {

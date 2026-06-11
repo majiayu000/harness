@@ -35,8 +35,10 @@ use std::sync::{
     Arc, Mutex,
 };
 
+mod issue_planning;
 mod local_review;
 mod p1_followups;
+mod pr_repair_evidence;
 mod replay_determinism;
 mod retry;
 
@@ -90,8 +92,27 @@ fn project_issue_instance(project_id: &str, issue_number: u64, state: &str) -> W
     }))
 }
 
+fn runtime_completion_event(
+    instance: &WorkflowInstance,
+    activity: &str,
+    activity_result: ActivityResult,
+) -> WorkflowEvent {
+    WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": WorkflowCommand::enqueue_activity(activity, "activity-1"),
+        "runtime_job_id": "job-1",
+        "activity_result": activity_result,
+    }))
+}
+
 #[test]
-fn issue_submission_decision_starts_discovered_issue_implementation() {
+fn issue_submission_decision_starts_discovered_issue_planning() {
     let labels = vec!["bug".to_string(), "p1".to_string()];
     let instance = issue_instance("discovered");
     let output = build_issue_submission_decision(
@@ -108,20 +129,17 @@ fn issue_submission_decision_starts_discovered_issue_implementation() {
         },
     );
 
-    assert_eq!(
-        output.action,
-        IssueSubmissionWorkflowAction::RunImplementation
-    );
+    assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
     assert_eq!(output.decision.decision, "submit_issue");
-    assert_eq!(output.decision.next_state, "implementing");
+    assert_eq!(output.decision.next_state, "planning");
     assert_eq!(output.decision.commands.len(), 1);
     assert_eq!(
         output.decision.commands[0].activity_name(),
-        Some("implement_issue")
+        Some("plan_issue")
     );
     assert_eq!(
         output.decision.commands[0].dedupe_key,
-        "issue-submit:owner/repo:issue:123:task:task-1:implement"
+        "issue-submit:owner/repo:issue:123:task:task-1:plan"
     );
     assert_eq!(
         output.decision.commands[0].command["additional_prompt"],
@@ -164,6 +182,43 @@ fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
 }
 
 #[test]
+fn issue_submission_decision_can_reopen_terminal_issue_for_planning() {
+    let labels = Vec::new();
+    for state in ["failed", "cancelled"] {
+        let instance = issue_instance(state);
+        let output = build_issue_submission_decision(
+            &instance,
+            IssueSubmissionDecisionInput {
+                task_id: "task-terminal",
+                repo: Some("owner/repo"),
+                issue_number: 124,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        );
+
+        assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
+        assert_eq!(output.decision.next_state, "planning");
+        assert_eq!(
+            output.decision.commands[0].activity_name(),
+            Some("plan_issue")
+        );
+        let validation = DecisionValidator::github_issue_pr().validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen(),
+        );
+        assert!(
+            validation.is_ok(),
+            "terminal issue in {state} should reopen for planning: {validation:?}"
+        );
+    }
+}
+
+#[test]
 fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
     let labels = Vec::new();
     let depends_on = vec!["task-upstream".to_string()];
@@ -191,6 +246,41 @@ fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("blocked issue submission should validate without dispatching");
+}
+
+#[test]
+fn issue_submission_decision_releases_dependencies_to_planning() {
+    let labels = Vec::new();
+    let instance = issue_instance("awaiting_dependencies");
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-4",
+            repo: Some("owner/repo"),
+            issue_number: 126,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+        },
+    );
+
+    assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
+    assert_eq!(output.decision.next_state, "planning");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("plan_issue")
+    );
+    let validation = DecisionValidator::github_issue_pr().validate(
+        &instance,
+        &output.decision,
+        &ValidationContext::new("workflow-policy", Utc::now()),
+    );
+    assert!(
+        validation.is_ok(),
+        "dependency release should allow planning: {validation:?}"
+    );
 }
 
 #[test]
@@ -585,7 +675,7 @@ fn pr_feedback_decision_waits_when_no_actionable_feedback_exists() {
 }
 
 #[test]
-fn pr_feedback_decision_marks_ready_to_merge() {
+fn pr_feedback_decision_starts_quality_gate_before_ready_to_merge() {
     let instance = issue_instance("awaiting_feedback");
     let output = build_pr_feedback_decision(
         &instance,
@@ -598,16 +688,25 @@ fn pr_feedback_decision_marks_ready_to_merge() {
         },
     );
 
-    assert_eq!(output.action, PrFeedbackWorkflowAction::ReadyToMerge);
-    assert_eq!(output.decision.decision, "mark_ready_to_merge");
-    assert_eq!(output.decision.next_state, "ready_to_merge");
+    assert_eq!(output.action, PrFeedbackWorkflowAction::RequestQualityGate);
+    assert_eq!(output.decision.decision, "start_quality_gate");
+    assert_eq!(output.decision.next_state, "quality_gate_pending");
+    assert_eq!(
+        output.decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(
+        output.decision.commands[0].command["definition_id"],
+        QUALITY_GATE_DEFINITION_ID
+    );
+    assert_eq!(output.decision.commands[0].command["subject_key"], "pr:77");
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
             &output.decision,
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
-        .expect("ready-to-merge decision should validate");
+        .expect("quality gate request decision should validate");
 }
 
 #[test]
@@ -828,6 +927,47 @@ fn runtime_completion_reducer_finishes_closed_issue_signal_without_pr() {
 }
 
 #[test]
+fn runtime_completion_reducer_finishes_closed_issue_during_quality_gate() {
+    let instance = issue_instance("quality_gate_pending");
+    let result = ActivityResult::succeeded(
+        QUALITY_GATE_ACTIVITY,
+        "Issue was closed before quality gate completed.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "issue_state",
+        json!({
+            "issue_number": 123,
+            "state": "closed"
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue artifact should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("closed issue quality gate completion should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_finishes_blocked_closed_issue_signal_without_pr() {
     let instance = issue_instance("implementing");
     let result = ActivityResult {
@@ -935,6 +1075,52 @@ fn runtime_completion_reducer_finishes_feedback_closed_issue_signal_without_pr()
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("feedback closed issue completion should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_finishes_succeeded_feedback_closed_issue_signal_without_pr() {
+    let instance = issue_instance("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Issue was closed while addressing PR feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue signal from successful feedback work should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkDone
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("successful feedback closed issue completion should validate");
 }
 
 #[test]
@@ -2904,6 +3090,76 @@ fn runtime_completion_reducer_passes_quality_gate_after_success() {
 }
 
 #[test]
+fn runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass() {
+    let instance = issue_instance("quality_gate_pending");
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({
+                "validation": "passed"
+            }),
+        ))
+        .with_validation(ValidationRecord::new("cargo check", "passed"));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate completion should mark parent ready");
+
+    assert_eq!(decision.decision, "quality_gate_passed");
+    assert_eq!(decision.next_state, "ready_to_merge");
+    assert!(decision.commands.is_empty());
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("parent quality gate pass transition should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_issue_pr_quality_gate_without_validation() {
+    let instance = issue_instance("quality_gate_pending");
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation was claimed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({
+                "validation": "passed"
+            }),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing validation evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("validation evidence"));
+}
+
+#[test]
 fn runtime_completion_reducer_blocks_quality_gate_success_without_status_signal() {
     let instance = quality_gate_instance("checking");
     let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
@@ -4665,6 +4921,156 @@ async fn runtime_worker_propagates_pr_feedback_child_completion_to_parent() -> a
         .expect("activity artifacts should be an array")
         .iter()
         .all(|artifact| artifact["artifact_type"] != "workflow_decision"));
+    Ok(())
+}
+
+async fn seed_quality_gate_child_job(
+    store: &WorkflowRuntimeStore,
+    parent_id: &str,
+    child_id: &str,
+) -> anyhow::Result<RuntimeJob> {
+    let parent = issue_instance("quality_gate_pending").with_id(parent_id);
+    store.upsert_instance(&parent).await?;
+    let child = WorkflowInstance::new(
+        QUALITY_GATE_DEFINITION_ID,
+        1,
+        "checking",
+        WorkflowSubject::new("quality_gate", "pr:77"),
+    )
+    .with_id(child_id)
+    .with_parent(parent.id.clone());
+    store.upsert_instance(&child).await?;
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate-77");
+    let command_id = store.enqueue_command(&child.id, None, &command).await?;
+    store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": QUALITY_GATE_ACTIVITY }),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn runtime_worker_propagates_quality_gate_child_pass_to_parent() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = seed_quality_gate_child_job(&store, "issue-parent", "quality-gate-child").await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+            .with_signal(ActivitySignal::new(
+                QUALITY_PASSED_SIGNAL,
+                json!({ "validation": "passed" }),
+            ))
+            .with_validation(ValidationRecord::new("cargo check", "passed")),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance("quality-gate-child")
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "passed");
+    let parent_after = store
+        .get_instance("issue-parent")
+        .await?
+        .expect("parent workflow should exist");
+    assert_eq!(parent_after.state, "ready_to_merge");
+    let parent_events = store.events_for("issue-parent").await?;
+    assert!(parent_events.iter().any(|event| {
+        event.event_type == "RuntimeJobCompleted"
+            && event.event["child_workflow_id"] == "quality-gate-child"
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_propagates_quality_gate_child_block_to_parent() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job =
+        seed_quality_gate_child_job(&store, "issue-parent-blocked", "quality-gate-child-blocked")
+            .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation was claimed.")
+            .with_signal(ActivitySignal::new(
+                QUALITY_PASSED_SIGNAL,
+                json!({ "validation": "passed" }),
+            )),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance("quality-gate-child-blocked")
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "blocked");
+    let parent_after = store
+        .get_instance("issue-parent-blocked")
+        .await?
+        .expect("parent workflow should exist");
+    assert_eq!(parent_after.state, "blocked");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_propagates_quality_gate_child_failure_to_parent() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job =
+        seed_quality_gate_child_job(&store, "issue-parent-failed", "quality-gate-child-failed")
+            .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::failed(
+            QUALITY_GATE_ACTIVITY,
+            "Quality gate execution failed.",
+            "validation command failed",
+        )
+        .with_error_kind(ActivityErrorKind::Fatal),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance("quality-gate-child-failed")
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "failed");
+    let parent_after = store
+        .get_instance("issue-parent-failed")
+        .await?
+        .expect("parent workflow should exist");
+    assert_eq!(parent_after.state, "failed");
     Ok(())
 }
 

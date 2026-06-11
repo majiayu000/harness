@@ -376,19 +376,6 @@ pub(crate) async fn run_agent_streaming_with_options(
                             }
                             StreamItem::TokenUsage { usage } => {
                                 token_usage = usage.clone();
-                                if let Some(events) = current_usage_event_store() {
-                                    log_llm_usage_event(
-                                        &events,
-                                        task_id,
-                                        turn,
-                                        &phase_str,
-                                        &agent_name,
-                                        requested_model.as_deref(),
-                                        &project,
-                                        usage,
-                                    )
-                                    .await;
-                                }
                             }
                             StreamItem::Done => {
                                 channel_closed = true;
@@ -415,6 +402,20 @@ pub(crate) async fn run_agent_streaming_with_options(
             &mut last_backfilled_issue,
             store,
             task_id,
+        )
+        .await;
+    }
+
+    if let Some(events) = current_usage_event_store() {
+        log_llm_usage_event(
+            &events,
+            task_id,
+            turn,
+            &phase_str,
+            &agent_name,
+            requested_model.as_deref(),
+            &project,
+            &token_usage,
         )
         .await;
     }

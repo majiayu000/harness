@@ -139,7 +139,7 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["status"], "planning");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(state.core.tasks.count(), before_count);
     assert_runtime_issue_submission(
@@ -256,7 +256,7 @@ async fn webhook_routes_runtime_issue_to_repo_specific_project_root() -> anyhow:
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "implementing");
+    assert_eq!(json["status"], "planning");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_runtime_issue_submission(
         &state,

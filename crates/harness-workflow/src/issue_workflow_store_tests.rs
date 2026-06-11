@@ -1,6 +1,7 @@
-use super::IssueWorkflowStore;
+use super::{IssueMergeApprovalOutcome, IssueWorkflowStore};
 use crate::issue_lifecycle::{
-    IssueLifecycleState, ReviewFallbackSnapshot, ReviewFallbackTier, ReviewFallbackTrigger,
+    IssueLifecycleEventKind, IssueLifecycleState, ReviewFallbackSnapshot, ReviewFallbackTier,
+    ReviewFallbackTrigger,
 };
 use chrono::Utc;
 
@@ -441,11 +442,72 @@ async fn record_merge_approved_transitions_workflow_to_done() -> anyhow::Result<
         .expect("workflow should be ready_to_merge");
     assert_eq!(workflow.state, IssueLifecycleState::ReadyToMerge);
 
-    let updated = store
+    let updated = match store
         .record_merge_approved(project_id, Some("owner/repo"), 120)
         .await?
-        .expect("updated workflow");
+    {
+        IssueMergeApprovalOutcome::Applied(workflow) => workflow,
+        other => panic!("expected applied approval outcome, got {other:?}"),
+    };
     assert_eq!(updated.state, IssueLifecycleState::Done);
+    Ok(())
+}
+
+#[tokio::test]
+async fn record_merge_approved_reports_wrong_state_without_mutating() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/project-merge-approved-wrong-state";
+    store
+        .record_issue_scheduled(project_id, Some("owner/repo"), 22, "task-1", &[], false)
+        .await?;
+    store
+        .record_pr_detected(
+            project_id,
+            Some("owner/repo"),
+            22,
+            "task-1",
+            121,
+            "https://github.com/owner/repo/pull/121",
+        )
+        .await?;
+    store
+        .record_terminal_for_issue(
+            project_id,
+            Some("owner/repo"),
+            22,
+            IssueLifecycleState::Done,
+            None,
+        )
+        .await?;
+    let before = store
+        .get_by_pr(project_id, Some("owner/repo"), 121)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow should exist"))?;
+
+    let outcome = store
+        .record_merge_approved(project_id, Some("owner/repo"), 121)
+        .await?;
+
+    let IssueMergeApprovalOutcome::IgnoredWrongState { actual, workflow } = outcome else {
+        panic!("expected ignored wrong-state outcome, got {outcome:?}");
+    };
+    assert_eq!(actual, IssueLifecycleState::Done);
+    assert_eq!(workflow.state, IssueLifecycleState::Done);
+    let after = store
+        .get_by_pr(project_id, Some("owner/repo"), 121)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow should still exist"))?;
+    assert_eq!(after.state, IssueLifecycleState::Done);
+    assert_eq!(
+        after.last_event.as_ref().map(|event| &event.kind),
+        before.last_event.as_ref().map(|event| &event.kind)
+    );
+    assert_eq!(
+        after.last_event.as_ref().map(|event| &event.kind),
+        Some(&IssueLifecycleEventKind::WorkflowDone)
+    );
     Ok(())
 }
 

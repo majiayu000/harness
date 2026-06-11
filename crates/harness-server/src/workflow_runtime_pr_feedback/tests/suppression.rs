@@ -175,7 +175,9 @@ async fn explicit_pr_feedback_request_starts_local_review_before_remote_suppress
         workflow_id.clone(),
         project_id,
         Some("owner/repo".to_string()),
+        &TaskId::from_str("repo-backlog::project::repo:owner/repo::pr:77:feedback"),
         77,
+        Some("https://github.com/owner/repo/pull/77"),
         "awaiting_feedback",
     )
     .with_data(json!({

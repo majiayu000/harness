@@ -66,9 +66,9 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 
 ## Server Operation
 
-- `harness serve` may be started from Codex when product behavior needs to be exercised, but start it with a sanitized environment so spawned agents do not inherit Codex/Claude wrapper variables.
-- Prefer a standalone terminal for long-running manual dogfood sessions. For Codex-launched smoke tests, use an explicit clean environment, for example:
-  `env -u Codex -u CLAUDE_CODE_ENTRYPOINT ./target/release/harness serve --transport http --port 9800 --project-root <path>`
+- `harness serve` may be started from Codex when product behavior needs to be exercised, but use `scripts/start-harness-codex-safe.sh` or an equivalent sanitized launcher.
+- Harness strips Claude-prefixed variables before spawning child agents. Codex-prefixed wrapper variables are not stripped by the adapter spawn path, so the launcher must keep them out of the server process environment.
+- Prefer a standalone terminal for long-running manual dogfood sessions when an operator needs an independently owned process.
 - Before starting a server, check whether the target port is already in use. Stop only harness processes you started yourself unless the user explicitly asks otherwise.
 
 ## Dependencies

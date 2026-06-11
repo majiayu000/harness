@@ -289,3 +289,28 @@ fn task_status_is_terminal_helper_matches_local_classification() {
         );
     }
 }
+
+#[test]
+fn task_status_sql_filters_match_restart_classification() {
+    let expected_terminal: Vec<&str> = all_task_statuses()
+        .iter()
+        .filter(|status| task_is_terminal(status))
+        .map(task_status_tag)
+        .collect();
+    assert_eq!(
+        TaskStatus::terminal_statuses(),
+        expected_terminal.as_slice(),
+        "TaskStatus::terminal_statuses must be derived from the terminal classification",
+    );
+
+    let expected_resumable: Vec<&str> = all_task_statuses()
+        .iter()
+        .filter(|status| status.is_resumable_after_restart())
+        .map(task_status_tag)
+        .collect();
+    assert_eq!(
+        TaskStatus::resumable_statuses(),
+        expected_resumable.as_slice(),
+        "TaskStatus::resumable_statuses must be derived from the restart classification",
+    );
+}

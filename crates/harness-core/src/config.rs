@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod dirs;
 pub mod intake;
+pub mod maintenance;
 pub mod misc;
 pub mod project;
 pub mod resolve;
@@ -10,6 +11,7 @@ pub mod workflow;
 
 use self::agents::*;
 use self::intake::*;
+use self::maintenance::*;
 use self::misc::*;
 use self::server::*;
 use serde::{Deserialize, Deserializer, Serialize};

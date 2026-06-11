@@ -19,6 +19,9 @@ use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
     prompt_task_request_for_job, PromptTaskRequest,
 };
+use super::pr_feedback_inspection::{
+    execute_pr_feedback_inspection, is_server_owned_pr_feedback_inspection,
+};
 use super::prompt_packet::{
     build_runtime_job_prompt, build_runtime_prompt_packet, prompt_packet_digest,
 };
@@ -55,7 +58,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             }
         }
         if let Some(result) = self
-            .execute_builtin_lifecycle_activity(&job, workflow.as_ref())
+            .execute_server_owned_activity(&job, workflow.as_ref())
             .await?
         {
             return Ok(result);
@@ -215,7 +218,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         store.get_instance(workflow_id).await
     }
 
-    async fn execute_builtin_lifecycle_activity(
+    async fn execute_server_owned_activity(
         &self,
         job: &RuntimeJob,
         parent: Option<&WorkflowInstance>,
@@ -230,6 +233,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             "recover_issue_workflow" => Ok(Some(
                 execute_recover_issue_workflow(self.state, job, parent).await?,
             )),
+            activity if activity == harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY => Ok(
+                Some(execute_pr_feedback_inspection(self.state, job, parent).await),
+            ),
             _ => Ok(None),
         }
     }
@@ -300,16 +306,14 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
-        !is_builtin_lifecycle_activity(job)
+        !is_internal_non_agent_activity(job)
     }
 
     async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
-        // Builtin lifecycle activities (start_child_workflow, mark_bound_issue_done,
-        // recover_issue_workflow, ...) are internal state transitions that do not run
-        // a user agent. They must keep flowing even when the runtime worker is disabled,
-        // otherwise disabling the worker would strand workflows (e.g. a manually merged
-        // PR could never be marked done).
-        if is_builtin_lifecycle_activity(job) {
+        // Internal server-owned activities do not run a user agent. They must keep
+        // flowing even when the runtime worker is disabled, otherwise disabling the
+        // worker would strand workflows or prevent server-owned PR snapshots.
+        if is_internal_non_agent_activity(job) {
             return None;
         }
         self.runtime_worker_disabled_result(job).await
@@ -326,6 +330,10 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
             ),
         }
     }
+}
+
+fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
+    is_builtin_lifecycle_activity(job) || is_server_owned_pr_feedback_inspection(job)
 }
 
 async fn persist_created_thread(state: &AppState, thread_id: &ThreadId) {
@@ -553,5 +561,15 @@ mod tests {
             &config,
         )
         .is_none());
+    }
+
+    #[test]
+    fn internal_non_agent_activity_includes_server_owned_pr_inspection() {
+        assert!(is_internal_non_agent_activity(&runtime_job(
+            "inspect_pr_feedback"
+        )));
+        assert!(!is_internal_non_agent_activity(&runtime_job(
+            "implement_issue"
+        )));
     }
 }

@@ -47,6 +47,110 @@ async fn pr_detected_persists_pr_open_state() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn transient_pr_lifecycle_persist_failure_is_retried_and_converges() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("transient-pr-lifecycle-persist-failure");
+    let _guard = set_pr_lifecycle_persist_test_failures(task_id.as_str(), 2);
+
+    record_pr_detected(
+        Some(&store),
+        PrDetectedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    )
+    .await;
+
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    let instance = store.get_instance(&workflow_id).await?;
+    let Some(instance) = instance else {
+        anyhow::bail!("workflow instance should be persisted after retry");
+    };
+    assert_eq!(instance.state, "pr_open");
+    let events = store.events_for(&workflow_id).await?;
+    assert!(events.iter().any(|event| event.event_type == "PrDetected"));
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "PrLifecyclePersistenceFailed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_pr_lifecycle_persist_failure_records_operator_event() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("persistent-pr-lifecycle-persist-failure");
+    let _guard =
+        set_pr_lifecycle_persist_test_failures(task_id.as_str(), PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS);
+
+    record_pr_detected(
+        Some(&store),
+        PrDetectedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    )
+    .await;
+
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    assert!(store.get_instance(&workflow_id).await?.is_none());
+    let events = store.events_for(&workflow_id).await?;
+    let failure_event = events
+        .iter()
+        .find(|event| event.event_type == "PrLifecyclePersistenceFailed");
+    let Some(failure_event) = failure_event else {
+        anyhow::bail!("persistent failure should create an operator-visible workflow event");
+    };
+    assert_eq!(failure_event.event["operation"], "record_pr_detected");
+    assert_eq!(
+        failure_event.event["attempts"],
+        serde_json::json!(PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS)
+    );
+    assert_eq!(failure_event.event["issue_number"], 123);
+    assert_eq!(failure_event.event["pr_number"], 77);
+    assert_eq!(failure_event.event["task_id"], task_id.as_str());
+    assert!(failure_event.event["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("injected PR lifecycle persist failure")));
+    Ok(())
+}
+
+#[tokio::test]
 async fn rejected_new_runtime_decision_persists_initial_instance() -> anyhow::Result<()> {
     let Ok(database_url) = resolve_database_url(None) else {
         return Ok(());
@@ -183,11 +287,18 @@ async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
         .get_instance(&workflow_id)
         .await?
         .expect("workflow instance should be persisted");
-    assert_eq!(instance.state, "ready_to_merge");
+    assert_eq!(instance.state, "quality_gate_pending");
     let events = store.events_for(&workflow_id).await?;
     assert!(events
         .iter()
         .any(|event| event.event_type == "PrReadyToMerge"));
+    let commands = store.commands_for(&workflow_id).await?;
+    assert!(commands.iter().any(|command| {
+        command.command.command_type
+            == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+            && command.command.command["definition_id"]
+                == harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID
+    }));
     Ok(())
 }
 

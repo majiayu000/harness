@@ -1,9 +1,13 @@
 use super::model::{
     WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
 };
+use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
 
 pub const PR_FEEDBACK_DEFINITION_ID: &str = "pr_feedback";
 pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
+pub const PR_FEEDBACK_SNAPSHOT_ARTIFACT: &str = "pr_feedback_snapshot";
+pub const PR_REPAIR_SNAPSHOT_ARTIFACT: &str = "pr_repair_snapshot";
+pub const SERVER_PR_SNAPSHOT_ARTIFACT: &str = "server_pr_snapshot";
 pub const LOCAL_REVIEW_ACTIVITY: &str = "run_local_review";
 pub const LOCAL_REVIEW_PASSED_SIGNAL: &str = "LocalReviewPassed";
 pub const LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL: &str = "LocalReviewChangesRequested";
@@ -20,6 +24,7 @@ pub enum PrFeedbackWorkflowAction {
     InspectFeedback,
     AddressFeedback,
     AwaitFeedback,
+    RequestQualityGate,
     ReadyToMerge,
 }
 
@@ -170,14 +175,26 @@ pub fn build_pr_feedback_decision(
             let decision = WorkflowDecision::new(
                 &instance.id,
                 &instance.state,
-                "mark_ready_to_merge",
-                "ready_to_merge",
+                "start_quality_gate",
+                "quality_gate_pending",
                 input.summary,
             )
+            .with_command(WorkflowCommand::new(
+                super::model::WorkflowCommandType::StartChildWorkflow,
+                format!("quality-gate:{}:{}:run", input.task_id, input.pr_number),
+                serde_json::json!({
+                    "definition_id": QUALITY_GATE_DEFINITION_ID,
+                    "subject_key": format!("pr:{}", input.pr_number),
+                    "child_activity": QUALITY_GATE_ACTIVITY,
+                    "pr_number": input.pr_number,
+                    "pr_url": input.pr_url,
+                    "validation_commands": [],
+                }),
+            ))
             .with_evidence(feedback_evidence(input))
             .high_confidence();
             PrFeedbackDecisionOutput {
-                action: PrFeedbackWorkflowAction::ReadyToMerge,
+                action: PrFeedbackWorkflowAction::RequestQualityGate,
                 decision,
             }
         }

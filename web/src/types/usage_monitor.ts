@@ -39,33 +39,38 @@ export interface UsageGroup {
   cost_confidence: string;
 }
 
-export interface LocalUsageModel {
+export interface LocalUsageModelSummary {
   model: string;
+  estimated_cost_usd: number | null;
   input_tokens: number;
   output_tokens: number;
   reasoning_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
   total_tokens: number;
-  estimated_cost_usd: number | null;
 }
 
-export interface LocalUsageSource {
+export interface LocalUsageSourceSummary {
   source: string;
   display_name: string;
-  status: string;
-  message: string | null;
-  range: string;
+  attribution: "global_local_source_logs";
+  status: "available" | "unavailable";
   since: string;
   until: string;
+  currency: string;
+  estimated_cost_usd: number | null;
   input_tokens: number;
   output_tokens: number;
   reasoning_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
   total_tokens: number;
-  estimated_cost_usd: number | null;
-  models: LocalUsageModel[];
+  period_count: number;
+  model_count: number;
+  models: LocalUsageModelSummary[];
+  cost_confidence: string;
+  elapsed_ms: number;
+  error: string | null;
 }
 
 export interface AgentInvocation {
@@ -130,9 +135,9 @@ export interface UsageMonitorPayload {
   tokens_by_agent: UsageGroup[];
   tokens_by_project: UsageGroup[];
   tokens_by_model: UsageGroup[];
-  local_usage_sources: LocalUsageSource[];
   agent_invocations: AgentInvocation[];
   external_agent_processes: AgentProcess[];
+  local_usage_sources: LocalUsageSourceSummary[];
   active_by_repo: ActiveCount[];
   active_by_activity: ActiveCount[];
   diagnostics: UsageDiagnostics;

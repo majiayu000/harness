@@ -17,18 +17,11 @@ pub async fn handle(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReconcileParams>,
 ) -> Result<Json<crate::reconciliation::ReconciliationReport>, StatusCode> {
-    let max_calls = state
-        .core
-        .server
-        .config
-        .reconciliation
-        .max_gh_calls_per_minute;
-
-    let report = crate::reconciliation::run_once_with_runtime_token(
+    let report = crate::reconciliation::run_once_with_runtime_config(
         &state.core.tasks,
         state.core.workflow_runtime_store.as_deref(),
         state.core.issue_workflow_store.as_deref(),
-        max_calls,
+        &state.core.server.config.reconciliation,
         params.dry_run,
         state.core.server.config.server.github_token.as_deref(),
     )

@@ -102,7 +102,12 @@ pub(super) fn github_issue_closed_decision(
 fn github_issue_state_can_finish_closed(state: &str) -> bool {
     matches!(
         state,
-        "implementing" | "pr_open" | "awaiting_feedback" | "addressing_feedback" | "ready_to_merge"
+        "implementing"
+            | "pr_open"
+            | "awaiting_feedback"
+            | "addressing_feedback"
+            | "quality_gate_pending"
+            | "ready_to_merge"
     )
 }
 

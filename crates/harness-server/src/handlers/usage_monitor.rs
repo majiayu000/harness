@@ -17,14 +17,12 @@ use std::sync::{Arc, OnceLock};
 
 use crate::http::AppState;
 
-#[path = "usage_monitor_ccstats.rs"]
-mod usage_monitor_ccstats;
+#[path = "usage_monitor_local_usage.rs"]
+mod usage_monitor_local_usage;
 #[path = "usage_monitor_process.rs"]
 mod usage_monitor_process;
 
-use usage_monitor_ccstats::{
-    any_ccstats_source_available, load_ccstats_local_sources, CcstatsLocalSource,
-};
+use usage_monitor_local_usage::{load_local_usage_summaries, LocalUsageSourceSummary};
 use usage_monitor_process::{sample_agent_processes, AgentProcess};
 
 const DEFAULT_USAGE_WINDOW_HOURS: i64 = 24;
@@ -45,9 +43,9 @@ struct UsageMonitorResponse {
     tokens_by_agent: Vec<UsageGroup>,
     tokens_by_project: Vec<UsageGroup>,
     tokens_by_model: Vec<UsageGroup>,
-    local_usage_sources: Vec<CcstatsLocalSource>,
     agent_invocations: Vec<AgentInvocation>,
     external_agent_processes: Vec<AgentProcess>,
+    local_usage_sources: Vec<LocalUsageSourceSummary>,
     active_by_repo: Vec<ActiveCount>,
     active_by_activity: Vec<ActiveCount>,
     diagnostics: UsageDiagnostics,
@@ -300,8 +298,6 @@ async fn build_usage_monitor_response(
     let now = Utc::now();
     let window = UsageWindow::from_query(query.hours, now);
     let price_catalog = PriceCatalog::from_env_cached();
-    let local_usage_sources = load_ccstats_local_sources(window.since, window.now).await;
-    let ccstats_available = any_ccstats_source_available(&local_usage_sources);
     let usage_records = load_usage_records(state, window, price_catalog).await?;
     let runtime_rows = load_runtime_usage_rows(state, window.since, query.limit).await?;
     let agent_invocations = runtime_rows
@@ -310,6 +306,7 @@ async fn build_usage_monitor_response(
         .collect::<Vec<_>>();
     let external_agent_processes =
         sample_agent_processes(now, &runtime_attribution_tokens(&runtime_rows));
+    let local_usage_sources = load_local_usage_summaries(window).await;
 
     let tokens_by_agent =
         aggregate_usage(&usage_records, |record| record.agent.clone(), price_catalog);
@@ -342,14 +339,18 @@ async fn build_usage_monitor_response(
     let cost = CostConfig {
         currency: "USD",
         configured: price_catalog.configured(),
-        source: cost_source(price_catalog.configured(), ccstats_available),
+        source: "HARNESS_USAGE_PRICE_CATALOG_JSON",
         missing_model_count: usage_records
             .iter()
             .filter(|record| record.estimated_cost_usd.is_none())
             .map(|record| record.model.as_str())
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
-        message: cost_message(price_catalog.configured(), ccstats_available),
+        message: if price_catalog.configured() {
+            "Harness-attributed token costs use the configured local price catalog. ccstats local source totals are reported separately from workflow and task attribution."
+        } else {
+            "Harness-attributed token costs need a local price catalog. ccstats local source totals may still report global Codex and Claude costs separately."
+        },
     };
 
     Ok(UsageMonitorResponse {
@@ -372,7 +373,6 @@ async fn build_usage_monitor_response(
         tokens_by_agent,
         tokens_by_project,
         tokens_by_model,
-        local_usage_sources,
         active_by_repo: aggregate_active_counts(&agent_invocations, |invocation| {
             invocation
                 .repo
@@ -384,6 +384,7 @@ async fn build_usage_monitor_response(
         }),
         agent_invocations,
         external_agent_processes,
+        local_usage_sources,
         diagnostics: UsageDiagnostics {
             runtime_store_available: state.core.workflow_runtime_store.is_some(),
             token_source: "llm_usage_events",
@@ -757,32 +758,6 @@ fn blank_label(value: &str) -> String {
         "unassigned".to_string()
     } else {
         value.to_string()
-    }
-}
-
-fn cost_source(price_catalog_configured: bool, ccstats_available: bool) -> &'static str {
-    match (price_catalog_configured, ccstats_available) {
-        (true, true) => "HARNESS_USAGE_PRICE_CATALOG_JSON + ccstats CLI",
-        (true, false) => "HARNESS_USAGE_PRICE_CATALOG_JSON",
-        (false, true) => "ccstats CLI (--offline cache)",
-        (false, false) => "unconfigured",
-    }
-}
-
-fn cost_message(price_catalog_configured: bool, ccstats_available: bool) -> &'static str {
-    match (price_catalog_configured, ccstats_available) {
-        (true, true) => {
-            "Harness token costs use the configured local price catalog; ccstats local source totals are shown separately from task attribution."
-        }
-        (true, false) => {
-            "Harness token costs use the configured local price catalog; ccstats local source totals are unavailable."
-        }
-        (false, true) => {
-            "Harness token counts are exact when events exist; ccstats local source totals use cached pricing and are not per-task attribution."
-        }
-        (false, false) => {
-            "Harness token counts are exact when events exist; cost is unavailable until a local price catalog or ccstats installation is available."
-        }
     }
 }
 

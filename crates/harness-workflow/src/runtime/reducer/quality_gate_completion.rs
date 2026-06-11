@@ -36,6 +36,42 @@ pub(super) fn quality_gate_success_decision(
     ))
 }
 
+pub(super) fn parent_quality_gate_pass_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        super::GITHUB_ISSUE_PR_DEFINITION_ID,
+        "quality_gate_pending",
+        QUALITY_GATE_ACTIVITY,
+    ) {
+        return None;
+    }
+
+    if let Some(reason) = quality_gate_success_contract_error(result) {
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, reason,
+        ));
+    }
+
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "quality_gate_passed",
+            "ready_to_merge",
+            "quality gate passed; PR is ready to merge",
+        )
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
+}
+
 pub(super) fn quality_gate_activity_matches(
     instance: &WorkflowInstance,
     result: &ActivityResult,

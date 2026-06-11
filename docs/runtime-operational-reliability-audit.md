@@ -136,5 +136,5 @@ deployment.
 ## Non-Goals
 
 - Do not run the one-time production schema cleanup in this PR.
-- Do not start `harness serve` from a Codex session.
+- Do not change long-running server process ownership policy in this PR.
 - Do not combine all runtime architecture fixes into one large PR.

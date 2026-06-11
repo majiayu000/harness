@@ -100,6 +100,8 @@ PR feedback flow:
 3. Only after local review passes, inspect top-level PR comments, inline review comments, review states, checks, and mergeability.
 4. Treat actionable remote feedback as blocking until it is fixed or explicitly answered with a justified response.
 5. Re-run validation after feedback-driven changes, then return to local review before remote feedback.
+6. Before the final response, refresh the PR state from GitHub again, including review threads, review states, checks, mergeability, and the current head commit.
+7. If any actionable review thread, requested change, failed check, or mergeability blocker remains, report the activity status as blocked instead of succeeded.
 
 Final response:
 

@@ -282,7 +282,15 @@ fn fenced_report_payload(raw_output: &str) -> Option<&str> {
     let start = raw_output.find(marker)?;
     let after_marker = &raw_output[start + marker.len()..];
     let after_newline = after_marker.strip_prefix('\n').unwrap_or(after_marker);
-    let end = after_newline.find("```")?;
+    let end = after_newline.match_indices("```").find_map(|(index, _)| {
+        let prefix_ok = index == 0 || after_newline[..index].ends_with('\n');
+        let suffix = &after_newline[index + 3..];
+        let suffix_after_whitespace = suffix.trim_start_matches([' ', '\t']);
+        let suffix_ok = suffix_after_whitespace.is_empty()
+            || suffix_after_whitespace.starts_with('\n')
+            || suffix_after_whitespace.starts_with("\r\n");
+        (prefix_ok && suffix_ok).then_some(index)
+    })?;
     Some(after_newline[..end].trim())
 }
 
@@ -387,6 +395,56 @@ mod tests {
         assert_eq!(report.elapsed_ms, 2_000);
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].category, ReviewCategory::Correctness);
+    }
+
+    #[test]
+    fn parses_fenced_review_report_with_backticks_in_string_field() {
+        let report = parse_review_report(
+            "codex_cli_review",
+            ReviewProviderKind::LocalCli,
+            r#"```harness-review-report
+{"decision":"changes_requested","summary":"One issue.","findings":[{"severity":"medium","category":"maintainability","path":"src/lib.rs","line":9,"message":"Keep example parseable","evidence":"The output included ```rust\nlet value = 1;\n``` inside the report.","recommendation":"Preserve the full JSON payload.","blocking":true,"confidence":0.8}]}
+```"#,
+            started(),
+            completed(),
+        );
+
+        assert_eq!(report.decision, ReviewDecision::ChangesRequested);
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.findings[0]
+            .evidence
+            .as_deref()
+            .is_some_and(|evidence| evidence.contains("```rust")));
+    }
+
+    #[test]
+    fn fenced_review_report_requires_closing_fence_on_own_line() {
+        assert_eq!(
+            fenced_report_payload(
+                "```harness-review-report\n{\"summary\":\"first\"}\n``` not closed\n{\"summary\":\"second\"}\n```\n",
+            ),
+            Some("{\"summary\":\"first\"}\n``` not closed\n{\"summary\":\"second\"}")
+        );
+    }
+
+    #[test]
+    fn parses_fenced_review_report_with_trailing_whitespace_on_closing_fence() {
+        let report = parse_review_report(
+            "codex_cli_review",
+            ReviewProviderKind::LocalCli,
+            concat!(
+                "```harness-review-report\n",
+                "{\"decision\":\"approved\",\"summary\":\"No blocking issues.\",\"findings\":[]}\n",
+                "```   \n",
+                "Ignored trailing markdown."
+            ),
+            started(),
+            completed(),
+        );
+
+        assert_eq!(report.decision, ReviewDecision::Approved);
+        assert_eq!(report.summary, "No blocking issues.");
+        assert!(report.findings.is_empty());
     }
 
     #[test]

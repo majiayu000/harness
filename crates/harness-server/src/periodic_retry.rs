@@ -760,8 +760,13 @@ mod tests {
             tasks.iter().all(|t| t.id == task_id),
             "runtime-first issue retry should not enqueue a successor task row"
         );
-        let workflow_id =
-            harness_workflow::issue_lifecycle::workflow_id(dir.path().to_str().unwrap(), None, 42);
+        let detected_repo = crate::task_executor::pr_detection::detect_repo_slug(dir.path()).await;
+        let project_id = dir.path().to_string_lossy();
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            project_id.as_ref(),
+            detected_repo.as_deref(),
+            42,
+        );
         let instance = runtime_store
             .get_instance(&workflow_id)
             .await?
@@ -770,7 +775,7 @@ mod tests {
         let commands = runtime_store.commands_for(&workflow_id).await?;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, "pending");
-        assert_eq!(commands[0].command.command["activity"], "implement_issue");
+        assert_eq!(commands[0].command.command["activity"], "plan_issue");
         assert!(
             commands[0].id != task_id.0,
             "runtime command id should be independent of the cancelled legacy task"

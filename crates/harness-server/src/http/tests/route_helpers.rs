@@ -5,6 +5,49 @@ pub(super) fn init_fake_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) fn init_worktree_git_repo(root: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)?;
+    run_git(root, &["init"])?;
+    run_git(root, &["config", "user.email", "test@harness.test"])?;
+    run_git(root, &["config", "user.name", "Harness Test"])?;
+    run_git(root, &["commit", "--allow-empty", "-m", "init"])?;
+    run_git(root, &["branch", "-M", "main"])?;
+    Ok(())
+}
+
+fn run_git(root: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
+    let git_bin = std::env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string());
+    let mut command = std::process::Command::new(git_bin);
+    for key in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command.arg("-C").arg(root).args(args).output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn task_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))
@@ -300,13 +343,13 @@ pub(super) async fn assert_runtime_issue_submission(
         .get_instance(&workflow_id)
         .await?
         .expect("runtime workflow should be persisted");
-    assert_eq!(instance.state, "implementing");
+    assert_eq!(instance.state, "planning");
     assert_eq!(instance.data["task_id"], task_id.0);
     assert_eq!(instance.data["execution_path"], "workflow_runtime");
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
-    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
 
     let get_response = task_app(state.clone())
         .oneshot(
@@ -319,7 +362,7 @@ pub(super) async fn assert_runtime_issue_submission(
     assert_eq!(get_response.status(), StatusCode::OK);
     let runtime_task = response_json(get_response).await?;
     assert_eq!(runtime_task["task_id"], task_id.0);
-    assert_eq!(runtime_task["status"], "implementing");
+    assert_eq!(runtime_task["status"], "planning");
     assert_eq!(runtime_task["execution_path"], "workflow_runtime");
     assert_eq!(runtime_task["workflow_id"], workflow_id);
     Ok(workflow_id)
