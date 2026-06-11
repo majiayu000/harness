@@ -1,3 +1,7 @@
+use crate::task_runner::{CreateTaskRequest, TaskId};
+use harness_workflow::runtime::PrFeedbackOutcome;
+use std::path::Path;
+
 pub(crate) async fn record_runtime_pr_feedback(
     issue_workflow_store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
     workflow_runtime_store: Option<&harness_workflow::runtime::WorkflowRuntimeStore>,
@@ -87,7 +91,7 @@ pub(crate) async fn record_runtime_pr_merged(
     .await;
 }
 
-async fn resolve_runtime_feedback_issue_number(
+pub(super) async fn resolve_runtime_feedback_issue_number(
     issue_workflow_store: Option<&harness_workflow::issue_lifecycle::IssueWorkflowStore>,
     project_root: &Path,
     repo: Option<&str>,

@@ -1,11 +1,21 @@
+use chrono::{DateTime, Utc};
+use harness_core::prompts;
+use serde::Deserialize;
+use std::collections::HashMap;
+use tokio::time::{sleep, Duration, Instant};
+
+pub(super) const CODEX_REVIEWER_NAME: &str = "chatgpt-codex-connector[bot]";
+pub(super) const CODEX_REVIEW_COMMAND: &str = "@codex";
+const CODEX_APPROVAL_SIGNATURE: &str = "no major issues";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ReviewBotKey {
+pub(super) enum ReviewBotKey {
     Gemini,
     Codex,
 }
 
 impl ReviewBotKey {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Gemini => "gemini",
             Self::Codex => "codex",
@@ -14,10 +24,10 @@ impl ReviewBotKey {
 }
 
 #[derive(Debug, Clone)]
-struct ReviewBotDescriptor {
-    key: ReviewBotKey,
-    reviewer_name: String,
-    review_command: String,
+pub(super) struct ReviewBotDescriptor {
+    pub(super) key: ReviewBotKey,
+    pub(super) reviewer_name: String,
+    pub(super) review_command: String,
 }
 
 impl ReviewBotDescriptor {
@@ -129,27 +139,27 @@ struct ActorNode {
 }
 
 #[derive(Debug, Clone)]
-struct PullRequestSignals {
-    latest_commit_at: DateTime<Utc>,
-    ci_state: Option<String>,
-    ci_green: bool,
-    latest_bot_activity_at: Option<DateTime<Utc>>,
-    blocking_feedback: bool,
-    bots: HashMap<ReviewBotKey, BotSignals>,
+pub(super) struct PullRequestSignals {
+    pub(super) latest_commit_at: DateTime<Utc>,
+    pub(super) ci_state: Option<String>,
+    pub(super) ci_green: bool,
+    pub(super) latest_bot_activity_at: Option<DateTime<Utc>>,
+    pub(super) blocking_feedback: bool,
+    pub(super) bots: HashMap<ReviewBotKey, BotSignals>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct BotSignals {
-    latest_review_at: Option<DateTime<Utc>>,
-    latest_review_state: Option<String>,
-    latest_review_body: Option<String>,
-    latest_comment_at: Option<DateTime<Utc>>,
-    latest_comment_body: Option<String>,
-    reviewed_any_commit: bool,
+pub(super) struct BotSignals {
+    pub(super) latest_review_at: Option<DateTime<Utc>>,
+    pub(super) latest_review_state: Option<String>,
+    pub(super) latest_review_body: Option<String>,
+    pub(super) latest_comment_at: Option<DateTime<Utc>>,
+    pub(super) latest_comment_body: Option<String>,
+    pub(super) reviewed_any_commit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BotClassification {
+pub(super) enum BotClassification {
     FreshApproval,
     ActionableFeedback,
     QuotaExhausted,
@@ -158,27 +168,29 @@ enum BotClassification {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PrCheckRollupState {
+pub(super) enum PrCheckRollupState {
     Success,
     Pending(String),
     Failed(String),
 }
 
 #[derive(Debug, Clone)]
-struct ReviewFallbackState {
-    tier: harness_workflow::issue_lifecycle::ReviewFallbackTier,
-    trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger,
-    active_bot: Option<ReviewBotKey>,
+pub(super) struct ReviewFallbackState {
+    pub(super) tier: harness_workflow::issue_lifecycle::ReviewFallbackTier,
+    pub(super) trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger,
+    pub(super) active_bot: Option<ReviewBotKey>,
 }
 
 #[derive(Debug, Clone)]
-struct ReviewLoopDecision {
-    active_bot: ReviewBotDescriptor,
-    fallback: Option<ReviewFallbackState>,
-    wait_for_bot: bool,
+pub(super) struct ReviewLoopDecision {
+    pub(super) active_bot: ReviewBotDescriptor,
+    pub(super) fallback: Option<ReviewFallbackState>,
+    pub(super) wait_for_bot: bool,
 }
 
-fn quota_trigger(bot: ReviewBotKey) -> harness_workflow::issue_lifecycle::ReviewFallbackTrigger {
+pub(super) fn quota_trigger(
+    bot: ReviewBotKey,
+) -> harness_workflow::issue_lifecycle::ReviewFallbackTrigger {
     match bot {
         ReviewBotKey::Gemini => {
             harness_workflow::issue_lifecycle::ReviewFallbackTrigger::GeminiQuota
@@ -187,7 +199,7 @@ fn quota_trigger(bot: ReviewBotKey) -> harness_workflow::issue_lifecycle::Review
     }
 }
 
-fn bot_fallback_chain(
+pub(super) fn bot_fallback_chain(
     review_config: &harness_core::config::agents::AgentReviewConfig,
 ) -> Vec<ReviewBotDescriptor> {
     let mut chain: Vec<ReviewBotDescriptor> = review_config
@@ -220,7 +232,10 @@ fn bot_approval_signal(bot: ReviewBotKey, body: &str) -> bool {
     }
 }
 
-fn review_bot_key_for_author(chain: &[ReviewBotDescriptor], author: &str) -> Option<ReviewBotKey> {
+pub(super) fn review_bot_key_for_author(
+    chain: &[ReviewBotDescriptor],
+    author: &str,
+) -> Option<ReviewBotKey> {
     chain
         .iter()
         .find(|descriptor| descriptor.reviewer_name.eq_ignore_ascii_case(author))
@@ -247,7 +262,11 @@ fn latest_comment_body_after_commit(
     }
 }
 
-fn record_bot_comment_signal(bot: &mut BotSignals, body: String, created_at: DateTime<Utc>) {
+pub(super) fn record_bot_comment_signal(
+    bot: &mut BotSignals,
+    body: String,
+    created_at: DateTime<Utc>,
+) {
     bot.reviewed_any_commit = true;
     let replace = bot
         .latest_comment_at
@@ -259,7 +278,7 @@ fn record_bot_comment_signal(bot: &mut BotSignals, body: String, created_at: Dat
     }
 }
 
-fn classify_bot(
+pub(super) fn classify_bot(
     descriptor: &ReviewBotDescriptor,
     bot: &BotSignals,
     latest_commit_at: DateTime<Utc>,
@@ -313,7 +332,7 @@ fn classify_bot(
     BotClassification::ActionableFeedback
 }
 
-fn classify_pr_check_rollup_state(state: Option<&str>) -> PrCheckRollupState {
+pub(super) fn classify_pr_check_rollup_state(state: Option<&str>) -> PrCheckRollupState {
     let Some(state) = state.map(str::trim).filter(|state| !state.is_empty()) else {
         return PrCheckRollupState::Pending("no statusCheckRollup state yet".to_string());
     };
@@ -324,7 +343,7 @@ fn classify_pr_check_rollup_state(state: Option<&str>) -> PrCheckRollupState {
     }
 }
 
-async fn fetch_pull_request_signals(
+pub(super) async fn fetch_pull_request_signals(
     repo_slug: &str,
     pr_num: u64,
     github_token: Option<&str>,
@@ -544,7 +563,7 @@ pub(crate) async fn verify_pr_checks_green(
     }
 }
 
-async fn post_review_bot_comment(
+pub(super) async fn post_review_bot_comment(
     repo_slug: &str,
     pr_num: u64,
     body: &str,

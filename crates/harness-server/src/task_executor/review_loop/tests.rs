@@ -1,4 +1,16 @@
-use super::*;
+use super::decision::{decide_review_loop_action, update_silence_rounds};
+use super::runtime_feedback::resolve_runtime_feedback_issue_number;
+use super::signals::{
+    bot_fallback_chain, classify_bot, classify_pr_check_rollup_state, record_bot_comment_signal,
+    review_bot_key_for_author, BotClassification, BotSignals, PrCheckRollupState,
+    PullRequestSignals, ReviewBotDescriptor, ReviewBotKey, CODEX_REVIEWER_NAME,
+    CODEX_REVIEW_COMMAND,
+};
+use super::wait_budget::ReviewWaitBudget;
+use crate::task_runner::{TaskId, TaskState, TaskStatus, TaskStore};
+use chrono::Utc;
+use std::collections::HashMap;
+use tokio::time::{Duration, Instant};
 fn descriptor(key: ReviewBotKey) -> ReviewBotDescriptor {
     match key {
         ReviewBotKey::Gemini => ReviewBotDescriptor {
@@ -46,6 +58,24 @@ fn classifies_pr_check_rollup_states() {
         classify_pr_check_rollup_state(None),
         PrCheckRollupState::Pending("no statusCheckRollup state yet".to_string())
     );
+}
+
+#[tokio::test]
+async fn review_wait_budget_zero_disables_failure() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store.insert(&TaskState::new(task_id.clone())).await;
+    let budget = ReviewWaitBudget::new(Instant::now() - Duration::from_secs(3600), 0);
+
+    let exceeded = budget.fail_if_exceeded(store.as_ref(), &task_id, 1).await?;
+
+    assert!(!exceeded);
+    let state = store
+        .get(&task_id)
+        .ok_or_else(|| anyhow::anyhow!("task state should exist"))?;
+    assert_ne!(state.status, TaskStatus::Failed);
+    Ok(())
 }
 
 async fn open_issue_workflow_test_store(

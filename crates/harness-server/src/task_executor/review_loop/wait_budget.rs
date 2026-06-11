@@ -1,23 +1,29 @@
-struct ReviewWaitBudget {
+use crate::task_runner::{mutate_and_persist, TaskId, TaskStatus, TaskStore};
+use tokio::time::Instant;
+
+pub(super) struct ReviewWaitBudget {
     started_at: Instant,
     budget_secs: u64,
 }
 
 impl ReviewWaitBudget {
-    fn new(started_at: Instant, budget_secs: u64) -> Self {
+    pub(super) fn new(started_at: Instant, budget_secs: u64) -> Self {
         Self {
             started_at,
             budget_secs,
         }
     }
 
-    async fn fail_if_exceeded(
+    pub(super) async fn fail_if_exceeded(
         &self,
         store: &TaskStore,
         task_id: &TaskId,
         round: u32,
     ) -> anyhow::Result<bool> {
         let elapsed_secs = self.started_at.elapsed().as_secs();
+        if self.budget_secs == 0 {
+            return Ok(false);
+        }
         if elapsed_secs < self.budget_secs {
             return Ok(false);
         }

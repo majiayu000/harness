@@ -72,6 +72,14 @@ pub(super) fn local_review_pr_check_timeout_secs(
         .saturating_mul(u64::from(hosted_review_max_rounds.max(1)))
 }
 
+pub(super) fn initial_hosted_review_wait_secs(wait_secs: u64, review_wait_budget_secs: u64) -> u64 {
+    if review_wait_budget_secs == 0 {
+        wait_secs
+    } else {
+        wait_secs.min(review_wait_budget_secs)
+    }
+}
+
 pub(super) fn review_repo_slug(pr_url: Option<&str>, detected_repo_slug: &str) -> String {
     pr_url
         .and_then(prompts::parse_github_pr_url)
@@ -696,8 +704,10 @@ pub(crate) async fn run_task(
     waiting_count += 1;
     update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
 
-    tracing::info!("waiting {wait_secs}s for review bot on PR #{pr_num}");
-    sleep(Duration::from_secs(wait_secs)).await;
+    let initial_wait_secs =
+        initial_hosted_review_wait_secs(wait_secs, review_config.review_wait_budget_secs);
+    tracing::info!("waiting {initial_wait_secs}s for review bot on PR #{pr_num}");
+    sleep(Duration::from_secs(initial_wait_secs)).await;
 
     review_loop::run_review_loop(
         store,

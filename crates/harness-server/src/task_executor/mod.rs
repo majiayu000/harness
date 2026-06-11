@@ -38,7 +38,8 @@ use pr_detection::{
 #[cfg(test)]
 use run_task::{
     effective_agent_review_round_limit, effective_hosted_review_round_limit,
-    local_review_pr_check_timeout_secs, review_repo_slug, should_run_issue_triage,
+    initial_hosted_review_wait_secs, local_review_pr_check_timeout_secs, review_repo_slug,
+    should_run_issue_triage,
 };
 #[cfg(test)]
 use std::collections::HashMap;

@@ -1,8 +1,12 @@
+use serde::Deserialize;
+use std::path::Path;
+use tokio::time::Duration;
+
 /// External state of a PR as observed via GitHub. Used to short-circuit the
 /// review loop when a PR has been merged or closed outside of this task so the
 /// loop does not keep invoking the reviewer agent against stale work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrExternalState {
+pub(super) enum PrExternalState {
     Open,
     Merged,
     Closed,
@@ -31,12 +35,13 @@ struct GitHubPullHead {
 /// Returns [`PrExternalState::Unknown`] on any transient
 /// failure so callers do not abort a healthy review loop because of a flaky
 /// network call.
-async fn fetch_pr_external_state(
+pub(super) async fn fetch_pr_external_state(
     pr_num: u64,
     project: &Path,
     github_token: Option<&str>,
 ) -> PrExternalState {
-    let Some(repo_slug) = super::pr_detection::detect_repo_slug(project).await else {
+    let Some(repo_slug) = crate::task_executor::pr_detection::detect_repo_slug(project).await
+    else {
         tracing::debug!(
             pr = pr_num,
             "PR state check skipped because repository slug is unavailable"
@@ -172,7 +177,7 @@ pub(crate) async fn fetch_pr_head_sha_for_gate(
 ///
 /// Used to detect convergence failure in the review loop so the caller can
 /// switch to impasse (critical-only) mode.
-fn issue_count_not_decreasing(counts: &[Option<u32>]) -> bool {
+pub(super) fn issue_count_not_decreasing(counts: &[Option<u32>]) -> bool {
     if counts.len() < 3 {
         return false;
     }
@@ -180,4 +185,4 @@ fn issue_count_not_decreasing(counts: &[Option<u32>]) -> bool {
     matches!(tail, [Some(a), Some(b), Some(c)] if c >= a && c >= b)
 }
 
-const MAX_CONSECUTIVE_WAITS: u32 = 10;
+pub(super) const MAX_CONSECUTIVE_WAITS: u32 = 10;

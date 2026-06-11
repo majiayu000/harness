@@ -1,4 +1,10 @@
-fn decide_review_loop_action(
+use super::signals::{
+    classify_bot, quota_trigger, BotClassification, PullRequestSignals, ReviewBotDescriptor,
+    ReviewFallbackState, ReviewLoopDecision,
+};
+use chrono::{DateTime, Utc};
+
+pub(super) fn decide_review_loop_action(
     chain: &[ReviewBotDescriptor],
     signals: &PullRequestSignals,
     silence_rounds: u32,
@@ -80,7 +86,7 @@ fn decide_review_loop_action(
     }
 }
 
-fn update_silence_rounds(
+pub(super) fn update_silence_rounds(
     current_rounds: u32,
     last_activity_at: Option<DateTime<Utc>>,
     next_activity_at: Option<DateTime<Utc>>,
