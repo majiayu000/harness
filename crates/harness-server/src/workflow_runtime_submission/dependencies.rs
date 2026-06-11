@@ -38,12 +38,6 @@ pub(crate) enum RuntimeDependencyStatus {
     Waiting,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RepoBacklogIssueDependency {
-    repo_key: String,
-    issue_number: u64,
-}
-
 pub(crate) async fn resolve_issue_dependency_status(
     store: Option<&WorkflowRuntimeStore>,
     tasks: &TaskStore,
@@ -153,34 +147,37 @@ async fn canonical_repo_backlog_issue_dependency_instance(
     waiting_instance: &WorkflowInstance,
     task_id: &TaskId,
 ) -> anyhow::Result<Option<WorkflowInstance>> {
-    let Some(dependency) = parse_repo_backlog_issue_dependency(task_id.as_str()) else {
+    let Some((dependency_repo, issue_number)) =
+        parse_repo_backlog_issue_dependency(task_id.as_str())
+    else {
         return Ok(None);
     };
-    let Some(project_id) = optional_string_field(&waiting_instance.data, "project_id") else {
+    let Some(project_id) = waiting_instance
+        .data
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+    else {
         return Ok(None);
     };
-    let repo = optional_string_field(&waiting_instance.data, "repo");
-    if dependency.repo_key != repo.as_deref().unwrap_or("<none>") {
+    let repo = waiting_instance
+        .data
+        .get("repo")
+        .and_then(serde_json::Value::as_str);
+    if dependency_repo != repo.unwrap_or("<none>") {
         return Ok(None);
     }
-    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-        &project_id,
-        repo.as_deref(),
-        dependency.issue_number,
-    );
+    let workflow_id =
+        harness_workflow::issue_lifecycle::workflow_id(project_id, repo, issue_number);
     store.get_instance(&workflow_id).await
 }
 
-fn parse_repo_backlog_issue_dependency(task_id: &str) -> Option<RepoBacklogIssueDependency> {
+fn parse_repo_backlog_issue_dependency(task_id: &str) -> Option<(&str, u64)> {
     let rest = task_id.strip_prefix("repo-backlog:")?;
     let (repo_key, issue_number) = rest.rsplit_once(":issue:")?;
     if repo_key.is_empty() {
         return None;
     }
-    Some(RepoBacklogIssueDependency {
-        repo_key: repo_key.to_string(),
-        issue_number: issue_number.parse().ok()?,
-    })
+    Some((repo_key, issue_number.parse().ok()?))
 }
 
 pub(crate) async fn release_ready_issue_dependencies(
