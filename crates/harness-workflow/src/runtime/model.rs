@@ -506,7 +506,6 @@ pub enum RuntimeJobStatus {
     Succeeded,
     Failed,
     Cancelled,
-    Expired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

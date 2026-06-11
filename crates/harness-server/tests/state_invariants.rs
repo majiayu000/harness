@@ -130,7 +130,6 @@ fn all_lifecycle_states() -> Vec<IssueLifecycleState> {
         IssueLifecycleState::FeedbackClaimed,
         IssueLifecycleState::AddressingFeedback,
         IssueLifecycleState::ReadyToMerge,
-        IssueLifecycleState::Blocked,
         IssueLifecycleState::Done,
         IssueLifecycleState::Failed,
         IssueLifecycleState::Cancelled,
@@ -147,7 +146,6 @@ fn lifecycle_tag(state: &IssueLifecycleState) -> &'static str {
         IssueLifecycleState::FeedbackClaimed => "feedback_claimed",
         IssueLifecycleState::AddressingFeedback => "addressing_feedback",
         IssueLifecycleState::ReadyToMerge => "ready_to_merge",
-        IssueLifecycleState::Blocked => "blocked",
         IssueLifecycleState::Done => "done",
         IssueLifecycleState::Failed => "failed",
         IssueLifecycleState::Cancelled => "cancelled",
@@ -166,8 +164,7 @@ fn lifecycle_is_terminal(state: &IssueLifecycleState) -> bool {
         | IssueLifecycleState::AwaitingFeedback
         | IssueLifecycleState::FeedbackClaimed
         | IssueLifecycleState::AddressingFeedback
-        | IssueLifecycleState::ReadyToMerge
-        | IssueLifecycleState::Blocked => false,
+        | IssueLifecycleState::ReadyToMerge => false,
     }
 }
 
