@@ -739,7 +739,6 @@ fn runtime_job_status(status: RuntimeJobStatus) -> &'static str {
         RuntimeJobStatus::Succeeded => "succeeded",
         RuntimeJobStatus::Failed => "failed",
         RuntimeJobStatus::Cancelled => "cancelled",
-        RuntimeJobStatus::Expired => "expired",
     }
 }
 

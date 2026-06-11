@@ -48,7 +48,6 @@ pub enum ProjectWorkflowEventKind {
     SprintPlanningStarted,
     SprintPlannerEnqueued,
     DispatchStarted,
-    DispatchCompleted,
     MonitoringStarted,
     FeedbackSweepStarted,
     FeedbackSweepCompleted,
@@ -139,8 +138,7 @@ impl ProjectWorkflowInstance {
                 self.state = ProjectWorkflowState::PlanningBatch;
                 self.active_planner_task_id = event.task_id.clone();
             }
-            ProjectWorkflowEventKind::DispatchStarted
-            | ProjectWorkflowEventKind::DispatchCompleted => {
+            ProjectWorkflowEventKind::DispatchStarted => {
                 self.state = ProjectWorkflowState::Dispatching;
             }
             ProjectWorkflowEventKind::MonitoringStarted => {
