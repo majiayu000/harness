@@ -9,10 +9,12 @@ use harness_core::config::agents::SandboxMode;
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig};
 use harness_core::types::Capability;
 use harness_sandbox::{wrap_command, SandboxSpec};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 #[path = "codex_exec_parser.rs"]
@@ -33,6 +35,18 @@ pub struct CodexAgent {
     /// Maximum seconds of idle silence on the output stream before the
     /// subprocess is declared a zombie and terminated. `None` = no timeout.
     pub stream_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexReviewRequest {
+    pub project_root: PathBuf,
+    pub instructions: Option<String>,
+    pub base_ref: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub sandbox_mode: SandboxMode,
+    pub approval_policy: Option<String>,
+    pub env_vars: HashMap<String, String>,
 }
 
 impl CodexAgent {
@@ -110,6 +124,143 @@ impl CodexAgent {
         args.push(req.project_root.as_os_str().to_os_string());
         args.push(OsString::from(req.prompt.clone()));
         args
+    }
+
+    fn review_args(&self, req: &CodexReviewRequest) -> Vec<OsString> {
+        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let reasoning_effort = req
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or(&self.reasoning_effort);
+        let mut args = vec![
+            OsString::from("-C"),
+            req.project_root.as_os_str().to_os_string(),
+            OsString::from("-m"),
+            OsString::from(model),
+            OsString::from("-c"),
+            OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
+        ];
+        push_codex_sandbox_args(&mut args, req.sandbox_mode);
+        if let Some(approval_policy) = req.approval_policy.as_deref() {
+            push_codex_approval_policy_args(&mut args, approval_policy);
+        }
+        if self.cloud.enabled {
+            args.push(OsString::from("--ephemeral"));
+        }
+
+        args.push(OsString::from("review"));
+        if let Some(base_ref) = req.base_ref.as_deref().filter(|value| !value.is_empty()) {
+            args.push(OsString::from("--base"));
+            args.push(OsString::from(base_ref));
+        }
+        if req.instructions.is_some() {
+            args.push(OsString::from("-"));
+        }
+        args
+    }
+
+    pub async fn execute_review(
+        &self,
+        req: CodexReviewRequest,
+    ) -> harness_core::error::Result<AgentResponse> {
+        self.run_setup_phase(&req.project_root).await?;
+
+        let review_args = self.review_args(&req);
+        let sandbox_spec = SandboxSpec::new(req.sandbox_mode, &req.project_root);
+        let wrapped_command =
+            wrap_command(&self.cli_path, &review_args, &sandbox_spec).map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "sandbox setup failed for codex review: {error}"
+                ))
+            })?;
+
+        let mut cmd = Command::new(&wrapped_command.program);
+        cmd.args(&wrapped_command.args)
+            .current_dir(&req.project_root)
+            .stdin(if req.instructions.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        crate::set_process_group(&mut cmd);
+        crate::strip_claude_env(&mut cmd);
+        cmd.envs(&req.env_vars);
+
+        if self.cloud.enabled {
+            for key in &self.cloud.setup_secret_env {
+                cmd.env_remove(key);
+            }
+        }
+
+        tracing::debug!(
+            agent = "codex",
+            mode = "review",
+            program = %wrapped_command.program.display(),
+            current_dir = %req.project_root.display(),
+            sandbox_engine = ?wrapped_command.engine,
+            arg_count = wrapped_command.args.len(),
+            has_stdin_instructions = req.instructions.is_some(),
+            "codex review spawn prepared"
+        );
+        let mut child = cmd.spawn().map_err(|error| {
+            let message = format!(
+                "failed to run codex review: {error}; mode=review; program={}; current_dir={}; sandbox_engine={:?}; arg_count={}",
+                wrapped_command.program.display(),
+                req.project_root.display(),
+                wrapped_command.engine,
+                wrapped_command.args.len()
+            );
+            tracing::error!(agent = "codex", mode = "review", error_kind = ?error.kind(), "{message}");
+            harness_core::error::HarnessError::AgentExecution(message)
+        })?;
+
+        if let Some(instructions) = req.instructions.as_deref() {
+            let Some(mut stdin) = child.stdin.take() else {
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "failed to open stdin for codex review instructions".to_string(),
+                ));
+            };
+            stdin
+                .write_all(instructions.as_bytes())
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "failed to write codex review instructions: {error}"
+                    ))
+                })?;
+        }
+
+        let output = child.wait_with_output().await.map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to wait for codex review: {error}"
+            ))
+        })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        log_captured_stderr_diagnostics(&stderr, self.name());
+
+        if !output.status.success() {
+            let error_output = if stderr.trim().is_empty() {
+                stdout.as_str()
+            } else {
+                stderr.as_str()
+            };
+            return Err(codex_nonzero_exit_error(output.status, error_output, None));
+        }
+
+        Ok(AgentResponse {
+            output: stdout,
+            stderr,
+            items: Vec::new(),
+            token_usage: Default::default(),
+            model: "codex".to_string(),
+            exit_code: output.status.code(),
+        })
     }
 }
 
@@ -615,3 +766,7 @@ mod tests;
 #[cfg(test)]
 #[path = "codex_failure_tests.rs"]
 mod failure_tests;
+
+#[cfg(test)]
+#[path = "codex_review_tests.rs"]
+mod review_tests;

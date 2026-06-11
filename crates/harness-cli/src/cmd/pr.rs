@@ -1,7 +1,16 @@
 use harness_agents::claude::ClaudeCodeAgent;
-use harness_core::{agent::AgentRequest, agent::CodeAgent, config::HarnessConfig, prompts};
+use harness_agents::codex::{CodexAgent, CodexReviewRequest};
+use harness_core::{
+    agent::AgentRequest,
+    agent::CodeAgent,
+    config::{agents::SandboxMode, HarnessConfig},
+    prompts,
+    review::{parse_review_report, ReviewDecision, ReviewProviderKind},
+};
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
+
+const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
 
 fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
     ClaudeCodeAgent::new(
@@ -81,6 +90,117 @@ pub async fn loop_pr(
         },
     )
     .await
+}
+
+pub async fn review(
+    config: &HarnessConfig,
+    pr: u64,
+    provider: String,
+    base: Option<String>,
+    project: PathBuf,
+) -> anyhow::Result<()> {
+    if provider != CODEX_CLI_REVIEW_PROVIDER_ID {
+        anyhow::bail!(
+            "unsupported review provider `{provider}`; supported provider: {CODEX_CLI_REVIEW_PROVIDER_ID}"
+        );
+    }
+
+    let mut review_config = config.agents.review.codex_cli_review.clone();
+    if let Some(base) = base {
+        review_config.base_ref = base;
+    }
+    if review_config.base_ref.trim().is_empty() {
+        anyhow::bail!("codex_cli_review requires a non-empty base ref");
+    }
+
+    let mut agent = CodexAgent::new(
+        review_config.cli_path.clone(),
+        SandboxMode::ReadOnlyWithNetwork,
+    )
+    .with_stream_timeout(Some(review_config.timeout_secs));
+    agent.default_model = review_config.model.clone();
+    agent.reasoning_effort = review_config.reasoning_effort.clone();
+
+    let started_at = chrono::Utc::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(review_config.timeout_secs.max(1)),
+        agent.execute_review(CodexReviewRequest {
+            project_root: project,
+            instructions: Some(codex_cli_review_instructions(
+                pr,
+                &review_config.base_ref,
+                &review_config.output_format,
+            )),
+            base_ref: Some(review_config.base_ref.clone()),
+            model: Some(review_config.model),
+            reasoning_effort: Some(review_config.reasoning_effort),
+            sandbox_mode: SandboxMode::ReadOnlyWithNetwork,
+            approval_policy: Some("never".to_string()),
+            env_vars: Default::default(),
+        }),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "codex_cli_review timed out after {}s",
+            review_config.timeout_secs.max(1)
+        )
+    })??;
+    let completed_at = chrono::Utc::now();
+
+    let report = parse_review_report(
+        CODEX_CLI_REVIEW_PROVIDER_ID,
+        ReviewProviderKind::LocalCli,
+        &response.output,
+        started_at,
+        completed_at,
+    );
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    match report.decision {
+        ReviewDecision::Approved => Ok(()),
+        ReviewDecision::ChangesRequested => {
+            anyhow::bail!("codex_cli_review requested changes for PR #{pr}")
+        }
+        ReviewDecision::Failed | ReviewDecision::TimedOut | ReviewDecision::Skipped => {
+            anyhow::bail!(
+                "codex_cli_review did not approve PR #{pr}: {}",
+                report.summary
+            )
+        }
+    }
+}
+
+fn codex_cli_review_instructions(pr: u64, base_ref: &str, output_format: &str) -> String {
+    let report_format = if output_format.eq_ignore_ascii_case("json") {
+        "Return exactly one fenced `harness-review-report` JSON block with this shape:\n\
+         ```harness-review-report\n\
+         {\"decision\":\"approved|changes_requested|failed|timed_out|skipped\",\
+         \"summary\":\"concise summary\",\
+         \"findings\":[{\"severity\":\"critical|high|medium|low\",\
+         \"category\":\"security|correctness|data_integrity|concurrency|performance|test_gap|maintainability|other\",\
+         \"path\":\"optional path or null\",\
+         \"line\":123,\
+         \"message\":\"finding\",\
+         \"evidence\":\"optional evidence or null\",\
+         \"recommendation\":\"optional recommendation or null\",\
+         \"blocking\":true,\
+         \"confidence\":0.9}]}\n\
+         ```"
+    } else {
+        "If everything is safe, put APPROVED on the last line. Otherwise list each blocking issue on its own line prefixed with ISSUE:."
+    };
+
+    format!(
+        "You are the configured codex_cli_review provider for PR #{pr}.\n\
+         Review the local workspace against base ref `{base_ref}` as a read-only provider.\n\n\
+         Requirements:\n\
+         - Inspect the PR intent, diff, and changed files before deciding.\n\
+         - Focus on security, logic, data integrity, error handling, and missing tests.\n\
+         - Do not modify files, commit, push, or post GitHub comments.\n\
+         - Treat unparseable or incomplete evidence as a failed provider review.\n\
+         {report_format}"
+    )
 }
 
 /// Resolve `owner/repo` slug from a PR URL.

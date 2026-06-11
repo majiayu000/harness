@@ -1,12 +1,13 @@
 use crate::task_runner::{mutate_and_persist, RoundResult, TaskId, TaskStore};
 use chrono::{DateTime, Utc};
-use harness_core::agent::{AgentRequest, CodeAgent};
+use harness_agents::codex::CodexReviewRequest;
+use harness_core::agent::AgentResponse;
 use harness_core::config::agents::{AgentReviewConfig, SandboxMode};
 use harness_core::review::{
     evaluate_review_gate, parse_review_report, ReviewDecision, ReviewGateProviderReport,
     ReviewGateResult, ReviewProviderKind, ReviewProviderRole, ReviewReport,
 };
-use harness_core::types::{ContextItem, ExecutionPhase};
+use harness_core::types::ContextItem;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::time::Duration;
@@ -15,6 +16,24 @@ pub(crate) type AgentReviewGateReport = Option<ReviewGateProviderReport>;
 
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
 const CODEX_AGENT_REVIEW_PROVIDER_ID: &str = "codex_agent_review";
+
+#[async_trait::async_trait]
+trait CodexCliReviewRunner: Send + Sync {
+    async fn execute_review(
+        &self,
+        req: CodexReviewRequest,
+    ) -> harness_core::error::Result<AgentResponse>;
+}
+
+#[async_trait::async_trait]
+impl CodexCliReviewRunner for harness_agents::codex::CodexAgent {
+    async fn execute_review(
+        &self,
+        req: CodexReviewRequest,
+    ) -> harness_core::error::Result<AgentResponse> {
+        harness_agents::codex::CodexAgent::execute_review(self, req).await
+    }
+}
 
 pub(crate) struct CodexCliReviewProviderRequest<'a> {
     pub(crate) review_config: &'a AgentReviewConfig,
@@ -106,28 +125,29 @@ pub(crate) async fn run_codex_cli_review_provider(
         .reasoning_effort
         .clone();
 
-    run_codex_cli_review_provider_with_agent(store, task_id, &provider, request, turns_used).await
+    run_codex_cli_review_provider_with_runner(store, task_id, &provider, request, turns_used).await
 }
 
-pub(crate) async fn run_codex_cli_review_provider_with_agent(
+async fn run_codex_cli_review_provider_with_runner(
     store: &TaskStore,
     task_id: &TaskId,
-    provider: &dyn CodeAgent,
+    provider: &dyn CodexCliReviewRunner,
     request: CodexCliReviewProviderRequest<'_>,
     turns_used: &mut u32,
 ) -> anyhow::Result<ReviewGateProviderReport> {
     let started_at = Utc::now();
-    let agent_request = AgentRequest {
-        prompt: codex_cli_review_prompt(
-            request.pr_url,
-            request.project_type,
-            &request.review_config.codex_cli_review.base_ref,
-            &request.review_config.codex_cli_review.output_format,
-        ),
+    let instructions = codex_cli_review_prompt(
+        request.pr_url,
+        request.project_type,
+        &request.review_config.codex_cli_review.base_ref,
+        &request.review_config.codex_cli_review.output_format,
+        request.context_items.len(),
+    );
+    let review_request = CodexReviewRequest {
         project_root: request.project.to_path_buf(),
-        context: request.context_items.to_vec(),
-        execution_phase: Some(ExecutionPhase::SimpleReview),
-        sandbox_mode: Some(SandboxMode::ReadOnlyWithNetwork),
+        instructions: Some(instructions),
+        base_ref: Some(request.review_config.codex_cli_review.base_ref.clone()),
+        sandbox_mode: SandboxMode::ReadOnlyWithNetwork,
         approval_policy: Some("never".to_string()),
         model: Some(request.review_config.codex_cli_review.model.clone()),
         reasoning_effort: Some(
@@ -138,13 +158,12 @@ pub(crate) async fn run_codex_cli_review_provider_with_agent(
                 .clone(),
         ),
         env_vars: request.cargo_env.clone(),
-        ..Default::default()
     };
 
     let timeout_secs = request.review_config.codex_cli_review.timeout_secs.max(1);
     let response = tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        provider.execute(agent_request),
+        provider.execute_review(review_request),
     )
     .await;
     *turns_used = turns_used.saturating_add(1);
@@ -199,6 +218,7 @@ fn codex_cli_review_prompt(
     project_type: &str,
     base_ref: &str,
     output_format: &str,
+    context_item_count: usize,
 ) -> String {
     let json_format = if output_format.eq_ignore_ascii_case("json") {
         "\nReturn exactly one fenced `harness-review-report` JSON block with this shape:\n\
@@ -222,7 +242,8 @@ fn codex_cli_review_prompt(
     format!(
         "You are the configured codex_cli_review provider for PR {pr_url}.\n\
          Review the local workspace against base ref `{base_ref}` as a read-only provider.\n\
-         Project type: {project_type}.\n\n\
+         Project type: {project_type}.\n\
+         Harness context item count: {context_item_count}.\n\n\
          Requirements:\n\
          - Inspect the PR intent, diff, and changed files before deciding.\n\
          - Focus on security, logic, data integrity, error handling, and missing tests.\n\
@@ -306,26 +327,20 @@ fn provider_policy_references(review_config: &AgentReviewConfig, provider_id: &s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::agent::{AgentResponse, StreamItem};
-    use harness_core::types::{Capability, TokenUsage};
+    use harness_core::types::TokenUsage;
     use tokio::sync::Mutex;
 
     struct RecordingProvider {
         output: String,
-        requests: Mutex<Vec<AgentRequest>>,
+        requests: Mutex<Vec<CodexReviewRequest>>,
     }
 
     #[async_trait::async_trait]
-    impl CodeAgent for RecordingProvider {
-        fn name(&self) -> &str {
-            "recording_codex"
-        }
-
-        fn capabilities(&self) -> Vec<Capability> {
-            Vec::new()
-        }
-
-        async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+    impl CodexCliReviewRunner for RecordingProvider {
+        async fn execute_review(
+            &self,
+            req: CodexReviewRequest,
+        ) -> harness_core::error::Result<AgentResponse> {
             self.requests.lock().await.push(req);
             Ok(AgentResponse {
                 output: self.output.clone(),
@@ -335,27 +350,6 @@ mod tests {
                 model: "recording_codex".to_string(),
                 exit_code: Some(0),
             })
-        }
-
-        async fn execute_stream(
-            &self,
-            req: AgentRequest,
-            tx: tokio::sync::mpsc::Sender<StreamItem>,
-        ) -> harness_core::error::Result<()> {
-            self.requests.lock().await.push(req);
-            if tx
-                .send(StreamItem::MessageDelta {
-                    text: self.output.clone(),
-                })
-                .await
-                .is_err()
-            {
-                return Ok(());
-            }
-            if tx.send(StreamItem::Done).await.is_err() {
-                return Ok(());
-            }
-            Ok(())
         }
     }
 
@@ -378,7 +372,7 @@ mod tests {
         config.codex_cli_review.timeout_secs = 5;
         let mut turns_used = 0;
 
-        let report = run_codex_cli_review_provider_with_agent(
+        let report = run_codex_cli_review_provider_with_runner(
             &store,
             &task_id,
             &provider,
@@ -399,12 +393,14 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].model.as_deref(), Some("gpt-test"));
         assert_eq!(requests[0].reasoning_effort.as_deref(), Some("xhigh"));
-        assert_eq!(
-            requests[0].sandbox_mode,
-            Some(SandboxMode::ReadOnlyWithNetwork)
-        );
+        assert_eq!(requests[0].sandbox_mode, SandboxMode::ReadOnlyWithNetwork);
         assert_eq!(requests[0].approval_policy.as_deref(), Some("never"));
-        assert!(requests[0].prompt.contains("origin/main"));
+        assert_eq!(requests[0].base_ref.as_deref(), Some("origin/main"));
+        let Some(instructions) = requests[0].instructions.as_deref() else {
+            panic!("review instructions should be provided through stdin");
+        };
+        assert!(instructions.contains("origin/main"));
+        assert!(instructions.contains("```harness-review-report"));
         assert_eq!(report.role, ReviewProviderRole::Required);
         assert_eq!(report.report.provider_id, CODEX_CLI_REVIEW_PROVIDER_ID);
         assert_eq!(report.report.decision, ReviewDecision::Approved);
@@ -424,6 +420,7 @@ mod tests {
             "rust",
             "origin/main",
             "json",
+            0,
         );
 
         assert!(prompt.contains("```harness-review-report"));

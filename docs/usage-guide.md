@@ -63,7 +63,14 @@ cli_path = "codex"
 enabled = true
 reviewer_agent = "codex"
 max_rounds = 3
+required_providers = ["codex_cli_review"]
+advisory_providers = ["gemini_github_bot", "codex_github_bot"]
 review_bot_auto_trigger = false
+
+[agents.review.codex_cli_review]
+enabled = true
+base_ref = "origin/main"
+output_format = "json"
 
 [gc]
 max_drafts_per_run = 5
@@ -355,7 +362,21 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 | `enabled` | `true` | Enable independent agent review after PR creation. |
 | `reviewer_agent` | `"codex"` | Agent used for review. It may match the implementor when configured explicitly; Harness runs it as a separate review turn. |
 | `max_rounds` | `3` | Maximum review-fix cycles |
+| `required_providers` | `["codex_cli_review"]` | Local review providers that must approve before local completion can pass. |
+| `advisory_providers` | `["gemini_github_bot", "codex_github_bot"]` | Hosted GitHub review bots that are recorded but non-blocking unless external review is explicitly required. |
 | `review_bot_auto_trigger` | `false` | Post and wait for a hosted review bot command. When omitted with `enabled = false`, Harness keeps the hosted-bot path; when disabled, local completion requires local review approval, validation, PR-head advancement after local review fixes that changed the workspace or reported a pushed commit, unchanged reviewed PR head after CI polling, green GitHub PR checks, an open PR or already merged PR, and a configured GitHub token. |
+
+### `[agents.review.codex_cli_review]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Enable native local `codex review` execution. |
+| `cli_path` | `"codex"` | Path to the Codex CLI binary. |
+| `model` | Codex default | Model used for the local review provider. |
+| `reasoning_effort` | Codex default | Reasoning effort passed to Codex CLI. |
+| `base_ref` | `"origin/main"` | Base ref passed to `codex review --base`. |
+| `timeout_secs` | `1800` | Maximum local review runtime. |
+| `output_format` | `"json"` | Request a fenced `harness-review-report` block for normalized gating. |
 
 ### `[review]`
 
@@ -646,6 +667,9 @@ harness skill list         # List discovered skills
 harness plan init spec.md           # Initialize execution plan
 harness plan status exec-plan.md    # Check plan status
 
+# PR review
+harness pr review 123 --provider codex_cli_review --base origin/main
+
 # Version
 harness --version
 ```
@@ -667,7 +691,7 @@ or macOS sandbox setting.
 
 ### Codex review shows "unexpected argument"
 
-Codex CLI updated. Check `codex exec --help` for current flags and update `crates/harness-agents/src/codex.rs`.
+Codex CLI updated. Check `codex review --help` for current flags and update `crates/harness-agents/src/codex.rs`.
 
 ### All tasks show `no_pr` status
 

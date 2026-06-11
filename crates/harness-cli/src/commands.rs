@@ -251,6 +251,19 @@ pub struct LoopArgs {
     pub project: std::path::PathBuf,
 }
 
+#[derive(Args)]
+pub struct ReviewArgs {
+    /// Review provider to run
+    #[arg(long, default_value = "codex_cli_review")]
+    pub provider: String,
+    /// Base ref for local PR diff review
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Project directory
+    #[arg(long, default_value = ".")]
+    pub project: std::path::PathBuf,
+}
+
 #[derive(Subcommand)]
 pub enum PrCommand {
     /// Implement a GitHub issue, create a PR, then run the review loop
@@ -266,6 +279,13 @@ pub enum PrCommand {
         pr: u64,
         #[command(flatten)]
         args: LoopArgs,
+    },
+    /// Run a local review provider for an existing PR branch
+    Review {
+        /// GitHub PR number
+        pr: u64,
+        #[command(flatten)]
+        args: ReviewArgs,
     },
 }
 
@@ -828,6 +848,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::cmd::pr::loop_pr(&config, pr, args.wait, args.max_rounds, args.project)
                     .await?;
             }
+            PrCommand::Review { pr, args } => {
+                crate::cmd::pr::review(&config, pr, args.provider, args.base, args.project).await?;
+            }
         },
 
         Command::Plan { cmd } => match cmd {
@@ -1330,6 +1353,34 @@ mod tests {
                 assert_eq!(args.max_rounds, 3);
             }
             _ => panic!("expected Pr Loop command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_pr_review_with_provider_and_base() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "pr",
+            "review",
+            "99",
+            "--provider",
+            "codex_cli_review",
+            "--base",
+            "origin/main",
+            "--project",
+            "/tmp/project",
+        ])
+        .expect("pr review should parse");
+        match cli.command {
+            Command::Pr {
+                cmd: PrCommand::Review { pr, args },
+            } => {
+                assert_eq!(pr, 99);
+                assert_eq!(args.provider, "codex_cli_review");
+                assert_eq!(args.base.as_deref(), Some("origin/main"));
+                assert_eq!(args.project, PathBuf::from("/tmp/project"));
+            }
+            _ => panic!("expected Pr Review command"),
         }
     }
 
