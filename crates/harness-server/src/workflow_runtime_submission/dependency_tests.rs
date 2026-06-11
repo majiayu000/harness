@@ -268,6 +268,87 @@ async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> a
 }
 
 #[tokio::test]
+async fn issue_submission_releases_dependency_by_repo_backlog_issue_handle_when_canonical_workflow_completed(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = open_runtime_store(dir.path()).await?;
+    let task_store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let labels = vec!["bug".to_string()];
+    let direct_dep_id = TaskId::from_str("direct-runtime-dep-handle");
+    let dep_result = record_issue_submission(
+        &store,
+        IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 78,
+            task_id: &direct_dep_id,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+    let mut dep_workflow = store
+        .get_instance(&dep_result.workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("dependency workflow should exist"))?;
+    dep_workflow.state = "done".to_string();
+    store.upsert_instance(&dep_workflow).await?;
+
+    let repo_backlog_dep_id = TaskId::from_str("repo-backlog:owner/repo:issue:78");
+    assert!(
+        store
+            .get_instance_by_task_id(repo_backlog_dep_id.as_str())
+            .await?
+            .is_none(),
+        "planner dependency handle should not exist as a runtime task id"
+    );
+
+    let task_id = TaskId::from_str("runtime-dependent-on-repo-backlog-handle");
+    let blocked = record_issue_submission(
+        &store,
+        IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 79,
+            task_id: &task_id,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: std::slice::from_ref(&repo_backlog_dep_id),
+            dependencies_blocked: true,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+
+    let released = release_ready_issue_dependencies(&store, &task_store, 10).await?;
+    assert_eq!(released.released, 1);
+    assert_eq!(released.waiting, 0);
+    assert_eq!(released.failed, 0);
+    let workflow = store
+        .get_instance(&blocked.workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("dependent workflow should remain persisted"))?;
+    assert_eq!(workflow.state, "planning");
+    let commands = store.commands_for(&blocked.workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn issue_submission_keeps_blocked_runtime_dependency_without_closed_evidence_waiting(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
