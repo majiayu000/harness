@@ -55,7 +55,7 @@ function shortPath(path: string | null): string {
 }
 
 function fmtRuntimeState(invocation: AgentInvocation): string {
-  const leaseState = invocation.lease_state ? ` / ${invocation.lease_state.replaceAll("_", " ")}` : "";
+  const leaseState = invocation.lease_state ? ` / ${invocation.lease_state.replace(/_/g, " ")}` : "";
   const inFlight = invocation.in_flight_model_turn ? " / in-flight" : "";
   return `${invocation.status}${leaseState}${inFlight} / ${invocation.workflow_state}`;
 }

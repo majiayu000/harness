@@ -119,7 +119,7 @@ function runtimeJobUpdatedAt(job: WorkflowRuntimeJob): number {
 
 function runtimeLeaseLabel(value?: string | null): string | null {
   if (!value) return null;
-  return value.replaceAll("_", " ");
+  return value.replace(/_/g, " ");
 }
 
 function compactRuntimeTimestamp(value?: string | null): string | null {

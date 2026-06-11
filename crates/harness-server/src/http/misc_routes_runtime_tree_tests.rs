@@ -1,5 +1,7 @@
 use super::*;
-use harness_workflow::runtime::{ActivityArtifact, ActivityResult, RuntimeJob, RuntimeKind};
+use harness_workflow::runtime::{
+    ActivityArtifact, ActivityResult, RuntimeEvent, RuntimeJob, RuntimeKind,
+};
 use serde_json::json;
 
 fn runtime_job_with_artifacts(artifacts: Vec<ActivityArtifact>) -> RuntimeJob {
@@ -98,4 +100,47 @@ fn runtime_activity_summary_counts_all_loaded_jobs() {
     assert_eq!(summary.activity_outcomes["accepted"], 1);
     assert_eq!(summary.activity_outcomes["repaired_structured_output"], 1);
     assert_eq!(summary.jobs_without_activity_envelope, 1);
+}
+
+#[test]
+fn runtime_job_has_in_flight_model_turn_uses_latest_turn_sequence() {
+    let mut job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-high",
+        json!({}),
+    );
+    job.claim(
+        "worker-1",
+        chrono::Utc::now() + chrono::Duration::minutes(5),
+    );
+    let events = vec![
+        RuntimeEvent::new(&job.id, 1, "RuntimeTurnStarted", json!({})),
+        RuntimeEvent::new(&job.id, 2, "ActivityResultReady", json!({})),
+        RuntimeEvent::new(&job.id, 3, "RuntimeTurnStarted", json!({})),
+    ];
+
+    assert!(runtime_job_has_in_flight_model_turn(&job, &events));
+}
+
+#[test]
+fn runtime_job_has_in_flight_model_turn_ends_after_result_for_latest_turn() {
+    let mut job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-high",
+        json!({}),
+    );
+    job.claim(
+        "worker-1",
+        chrono::Utc::now() + chrono::Duration::minutes(5),
+    );
+    let events = vec![
+        RuntimeEvent::new(&job.id, 1, "RuntimeTurnStarted", json!({})),
+        RuntimeEvent::new(&job.id, 2, "ActivityResultReady", json!({})),
+        RuntimeEvent::new(&job.id, 3, "RuntimeTurnStarted", json!({})),
+        RuntimeEvent::new(&job.id, 4, "ActivityResultReady", json!({})),
+    ];
+
+    assert!(!runtime_job_has_in_flight_model_turn(&job, &events));
 }

@@ -86,7 +86,7 @@ fn runtime_attribution_tokens_include_runtime_job_and_command_ids() {
         latest_runtime_event_type: None,
         latest_runtime_event_at: None,
         runtime_turn_started: false,
-        activity_result_ready: false,
+        activity_result_ready_after_latest_turn: false,
     };
 
     let tokens = runtime_attribution_tokens(&[row]);
@@ -129,7 +129,7 @@ fn agent_invocation_exposes_running_lease_state_and_observation() {
         latest_runtime_event_type: Some("RuntimeTurnStarted".to_string()),
         latest_runtime_event_at: Some(now - chrono::Duration::seconds(30)),
         runtime_turn_started: true,
-        activity_result_ready: false,
+        activity_result_ready_after_latest_turn: false,
     };
 
     let invocation = agent_invocation_from_row(&row, now);
@@ -145,4 +145,39 @@ fn agent_invocation_exposes_running_lease_state_and_observation() {
         Some(row.runtime_job.updated_at)
     );
     assert!(!invocation.stale);
+}
+
+#[test]
+fn agent_invocation_ends_in_flight_after_latest_turn_result() {
+    let now = Utc::now();
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1170"),
+    )
+    .with_id("workflow-1170");
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "impl-1170");
+    let mut runtime_job = RuntimeJob::pending(
+        "command-1170",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        serde_json::json!({ "activity": "implement_issue" }),
+    );
+    runtime_job.claim("runtime-1", now + chrono::Duration::minutes(5));
+    let row = RuntimeUsageRow {
+        workflow,
+        command_id: "command-1170".to_string(),
+        command_status: "dispatched".to_string(),
+        command,
+        runtime_job,
+        latest_runtime_event_type: Some("ActivityResultReady".to_string()),
+        latest_runtime_event_at: Some(now - chrono::Duration::seconds(5)),
+        runtime_turn_started: true,
+        activity_result_ready_after_latest_turn: true,
+    };
+
+    let invocation = agent_invocation_from_row(&row, now);
+
+    assert!(!invocation.in_flight_model_turn);
 }

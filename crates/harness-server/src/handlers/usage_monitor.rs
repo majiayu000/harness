@@ -269,7 +269,7 @@ struct RuntimeUsageRow {
     latest_runtime_event_type: Option<String>,
     latest_runtime_event_at: Option<DateTime<Utc>>,
     runtime_turn_started: bool,
-    activity_result_ready: bool,
+    activity_result_ready_after_latest_turn: bool,
 }
 
 type RuntimeUsageSqlRow = (
@@ -510,7 +510,7 @@ async fn load_runtime_usage_rows(
              job.data::text,
              latest_event.event_type,
              latest_event.created_at,
-             COALESCE(event_flags.runtime_turn_started, false),
+             latest_turn.sequence IS NOT NULL,
              COALESCE(event_flags.activity_result_ready, false)
          FROM runtime_jobs job
          JOIN workflow_commands command ON command.id = job.command_id
@@ -523,11 +523,14 @@ async fn load_runtime_usage_rows(
              LIMIT 1
          ) latest_event ON true
          LEFT JOIN LATERAL (
-             SELECT
-                 BOOL_OR(event_type = 'RuntimeTurnStarted') AS runtime_turn_started,
-                 BOOL_OR(event_type = 'ActivityResultReady') AS activity_result_ready
+             SELECT sequence FROM runtime_events event
+             WHERE event.runtime_job_id = job.id AND event.event_type = 'RuntimeTurnStarted'
+             ORDER BY sequence DESC LIMIT 1
+         ) latest_turn ON true
+         LEFT JOIN LATERAL (
+             SELECT BOOL_OR(event_type = 'ActivityResultReady') AS activity_result_ready
              FROM runtime_events event
-             WHERE event.runtime_job_id = job.id
+             WHERE event.runtime_job_id = job.id AND event.sequence > latest_turn.sequence
          ) event_flags ON true
          WHERE job.status IN ('pending', 'running')
             OR job.updated_at >= $1
@@ -559,7 +562,7 @@ async fn load_runtime_usage_rows(
                 latest_runtime_event_type,
                 latest_runtime_event_at,
                 runtime_turn_started,
-                activity_result_ready,
+                activity_result_ready_after_latest_turn,
             )| {
                 match parse_runtime_usage_row(
                     &workflow_id,
@@ -571,7 +574,7 @@ async fn load_runtime_usage_rows(
                     latest_runtime_event_type,
                     latest_runtime_event_at,
                     runtime_turn_started,
-                    activity_result_ready,
+                    activity_result_ready_after_latest_turn,
                 ) {
                     Ok(row) => Some(row),
                     Err(error) => {
@@ -597,7 +600,7 @@ fn parse_runtime_usage_row(
     latest_runtime_event_type: Option<String>,
     latest_runtime_event_at: Option<DateTime<Utc>>,
     runtime_turn_started: bool,
-    activity_result_ready: bool,
+    activity_result_ready_after_latest_turn: bool,
 ) -> anyhow::Result<RuntimeUsageRow> {
     Ok(RuntimeUsageRow {
         workflow: serde_json::from_str(workflow).map_err(|error| {
@@ -613,7 +616,7 @@ fn parse_runtime_usage_row(
         latest_runtime_event_type,
         latest_runtime_event_at,
         runtime_turn_started,
-        activity_result_ready,
+        activity_result_ready_after_latest_turn,
     })
 }
 
@@ -638,10 +641,8 @@ fn agent_invocation_from_row(row: &RuntimeUsageRow, now: DateTime<Utc>) -> Agent
         .unwrap_or_else(|| row.command.command_type.as_str())
         .to_string();
     let lease_expires_at = job.lease.as_ref().map(|lease| lease.expires_at);
-    let lease_state =
-        runtime_job_running_lease_state_at(job, now).map(|state| state.status_label());
-    let stale = matches!(job.status, RuntimeJobStatus::Running)
-        && matches!(lease_state, Some("expired_lease" | "missing_lease"));
+    let lease_state = runtime_job_running_lease_state_at(job, now).map(|s| s.status_label());
+    let stale = matches!(lease_state, Some("expired_lease" | "missing_lease"));
     let age_secs = (now - job.created_at).num_seconds().max(0);
     let updated_age_secs = (now - job.updated_at).num_seconds().max(0);
     let last_runtime_observation_at = last_runtime_observation_at(job, row.latest_runtime_event_at);
@@ -688,7 +689,7 @@ fn agent_invocation_from_row(row: &RuntimeUsageRow, now: DateTime<Utc>) -> Agent
         lease_state,
         in_flight_model_turn: matches!(job.status, RuntimeJobStatus::Running)
             && row.runtime_turn_started
-            && !row.activity_result_ready,
+            && !row.activity_result_ready_after_latest_turn,
         latest_runtime_event_type: row.latest_runtime_event_type.clone(),
         last_runtime_observation_at,
         stale,

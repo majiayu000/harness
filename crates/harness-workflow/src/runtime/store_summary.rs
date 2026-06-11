@@ -79,8 +79,7 @@ async fn running_job_lease_statuses_for_instances(
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT
              CASE
-                 WHEN NOT (job.data ? 'lease')
-                   OR NOT (job.data->'lease' ? 'expires_at')
+                 WHEN job.data->'lease'->>'expires_at' IS NULL
                  THEN 'missing_lease'
                  WHEN (job.data->'lease'->>'expires_at')::timestamptz > CURRENT_TIMESTAMP
                  THEN 'active_leased'

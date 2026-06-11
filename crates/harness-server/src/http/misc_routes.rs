@@ -576,13 +576,20 @@ fn prompt_packet_digest_from_events(events: &[RuntimeEvent]) -> Option<String> {
 }
 
 fn runtime_job_has_in_flight_model_turn(job: &RuntimeJob, events: &[RuntimeEvent]) -> bool {
-    job.status == RuntimeJobStatus::Running
-        && events
-            .iter()
-            .any(|event| event.event_type == "RuntimeTurnStarted")
-        && !events
-            .iter()
-            .any(|event| event.event_type == "ActivityResultReady")
+    if job.status != RuntimeJobStatus::Running {
+        return false;
+    }
+    let Some(latest_turn_sequence) = events
+        .iter()
+        .filter(|event| event.event_type == "RuntimeTurnStarted")
+        .map(|event| event.sequence)
+        .max()
+    else {
+        return false;
+    };
+    !events.iter().any(|event| {
+        event.event_type == "ActivityResultReady" && event.sequence > latest_turn_sequence
+    })
 }
 
 fn last_runtime_observation_at(
