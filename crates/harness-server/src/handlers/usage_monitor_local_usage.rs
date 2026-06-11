@@ -277,10 +277,21 @@ fn unavailable_summary(
 
 fn parse_ccstats_session_rows(stdout: &str) -> Result<Vec<CcstatsSessionRow>, serde_json::Error> {
     let trimmed = stdout.trim();
-    if trimmed.is_empty() || trimmed.contains(" session data found in the selected date range") {
+    if is_ccstats_no_data_output(trimmed) {
         return Ok(Vec::new());
     }
     serde_json::from_str::<Vec<CcstatsSessionRow>>(trimmed)
+}
+
+fn is_ccstats_no_data_output(stdout: &str) -> bool {
+    let Some(first_line) = stdout.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return true;
+    };
+
+    first_line.starts_with("No ")
+        && (first_line.ends_with(" data found.")
+            || first_line.ends_with(" session data found in the selected date range.")
+            || first_line.ends_with(" usage data found in the selected date range."))
 }
 
 fn format_window_timestamp(timestamp: DateTime<Utc>) -> String {
@@ -493,14 +504,18 @@ mod tests {
 
     #[test]
     fn parse_ccstats_session_rows_treats_no_data_message_as_empty() {
-        let rows = match parse_ccstats_session_rows(
+        for output in [
+            "",
             "No OpenAI Codex session data found in the selected date range.",
-        ) {
-            Ok(rows) => rows,
-            Err(error) => panic!("no-data ccstats output should parse as empty: {error}"),
-        };
+            "No codex usage data found in the selected date range.\nRun ccstats without --offline to refresh cached pricing.",
+        ] {
+            let rows = match parse_ccstats_session_rows(output) {
+                Ok(rows) => rows,
+                Err(error) => panic!("no-data ccstats output should parse as empty: {error}"),
+            };
 
-        assert!(rows.is_empty());
+            assert!(rows.is_empty());
+        }
     }
 
     fn fake_session_row() -> CcstatsSessionRow {

@@ -287,9 +287,9 @@ export function UsageMonitor() {
           <div className="grid grid-cols-6 border-b border-line">
             <KpiCard label="Tokens" value={fmtTokens(data?.summary.total_tokens)} delta={`${fmtInt(data?.summary.request_count)} requests`} />
             <KpiCard
-              label="Est. cost"
+              label="Harness cost"
               value={fmtCost(data?.summary.estimated_cost_usd)}
-              delta={data?.cost.configured ? `${data.cost.currency} catalog` : "price unavailable"}
+              delta={data?.cost.configured ? `${data.cost.currency} catalog` : "see local totals"}
             />
             <KpiCard label="Running agents" value={fmtInt(data?.summary.running_agent_invocations)} delta={`${fmtInt(data?.summary.pending_agent_invocations)} pending`} />
             <KpiCard label="High burn" value={fmtInt(data?.summary.high_burn_invocations)} delta={`${fmtInt(data?.summary.stale_agent_invocations)} stale`} />
