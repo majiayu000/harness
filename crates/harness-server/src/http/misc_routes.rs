@@ -14,8 +14,9 @@ use std::sync::Arc;
 use super::{state::AppState, task_routes};
 use crate::{router, task_runner};
 use harness_workflow::runtime::{
-    RuntimeEvent, RuntimeJob, WorkflowCommand, WorkflowCommandRecord, WorkflowDecisionRecord,
-    WorkflowEvent, WorkflowInstance,
+    runtime_job_running_lease_state_at, RuntimeEvent, RuntimeJob, RuntimeJobStatus,
+    WorkflowCommand, WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowEvent,
+    WorkflowInstance,
 };
 
 const ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE: &str = "activity_result_envelope";
@@ -182,6 +183,9 @@ struct WorkflowRuntimeJobNode {
     pub latest_runtime_event_type: Option<String>,
     pub prompt_packet_digest: Option<String>,
     pub activity_result_envelope: Option<Value>,
+    pub lease_state: Option<&'static str>,
+    pub in_flight_model_turn: bool,
+    pub last_runtime_observation_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl WorkflowRuntimeJobNode {
@@ -189,12 +193,19 @@ impl WorkflowRuntimeJobNode {
         let latest_runtime_event_type = runtime_events.last().map(|event| event.event_type.clone());
         let prompt_packet_digest = prompt_packet_digest_from_events(&runtime_events);
         let activity_result_envelope = activity_result_envelope_from_job(&job);
+        let lease_state = runtime_job_running_lease_state_at(&job, chrono::Utc::now())
+            .map(|state| state.status_label());
+        let in_flight_model_turn = runtime_job_has_in_flight_model_turn(&job, &runtime_events);
+        let last_runtime_observation_at = last_runtime_observation_at(&job, &runtime_events);
         Self {
             job,
             runtime_event_count: runtime_events.len(),
             latest_runtime_event_type,
             prompt_packet_digest,
             activity_result_envelope,
+            lease_state,
+            in_flight_model_turn,
+            last_runtime_observation_at,
         }
     }
 }
@@ -253,6 +264,7 @@ struct WorkflowRuntimeTreeSummary {
     pub total_runtime_jobs: usize,
     pub command_statuses: BTreeMap<String, usize>,
     pub runtime_job_statuses: BTreeMap<String, usize>,
+    pub running_job_lease_statuses: BTreeMap<String, usize>,
     pub activity_outcomes: BTreeMap<String, usize>,
     pub jobs_without_activity_envelope: usize,
 }
@@ -433,6 +445,7 @@ async fn build_workflow_runtime_tree(
         total_runtime_jobs: aggregate_summary.total_runtime_jobs,
         command_statuses: aggregate_summary.command_statuses,
         runtime_job_statuses: aggregate_summary.runtime_job_statuses,
+        running_job_lease_statuses: aggregate_summary.running_job_lease_statuses,
         activity_outcomes: aggregate_summary.activity_outcomes,
         jobs_without_activity_envelope: aggregate_summary.jobs_without_activity_envelope,
     };
@@ -562,6 +575,30 @@ fn prompt_packet_digest_from_events(events: &[RuntimeEvent]) -> Option<String> {
     })
 }
 
+fn runtime_job_has_in_flight_model_turn(job: &RuntimeJob, events: &[RuntimeEvent]) -> bool {
+    job.status == RuntimeJobStatus::Running
+        && events
+            .iter()
+            .any(|event| event.event_type == "RuntimeTurnStarted")
+        && !events
+            .iter()
+            .any(|event| event.event_type == "ActivityResultReady")
+}
+
+fn last_runtime_observation_at(
+    job: &RuntimeJob,
+    events: &[RuntimeEvent],
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let latest_event_at = events.last().map(|event| event.created_at);
+    if job.status == RuntimeJobStatus::Running {
+        return Some(match latest_event_at {
+            Some(created_at) => created_at.max(job.updated_at),
+            None => job.updated_at,
+        });
+    }
+    latest_event_at
+}
+
 fn activity_result_envelope_from_job(job: &RuntimeJob) -> Option<Value> {
     let artifacts = job.output.as_ref()?.get("artifacts")?.as_array()?;
     artifacts.iter().rev().find_map(|artifact| {
@@ -599,109 +636,8 @@ fn attach_workflow_children(
 }
 
 #[cfg(test)]
-mod runtime_tree_tests {
-    use super::*;
-    use harness_workflow::runtime::{ActivityArtifact, ActivityResult, RuntimeJob, RuntimeKind};
-    use serde_json::json;
-
-    fn runtime_job_with_artifacts(artifacts: Vec<ActivityArtifact>) -> RuntimeJob {
-        let result = artifacts.into_iter().fold(
-            ActivityResult::succeeded("replan_issue", "Runtime job completed."),
-            ActivityResult::with_artifact,
-        );
-        let mut job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-high",
-            json!({}),
-        );
-        job.output = Some(serde_json::to_value(result).expect("activity result should serialize"));
-        job
-    }
-
-    #[test]
-    fn activity_result_envelope_from_job_returns_latest_valid_envelope() {
-        let older = ActivityArtifact::new(
-            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
-            json!({
-                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
-                "outcome": "accepted",
-            }),
-        );
-        let newer = ActivityArtifact::new(
-            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
-            json!({
-                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
-                "outcome": "repaired_structured_output",
-            }),
-        );
-        let job = runtime_job_with_artifacts(vec![older, newer]);
-
-        let envelope =
-            activity_result_envelope_from_job(&job).expect("valid envelope should be exposed");
-
-        assert_eq!(envelope["outcome"], "repaired_structured_output");
-    }
-
-    #[test]
-    fn activity_result_envelope_from_job_ignores_missing_or_invalid_envelope() {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-high",
-            json!({}),
-        );
-        assert!(activity_result_envelope_from_job(&job).is_none());
-
-        let job = runtime_job_with_artifacts(vec![ActivityArtifact::new(
-            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
-            json!({
-                "schema": "harness.runtime.activity_result_envelope.v0",
-                "outcome": "accepted",
-            }),
-        )]);
-        assert!(activity_result_envelope_from_job(&job).is_none());
-    }
-
-    #[test]
-    fn runtime_activity_summary_counts_all_loaded_jobs() {
-        let accepted = ActivityArtifact::new(
-            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
-            json!({
-                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
-                "outcome": "accepted",
-            }),
-        );
-        let repaired = ActivityArtifact::new(
-            ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE,
-            json!({
-                "schema": ACTIVITY_RESULT_ENVELOPE_SCHEMA,
-                "outcome": "repaired_structured_output",
-            }),
-        );
-        let mut jobs_by_command = BTreeMap::new();
-        jobs_by_command.insert(
-            "command-1".to_string(),
-            vec![
-                runtime_job_with_artifacts(vec![accepted]),
-                runtime_job_with_artifacts(vec![repaired]),
-                RuntimeJob::pending(
-                    "command-1",
-                    RuntimeKind::CodexJsonrpc,
-                    "codex-high",
-                    json!({}),
-                ),
-            ],
-        );
-        let mut summary = WorkflowRuntimeTreeSummary::default();
-
-        apply_runtime_activity_summary(&mut summary, &jobs_by_command);
-
-        assert_eq!(summary.activity_outcomes["accepted"], 1);
-        assert_eq!(summary.activity_outcomes["repaired_structured_output"], 1);
-        assert_eq!(summary.jobs_without_activity_envelope, 1);
-    }
-}
+#[path = "misc_routes_runtime_tree_tests.rs"]
+mod runtime_tree_tests;
 
 pub(crate) async fn handle_rpc(
     State(state): State<Arc<AppState>>,

@@ -301,6 +301,7 @@ describe("<Active>", () => {
           total_runtime_jobs: 7,
           command_statuses: { pending: 1 },
           runtime_job_statuses: { failed: 3, running: 4 },
+          running_job_lease_statuses: { active_leased: 2, expired_lease: 2 },
         },
         workflows: [
           {
@@ -392,6 +393,9 @@ describe("<Active>", () => {
                         runtime_kind: "codex_jsonrpc",
                         runtime_profile: "codex-high",
                         status: "running",
+                        lease_state: "active_leased",
+                        in_flight_model_turn: true,
+                        last_runtime_observation_at: "2026-04-30T00:03:30Z",
                         input: {},
                         not_before: null,
                         runtime_event_count: 3,
@@ -420,13 +424,15 @@ describe("<Active>", () => {
 
     expect(screen.getByText("Workflow Runtime")).toBeInTheDocument();
     expect(screen.getByText("2/2 workflows")).toBeInTheDocument();
+    expect(screen.getByText("2 active leases")).toBeInTheDocument();
+    expect(screen.getByText("2 expired/missing")).toBeInTheDocument();
     expect(screen.getByText("repo_backlog - owner/repo")).toBeInTheDocument();
     expect(screen.getByText("github_issue_pr - issue:123")).toBeInTheDocument();
     expect(screen.getByText("activity: replan_issue")).toBeInTheDocument();
     expect(screen.getByText("7 jobs")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "2/7 jobs - running - event ActivityStarted - prompt abcdef012345",
+        "2/7 jobs - running - active leased - in-flight - observed 2026-04-30 00:03:30Z - event ActivityStarted - prompt abcdef012345",
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("rejected: replan limit exhausted")).toBeInTheDocument();

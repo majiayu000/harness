@@ -54,6 +54,17 @@ function shortPath(path: string | null): string {
   return parts.slice(-3).join("/");
 }
 
+function fmtRuntimeState(invocation: AgentInvocation): string {
+  const leaseState = invocation.lease_state ? ` / ${invocation.lease_state.replaceAll("_", " ")}` : "";
+  const inFlight = invocation.in_flight_model_turn ? " / in-flight" : "";
+  return `${invocation.status}${leaseState}${inFlight} / ${invocation.workflow_state}`;
+}
+
+function fmtObservedAt(value: string | null): string {
+  if (!value) return "-";
+  return value.replace("T", " ").replace(/\.\d+Z$/, "Z");
+}
+
 function UsageGroupsTable({ rows, empty }: { rows: UsageGroup[]; empty: string }) {
   return (
     <div className="overflow-auto">
@@ -92,10 +103,11 @@ function ActiveCountsList({ rows }: { rows: ActiveCount[] }) {
     <div className="p-4 space-y-2">
       {rows.length ? (
         rows.slice(0, 10).map((row) => (
-          <div key={row.name} className="grid grid-cols-[1fr_48px_48px_48px] gap-2 font-mono text-[11.5px]">
+          <div key={row.name} className="grid grid-cols-[1fr_48px_48px_48px_48px] gap-2 font-mono text-[11.5px]">
             <span className="truncate text-ink-2" title={row.name}>{row.name}</span>
-            <span className="text-right text-ok">{fmtInt(row.running)}</span>
+            <span className="text-right text-ok">{fmtInt(row.active_leased)}</span>
             <span className="text-right text-sand">{fmtInt(row.pending)}</span>
+            <span className="text-right text-warn">{fmtInt(row.expired_or_missing_lease)}</span>
             <span className="text-right text-danger">{fmtInt(row.high_burn)}</span>
           </div>
         ))
@@ -119,6 +131,7 @@ function AgentInvocationsTable({ invocations }: { invocations: AgentInvocation[]
             <th className="text-left font-medium px-4 py-2">Runtime</th>
             <th className="text-left font-medium px-4 py-2">State</th>
             <th className="text-right font-medium px-4 py-2">Age</th>
+            <th className="text-left font-medium px-4 py-2">Observed</th>
             <th className="text-left font-medium px-4 py-2">Owner</th>
           </tr>
         </thead>
@@ -142,8 +155,11 @@ function AgentInvocationsTable({ invocations }: { invocations: AgentInvocation[]
                   {invocation.agent_runtime}
                   {invocation.reasoning_effort ? <span className="text-ink-4"> / {invocation.reasoning_effort}</span> : null}
                 </td>
-                <td className="px-4 py-2 text-ink-2">{invocation.status} / {invocation.workflow_state}</td>
+                <td className="px-4 py-2 text-ink-2">{fmtRuntimeState(invocation)}</td>
                 <td className="px-4 py-2 text-right text-ink-2">{fmtDuration(invocation.age_secs)}</td>
+                <td className="px-4 py-2 text-ink-3 max-w-[180px] truncate" title={invocation.latest_runtime_event_type ?? ""}>
+                  {fmtObservedAt(invocation.last_runtime_observation_at)}
+                </td>
                 <td className="px-4 py-2 text-ink-3 max-w-[160px] truncate" title={invocation.lease_owner ?? ""}>
                   {invocation.lease_owner ?? "-"}
                 </td>
@@ -151,7 +167,7 @@ function AgentInvocationsTable({ invocations }: { invocations: AgentInvocation[]
             ))
           ) : (
             <tr>
-              <td className="px-4 py-6 text-ink-3" colSpan={8}>no active agent invocations</td>
+              <td className="px-4 py-6 text-ink-3" colSpan={9}>no active agent invocations</td>
             </tr>
           )}
         </tbody>
@@ -291,7 +307,11 @@ export function UsageMonitor() {
               value={fmtCost(data?.summary.estimated_cost_usd)}
               delta={data?.cost.configured ? `${data.cost.currency} catalog` : "price unavailable"}
             />
-            <KpiCard label="Running agents" value={fmtInt(data?.summary.running_agent_invocations)} delta={`${fmtInt(data?.summary.pending_agent_invocations)} pending`} />
+            <KpiCard
+              label="Active leases"
+              value={fmtInt(data?.summary.active_leased_agent_invocations)}
+              delta={`${fmtInt(data?.summary.expired_or_missing_lease_agent_invocations)} expired/missing, ${fmtInt(data?.summary.pending_agent_invocations)} pending`}
+            />
             <KpiCard label="High burn" value={fmtInt(data?.summary.high_burn_invocations)} delta={`${fmtInt(data?.summary.stale_agent_invocations)} stale`} />
             <KpiCard label="External procs" value={fmtInt(data?.summary.external_agent_processes)} delta="local CLI only" />
             <KpiCard label="Models" value={fmtInt(data?.tokens_by_model.length)} delta={`${fmtInt(data?.cost.missing_model_count)} unpriced`} />
@@ -303,7 +323,7 @@ export function UsageMonitor() {
             </Panel>
             <Panel
               title="Active pressure"
-              sub="running / pending / high"
+              sub="active / pending / expired / high"
             >
               <div className="grid grid-cols-2">
                 <Panel title="By repo" className="border-r border-line">

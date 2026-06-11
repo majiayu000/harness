@@ -8,7 +8,8 @@ use chrono::{DateTime, Duration, Utc};
 use harness_core::types::{Event, EventFilters};
 use harness_observe::usage::UsageMetrics;
 use harness_workflow::runtime::{
-    RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, WorkflowCommand, WorkflowInstance,
+    runtime_job_running_lease_state_at, RuntimeJob, RuntimeJobStatus, RuntimeProfile,
+    WorkflowCommand, WorkflowInstance,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,11 +18,14 @@ use std::sync::{Arc, OnceLock};
 
 use crate::http::AppState;
 
+#[path = "usage_monitor_active.rs"]
+mod usage_monitor_active;
 #[path = "usage_monitor_local_usage.rs"]
 mod usage_monitor_local_usage;
 #[path = "usage_monitor_process.rs"]
 mod usage_monitor_process;
 
+use usage_monitor_active::{aggregate_active_counts, burn_level, runtime_job_status, runtime_kind};
 use usage_monitor_local_usage::{load_local_usage_summaries, LocalUsageSourceSummary};
 use usage_monitor_process::{sample_agent_processes, AgentProcess};
 
@@ -90,6 +94,8 @@ struct UsageSummary {
     request_count: u64,
     estimated_cost_usd: Option<f64>,
     running_agent_invocations: u64,
+    active_leased_agent_invocations: u64,
+    expired_or_missing_lease_agent_invocations: u64,
     pending_agent_invocations: u64,
     stale_agent_invocations: u64,
     high_burn_invocations: u64,
@@ -242,6 +248,10 @@ struct AgentInvocation {
     reasoning_effort: Option<String>,
     lease_owner: Option<String>,
     lease_expires_at: Option<DateTime<Utc>>,
+    lease_state: Option<&'static str>,
+    in_flight_model_turn: bool,
+    latest_runtime_event_type: Option<String>,
+    last_runtime_observation_at: Option<DateTime<Utc>>,
     stale: bool,
     age_secs: i64,
     updated_age_secs: i64,
@@ -256,12 +266,31 @@ struct RuntimeUsageRow {
     command_status: String,
     command: WorkflowCommand,
     runtime_job: RuntimeJob,
+    latest_runtime_event_type: Option<String>,
+    latest_runtime_event_at: Option<DateTime<Utc>>,
+    runtime_turn_started: bool,
+    activity_result_ready: bool,
 }
+
+type RuntimeUsageSqlRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    bool,
+    bool,
+);
 
 #[derive(Debug, Serialize)]
 struct ActiveCount {
     name: String,
     running: u64,
+    active_leased: u64,
+    expired_or_missing_lease: u64,
     pending: u64,
     high_burn: u64,
 }
@@ -323,6 +352,19 @@ async fn build_usage_monitor_response(
         .iter()
         .filter(|invocation| invocation.status == "running")
         .count() as u64;
+    let active_leased_agent_invocations = agent_invocations
+        .iter()
+        .filter(|invocation| invocation.lease_state == Some("active_leased"))
+        .count() as u64;
+    let expired_or_missing_lease_agent_invocations = agent_invocations
+        .iter()
+        .filter(|invocation| {
+            matches!(
+                invocation.lease_state,
+                Some("expired_lease" | "missing_lease")
+            )
+        })
+        .count() as u64;
     let pending_agent_invocations = agent_invocations
         .iter()
         .filter(|invocation| invocation.status == "pending")
@@ -365,6 +407,8 @@ async fn build_usage_monitor_response(
             request_count: total_usage.request_count,
             estimated_cost_usd: total_usage.estimated_cost_json(price_catalog.configured()),
             running_agent_invocations,
+            active_leased_agent_invocations,
+            expired_or_missing_lease_agent_invocations,
             pending_agent_invocations,
             stale_agent_invocations,
             high_burn_invocations,
@@ -456,17 +500,35 @@ async fn load_runtime_usage_rows(
     let limit = limit
         .unwrap_or(DEFAULT_RUNTIME_JOB_LIMIT)
         .clamp(1, DEFAULT_RUNTIME_JOB_LIMIT);
-    let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+    let rows: Vec<RuntimeUsageSqlRow> = sqlx::query_as(
         "SELECT
              workflow.id,
              workflow.data::text,
              command.id,
              command.status,
              command.data::text,
-             job.data::text
+             job.data::text,
+             latest_event.event_type,
+             latest_event.created_at,
+             COALESCE(event_flags.runtime_turn_started, false),
+             COALESCE(event_flags.activity_result_ready, false)
          FROM runtime_jobs job
          JOIN workflow_commands command ON command.id = job.command_id
          JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+         LEFT JOIN LATERAL (
+             SELECT event_type, created_at
+             FROM runtime_events event
+             WHERE event.runtime_job_id = job.id
+             ORDER BY sequence DESC
+             LIMIT 1
+         ) latest_event ON true
+         LEFT JOIN LATERAL (
+             SELECT
+                 BOOL_OR(event_type = 'RuntimeTurnStarted') AS runtime_turn_started,
+                 BOOL_OR(event_type = 'ActivityResultReady') AS activity_result_ready
+             FROM runtime_events event
+             WHERE event.runtime_job_id = job.id
+         ) event_flags ON true
          WHERE job.status IN ('pending', 'running')
             OR job.updated_at >= $1
          ORDER BY
@@ -487,7 +549,18 @@ async fn load_runtime_usage_rows(
     Ok(rows
         .into_iter()
         .filter_map(
-            |(workflow_id, workflow, command_id, command_status, command, runtime_job)| {
+            |(
+                workflow_id,
+                workflow,
+                command_id,
+                command_status,
+                command,
+                runtime_job,
+                latest_runtime_event_type,
+                latest_runtime_event_at,
+                runtime_turn_started,
+                activity_result_ready,
+            )| {
                 match parse_runtime_usage_row(
                     &workflow_id,
                     command_id,
@@ -495,6 +568,10 @@ async fn load_runtime_usage_rows(
                     &workflow,
                     &command,
                     &runtime_job,
+                    latest_runtime_event_type,
+                    latest_runtime_event_at,
+                    runtime_turn_started,
+                    activity_result_ready,
                 ) {
                     Ok(row) => Some(row),
                     Err(error) => {
@@ -517,6 +594,10 @@ fn parse_runtime_usage_row(
     workflow: &str,
     command: &str,
     runtime_job: &str,
+    latest_runtime_event_type: Option<String>,
+    latest_runtime_event_at: Option<DateTime<Utc>>,
+    runtime_turn_started: bool,
+    activity_result_ready: bool,
 ) -> anyhow::Result<RuntimeUsageRow> {
     Ok(RuntimeUsageRow {
         workflow: serde_json::from_str(workflow).map_err(|error| {
@@ -529,6 +610,10 @@ fn parse_runtime_usage_row(
         runtime_job: serde_json::from_str(runtime_job).map_err(|error| {
             anyhow::anyhow!("runtime job for command `{command_id}` JSON is invalid: {error}")
         })?,
+        latest_runtime_event_type,
+        latest_runtime_event_at,
+        runtime_turn_started,
+        activity_result_ready,
     })
 }
 
@@ -553,10 +638,13 @@ fn agent_invocation_from_row(row: &RuntimeUsageRow, now: DateTime<Utc>) -> Agent
         .unwrap_or_else(|| row.command.command_type.as_str())
         .to_string();
     let lease_expires_at = job.lease.as_ref().map(|lease| lease.expires_at);
+    let lease_state =
+        runtime_job_running_lease_state_at(job, now).map(|state| state.status_label());
     let stale = matches!(job.status, RuntimeJobStatus::Running)
-        && lease_expires_at.is_some_and(|expires_at| expires_at <= now);
+        && matches!(lease_state, Some("expired_lease" | "missing_lease"));
     let age_secs = (now - job.created_at).num_seconds().max(0);
     let updated_age_secs = (now - job.updated_at).num_seconds().max(0);
+    let last_runtime_observation_at = last_runtime_observation_at(job, row.latest_runtime_event_at);
     let reasoning_effort = runtime_profile
         .as_ref()
         .and_then(|profile| profile.reasoning_effort.clone());
@@ -597,12 +685,31 @@ fn agent_invocation_from_row(row: &RuntimeUsageRow, now: DateTime<Utc>) -> Agent
         reasoning_effort,
         lease_owner: job.lease.as_ref().map(|lease| lease.owner.clone()),
         lease_expires_at,
+        lease_state,
+        in_flight_model_turn: matches!(job.status, RuntimeJobStatus::Running)
+            && row.runtime_turn_started
+            && !row.activity_result_ready,
+        latest_runtime_event_type: row.latest_runtime_event_type.clone(),
+        last_runtime_observation_at,
         stale,
         age_secs,
         updated_age_secs,
         burn_level,
         cost_confidence: "estimated_runtime_burn",
     }
+}
+
+fn last_runtime_observation_at(
+    job: &RuntimeJob,
+    latest_runtime_event_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    if job.status == RuntimeJobStatus::Running {
+        return Some(match latest_runtime_event_at {
+            Some(created_at) => created_at.max(job.updated_at),
+            None => job.updated_at,
+        });
+    }
+    latest_runtime_event_at
 }
 
 fn runtime_profile_from_job(job: &RuntimeJob) -> Option<RuntimeProfile> {
@@ -664,63 +771,6 @@ fn usage_group(name: String, usage: UsageAggregate, prices_configured: bool) -> 
     }
 }
 
-fn aggregate_active_counts<F>(invocations: &[AgentInvocation], key_fn: F) -> Vec<ActiveCount>
-where
-    F: Fn(&AgentInvocation) -> String,
-{
-    let mut counts: BTreeMap<String, ActiveCount> = BTreeMap::new();
-    for invocation in invocations {
-        let entry = counts
-            .entry(key_fn(invocation))
-            .or_insert_with_key(|name| ActiveCount {
-                name: name.clone(),
-                running: 0,
-                pending: 0,
-                high_burn: 0,
-            });
-        match invocation.status {
-            "running" => entry.running += 1,
-            "pending" => entry.pending += 1,
-            _ => {}
-        }
-        if invocation.burn_level == "high" {
-            entry.high_burn += 1;
-        }
-    }
-    let mut rows = counts.into_values().collect::<Vec<_>>();
-    rows.sort_by(|a, b| {
-        let a_total = a.running + a.pending;
-        let b_total = b.running + b.pending;
-        b_total.cmp(&a_total).then_with(|| a.name.cmp(&b.name))
-    });
-    rows
-}
-
-fn burn_level(
-    status: &str,
-    activity: &str,
-    reasoning_effort: Option<&str>,
-    age_secs: i64,
-    stale: bool,
-) -> &'static str {
-    if stale {
-        return "high";
-    }
-    if status != "running" {
-        return "low";
-    }
-    if matches!(reasoning_effort, Some("xhigh" | "high")) || age_secs >= 1800 {
-        return "high";
-    }
-    if activity == "poll_repo_backlog" && age_secs >= 300 {
-        return "medium";
-    }
-    if age_secs >= 900 {
-        return "medium";
-    }
-    "low"
-}
-
 fn string_field(value: &Value, field: &str) -> Option<String> {
     value
         .get(field)
@@ -730,27 +780,6 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
 
 fn u64_field(value: &Value, field: &str) -> Option<u64> {
     value.get(field).and_then(Value::as_u64)
-}
-
-fn runtime_job_status(status: RuntimeJobStatus) -> &'static str {
-    match status {
-        RuntimeJobStatus::Pending => "pending",
-        RuntimeJobStatus::Running => "running",
-        RuntimeJobStatus::Succeeded => "succeeded",
-        RuntimeJobStatus::Failed => "failed",
-        RuntimeJobStatus::Cancelled => "cancelled",
-        RuntimeJobStatus::Expired => "expired",
-    }
-}
-
-fn runtime_kind(kind: RuntimeKind) -> &'static str {
-    match kind {
-        RuntimeKind::CodexExec => "codex_exec",
-        RuntimeKind::CodexJsonrpc => "codex_jsonrpc",
-        RuntimeKind::ClaudeCode => "claude_code",
-        RuntimeKind::AnthropicApi => "anthropic_api",
-        RuntimeKind::RemoteHost => "remote_host",
-    }
 }
 
 fn blank_label(value: &str) -> String {

@@ -21,6 +21,8 @@ export interface UsageSummary {
   request_count: number;
   estimated_cost_usd: number | null;
   running_agent_invocations: number;
+  active_leased_agent_invocations: number;
+  expired_or_missing_lease_agent_invocations: number;
   pending_agent_invocations: number;
   stale_agent_invocations: number;
   high_burn_invocations: number;
@@ -97,6 +99,10 @@ export interface AgentInvocation {
   reasoning_effort: string | null;
   lease_owner: string | null;
   lease_expires_at: string | null;
+  lease_state: string | null;
+  in_flight_model_turn: boolean;
+  latest_runtime_event_type: string | null;
+  last_runtime_observation_at: string | null;
   stale: boolean;
   age_secs: number;
   updated_age_secs: number;
@@ -117,6 +123,8 @@ export interface AgentProcess {
 export interface ActiveCount {
   name: string;
   running: number;
+  active_leased: number;
+  expired_or_missing_lease: number;
   pending: number;
   high_burn: number;
 }
