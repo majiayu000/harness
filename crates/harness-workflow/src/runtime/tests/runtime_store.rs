@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn dedupe_returns_latest_runtime_job_for_command() -> anyhow::Result<()> {
+async fn dedupe_uses_runtime_job_timestamps_not_uuid_order() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -29,6 +29,8 @@ async fn dedupe_returns_latest_runtime_job_for_command() -> anyhow::Result<()> {
             json!({"attempt": 2}),
         )
         .await?;
+    assert!(older.created_at < newer.created_at);
+
     let shared_db_created_at = older.created_at;
     sqlx::query("UPDATE runtime_jobs SET id = $1, created_at = $2 WHERE id = $3")
         .bind("ffffffff-ffff-4fff-bfff-ffffffffffff")
@@ -52,6 +54,11 @@ async fn dedupe_returns_latest_runtime_job_for_command() -> anyhow::Result<()> {
             None,
         )
         .await?;
+
+    let jobs = store
+        .runtime_jobs_for_commands_limited(std::slice::from_ref(&command_id), 1)
+        .await?;
+    assert_eq!(jobs[&command_id][0].id, newer.id);
 
     assert_ne!(older.id, newer.id);
     match outcome {

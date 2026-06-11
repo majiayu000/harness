@@ -1932,13 +1932,13 @@ impl WorkflowRuntimeStore {
             "SELECT job.command_id, job.data
              FROM unnest($1::text[]) AS selected(command_id)
              JOIN LATERAL (
-                 SELECT command_id, data::text AS data, (data->>'created_at')::timestamptz AS created_at, id
+                 SELECT command_id, data::text AS data, created_at, (data->>'created_at')::timestamptz AS job_created_at
                  FROM runtime_jobs
                  WHERE command_id = selected.command_id
-                 ORDER BY (data->>'created_at')::timestamptz DESC
+                 ORDER BY created_at DESC, (data->>'created_at')::timestamptz DESC
                  LIMIT $2
              ) AS job ON true
-             ORDER BY job.command_id ASC, job.created_at ASC",
+             ORDER BY job.command_id ASC, job.created_at ASC, job.job_created_at ASC",
         )
         .bind(command_ids)
         .bind(per_command_limit)
@@ -2007,7 +2007,7 @@ async fn runtime_job_for_command_tx(
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT data::text FROM runtime_jobs
          WHERE command_id = $1
-         ORDER BY (data->>'created_at')::timestamptz DESC
+         ORDER BY created_at DESC, (data->>'created_at')::timestamptz DESC
          LIMIT 1",
     )
     .bind(command_id)
