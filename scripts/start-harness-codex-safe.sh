@@ -115,6 +115,12 @@ recorded_pid() {
   fi
 }
 
+listener_pid_for_port() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
+  fi
+}
+
 health_url="http://127.0.0.1:${PORT}/health"
 
 if [[ "$STOP" -eq 1 ]]; then
@@ -135,14 +141,16 @@ fi
 
 if [[ "$STATUS" -eq 1 ]]; then
   pid="$(recorded_pid)"
-  if ! pid_alive "$pid"; then
-    pid="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
-  fi
   if pid_alive "$pid"; then
     echo "$pid" > "$PID_FILE"
     echo "pid=$pid status=running log=$LOG_FILE"
   else
-    echo "pid=${pid:-none} status=not_running log=$LOG_FILE"
+    listener_pid="$(listener_pid_for_port)"
+    if [[ -n "$listener_pid" ]]; then
+      echo "pid=$listener_pid status=unmanaged_listener log=$LOG_FILE"
+    else
+      echo "pid=${pid:-none} status=not_running log=$LOG_FILE"
+    fi
   fi
   if command -v curl >/dev/null 2>&1; then
     curl -sS --max-time 2 "$health_url" || true
@@ -152,6 +160,19 @@ if [[ "$STATUS" -eq 1 ]]; then
     echo "tmux_session=$TMUX_SESSION status=running"
   fi
   exit 0
+fi
+
+pid="$(recorded_pid)"
+if pid_alive "$pid"; then
+  echo "harness server already recorded as running pid=$pid port=$PORT"
+  exit 0
+fi
+
+listener_pid="$(listener_pid_for_port)"
+if [[ -n "$listener_pid" ]]; then
+  echo "refusing to start harness server: port $PORT already has listener pid=$listener_pid" >&2
+  echo "choose another --port or stop the existing process explicitly" >&2
+  exit 4
 fi
 
 if [[ -z "$BIN" ]]; then
@@ -167,12 +188,6 @@ fi
 if [[ ! -x "$BIN" ]]; then
   echo "harness binary is not executable: $BIN" >&2
   exit 3
-fi
-
-pid="$(recorded_pid)"
-if pid_alive "$pid"; then
-  echo "harness server already recorded as running pid=$pid port=$PORT"
-  exit 0
 fi
 
 unset_args=()
