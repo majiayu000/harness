@@ -286,6 +286,12 @@ pub(crate) async fn run_review_loop(
             }
             Err(error) => {
                 waiting_on_bot = None;
+                if review_wait_budget
+                    .fail_if_exceeded(store, task_id, round)
+                    .await?
+                {
+                    return Ok(());
+                }
                 tracing::warn!(
                     pr = pr_num,
                     error = %error,

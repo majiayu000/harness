@@ -19,6 +19,10 @@ impl StaticReviewAgent {
             requests: Mutex::new(0),
         }
     }
+
+    async fn request_count(&self) -> u32 {
+        *self.requests.lock().await
+    }
 }
 
 #[async_trait::async_trait]
@@ -57,6 +61,74 @@ impl CodeAgent for StaticReviewAgent {
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn review_loop_signal_fetch_failure_fails_before_prompt_when_wait_budget_exceeded(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store.insert(&TaskState::new(task_id.clone())).await;
+    let agent = StaticReviewAgent::new("LGTM");
+    let review_config = harness_core::config::agents::AgentReviewConfig {
+        review_wait_budget_secs: 1,
+        ..harness_core::config::agents::AgentReviewConfig::default()
+    };
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+    let interceptors = Arc::new(Vec::new());
+    let mut turns_used = 0;
+    let mut turns_used_acc = 0;
+
+    run_review_loop(
+        store.as_ref(),
+        &task_id,
+        &agent,
+        &review_config,
+        &harness_core::config::project::ProjectConfig::default(),
+        None,
+        None,
+        dir.path(),
+        &CreateTaskRequest::default(),
+        &events,
+        &interceptors,
+        &[],
+        dir.path(),
+        &HashMap::new(),
+        Some("https://github.com/owner/repo/pull/1".to_string()),
+        1,
+        None,
+        1,
+        0,
+        1,
+        false,
+        false,
+        Duration::from_secs(5),
+        &mut turns_used,
+        &mut turns_used_acc,
+        Instant::now(),
+        Instant::now() - Duration::from_secs(2),
+        "invalid-repo-slug".to_string(),
+        0.9,
+        None,
+    )
+    .await?;
+
+    let final_state = store
+        .get(&task_id)
+        .ok_or_else(|| anyhow::anyhow!("task state should exist"))?;
+    assert_eq!(final_state.status, TaskStatus::Failed);
+    assert!(
+        final_state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("review wait budget exceeded"),
+        "unexpected error: {:?}",
+        final_state.error
+    );
+    assert_eq!(agent.request_count().await, 0);
+    Ok(())
 }
 
 #[tokio::test]
