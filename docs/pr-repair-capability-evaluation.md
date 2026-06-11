@@ -169,7 +169,7 @@ still preserving enough evidence to debug why no repair attempt started.
 
 ### Level 2: Harness Live PR Repair
 
-Start Harness from a standalone terminal, not from a Codex session:
+Start or reuse a Harness server:
 
 ```bash
 ./target/release/harness serve \

@@ -425,14 +425,22 @@ path.
 
 ## Server Startup
 
-**Important:** Always start the server from a standalone terminal, not from within Claude Code or other agent sessions. Agent environment variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) propagate to spawned subprocesses and cause SIGTRAP.
+`harness serve` can be started directly from a normal terminal. When product
+behavior needs live verification from a Codex or Claude agent session, launch
+the server with a sanitized environment so spawned agents do not inherit wrapper
+variables from the parent process. Harness strips Claude-prefixed variables
+before spawning child agents; Codex-prefixed variables are not stripped by the
+adapter spawn path, so use `scripts/start-harness-codex-safe.sh` or an
+equivalent sanitized launcher when starting from a Codex-owned session. For
+long-running manual dogfood sessions, a standalone terminal is still useful
+because the operator owns the process lifetime directly.
 
 ```bash
 # Single project (backward compatible)
 ./target/release/harness serve --transport http --port 9800 --project-root /path/to/project
 
 # Multi-project via config file (recommended)
-./target/release/harness serve --transport http --port 9800 --config config/default.toml
+./target/release/harness --config config/default.toml serve --transport http --port 9800
 
 # Multi-project via CLI flags
 ./target/release/harness serve --transport http --port 9800 \
@@ -440,7 +448,7 @@ path.
   --project litellm=/path/to/litellm
 
 # With GitHub token for auto-review
-GITHUB_TOKEN=ghp_xxx ./target/release/harness serve --transport http --port 9800 --config config/default.toml
+GITHUB_TOKEN=ghp_xxx ./target/release/harness --config config/default.toml serve --transport http --port 9800
 ```
 
 ## Task Execution Flow

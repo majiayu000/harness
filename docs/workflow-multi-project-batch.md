@@ -33,7 +33,7 @@ max_concurrent = 1
 
 ```bash
 # 3. Start server in a STANDALONE terminal (NOT inside Claude Code)
-./target/release/harness serve --transport http --port 9800 --config config/default.toml
+./target/release/harness --config config/default.toml serve --transport http --port 9800
 
 # 4. Verify projects registered
 curl -s http://127.0.0.1:9800/api/dashboard | python3 -m json.tool

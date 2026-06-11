@@ -186,8 +186,16 @@ mod tests {
         let bundle = build_storage(dir.path())
             .await
             .expect("build_storage should succeed");
-        assert!(bundle.tasks.is_some(), "tasks store should be ready");
-        assert!(bundle.eval_store.is_some(), "eval store should be ready");
+        assert!(
+            bundle.tasks.is_some(),
+            "tasks store should be ready: {:?}",
+            bundle.startup_results
+        );
+        assert!(
+            bundle.eval_store.is_some(),
+            "eval store should be ready: {:?}",
+            bundle.startup_results
+        );
         drop(bundle.q_values);
     }
 
@@ -205,7 +213,8 @@ mod tests {
         .expect("build_storage should succeed");
         assert!(
             bundle.tasks.is_some(),
-            "critical task store should still open"
+            "critical task store should still open: {:?}",
+            bundle.startup_results
         );
         assert!(
             bundle.q_values.is_none(),

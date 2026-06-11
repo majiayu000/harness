@@ -18,7 +18,15 @@ The binary is at `./target/release/harness`.
 
 ## Server Startup
 
-> **Important:** Never start the server from within Claude Code or other agent sessions. The `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` environment variables propagate to spawned agents and cause SIGTRAP crashes. Always use a standalone terminal.
+`harness serve` can be started directly from a normal terminal. When product
+behavior needs live verification from a Codex or Claude agent session, launch
+the server with a sanitized environment so spawned agents do not inherit wrapper
+variables from the parent process. Harness strips Claude-prefixed variables
+before spawning child agents; Codex-prefixed variables are not stripped by the
+adapter spawn path, so use `scripts/start-harness-codex-safe.sh` or an
+equivalent sanitized launcher when starting from a Codex-owned session. For
+long-running manual dogfood sessions, a standalone terminal remains a convenient
+way for the operator to own the process lifetime directly.
 
 ### Single Project
 
@@ -86,10 +94,9 @@ max_concurrent = 1
 Start with:
 
 ```bash
-./target/release/harness serve \
+./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ### Multi-Project via CLI Flags
@@ -110,10 +117,9 @@ CLI `--project` flags merge with config `[[projects]]` entries. CLI overrides co
 Enable auto-review bot comments on PRs:
 
 ```bash
-GITHUB_TOKEN=ghp_xxx ./target/release/harness serve \
+GITHUB_TOKEN=ghp_xxx ./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ### With Anthropic API Key
@@ -121,10 +127,9 @@ GITHUB_TOKEN=ghp_xxx ./target/release/harness serve \
 Enable the direct Anthropic API agent:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-xxx ./target/release/harness serve \
+ANTHROPIC_API_KEY=sk-ant-xxx ./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ## Submitting Tasks
@@ -622,7 +627,7 @@ RuleEngine / SkillStore (permanently prevents recurrence)
 
 ```bash
 # Start server
-harness serve --transport http --port 9800 --config config/default.toml
+harness --config config/default.toml serve --transport http --port 9800
 
 # One-shot execution
 harness exec "Fix the failing test in src/lib.rs"
@@ -653,7 +658,12 @@ macOS Seatbelt sandbox blocks Claude Code syscalls. Set `sandbox_mode = "danger-
 
 ### Tasks fail with SIGTRAP
 
-Started server from within Claude Code. Restart from a standalone terminal.
+Use a current Harness binary and inspect the server logs for the failing
+adapter command. Harness strips Claude-prefixed wrapper variables before
+spawning child agents. Codex-prefixed parent variables are not stripped by
+Harness, so start the server through a sanitized launcher when it is owned by a
+Codex session. A SIGTRAP can also point to a stale binary, adapter configuration,
+or macOS sandbox setting.
 
 ### Codex review shows "unexpected argument"
 

@@ -26,7 +26,7 @@ Options:
 Environment:
   HARNESS_API_TOKEN       Optional Bearer token for Harness HTTP routes.
 
-The script never starts `harness serve`; start the server before a live
+The script never starts `harness serve`; start or reuse a Harness server before
 evaluation. Live evaluations persist the final score through `/api/evals`.
 EOF
 }
