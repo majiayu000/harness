@@ -363,17 +363,21 @@ fn snapshot_allows_ready(snapshot: &Value) -> bool {
             .get("active_unresolved_review_threads_count")
             .and_then(Value::as_u64)
             == Some(0)
-        && snapshot
-            .get("review_threads_complete")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+        && snapshot_review_threads_complete(snapshot)
 }
 
 fn snapshot_review_threads_incomplete(snapshot: &Value) -> bool {
     snapshot
         .get("review_threads_complete")
         .and_then(Value::as_bool)
-        == Some(false)
+        != Some(true)
+}
+
+fn snapshot_review_threads_complete(snapshot: &Value) -> bool {
+    snapshot
+        .get("review_threads_complete")
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn snapshot_check_failed(snapshot: &Value) -> bool {
@@ -571,6 +575,20 @@ mod tests {
         let signal = pr_feedback_signal_for_snapshot(&snapshot);
 
         assert_eq!(snapshot["review_threads_complete"], false);
+        assert_eq!(signal.signal_type, "FeedbackFound");
+    }
+
+    #[test]
+    fn missing_review_thread_completeness_emits_blocking_feedback() {
+        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
+        let mut snapshot = normalize_github_pr_snapshot(&target, &ready_pr()).unwrap();
+        let Some(snapshot_object) = snapshot.as_object_mut() else {
+            panic!("snapshot should be an object");
+        };
+        snapshot_object.remove("review_threads_complete");
+
+        let signal = pr_feedback_signal_for_snapshot(&snapshot);
+
         assert_eq!(signal.signal_type, "FeedbackFound");
     }
 

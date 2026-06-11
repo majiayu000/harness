@@ -443,13 +443,10 @@ fn snapshot_review_threads_allow_ready(snapshot: &Value) -> bool {
 }
 
 fn snapshot_review_threads_are_complete(snapshot: &Value) -> bool {
-    !matches!(
-        field_bool(
-            snapshot,
-            &["review_threads_complete", "reviewThreadsComplete"]
-        ),
-        Some(false)
-    )
+    field_bool(
+        snapshot,
+        &["review_threads_complete", "reviewThreadsComplete"],
+    ) == Some(true)
 }
 
 fn snapshot_has_repair_action(snapshot: &Value) -> bool {
