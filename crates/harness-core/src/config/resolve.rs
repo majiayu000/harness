@@ -71,6 +71,9 @@ pub fn resolve_config(server: &HarnessConfig, project: &ProjectConfig) -> Resolv
             }
             (None, _) => {}
         }
+        if let Some(budget_secs) = proj_review.review_wait_budget_secs {
+            review.review_wait_budget_secs = budget_secs;
+        }
     }
 
     let mut concurrency = server.concurrency.clone();
@@ -160,6 +163,7 @@ mod tests {
                 review_bot_auto_trigger: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
+                review_wait_budget_secs: None,
             }),
             ..Default::default()
         };
@@ -184,6 +188,7 @@ mod tests {
                 review_bot_auto_trigger: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
+                review_wait_budget_secs: None,
             }),
             ..Default::default()
         };
@@ -204,6 +209,7 @@ mod tests {
                 review_bot_auto_trigger: Some(false),
                 review_wait_secs: None,
                 review_max_rounds: None,
+                review_wait_budget_secs: None,
             }),
             ..Default::default()
         };
@@ -224,6 +230,7 @@ mod tests {
                 review_bot_auto_trigger: None,
                 review_wait_secs: None,
                 review_max_rounds: None,
+                review_wait_budget_secs: None,
             }),
             ..Default::default()
         };
@@ -272,6 +279,7 @@ mod tests {
                 review_bot_auto_trigger: None,
                 review_wait_secs: Some(300),
                 review_max_rounds: Some(8),
+                review_wait_budget_secs: Some(1800),
             }),
             ..Default::default()
         };
@@ -279,6 +287,7 @@ mod tests {
         let resolved = resolve_config(&server, &project);
         assert_eq!(resolved.review_wait_secs, Some(300));
         assert_eq!(resolved.review_max_rounds, Some(8));
+        assert_eq!(resolved.review.review_wait_budget_secs, 1800);
     }
 
     #[test]

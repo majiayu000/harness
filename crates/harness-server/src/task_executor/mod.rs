@@ -14,6 +14,8 @@ mod local_review_completion_tests;
 pub(crate) mod non_implementation;
 pub(crate) mod pr_detection;
 pub(crate) mod review_loop;
+#[cfg(test)]
+mod review_loop_wait_budget_tests;
 mod run_task;
 pub(crate) mod triage_pipeline;
 pub(crate) mod turn_lifecycle;
@@ -38,7 +40,8 @@ use pr_detection::{
 #[cfg(test)]
 use run_task::{
     effective_agent_review_round_limit, effective_hosted_review_round_limit,
-    local_review_pr_check_timeout_secs, review_repo_slug, should_run_issue_triage,
+    initial_hosted_review_wait_secs, local_review_pr_check_timeout_secs, review_repo_slug,
+    should_run_issue_triage,
 };
 #[cfg(test)]
 use std::collections::HashMap;
