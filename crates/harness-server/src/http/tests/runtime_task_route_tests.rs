@@ -480,6 +480,98 @@ async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn cancel_task_accepts_runtime_submission_handle_without_task_row() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let task_id = harness_core::types::TaskId::from_str("runtime-compat-cancel-task-58");
+    let submission = crate::workflow_runtime_submission::record_issue_submission(
+        store,
+        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 58,
+            task_id: &task_id,
+            labels: &[],
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_id)
+            .await?
+            .is_none(),
+        "runtime submissions should not require legacy task rows"
+    );
+    let app = Router::new()
+        .route("/tasks/{id}/cancel", post(task_routes::cancel_task))
+        .with_state(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{}/cancel", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "cancelled");
+    assert_eq!(body["execution_path"], "workflow_runtime");
+    assert_eq!(body["workflow_id"], submission.workflow_id);
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_id)
+            .await?
+            .is_none(),
+        "legacy compatibility cancel must not create a TaskStore row"
+    );
+    let updated = store
+        .get_instance(&submission.workflow_id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "cancelled");
+    assert_eq!(updated.data["last_decision"], "cancel_issue_submission");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{}/cancel", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "task already in terminal state");
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
