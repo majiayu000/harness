@@ -351,6 +351,26 @@ fn add_workflow_source_activity(
 }
 
 fn add_legacy_source_activity(by_source: &mut HashMap<String, SourceActivity>, task: &TaskSummary) {
+    let update: fn(&mut SourceActivity) = if task.status.is_failure()
+        || task.scheduler.authority_state == SchedulerAuthorityState::Failed
+    {
+        |entry| entry.failed += 1
+    } else if matches!(
+        task.scheduler.authority_state,
+        SchedulerAuthorityState::Running
+            | SchedulerAuthorityState::Leased
+            | SchedulerAuthorityState::Recovering
+    ) {
+        |entry| entry.running += 1
+    } else if matches!(
+        task.scheduler.authority_state,
+        SchedulerAuthorityState::AwaitingDependencies | SchedulerAuthorityState::RetryBackoff
+    ) || matches!(task.status.as_ref(), "awaiting_deps" | "waiting")
+    {
+        |entry| entry.blocked += 1
+    } else {
+        return;
+    };
     let source = task
         .source
         .as_deref()
@@ -363,13 +383,7 @@ fn add_legacy_source_activity(by_source: &mut HashMap<String, SourceActivity>, t
             source,
             ..Default::default()
         });
-    if task.status.is_failure() {
-        entry.failed += 1;
-    } else if task.status.as_ref() == "waiting" {
-        entry.blocked += 1;
-    } else {
-        entry.running += 1;
-    }
+    update(entry);
 }
 
 fn source_total(source: &SourceActivity) -> u64 {
@@ -476,8 +490,9 @@ fn grouped_failures(failures: &[RecentFailureTask]) -> Vec<FailureGroup> {
     }
     let mut rows: Vec<FailureGroup> = groups.into_values().collect();
     rows.sort_by(|a, b| {
-        parsed_timestamp(b.last_seen.as_deref())
-            .cmp(&parsed_timestamp(a.last_seen.as_deref()))
+        b.last_seen
+            .as_deref()
+            .cmp(&a.last_seen.as_deref())
             .then_with(|| b.count.cmp(&a.count))
             .then_with(|| a.family.cmp(b.family))
     });
@@ -548,41 +563,27 @@ fn normalize_failure_message(message: &str) -> String {
 }
 
 fn earlier_timestamp(current: Option<&str>, candidate: Option<&str>) -> Option<String> {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => {
-            if parsed_timestamp(Some(candidate)) < parsed_timestamp(Some(current)) {
-                Some(candidate.to_string())
-            } else {
-                Some(current.to_string())
-            }
+    Some(
+        match (current, candidate) {
+            (Some(current), Some(candidate)) => current.min(candidate),
+            (Some(current), None) => current,
+            (None, Some(candidate)) => candidate,
+            (None, None) => return None,
         }
-        (Some(current), None) => Some(current.to_string()),
-        (None, Some(candidate)) => Some(candidate.to_string()),
-        (None, None) => None,
-    }
+        .to_string(),
+    )
 }
 
 fn later_timestamp(current: Option<&str>, candidate: Option<&str>) -> Option<String> {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => {
-            if parsed_timestamp(Some(candidate)) > parsed_timestamp(Some(current)) {
-                Some(candidate.to_string())
-            } else {
-                Some(current.to_string())
-            }
+    Some(
+        match (current, candidate) {
+            (Some(current), Some(candidate)) => current.max(candidate),
+            (Some(current), None) => current,
+            (None, Some(candidate)) => candidate,
+            (None, None) => return None,
         }
-        (Some(current), None) => Some(current.to_string()),
-        (None, Some(candidate)) => Some(candidate.to_string()),
-        (None, None) => None,
-    }
-}
-
-fn parsed_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
-    value.and_then(|value| {
-        DateTime::parse_from_rfc3339(value)
-            .ok()
-            .map(|parsed| parsed.with_timezone(&Utc))
-    })
+        .to_string(),
+    )
 }
 
 fn stale_worktree_count(
@@ -736,7 +737,46 @@ mod tests {
     }
 
     #[test]
-    fn legacy_workflow_summaries_are_not_double_counted_by_source() {
+    fn legacy_workflow_and_queued_tasks_are_not_counted_by_source() {
+        let legacy_row = TaskSummary {
+            id: TaskId("legacy-row".to_string()),
+            task_kind: crate::task_runner::TaskKind::Issue,
+            status: crate::task_runner::TaskStatus::Waiting,
+            failure_kind: None,
+            turn: 0,
+            pr_url: None,
+            error: None,
+            source: Some("github".to_string()),
+            parent_id: None,
+            external_id: Some("issue:1".to_string()),
+            repo: Some("owner/repo".to_string()),
+            description: None,
+            created_at: None,
+            phase: crate::task_runner::TaskPhase::Review,
+            depends_on: vec![],
+            subtask_ids: vec![],
+            project: None,
+            workspace_path: None,
+            workspace_owner: None,
+            run_generation: 0,
+            workflow: Some(TaskWorkflowSummary {
+                id: "workflow-1".to_string(),
+                definition_id: Some(GITHUB_ISSUE_PR_DEFINITION_ID.to_string()),
+                state: "ready_to_merge".to_string(),
+                project_id: None,
+                issue_number: Some(1),
+                pr_number: Some(7),
+                force_execute: None,
+                plan_concern: None,
+                review_fallback: None,
+            }),
+            scheduler: crate::task_runner::TaskSchedulerState::queued(),
+        };
+        let mut queued_row = legacy_row.clone();
+        queued_row.id = TaskId("queued-row".to_string());
+        queued_row.workflow = None;
+        queued_row.status = crate::task_runner::TaskStatus::Pending;
+
         let mut by_source = source_activity(
             &[workflow(
                 "ready_to_merge",
@@ -746,46 +786,14 @@ mod tests {
                     "pr_url": "https://github.com/owner/repo/pull/7",
                 }),
             )],
-            &[TaskSummary {
-                id: TaskId("legacy-row".to_string()),
-                task_kind: crate::task_runner::TaskKind::Issue,
-                status: crate::task_runner::TaskStatus::Waiting,
-                failure_kind: None,
-                turn: 0,
-                pr_url: None,
-                error: None,
-                source: Some("github".to_string()),
-                parent_id: None,
-                external_id: Some("issue:1".to_string()),
-                repo: Some("owner/repo".to_string()),
-                description: None,
-                created_at: None,
-                phase: crate::task_runner::TaskPhase::Review,
-                depends_on: vec![],
-                subtask_ids: vec![],
-                project: None,
-                workspace_path: None,
-                workspace_owner: None,
-                run_generation: 0,
-                workflow: Some(TaskWorkflowSummary {
-                    id: "workflow-1".to_string(),
-                    definition_id: Some(GITHUB_ISSUE_PR_DEFINITION_ID.to_string()),
-                    state: "ready_to_merge".to_string(),
-                    project_id: None,
-                    issue_number: Some(1),
-                    pr_number: Some(7),
-                    force_execute: None,
-                    plan_concern: None,
-                    review_fallback: None,
-                }),
-                scheduler: crate::task_runner::TaskSchedulerState::queued(),
-            }],
+            &[legacy_row, queued_row],
         );
 
         assert_eq!(by_source.len(), 1);
         let source = by_source.pop().expect("source row");
         assert_eq!(source.source, "github");
         assert_eq!(source.ready_to_merge, 1);
+        assert_eq!(source.running, 0);
         assert_eq!(source.blocked, 0);
     }
 }
