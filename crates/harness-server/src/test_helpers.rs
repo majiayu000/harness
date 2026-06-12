@@ -22,7 +22,7 @@ static TEST_PG_POOL_CONFIGURED: OnceLock<()> = OnceLock::new();
 pub fn configure_test_pg_pool_defaults() {
     TEST_PG_POOL_CONFIGURED.get_or_init(|| {
         let server = harness_core::config::server::ServerConfig {
-            database_pool_max_connections: Some(2),
+            database_pool_max_connections: Some(1),
             database_pool_acquire_timeout_secs: Some(30),
             ..Default::default()
         };
