@@ -228,9 +228,68 @@ async fn apply_decision(
     if new_instance {
         store.upsert_instance(&instance).await?;
     }
-    let event = store
+    let event_id = issue_submission_event_id_or_append(store, &instance.id, ctx).await?;
+    let record = if let Some(record) = decision_for_event(store, &instance.id, &event_id).await? {
+        record
+    } else {
+        match validation {
+            Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event_id.clone())),
+            Err(error) => {
+                let reason = error.to_string();
+                let record = WorkflowDecisionRecord::rejected(decision, Some(event_id), &reason);
+                store.record_decision(&record).await?;
+                return Ok(WorkflowSubmissionRuntimeRecord {
+                    workflow_id: instance.id,
+                    accepted: false,
+                    decision_id: record.id,
+                    command_ids: Vec::new(),
+                    rejection_reason: Some(reason),
+                });
+            }
+        }
+    };
+    if !record.accepted {
+        return Ok(WorkflowSubmissionRuntimeRecord {
+            workflow_id: instance.id,
+            accepted: false,
+            decision_id: record.id,
+            command_ids: Vec::new(),
+            rejection_reason: record.rejection_reason,
+        });
+    }
+    store.record_decision(&record).await?;
+    let mut command_ids = Vec::with_capacity(record.decision.commands.len());
+    for command in &record.decision.commands {
+        command_ids.push(
+            store
+                .enqueue_command(&instance.id, Some(&record.id), command)
+                .await?,
+        );
+    }
+    instance.state = record.decision.next_state.clone();
+    instance.version = instance.version.saturating_add(1);
+    instance.data = merge_last_decision(accepted_data, &record.decision.decision);
+    store.upsert_instance(&instance).await?;
+    Ok(WorkflowSubmissionRuntimeRecord {
+        workflow_id: instance.id,
+        accepted: true,
+        decision_id: record.id,
+        command_ids,
+        rejection_reason: None,
+    })
+}
+
+async fn issue_submission_event_id_or_append(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    ctx: &IssueSubmissionRuntimeContext<'_>,
+) -> anyhow::Result<String> {
+    if let Some(event_id) = issue_submission_event_id(store, workflow_id, ctx.task_id).await? {
+        return Ok(event_id);
+    }
+    Ok(store
         .append_event(
-            &instance.id,
+            workflow_id,
             "IssueSubmitted",
             "workflow_runtime_submission",
             json!({
@@ -245,42 +304,41 @@ async fn apply_decision(
                 "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
             }),
         )
-        .await?;
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id)),
-        Err(error) => {
-            let reason = error.to_string();
-            let record = WorkflowDecisionRecord::rejected(decision, Some(event.id), &reason);
-            store.record_decision(&record).await?;
-            return Ok(WorkflowSubmissionRuntimeRecord {
-                workflow_id: instance.id,
-                accepted: false,
-                decision_id: record.id,
-                command_ids: Vec::new(),
-                rejection_reason: Some(reason),
-            });
-        }
-    };
-    store.record_decision(&record).await?;
-    let mut command_ids = Vec::with_capacity(decision.commands.len());
-    for command in &decision.commands {
-        command_ids.push(
-            store
-                .enqueue_command(&instance.id, Some(&record.id), command)
-                .await?,
-        );
-    }
-    instance.state = decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(accepted_data, &decision.decision);
-    store.upsert_instance(&instance).await?;
-    Ok(WorkflowSubmissionRuntimeRecord {
-        workflow_id: instance.id,
-        accepted: true,
-        decision_id: record.id,
-        command_ids,
-        rejection_reason: None,
-    })
+        .await?
+        .id)
+}
+
+async fn issue_submission_event_id(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    task_id: &TaskId,
+) -> anyhow::Result<Option<String>> {
+    let task_id = task_id.as_str();
+    Ok(store
+        .events_for(workflow_id)
+        .await?
+        .into_iter()
+        .find(|event| {
+            event.event_type == "IssueSubmitted"
+                && event
+                    .event
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|recorded| recorded == task_id)
+        })
+        .map(|event| event.id))
+}
+
+async fn decision_for_event(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    event_id: &str,
+) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+    Ok(store
+        .decisions_for(workflow_id)
+        .await?
+        .into_iter()
+        .find(|record| record.event_id.as_deref() == Some(event_id)))
 }
 
 async fn apply_prompt_decision(
