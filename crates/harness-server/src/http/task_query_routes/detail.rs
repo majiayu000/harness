@@ -305,7 +305,8 @@ pub(crate) fn proof_from_runtime_workflow(
     events: &[harness_workflow::runtime::WorkflowEvent],
     decisions: &[harness_workflow::runtime::WorkflowDecisionRecord],
 ) -> ProofOfWork {
-    let status = runtime_workflow_state_to_task_status(&workflow.state);
+    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let status = projection.task_status;
     let pr_url = runtime_string_field(&workflow.data, "pr_url")
         .or_else(|| runtime_string_field(&workflow.data, "last_pr_url"));
     let accepted_decisions = decisions
@@ -414,7 +415,7 @@ async fn runtime_proof_by_handle(
     let Some(workflow) = store.get_instance_by_task_id(task_id.as_str()).await? else {
         return Ok(RuntimeProofLookup::Missing);
     };
-    let status = runtime_workflow_state_to_task_status(&workflow.state);
+    let status = RuntimeWorkflowProjection::from_workflow(&workflow).task_status;
     if !status.is_terminal() {
         return Ok(RuntimeProofLookup::InFlight(status.as_ref().to_string()));
     }

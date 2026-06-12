@@ -1,5 +1,6 @@
 use super::*;
-use crate::task_runner::{RoundResult, TaskState};
+use crate::runtime_projection::RuntimeWorkflowProjection;
+use crate::task_runner::{RoundResult, SchedulerAuthorityState, TaskState, TaskStatus};
 
 fn task_with_id(id: &str) -> TaskState {
     TaskState::new(harness_core::types::TaskId(id.to_string()))
@@ -241,23 +242,32 @@ fn runtime_proof_excludes_merge_events_from_review_rounds() {
 
 #[test]
 fn runtime_workflow_scheduler_state_only_marks_executing_states_running() {
-    let blocked = runtime_workflow_scheduler_state("blocked", &TaskStatus::Waiting);
+    let scheduler_for = |state: &str| {
+        RuntimeWorkflowProjection::from_workflow(&harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            state,
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
+        ))
+        .scheduler
+    };
+
+    let blocked = scheduler_for("blocked");
     assert_eq!(blocked.authority_state, SchedulerAuthorityState::Queued);
 
-    let awaiting_feedback =
-        runtime_workflow_scheduler_state("awaiting_feedback", &TaskStatus::Waiting);
+    let awaiting_feedback = scheduler_for("awaiting_feedback");
     assert_eq!(
         awaiting_feedback.authority_state,
         SchedulerAuthorityState::Queued
     );
 
-    let implementing = runtime_workflow_scheduler_state("implementing", &TaskStatus::Implementing);
+    let implementing = scheduler_for("implementing");
     assert_eq!(
         implementing.authority_state,
         SchedulerAuthorityState::Running
     );
 
-    let planning = runtime_workflow_scheduler_state("planning", &TaskStatus::Planning);
+    let planning = scheduler_for("planning");
     assert_eq!(planning.authority_state, SchedulerAuthorityState::Running);
 }
 

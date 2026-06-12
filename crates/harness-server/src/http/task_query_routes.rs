@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::state::AppState;
+use crate::runtime_projection::{runtime_string_field, RuntimeWorkflowProjection};
 use crate::task_runner::{
-    SchedulerAuthorityState, TaskFailureKind, TaskKind, TaskPhase, TaskSchedulerState, TaskState,
-    TaskStatus, TaskSummary, TaskSummaryFilter, TaskSummaryPageCursor, TaskWorkflowSummary,
+    SchedulerAuthorityState, TaskId, TaskKind, TaskState, TaskStatus, TaskSummary,
+    TaskSummaryFilter, TaskSummaryPageCursor, TaskWorkflowSummary,
 };
 use harness_core::proof_of_work::{CiStatus, ProofOfWork, QualitySignal, ReviewOutcome};
 
@@ -617,9 +618,8 @@ async fn append_runtime_definition_summaries(
         .map(|summary| summary.id.as_str().to_string())
         .collect();
     for workflow in workflows {
-        let Some(task_id) =
-            crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
-        else {
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+        let Some(task_id) = projection.submission_handle.clone() else {
             continue;
         };
         if !listed_ids.insert(task_id.as_str().to_string()) {
@@ -638,8 +638,8 @@ fn runtime_workflow_task_summary(
     task_id: harness_core::types::TaskId,
     task_kind: TaskKind,
 ) -> TaskSummary {
-    let status = runtime_workflow_state_to_task_status(&workflow.state);
-    let scheduler = runtime_workflow_scheduler_state(&workflow.state, &status);
+    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+    let status = projection.task_status.clone();
     let issue = workflow
         .data
         .get("issue_number")
@@ -661,7 +661,7 @@ fn runtime_workflow_task_summary(
         id: task_id,
         task_kind,
         status: status.clone(),
-        failure_kind: status.is_failure().then_some(TaskFailureKind::Task),
+        failure_kind: projection.failure_kind,
         turn: 0,
         pr_url: runtime_string_field(&workflow.data, "pr_url"),
         error: runtime_string_field(&workflow.data, "failure_reason"),
@@ -671,89 +671,16 @@ fn runtime_workflow_task_summary(
         repo: runtime_string_field(&workflow.data, "repo"),
         description,
         created_at: Some(workflow.created_at.to_rfc3339()),
-        phase: runtime_workflow_state_to_task_phase(&workflow.state),
+        phase: projection.phase,
         depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
         subtask_ids: Vec::new(),
-        project: runtime_string_field(&workflow.data, "project_id"),
+        project: projection.project_id,
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
         workflow: Some(TaskWorkflowSummary::from_runtime_workflow(&workflow)),
-        scheduler,
+        scheduler: projection.scheduler,
     }
-}
-
-pub(super) fn runtime_workflow_state_to_task_status(state: &str) -> TaskStatus {
-    match state {
-        "awaiting_dependencies" => TaskStatus::AwaitingDeps,
-        "scheduled" | "discovered" => TaskStatus::Pending,
-        "planning" => TaskStatus::Planning,
-        "implementing" | "replanning" | "addressing_feedback" => TaskStatus::Implementing,
-        "pr_open"
-        | "local_review_gate"
-        | "awaiting_feedback"
-        | "quality_gate_pending"
-        | "ready_to_merge"
-        | "blocked" => TaskStatus::Waiting,
-        "done" | "passed" => TaskStatus::Done,
-        "failed" => TaskStatus::Failed,
-        "cancelled" => TaskStatus::Cancelled,
-        _ => TaskStatus::Waiting,
-    }
-}
-
-fn runtime_workflow_state_to_task_phase(state: &str) -> TaskPhase {
-    match state {
-        "done" | "passed" | "failed" | "cancelled" => TaskPhase::Terminal,
-        "pr_open"
-        | "local_review_gate"
-        | "awaiting_feedback"
-        | "quality_gate_pending"
-        | "ready_to_merge" => TaskPhase::Review,
-        "planning" | "replanning" | "blocked" => TaskPhase::Plan,
-        _ => TaskPhase::Implement,
-    }
-}
-
-fn runtime_workflow_scheduler_state(state: &str, status: &TaskStatus) -> TaskSchedulerState {
-    match state {
-        "awaiting_dependencies" => TaskSchedulerState::awaiting_dependencies(),
-        "scheduled" | "discovered" => TaskSchedulerState::queued(),
-        "planning" | "implementing" | "replanning" | "addressing_feedback" => TaskSchedulerState {
-            authority_state: SchedulerAuthorityState::Running,
-            owner: None,
-            run_generation: 0,
-            recovery_generation: 0,
-            lease_expires_at: None,
-        },
-        "done" | "passed" | "failed" | "cancelled" => {
-            let mut scheduler = TaskSchedulerState::queued();
-            scheduler.mark_terminal(status);
-            scheduler
-        }
-        "pr_open"
-        | "local_review_gate"
-        | "awaiting_feedback"
-        | "quality_gate_pending"
-        | "ready_to_merge"
-        | "blocked" => TaskSchedulerState::queued(),
-        _ => match status {
-            TaskStatus::AwaitingDeps => TaskSchedulerState::awaiting_dependencies(),
-            TaskStatus::Pending => TaskSchedulerState::queued(),
-            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
-                let mut scheduler = TaskSchedulerState::queued();
-                scheduler.mark_terminal(status);
-                scheduler
-            }
-            _ => TaskSchedulerState::queued(),
-        },
-    }
-}
-
-pub(super) fn runtime_string_field(data: &serde_json::Value, field: &str) -> Option<String> {
-    data.get(field)
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned)
 }
 
 /// Render the `external_id` shown for a runtime-backed task in dashboard
@@ -772,16 +699,13 @@ pub(super) fn runtime_external_id(
     }
 }
 
-fn runtime_task_id_array(
-    data: &serde_json::Value,
-    field: &str,
-) -> Vec<harness_core::types::TaskId> {
+fn runtime_task_id_array(data: &serde_json::Value, field: &str) -> Vec<TaskId> {
     data.get(field)
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
         .filter_map(|value| value.as_str())
-        .map(harness_core::types::TaskId::from_str)
+        .map(TaskId::from_str)
         .collect()
 }
 

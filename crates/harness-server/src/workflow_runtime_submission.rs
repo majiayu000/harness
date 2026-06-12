@@ -106,7 +106,7 @@ pub(crate) async fn runtime_issue_by_task_id(
 }
 
 pub(crate) fn runtime_issue_task_handle(instance: &WorkflowInstance) -> Option<TaskId> {
-    runtime_submission_id(&instance.data).map(|submission_id| TaskId::from_str(&submission_id))
+    crate::runtime_projection::RuntimeWorkflowProjection::from_workflow(instance).submission_handle
 }
 
 async fn persist_issue_submission(

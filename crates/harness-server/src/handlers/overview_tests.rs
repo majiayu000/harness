@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::test_helpers;
 use axum::{body::to_bytes, routing::get, Router};
 use harness_core::types::SessionId;
@@ -202,7 +203,9 @@ fn runtime_workflow_without_task_handle_still_counts_active_work() {
         "project_id": "/repo",
     }));
 
-    assert!(runtime_workflow_dedupe_task_handle(&runtime).is_none());
+    assert!(RuntimeWorkflowProjection::from_workflow(&runtime)
+        .legacy_dedupe_task_handle
+        .is_none());
     assert!(!runtime_workflow_matches_active_legacy_task(
         &runtime,
         &active_legacy_task_ids,
@@ -241,7 +244,8 @@ fn terminal_legacy_summary_does_not_suppress_active_runtime_workflow() {
         "project_id": "/repo",
         "task_id": "runtime-task-1",
     }));
-    let task_id = runtime_workflow_dedupe_task_handle(&runtime)
+    let task_id = RuntimeWorkflowProjection::from_workflow(&runtime)
+        .legacy_dedupe_task_handle
         .expect("runtime workflow should expose a task handle");
     if !active_legacy_task_ids.contains(task_id.as_str()) {
         add_active_runtime_workflow(&mut counts, &runtime);
@@ -277,7 +281,8 @@ fn active_legacy_summary_still_suppresses_matching_runtime_workflow() {
         "project_id": "/repo",
         "task_id": "runtime-task-1",
     }));
-    let task_id = runtime_workflow_dedupe_task_handle(&runtime)
+    let task_id = RuntimeWorkflowProjection::from_workflow(&runtime)
+        .legacy_dedupe_task_handle
         .expect("runtime workflow should expose a task handle");
     if !active_legacy_task_ids.contains(task_id.as_str()) {
         add_active_runtime_workflow(&mut counts, &runtime);
@@ -334,9 +339,10 @@ fn active_legacy_summary_suppresses_runtime_workflow_by_current_task_id() {
         "task_id": "current-runtime-task",
         "task_ids": ["historical-runtime-task", "current-runtime-task"],
     }));
-    let task_id = runtime_workflow_dedupe_task_handle(&runtime)
+    let task_id = RuntimeWorkflowProjection::from_workflow(&runtime)
+        .legacy_dedupe_task_handle
         .expect("runtime workflow should expose a task handle");
-    assert_eq!(task_id, "current-runtime-task");
+    assert_eq!(task_id.as_str(), "current-runtime-task");
     if !active_legacy_task_ids.contains(task_id.as_str()) {
         add_active_runtime_workflow(&mut counts, &runtime);
     }
