@@ -375,19 +375,29 @@ fn stale_success_completion(instance: &WorkflowInstance, result: &ActivityResult
         return true;
     }
 
-    instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
-        && matches!(
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
+        return false;
+    }
+
+    match result.activity.as_str() {
+        "sweep_pr_feedback" | super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY => matches!(
             instance.state.as_str(),
             "addressing_feedback"
                 | "local_review_gate"
                 | "quality_gate_pending"
                 | "ready_to_merge"
                 | "blocked"
-        )
-        && matches!(
-            result.activity.as_str(),
-            "sweep_pr_feedback" | super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY
-        )
+        ),
+        super::pr_feedback::LOCAL_REVIEW_ACTIVITY => matches!(
+            instance.state.as_str(),
+            "awaiting_feedback"
+                | "addressing_feedback"
+                | "quality_gate_pending"
+                | "ready_to_merge"
+                | "blocked"
+        ),
+        _ => false,
+    }
 }
 
 fn workflow_decision_from_activity_result(

@@ -1759,6 +1759,54 @@ fn runtime_completion_reducer_ignores_stale_pr_feedback_child_after_parent_advan
 }
 
 #[test]
+fn runtime_completion_reducer_ignores_stale_local_review_after_pass_advances_parent() {
+    let instance = issue_instance("awaiting_feedback").with_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(
+        LOCAL_REVIEW_ACTIVITY,
+        "Late local review passed after the parent advanced.",
+    )
+    .with_signal(ActivitySignal::new(
+        "LocalReviewPassed",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event).expect("event should parse");
+
+    assert!(
+        decision.is_none(),
+        "late local review pass should be treated as obsolete"
+    );
+}
+
+#[test]
+fn runtime_completion_reducer_ignores_stale_local_review_after_changes_advance_parent() {
+    let instance = issue_instance("addressing_feedback").with_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(
+        LOCAL_REVIEW_ACTIVITY,
+        "Late local review requested changes after the parent advanced.",
+    )
+    .with_signal(ActivitySignal::new(
+        "LocalReviewChangesRequested",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event).expect("event should parse");
+
+    assert!(
+        decision.is_none(),
+        "late local review change request should be treated as obsolete"
+    );
+}
+
+#[test]
 fn runtime_completion_reducer_ignores_child_workflow_start_ack_without_parent_decision() {
     let instance = issue_instance("quality_gate_pending");
     let command = WorkflowCommand::start_child_workflow(
