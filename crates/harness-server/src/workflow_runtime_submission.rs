@@ -23,6 +23,8 @@ mod cancel;
 mod dependencies;
 #[path = "workflow_runtime_submission/prompt_memory.rs"]
 mod prompt_memory;
+#[path = "workflow_runtime_submission/replay.rs"]
+mod replay;
 
 pub(crate) use cancel::{
     cancel_issue_submission_by_task_id, cancel_submission_by_workflow_id,
@@ -46,6 +48,10 @@ pub(crate) use prompt_memory::{
 use prompt_memory::{
     persist_prompt_submission_prompt, prompt_ref_for_submission,
     remove_prompt_submission_prompt_durable,
+};
+use replay::{
+    decision_for_event, disambiguate_submission_command_dedupe, submission_event_for_replay,
+    SubmissionEventSelection,
 };
 
 pub(crate) struct PromptSubmissionRuntimeContext<'a> {
@@ -214,7 +220,7 @@ async fn apply_decision(
     store: &WorkflowRuntimeStore,
     mut instance: WorkflowInstance,
     new_instance: bool,
-    decision: WorkflowDecision,
+    mut decision: WorkflowDecision,
     ctx: &IssueSubmissionRuntimeContext<'_>,
     accepted_data: serde_json::Value,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
@@ -223,31 +229,41 @@ async fn apply_decision(
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())
     };
-    let validation =
-        DecisionValidator::github_issue_pr().validate(&instance, &decision, &validation_context);
     if new_instance {
         store.upsert_instance(&instance).await?;
     }
-    let event_id = issue_submission_event_id_or_append(store, &instance.id, ctx).await?;
-    let record = if let Some(record) = decision_for_event(store, &instance.id, &event_id).await? {
-        record
-    } else {
-        match validation {
-            Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event_id.clone())),
-            Err(error) => {
-                let reason = error.to_string();
-                let record = WorkflowDecisionRecord::rejected(decision, Some(event_id), &reason);
-                store.record_decision(&record).await?;
-                return Ok(WorkflowSubmissionRuntimeRecord {
-                    workflow_id: instance.id,
-                    accepted: false,
-                    decision_id: record.id,
-                    command_ids: Vec::new(),
-                    rejection_reason: Some(reason),
-                });
+    let event = issue_submission_event_id_or_append(store, &instance.id, ctx).await?;
+    if event.disambiguates_command_dedupe() {
+        disambiguate_submission_command_dedupe(&mut decision, &event.event_id);
+    }
+    let record =
+        if let Some(record) = decision_for_event(store, &instance.id, &event.event_id).await? {
+            record
+        } else {
+            let validation = DecisionValidator::github_issue_pr().validate(
+                &instance,
+                &decision,
+                &validation_context,
+            );
+            match validation {
+                Ok(()) => {
+                    WorkflowDecisionRecord::accepted(decision.clone(), Some(event.event_id.clone()))
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    let record =
+                        WorkflowDecisionRecord::rejected(decision, Some(event.event_id), &reason);
+                    store.record_decision(&record).await?;
+                    return Ok(WorkflowSubmissionRuntimeRecord {
+                        workflow_id: instance.id,
+                        accepted: false,
+                        decision_id: record.id,
+                        command_ids: Vec::new(),
+                        rejection_reason: Some(reason),
+                    });
+                }
             }
-        }
-    };
+        };
     if !record.accepted {
         return Ok(WorkflowSubmissionRuntimeRecord {
             workflow_id: instance.id,
@@ -282,11 +298,17 @@ async fn issue_submission_event_id_or_append(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
     ctx: &IssueSubmissionRuntimeContext<'_>,
-) -> anyhow::Result<String> {
-    if let Some(event_id) = issue_submission_event_id(store, workflow_id, ctx.task_id).await? {
-        return Ok(event_id);
+) -> anyhow::Result<SubmissionEventSelection> {
+    let lookup =
+        submission_event_for_replay(store, workflow_id, "IssueSubmitted", ctx.task_id).await?;
+    if let Some(event_id) = lookup.event_id {
+        return Ok(SubmissionEventSelection {
+            event_id,
+            has_prior_attempt: true,
+            replay_existing: true,
+        });
     }
-    Ok(store
+    let event_id = store
         .append_event(
             workflow_id,
             "IssueSubmitted",
@@ -304,48 +326,29 @@ async fn issue_submission_event_id_or_append(
             }),
         )
         .await?
-        .id)
+        .id;
+    Ok(SubmissionEventSelection {
+        event_id,
+        has_prior_attempt: lookup.has_prior_attempt,
+        replay_existing: false,
+    })
 }
-async fn issue_submission_event_id(
-    store: &WorkflowRuntimeStore,
-    workflow_id: &str,
-    task_id: &TaskId,
-) -> anyhow::Result<Option<String>> {
-    let task_id = task_id.as_str();
-    Ok(store
-        .events_for(workflow_id)
-        .await?
-        .into_iter()
-        .find(|event| {
-            event.event_type == "IssueSubmitted"
-                && event
-                    .event
-                    .get("task_id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|recorded| recorded == task_id)
-        })
-        .map(|event| event.id))
-}
-async fn decision_for_event(
-    store: &WorkflowRuntimeStore,
-    workflow_id: &str,
-    event_id: &str,
-) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
-    Ok(store
-        .decisions_for(workflow_id)
-        .await?
-        .into_iter()
-        .find(|record| record.event_id.as_deref() == Some(event_id)))
-}
+
 async fn prompt_submission_event_id_or_append(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
     ctx: &PromptSubmissionRuntimeContext<'_>,
-) -> anyhow::Result<String> {
-    if let Some(event_id) = prompt_submission_event_id(store, workflow_id, ctx.task_id).await? {
-        return Ok(event_id);
+) -> anyhow::Result<SubmissionEventSelection> {
+    let lookup =
+        submission_event_for_replay(store, workflow_id, "PromptSubmitted", ctx.task_id).await?;
+    if let Some(event_id) = lookup.event_id {
+        return Ok(SubmissionEventSelection {
+            event_id,
+            has_prior_attempt: true,
+            replay_existing: true,
+        });
     }
-    Ok(store
+    let event_id = store
         .append_event(
             workflow_id,
             "PromptSubmitted",
@@ -362,33 +365,18 @@ async fn prompt_submission_event_id_or_append(
             }),
         )
         .await?
-        .id)
-}
-async fn prompt_submission_event_id(
-    store: &WorkflowRuntimeStore,
-    workflow_id: &str,
-    task_id: &TaskId,
-) -> anyhow::Result<Option<String>> {
-    let task_id = task_id.as_str();
-    Ok(store
-        .events_for(workflow_id)
-        .await?
-        .into_iter()
-        .find(|event| {
-            event.event_type == "PromptSubmitted"
-                && event
-                    .event
-                    .get("task_id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|recorded| recorded == task_id)
-        })
-        .map(|event| event.id))
+        .id;
+    Ok(SubmissionEventSelection {
+        event_id,
+        has_prior_attempt: lookup.has_prior_attempt,
+        replay_existing: false,
+    })
 }
 async fn apply_prompt_decision(
     store: &WorkflowRuntimeStore,
     mut instance: WorkflowInstance,
     new_instance: bool,
-    decision: WorkflowDecision,
+    mut decision: WorkflowDecision,
     ctx: &PromptSubmissionRuntimeContext<'_>,
     accepted_data: serde_json::Value,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
@@ -397,20 +385,28 @@ async fn apply_prompt_decision(
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())
     };
-    let validation =
-        DecisionValidator::prompt_task().validate(&instance, &decision, &validation_context);
     if new_instance {
         store.upsert_instance(&instance).await?;
     }
-    let event_id = prompt_submission_event_id_or_append(store, &instance.id, ctx).await?;
-    let record = if let Some(record) = decision_for_event(store, &instance.id, &event_id).await? {
+    let event = prompt_submission_event_id_or_append(store, &instance.id, ctx).await?;
+    if event.disambiguates_command_dedupe() {
+        disambiguate_submission_command_dedupe(&mut decision, &event.event_id);
+    }
+    let record = if let Some(record) =
+        decision_for_event(store, &instance.id, &event.event_id).await?
+    {
         record
     } else {
+        let validation =
+            DecisionValidator::prompt_task().validate(&instance, &decision, &validation_context);
         match validation {
-            Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event_id.clone())),
+            Ok(()) => {
+                WorkflowDecisionRecord::accepted(decision.clone(), Some(event.event_id.clone()))
+            }
             Err(error) => {
                 let reason = error.to_string();
-                let record = WorkflowDecisionRecord::rejected(decision, Some(event_id), &reason);
+                let record =
+                    WorkflowDecisionRecord::rejected(decision, Some(event.event_id), &reason);
                 store.record_decision(&record).await?;
                 return Ok(WorkflowSubmissionRuntimeRecord {
                     workflow_id: instance.id,
@@ -792,6 +788,11 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "workflow_runtime_submission/dependency_tests.rs"]
 mod dependency_tests;
+
+#[cfg(test)]
+#[path = "workflow_runtime_submission/replay_tests.rs"]
+mod replay_tests;
+
 #[cfg(test)]
 #[path = "workflow_runtime_submission_tests.rs"]
 mod tests;
