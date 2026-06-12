@@ -216,4 +216,10 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                 END IF;
               END $$",
     },
+    Migration {
+        version: 12,
+        description: "index explicit runtime submission handles",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_submission_id
+              ON workflow_instances ((data->'data'->>'submission_id'))",
+    },
 ];

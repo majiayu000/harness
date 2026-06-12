@@ -611,3 +611,99 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
     assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     Ok(())
 }
+
+#[tokio::test]
+async fn create_task_with_terminal_issue_retry_returns_stable_submission_handle(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let before_count = state.core.tasks.count();
+    let app = task_app(state.clone());
+
+    let body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "repo": "owner/repo",
+        "issue": 42,
+        "labels": ["bug"]
+    });
+    let first_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+    let first_json = response_json(first_response).await?;
+    let stable_submission_id = first_json["submission_id"]
+        .as_str()
+        .expect("first response should include submission id")
+        .to_string();
+
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let canonical_project_root = project_root.canonicalize()?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &canonical_project_root.to_string_lossy(),
+        Some("owner/repo"),
+        42,
+    );
+    let mut instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should be persisted");
+    assert_eq!(instance.data["submission_id"], stable_submission_id);
+    instance.state = "failed".to_string();
+    store.upsert_instance(&instance).await?;
+
+    let retry_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(retry_response.status(), StatusCode::ACCEPTED);
+    let retry_json = response_json(retry_response).await?;
+    assert_eq!(retry_json["task_id"], stable_submission_id);
+    assert_eq!(retry_json["submission_id"], stable_submission_id);
+    assert_eq!(retry_json["workflow_id"], workflow_id);
+    assert_eq!(retry_json["execution_path"], "workflow_runtime");
+    assert_eq!(state.core.tasks.count(), before_count);
+
+    let retry_instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should remain persisted");
+    assert_eq!(retry_instance.state, "planning");
+    assert_eq!(retry_instance.data["submission_id"], stable_submission_id);
+    let internal_retry_task_id = retry_instance.data["task_id"]
+        .as_str()
+        .expect("retry task id should be recorded");
+    assert_ne!(internal_retry_task_id, stable_submission_id);
+    assert_eq!(
+        retry_instance.data["task_ids"],
+        serde_json::json!([stable_submission_id, internal_retry_task_id])
+    );
+    Ok(())
+}

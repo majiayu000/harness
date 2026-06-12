@@ -62,7 +62,7 @@ pub(crate) async fn task_response_details(
 ) -> Result<TaskResponseDetails, EnqueueTaskError> {
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
         if let Some(workflow) = store
-            .get_instance_by_task_id(task_id.as_str())
+            .get_instance_by_submission_id(task_id.as_str())
             .await
             .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
         {

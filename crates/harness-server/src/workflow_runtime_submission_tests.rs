@@ -335,18 +335,17 @@ async fn issue_submission_preserves_prior_task_handles_for_lookup() -> anyhow::R
         "runtime-handle-first"
     );
     assert_eq!(
-        runtime_issue_by_task_id(&store, &first_task_id)
+        runtime_issue_by_submission_id(&store, &first_task_id)
             .await?
             .expect("first handle should resolve")
             .id,
         workflow.id
     );
-    assert_eq!(
-        runtime_issue_by_task_id(&store, &second_task_id)
+    assert!(
+        runtime_issue_by_submission_id(&store, &second_task_id)
             .await?
-            .expect("second handle should resolve")
-            .id,
-        workflow.id
+            .is_none(),
+        "retry task id should not remain a public lookup alias after submission_id is explicit"
     );
     Ok(())
 }

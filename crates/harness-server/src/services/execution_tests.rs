@@ -469,7 +469,9 @@ async fn enqueue_background_pr_feedback_uses_bound_workflow_runtime_without_task
         "project_id": project_id,
         "repo": "owner/repo",
         "issue_number": 42,
-        "task_id": "runtime-issue-task",
+        "submission_id": "runtime-stable-submission",
+        "task_id": "runtime-issue-retry-task",
+        "task_ids": ["runtime-stable-submission", "runtime-issue-retry-task"],
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "execution_path": "workflow_runtime"
@@ -485,7 +487,7 @@ async fn enqueue_background_pr_feedback_uses_bound_workflow_runtime_without_task
 
     let task_id = svc.enqueue_background(req).await?;
 
-    assert_eq!(task_id.as_str(), "runtime-issue-task");
+    assert_eq!(task_id.as_str(), "runtime-stable-submission");
     assert!(
         task_store.get_with_db_fallback(&task_id).await?.is_none(),
         "workflow runtime PR feedback submissions must not register legacy PR task rows"
@@ -495,6 +497,8 @@ async fn enqueue_background_pr_feedback_uses_bound_workflow_runtime_without_task
         .await?
         .expect("bound issue workflow should still exist");
     assert_eq!(updated.state, "local_review_gate");
+    assert_eq!(updated.data["task_id"], "runtime-issue-retry-task");
+    assert_eq!(updated.data["submission_id"], task_id.as_str());
     let commands = runtime_store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].status, "pending");
@@ -630,10 +634,15 @@ async fn enqueue_background_prompt_submission_reopens_blocked_runtime_workflow(
         .await?
         .expect("blocked workflow should be reopened");
     assert_eq!(instance.state, "implementing");
-    assert_eq!(instance.data["task_id"], task_id.as_str());
+    assert_eq!(task_id.as_str(), "old-prompt-task");
+    assert_eq!(instance.data["submission_id"], task_id.as_str());
+    let retry_task_id = instance.data["task_id"]
+        .as_str()
+        .expect("retry task id should be recorded");
+    assert_ne!(retry_task_id, task_id.as_str());
     assert_eq!(
         instance.data["task_ids"],
-        serde_json::json!(["old-prompt-task", task_id.as_str()])
+        serde_json::json!(["old-prompt-task", retry_task_id])
     );
     assert!(instance.data.get("prompt").is_none());
     let prompt_ref = instance.data["prompt_ref"]

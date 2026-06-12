@@ -16,7 +16,7 @@ use harness_skills::store::SkillStore;
 use harness_workflow::issue_lifecycle::{
     is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
 };
-use harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID;
+use harness_workflow::runtime::{WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
@@ -722,7 +722,7 @@ impl DefaultExecutionService {
             command_count = record.command_ids.len(),
             "execution service: accepted issue submission into workflow runtime"
         );
-        Ok(task_id)
+        runtime_submission_response_handle(store, &record.workflow_id, &task_id).await
     }
 
     async fn submit_prompt_to_workflow_runtime(
@@ -785,7 +785,7 @@ impl DefaultExecutionService {
             command_count = record.command_ids.len(),
             "execution service: accepted prompt submission into workflow runtime"
         );
-        Ok(task_id)
+        runtime_submission_response_handle(store, &record.workflow_id, &task_id).await
     }
 
     async fn submit_pr_feedback_to_workflow_runtime(
@@ -841,13 +841,18 @@ impl DefaultExecutionService {
 
         match outcome {
             crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
+                workflow_id,
                 task_id,
                 ..
             }
             | crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                workflow_id,
                 task_id,
                 ..
-            } => Ok(TaskId::from_str(&task_id)),
+            } => {
+                runtime_submission_response_handle(store, &workflow_id, &TaskId::from_str(&task_id))
+                    .await
+            }
             crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::NotCandidate {
                 workflow_id,
                 state,
@@ -1023,6 +1028,26 @@ fn runtime_prompt_duplicate_allows_resubmission(
     instance: &harness_workflow::runtime::WorkflowInstance,
 ) -> bool {
     instance.is_terminal() || instance.state == "blocked"
+}
+
+async fn runtime_submission_response_handle(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    fallback_task_id: &TaskId,
+) -> Result<TaskId, EnqueueTaskError> {
+    let Some(instance) = store
+        .get_instance(workflow_id)
+        .await
+        .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
+    else {
+        return Err(EnqueueTaskError::Internal(format!(
+            "workflow runtime accepted submission for missing workflow {workflow_id}"
+        )));
+    };
+    Ok(
+        crate::workflow_runtime_submission::runtime_issue_task_handle(&instance)
+            .unwrap_or_else(|| fallback_task_id.clone()),
+    )
 }
 
 fn workflow_runtime_loops_enabled(project_root: &Path) -> Result<bool, EnqueueTaskError> {
