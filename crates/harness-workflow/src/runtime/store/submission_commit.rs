@@ -193,3 +193,134 @@ async fn load_submission_instance_tx(
     }
     select_instance_for_update_tx(tx, transition.workflow_id).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{WorkflowCommand, WorkflowCommandRecord, WorkflowSubject};
+    use harness_core::db::resolve_database_url;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn submission_replay_keeps_completed_commands_when_repairing_pending_commands(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let initial = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "addressing_feedback",
+            WorkflowSubject::new("pr", "77"),
+        )
+        .with_id("submission-replay-keeps-completed-commands")
+        .with_data(json!({
+            "project_id": "/project-a",
+            "pr_number": 77,
+        }));
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "addressing_feedback",
+            "address_feedback",
+            "awaiting_feedback",
+            "review feedback was addressed",
+        )
+        .with_command(WorkflowCommand::enqueue_activity(
+            "run_local_review",
+            "submission-local-review",
+        ))
+        .with_command(WorkflowCommand::enqueue_activity(
+            "inspect_pr_feedback",
+            "submission-remote-feedback",
+        ));
+        let mut final_instance = initial.clone();
+        final_instance.state = "awaiting_feedback".to_string();
+        final_instance.version = final_instance.version.saturating_add(1);
+        final_instance.data = json!({
+            "project_id": "/project-a",
+            "pr_number": 77,
+            "last_decision": "address_feedback",
+        });
+
+        let first_commit = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &initial.id,
+                expected_state: &initial.state,
+                expected_version: initial.version,
+                create_if_missing: Some(&initial),
+                event_id: None,
+                new_event_id: Some("submission-replay-event-1"),
+                event_type: "IssueSubmitted",
+                source: "workflow-runtime-test",
+                payload: json!({"task_id": "feedback-submission"}),
+                decision: &decision,
+                existing_record: None,
+                rejection_reason: None,
+                final_instance: Some(&final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+            })
+            .await?
+            .expect("initial submission commit should be accepted");
+        let commands = store.commands_for(&initial.id).await?;
+        assert_eq!(commands.len(), 2);
+        let completed_command_id = command_by_dedupe(&commands, "submission-local-review")
+            .id
+            .clone();
+        let pending_command_id = command_by_dedupe(&commands, "submission-remote-feedback")
+            .id
+            .clone();
+        store
+            .mark_command_status(&completed_command_id, WorkflowCommandStatus::Completed)
+            .await?;
+
+        let replay_commit = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &initial.id,
+                expected_state: &final_instance.state,
+                expected_version: final_instance.version,
+                create_if_missing: Some(&initial),
+                event_id: first_commit.record.event_id.as_deref(),
+                new_event_id: None,
+                event_type: "IssueSubmitted",
+                source: "workflow-runtime-test",
+                payload: json!({"task_id": "feedback-submission"}),
+                decision: &decision,
+                existing_record: Some(&first_commit.record),
+                rejection_reason: None,
+                final_instance: Some(&final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+            })
+            .await?
+            .expect("submission replay should reuse the accepted decision");
+
+        assert_eq!(replay_commit.command_ids, first_commit.command_ids);
+        let commands = store.commands_for(&initial.id).await?;
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            command_by_dedupe(&commands, "submission-local-review").status,
+            WorkflowCommandStatus::Completed
+        );
+        assert_eq!(
+            store
+                .get_command(&pending_command_id)
+                .await?
+                .expect("pending command should remain present")
+                .status,
+            WorkflowCommandStatus::Pending
+        );
+        Ok(())
+    }
+
+    fn command_by_dedupe<'a>(
+        commands: &'a [WorkflowCommandRecord],
+        dedupe_key: &str,
+    ) -> &'a WorkflowCommandRecord {
+        commands
+            .iter()
+            .find(|command| command.command.dedupe_key == dedupe_key)
+            .expect("command should be present")
+    }
+}

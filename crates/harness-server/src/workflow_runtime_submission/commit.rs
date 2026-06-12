@@ -224,8 +224,11 @@ pub(super) async fn apply_prompt_decision(
         })
         .await?
         .ok_or_else(|| submission_commit_conflict(&instance.id))?;
-    if previous_prompt_ref.as_deref() != Some(prompt_ref.as_str()) {
-        remove_prompt_submission_prompt_durable(store, previous_prompt_ref.as_deref()).await?;
+    if let Some(previous_prompt_ref) = previous_prompt_ref
+        .as_deref()
+        .filter(|previous_prompt_ref| *previous_prompt_ref != prompt_ref.as_str())
+    {
+        remove_prompt_submission_prompt_durable(store, Some(previous_prompt_ref)).await?;
     }
     Ok(WorkflowSubmissionRuntimeRecord {
         workflow_id: instance.id,
