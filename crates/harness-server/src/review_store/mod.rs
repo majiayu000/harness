@@ -566,7 +566,7 @@ pub async fn migrate_legacy_review_store_if_needed(
     }
 
     let legacy_table: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
-        .bind(format!("{legacy_schema}.review_findings"))
+        .bind(format!("\"{legacy_schema}\".review_findings"))
         .fetch_one(&target_store.pool)
         .await?;
     if legacy_table.is_none() {
