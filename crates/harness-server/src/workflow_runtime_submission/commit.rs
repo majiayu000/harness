@@ -197,10 +197,6 @@ pub(super) async fn apply_prompt_decision(
     }
 
     let prompt_ref = string_field(&accepted_data, "prompt_ref")?;
-    let previous_prompt_ref = optional_string_field(&instance.data, "prompt_ref");
-    let previous_prompt_ref_to_remove = previous_prompt_ref
-        .as_deref()
-        .filter(|previous_prompt_ref| *previous_prompt_ref != prompt_ref.as_str());
     let committed_decision = existing_record
         .as_ref()
         .map(|record| &record.decision)
@@ -211,6 +207,13 @@ pub(super) async fn apply_prompt_decision(
         accepted_data,
         preserves_applied_instance(&instance, existing_record.as_ref()),
     );
+    let final_prompt_ref = optional_string_field(&final_instance.data, "prompt_ref");
+    let prompt_payload_commits = final_prompt_ref.as_deref() == Some(prompt_ref.as_str());
+    let previous_prompt_ref = optional_string_field(&instance.data, "prompt_ref");
+    let previous_prompt_ref_to_remove = prompt_payload_commits
+        .then_some(previous_prompt_ref.as_deref())
+        .flatten()
+        .filter(|previous_prompt_ref| *previous_prompt_ref != prompt_ref.as_str());
     let outcome = store
         .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
             workflow_id: &instance.id,
@@ -227,7 +230,7 @@ pub(super) async fn apply_prompt_decision(
             rejection_reason: None,
             final_instance: Some(&final_instance),
             command_status: WorkflowCommandStatus::Pending,
-            prompt_payload: Some(WorkflowSubmissionPromptPayload {
+            prompt_payload: prompt_payload_commits.then_some(WorkflowSubmissionPromptPayload {
                 prompt_ref: &prompt_ref,
                 prompt: ctx.prompt,
                 previous_prompt_ref: previous_prompt_ref_to_remove,
@@ -235,8 +238,10 @@ pub(super) async fn apply_prompt_decision(
         })
         .await?
         .ok_or_else(|| submission_commit_conflict(&instance.id))?;
-    cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
-    remove_prompt_submission_prompt(previous_prompt_ref_to_remove);
+    if prompt_payload_commits {
+        cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
+        remove_prompt_submission_prompt(previous_prompt_ref_to_remove);
+    }
     Ok(WorkflowSubmissionRuntimeRecord {
         workflow_id: instance.id,
         accepted: true,

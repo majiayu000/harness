@@ -204,3 +204,78 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
     assert!(lookup_prompt_submission_prompt(&prompt_ref).is_none());
     Ok(())
 }
+
+#[tokio::test]
+async fn accepted_prompt_replay_with_new_prompt_keeps_referenced_payload() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = open_runtime_store(dir.path()).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("runtime-prompt-replay");
+    let first_prompt = "original prompt";
+    let replay_prompt = "changed prompt on replay";
+    let first = record_prompt_submission(
+        &store,
+        PromptSubmissionRuntimeContext {
+            project_root: &project_root,
+            task_id: &task_id,
+            prompt: first_prompt,
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+    let workflow = store
+        .get_instance(&first.workflow_id)
+        .await?
+        .expect("accepted prompt submission should persist a workflow");
+    let first_prompt_ref = workflow.data["prompt_ref"]
+        .as_str()
+        .expect("workflow should reference the first prompt")
+        .to_string();
+    let replay_prompt_ref = prompt_ref_for_submission(
+        project_root.to_string_lossy().as_ref(),
+        None,
+        &task_id,
+        replay_prompt,
+    );
+
+    let replay = record_prompt_submission(
+        &store,
+        PromptSubmissionRuntimeContext {
+            project_root: &project_root,
+            task_id: &task_id,
+            prompt: replay_prompt,
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+
+    assert!(replay.accepted);
+    assert_eq!(replay.decision_id, first.decision_id);
+    let workflow = store
+        .get_instance(&first.workflow_id)
+        .await?
+        .expect("workflow should remain persisted");
+    assert_eq!(workflow.data["prompt_ref"], first_prompt_ref);
+    assert_eq!(
+        store.get_prompt_payload(&first_prompt_ref).await?,
+        Some(first_prompt.to_string())
+    );
+    assert!(store
+        .get_prompt_payload(&replay_prompt_ref)
+        .await?
+        .is_none());
+    Ok(())
+}
