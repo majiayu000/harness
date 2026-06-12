@@ -132,6 +132,11 @@ impl CodexAgent {
             .reasoning_effort
             .as_deref()
             .unwrap_or(&self.reasoning_effort);
+        let base_ref = req
+            .base_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let mut args = vec![
             OsString::from("-C"),
             req.project_root.as_os_str().to_os_string(),
@@ -149,11 +154,11 @@ impl CodexAgent {
         }
 
         args.push(OsString::from("review"));
-        if let Some(base_ref) = req.base_ref.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(base_ref) = base_ref {
             args.push(OsString::from("--base"));
             args.push(OsString::from(base_ref));
         }
-        if req.instructions.is_some() {
+        if review_uses_stdin_prompt(req) {
             args.push(OsString::from("-"));
         }
         args
@@ -166,6 +171,7 @@ impl CodexAgent {
         self.run_setup_phase(&req.project_root).await?;
 
         let review_args = self.review_args(&req);
+        let use_stdin_prompt = review_uses_stdin_prompt(&req);
         let sandbox_spec = SandboxSpec::new(req.sandbox_mode, &req.project_root);
         let wrapped_command =
             wrap_command(&self.cli_path, &review_args, &sandbox_spec).map_err(|error| {
@@ -177,7 +183,7 @@ impl CodexAgent {
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
-            .stdin(if req.instructions.is_some() {
+            .stdin(if use_stdin_prompt {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -203,7 +209,7 @@ impl CodexAgent {
             current_dir = %req.project_root.display(),
             sandbox_engine = ?wrapped_command.engine,
             arg_count = wrapped_command.args.len(),
-            has_stdin_instructions = req.instructions.is_some(),
+            has_stdin_instructions = use_stdin_prompt,
             "codex review spawn prepared"
         );
         let mut child = cmd.spawn().map_err(|error| {
@@ -218,7 +224,10 @@ impl CodexAgent {
             harness_core::error::HarnessError::AgentExecution(message)
         })?;
 
-        if let Some(instructions) = req.instructions.as_deref() {
+        if use_stdin_prompt {
+            let Some(instructions) = req.instructions.as_deref() else {
+                unreachable!("review stdin prompt requires instructions");
+            };
             let Some(mut stdin) = child.stdin.take() else {
                 return Err(harness_core::error::HarnessError::AgentExecution(
                     "failed to open stdin for codex review instructions".to_string(),
@@ -262,6 +271,16 @@ impl CodexAgent {
             exit_code: output.status.code(),
         })
     }
+}
+
+fn review_uses_stdin_prompt(req: &CodexReviewRequest) -> bool {
+    req.instructions.is_some()
+        && req
+            .base_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
 }
 
 #[derive(Debug)]
