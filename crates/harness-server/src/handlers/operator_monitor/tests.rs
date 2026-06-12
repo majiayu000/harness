@@ -43,6 +43,7 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
         workflow("awaiting_feedback", json!({})),
         workflow("ready_to_merge", json!({})),
         workflow("awaiting_dependencies", json!({})),
+        workflow("idle", json!({})),
         workflow("failed", json!({})),
         workflow("done", json!({})),
     ];
@@ -55,6 +56,7 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
     assert_eq!(counts.awaiting_dependencies, 1);
     assert_eq!(counts.failed, 1);
     assert_eq!(counts.done, 1);
+    assert_eq!(counts.other, 1);
 }
 
 #[test]
@@ -258,6 +260,19 @@ fn operator_actions_link_evidence_to_current_legacy_task_id() {
     );
 }
 
+#[test]
+fn idle_workflows_are_inactive_for_source_activity() {
+    let workflows = vec![workflow("idle", json!({ "source": "repo_backlog" }))];
+
+    let counts = runtime_workflow_counts(&workflows);
+    let by_source = source_activity(&workflows, &[]);
+
+    assert_eq!(counts.pending, 0);
+    assert_eq!(counts.running, 0);
+    assert_eq!(counts.other, 1);
+    assert!(by_source.is_empty());
+}
+
 #[tokio::test]
 async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
@@ -358,6 +373,46 @@ async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result
 
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0].id, "recent-failed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_action_age_uses_store_updated_at() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-action-age-")?;
+    let workflow_runtime_store = WorkflowRuntimeStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+        Some(&test_helpers::test_database_url()?),
+    )
+    .await?;
+    let mut ready = workflow(
+        "ready_to_merge",
+        json!({
+            "source": "github",
+            "pr_number": 7,
+            "pr_url": "https://github.com/owner/repo/pull/7",
+        }),
+    )
+    .with_id("ready-store-age".to_string());
+    ready.updated_at = Utc::now() - chrono::Duration::days(2);
+    workflow_runtime_store.upsert_instance(&ready).await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = NOW() WHERE id = $1")
+        .bind("ready-store-age")
+        .execute(workflow_runtime_store.pool())
+        .await?;
+
+    let workflows = list_runtime_workflows_from_store(&workflow_runtime_store).await?;
+    let actions = operator_actions(&workflows, Utc::now());
+
+    let action = actions
+        .iter()
+        .find(|action| action.workflow_id == "ready-store-age")
+        .expect("ready action");
+    assert!(
+        action.age_secs < 60,
+        "action age should use the fresh store timestamp, got {}",
+        action.age_secs
+    );
     Ok(())
 }
 

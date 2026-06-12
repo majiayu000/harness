@@ -400,6 +400,7 @@ fn workflow_bucket(workflow: &WorkflowInstance) -> WorkflowBucket {
         "blocked" => WorkflowBucket::Blocked,
         "failed" => WorkflowBucket::Failed,
         "done" | "passed" => WorkflowBucket::Done,
+        "idle" => WorkflowBucket::Other,
         "pr_open" | "local_review_gate" | "awaiting_feedback" | "quality_gate_pending" => {
             WorkflowBucket::Review
         }
@@ -486,6 +487,10 @@ fn add_workflow_source_activity(
     by_source: &mut HashMap<String, SourceActivity>,
     workflow: &WorkflowInstance,
 ) {
+    let bucket = workflow_bucket(workflow);
+    if matches!(bucket, WorkflowBucket::Done | WorkflowBucket::Other) {
+        return;
+    }
     let source = workflow_source(workflow);
     let entry = by_source
         .entry(source.clone())
@@ -493,7 +498,7 @@ fn add_workflow_source_activity(
             source,
             ..Default::default()
         });
-    match workflow_bucket(workflow) {
+    match bucket {
         WorkflowBucket::Pending => entry.pending += 1,
         WorkflowBucket::Running => entry.running += 1,
         WorkflowBucket::Review => entry.review += 1,
