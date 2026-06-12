@@ -117,6 +117,16 @@ function runtimeJobUpdatedAt(job: WorkflowRuntimeJob): number {
   return Math.max(timestampValue(job.updated_at), timestampValue(job.created_at));
 }
 
+function runtimeLeaseLabel(value?: string | null): string | null {
+  if (!value) return null;
+  return value.replace(/_/g, " ");
+}
+
+function compactRuntimeTimestamp(value?: string | null): string | null {
+  if (!value) return null;
+  return value.replace("T", " ").replace(/\.\d+Z$/, "Z");
+}
+
 function latestRuntimeJob(command: WorkflowRuntimeCommandNode): WorkflowRuntimeJob | null {
   return command.runtime_jobs.reduce<WorkflowRuntimeJob | null>((latest, job) => {
     if (!latest) return job;
@@ -133,9 +143,14 @@ function runtimeJobLabel(command: WorkflowRuntimeCommandNode): string {
       : `${command.runtime_jobs.length}/${totalJobs} jobs`;
   if (!job) return jobCountLabel;
   const notBefore = job.not_before ? ` - not before ${job.not_before}` : "";
+  const leaseState = runtimeLeaseLabel(job.lease_state);
+  const lease = leaseState ? ` - ${leaseState}` : "";
+  const inFlight = job.in_flight_model_turn ? " - in-flight" : "";
+  const observedAt = compactRuntimeTimestamp(job.last_runtime_observation_at);
+  const observed = observedAt ? ` - observed ${observedAt}` : "";
   const latestEvent = job.latest_runtime_event_type ? ` - event ${job.latest_runtime_event_type}` : "";
   const promptDigest = job.prompt_packet_digest ? ` - prompt ${job.prompt_packet_digest.slice(0, 12)}` : "";
-  return `${jobCountLabel} - ${job.status}${notBefore}${latestEvent}${promptDigest}`;
+  return `${jobCountLabel} - ${job.status}${lease}${inFlight}${observed}${notBefore}${latestEvent}${promptDigest}`;
 }
 
 function runtimeMergeWorkflowId(workflow?: WorkflowSummary | null): string | null {
@@ -178,11 +193,15 @@ function workflowRuntimeCounts(nodes: WorkflowRuntimeTreeNode[]) {
 
 function workflowRuntimePanelCounts(payload?: WorkflowRuntimeTreePayload) {
   const counts = workflowRuntimeCounts(payload?.workflows ?? []);
+  const leaseStatuses = payload?.summary?.running_job_lease_statuses ?? {};
   return {
     ...counts,
     workflows: payload?.total_workflows ?? counts.workflows,
     commands: payload?.summary?.total_commands ?? counts.commands,
     jobs: payload?.summary?.total_runtime_jobs ?? counts.jobs,
+    activeLeased: leaseStatuses.active_leased ?? 0,
+    expiredOrMissing:
+      (leaseStatuses.expired_lease ?? 0) + (leaseStatuses.missing_lease ?? 0),
   };
 }
 
@@ -313,6 +332,8 @@ function WorkflowRuntimePanel({
             <span>{workflowRuntimeWorkflowLabel(payload, counts.workflows)} workflows</span>
             <span>{counts.commands} commands</span>
             <span>{counts.jobs} jobs</span>
+            <span>{counts.activeLeased} active leases</span>
+            <span>{counts.expiredOrMissing} expired/missing</span>
             <span>{counts.rejected} rejected</span>
           </div>
         </div>

@@ -8,6 +8,7 @@ pub mod bus;
 pub mod dispatcher;
 pub mod errors;
 mod job_claim;
+pub mod lease_state;
 pub mod model;
 pub mod plan_issue;
 pub mod pr_feedback;
@@ -18,6 +19,7 @@ pub mod repo_backlog;
 pub mod status;
 pub mod store;
 mod store_migrations;
+mod store_summary;
 pub mod submission;
 pub mod validator;
 pub mod worker;
@@ -28,6 +30,7 @@ mod tests;
 pub use bus::InMemoryWorkflowBus;
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use errors::RuntimeJobNotFoundError;
+pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use model::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, ActivityStatus,
     RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord,
