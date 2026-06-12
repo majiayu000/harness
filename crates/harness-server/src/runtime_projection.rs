@@ -125,14 +125,14 @@ fn runtime_submission_handle(data: &serde_json::Value) -> Option<TaskId> {
     trimmed_string_field(data, "submission_id")
         .or_else(|| first_string_array_field(data, "task_ids"))
         .or_else(|| trimmed_string_field(data, "task_id"))
-        .map(|task_id| TaskId::from_str(&task_id))
+        .map(harness_core::types::TaskId)
 }
 
 fn legacy_dedupe_task_handle(data: &serde_json::Value) -> Option<TaskId> {
     trimmed_string_field(data, "task_id")
         .or_else(|| last_string_array_field(data, "task_ids"))
         .or_else(|| trimmed_string_field(data, "submission_id"))
-        .map(|task_id| TaskId::from_str(&task_id))
+        .map(harness_core::types::TaskId)
 }
 
 fn trimmed_string_field(data: &serde_json::Value, field: &str) -> Option<String> {
