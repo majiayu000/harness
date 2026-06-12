@@ -426,6 +426,7 @@ async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()>
                 source_repo: dir.path().to_path_buf(),
                 repo: None,
                 runtime_workflow_id: None,
+                workspace_key: format!("workspace-key-{i}"),
                 project_key: "test-project".to_string(),
                 slot_index: i as u32,
                 branch: format!("harness/fake-{i}"),

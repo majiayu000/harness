@@ -482,6 +482,85 @@ async fn pool_slot_reuse_preserves_released_same_task_workspace() {
 }
 
 #[tokio::test]
+async fn pool_slot_reuse_uses_workspace_identity_for_new_task_id() {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        auto_cleanup: false,
+        ..Default::default()
+    };
+    let mgr = WorkspaceManager::new_with_pool(
+        config,
+        crate::workspace_pool::WorkspacePoolConfig::new(2, std::collections::HashMap::new()),
+        None,
+    )
+    .expect("new");
+    let blocker_task = harness_core::types::TaskId("slot-zero-blocker".to_string());
+    let first_task = harness_core::types::TaskId("issue-task-old-internal-id".to_string());
+    let second_task = harness_core::types::TaskId("issue-task-new-internal-id".to_string());
+
+    let blocker = mgr
+        .create_workspace(
+            &blocker_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:7"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect("create blocker workspace");
+    assert_eq!(blocker.slot_index, 0);
+    let first = mgr
+        .create_workspace(
+            &first_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect("create first issue workspace");
+    assert_eq!(first.slot_index, 1);
+    let marker = first.workspace_path.join("handoff.txt");
+    std::fs::write(&marker, "preserve this file").expect("write marker");
+    mgr.release_workspace(&first_task).await;
+    mgr.remove_workspace(&blocker_task)
+        .await
+        .expect("remove blocker so slot 0 is free");
+
+    let second = mgr
+        .create_workspace(
+            &second_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect("reuse released issue workspace by workspace identity");
+
+    assert_eq!(second.slot_index, 1);
+    assert_eq!(first.workspace_path, second.workspace_path);
+    assert_eq!(second.decision, WorkspaceAcquireDecision::ReusedRecovered);
+    assert!(
+        second.workspace_path.join("handoff.txt").exists(),
+        "successor issue task should reuse the preserved workspace identity"
+    );
+
+    mgr.remove_workspace(&second_task).await.expect("remove");
+}
+
+#[tokio::test]
 async fn create_workspace_allocates_distinct_slots_for_concurrent_same_repo_tasks() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
@@ -619,6 +698,7 @@ async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::R
         project_key: "project-a".to_string(),
         slot_index: 0,
         task_id: task_id.clone(),
+        workspace_key: "workspace-a".to_string(),
         workspace_path: dir.path().join("workspaces/project-a-slot-0"),
         source_repo: dir.path().join("repo"),
         repo: Some("owner/repo".to_string()),
@@ -661,6 +741,7 @@ async fn workspace_lease_store_does_not_steal_live_foreign_slot() -> anyhow::Res
         project_key: "project-a".to_string(),
         slot_index: 0,
         task_id: first_task,
+        workspace_key: "workspace-a".to_string(),
         workspace_path: dir.path().join("workspaces/project-a-slot-0"),
         source_repo: dir.path().join("repo"),
         repo: Some("owner/repo".to_string()),
@@ -714,6 +795,7 @@ async fn workspace_lease_store_releases_only_dead_foreign_processes() -> anyhow:
         project_key: "project-a".to_string(),
         slot_index: 0,
         task_id: harness_core::types::TaskId("live-foreign-task".to_string()),
+        workspace_key: "workspace-live".to_string(),
         workspace_path: dir.path().join("workspaces/project-a-slot-0"),
         source_repo: dir.path().join("repo"),
         repo: Some("owner/repo".to_string()),
@@ -725,6 +807,7 @@ async fn workspace_lease_store_releases_only_dead_foreign_processes() -> anyhow:
     let dead_record = WorkspaceLeaseRecord {
         slot_index: 1,
         task_id: harness_core::types::TaskId("dead-foreign-task".to_string()),
+        workspace_key: "workspace-dead".to_string(),
         workspace_path: dir.path().join("workspaces/project-a-slot-1"),
         runtime_workflow_id: Some("workflow-dead".to_string()),
         owner_session: "session-dead".to_string(),
@@ -946,6 +1029,80 @@ async fn remove_workspace_releases_persisted_slot_after_cleanup_hook_finishes() 
     assert!(
         store.list_leased().await?.is_empty(),
         "persisted lease should release after cleanup completes"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_workspace_for_retry_releases_persisted_slot_after_cleanup_finishes(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let lease_db = tempfile::tempdir().expect("tempdir");
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("workspace-leases")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let mgr = std::sync::Arc::new(WorkspaceManager::new_with_pool(
+        config,
+        crate::workspace_pool::WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        Some(store.clone()),
+    )?);
+    let task_id = harness_core::types::TaskId("retry-cleanup-holds-lease".to_string());
+
+    let lease = mgr
+        .create_workspace(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await?;
+    assert_eq!(store.list_leased().await?.len(), 1);
+
+    let git_ops_guard = mgr.git_ops.lock().await;
+    let mgr_for_spawn = mgr.clone();
+    let task_id_for_spawn = task_id.clone();
+    let source_path = source.path().to_path_buf();
+    let workspace_path = lease.workspace_path.clone();
+    let cleanup_handle = tokio::spawn(async move {
+        mgr_for_spawn
+            .cleanup_workspace_for_retry(&task_id_for_spawn, &source_path, Some(&workspace_path))
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        store.list_leased().await?.len(),
+        1,
+        "persisted lease should remain held while retry cleanup is waiting"
+    );
+
+    drop(git_ops_guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), cleanup_handle)
+        .await
+        .expect("retry cleanup should finish")
+        .expect("retry cleanup task should join")?;
+    assert!(
+        store.list_leased().await?.is_empty(),
+        "persisted lease should release after retry cleanup finishes"
+    );
+    assert!(
+        !lease.workspace_path.exists(),
+        "retry cleanup should remove the workspace"
     );
 
     Ok(())

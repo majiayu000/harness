@@ -73,6 +73,7 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
             source_repo: project_root.clone(),
             repo: Some("owner/repo".to_string()),
             runtime_workflow_id: Some(workflow.id.clone()),
+            workspace_key: "owner_repo__issue_42".to_string(),
             project_key: "test-project".to_string(),
             slot_index: 0,
             branch: "harness/runtime-wf-github-issue-pr-test".to_string(),

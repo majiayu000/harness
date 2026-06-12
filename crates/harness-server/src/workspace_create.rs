@@ -140,9 +140,22 @@ impl WorkspaceManager {
         } else {
             None
         };
+        let released_path_for_workspace_key = if options.reuse_existing_workspace {
+            self.released_workspace_paths
+                .get(&owner_record_workspace_key)
+                .map(|entry| entry.value().clone())
+        } else {
+            None
+        };
         let preferred_released_lease = if options.reuse_existing_workspace {
             if let Some(store) = self.lease_store.as_ref() {
-                match store.latest_released_lease_for_task(task_id).await {
+                match store
+                    .latest_released_lease_for_workspace_key(
+                        &project_key,
+                        &owner_record_workspace_key,
+                    )
+                    .await
+                {
                     Ok(record) => record.filter(|record| {
                         record.project_key == project_key && record.slot_index < capacity as u32
                     }),
@@ -151,8 +164,8 @@ impl WorkspaceManager {
                             workspace_path: self.config.root.join(&project_key),
                             workspace_owner: None,
                             message: format!(
-                                "failed to inspect released workspace lease for task {}: {err}",
-                                task_id.0
+                                "failed to inspect released workspace lease for workspace key {}: {err}",
+                                owner_record_workspace_key
                             ),
                         });
                     }
@@ -168,6 +181,12 @@ impl WorkspaceManager {
             .map(|record| record.slot_index)
             .or_else(|| {
                 released_path_for_task
+                    .as_deref()
+                    .and_then(|path| slot_index_from_workspace_path(&project_key, path))
+                    .filter(|slot| *slot < capacity as u32)
+            })
+            .or_else(|| {
+                released_path_for_workspace_key
                     .as_deref()
                     .and_then(|path| slot_index_from_workspace_path(&project_key, path))
                     .filter(|slot| *slot < capacity as u32)
@@ -226,6 +245,7 @@ impl WorkspaceManager {
                 source_repo: source_repo.to_path_buf(),
                 repo: repo.map(str::to_owned),
                 runtime_workflow_id: options.runtime_workflow_id.clone(),
+                workspace_key: owner_record_workspace_key.clone(),
                 owner_session: owner_session.clone(),
                 run_generation,
                 process_id: std::process::id(),
@@ -337,6 +357,7 @@ impl WorkspaceManager {
                         source_repo: source_repo.to_path_buf(),
                         repo: repo.map(str::to_owned),
                         runtime_workflow_id: options.runtime_workflow_id.clone(),
+                        workspace_key: owner_record_workspace_key.clone(),
                         project_key: project_key.clone(),
                         slot_index,
                         branch: branch.clone(),
@@ -397,9 +418,12 @@ impl WorkspaceManager {
                 });
             }
         };
-        let reacquired_released_task_path = released_path_for_task
+        let reacquired_released_path = released_path_for_task
             .as_ref()
-            .is_some_and(|path| path == &workspace_path);
+            .is_some_and(|path| path == &workspace_path)
+            || released_path_for_workspace_key
+                .as_ref()
+                .is_some_and(|path| path == &workspace_path);
 
         if !fetch_output.status.success() {
             let stderr = String::from_utf8_lossy(&fetch_output.stderr);
@@ -453,7 +477,7 @@ impl WorkspaceManager {
                             == Some(owner_record_workspace_key.as_str())
                 });
             let can_reuse_without_reset = options.reuse_existing_workspace
-                && (reacquired_released_task_slot || reacquired_released_task_path)
+                && (reacquired_released_task_slot || reacquired_released_path)
                 && owner_record_matches_current_workspace;
             if can_reuse_without_reset {
                 decision = WorkspaceAcquireDecision::ReusedRecovered;

@@ -66,6 +66,7 @@ pub(crate) struct ActiveWorkspace {
     pub(crate) source_repo: PathBuf,
     pub(crate) repo: Option<String>,
     pub(crate) runtime_workflow_id: Option<String>,
+    pub(crate) workspace_key: String,
     pub(crate) project_key: String,
     pub(crate) slot_index: u32,
     pub(crate) branch: String,
@@ -214,6 +215,7 @@ pub struct WorkspaceManager {
     pub(crate) active: DashMap<TaskId, ActiveWorkspace>,
     pub(crate) active_paths: DashMap<PathBuf, TaskId>,
     released_paths: DashMap<TaskId, PathBuf>,
+    released_workspace_paths: DashMap<String, PathBuf>,
     pub(crate) owner_session: String,
     git_ops: tokio::sync::Mutex<()>,
     pool: WorkspacePool,
@@ -239,6 +241,7 @@ impl WorkspaceManager {
             active: DashMap::new(),
             active_paths: DashMap::new(),
             released_paths: DashMap::new(),
+            released_workspace_paths: DashMap::new(),
             owner_session: SessionId::new().to_string(),
             git_ops: tokio::sync::Mutex::new(()),
             pool: WorkspacePool::new(pool_config),
@@ -304,6 +307,7 @@ impl WorkspaceManager {
             None => return Ok(()),
         };
         self.released_paths.remove(task_id);
+        self.released_workspace_paths.remove(&entry.workspace_key);
 
         // Run before_remove_hook if set. Non-fatal on failure.
         if let Some(hook) = &self.config.before_remove_hook {
@@ -344,6 +348,8 @@ impl WorkspaceManager {
         if let Some(entry) = self.remove_active_workspace(task_id) {
             self.released_paths
                 .insert(task_id.clone(), entry.workspace_path.clone());
+            self.released_workspace_paths
+                .insert(entry.workspace_key.clone(), entry.workspace_path.clone());
             self.release_persisted_lease(task_id, &entry).await;
         } else if let Some(store) = self.lease_store.as_ref() {
             if let Err(error) = store.release_task(task_id).await {
@@ -378,10 +384,11 @@ impl WorkspaceManager {
                 return Ok(());
             }
         }
-        if let Some(entry) = self.remove_active_workspace(task_id) {
-            self.release_persisted_lease(task_id, &entry).await;
-        }
+        let active_entry = self.remove_active_workspace(task_id);
         self.released_paths.remove(task_id);
+        if let Some(entry) = active_entry.as_ref() {
+            self.released_workspace_paths.remove(&entry.workspace_key);
+        }
         if let Some(owner_task) = self.active_paths.get(&target) {
             tracing::warn!(
                 task_id = %task_id.0,
@@ -389,10 +396,18 @@ impl WorkspaceManager {
                 workspace_path = ?target,
                 "cleanup_workspace_for_retry: skipped deleting workspace claimed during retry cleanup"
             );
+            if let Some(entry) = active_entry.as_ref() {
+                self.release_persisted_lease(task_id, entry).await;
+            }
             return Ok(());
         }
-        self.cleanup_workspace_path_locked(source_repo, &target)
-            .await
+        let cleanup_result = self
+            .cleanup_workspace_path_locked(source_repo, &target)
+            .await;
+        if let Some(entry) = active_entry.as_ref() {
+            self.release_persisted_lease(task_id, entry).await;
+        }
+        cleanup_result
     }
 
     pub(crate) fn workspace_path_for(
@@ -423,6 +438,14 @@ impl WorkspaceManager {
         if let Some(path) = self
             .released_paths
             .get(task_id)
+            .map(|entry| entry.value().clone())
+        {
+            return path;
+        }
+        let workspace_key = derive_workspace_key(task_id, external_id, repo, Some(source_repo));
+        if let Some(path) = self
+            .released_workspace_paths
+            .get(&workspace_key)
             .map(|entry| entry.value().clone())
         {
             return path;

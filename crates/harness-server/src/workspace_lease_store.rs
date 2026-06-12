@@ -11,6 +11,7 @@ pub(crate) struct WorkspaceLeaseRecord {
     pub(crate) project_key: String,
     pub(crate) slot_index: u32,
     pub(crate) task_id: TaskId,
+    pub(crate) workspace_key: String,
     pub(crate) workspace_path: PathBuf,
     pub(crate) source_repo: PathBuf,
     pub(crate) repo: Option<String>,
@@ -48,13 +49,14 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "INSERT INTO workspace_leases (
-                project_key, slot_index, task_id, workspace_path, source_repo, repo,
+                project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
                 runtime_workflow_id, owner_session, run_generation, process_id,
                 state, acquired_at, released_at, last_used_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'leased',
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'leased',
                        CURRENT_TIMESTAMP, NULL, CURRENT_TIMESTAMP)
              ON CONFLICT(project_key, slot_index) DO UPDATE SET
                 task_id = EXCLUDED.task_id,
+                workspace_key = EXCLUDED.workspace_key,
                 workspace_path = EXCLUDED.workspace_path,
                 source_repo = EXCLUDED.source_repo,
                 repo = EXCLUDED.repo,
@@ -75,6 +77,7 @@ impl WorkspaceLeaseStore {
         .bind(&record.project_key)
         .bind(record.slot_index as i64)
         .bind(record.task_id.as_str())
+        .bind(&record.workspace_key)
         .bind(record.workspace_path.to_string_lossy().as_ref())
         .bind(record.source_repo.to_string_lossy().as_ref())
         .bind(record.repo.as_deref())
@@ -149,7 +152,7 @@ impl WorkspaceLeaseStore {
         current_owner_session: &str,
     ) -> anyhow::Result<u64> {
         let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(
-            "SELECT project_key, slot_index, task_id, workspace_path, source_repo, repo,
+            "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
                     runtime_workflow_id, owner_session, run_generation, process_id
              FROM workspace_leases
              WHERE state = 'leased'
@@ -215,20 +218,23 @@ impl WorkspaceLeaseStore {
         Ok(row.map(|(path,)| PathBuf::from(path)))
     }
 
-    pub(crate) async fn latest_released_lease_for_task(
+    pub(crate) async fn latest_released_lease_for_workspace_key(
         &self,
-        task_id: &TaskId,
+        project_key: &str,
+        workspace_key: &str,
     ) -> anyhow::Result<Option<WorkspaceLeaseRecord>> {
         let row = sqlx::query_as::<_, WorkspaceLeaseRow>(
-            "SELECT project_key, slot_index, task_id, workspace_path, source_repo, repo,
+            "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
                     runtime_workflow_id, owner_session, run_generation, process_id
              FROM workspace_leases
-             WHERE task_id = $1
+             WHERE project_key = $1
+               AND workspace_key = $2
                AND state = 'released'
              ORDER BY last_used_at DESC
              LIMIT 1",
         )
-        .bind(task_id.as_str())
+        .bind(project_key)
+        .bind(workspace_key)
         .fetch_optional(&self.pool)
         .await?;
         row.map(TryInto::try_into).transpose()
@@ -237,7 +243,7 @@ impl WorkspaceLeaseStore {
     #[cfg(test)]
     pub(crate) async fn list_leased(&self) -> anyhow::Result<Vec<WorkspaceLeaseRecord>> {
         let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(
-            "SELECT project_key, slot_index, task_id, workspace_path, source_repo, repo,
+            "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
                     runtime_workflow_id, owner_session, run_generation, process_id
              FROM workspace_leases
              WHERE state = 'leased'
@@ -258,6 +264,7 @@ struct WorkspaceLeaseRow {
     project_key: String,
     slot_index: i64,
     task_id: String,
+    workspace_key: String,
     workspace_path: String,
     source_repo: String,
     repo: Option<String>,
@@ -275,6 +282,7 @@ impl TryFrom<WorkspaceLeaseRow> for WorkspaceLeaseRecord {
             project_key: row.project_key,
             slot_index: u32::try_from(row.slot_index)?,
             task_id: TaskId::from_str(&row.task_id),
+            workspace_key: row.workspace_key,
             workspace_path: PathBuf::from(row.workspace_path),
             source_repo: PathBuf::from(row.source_repo),
             repo: row.repo,
@@ -302,6 +310,7 @@ pub(crate) const WORKSPACE_LEASES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS 
     project_key         TEXT NOT NULL,
     slot_index          BIGINT NOT NULL,
     task_id             TEXT NOT NULL,
+    workspace_key       TEXT NOT NULL,
     workspace_path      TEXT NOT NULL,
     source_repo         TEXT NOT NULL,
     repo                TEXT,
@@ -317,5 +326,7 @@ pub(crate) const WORKSPACE_LEASES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS 
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_leases_task_state
     ON workspace_leases(task_id, state);
+CREATE INDEX IF NOT EXISTS idx_workspace_leases_workspace_key_state
+    ON workspace_leases(project_key, workspace_key, state);
 CREATE INDEX IF NOT EXISTS idx_workspace_leases_state_owner
     ON workspace_leases(state, owner_session)";
