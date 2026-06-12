@@ -95,7 +95,9 @@ pub(super) async fn run_runtime_pr_hygiene_sweep_tick(
             remaining -= 1;
             tick.inspected += 1;
             let dirty_age_secs = pr.dirty_age_secs(now);
-            let result = if pr.requires_mergeability_repair() {
+            let result = if pr.requires_mergeability_repair()
+                && should_request_pr_hygiene_repair(dirty_age_secs, &workflow_cfg.pr_feedback)
+            {
                 let task_id = crate::workflow_runtime_pr_feedback::synthesized_pr_feedback_task_id(
                     &repo.project_root.to_string_lossy(),
                     Some(pr.repo_slug.as_str()),
@@ -131,6 +133,9 @@ pub(super) async fn run_runtime_pr_hygiene_sweep_tick(
                     dirty_age_secs,
                     &workflow_cfg.pr_feedback,
                 )
+            } else if pr.requires_mergeability_repair() {
+                tick.not_needed += 1;
+                "not_stale_enough"
             } else {
                 tick.not_needed += 1;
                 "ok"
@@ -146,6 +151,13 @@ pub(super) async fn run_runtime_pr_hygiene_sweep_tick(
         }
     }
     Ok(tick)
+}
+
+fn should_request_pr_hygiene_repair(
+    dirty_age_secs: u64,
+    policy: &harness_core::config::workflow::PrFeedbackPolicy,
+) -> bool {
+    dirty_age_secs >= policy.dirty_age_to_repair_secs
 }
 
 fn map_repair_outcome(
@@ -403,5 +415,16 @@ mod tests {
 
         assert_eq!(result, "comment_only");
         assert_eq!(tick.repair_requested, 1);
+    }
+
+    #[test]
+    fn should_request_pr_hygiene_repair_honors_repair_threshold() {
+        let policy = harness_core::config::workflow::PrFeedbackPolicy {
+            dirty_age_to_repair_secs: 100,
+            ..Default::default()
+        };
+
+        assert!(!should_request_pr_hygiene_repair(99, &policy));
+        assert!(should_request_pr_hygiene_repair(100, &policy));
     }
 }
