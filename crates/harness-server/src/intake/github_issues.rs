@@ -864,7 +864,7 @@ mod tests {
         }
 
         let _db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
-        let database_url = crate::test_helpers::ensure_test_database_url_override()?;
+        let database_url = crate::test_helpers::test_database_url()?;
         let dir = tempfile::tempdir()?;
         let tasks = crate::task_runner::TaskStore::open_with_database_url(
             &harness_core::config::dirs::default_db_path(dir.path(), "tasks"),

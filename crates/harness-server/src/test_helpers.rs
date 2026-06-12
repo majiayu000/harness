@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64},
-    Arc, Mutex, OnceLock,
+    Arc, OnceLock,
 };
 use std::time::Duration;
 
@@ -15,9 +15,20 @@ use tokio::sync::OnceCell;
 /// spurious "project root must be within HOME" failures.
 pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
-static DATABASE_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
 static DB_STATE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 static TEST_DATABASE_URL: OnceLock<String> = OnceLock::new();
+static TEST_PG_POOL_CONFIGURED: OnceLock<()> = OnceLock::new();
+
+pub fn configure_test_pg_pool_defaults() {
+    TEST_PG_POOL_CONFIGURED.get_or_init(|| {
+        let server = harness_core::config::server::ServerConfig {
+            database_pool_max_connections: Some(1),
+            database_pool_acquire_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        harness_core::db::configure_pg_pool_from_server(&server);
+    });
+}
 
 fn db_state_lock() -> Arc<tokio::sync::Mutex<()>> {
     DB_STATE_LOCK
@@ -81,6 +92,7 @@ pub fn tempdir_in_home(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
 }
 
 pub async fn db_tests_enabled() -> bool {
+    configure_test_pg_pool_defaults();
     if resolve_database_url(None).is_err() {
         return false;
     }
@@ -102,10 +114,12 @@ pub async fn db_tests_enabled() -> bool {
 }
 
 pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
+    configure_test_pg_pool_defaults();
     db_state_lock().lock_owned().await
 }
 
 pub fn test_database_url() -> anyhow::Result<String> {
+    configure_test_pg_pool_defaults();
     if let Some(database_url) = TEST_DATABASE_URL.get() {
         return Ok(database_url.clone());
     }
@@ -121,24 +135,6 @@ pub fn test_database_url() -> anyhow::Result<String> {
 
     let url = resolve_database_url(None)?;
     let _ = TEST_DATABASE_URL.set(url.clone());
-    Ok(url)
-}
-
-pub fn ensure_test_database_url_override() -> anyhow::Result<String> {
-    let _guard = DATABASE_URL_ENV_LOCK
-        .lock()
-        .expect("database URL env lock poisoned");
-    if let Ok(url) = std::env::var("HARNESS_DATABASE_URL") {
-        let url = url.trim();
-        if !url.is_empty() {
-            return Ok(url.to_string());
-        }
-    }
-
-    let url = test_database_url()?;
-    unsafe {
-        std::env::set_var("HARNESS_DATABASE_URL", &url);
-    }
     Ok(url)
 }
 
@@ -202,7 +198,7 @@ async fn make_state_inner(
     mut config: HarnessConfig,
 ) -> anyhow::Result<AppState> {
     let db_setup_guard = acquire_db_state_guard().await;
-    let database_url = ensure_test_database_url_override()?;
+    let database_url = test_database_url()?;
     config.server.database_url = Some(database_url.clone());
     let server = Arc::new(HarnessServer::new(
         config,
