@@ -21,6 +21,43 @@ fn make_skill(name: &str, location: SkillLocation) -> Skill {
     }
 }
 
+fn make_skill_with_patterns(
+    name: &str,
+    location: SkillLocation,
+    description: &str,
+    trigger_patterns: &[&str],
+    author: &str,
+) -> Skill {
+    Skill {
+        description: description.to_string(),
+        content: String::new(),
+        content_hash: compute_content_hash(""),
+        trigger_patterns: trigger_patterns
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+        author: author.to_string(),
+        ..make_skill(name, location)
+    }
+}
+
+fn make_retired_skill_with_patterns(
+    name: &str,
+    location: SkillLocation,
+    description: &str,
+    trigger_patterns: &[&str],
+    author: &str,
+) -> Skill {
+    Skill {
+        quality_score: 0.2,
+        scored_samples: 100,
+        governance_status: SkillGovernanceStatus::Retired,
+        canary_ratio: 0.0,
+        last_scored: Some(Utc::now()),
+        ..make_skill_with_patterns(name, location, description, trigger_patterns, author)
+    }
+}
+
 #[test]
 fn deduplicate_keeps_higher_priority() {
     let mut store = SkillStore::new();
@@ -231,13 +268,13 @@ fn create_parses_trigger_patterns_from_content() {
 #[test]
 fn match_prompt_returns_matching_skills() {
     let mut store = SkillStore::new();
-    let mut skill = make_skill("review", SkillLocation::System);
-    skill.description = "review code".to_string();
-    skill.content = String::new();
-    skill.content_hash = compute_content_hash("");
-    skill.trigger_patterns = vec!["code review".to_string(), "review pr".to_string()];
-    skill.author = "system".to_string();
-    store.skills.push(skill);
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "review code",
+        &["code review", "review pr"],
+        "system",
+    ));
     let matches = store.match_prompt("please do a code review of this PR");
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].name, "review");
@@ -246,13 +283,13 @@ fn match_prompt_returns_matching_skills() {
 #[test]
 fn match_prompt_is_case_insensitive() {
     let mut store = SkillStore::new();
-    let mut skill = make_skill("build-fix", SkillLocation::System);
-    skill.description = "fix builds".to_string();
-    skill.content = String::new();
-    skill.content_hash = compute_content_hash("");
-    skill.trigger_patterns = vec!["build error".to_string()];
-    skill.author = "system".to_string();
-    store.skills.push(skill);
+    store.skills.push(make_skill_with_patterns(
+        "build-fix",
+        SkillLocation::System,
+        "fix builds",
+        &["build error"],
+        "system",
+    ));
     let matches = store.match_prompt("I have a BUILD ERROR in my project");
     assert_eq!(matches.len(), 1);
 }
@@ -273,13 +310,13 @@ fn match_prompt_skips_skills_without_patterns() {
 #[test]
 fn match_prompt_returns_empty_when_no_match() {
     let mut store = SkillStore::new();
-    let mut skill = make_skill("review", SkillLocation::System);
-    skill.description = "review code".to_string();
-    skill.content = String::new();
-    skill.content_hash = compute_content_hash("");
-    skill.trigger_patterns = vec!["code review".to_string()];
-    skill.author = "system".to_string();
-    store.skills.push(skill);
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "review code",
+        &["code review"],
+        "system",
+    ));
     let matches = store.match_prompt("implement feature X");
     assert!(matches.is_empty());
 }
@@ -489,18 +526,13 @@ fn governance_update_ignores_unknown_only_samples() {
 #[test]
 fn retired_skill_is_not_auto_injected() {
     let mut store = SkillStore::new();
-    let mut skill = make_skill("retired-review", SkillLocation::System);
-    skill.description = "review code".to_string();
-    skill.content = String::new();
-    skill.content_hash = compute_content_hash("");
-    skill.trigger_patterns = vec!["code review".to_string()];
-    skill.author = "system".to_string();
-    skill.quality_score = 0.2;
-    skill.scored_samples = 100;
-    skill.governance_status = SkillGovernanceStatus::Retired;
-    skill.canary_ratio = 0.0;
-    skill.last_scored = Some(Utc::now());
-    store.skills.push(skill);
+    store.skills.push(make_retired_skill_with_patterns(
+        "retired-review",
+        SkillLocation::System,
+        "review code",
+        &["code review"],
+        "system",
+    ));
     let matches = store.match_prompt("please do a code review of this PR");
     assert!(matches.is_empty(), "retired skill should not auto-inject");
 }
