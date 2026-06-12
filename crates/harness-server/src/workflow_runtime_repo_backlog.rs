@@ -96,7 +96,7 @@ pub(crate) async fn record_merged_pr(
     ctx: MergedPrRuntimeContext<'_>,
 ) {
     if let Some(workflows) = issue_workflows {
-        if let Err(error) = workflows
+        match workflows
             .record_pr_merged(
                 &ctx.project_root.to_string_lossy(),
                 ctx.repo,
@@ -105,11 +105,36 @@ pub(crate) async fn record_merged_pr(
             )
             .await
         {
-            tracing::warn!(
-                pr = ctx.pr_number,
-                repo = ctx.repo,
-                "issue workflow merged PR update failed: {error}"
-            );
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Some(issue_number) = ctx.issue_number {
+                    if let Err(error) = workflows
+                        .record_pr_merged_for_issue(
+                            &ctx.project_root.to_string_lossy(),
+                            ctx.repo,
+                            issue_number,
+                            ctx.pr_number,
+                            ctx.pr_url,
+                            Some(ctx.detail),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            issue = issue_number,
+                            pr = ctx.pr_number,
+                            repo = ctx.repo,
+                            "issue workflow merged PR fallback update failed: {error}"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    pr = ctx.pr_number,
+                    repo = ctx.repo,
+                    "issue workflow merged PR update failed: {error}"
+                );
+            }
         }
     }
 

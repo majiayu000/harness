@@ -27,7 +27,7 @@ pub(super) fn validate_blocked_done_reconciliation(
 
     if !decision.commands.iter().any(is_pr_merge_mark_done_command) {
         return Err(missing_terminal_evidence(
-            "blocked issue PR-merge reconciliation requires pr_number and pr_url evidence",
+            "blocked issue PR-merge reconciliation requires pr_number plus pr_url or repo evidence",
         ));
     }
 
@@ -51,11 +51,16 @@ fn is_pr_merge_mark_done_command(command: &WorkflowCommand) -> bool {
             .get("pr_number")
             .and_then(serde_json::Value::as_u64)
             .is_some()
-        && command
-            .command
-            .get("pr_url")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+        && (has_non_empty_command_string(command, "pr_url")
+            || has_non_empty_command_string(command, "repo"))
+}
+
+fn has_non_empty_command_string(command: &WorkflowCommand, field: &str) -> bool {
+    command
+        .command
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn missing_terminal_evidence(message: impl Into<String>) -> WorkflowDecisionRejection {

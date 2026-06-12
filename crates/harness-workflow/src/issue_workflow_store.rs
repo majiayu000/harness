@@ -421,6 +421,29 @@ impl IssueWorkflowStore {
         .await
     }
 
+    pub async fn record_pr_merged_for_issue(
+        &self,
+        project_id: &str,
+        repo: Option<&str>,
+        issue_number: u64,
+        pr_number: u64,
+        pr_url: Option<&str>,
+        detail: Option<&str>,
+    ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
+        self.update_existing_issue(project_id, repo, issue_number, |workflow| {
+            let mut event = IssueLifecycleEvent::new(IssueLifecycleEventKind::WorkflowDone);
+            event.pr_number = Some(pr_number);
+            if let Some(pr_url) = pr_url {
+                event.pr_url = Some(pr_url.to_string());
+            }
+            if let Some(detail) = detail {
+                event = event.with_detail(detail.to_string());
+            }
+            workflow.apply_event(event);
+        })
+        .await
+    }
+
     pub async fn list_feedback_candidates(&self) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT data FROM issue_workflows

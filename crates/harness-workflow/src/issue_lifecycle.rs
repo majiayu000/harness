@@ -255,6 +255,12 @@ impl IssueWorkflowInstance {
             IssueLifecycleEventKind::WorkflowDone => {
                 self.state = IssueLifecycleState::Done;
                 self.feedback_claimed_at = None;
+                if event.pr_number.is_some() {
+                    self.pr_number = event.pr_number;
+                }
+                if event.pr_url.is_some() {
+                    self.pr_url = event.pr_url.clone();
+                }
             }
         }
         self.last_event = Some(event);
