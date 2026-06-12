@@ -35,6 +35,7 @@ fn github_fetch_failure(id: &str, issue: u64, failed_at: &str) -> RecentFailureT
 fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
     let workflows = vec![
         workflow("implementing", json!({})),
+        workflow("checking", json!({})),
         workflow("awaiting_feedback", json!({})),
         workflow("ready_to_merge", json!({})),
         workflow("awaiting_dependencies", json!({})),
@@ -44,7 +45,7 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
 
     let counts = runtime_workflow_counts(&workflows);
 
-    assert_eq!(counts.running, 1);
+    assert_eq!(counts.running, 2);
     assert_eq!(counts.review, 1);
     assert_eq!(counts.ready_to_merge, 1);
     assert_eq!(counts.awaiting_dependencies, 1);
@@ -146,6 +147,7 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
                 }),
             ),
             workflow("awaiting_dependencies", json!({ "source": "github" })),
+            workflow("checking", json!({ "source": "github" })),
         ],
         &[legacy_row, queued_row],
     );
@@ -154,6 +156,6 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     let source = by_source.pop().expect("source row");
     assert_eq!(source.source, "github");
     assert_eq!(source.ready_to_merge, 1);
-    assert_eq!(source.running, 0);
+    assert_eq!(source.running, 1);
     assert_eq!(source.blocked, 1);
 }
