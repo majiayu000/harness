@@ -19,6 +19,8 @@ const PROMPT_TASK_DESCRIPTION: &str = "prompt task";
 
 #[path = "workflow_runtime_submission/cancel.rs"]
 mod cancel;
+#[path = "workflow_runtime_submission/commit.rs"]
+mod commit;
 #[path = "workflow_runtime_submission/dependencies.rs"]
 mod dependencies;
 #[path = "workflow_runtime_submission/prompt_memory.rs"]
@@ -30,12 +32,14 @@ pub(crate) use cancel::{
     cancel_issue_submission_by_task_id, cancel_submission_by_workflow_id,
     RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
 };
+use commit::{apply_decision, apply_prompt_decision};
 pub(crate) use dependencies::{
     release_ready_issue_dependencies, release_ready_prompt_dependencies,
     resolve_issue_dependency_status, RuntimeDependencyStatus,
 };
 #[cfg(test)]
 pub(crate) use prompt_memory::clear_prompt_submission_prompt_cache_for_test;
+use prompt_memory::prompt_ref_for_submission;
 #[cfg(test)]
 use prompt_memory::{
     cache_prompt_submission_prompt, remove_prompt_submission_prompt,
@@ -44,14 +48,6 @@ use prompt_memory::{
 pub(crate) use prompt_memory::{
     lookup_prompt_submission_prompt, lookup_prompt_submission_prompt_durable,
     remove_terminal_prompt_submission_payload,
-};
-use prompt_memory::{
-    persist_prompt_submission_prompt, prompt_ref_for_submission,
-    remove_prompt_submission_prompt_durable,
-};
-use replay::{
-    decision_for_event, disambiguate_submission_command_dedupe, submission_event_for_replay,
-    SubmissionEventSelection,
 };
 
 pub(crate) struct PromptSubmissionRuntimeContext<'a> {
@@ -214,245 +210,6 @@ fn prompt_submission_dependency_ids(ctx: &PromptSubmissionRuntimeContext<'_>) ->
         }
     }
     depends_on
-}
-
-async fn apply_decision(
-    store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
-    new_instance: bool,
-    mut decision: WorkflowDecision,
-    ctx: &IssueSubmissionRuntimeContext<'_>,
-    accepted_data: serde_json::Value,
-) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
-    let validation_context = if instance.is_terminal() {
-        ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
-    } else {
-        ValidationContext::new("workflow-policy", chrono::Utc::now())
-    };
-    if new_instance {
-        store.upsert_instance(&instance).await?;
-    }
-    let event = issue_submission_event_id_or_append(store, &instance.id, ctx).await?;
-    if event.disambiguates_command_dedupe() {
-        disambiguate_submission_command_dedupe(&mut decision, &event.event_id);
-    }
-    let record =
-        if let Some(record) = decision_for_event(store, &instance.id, &event.event_id).await? {
-            record
-        } else {
-            let validation = DecisionValidator::github_issue_pr().validate(
-                &instance,
-                &decision,
-                &validation_context,
-            );
-            match validation {
-                Ok(()) => {
-                    WorkflowDecisionRecord::accepted(decision.clone(), Some(event.event_id.clone()))
-                }
-                Err(error) => {
-                    let reason = error.to_string();
-                    let record =
-                        WorkflowDecisionRecord::rejected(decision, Some(event.event_id), &reason);
-                    store.record_decision(&record).await?;
-                    return Ok(WorkflowSubmissionRuntimeRecord {
-                        workflow_id: instance.id,
-                        accepted: false,
-                        decision_id: record.id,
-                        command_ids: Vec::new(),
-                        rejection_reason: Some(reason),
-                    });
-                }
-            }
-        };
-    if !record.accepted {
-        return Ok(WorkflowSubmissionRuntimeRecord {
-            workflow_id: instance.id,
-            accepted: false,
-            decision_id: record.id,
-            command_ids: Vec::new(),
-            rejection_reason: record.rejection_reason,
-        });
-    }
-    store.record_decision(&record).await?;
-    let mut command_ids = Vec::with_capacity(record.decision.commands.len());
-    for command in &record.decision.commands {
-        command_ids.push(
-            store
-                .enqueue_command(&instance.id, Some(&record.id), command)
-                .await?,
-        );
-    }
-    instance.state = record.decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(accepted_data, &record.decision.decision);
-    store.upsert_instance(&instance).await?;
-    Ok(WorkflowSubmissionRuntimeRecord {
-        workflow_id: instance.id,
-        accepted: true,
-        decision_id: record.id,
-        command_ids,
-        rejection_reason: None,
-    })
-}
-async fn issue_submission_event_id_or_append(
-    store: &WorkflowRuntimeStore,
-    workflow_id: &str,
-    ctx: &IssueSubmissionRuntimeContext<'_>,
-) -> anyhow::Result<SubmissionEventSelection> {
-    let lookup =
-        submission_event_for_replay(store, workflow_id, "IssueSubmitted", ctx.task_id).await?;
-    if let Some(event_id) = lookup.event_id {
-        return Ok(SubmissionEventSelection {
-            event_id,
-            has_prior_attempt: true,
-            replay_existing: true,
-        });
-    }
-    let event_id = store
-        .append_event(
-            workflow_id,
-            "IssueSubmitted",
-            "workflow_runtime_submission",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "repo": ctx.repo,
-                "issue_number": ctx.issue_number,
-                "labels": ctx.labels,
-                "force_execute": ctx.force_execute,
-                "additional_prompt": ctx.additional_prompt,
-                "depends_on": depends_on_strings(ctx.depends_on),
-                "dependencies_blocked": ctx.dependencies_blocked,
-                "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?
-        .id;
-    Ok(SubmissionEventSelection {
-        event_id,
-        has_prior_attempt: lookup.has_prior_attempt,
-        replay_existing: false,
-    })
-}
-
-async fn prompt_submission_event_id_or_append(
-    store: &WorkflowRuntimeStore,
-    workflow_id: &str,
-    ctx: &PromptSubmissionRuntimeContext<'_>,
-) -> anyhow::Result<SubmissionEventSelection> {
-    let lookup =
-        submission_event_for_replay(store, workflow_id, "PromptSubmitted", ctx.task_id).await?;
-    if let Some(event_id) = lookup.event_id {
-        return Ok(SubmissionEventSelection {
-            event_id,
-            has_prior_attempt: true,
-            replay_existing: true,
-        });
-    }
-    let event_id = store
-        .append_event(
-            workflow_id,
-            "PromptSubmitted",
-            "workflow_runtime_submission",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "prompt_chars": ctx.prompt.chars().count(),
-                "depends_on": depends_on_strings(ctx.depends_on),
-                "serialization_depends_on": depends_on_strings(ctx.serialization_depends_on),
-                "dependencies_blocked": ctx.dependencies_blocked,
-                "source": ctx.source,
-                "external_id": ctx.external_id,
-                "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?
-        .id;
-    Ok(SubmissionEventSelection {
-        event_id,
-        has_prior_attempt: lookup.has_prior_attempt,
-        replay_existing: false,
-    })
-}
-async fn apply_prompt_decision(
-    store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
-    new_instance: bool,
-    mut decision: WorkflowDecision,
-    ctx: &PromptSubmissionRuntimeContext<'_>,
-    accepted_data: serde_json::Value,
-) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
-    let validation_context = if instance.is_terminal() {
-        ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
-    } else {
-        ValidationContext::new("workflow-policy", chrono::Utc::now())
-    };
-    if new_instance {
-        store.upsert_instance(&instance).await?;
-    }
-    let event = prompt_submission_event_id_or_append(store, &instance.id, ctx).await?;
-    if event.disambiguates_command_dedupe() {
-        disambiguate_submission_command_dedupe(&mut decision, &event.event_id);
-    }
-    let record = if let Some(record) =
-        decision_for_event(store, &instance.id, &event.event_id).await?
-    {
-        record
-    } else {
-        let validation =
-            DecisionValidator::prompt_task().validate(&instance, &decision, &validation_context);
-        match validation {
-            Ok(()) => {
-                WorkflowDecisionRecord::accepted(decision.clone(), Some(event.event_id.clone()))
-            }
-            Err(error) => {
-                let reason = error.to_string();
-                let record =
-                    WorkflowDecisionRecord::rejected(decision, Some(event.event_id), &reason);
-                store.record_decision(&record).await?;
-                return Ok(WorkflowSubmissionRuntimeRecord {
-                    workflow_id: instance.id,
-                    accepted: false,
-                    decision_id: record.id,
-                    command_ids: Vec::new(),
-                    rejection_reason: Some(reason),
-                });
-            }
-        }
-    };
-    if !record.accepted {
-        return Ok(WorkflowSubmissionRuntimeRecord {
-            workflow_id: instance.id,
-            accepted: false,
-            decision_id: record.id,
-            command_ids: Vec::new(),
-            rejection_reason: record.rejection_reason,
-        });
-    }
-    store.record_decision(&record).await?;
-    let prompt_ref = string_field(&accepted_data, "prompt_ref")?;
-    let previous_prompt_ref = optional_string_field(&instance.data, "prompt_ref");
-    if previous_prompt_ref.as_deref() != Some(prompt_ref.as_str()) {
-        remove_prompt_submission_prompt_durable(store, previous_prompt_ref.as_deref()).await?;
-    }
-    persist_prompt_submission_prompt(store, &prompt_ref, ctx.prompt).await?;
-    let mut command_ids = Vec::with_capacity(record.decision.commands.len());
-    for command in &record.decision.commands {
-        command_ids.push(
-            store
-                .enqueue_command(&instance.id, Some(&record.id), command)
-                .await?,
-        );
-    }
-    instance.state = record.decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(accepted_data, &record.decision.decision);
-    store.upsert_instance(&instance).await?;
-    Ok(WorkflowSubmissionRuntimeRecord {
-        workflow_id: instance.id,
-        accepted: true,
-        decision_id: record.id,
-        command_ids,
-        rejection_reason: None,
-    })
 }
 
 async fn commit_runtime_decision(
@@ -780,6 +537,10 @@ fn set_data_string(mut data: serde_json::Value, key: &str, value: &str) -> serde
     }
     data
 }
+
+#[cfg(test)]
+#[path = "workflow_runtime_submission/atomicity_tests.rs"]
+mod atomicity_tests;
 
 #[cfg(test)]
 #[path = "workflow_runtime_submission/identity_tests.rs"]
