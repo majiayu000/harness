@@ -222,6 +222,10 @@ fn reduce_success(
         return None;
     }
 
+    if stale_success_completion(instance, result) {
+        return None;
+    }
+
     if let Some(decision) = structured_decision.as_ref() {
         let reason = format!(
             "runtime activity `{}` emitted workflow_decision `{}` for workflow `{}` in state `{}`, but the decision to `{}` did not validate and no domain fallback was available",
@@ -347,11 +351,11 @@ fn known_success_without_decision(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> bool {
-    if instance.is_terminal() {
+    if event_command_type(event) == Some(WorkflowCommandType::StartChildWorkflow.as_str()) {
         return true;
     }
 
-    if event_command_type(event) == Some(WorkflowCommandType::StartChildWorkflow.as_str()) {
+    if stale_success_completion(instance, result) {
         return true;
     }
 
@@ -364,6 +368,26 @@ fn known_success_without_decision(
         "inspecting",
         super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY,
     )
+}
+
+fn stale_success_completion(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+    if instance.is_terminal() {
+        return true;
+    }
+
+    instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && matches!(
+            instance.state.as_str(),
+            "addressing_feedback"
+                | "local_review_gate"
+                | "quality_gate_pending"
+                | "ready_to_merge"
+                | "blocked"
+        )
+        && matches!(
+            result.activity.as_str(),
+            "sweep_pr_feedback" | super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY
+        )
 }
 
 fn workflow_decision_from_activity_result(

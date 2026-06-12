@@ -1700,6 +1700,65 @@ fn runtime_completion_reducer_blocks_unknown_success_without_structured_decision
 }
 
 #[test]
+fn runtime_completion_reducer_ignores_stale_pr_feedback_sweep_after_parent_advances() {
+    let instance = issue_instance("ready_to_merge").with_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Late feedback sweep found actionable feedback after the parent advanced.",
+    )
+    .with_signal(ActivitySignal::new(
+        "FeedbackFound",
+        json!({ "count": 1, "pr_number": 77 }),
+    ));
+    let event = runtime_completion_event(&instance, "sweep_pr_feedback", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event).expect("event should parse");
+
+    assert!(
+        decision.is_none(),
+        "late feedback sweep completion should be treated as obsolete"
+    );
+}
+
+#[test]
+fn runtime_completion_reducer_ignores_stale_pr_feedback_child_after_parent_advances() {
+    let instance = issue_instance("ready_to_merge").with_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Late feedback child reported no actionable feedback after the parent advanced.",
+    )
+    .with_signal(ActivitySignal::new(
+        "NoFeedbackFound",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "child-command-1",
+        "runtime_job_id": "child-job-1",
+        "child_workflow_id": "pr-feedback-child-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event).expect("event should parse");
+
+    assert!(
+        decision.is_none(),
+        "late feedback child completion should be treated as obsolete"
+    );
+}
+
+#[test]
 fn runtime_completion_reducer_ignores_child_workflow_start_ack_without_parent_decision() {
     let instance = issue_instance("quality_gate_pending");
     let command = WorkflowCommand::start_child_workflow(
