@@ -48,6 +48,15 @@ fn github_issue_pr_validator_allows_blocked_done_for_pr_merge_reconciliation() {
 }
 
 #[test]
+fn github_issue_pr_validator_does_not_advertise_reconciliation_only_blocked_done() {
+    let validator = DecisionValidator::github_issue_pr();
+
+    assert!(!validator
+        .transition_rules_from("blocked")
+        .any(|rule| rule.to_state == "done"));
+}
+
+#[test]
 fn github_issue_pr_validator_rejects_non_reconciliation_blocked_done() {
     let instance = issue_instance("blocked");
     let decision = blocked_done_pr_merge_decision(&instance);

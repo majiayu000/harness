@@ -3,6 +3,9 @@ use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::fmt;
 
+#[path = "validator_github_issue_pr.rs"]
+mod github_issue_pr_validation;
+
 #[cfg(test)]
 #[path = "validator_tests.rs"]
 mod tests;
@@ -216,7 +219,6 @@ impl TransitionAllowlist {
             .allow("quality_gate_pending", "quality_gate_pending", [Wait])
             .allow("ready_to_merge", "ready_to_merge", [Wait])
             .allow("ready_to_merge", "done", [MarkDone])
-            .allow("blocked", "done", [MarkDone])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
@@ -530,6 +532,10 @@ impl DecisionValidator {
             }
         }
 
+        if self.validate_hidden_workflow_transition(decision, context)? {
+            return Ok(());
+        }
+
         let Some(rule) = self
             .allowlist
             .rule_for(&decision.observed_state, &decision.next_state)
@@ -632,9 +638,26 @@ impl DecisionValidator {
         context: &ValidationContext,
     ) -> Result<(), WorkflowDecisionRejection> {
         if self.kind == DecisionValidatorKind::GithubIssuePr {
-            validate_github_issue_pr_decision(decision, context)?;
+            github_issue_pr_validation::validate_decision(decision, context)?;
         }
         Ok(())
+    }
+
+    fn validate_hidden_workflow_transition(
+        &self,
+        decision: &WorkflowDecision,
+        context: &ValidationContext,
+    ) -> Result<bool, WorkflowDecisionRejection> {
+        if self.kind != DecisionValidatorKind::GithubIssuePr
+            || !github_issue_pr_validation::is_blocked_done_transition(decision)
+        {
+            return Ok(false);
+        }
+
+        let rule = TransitionRule::new("blocked", "done", [WorkflowCommandType::MarkDone]);
+        self.validate_commands(&rule, decision, context)?;
+        github_issue_pr_validation::validate_blocked_done_reconciliation(decision, context)?;
+        Ok(true)
     }
 
     fn validate_command_payload(
@@ -707,65 +730,6 @@ impl DecisionValidator {
 
         Ok(())
     }
-}
-
-fn validate_github_issue_pr_decision(
-    decision: &WorkflowDecision,
-    context: &ValidationContext,
-) -> Result<(), WorkflowDecisionRejection> {
-    if decision.observed_state == "blocked" && decision.next_state == "done" {
-        validate_blocked_done_reconciliation(decision, context)?;
-    }
-    Ok(())
-}
-
-fn validate_blocked_done_reconciliation(
-    decision: &WorkflowDecision,
-    context: &ValidationContext,
-) -> Result<(), WorkflowDecisionRejection> {
-    if context.actor != "reconciliation" || decision.decision != "reconcile_pr_merged" {
-        return Err(missing_terminal_evidence(
-            "blocked issue workflows can only be marked done by PR-merge reconciliation",
-        ));
-    }
-
-    let has_pr_command = decision.commands.iter().any(|command| {
-        command.command_type == WorkflowCommandType::MarkDone
-            && command
-                .command
-                .get("pr_number")
-                .and_then(serde_json::Value::as_u64)
-                .is_some()
-            && command
-                .command
-                .get("pr_url")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
-    });
-    if !has_pr_command {
-        return Err(missing_terminal_evidence(
-            "blocked issue PR-merge reconciliation requires pr_number and pr_url evidence",
-        ));
-    }
-
-    if !decision
-        .evidence
-        .iter()
-        .any(|evidence| evidence.kind == "github_pr")
-    {
-        return Err(missing_terminal_evidence(
-            "blocked issue PR-merge reconciliation requires github_pr evidence",
-        ));
-    }
-
-    Ok(())
-}
-
-fn missing_terminal_evidence(message: impl Into<String>) -> WorkflowDecisionRejection {
-    WorkflowDecisionRejection::new(
-        WorkflowDecisionRejectionKind::MissingTerminalEvidence,
-        message,
-    )
 }
 
 fn is_replan_command(command: &WorkflowCommand) -> bool {
