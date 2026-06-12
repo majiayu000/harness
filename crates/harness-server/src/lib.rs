@@ -47,6 +47,7 @@ pub mod runtime_hosts;
 pub mod runtime_hosts_state;
 pub mod runtime_project_cache;
 pub mod runtime_project_cache_state;
+pub(crate) mod runtime_projection;
 pub mod runtime_state_store;
 pub mod scheduler;
 pub mod self_evolution;

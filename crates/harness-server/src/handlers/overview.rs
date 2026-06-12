@@ -8,6 +8,7 @@
 //! returned as `null` so the UI degrades gracefully.
 
 use crate::http::AppState;
+use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
 use crate::task_runner::{SchedulerAuthorityState, TaskSummary};
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Duration, Timelike, Utc};
@@ -523,60 +524,26 @@ fn add_active_runtime_workflow(
     counts: &mut ActiveTaskOverviewCounts,
     workflow: &harness_workflow::runtime::WorkflowInstance,
 ) -> bool {
-    let Some(bucket) = runtime_workflow_active_bucket(&workflow.state) else {
+    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let Some(bucket) = projection.active_bucket() else {
         return false;
     };
-    let project = workflow
-        .data
-        .get("project_id")
-        .and_then(serde_json::Value::as_str);
-    counts.add(project, bucket);
+    let bucket = match bucket {
+        RuntimeActiveBucket::Running => ActiveTaskBucket::Running,
+        RuntimeActiveBucket::Queued => ActiveTaskBucket::Queued,
+    };
+    counts.add(projection.project_id.as_deref(), bucket);
     true
-}
-
-fn runtime_workflow_active_bucket(state: &str) -> Option<ActiveTaskBucket> {
-    match state {
-        "done" | "passed" | "failed" | "cancelled" => None,
-        "planning" | "implementing" | "replanning" | "addressing_feedback" => {
-            Some(ActiveTaskBucket::Running)
-        }
-        _ => Some(ActiveTaskBucket::Queued),
-    }
 }
 
 fn runtime_workflow_matches_active_legacy_task(
     workflow: &harness_workflow::runtime::WorkflowInstance,
     active_legacy_task_ids: &HashSet<String>,
 ) -> bool {
-    runtime_workflow_dedupe_task_handle(workflow)
+    RuntimeWorkflowProjection::from_workflow(workflow)
+        .legacy_dedupe_task_handle
+        .as_ref()
         .is_some_and(|task_id| active_legacy_task_ids.contains(task_id.as_str()))
-}
-
-fn runtime_workflow_dedupe_task_handle(
-    workflow: &harness_workflow::runtime::WorkflowInstance,
-) -> Option<String> {
-    workflow
-        .data
-        .get("task_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|task_id| !task_id.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            workflow
-                .data
-                .get("task_ids")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|task_ids| {
-                    task_ids.iter().rev().find_map(|task_id| {
-                        task_id
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|task_id| !task_id.is_empty())
-                            .map(ToOwned::to_owned)
-                    })
-                })
-        })
 }
 
 /// Top of the current hour (i.e. `HH:00:00Z`). Falls back to `now` on the
