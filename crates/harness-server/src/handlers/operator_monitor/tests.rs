@@ -57,6 +57,37 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
 }
 
 #[test]
+fn workflow_sample_truncation_preserves_operator_action_states() {
+    let base = Utc::now();
+    let mut workflows = (0..500)
+        .map(|index| {
+            let mut workflow = workflow("checking", json!({ "source": "repo_backlog" }))
+                .with_id(format!("checking-{index}"));
+            workflow.updated_at = base + chrono::Duration::seconds(index);
+            workflow
+        })
+        .collect::<Vec<_>>();
+    let mut ready = workflow(
+        "ready_to_merge",
+        json!({
+            "source": "github",
+            "pr_number": 7,
+            "pr_url": "https://github.com/owner/repo/pull/7",
+        }),
+    )
+    .with_id("older-ready".to_string());
+    ready.updated_at = base - chrono::Duration::hours(1);
+    workflows.push(ready);
+
+    truncate_workflow_sample(&mut workflows, 500);
+
+    assert!(workflows
+        .iter()
+        .any(|workflow| workflow.id == "older-ready"));
+    assert_eq!(workflows.len(), 500);
+}
+
+#[test]
 fn grouped_failures_classifies_and_counts_github_fetch_failures() {
     let failures = vec![
         github_fetch_failure("task-1", 1, "2026-06-12T00:00:00Z"),

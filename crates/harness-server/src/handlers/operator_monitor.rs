@@ -260,8 +260,7 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
                 .await?,
         );
     }
-    workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
-    workflows.truncate(sample_limit);
+    truncate_workflow_sample(&mut workflows, sample_limit);
     let failed_capacity = sample_limit.saturating_sub(workflows.len());
     if failed_capacity > 0 {
         let failed_workflows = list_recent_failed_workflows(store, failed_capacity).await?;
@@ -269,6 +268,24 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
         workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
     }
     Ok(workflows)
+}
+
+fn truncate_workflow_sample(workflows: &mut Vec<WorkflowInstance>, limit: usize) {
+    workflows.sort_by(|a, b| {
+        workflow_sample_priority(a)
+            .cmp(&workflow_sample_priority(b))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    workflows.truncate(limit);
+    workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
+}
+
+fn workflow_sample_priority(workflow: &WorkflowInstance) -> u8 {
+    if workflow_action_kind(workflow.state.as_str()).is_some() {
+        0
+    } else {
+        1
+    }
 }
 
 async fn list_recent_failed_workflows(
