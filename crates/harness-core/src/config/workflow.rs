@@ -100,6 +100,18 @@ pub struct PrFeedbackPolicy {
     pub sweep_interval_secs: u64,
     #[serde(default = "default_feedback_claim_stale_after_secs")]
     pub claim_stale_after_secs: u64,
+    #[serde(default = "default_true")]
+    pub hygiene_enabled: bool,
+    #[serde(default = "default_pr_hygiene_interval_secs")]
+    pub hygiene_interval_secs: u64,
+    #[serde(default = "default_pr_hygiene_dirty_age_to_repair_secs")]
+    pub dirty_age_to_repair_secs: u64,
+    #[serde(default = "default_pr_hygiene_dirty_age_to_comment_secs")]
+    pub dirty_age_to_comment_secs: u64,
+    #[serde(default = "default_pr_hygiene_rebase_needed_label")]
+    pub rebase_needed_label: String,
+    #[serde(default = "default_pr_hygiene_batch_limit")]
+    pub hygiene_batch_limit: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +280,12 @@ impl Default for PrFeedbackPolicy {
             enabled: default_true(),
             sweep_interval_secs: default_feedback_sweep_interval_secs(),
             claim_stale_after_secs: default_feedback_claim_stale_after_secs(),
+            hygiene_enabled: default_true(),
+            hygiene_interval_secs: default_pr_hygiene_interval_secs(),
+            dirty_age_to_repair_secs: default_pr_hygiene_dirty_age_to_repair_secs(),
+            dirty_age_to_comment_secs: default_pr_hygiene_dirty_age_to_comment_secs(),
+            rebase_needed_label: default_pr_hygiene_rebase_needed_label(),
+            hygiene_batch_limit: default_pr_hygiene_batch_limit(),
         }
     }
 }
@@ -445,6 +463,26 @@ fn default_feedback_sweep_interval_secs() -> u64 {
 
 fn default_feedback_claim_stale_after_secs() -> u64 {
     300
+}
+
+fn default_pr_hygiene_interval_secs() -> u64 {
+    30 * 60
+}
+
+fn default_pr_hygiene_dirty_age_to_repair_secs() -> u64 {
+    48 * 60 * 60
+}
+
+fn default_pr_hygiene_dirty_age_to_comment_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_pr_hygiene_rebase_needed_label() -> String {
+    "rebase-needed".to_string()
+}
+
+fn default_pr_hygiene_batch_limit() -> u32 {
+    25
 }
 
 fn default_repo_backlog_poll_interval_secs() -> u64 {

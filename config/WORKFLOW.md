@@ -30,6 +30,12 @@ pr_feedback:
   enabled: true
   sweep_interval_secs: 60
   claim_stale_after_secs: 300
+  hygiene_enabled: true
+  hygiene_interval_secs: 1800
+  dirty_age_to_repair_secs: 172800
+  dirty_age_to_comment_secs: 604800
+  rebase_needed_label: rebase-needed
+  hygiene_batch_limit: 25
 repo_backlog:
   # Disabled by default: issues/PRs are picked up via webhook events only, so an
   # idle system (no GitHub events) runs zero LLM turns. Set enabled: true in a
@@ -99,6 +105,8 @@ PR feedback flow:
 1. Inspect top-level PR comments, inline review comments, review states, checks, and mergeability.
 2. Treat actionable feedback as blocking until it is fixed or explicitly answered with a justified response.
 3. Re-run validation after feedback-driven changes.
+4. Before the final response, refresh the PR state from GitHub again, including review threads, review states, checks, mergeability, and the current head commit.
+5. If any actionable review thread, requested change, failed check, or mergeability blocker remains, report the activity status as blocked instead of succeeded.
 
 Final response:
 

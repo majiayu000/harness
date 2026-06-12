@@ -55,12 +55,31 @@ max_tokens = 4096
 enabled = true
 reviewer_agent = "codex"
 max_rounds = 3
+required_providers = ["codex_cli_review"]
+advisory_providers = ["gemini_github_bot", "codex_github_bot"]
 # Hosted GitHub review bots are advisory. Leave this disabled unless you
 # explicitly want Harness to post /gemini review and wait for hosted bot output.
 review_bot_auto_trigger = false
 fallback_chain = ["gemini", "codex"]
 silence_rounds_threshold = 3
 silence_min_minutes_after_commit = 30
+
+[agents.review.codex_cli_review]
+enabled = true
+cli_path = "codex"
+model = "gpt-5.5"
+reasoning_effort = "xhigh"
+base_ref = "origin/main"
+timeout_secs = 1800
+output_format = "json"
+
+[agents.review.gemini_github_bot]
+enabled = true
+auto_trigger = false
+
+[agents.review.codex_github_bot]
+enabled = true
+auto_trigger = false
 
 [gc]
 max_drafts_per_run = 5

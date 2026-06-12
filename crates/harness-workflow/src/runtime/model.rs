@@ -1,3 +1,4 @@
+use super::status::WorkflowCommandStatus;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -329,7 +330,7 @@ pub struct WorkflowCommandRecord {
     pub workflow_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_id: Option<String>,
-    pub status: String,
+    pub status: WorkflowCommandStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch_owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -506,7 +507,6 @@ pub enum RuntimeJobStatus {
     Succeeded,
     Failed,
     Cancelled,
-    Expired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

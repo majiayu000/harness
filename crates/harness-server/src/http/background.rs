@@ -10,8 +10,8 @@ use harness_workflow::issue_lifecycle::{
 };
 use harness_workflow::runtime::{
     CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
-    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowCommandType, WorkflowDefinition,
-    WorkflowInstance, WorkflowRuntimeStore,
+    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowCommandType,
+    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -625,7 +625,9 @@ async fn dispatch_runtime_command_with_project_policy(
         Ok(Some(profile_selector)) => profile_selector,
         Ok(None) => {
             let command_id = command.id.clone();
-            store.mark_command_status(&command_id, "skipped").await?;
+            store
+                .mark_command_status(&command_id, WorkflowCommandStatus::Skipped)
+                .await?;
             let reason = "workflow runtime dispatch or worker is disabled for the command project"
                 .to_string();
             return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
@@ -633,7 +635,9 @@ async fn dispatch_runtime_command_with_project_policy(
         Err(RuntimeDispatchProfileSelectionError::WorkflowConfig(error)) => {
             let command_id = command.id.clone();
             let reason = format!("workflow runtime project config failed to load: {error}");
-            store.mark_command_status(&command_id, "failed").await?;
+            store
+                .mark_command_status(&command_id, WorkflowCommandStatus::Failed)
+                .await?;
             store
                 .append_event(
                     &command.workflow_id,
@@ -747,7 +751,7 @@ fn workflow_project_root(instance: &WorkflowInstance) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn load_runtime_workflow_config(
+pub(super) fn load_runtime_workflow_config(
     project_root: &Path,
     subsystem: &str,
 ) -> anyhow::Result<harness_core::config::workflow::WorkflowConfig> {
@@ -860,7 +864,7 @@ pub(super) async fn run_runtime_repo_backlog_poll_tick(
     Ok(tick)
 }
 
-async fn repo_backlog_project_root(
+pub(super) async fn repo_backlog_project_root(
     repo_config: &harness_core::config::intake::GitHubRepoConfig,
     fallback: &Path,
 ) -> PathBuf {

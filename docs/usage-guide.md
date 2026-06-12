@@ -18,7 +18,15 @@ The binary is at `./target/release/harness`.
 
 ## Server Startup
 
-> **Important:** Never start the server from within Claude Code or other agent sessions. The `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` environment variables propagate to spawned agents and cause SIGTRAP crashes. Always use a standalone terminal.
+`harness serve` can be started directly from a normal terminal. When product
+behavior needs live verification from a Codex or Claude agent session, launch
+the server with a sanitized environment so spawned agents do not inherit wrapper
+variables from the parent process. Harness strips Claude-prefixed variables
+before spawning child agents; Codex-prefixed variables are not stripped by the
+adapter spawn path, so use `scripts/start-harness-codex-safe.sh` or an
+equivalent sanitized launcher when starting from a Codex-owned session. For
+long-running manual dogfood sessions, a standalone terminal remains a convenient
+way for the operator to own the process lifetime directly.
 
 ### Single Project
 
@@ -55,7 +63,14 @@ cli_path = "codex"
 enabled = true
 reviewer_agent = "codex"
 max_rounds = 3
+required_providers = ["codex_cli_review"]
+advisory_providers = ["gemini_github_bot", "codex_github_bot"]
 review_bot_auto_trigger = false
+
+[agents.review.codex_cli_review]
+enabled = true
+base_ref = "origin/main"
+output_format = "json"
 
 [gc]
 max_drafts_per_run = 5
@@ -86,10 +101,9 @@ max_concurrent = 1
 Start with:
 
 ```bash
-./target/release/harness serve \
+./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ### Multi-Project via CLI Flags
@@ -110,10 +124,9 @@ CLI `--project` flags merge with config `[[projects]]` entries. CLI overrides co
 Enable auto-review bot comments on PRs:
 
 ```bash
-GITHUB_TOKEN=ghp_xxx ./target/release/harness serve \
+GITHUB_TOKEN=ghp_xxx ./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ### With Anthropic API Key
@@ -121,10 +134,9 @@ GITHUB_TOKEN=ghp_xxx ./target/release/harness serve \
 Enable the direct Anthropic API agent:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-xxx ./target/release/harness serve \
+ANTHROPIC_API_KEY=sk-ant-xxx ./target/release/harness --config config/default.toml serve \
   --transport http \
-  --port 9800 \
-  --config config/default.toml
+  --port 9800
 ```
 
 ## Submitting Tasks
@@ -350,7 +362,21 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 | `enabled` | `true` | Enable independent agent review after PR creation. |
 | `reviewer_agent` | `"codex"` | Agent used for review. It may match the implementor when configured explicitly; Harness runs it as a separate review turn. |
 | `max_rounds` | `3` | Maximum review-fix cycles |
+| `required_providers` | `["codex_cli_review"]` | Local review providers that must approve before local completion can pass. |
+| `advisory_providers` | `["gemini_github_bot", "codex_github_bot"]` | Hosted GitHub review bots that are recorded but non-blocking unless external review is explicitly required. |
 | `review_bot_auto_trigger` | `false` | Post and wait for a hosted review bot command. When omitted with `enabled = false`, Harness keeps the hosted-bot path; when disabled, local completion requires local review approval, validation, PR-head advancement after local review fixes that changed the workspace or reported a pushed commit, unchanged reviewed PR head after CI polling, green GitHub PR checks, an open PR or already merged PR, and a configured GitHub token. |
+
+### `[agents.review.codex_cli_review]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Enable native local `codex review` execution. |
+| `cli_path` | `"codex"` | Path to the Codex CLI binary. |
+| `model` | Codex default | Model used for the local review provider. |
+| `reasoning_effort` | Codex default | Reasoning effort passed to Codex CLI. |
+| `base_ref` | `"origin/main"` | Base ref passed to `codex review --base`. |
+| `timeout_secs` | `1800` | Maximum local review runtime. |
+| `output_format` | `"json"` | Request a fenced `harness-review-report` block for normalized gating. |
 
 ### `[review]`
 
@@ -622,7 +648,7 @@ RuleEngine / SkillStore (permanently prevents recurrence)
 
 ```bash
 # Start server
-harness serve --transport http --port 9800 --config config/default.toml
+harness --config config/default.toml serve --transport http --port 9800
 
 # One-shot execution
 harness exec "Fix the failing test in src/lib.rs"
@@ -641,6 +667,9 @@ harness skill list         # List discovered skills
 harness plan init spec.md           # Initialize execution plan
 harness plan status exec-plan.md    # Check plan status
 
+# PR review
+harness pr review 123 --provider codex_cli_review --base origin/main
+
 # Version
 harness --version
 ```
@@ -653,11 +682,16 @@ macOS Seatbelt sandbox blocks Claude Code syscalls. Set `sandbox_mode = "danger-
 
 ### Tasks fail with SIGTRAP
 
-Started server from within Claude Code. Restart from a standalone terminal.
+Use a current Harness binary and inspect the server logs for the failing
+adapter command. Harness strips Claude-prefixed wrapper variables before
+spawning child agents. Codex-prefixed parent variables are not stripped by
+Harness, so start the server through a sanitized launcher when it is owned by a
+Codex session. A SIGTRAP can also point to a stale binary, adapter configuration,
+or macOS sandbox setting.
 
 ### Codex review shows "unexpected argument"
 
-Codex CLI updated. Check `codex exec --help` for current flags and update `crates/harness-agents/src/codex.rs`.
+Codex CLI updated. Check `codex review --help` for current flags and update `crates/harness-agents/src/codex.rs`.
 
 ### All tasks show `no_pr` status
 

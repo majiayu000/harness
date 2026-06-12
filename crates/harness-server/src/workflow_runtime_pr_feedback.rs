@@ -2,9 +2,10 @@ use crate::task_runner::TaskId;
 use harness_workflow::runtime::{
     build_local_review_completed_decision, build_local_review_request_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
-    DecisionValidator, LocalReviewCompletedInput, LocalReviewDecisionInput, LocalReviewOutcome,
-    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
-    PrFeedbackSweepDecisionInput, ValidationContext, WorkflowCommand, WorkflowCommandType,
+    build_pr_hygiene_repair_decision, DecisionValidator, LocalReviewCompletedInput,
+    LocalReviewDecisionInput, LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput,
+    PrFeedbackOutcome, PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput,
+    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
     WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
     WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
     GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
@@ -14,6 +15,15 @@ use serde_json::json;
 use std::path::Path;
 
 const DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS: u64 = 24 * 60 * 60;
+
+mod pr_lifecycle_persist;
+use pr_lifecycle_persist::{
+    issue_workflow_id, persist_pr_lifecycle_with_retry, pr_lifecycle_workflow_id,
+};
+#[cfg(test)]
+use pr_lifecycle_persist::{
+    set_pr_lifecycle_persist_test_failures, PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS,
+};
 
 pub(crate) struct PrDetectedRuntimeContext<'a> {
     pub project_root: &'a Path,
@@ -61,6 +71,23 @@ pub(crate) struct PrFeedbackSweepRuntimeContext<'a> {
     pub task_id: &'a TaskId,
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
+}
+
+pub(crate) struct PrHygieneRepairRuntimeContext<'a> {
+    pub project_root: &'a Path,
+    pub repo: Option<&'a str>,
+    pub task_id: &'a TaskId,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub merge_state_status: Option<&'a str>,
+    pub head_oid: Option<&'a str>,
+    pub updated_at: Option<&'a str>,
+    pub observed_at: &'a str,
+    pub dirty_age_secs: u64,
+    pub dirty_age_to_repair_secs: u64,
+    pub dirty_age_to_comment_secs: u64,
+    pub rebase_needed_label: &'a str,
 }
 
 struct PrRuntimeTarget {
@@ -142,14 +169,39 @@ pub(crate) async fn record_pr_detected(
     ctx: PrDetectedRuntimeContext<'_>,
 ) {
     let Some(store) = store else {
-        return;
-    };
-    if let Err(error) = persist_pr_detected(store, &ctx).await {
-        tracing::warn!(
+        tracing::error!(
             issue = ctx.issue_number,
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
-            "workflow runtime PR detection write failed: {error}"
+            "workflow runtime PR detection write skipped because the runtime store is unavailable"
+        );
+        return;
+    };
+    let workflow_id = issue_workflow_id(ctx.project_root, ctx.repo, ctx.issue_number);
+    let failure_payload = json!({
+        "issue_number": ctx.issue_number,
+        "repo": ctx.repo,
+        "task_id": ctx.task_id.as_str(),
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+    });
+    if let Err(error) = persist_pr_lifecycle_with_retry(
+        store,
+        &workflow_id,
+        "record_pr_detected",
+        ctx.task_id,
+        ctx.pr_number,
+        failure_payload,
+        || persist_pr_detected(store, &ctx),
+    )
+    .await
+    {
+        tracing::error!(
+            workflow_id = %workflow_id,
+            issue = ctx.issue_number,
+            pr = ctx.pr_number,
+            task_id = %ctx.task_id.0,
+            "workflow runtime PR detection write failed after retries: {error}"
         );
     }
 }
@@ -159,13 +211,42 @@ pub(crate) async fn record_pr_feedback(
     ctx: PrFeedbackRuntimeContext<'_>,
 ) {
     let Some(store) = store else {
-        return;
-    };
-    if let Err(error) = persist_pr_feedback(store, &ctx).await {
-        tracing::warn!(
+        tracing::error!(
+            issue = ?ctx.issue_number,
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
-            "workflow runtime PR feedback write failed: {error}"
+            "workflow runtime PR feedback write skipped because the runtime store is unavailable"
+        );
+        return;
+    };
+    let workflow_id =
+        pr_lifecycle_workflow_id(ctx.project_root, ctx.repo, ctx.issue_number, ctx.pr_number);
+    let failure_payload = json!({
+        "issue_number": ctx.issue_number,
+        "repo": ctx.repo,
+        "task_id": ctx.task_id.as_str(),
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+        "outcome": outcome_label(ctx.outcome),
+        "summary": ctx.summary,
+    });
+    if let Err(error) = persist_pr_lifecycle_with_retry(
+        store,
+        &workflow_id,
+        "record_pr_feedback",
+        ctx.task_id,
+        ctx.pr_number,
+        failure_payload,
+        || persist_pr_feedback(store, &ctx),
+    )
+    .await
+    {
+        tracing::error!(
+            workflow_id = %workflow_id,
+            issue = ?ctx.issue_number,
+            pr = ctx.pr_number,
+            task_id = %ctx.task_id.0,
+            "workflow runtime PR feedback write failed after retries: {error}"
         );
     }
 }
@@ -191,13 +272,41 @@ pub(crate) async fn record_pr_merged(
     ctx: PrMergedRuntimeContext<'_>,
 ) {
     let Some(store) = store else {
-        return;
-    };
-    if let Err(error) = persist_pr_merged(store, &ctx).await {
-        tracing::warn!(
+        tracing::error!(
+            issue = ?ctx.issue_number,
             pr = ctx.pr_number,
             task_id = %ctx.task_id.0,
-            "workflow runtime PR merge write failed: {error}"
+            "workflow runtime PR merge write skipped because the runtime store is unavailable"
+        );
+        return;
+    };
+    let workflow_id =
+        pr_lifecycle_workflow_id(ctx.project_root, ctx.repo, ctx.issue_number, ctx.pr_number);
+    let failure_payload = json!({
+        "issue_number": ctx.issue_number,
+        "repo": ctx.repo,
+        "task_id": ctx.task_id.as_str(),
+        "pr_number": ctx.pr_number,
+        "pr_url": ctx.pr_url,
+        "summary": ctx.summary,
+    });
+    if let Err(error) = persist_pr_lifecycle_with_retry(
+        store,
+        &workflow_id,
+        "record_pr_merged",
+        ctx.task_id,
+        ctx.pr_number,
+        failure_payload,
+        || persist_pr_merged(store, &ctx),
+    )
+    .await
+    {
+        tracing::error!(
+            workflow_id = %workflow_id,
+            issue = ?ctx.issue_number,
+            pr = ctx.pr_number,
+            task_id = %ctx.task_id.0,
+            "workflow runtime PR merge write failed after retries: {error}"
         );
     }
 }
@@ -209,24 +318,63 @@ pub(crate) async fn request_pr_feedback_sweep_for_pr(
     let project_id = ctx.project_root.to_string_lossy().into_owned();
     let instance = pr_scoped_instance(
         pr_workflow_id(&project_id, ctx.repo, ctx.pr_number),
-        project_id.clone(),
-        ctx.repo.map(ToOwned::to_owned),
-        ctx.pr_number,
-        "pr_open",
-    )
-    .with_data(pr_runtime_data(
-        ctx.project_root,
         project_id,
-        ctx.repo,
-        None,
+        ctx.repo.map(ToOwned::to_owned),
         ctx.task_id,
         ctx.pr_number,
         ctx.pr_url,
-        None,
-    ));
+        "pr_open",
+    );
     upsert_github_issue_pr_definition(store).await?;
     store.upsert_instance(&instance).await?;
     request_local_review(store, &instance.id).await
+}
+
+pub(crate) async fn request_pr_hygiene_repair(
+    store: &WorkflowRuntimeStore,
+    ctx: PrHygieneRepairRuntimeContext<'_>,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    let PrRuntimeTarget {
+        instance,
+        new_instance,
+        issue_number,
+    } = load_or_pr_runtime_target(
+        store,
+        ctx.project_root,
+        ctx.repo,
+        None,
+        ctx.pr_number,
+        ctx.task_id,
+        ctx.pr_url,
+        "awaiting_feedback",
+    )
+    .await?;
+
+    match instance.state.as_str() {
+        "awaiting_feedback" | "addressing_feedback" => {}
+        "pr_open" => return request_local_review(store, &instance.id).await,
+        "local_review_gate" => {
+            return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                workflow_id: instance.id.clone(),
+                task_id: runtime_task_id_from_instance(&instance),
+            });
+        }
+        _ => {
+            return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
+                workflow_id: instance.id,
+                state: instance.state,
+            });
+        }
+    }
+
+    if has_active_pr_feedback_command_with_activity(store, &instance.id, 0, None).await? {
+        return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+            workflow_id: instance.id.clone(),
+            task_id: runtime_task_id_from_instance(&instance),
+        });
+    }
+
+    persist_pr_hygiene_repair_request(store, instance, new_instance, issue_number, ctx).await
 }
 
 pub(crate) async fn request_local_review(
@@ -385,6 +533,17 @@ pub(crate) async fn approve_runtime_merge_by_task_id(
     approve_runtime_merge(store, instance, Some(task_id)).await
 }
 
+pub(crate) fn synthesized_pr_feedback_task_id(
+    project_id: &str,
+    repo: Option<&str>,
+    pr_number: u64,
+) -> TaskId {
+    TaskId::from_str(&format!(
+        "repo-backlog::{project_id}::repo:{}::pr:{pr_number}:feedback",
+        repo.unwrap_or("<none>")
+    ))
+}
+
 pub(crate) async fn approve_runtime_merge_by_workflow_id(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
@@ -516,6 +675,121 @@ async fn persist_pr_feedback_sweep_request(
     }
 }
 
+async fn persist_pr_hygiene_repair_request(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+    new_instance: bool,
+    issue_number: Option<u64>,
+    ctx: PrHygieneRepairRuntimeContext<'_>,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    let workflow_id = instance.id.clone();
+    let task_id = runtime_task_id_from_instance(&instance);
+    let project_id = ctx.project_root.to_string_lossy().into_owned();
+    let pr_url = optional_string_field(&instance.data, "pr_url").or_else(|| {
+        ctx.pr_url
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    });
+    let repo = optional_string_field(&instance.data, "repo").or_else(|| {
+        ctx.repo
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    });
+    let summary = format!(
+        "Runtime PR hygiene found mergeability repair is needed for PR #{}.",
+        ctx.pr_number
+    );
+    let hygiene_context = json!({
+        "source": "pr_hygiene",
+        "repo": repo.as_deref(),
+        "pr_number": ctx.pr_number,
+        "pr_url": pr_url.as_deref(),
+        "title": ctx.title,
+        "merge_state_status": ctx.merge_state_status,
+        "head_oid": ctx.head_oid,
+        "updated_at": ctx.updated_at,
+        "observed_at": ctx.observed_at,
+        "dirty_age_secs": ctx.dirty_age_secs,
+        "age_source": "updated_at",
+        "dirty_age_to_repair_secs": ctx.dirty_age_to_repair_secs,
+        "dirty_age_to_comment_secs": ctx.dirty_age_to_comment_secs,
+        "rebase_needed_label": ctx.rebase_needed_label,
+        "instructions": [
+            "Try a GitHub-side update or rebase for this PR before making unrelated code changes.",
+            "If GitHub-side update or rebase fails, apply the configured rebase-needed label.",
+            "Escalate when dirty_age_secs is at least dirty_age_to_repair_secs.",
+            "Comment asking whether the PR should be closed when dirty_age_secs is at least dirty_age_to_comment_secs and no recent activity explains the stale state."
+        ],
+    });
+    let mut accepted_data = pr_runtime_data(
+        ctx.project_root,
+        project_id,
+        repo.as_deref(),
+        issue_number,
+        ctx.task_id,
+        ctx.pr_number,
+        pr_url.as_deref(),
+        Some(&summary),
+    );
+    if let Some(object) = accepted_data.as_object_mut() {
+        object.insert("hygiene_context".to_string(), hygiene_context.clone());
+    }
+    let repair_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let output = build_pr_hygiene_repair_decision(
+        &instance,
+        PrHygieneRepairDecisionInput {
+            dedupe_key: &format!("pr-hygiene:{}:{repair_nonce}", instance.id),
+            pr_number: ctx.pr_number,
+            pr_url: pr_url.as_deref(),
+            issue_number,
+            repo: repo.as_deref(),
+            summary: &summary,
+            hygiene_context: hygiene_context.clone(),
+        },
+    );
+    let event_payload = json!({
+        "issue_number": issue_number,
+        "repo": repo.as_deref(),
+        "pr_number": ctx.pr_number,
+        "pr_url": pr_url.as_deref(),
+        "merge_state_status": ctx.merge_state_status,
+        "dirty_age_secs": ctx.dirty_age_secs,
+    });
+    match commit_runtime_decision(
+        store,
+        instance,
+        new_instance,
+        output.decision,
+        "PrHygieneRepairRequested",
+        "workflow_runtime_pr_hygiene",
+        event_payload,
+        accepted_data,
+    )
+    .await?
+    {
+        RuntimeDecisionCommitOutcome::Accepted => Ok(PrFeedbackSweepRequestOutcome::Requested {
+            workflow_id,
+            task_id,
+        }),
+        RuntimeDecisionCommitOutcome::Rejected { reason } => {
+            Ok(PrFeedbackSweepRequestOutcome::Rejected {
+                workflow_id,
+                reason,
+            })
+        }
+        RuntimeDecisionCommitOutcome::Stale => {
+            let state = store
+                .get_instance(&workflow_id)
+                .await?
+                .map(|instance| instance.state)
+                .unwrap_or_else(|| "missing".to_string());
+            Ok(PrFeedbackSweepRequestOutcome::NotCandidate { workflow_id, state })
+        }
+    }
+}
+
 async fn persist_pr_feedback(
     store: &WorkflowRuntimeStore,
     ctx: &PrFeedbackRuntimeContext<'_>,
@@ -531,6 +805,8 @@ async fn persist_pr_feedback(
         ctx.repo,
         ctx.issue_number,
         ctx.pr_number,
+        ctx.task_id,
+        ctx.pr_url,
         "pr_open",
     )
     .await?;
@@ -605,6 +881,8 @@ async fn persist_local_review_passed(
         ctx.repo,
         ctx.issue_number,
         ctx.pr_number,
+        ctx.task_id,
+        ctx.pr_url,
         "pr_open",
     )
     .await?;
@@ -746,6 +1024,8 @@ async fn persist_pr_merged(
         ctx.repo,
         ctx.issue_number,
         ctx.pr_number,
+        ctx.task_id,
+        ctx.pr_url,
         "pr_open",
     )
     .await?;
@@ -932,7 +1212,7 @@ async fn commit_runtime_decision(
             payload: event_payload,
             decision: &decision,
             final_instance: &final_instance,
-            command_status: "pending",
+            command_status: WorkflowCommandStatus::Pending,
         })
         .await?;
     Ok(match record {
@@ -941,8 +1221,13 @@ async fn commit_runtime_decision(
     })
 }
 
-fn is_active_pr_feedback_command_status(status: &str) -> bool {
-    matches!(status, "pending" | "dispatching" | "dispatched")
+fn is_active_pr_feedback_command_status(status: WorkflowCommandStatus) -> bool {
+    matches!(
+        status,
+        WorkflowCommandStatus::Pending
+            | WorkflowCommandStatus::Dispatching
+            | WorkflowCommandStatus::Dispatched
+    )
 }
 
 async fn has_active_local_review_command(
@@ -954,7 +1239,7 @@ async fn has_active_local_review_command(
         .await?
         .into_iter()
         .any(|record| {
-            is_active_pr_feedback_command_status(record.status.as_str())
+            is_active_pr_feedback_command_status(record.status)
                 && record.command.activity_name() == Some(LOCAL_REVIEW_ACTIVITY)
         }))
 }
@@ -986,12 +1271,12 @@ async fn has_active_pr_feedback_command_with_activity(
             .await?
             .into_iter()
             .any(|record| {
-                is_active_pr_feedback_command_status(record.status.as_str())
+                is_active_pr_feedback_command_status(record.status)
                     && matches!(
                         record.command.activity_name(),
                         Some("sweep_pr_feedback" | "address_pr_feedback")
                     )
-                    || is_active_pr_feedback_command_status(record.status.as_str())
+                    || is_active_pr_feedback_command_status(record.status)
                         && record.command.command_type
                             == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
                         && record
@@ -1050,8 +1335,10 @@ async fn has_recent_failed_child_pr_feedback_command(
         .await?
         .into_iter()
         .any(|record| {
-            matches!(record.status.as_str(), "failed" | "blocked")
-                && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
+            matches!(
+                record.status,
+                WorkflowCommandStatus::Failed | WorkflowCommandStatus::Blocked
+            ) && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
                 && record.updated_at >= cutoff
                 && failed_child_suppression_still_applies(record.updated_at, latest_pr_activity_at)
         }))
@@ -1089,7 +1376,7 @@ async fn has_active_child_pr_feedback_command(
         .await?
         .into_iter()
         .any(|record| {
-            is_active_pr_feedback_command_status(record.status.as_str())
+            is_active_pr_feedback_command_status(record.status)
                 && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
         }))
 }
@@ -1127,6 +1414,8 @@ async fn load_or_pr_runtime_target(
     repo: Option<&str>,
     issue_number: Option<u64>,
     pr_number: u64,
+    task_id: &TaskId,
+    pr_url: Option<&str>,
     state: &str,
 ) -> anyhow::Result<PrRuntimeTarget> {
     upsert_github_issue_pr_definition(store).await?;
@@ -1170,7 +1459,9 @@ async fn load_or_pr_runtime_target(
             pr_workflow_id(&project_id, repo, pr_number),
             project_id,
             repo.map(ToOwned::to_owned),
+            task_id,
             pr_number,
+            pr_url,
             state,
         ),
         new_instance: true,
@@ -1206,22 +1497,19 @@ fn pr_scoped_instance(
     workflow_id: String,
     project_id: String,
     repo: Option<String>,
+    task_id: &TaskId,
     pr_number: u64,
+    pr_url: Option<&str>,
     state: &str,
 ) -> WorkflowInstance {
-    let task_id = TaskId::from_str(&format!(
-        "pr-feedback:{}:{}",
-        repo.as_deref().unwrap_or("<none>"),
-        pr_number
-    ));
     let data = pr_runtime_data(
         Path::new(&project_id),
         project_id.clone(),
         repo.as_deref(),
         None,
-        &task_id,
+        task_id,
         pr_number,
-        None,
+        pr_url,
         None,
     );
     WorkflowInstance::new(

@@ -1,4 +1,5 @@
 mod github_issue_completion;
+mod plan_issue_completion;
 mod pr_feedback_completion;
 mod quality_gate_completion;
 mod repo_backlog_candidates;
@@ -11,13 +12,16 @@ use self::github_issue_completion::{
     closed_issue_evidence_from_activity_result_value, closed_issue_evidence_from_value,
     github_issue_closed_decision, issue_implementation_missing_result_decision,
 };
+use self::plan_issue_completion::issue_plan_decision_from_activity_result;
 use self::pr_feedback_completion::{
-    local_review_decision_from_activity_result, pr_feedback_child_decision_from_activity_result,
+    local_review_decision_from_activity_result,
+    pr_feedback_blocking_signal_overrides_structured_ready,
+    pr_feedback_child_decision_from_activity_result, pr_feedback_success_contract_error,
     pr_feedback_sweep_decision_from_activity_result,
 };
 use self::quality_gate_completion::{
-    quality_gate_activity_matches, quality_gate_success_contract_error,
-    quality_gate_success_decision,
+    parent_quality_gate_pass_decision, quality_gate_activity_matches,
+    quality_gate_success_contract_error, quality_gate_success_decision,
 };
 use self::repo_backlog_completion::{
     repo_backlog_child_dispatch_still_active, repo_backlog_invalid_success_decision,
@@ -96,11 +100,35 @@ fn reduce_success(
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
     let structured_decision = workflow_decision_from_activity_result(event, result);
+    if let Some(decision) = github_issue_closed_decision(instance, event, result) {
+        return Some(decision);
+    }
+    if let Some(decision) = issue_plan_decision_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+    if let Some(reason) =
+        pr_feedback_success_contract_error(instance, result, structured_decision.as_ref())
+    {
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, &reason,
+        ));
+    }
+    let pr_feedback_blocker_overrides_structured_ready =
+        pr_feedback_blocking_signal_overrides_structured_ready(
+            instance,
+            result,
+            structured_decision.as_ref(),
+        );
     if let Some(decision) = structured_decision
         .as_ref()
+        .filter(|_| !pr_feedback_blocker_overrides_structured_ready)
         .filter(|decision| structured_decision_validates(instance, event, result, decision))
         .cloned()
     {
+        return Some(decision);
+    }
+
+    if let Some(decision) = parent_quality_gate_pass_decision(instance, event, result) {
         return Some(decision);
     }
 
@@ -138,10 +166,6 @@ fn reduce_success(
     }
 
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
-        return Some(decision);
-    }
-
-    if let Some(decision) = github_issue_closed_decision(instance, event, result) {
         return Some(decision);
     }
 

@@ -3,6 +3,7 @@ mod activity_result;
 mod child_workflow;
 mod data_helpers;
 mod executor;
+mod pr_feedback_inspection;
 mod prompt_packet;
 mod runtime_profile;
 mod workspace;
@@ -43,9 +44,7 @@ impl RuntimeJobWorkerTick {
                 cancelled: 1,
                 ..Self::default()
             },
-            Some(
-                RuntimeJobStatus::Pending | RuntimeJobStatus::Running | RuntimeJobStatus::Expired,
-            ) => Self::default(),
+            Some(RuntimeJobStatus::Pending | RuntimeJobStatus::Running) => Self::default(),
             None => Self {
                 idle: true,
                 ..Self::default()
@@ -110,6 +109,12 @@ pub(crate) async fn notify_runtime_submission_terminal_workflow(
         &instance,
     )
     .await?;
+    if let Err(error) = workspace::cleanup_terminal_runtime_workspace(state, &instance).await {
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            "terminal runtime workspace cleanup failed: {error}"
+        );
+    }
     let Some(callback) = state.intake.completion_callback.as_ref() else {
         return Ok(false);
     };

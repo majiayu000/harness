@@ -15,6 +15,7 @@ export interface WorkflowRuntimeTreePayload {
     total_runtime_jobs: number;
     command_statuses: Record<string, number>;
     runtime_job_statuses: Record<string, number>;
+    running_job_lease_statuses?: Record<string, number>;
   };
 }
 
@@ -89,6 +90,13 @@ export interface WorkflowRuntimeJob {
   runtime_kind: string;
   runtime_profile: string;
   status: string;
+  lease?: {
+    owner: string;
+    expires_at: string;
+  } | null;
+  lease_state?: string | null;
+  in_flight_model_turn?: boolean;
+  last_runtime_observation_at?: string | null;
   input: Record<string, unknown>;
   output?: Record<string, unknown> | null;
   error?: string | null;

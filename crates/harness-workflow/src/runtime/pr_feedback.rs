@@ -1,9 +1,14 @@
 use super::model::{
     WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
 };
+use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
+use serde_json::{json, Value};
 
 pub const PR_FEEDBACK_DEFINITION_ID: &str = "pr_feedback";
 pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
+pub const PR_FEEDBACK_SNAPSHOT_ARTIFACT: &str = "pr_feedback_snapshot";
+pub const PR_REPAIR_SNAPSHOT_ARTIFACT: &str = "pr_repair_snapshot";
+pub const SERVER_PR_SNAPSHOT_ARTIFACT: &str = "server_pr_snapshot";
 pub const LOCAL_REVIEW_ACTIVITY: &str = "run_local_review";
 pub const LOCAL_REVIEW_PASSED_SIGNAL: &str = "LocalReviewPassed";
 pub const LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL: &str = "LocalReviewChangesRequested";
@@ -19,7 +24,9 @@ pub enum PrFeedbackWorkflowAction {
     SweepFeedback,
     InspectFeedback,
     AddressFeedback,
+    HygieneRepair,
     AwaitFeedback,
+    RequestQualityGate,
     ReadyToMerge,
 }
 
@@ -54,6 +61,17 @@ pub struct PrFeedbackSweepDecisionInput<'a> {
     pub issue_number: Option<u64>,
     pub repo: Option<&'a str>,
     pub summary: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrHygieneRepairDecisionInput<'a> {
+    pub dedupe_key: &'a str,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
+    pub issue_number: Option<u64>,
+    pub repo: Option<&'a str>,
+    pub summary: &'a str,
+    pub hygiene_context: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -170,14 +188,26 @@ pub fn build_pr_feedback_decision(
             let decision = WorkflowDecision::new(
                 &instance.id,
                 &instance.state,
-                "mark_ready_to_merge",
-                "ready_to_merge",
+                "start_quality_gate",
+                "quality_gate_pending",
                 input.summary,
             )
+            .with_command(WorkflowCommand::new(
+                super::model::WorkflowCommandType::StartChildWorkflow,
+                format!("quality-gate:{}:{}:run", input.task_id, input.pr_number),
+                serde_json::json!({
+                    "definition_id": QUALITY_GATE_DEFINITION_ID,
+                    "subject_key": format!("pr:{}", input.pr_number),
+                    "child_activity": QUALITY_GATE_ACTIVITY,
+                    "pr_number": input.pr_number,
+                    "pr_url": input.pr_url,
+                    "validation_commands": [],
+                }),
+            ))
             .with_evidence(feedback_evidence(input))
             .high_confidence();
             PrFeedbackDecisionOutput {
-                action: PrFeedbackWorkflowAction::ReadyToMerge,
+                action: PrFeedbackWorkflowAction::RequestQualityGate,
                 decision,
             }
         }
@@ -325,6 +355,42 @@ pub fn build_pr_feedback_sweep_decision(
     }
 }
 
+pub fn build_pr_hygiene_repair_decision(
+    instance: &WorkflowInstance,
+    input: PrHygieneRepairDecisionInput<'_>,
+) -> PrFeedbackDecisionOutput {
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "address_pr_feedback",
+        "addressing_feedback",
+        input.summary,
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        input.dedupe_key,
+        json!({
+            "activity": "address_pr_feedback",
+            "source": "pr_hygiene",
+            "pr_number": input.pr_number,
+            "pr_url": input.pr_url,
+            "issue_number": input.issue_number,
+            "repo": input.repo,
+            "review_summary": input.summary,
+            "hygiene": input.hygiene_context,
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "pr_hygiene",
+        hygiene_repair_summary(input),
+    ));
+
+    PrFeedbackDecisionOutput {
+        action: PrFeedbackWorkflowAction::HygieneRepair,
+        decision,
+    }
+}
+
 pub fn build_pr_feedback_inspect_decision(
     instance: &WorkflowInstance,
     input: PrFeedbackInspectDecisionInput<'_>,
@@ -419,6 +485,35 @@ fn feedback_sweep_summary(input: PrFeedbackSweepDecisionInput<'_>) -> String {
     }
     if let Some(repo) = input.repo {
         parts.push(format!("repo={repo}"));
+    }
+    parts.push(input.summary.to_string());
+    parts.join(" ")
+}
+
+fn hygiene_repair_summary(input: PrHygieneRepairDecisionInput<'_>) -> String {
+    let mut parts = vec![format!("pr={}", input.pr_number)];
+    if let Some(pr_url) = input.pr_url {
+        parts.push(format!("url={pr_url}"));
+    }
+    if let Some(issue_number) = input.issue_number {
+        parts.push(format!("issue={issue_number}"));
+    }
+    if let Some(repo) = input.repo {
+        parts.push(format!("repo={repo}"));
+    }
+    if let Some(merge_state_status) = input
+        .hygiene_context
+        .get("merge_state_status")
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("merge_state_status={merge_state_status}"));
+    }
+    if let Some(dirty_age_secs) = input
+        .hygiene_context
+        .get("dirty_age_secs")
+        .and_then(Value::as_u64)
+    {
+        parts.push(format!("dirty_age_secs={dirty_age_secs}"));
     }
     parts.push(input.summary.to_string());
     parts.join(" ")

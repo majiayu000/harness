@@ -19,6 +19,9 @@ use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
     prompt_task_request_for_job, PromptTaskRequest,
 };
+use super::pr_feedback_inspection::{
+    execute_pr_feedback_inspection, is_server_owned_pr_feedback_inspection,
+};
 use super::prompt_packet::{
     build_runtime_job_prompt, build_runtime_prompt_packet, prompt_packet_digest,
 };
@@ -31,6 +34,8 @@ use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS: u64 = 3600;
+const RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT: &str =
+    "runtime_workspace_finalization_warning";
 
 pub(super) struct ServerRuntimeJobExecutor<'a> {
     state: &'a Arc<AppState>,
@@ -55,7 +60,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             }
         }
         if let Some(result) = self
-            .execute_builtin_lifecycle_activity(&job, workflow.as_ref())
+            .execute_server_owned_activity(&job, workflow.as_ref())
             .await?
         {
             return Ok(result);
@@ -177,32 +182,23 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         }
         .await;
         let finish_result = finish_runtime_workspace(self.state, &runtime_workspace).await;
-        match (activity_result, finish_result) {
-            (Ok(mut result), Err(error)) => {
+        let activity_completed = activity_result.is_ok();
+        if let Err(error) = &finish_result {
+            if activity_completed {
                 tracing::warn!(
                     runtime_job_id = %job.id,
                     workspace_path = %runtime_workspace.run_project.display(),
                     "runtime workspace finalization failed: {error}"
                 );
-                result = result.with_artifact(ActivityArtifact::new(
-                    "runtime_workspace_finalization_warning",
-                    json!({ "error": error.to_string() }),
-                ));
-                Ok(result)
-            }
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(error), Err(finish_error)) => {
+            } else {
                 tracing::warn!(
                     runtime_job_id = %job.id,
                     workspace_path = %runtime_workspace.run_project.display(),
-                    "runtime workspace finalization failed after runtime error: {finish_error}"
+                    "runtime workspace finalization failed after runtime error: {error}"
                 );
-                Err(error.context(format!(
-                    "runtime workspace finalization also failed: {finish_error}"
-                )))
             }
-            (Err(error), Ok(())) => Err(error),
         }
+        combine_activity_result_with_runtime_workspace_finalization(activity_result, finish_result)
     }
 
     async fn workflow_for_job(&self, job: &RuntimeJob) -> anyhow::Result<Option<WorkflowInstance>> {
@@ -215,7 +211,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         store.get_instance(workflow_id).await
     }
 
-    async fn execute_builtin_lifecycle_activity(
+    async fn execute_server_owned_activity(
         &self,
         job: &RuntimeJob,
         parent: Option<&WorkflowInstance>,
@@ -230,6 +226,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             "recover_issue_workflow" => Ok(Some(
                 execute_recover_issue_workflow(self.state, job, parent).await?,
             )),
+            activity if activity == harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY => Ok(
+                Some(execute_pr_feedback_inspection(self.state, job, parent).await),
+            ),
             _ => Ok(None),
         }
     }
@@ -300,16 +299,14 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
-        !is_builtin_lifecycle_activity(job)
+        !is_internal_non_agent_activity(job)
     }
 
     async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
-        // Builtin lifecycle activities (start_child_workflow, mark_bound_issue_done,
-        // recover_issue_workflow, ...) are internal state transitions that do not run
-        // a user agent. They must keep flowing even when the runtime worker is disabled,
-        // otherwise disabling the worker would strand workflows (e.g. a manually merged
-        // PR could never be marked done).
-        if is_builtin_lifecycle_activity(job) {
+        // Internal server-owned activities do not run a user agent. They must keep
+        // flowing even when the runtime worker is disabled, otherwise disabling the
+        // worker would strand workflows or prevent server-owned PR snapshots.
+        if is_internal_non_agent_activity(job) {
             return None;
         }
         self.runtime_worker_disabled_result(job).await
@@ -326,6 +323,10 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
             ),
         }
     }
+}
+
+fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
+    is_builtin_lifecycle_activity(job) || is_server_owned_pr_feedback_inspection(job)
 }
 
 async fn persist_created_thread(state: &AppState, thread_id: &ThreadId) {
@@ -414,6 +415,47 @@ fn runtime_worker_disabled_result_for_config(
             project_root.display()
         ),
     ))
+}
+
+fn combine_activity_result_with_runtime_workspace_finalization(
+    activity_result: anyhow::Result<ActivityResult>,
+    finish_result: anyhow::Result<()>,
+) -> anyhow::Result<ActivityResult> {
+    match (activity_result, finish_result) {
+        (Ok(result), Err(error)) => {
+            if result.status == harness_workflow::runtime::ActivityStatus::Succeeded {
+                Ok(activity_result_failed_by_runtime_workspace_finalization(
+                    result, &error,
+                ))
+            } else {
+                Ok(result.with_artifact(runtime_workspace_finalization_warning_artifact(&error)))
+            }
+        }
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Err(finish_error)) => Err(error.context(format!(
+            "runtime workspace finalization also failed: {finish_error}"
+        ))),
+        (Err(error), Ok(())) => Err(error),
+    }
+}
+
+fn activity_result_failed_by_runtime_workspace_finalization(
+    mut result: ActivityResult,
+    error: &anyhow::Error,
+) -> ActivityResult {
+    result.status = harness_workflow::runtime::ActivityStatus::Failed;
+    result.summary =
+        "Runtime workspace finalization failed after the activity completed.".to_string();
+    result.error = Some(format!("runtime workspace finalization failed: {error}"));
+    result.error_kind = Some(harness_workflow::runtime::ActivityErrorKind::Retryable);
+    result.with_artifact(runtime_workspace_finalization_warning_artifact(error))
+}
+
+fn runtime_workspace_finalization_warning_artifact(error: &anyhow::Error) -> ActivityArtifact {
+    ActivityArtifact::new(
+        RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT,
+        json!({ "error": error.to_string() }),
+    )
 }
 
 #[cfg(test)]
@@ -553,5 +595,105 @@ mod tests {
             &config,
         )
         .is_none());
+    }
+
+    #[test]
+    fn runtime_workspace_finalization_failure_marks_activity_failed() {
+        let result =
+            ActivityResult::succeeded("implement_issue", "Created a pull request.").with_artifact(
+                ActivityArtifact::new("pull_request", json!({ "pr_number": 42 })),
+            );
+
+        let result = match combine_activity_result_with_runtime_workspace_finalization(
+            Ok(result),
+            Err(anyhow::anyhow!("after_run hook failed")),
+        ) {
+            Ok(result) => result,
+            Err(error) => panic!(
+                "finalization failure should be returned as a failed activity result: {error}"
+            ),
+        };
+
+        assert_eq!(result.activity, "implement_issue");
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(
+            result.error_kind,
+            Some(harness_workflow::runtime::ActivityErrorKind::Retryable)
+        );
+        assert!(result
+            .summary
+            .contains("Runtime workspace finalization failed"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("after_run hook failed"));
+        assert!(result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "pull_request"));
+        let Some(warning) = result.artifacts.iter().find(|artifact| {
+            artifact.artifact_type == RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT
+        }) else {
+            panic!("finalization failure should preserve a diagnostic warning artifact");
+        };
+        assert_eq!(warning.artifact["error"], "after_run hook failed");
+    }
+
+    #[test]
+    fn runtime_workspace_finalization_failure_preserves_failed_activity_result() {
+        let result = ActivityResult::failed(
+            "address_pr_feedback",
+            "Structured output was invalid.",
+            "fatal",
+        )
+        .with_error_kind(harness_workflow::runtime::ActivityErrorKind::Fatal)
+        .with_artifact(ActivityArtifact::new(
+            "activity_result_parse_error",
+            json!({ "field": "status" }),
+        ));
+
+        let result = match combine_activity_result_with_runtime_workspace_finalization(
+            Ok(result),
+            Err(anyhow::anyhow!("after_run hook failed")),
+        ) {
+            Ok(result) => result,
+            Err(error) => panic!("failed activity result should be preserved: {error}"),
+        };
+
+        assert_eq!(result.activity, "address_pr_feedback");
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(result.summary, "Structured output was invalid.");
+        assert_eq!(result.error.as_deref(), Some("fatal"));
+        assert_eq!(
+            result.error_kind,
+            Some(harness_workflow::runtime::ActivityErrorKind::Fatal)
+        );
+        assert!(result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "activity_result_parse_error"));
+        let Some(warning) = result.artifacts.iter().find(|artifact| {
+            artifact.artifact_type == RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT
+        }) else {
+            panic!("finalization failure should preserve a diagnostic warning artifact");
+        };
+        assert_eq!(warning.artifact["error"], "after_run hook failed");
+    }
+
+    #[test]
+    fn internal_non_agent_activity_includes_server_owned_pr_inspection() {
+        assert!(is_internal_non_agent_activity(&runtime_job(
+            "inspect_pr_feedback"
+        )));
+        assert!(!is_internal_non_agent_activity(&runtime_job(
+            "implement_issue"
+        )));
     }
 }

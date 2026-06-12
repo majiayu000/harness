@@ -20,6 +20,11 @@ pub(super) struct RuntimeStreamAgent {
     pub(super) approval_policies: Mutex<Vec<Option<String>>>,
 }
 
+pub(super) struct FailingStreamAgent {
+    pub(super) prompts: Mutex<Vec<String>>,
+    error: String,
+}
+
 impl RuntimeStreamAgent {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -28,6 +33,15 @@ impl RuntimeStreamAgent {
             reasoning_efforts: Mutex::new(Vec::new()),
             sandbox_modes: Mutex::new(Vec::new()),
             approval_policies: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl FailingStreamAgent {
+    pub(super) fn new(error: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            prompts: Mutex::new(Vec::new()),
+            error: error.into(),
         })
     }
 }
@@ -162,6 +176,35 @@ impl CodeAgent for RuntimeStreamAgent {
             .await;
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl CodeAgent for FailingStreamAgent {
+    fn name(&self) -> &str {
+        "failing-stream-agent"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.prompts.lock().await.push(req.prompt);
+        Err(harness_core::error::HarnessError::AgentExecution(
+            self.error.clone(),
+        ))
+    }
+
+    async fn execute_stream(
+        &self,
+        req: AgentRequest,
+        _tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.prompts.lock().await.push(req.prompt);
+        Err(harness_core::error::HarnessError::AgentExecution(
+            self.error.clone(),
+        ))
     }
 }
 

@@ -11,6 +11,7 @@ members = [
     "crates/harness-rules",
     "crates/harness-skills",
     "crates/harness-exec",
+    "crates/harness-eval",
     "crates/harness-observe",
     "crates/harness-cli",
     "crates/harness-workflow",
@@ -35,6 +36,7 @@ harness-gc = { path = "crates/harness-gc", version = "0.6.34" }
 harness-rules = { path = "crates/harness-rules", version = "0.6.34" }
 harness-skills = { path = "crates/harness-skills", version = "0.6.34" }
 harness-exec = { path = "crates/harness-exec", version = "0.6.34" }
+harness-eval = { path = "crates/harness-eval", version = "0.6.34" }
 harness-observe = { path = "crates/harness-observe", version = "0.6.34" }
 harness-workflow = { path = "crates/harness-workflow", version = "0.6.34" }
 

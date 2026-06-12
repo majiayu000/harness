@@ -1,4 +1,5 @@
 use super::*;
+use harness_workflow::issue_lifecycle::IssueLifecycleState;
 
 #[tokio::test]
 async fn list_tasks_marks_runtime_submission_summaries_degraded_when_store_failed(
@@ -83,6 +84,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     assert_eq!(state.core.tasks.count(), before_count);
 
     let list_response = app
+        .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
     assert_eq!(list_response.status(), StatusCode::OK);
@@ -95,7 +97,8 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     let canonical_project_root = project_root.canonicalize()?;
 
     assert_eq!(runtime_task["task_kind"], "issue");
-    assert_eq!(runtime_task["status"], "implementing");
+    assert_eq!(runtime_task["status"], "planning");
+    assert_eq!(runtime_task["phase"], "plan");
     assert_eq!(runtime_task["external_id"], "issue:52");
     assert_eq!(runtime_task["repo"], "owner/repo");
     assert_eq!(runtime_task["description"], "issue #52");
@@ -108,8 +111,25 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         .as_str()
         .is_some_and(|id| id.ends_with("::repo:owner/repo::issue:52")));
     assert_eq!(runtime_task["workflow"]["definition_id"], "github_issue_pr");
-    assert_eq!(runtime_task["workflow"]["state"], "implementing");
+    assert_eq!(runtime_task["workflow"]["state"], "planning");
     assert_eq!(runtime_task["workflow"]["issue_number"], 52);
+
+    let planning_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks?status=planning")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(planning_response.status(), StatusCode::OK);
+    let planning_listed = response_json(planning_response).await?;
+    let planning_tasks = planning_listed["data"]
+        .as_array()
+        .expect("planning-filtered tasks should be an array");
+    assert!(
+        planning_tasks.iter().any(|task| task["id"] == task_id),
+        "status=planning should include runtime-backed planning workflows"
+    );
     Ok(())
 }
 
@@ -182,6 +202,136 @@ async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()>
         commands[0].command.command_type,
         harness_workflow::runtime::WorkflowCommandType::MarkDone
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_task_reports_legacy_workflow_actual_state_when_not_ready() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_issue_workflows(dir.path()).await?;
+    let task_id = task_runner::TaskId::from_str("legacy-done-task-56");
+    let project_id = dir.path().to_string_lossy().into_owned();
+    let repo = "owner/repo";
+    let pr_number = 127;
+    let mut task = task_runner::TaskState::new(task_id.clone());
+    task.task_kind = task_runner::TaskKind::Issue;
+    task.pr_url = Some(format!("https://github.com/{repo}/pull/{pr_number}"));
+    task.project_root = Some(dir.path().to_path_buf());
+    task.repo = Some(repo.to_string());
+    state.core.tasks.insert(&task).await;
+
+    let workflows = state
+        .core
+        .issue_workflow_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("issue workflow store should be configured"))?;
+    workflows
+        .record_issue_scheduled(&project_id, Some(repo), 56, task_id.as_str(), &[], false)
+        .await?;
+    workflows
+        .record_pr_detected(
+            &project_id,
+            Some(repo),
+            56,
+            task_id.as_str(),
+            pr_number,
+            &format!("https://github.com/{repo}/pull/{pr_number}"),
+        )
+        .await?;
+    workflows
+        .record_terminal_for_issue(&project_id, Some(repo), 56, IssueLifecycleState::Done, None)
+        .await?;
+    let app = Router::new()
+        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{}/merge", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "workflow not in ready_to_merge state");
+    assert_eq!(body["state"], "done");
+    let workflow = workflows
+        .get_by_pr(&project_id, Some(repo), pr_number)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow should still exist"))?;
+    assert_eq!(workflow.state, IssueLifecycleState::Done);
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_task_approves_legacy_ready_workflow() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_issue_workflows(dir.path()).await?;
+    let task_id = task_runner::TaskId::from_str("legacy-ready-task-57");
+    let project_id = dir.path().to_string_lossy().into_owned();
+    let repo = "owner/repo";
+    let pr_number = 128;
+    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
+    let mut task = task_runner::TaskState::new(task_id.clone());
+    task.task_kind = task_runner::TaskKind::Issue;
+    task.pr_url = Some(pr_url.clone());
+    task.project_root = Some(dir.path().to_path_buf());
+    task.repo = Some(repo.to_string());
+    state.core.tasks.insert(&task).await;
+
+    let workflows = state
+        .core
+        .issue_workflow_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("issue workflow store should be configured"))?;
+    workflows
+        .record_issue_scheduled(&project_id, Some(repo), 57, task_id.as_str(), &[], false)
+        .await?;
+    workflows
+        .record_pr_detected(
+            &project_id,
+            Some(repo),
+            57,
+            task_id.as_str(),
+            pr_number,
+            &pr_url,
+        )
+        .await?;
+    workflows
+        .record_terminal_for_pr(&project_id, Some(repo), pr_number, true, false, None)
+        .await?;
+    let app = Router::new()
+        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{}/merge", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "merge_approved");
+    let workflow = workflows
+        .get_by_pr(&project_id, Some(repo), pr_number)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow should still exist"))?;
+    assert_eq!(workflow.state, IssueLifecycleState::Done);
     Ok(())
 }
 
@@ -326,6 +476,157 @@ async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Re
     let body = response_json(response).await?;
     assert_eq!(body["error"], "workflow already terminal");
     assert_eq!(body["state"], "cancelled");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_task_accepts_runtime_submission_handle_without_task_row() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let task_id = harness_core::types::TaskId::from_str("runtime-compat-cancel-task-58");
+    let submission = crate::workflow_runtime_submission::record_issue_submission(
+        store,
+        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 58,
+            task_id: &task_id,
+            labels: &[],
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+        },
+    )
+    .await?;
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_id)
+            .await?
+            .is_none(),
+        "runtime submissions should not require legacy task rows"
+    );
+    let app = Router::new()
+        .route("/tasks/{id}/cancel", post(task_routes::cancel_task))
+        .with_state(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{}/cancel", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "cancelled");
+    assert_eq!(body["execution_path"], "workflow_runtime");
+    assert_eq!(body["workflow_id"], submission.workflow_id);
+    assert!(
+        state
+            .core
+            .tasks
+            .get_with_db_fallback(&task_id)
+            .await?
+            .is_none(),
+        "legacy compatibility cancel must not create a TaskStore row"
+    );
+    let updated = store
+        .get_instance(&submission.workflow_id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "cancelled");
+    assert_eq!(updated.data["last_decision"], "cancel_issue_submission");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{}/cancel", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "task already in terminal state");
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "failed",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1299"),
+    )
+    .with_id("issue-1299")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 1299,
+        "task_id": "runtime-task-1299",
+        "task_ids": ["runtime-task-1299"],
+        "failure_reason": "WorktreeCollision: workspace path is managed by another harness session",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let app = Router::new()
+        .route("/tasks/{id}", get(get_task))
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/runtime-task-1299")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "failed");
+    assert_eq!(
+        body["error"],
+        "WorktreeCollision: workspace path is managed by another harness session"
+    );
     Ok(())
 }
 

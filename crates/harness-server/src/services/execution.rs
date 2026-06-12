@@ -820,11 +820,11 @@ impl DefaultExecutionService {
                     .await
             }
         } else {
-            let repo_key = prepared.req.repo.as_deref().unwrap_or("<none>");
-            let task_id = TaskId::from_str(&format!(
-                "repo-backlog:{project_id}:{repo_key}:pr:{pr_number}:feedback",
-                project_id = prepared.project_id,
-            ));
+            let task_id = crate::workflow_runtime_pr_feedback::synthesized_pr_feedback_task_id(
+                &prepared.project_id,
+                prepared.req.repo.as_deref(),
+                pr_number,
+            );
             crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep_for_pr(
                 store,
                 crate::workflow_runtime_pr_feedback::PrFeedbackSweepRuntimeContext {

@@ -129,7 +129,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         .get_instance(&child_id)
         .await?
         .expect("child workflow should still exist");
-    assert_eq!(child_after.state, "implementing");
+    assert_eq!(child_after.state, "planning");
     let child_events = store.events_for(&child_id).await?;
     assert_eq!(
         child_events
@@ -149,7 +149,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
     assert_eq!(child_commands.len(), 1);
     assert_eq!(
         child_commands[0].command.activity_name(),
-        Some("implement_issue")
+        Some("plan_issue")
     );
     let parent_after = store
         .get_instance("repo-backlog-auto-submit-replay")

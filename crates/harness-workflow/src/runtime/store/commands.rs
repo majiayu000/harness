@@ -1,5 +1,5 @@
 use super::{enum_str, to_jsonb_string};
-use crate::runtime::WorkflowCommand;
+use crate::runtime::{WorkflowCommand, WorkflowCommandStatus};
 use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
@@ -8,7 +8,7 @@ pub(super) async fn insert(
     workflow_id: &str,
     decision_id: Option<&str>,
     command: &WorkflowCommand,
-    status: &str,
+    status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
     let data = to_jsonb_string(command)?;
     let command_type = enum_str(&command.command_type)?;
@@ -18,7 +18,7 @@ pub(super) async fn insert(
         .bind(decision_id)
         .bind(&command_type)
         .bind(&command.dedupe_key)
-        .bind(status)
+        .bind(status.as_str())
         .bind(&data)
         .fetch_one(pool)
         .await?;
@@ -30,7 +30,7 @@ pub(super) async fn insert_tx(
     workflow_id: &str,
     decision_id: Option<&str>,
     command: &WorkflowCommand,
-    status: &str,
+    status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
     let data = to_jsonb_string(command)?;
     let command_type = enum_str(&command.command_type)?;
@@ -40,7 +40,7 @@ pub(super) async fn insert_tx(
         .bind(decision_id)
         .bind(&command_type)
         .bind(&command.dedupe_key)
-        .bind(status)
+        .bind(status.as_str())
         .bind(&data)
         .fetch_one(&mut **tx)
         .await?;

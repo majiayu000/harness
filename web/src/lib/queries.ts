@@ -3,6 +3,9 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiJson, apiFetch } from "./api";
 import type {
   DashboardPayload,
+  EvalDashboardResponse,
+  EvalQualitySnapshotResponse,
+  EvalRunsResponse,
   FullTask,
   OperatorSnapshotPayload,
   OverviewPayload,
@@ -42,6 +45,45 @@ export function useUsageMonitor() {
   });
 }
 
+export function useEvalDashboard(limit = 50) {
+  return useQuery<EvalDashboardResponse, Error>({
+    queryKey: ["eval-dashboard", limit],
+    queryFn: async ({ signal }) => {
+      const runs = await apiJson<EvalRunsResponse>(`/api/evals/runs?limit=${limit}`, { signal });
+      const rows = await Promise.all(
+        runs.runs.map(async (run) => {
+          if (!run.quality_snapshot_id) {
+            return {
+              run,
+              quality_snapshot: null,
+              quality_snapshot_error: null,
+            };
+          }
+          try {
+            const snapshot = await apiJson<EvalQualitySnapshotResponse>(
+              `/api/evals/quality-snapshots/${encodeURIComponent(run.quality_snapshot_id)}`,
+              { signal },
+            );
+            return {
+              run,
+              quality_snapshot: snapshot.quality_snapshot,
+              quality_snapshot_error: null,
+            };
+          } catch (error) {
+            return {
+              run,
+              quality_snapshot: null,
+              quality_snapshot_error: error instanceof Error ? error.message : "snapshot unavailable",
+            };
+          }
+        }),
+      );
+      return { rows };
+    },
+    refetchInterval: 30_000,
+  });
+}
+
 export interface TaskListParams {
   status?: string;
   scheduler_state?: string;
@@ -70,6 +112,42 @@ export function useTasks(params: TaskListParams = { active: true, limit: 200 }) 
     // Task list/detail/stream routes are exposed at `/tasks`; only aggregate
     // dashboard endpoints are mounted under `/api/*`.
     queryFn: ({ signal }) => apiJson<TaskListResponse>(taskListPath(params), { signal }),
+  });
+}
+
+async function fetchAllTaskPages(params: TaskListParams, signal?: AbortSignal): Promise<TaskListResponse> {
+  const seenCursors = new Set<string>();
+  const rows: TaskListResponse["data"] = [];
+  let cursor = params.cursor;
+  let latest: TaskListResponse | null = null;
+
+  for (;;) {
+    latest = await apiJson<TaskListResponse>(taskListPath({ ...params, cursor }), { signal });
+    rows.push(...latest.data);
+    const nextCursor = latest.page.next_cursor ?? null;
+    if (!latest.page.has_more || !nextCursor) break;
+    if (seenCursors.has(nextCursor)) {
+      throw new Error("Task pagination returned a repeated cursor");
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+
+  if (!latest) {
+    throw new Error("Task pagination returned no response");
+  }
+
+  return {
+    ...latest,
+    data: rows,
+    page: { ...latest.page, has_more: false, next_cursor: null },
+  };
+}
+
+export function useAllTasks(params: TaskListParams = { limit: 200 }) {
+  return useQuery<TaskListResponse, Error>({
+    queryKey: ["tasks", "all-pages", params],
+    queryFn: ({ signal }) => fetchAllTaskPages(params, signal),
   });
 }
 

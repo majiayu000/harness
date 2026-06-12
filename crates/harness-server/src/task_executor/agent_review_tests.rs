@@ -188,7 +188,7 @@ async fn reviewer_request_uses_read_only_network_sandbox() -> anyhow::Result<()>
     let reviewer = SequenceAgent::new("reviewer", vec!["APPROVED"]);
     let mut turns_used = 0;
 
-    let (approved, pushed, approved_head) = run_agent_review(
+    let (approved, pushed, approved_head, provider_report) = run_agent_review(
         &store,
         &task_id,
         &implementor,
@@ -214,6 +214,12 @@ async fn reviewer_request_uses_read_only_network_sandbox() -> anyhow::Result<()>
     let reviewer_requests = reviewer.recorded_requests().await;
     assert!(approved);
     assert!(!pushed);
+    assert_eq!(
+        provider_report
+            .as_ref()
+            .map(|report| report.report.provider_id.as_str()),
+        Some("codex_agent_review")
+    );
     assert_eq!(
         approved_head
             .as_ref()
@@ -246,7 +252,7 @@ async fn claude_reviewer_request_uses_configured_sandbox() -> anyhow::Result<()>
     let reviewer = SequenceAgent::new("claude", vec!["APPROVED"]);
     let mut turns_used = 0;
 
-    let (approved, pushed, _) = run_agent_review(
+    let (approved, pushed, _, _) = run_agent_review(
         &store,
         &task_id,
         &implementor,
@@ -292,7 +298,7 @@ async fn unresolved_issues_after_max_rounds_fail_local_review() -> anyhow::Resul
     let reviewer = SequenceAgent::new("reviewer", vec!["ISSUE: unresolved defect"]);
     let mut turns_used = 0;
 
-    let (approved, pushed, _) = run_agent_review(
+    let (approved, pushed, _, _) = run_agent_review(
         &store,
         &task_id,
         &implementor,
@@ -359,7 +365,7 @@ async fn final_impasse_round_does_not_push_unreviewed_fix() -> anyhow::Result<()
     );
     let mut turns_used = 0;
 
-    let (approved, pushed, _) = run_agent_review(
+    let (approved, pushed, _, _) = run_agent_review(
         &store,
         &task_id,
         &implementor,
@@ -429,7 +435,7 @@ async fn changed_fix_round_requires_pr_head_advance() -> anyhow::Result<()> {
     let reviewer = SequenceAgent::new("reviewer", vec!["ISSUE: defect", "APPROVED"]);
     let mut turns_used = 0;
 
-    let (approved, requires_head_advance, _) = run_agent_review(
+    let (approved, requires_head_advance, _, _) = run_agent_review(
         &store,
         &task_id,
         &implementor,
@@ -481,7 +487,7 @@ async fn changed_fix_round_rejects_false_noop_marker() -> anyhow::Result<()> {
     let reviewer = SequenceAgent::new("reviewer", vec!["ISSUE: defect", "APPROVED"]);
     let mut turns_used = 0;
 
-    let (approved, requires_head_advance, _) = run_agent_review(
+    let (approved, requires_head_advance, _, _) = run_agent_review(
         &store,
         &task_id,
         &implementor,
@@ -544,7 +550,7 @@ async fn noop_fix_round_ignores_validation_cache_artifacts() -> anyhow::Result<(
     })];
     let mut turns_used = 0;
 
-    let (approved, requires_head_advance, _) = run_agent_review(
+    let (approved, requires_head_advance, _, _) = run_agent_review(
         &store,
         &task_id,
         &implementor,
@@ -599,7 +605,7 @@ async fn noop_fix_round_rejects_validation_source_artifacts() -> anyhow::Result<
     })];
     let mut turns_used = 0;
 
-    let (approved, requires_head_advance, _) = run_agent_review(
+    let (approved, requires_head_advance, _, _) = run_agent_review(
         &store,
         &task_id,
         &implementor,
@@ -653,7 +659,7 @@ async fn malformed_reviewer_output_fails_local_review() -> anyhow::Result<()> {
     let reviewer = SequenceAgent::new("reviewer", vec!["looks fine to me"]);
     let mut turns_used = 0;
 
-    let (approved, _, _) = run_agent_review(
+    let (approved, _, _, _) = run_agent_review(
         &store,
         &task_id,
         &implementor,

@@ -114,4 +114,4 @@ Required checks for this hardening layer:
 
 ## Non-Goals
 
-This design does not make agents deterministic. It makes unstable output observable and bounded. It also does not start the harness server from inside a Codex session; server startup remains an operator action from a standalone terminal.
+This design does not make agents deterministic. It makes unstable output observable and bounded. It also does not change server process ownership; startup remains an operational concern outside the runtime reducer.

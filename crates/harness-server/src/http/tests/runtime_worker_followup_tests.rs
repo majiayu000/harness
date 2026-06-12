@@ -81,7 +81,10 @@ async fn runtime_job_worker_requeues_pr_feedback_child_inspect_after_stale_dedup
         .enqueue_command(&child_id, None, &stale_command)
         .await?;
     store
-        .mark_command_status(&stale_command_id, "completed")
+        .mark_command_status(
+            &stale_command_id,
+            harness_workflow::runtime::WorkflowCommandStatus::Completed,
+        )
         .await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
@@ -193,14 +196,14 @@ async fn runtime_job_worker_auto_submits_repo_backlog_child_workflow() -> anyhow
         .get_instance(&child_id)
         .await?
         .expect("child workflow should be created");
-    assert_eq!(child.state, "implementing");
+    assert_eq!(child.state, "planning");
     assert_eq!(child.data["source"], "github");
     assert_eq!(child.data["external_id"], "127");
     let child_commands = store.commands_for(&child_id).await?;
     assert_eq!(child_commands.len(), 1);
     assert_eq!(
         child_commands[0].command.activity_name(),
-        Some("implement_issue")
+        Some("plan_issue")
     );
     let completed = store
         .get_runtime_job(&runtime_job.id)

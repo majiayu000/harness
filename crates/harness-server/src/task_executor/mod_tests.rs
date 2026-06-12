@@ -59,6 +59,17 @@ fn local_review_pr_check_timeout_uses_hosted_review_budget() {
 }
 
 #[test]
+fn initial_hosted_review_wait_respects_wait_budget() {
+    assert_eq!(initial_hosted_review_wait_secs(300, 60), 60);
+    assert_eq!(initial_hosted_review_wait_secs(30, 60), 30);
+}
+
+#[test]
+fn initial_hosted_review_wait_zero_budget_keeps_poll_interval() {
+    assert_eq!(initial_hosted_review_wait_secs(300, 0), 300);
+}
+
+#[test]
 fn review_repo_slug_prefers_parseable_pr_url() {
     assert_eq!(
         review_repo_slug(

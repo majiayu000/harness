@@ -15,6 +15,7 @@ struct RuntimeTreeSummary {
     command_statuses: BTreeMap<String, usize>,
     jobs: usize,
     job_statuses: BTreeMap<String, usize>,
+    running_job_lease_statuses: BTreeMap<String, usize>,
     activity_outcomes: BTreeMap<String, usize>,
     jobs_without_activity_envelope: usize,
 }
@@ -215,6 +216,10 @@ fn print_summary(combined: &Value) {
     print_count_map("Command statuses", &runtime_summary.command_statuses);
     print_count_map("Runtime job statuses", &runtime_summary.job_statuses);
     print_count_map(
+        "Running job lease states",
+        &runtime_summary.running_job_lease_statuses,
+    );
+    print_count_map(
         "Activity result outcomes",
         &runtime_summary.activity_outcomes,
     );
@@ -237,6 +242,8 @@ fn summarize_runtime_tree(tree: &Value) -> RuntimeTreeSummary {
         summary.jobs = tree["summary"]["total_runtime_jobs"].as_u64().unwrap_or(0) as usize;
         summary.command_statuses = count_map_from_value(&tree["summary"]["command_statuses"]);
         summary.job_statuses = count_map_from_value(&tree["summary"]["runtime_job_statuses"]);
+        summary.running_job_lease_statuses =
+            count_map_from_value(&tree["summary"]["running_job_lease_statuses"]);
         summary.activity_outcomes = count_map_from_value(&tree["summary"]["activity_outcomes"]);
         summary.jobs_without_activity_envelope = tree["summary"]["jobs_without_activity_envelope"]
             .as_u64()
@@ -268,6 +275,9 @@ fn summarize_workflow_node(node: &Value, summary: &mut RuntimeTreeSummary, inclu
                             &mut summary.job_statuses,
                             job["status"].as_str().unwrap_or("unknown"),
                         );
+                        if let Some(lease_state) = job["lease_state"].as_str() {
+                            increment(&mut summary.running_job_lease_statuses, lease_state);
+                        }
                     }
                     if include_counts {
                         if let Some(outcome) = job["activity_result_envelope"]["outcome"].as_str() {
@@ -369,18 +379,20 @@ mod tests {
             "workflows": [{
                 "commands": [{
                     "status": "completed",
-                    "runtime_jobs": [{
-                        "status": "succeeded",
-                        "activity_result_envelope": {
-                            "outcome": "accepted"
-                        }
+                        "runtime_jobs": [{
+                            "status": "succeeded",
+                            "lease_state": null,
+                            "activity_result_envelope": {
+                                "outcome": "accepted"
+                            }
                     }]
                 }],
                 "children": [{
                     "commands": [{
                         "status": "pending",
                         "runtime_jobs": [{
-                            "status": "pending"
+                            "status": "pending",
+                            "lease_state": null
                         }]
                     }],
                     "children": []
@@ -397,6 +409,7 @@ mod tests {
         assert_eq!(summary.command_statuses["pending"], 1);
         assert_eq!(summary.job_statuses["succeeded"], 1);
         assert_eq!(summary.job_statuses["pending"], 1);
+        assert!(summary.running_job_lease_statuses.is_empty());
         assert_eq!(summary.activity_outcomes["accepted"], 1);
         assert_eq!(summary.jobs_without_activity_envelope, 1);
     }
@@ -415,6 +428,10 @@ mod tests {
                 "runtime_job_statuses": {
                     "failed": 4,
                     "succeeded": 38
+                },
+                "running_job_lease_statuses": {
+                    "active_leased": 3,
+                    "expired_lease": 1
                 },
                 "activity_outcomes": {
                     "accepted": 36,
@@ -445,6 +462,8 @@ mod tests {
         assert_eq!(summary.command_statuses["pending"], 2);
         assert_eq!(summary.job_statuses["failed"], 4);
         assert_eq!(summary.job_statuses["succeeded"], 38);
+        assert_eq!(summary.running_job_lease_statuses["active_leased"], 3);
+        assert_eq!(summary.running_job_lease_statuses["expired_lease"], 1);
         assert_eq!(summary.activity_outcomes["accepted"], 36);
         assert_eq!(summary.activity_outcomes["repaired_structured_output"], 2);
         assert_eq!(summary.jobs_without_activity_envelope, 4);

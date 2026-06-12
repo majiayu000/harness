@@ -11,6 +11,55 @@ use harness_core::{
 };
 use std::sync::Arc;
 
+#[test]
+fn http_listener_starts_before_background_work() {
+    let source = include_str!("mod.rs");
+    let Some(bind_index) = source.find("tokio::net::TcpListener::bind") else {
+        panic!("serve should bind a TCP listener");
+    };
+    let Some(serve_task_index) = source.find("let serve_handle = tokio::spawn") else {
+        panic!("serve should start Axum before background work");
+    };
+    let Some(reconciliation_index) = source.find("run_once_with_runtime_config") else {
+        panic!("serve should still run startup reconciliation");
+    };
+    let Some(reconciliation_gate_index) =
+        source.find("state.core.server.config.reconciliation.enabled")
+    else {
+        panic!("startup reconciliation should respect reconciliation.enabled");
+    };
+    let Some(feedback_sweeper_index) = source.find("spawn_runtime_pr_feedback_sweeper") else {
+        panic!("serve should still start the PR feedback sweeper");
+    };
+    let Some(backlog_poller_index) = source.find("spawn_runtime_repo_backlog_poller") else {
+        panic!("serve should still start the repo backlog poller");
+    };
+    let Some(runtime_worker_index) = source.find("spawn_runtime_job_workers") else {
+        panic!("serve should still start runtime workers");
+    };
+
+    for background_index in [
+        reconciliation_index,
+        feedback_sweeper_index,
+        backlog_poller_index,
+        runtime_worker_index,
+    ] {
+        assert!(
+            bind_index < background_index,
+            "HTTP listener must be bound before background work can enqueue or execute agent jobs"
+        );
+        assert!(
+            serve_task_index < background_index,
+            "Axum must be running before background work can enqueue or execute agent jobs"
+        );
+    }
+
+    assert!(
+        reconciliation_gate_index < reconciliation_index,
+        "startup reconciliation must be gated before it can make GitHub calls"
+    );
+}
+
 #[tokio::test]
 async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
     // Hold the shared HOME_LOCK so no sibling test races on HOME.

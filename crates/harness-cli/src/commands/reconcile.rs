@@ -17,11 +17,11 @@ pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig
     let store = harness_server::task_runner::TaskStore::open(&db_path).await?;
     let (runtime_store, issue_workflow_store) = open_workflow_stores(config).await;
 
-    let report = harness_server::reconciliation::run_once_with_runtime_token(
+    let report = harness_server::reconciliation::run_once_with_runtime_config(
         &store,
         runtime_store.as_ref(),
         issue_workflow_store.as_ref(),
-        config.reconciliation.max_gh_calls_per_minute,
+        &config.reconciliation,
         dry_run,
         config.server.github_token.as_deref(),
     )
@@ -29,11 +29,12 @@ pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig
 
     if dry_run {
         println!(
-            "Reconciliation dry-run: {} candidate(s), {} terminal skipped, {} task transition(s), {} workflow transition(s)",
+            "Reconciliation dry-run: {} candidate(s), {} terminal skipped, {} task transition(s), {} workflow transition(s), {} workflow alert(s)",
             report.candidates,
             report.skipped_terminal,
             report.transitions.len(),
-            report.workflow_transitions.len()
+            report.workflow_transitions.len(),
+            report.workflow_alerts.len()
         );
     } else {
         let applied = report.transitions.iter().filter(|t| t.applied).count()
@@ -43,8 +44,11 @@ pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig
                 .filter(|t| t.applied)
                 .count();
         println!(
-            "Reconciliation: {} candidate(s), {} terminal skipped, {} transition(s) applied",
-            report.candidates, report.skipped_terminal, applied
+            "Reconciliation: {} candidate(s), {} terminal skipped, {} transition(s) applied, {} workflow alert(s)",
+            report.candidates,
+            report.skipped_terminal,
+            applied,
+            report.workflow_alerts.len()
         );
     }
 
@@ -59,6 +63,27 @@ pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig
         println!(
             "  workflow {} {}#{}: {} → {} ({}) [{}]",
             t.workflow_id, repo, t.pr_number, t.from, t.to, t.reason, applied
+        );
+    }
+
+    for alert in &report.workflow_alerts {
+        let repo = alert.repo.as_deref().unwrap_or("<unknown>");
+        let issue_number = alert
+            .issue_number
+            .map(|number| number.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let pr_url = alert.pr_url.as_deref().unwrap_or("<unknown>");
+        println!(
+            "  workflow alert {} repo={} issue=#{} pr=#{} state={} age_secs={} ttl_secs={} reason={} url={}",
+            alert.workflow_id,
+            repo,
+            issue_number,
+            alert.pr_number,
+            alert.state,
+            alert.age_secs,
+            alert.ttl_secs,
+            alert.reason,
+            pr_url
         );
     }
 

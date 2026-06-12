@@ -4,6 +4,7 @@ use tokio::time::Duration;
 
 fn legacy_hosted_bot_server_config() -> std::sync::Arc<harness_core::config::HarnessConfig> {
     let mut config = harness_core::config::HarnessConfig::default();
+    config.agents.review.strategy = harness_core::config::agents::ReviewStrategy::LegacyHostedBot;
     config.agents.review.review_bot_auto_trigger = true;
     std::sync::Arc::new(config)
 }

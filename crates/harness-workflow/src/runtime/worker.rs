@@ -3,6 +3,7 @@ use super::model::{
     WorkflowCommandRecord, WorkflowCommandType, WorkflowInstance,
 };
 use super::reducer::reduce_runtime_job_completed;
+use super::status::WorkflowCommandStatus;
 use super::store::WorkflowRuntimeStore;
 use super::validator::{DecisionValidator, ValidationContext};
 use anyhow::Context;
@@ -11,7 +12,7 @@ use chrono::{Duration, Utc};
 use serde_json::{json, Value};
 use std::time::Duration as StdDuration;
 
-const COMMAND_STATUS_HANDLED_INLINE: &str = "handled_inline";
+const COMMAND_STATUS_HANDLED_INLINE: WorkflowCommandStatus = WorkflowCommandStatus::HandledInline;
 
 #[async_trait]
 pub trait RuntimeJobExecutor: Send + Sync {
@@ -134,6 +135,8 @@ impl<'a> RuntimeWorker<'a> {
         if let Some(event) = completion.workflow_event.as_ref() {
             self.propagate_pr_feedback_child_completion(&event.workflow_id, event)
                 .await?;
+            self.propagate_quality_gate_child_completion(&event.workflow_id, event)
+                .await?;
         }
         Ok(Some(completion.runtime_job))
     }
@@ -232,6 +235,39 @@ impl<'a> RuntimeWorker<'a> {
             return Ok(());
         }
         if matches!(child.state.as_str(), "pending" | "inspecting") {
+            return Ok(());
+        }
+        let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {
+            return Ok(());
+        };
+        let parent_event = self
+            .store
+            .append_event(
+                parent_workflow_id,
+                "RuntimeJobCompleted",
+                &self.owner,
+                merge_child_completion_payload(event, &child.id),
+            )
+            .await?;
+        self.apply_runtime_completion_reducer(parent_workflow_id, &parent_event)
+            .await
+    }
+
+    async fn propagate_quality_gate_child_completion(
+        &self,
+        workflow_id: &str,
+        event: &super::model::WorkflowEvent,
+    ) -> anyhow::Result<()> {
+        let Some(child) = self.store.get_instance(workflow_id).await? else {
+            return Ok(());
+        };
+        if child.definition_id != super::quality_gate::QUALITY_GATE_DEFINITION_ID {
+            return Ok(());
+        }
+        if !matches!(
+            child.state.as_str(),
+            "passed" | "blocked" | "failed" | "cancelled"
+        ) {
             return Ok(());
         }
         let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {

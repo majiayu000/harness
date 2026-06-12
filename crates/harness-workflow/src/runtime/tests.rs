@@ -19,12 +19,13 @@ use super::{
     PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PromptSubmissionDecisionInput,
     QualityGateDecisionInput, QualityGateWorkflowAction, RepoBacklogPollDecisionInput,
     RepoBacklogWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
-    RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowDecisionTransition,
-    WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
-    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
-    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    RuntimeProfileSelector, RuntimeWorker, StaleWorkflowDecisionInput, WorkflowCommandStatus,
+    WorkflowDecisionTransition, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
+    LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
+    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -35,10 +36,13 @@ use std::sync::{
     Arc, Mutex,
 };
 
+mod issue_planning;
 mod local_review;
 mod p1_followups;
+mod pr_repair_evidence;
 mod replay_determinism;
 mod retry;
+mod runtime_store;
 
 fn issue_instance(state: &str) -> WorkflowInstance {
     WorkflowInstance::new(
@@ -90,8 +94,27 @@ fn project_issue_instance(project_id: &str, issue_number: u64, state: &str) -> W
     }))
 }
 
+fn runtime_completion_event(
+    instance: &WorkflowInstance,
+    activity: &str,
+    activity_result: ActivityResult,
+) -> WorkflowEvent {
+    WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": WorkflowCommand::enqueue_activity(activity, "activity-1"),
+        "runtime_job_id": "job-1",
+        "activity_result": activity_result,
+    }))
+}
+
 #[test]
-fn issue_submission_decision_starts_discovered_issue_implementation() {
+fn issue_submission_decision_starts_discovered_issue_planning() {
     let labels = vec!["bug".to_string(), "p1".to_string()];
     let instance = issue_instance("discovered");
     let output = build_issue_submission_decision(
@@ -108,20 +131,17 @@ fn issue_submission_decision_starts_discovered_issue_implementation() {
         },
     );
 
-    assert_eq!(
-        output.action,
-        IssueSubmissionWorkflowAction::RunImplementation
-    );
+    assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
     assert_eq!(output.decision.decision, "submit_issue");
-    assert_eq!(output.decision.next_state, "implementing");
+    assert_eq!(output.decision.next_state, "planning");
     assert_eq!(output.decision.commands.len(), 1);
     assert_eq!(
         output.decision.commands[0].activity_name(),
-        Some("implement_issue")
+        Some("plan_issue")
     );
     assert_eq!(
         output.decision.commands[0].dedupe_key,
-        "issue-submit:owner/repo:issue:123:task:task-1:implement"
+        "issue-submit:owner/repo:issue:123:task:task-1:plan"
     );
     assert_eq!(
         output.decision.commands[0].command["additional_prompt"],
@@ -164,6 +184,43 @@ fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
 }
 
 #[test]
+fn issue_submission_decision_can_reopen_terminal_issue_for_planning() {
+    let labels = Vec::new();
+    for state in ["failed", "cancelled"] {
+        let instance = issue_instance(state);
+        let output = build_issue_submission_decision(
+            &instance,
+            IssueSubmissionDecisionInput {
+                task_id: "task-terminal",
+                repo: Some("owner/repo"),
+                issue_number: 124,
+                labels: &labels,
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+            },
+        );
+
+        assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
+        assert_eq!(output.decision.next_state, "planning");
+        assert_eq!(
+            output.decision.commands[0].activity_name(),
+            Some("plan_issue")
+        );
+        let validation = DecisionValidator::github_issue_pr().validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen(),
+        );
+        assert!(
+            validation.is_ok(),
+            "terminal issue in {state} should reopen for planning: {validation:?}"
+        );
+    }
+}
+
+#[test]
 fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
     let labels = Vec::new();
     let depends_on = vec!["task-upstream".to_string()];
@@ -191,6 +248,41 @@ fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("blocked issue submission should validate without dispatching");
+}
+
+#[test]
+fn issue_submission_decision_releases_dependencies_to_planning() {
+    let labels = Vec::new();
+    let instance = issue_instance("awaiting_dependencies");
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-4",
+            repo: Some("owner/repo"),
+            issue_number: 126,
+            labels: &labels,
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+        },
+    );
+
+    assert_eq!(output.action, IssueSubmissionWorkflowAction::RunPlanning);
+    assert_eq!(output.decision.next_state, "planning");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("plan_issue")
+    );
+    let validation = DecisionValidator::github_issue_pr().validate(
+        &instance,
+        &output.decision,
+        &ValidationContext::new("workflow-policy", Utc::now()),
+    );
+    assert!(
+        validation.is_ok(),
+        "dependency release should allow planning: {validation:?}"
+    );
 }
 
 #[test]
@@ -585,7 +677,7 @@ fn pr_feedback_decision_waits_when_no_actionable_feedback_exists() {
 }
 
 #[test]
-fn pr_feedback_decision_marks_ready_to_merge() {
+fn pr_feedback_decision_starts_quality_gate_before_ready_to_merge() {
     let instance = issue_instance("awaiting_feedback");
     let output = build_pr_feedback_decision(
         &instance,
@@ -598,16 +690,25 @@ fn pr_feedback_decision_marks_ready_to_merge() {
         },
     );
 
-    assert_eq!(output.action, PrFeedbackWorkflowAction::ReadyToMerge);
-    assert_eq!(output.decision.decision, "mark_ready_to_merge");
-    assert_eq!(output.decision.next_state, "ready_to_merge");
+    assert_eq!(output.action, PrFeedbackWorkflowAction::RequestQualityGate);
+    assert_eq!(output.decision.decision, "start_quality_gate");
+    assert_eq!(output.decision.next_state, "quality_gate_pending");
+    assert_eq!(
+        output.decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(
+        output.decision.commands[0].command["definition_id"],
+        QUALITY_GATE_DEFINITION_ID
+    );
+    assert_eq!(output.decision.commands[0].command["subject_key"], "pr:77");
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
             &output.decision,
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
-        .expect("ready-to-merge decision should validate");
+        .expect("quality gate request decision should validate");
 }
 
 #[test]
@@ -828,6 +929,47 @@ fn runtime_completion_reducer_finishes_closed_issue_signal_without_pr() {
 }
 
 #[test]
+fn runtime_completion_reducer_finishes_closed_issue_during_quality_gate() {
+    let instance = issue_instance("quality_gate_pending");
+    let result = ActivityResult::succeeded(
+        QUALITY_GATE_ACTIVITY,
+        "Issue was closed before quality gate completed.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "issue_state",
+        json!({
+            "issue_number": 123,
+            "state": "closed"
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue artifact should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("closed issue quality gate completion should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_finishes_blocked_closed_issue_signal_without_pr() {
     let instance = issue_instance("implementing");
     let result = ActivityResult {
@@ -935,6 +1077,52 @@ fn runtime_completion_reducer_finishes_feedback_closed_issue_signal_without_pr()
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("feedback closed issue completion should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_finishes_succeeded_feedback_closed_issue_signal_without_pr() {
+    let instance = issue_instance("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Issue was closed while addressing PR feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue signal from successful feedback work should finish the workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkDone
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("successful feedback closed issue completion should validate");
 }
 
 #[test]
@@ -2904,6 +3092,76 @@ fn runtime_completion_reducer_passes_quality_gate_after_success() {
 }
 
 #[test]
+fn runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass() {
+    let instance = issue_instance("quality_gate_pending");
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({
+                "validation": "passed"
+            }),
+        ))
+        .with_validation(ValidationRecord::new("cargo check", "passed"));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate completion should mark parent ready");
+
+    assert_eq!(decision.decision, "quality_gate_passed");
+    assert_eq!(decision.next_state, "ready_to_merge");
+    assert!(decision.commands.is_empty());
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("parent quality gate pass transition should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_issue_pr_quality_gate_without_validation() {
+    let instance = issue_instance("quality_gate_pending");
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation was claimed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({
+                "validation": "passed"
+            }),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing validation evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("validation evidence"));
+}
+
+#[test]
 fn runtime_completion_reducer_blocks_quality_gate_success_without_status_signal() {
     let instance = quality_gate_instance("checking");
     let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate:run");
@@ -4106,7 +4364,7 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
     assert_eq!(completed.id, job.id);
     assert_eq!(
         store.commands_for(&workflow.id).await?[0].status,
-        "completed"
+        WorkflowCommandStatus::Completed
     );
     let workflow_events = store.events_for(&workflow.id).await?;
     let event = workflow_events
@@ -4195,12 +4453,12 @@ async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> any
 
     let commands = store.commands_for(&workflow.id).await?;
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].status, "completed");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
     assert_eq!(
         commands[1].command.command_type,
         WorkflowCommandType::BindPr
     );
-    assert_ne!(commands[1].status, "pending");
+    assert_ne!(commands[1].status, WorkflowCommandStatus::Pending);
     Ok(())
 }
 
@@ -4272,7 +4530,7 @@ async fn runtime_worker_blocks_invalid_inline_bind_pr_before_persisting_command(
     }));
     assert!(commands.iter().any(|record| {
         record.command.command_type == WorkflowCommandType::MarkBlocked
-            && record.status == "handled_inline"
+            && record.status == WorkflowCommandStatus::HandledInline
     }));
 
     let decisions = store.decisions_for(&workflow.id).await?;
@@ -4329,14 +4587,14 @@ async fn runtime_worker_blocks_implementation_success_without_pr_evidence() -> a
 
     let commands = store.commands_for(&workflow.id).await?;
     assert_eq!(commands[0].id, command_id);
-    assert_eq!(commands[0].status, "completed");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
     assert!(commands.iter().any(|record| {
         record.command.command_type == WorkflowCommandType::MarkBlocked
-            && record.status == "handled_inline"
+            && record.status == WorkflowCommandStatus::HandledInline
     }));
     assert!(commands.iter().any(|record| {
         record.command.command_type == WorkflowCommandType::RequestOperatorAttention
-            && record.status == "handled_inline"
+            && record.status == WorkflowCommandStatus::HandledInline
     }));
 
     let decisions = store.decisions_for(&workflow.id).await?;
@@ -4408,10 +4666,10 @@ async fn runtime_worker_finishes_closed_issue_success_without_pr() -> anyhow::Re
 
     let commands = store.commands_for(&workflow.id).await?;
     assert_eq!(commands[0].id, command_id);
-    assert_eq!(commands[0].status, "completed");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
     assert!(commands.iter().any(|record| {
         record.command.command_type == WorkflowCommandType::MarkDone
-            && record.status == "handled_inline"
+            && record.status == WorkflowCommandStatus::HandledInline
     }));
 
     let decisions = store.decisions_for(&workflow.id).await?;
@@ -4495,7 +4753,9 @@ async fn runtime_worker_keeps_repo_backlog_dispatching_until_child_starts_finish
     assert_eq!(final_update.state, "idle");
 
     let commands = store.commands_for(&workflow.id).await?;
-    assert!(commands.iter().all(|command| command.status == "completed"));
+    assert!(commands
+        .iter()
+        .all(|command| command.status == WorkflowCommandStatus::Completed));
     Ok(())
 }
 
@@ -4540,7 +4800,7 @@ async fn runtime_completion_counts_dispatching_sibling_as_active() -> anyhow::Re
         .await?;
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].id, second_command_id);
-    assert_eq!(claimed[0].status, "dispatching");
+    assert_eq!(claimed[0].status, WorkflowCommandStatus::Dispatching);
 
     let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
     let executor = StaticRuntimeExecutor {
@@ -4665,6 +4925,156 @@ async fn runtime_worker_propagates_pr_feedback_child_completion_to_parent() -> a
         .expect("activity artifacts should be an array")
         .iter()
         .all(|artifact| artifact["artifact_type"] != "workflow_decision"));
+    Ok(())
+}
+
+async fn seed_quality_gate_child_job(
+    store: &WorkflowRuntimeStore,
+    parent_id: &str,
+    child_id: &str,
+) -> anyhow::Result<RuntimeJob> {
+    let parent = issue_instance("quality_gate_pending").with_id(parent_id);
+    store.upsert_instance(&parent).await?;
+    let child = WorkflowInstance::new(
+        QUALITY_GATE_DEFINITION_ID,
+        1,
+        "checking",
+        WorkflowSubject::new("quality_gate", "pr:77"),
+    )
+    .with_id(child_id)
+    .with_parent(parent.id.clone());
+    store.upsert_instance(&child).await?;
+    let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate-77");
+    let command_id = store.enqueue_command(&child.id, None, &command).await?;
+    store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": QUALITY_GATE_ACTIVITY }),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn runtime_worker_propagates_quality_gate_child_pass_to_parent() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = seed_quality_gate_child_job(&store, "issue-parent", "quality-gate-child").await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+            .with_signal(ActivitySignal::new(
+                QUALITY_PASSED_SIGNAL,
+                json!({ "validation": "passed" }),
+            ))
+            .with_validation(ValidationRecord::new("cargo check", "passed")),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance("quality-gate-child")
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "passed");
+    let parent_after = store
+        .get_instance("issue-parent")
+        .await?
+        .expect("parent workflow should exist");
+    assert_eq!(parent_after.state, "ready_to_merge");
+    let parent_events = store.events_for("issue-parent").await?;
+    assert!(parent_events.iter().any(|event| {
+        event.event_type == "RuntimeJobCompleted"
+            && event.event["child_workflow_id"] == "quality-gate-child"
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_propagates_quality_gate_child_block_to_parent() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job =
+        seed_quality_gate_child_job(&store, "issue-parent-blocked", "quality-gate-child-blocked")
+            .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation was claimed.")
+            .with_signal(ActivitySignal::new(
+                QUALITY_PASSED_SIGNAL,
+                json!({ "validation": "passed" }),
+            )),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance("quality-gate-child-blocked")
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "blocked");
+    let parent_after = store
+        .get_instance("issue-parent-blocked")
+        .await?
+        .expect("parent workflow should exist");
+    assert_eq!(parent_after.state, "blocked");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_propagates_quality_gate_child_failure_to_parent() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job =
+        seed_quality_gate_child_job(&store, "issue-parent-failed", "quality-gate-child-failed")
+            .await?;
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::failed(
+            QUALITY_GATE_ACTIVITY,
+            "Quality gate execution failed.",
+            "validation command failed",
+        )
+        .with_error_kind(ActivityErrorKind::Fatal),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance("quality-gate-child-failed")
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "failed");
+    let parent_after = store
+        .get_instance("issue-parent-failed")
+        .await?
+        .expect("parent workflow should exist");
+    assert_eq!(parent_after.state, "failed");
     Ok(())
 }
 
@@ -4820,7 +5230,7 @@ async fn runtime_worker_does_not_propagate_retrying_pr_feedback_child() -> anyho
     );
     let child_commands = store.commands_for(&child.id).await?;
     assert!(child_commands.iter().any(|record| {
-        record.status == "pending"
+        record.status == WorkflowCommandStatus::Pending
             && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
             && record.command.command["retry_attempt"] == 1
     }));
@@ -4992,8 +5402,8 @@ async fn runtime_worker_blocks_when_profile_max_turns_is_exhausted() -> anyhow::
         .unwrap_or_default()
         .contains("exhausted max_turns"));
     let commands = store.commands_for(&workflow.id).await?;
-    assert_eq!(commands[0].status, "completed");
-    assert_eq!(commands[1].status, "blocked");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
+    assert_eq!(commands[1].status, WorkflowCommandStatus::Blocked);
     Ok(())
 }
 
@@ -5244,7 +5654,7 @@ async fn durable_store_apply_decision_transition_can_create_initial_instance() -
             }),
             decision: &decision,
             final_instance: &final_instance,
-            command_status: "pending",
+            command_status: WorkflowCommandStatus::Pending,
         })
         .await?
         .expect("missing initial instance should be created inside the transition");
@@ -5321,7 +5731,7 @@ async fn durable_store_apply_decision_transition_does_not_rewind_existing_instan
             }),
             decision: &decision,
             final_instance: &final_instance,
-            command_status: "pending",
+            command_status: WorkflowCommandStatus::Pending,
         })
         .await?;
 
@@ -5529,7 +5939,7 @@ async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() 
     );
     assert_eq!(
         store.commands_for(&instance.id).await?[0].status,
-        "dispatched"
+        WorkflowCommandStatus::Dispatched
     );
     assert!(dispatcher.dispatch_once().await?.is_none());
     Ok(())
@@ -5548,13 +5958,18 @@ async fn runtime_store_can_insert_non_pending_command_atomically() -> anyhow::Re
     let command =
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-inline");
     let command_id = store
-        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .enqueue_command_with_status(
+            &instance.id,
+            None,
+            &command,
+            WorkflowCommandStatus::HandledInline,
+        )
         .await?;
 
     let commands = store.commands_for(&instance.id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].id, command_id);
-    assert_eq!(commands[0].status, "handled_inline");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::HandledInline);
     assert!(
         store.pending_commands(10).await?.is_empty(),
         "inline commands must never be visible to the dispatcher as pending"
@@ -5576,13 +5991,18 @@ async fn runtime_store_non_pending_status_updates_existing_pending_command() -> 
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-inline");
     let pending_id = store.enqueue_command(&instance.id, None, &command).await?;
     let inline_id = store
-        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .enqueue_command_with_status(
+            &instance.id,
+            None,
+            &command,
+            WorkflowCommandStatus::HandledInline,
+        )
         .await?;
 
     assert_eq!(inline_id, pending_id);
     let commands = store.commands_for(&instance.id).await?;
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].status, "handled_inline");
+    assert_eq!(commands[0].status, WorkflowCommandStatus::HandledInline);
     assert!(
         store.pending_commands(10).await?.is_empty(),
         "dedupe conflict must not leave an inline command visible as pending"
@@ -5615,13 +6035,18 @@ async fn runtime_store_dedupe_status_update_does_not_regress_dispatched_command(
     assert!(matches!(outcome, RuntimeJobEnqueueOutcome::Enqueued(_)));
 
     let duplicate_id = store
-        .enqueue_command_with_status(&instance.id, None, &command, "handled_inline")
+        .enqueue_command_with_status(
+            &instance.id,
+            None,
+            &command,
+            WorkflowCommandStatus::HandledInline,
+        )
         .await?;
 
     assert_eq!(duplicate_id, command_id);
     assert_eq!(
         store.commands_for(&instance.id).await?[0].status,
-        "dispatched"
+        WorkflowCommandStatus::Dispatched
     );
     Ok(())
 }
@@ -5695,7 +6120,7 @@ async fn runtime_store_pending_command_enqueue_is_idempotent_across_concurrent_c
     assert_eq!(jobs[0].id, first_job_id);
     assert_eq!(
         store.commands_for(&instance.id).await?[0].status,
-        "dispatched"
+        WorkflowCommandStatus::Dispatched
     );
     Ok(())
 }
@@ -5718,7 +6143,7 @@ async fn runtime_store_claims_pending_commands_with_dispatch_lease() -> anyhow::
         .await?;
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].id, command_id);
-    assert_eq!(claimed[0].status, "dispatching");
+    assert_eq!(claimed[0].status, WorkflowCommandStatus::Dispatching);
     assert_eq!(claimed[0].dispatch_owner.as_deref(), Some("dispatcher-a"));
     assert!(claimed[0].dispatch_lease_expires_at.is_some());
     assert!(store.pending_commands(10).await?.is_empty());
@@ -6009,7 +6434,10 @@ async fn runtime_command_dispatcher_skips_non_runtime_commands() -> anyhow::Resu
         .runtime_jobs_for_command(&command_id)
         .await?
         .is_empty());
-    assert_eq!(store.commands_for(&instance.id).await?[0].status, "skipped");
+    assert_eq!(
+        store.commands_for(&instance.id).await?[0].status,
+        WorkflowCommandStatus::Skipped
+    );
     Ok(())
 }
 
@@ -6051,7 +6479,7 @@ async fn runtime_command_dispatcher_skips_terminal_workflow_before_enqueue() -> 
         .is_empty());
     assert_eq!(
         store.commands_for(&instance.id).await?[0].status,
-        "cancelled"
+        WorkflowCommandStatus::Cancelled
     );
     Ok(())
 }

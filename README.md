@@ -154,6 +154,25 @@ Integration tests that require a database (e.g. `runtime_state_store`,
 `thread_db`, `q_value_store`) skip automatically when no Harness database URL
 is configured.
 
+**Harness-server validation ladder:**
+
+```bash
+# Routine server work: fast module and lightweight route path.
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-fast.sh
+
+# Full server DB, startup, recovery, route, and workflow profile.
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh
+
+# Final PR handoff: full workspace coverage.
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness cargo test --workspace
+```
+
+`scripts/test-server-fast.sh` is the warm local feedback path for routine
+`harness-server` changes once a test database URL is configured.
+`scripts/test-server-db.sh` runs the full server suite single-threaded so
+DB-backed startup, recovery, full `AppState`, route, and workflow-runtime
+coverage remains explicit and stable.
+
 ### Run
 
 **HTTP server:**
@@ -406,14 +425,22 @@ path.
 
 ## Server Startup
 
-**Important:** Always start the server from a standalone terminal, not from within Claude Code or other agent sessions. Agent environment variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) propagate to spawned subprocesses and cause SIGTRAP.
+`harness serve` can be started directly from a normal terminal. When product
+behavior needs live verification from a Codex or Claude agent session, launch
+the server with a sanitized environment so spawned agents do not inherit wrapper
+variables from the parent process. Harness strips Claude-prefixed variables
+before spawning child agents; Codex-prefixed variables are not stripped by the
+adapter spawn path, so use `scripts/start-harness-codex-safe.sh` or an
+equivalent sanitized launcher when starting from a Codex-owned session. For
+long-running manual dogfood sessions, a standalone terminal is still useful
+because the operator owns the process lifetime directly.
 
 ```bash
 # Single project (backward compatible)
 ./target/release/harness serve --transport http --port 9800 --project-root /path/to/project
 
 # Multi-project via config file (recommended)
-./target/release/harness serve --transport http --port 9800 --config config/default.toml
+./target/release/harness --config config/default.toml serve --transport http --port 9800
 
 # Multi-project via CLI flags
 ./target/release/harness serve --transport http --port 9800 \
@@ -421,7 +448,7 @@ path.
   --project litellm=/path/to/litellm
 
 # With GitHub token for auto-review
-GITHUB_TOKEN=ghp_xxx ./target/release/harness serve --transport http --port 9800 --config config/default.toml
+GITHUB_TOKEN=ghp_xxx ./target/release/harness --config config/default.toml serve --transport http --port 9800
 ```
 
 ## Task Execution Flow

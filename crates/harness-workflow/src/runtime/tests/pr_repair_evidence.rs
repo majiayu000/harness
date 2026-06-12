@@ -1,0 +1,833 @@
+use super::*;
+use crate::runtime::{
+    build_pr_hygiene_repair_decision, PrHygieneRepairDecisionInput, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
+};
+
+fn pr_workflow_state(state: &str) -> WorkflowInstance {
+    issue_instance(state).with_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+    }))
+}
+
+fn event_for_result(result: ActivityResult) -> WorkflowEvent {
+    WorkflowEvent::new(
+        "workflow-1",
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }))
+}
+
+#[test]
+fn pr_hygiene_repair_decision_preserves_rebase_context() {
+    let instance = issue_instance("awaiting_feedback");
+    let output = build_pr_hygiene_repair_decision(
+        &instance,
+        PrHygieneRepairDecisionInput {
+            dedupe_key: "pr-hygiene:owner/repo:77",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            issue_number: Some(123),
+            repo: Some("owner/repo"),
+            summary: "Runtime PR hygiene found mergeability repair is needed.",
+            hygiene_context: json!({
+                "merge_state_status": "DIRTY",
+                "dirty_age_secs": 172800,
+                "dirty_age_to_repair_secs": 172800,
+                "dirty_age_to_comment_secs": 604800,
+                "rebase_needed_label": "rebase-needed",
+            }),
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::HygieneRepair);
+    assert_eq!(output.decision.decision, "address_pr_feedback");
+    assert_eq!(output.decision.next_state, "addressing_feedback");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert_eq!(output.decision.commands[0].command["source"], "pr_hygiene");
+    assert_eq!(
+        output.decision.commands[0].command["hygiene"]["rebase_needed_label"],
+        "rebase-needed"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("PR hygiene repair decision should validate");
+}
+
+fn ready_snapshot_artifact() -> ActivityArtifact {
+    ActivityArtifact::new(
+        SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads": [],
+            "active_unresolved_review_threads_count": 0,
+            "review_threads_complete": true,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false,
+            "changed_files": [],
+            "action_taken": "confirmed_ready",
+            "validation": [
+                {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "passed"}
+            ]
+        }),
+    )
+}
+
+fn agent_ready_snapshot_artifact() -> ActivityArtifact {
+    ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads": [],
+            "active_unresolved_review_threads_count": 0,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
+        }),
+    )
+}
+
+fn repair_snapshot_artifact() -> ActivityArtifact {
+    ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_sha": "def456",
+            "observed_at": "2026-06-06T00:05:00Z",
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "action_taken": "pushed_commit",
+            "validation_commands": [
+                {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "passed"}
+            ]
+        }),
+    )
+}
+
+#[test]
+fn ready_to_merge_signal_without_current_pr_snapshot_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent claimed the PR is ready to merge.",
+    )
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing snapshot should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("missing snapshot block should validate");
+}
+
+#[test]
+fn structured_ready_decision_without_current_pr_snapshot_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "awaiting_feedback",
+        "mark_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted a ready workflow decision.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing snapshot should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+}
+
+#[test]
+fn structured_ready_decision_with_snapshot_without_ready_signal_blocks_quality_gate_bypass() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "awaiting_feedback",
+        "mark_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted a direct ready workflow decision.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_artifact(ready_snapshot_artifact());
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("direct ready decision should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("quality_gate"));
+}
+
+#[test]
+fn structured_ready_decision_with_blocking_signal_uses_blocking_feedback() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "awaiting_feedback",
+        "mark_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted both ready and blocking feedback.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_signal(ActivitySignal::new(
+        "FeedbackFound",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("blocking signal should override structured ready output");
+
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+}
+
+#[test]
+fn closed_issue_evidence_wins_over_structured_ready_decision() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "awaiting_feedback",
+        "mark_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted both terminal closed evidence and a ready decision.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 77,
+            "issue_url": "https://github.com/owner/repo/issues/77",
+            "state": "closed"
+        }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("closed issue evidence should finish workflow");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+}
+
+#[test]
+fn address_pr_feedback_success_without_repair_evidence_blocks() {
+    let instance = pr_workflow_state("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Runtime agent claimed review feedback was addressed.",
+    );
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing repair evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR repair evidence is missing"));
+}
+
+#[test]
+fn address_pr_feedback_success_with_repair_snapshot_requests_local_review() {
+    let instance = pr_workflow_state("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Runtime agent addressed review feedback and pushed validation-backed changes.",
+    )
+    .with_artifact(repair_snapshot_artifact())
+    .with_validation(ValidationRecord::new(
+        "cargo test -p harness-workflow pr_repair_evidence",
+        "passed",
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("valid repair snapshot should request local review");
+
+    assert_eq!(decision.decision, "run_local_review_after_rework");
+    assert_eq!(decision.next_state, "local_review_gate");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some(LOCAL_REVIEW_ACTIVITY)
+    );
+}
+
+#[test]
+fn address_pr_feedback_snapshot_with_failed_validation_blocks() {
+    let instance = pr_workflow_state("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Runtime agent reported a repair with failed validation.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_sha": "def456",
+            "observed_at": "2026-06-06T00:05:00Z",
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "action_taken": "pushed_commit",
+            "validation_commands": [
+                {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "failed"}
+            ]
+        }),
+    ))
+    .with_validation(ValidationRecord::new(
+        "cargo test -p harness-workflow pr_repair_evidence",
+        "failed",
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("failed validation evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR repair evidence is missing"));
+}
+
+#[test]
+fn address_pr_feedback_snapshot_with_mixed_validation_blocks() {
+    let instance = pr_workflow_state("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Runtime agent reported one passing and one failing validation command.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_sha": "def456",
+            "observed_at": "2026-06-06T00:05:00Z",
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "action_taken": "pushed_commit",
+            "validation_commands": [
+                {"command": "cargo fmt --all -- --check", "status": "passed"},
+                {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "failed"}
+            ]
+        }),
+    ))
+    .with_validation(ValidationRecord::new(
+        "cargo fmt --all -- --check",
+        "passed",
+    ))
+    .with_validation(ValidationRecord::new(
+        "cargo test -p harness-workflow pr_repair_evidence",
+        "failed",
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("mixed validation evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR repair evidence is missing"));
+}
+
+#[test]
+fn address_pr_feedback_snapshot_for_different_pr_blocks() {
+    let instance = pr_workflow_state("addressing_feedback");
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Runtime agent attached repair evidence copied from another PR.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        PR_REPAIR_SNAPSHOT_ARTIFACT,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/88",
+            "head_sha": "def456",
+            "observed_at": "2026-06-06T00:05:00Z",
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "validation_commands": [
+                {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "passed"}
+            ]
+        }),
+    ))
+    .with_validation(ValidationRecord::new(
+        "cargo test -p harness-workflow pr_repair_evidence",
+        "passed",
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("wrong PR repair evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR repair evidence is missing"));
+}
+
+#[test]
+fn ready_to_merge_signal_with_current_pr_snapshot_starts_quality_gate() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection verified the PR is ready to merge.",
+    )
+    .with_artifact(ready_snapshot_artifact())
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("valid snapshot should reduce");
+
+    assert_eq!(decision.decision, "start_quality_gate");
+    assert_eq!(decision.next_state, "quality_gate_pending");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(
+        decision.commands[0].command["definition_id"],
+        QUALITY_GATE_DEFINITION_ID
+    );
+    assert_eq!(decision.commands[0].command["subject_key"], "pr:77");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("ready snapshot quality gate decision should validate");
+}
+
+#[test]
+fn ready_to_merge_signal_with_missing_review_thread_completeness_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let mut artifact = ready_snapshot_artifact();
+    let Some(snapshot) = artifact.artifact.as_object_mut() else {
+        panic!("snapshot artifact should be an object");
+    };
+    snapshot.remove("review_threads_complete");
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection claimed the PR is ready to merge.",
+    )
+    .with_artifact(artifact)
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = match reduce_runtime_job_completed(&instance, &event) {
+        Ok(Some(decision)) => decision,
+        Ok(None) => panic!("missing completeness evidence should block"),
+        Err(error) => panic!("event should parse: {error}"),
+    };
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+}
+
+#[test]
+fn ready_to_merge_signal_with_false_review_thread_completeness_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let mut artifact = ready_snapshot_artifact();
+    artifact.artifact["review_threads_complete"] = json!(false);
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection claimed the PR is ready to merge.",
+    )
+    .with_artifact(artifact)
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = match reduce_runtime_job_completed(&instance, &event) {
+        Ok(Some(decision)) => decision,
+        Ok(None) => panic!("false completeness evidence should block"),
+        Err(error) => panic!("event should parse: {error}"),
+    };
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+}
+
+#[test]
+fn ready_to_merge_signal_from_agent_sweep_with_server_snapshot_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent forged server-owned ready evidence.",
+    )
+    .with_artifact(ready_snapshot_artifact())
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("agent sweep ready evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("server_pr_snapshot"));
+}
+
+#[test]
+fn ready_to_merge_signal_with_only_agent_repair_snapshot_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent attached a ready-looking self-reported snapshot.",
+    )
+    .with_artifact(agent_ready_snapshot_artifact())
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("agent-owned ready snapshot should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("server_pr_snapshot"));
+}
+
+#[test]
+fn ready_to_merge_snapshot_accepts_quoted_pr_number() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection verified the PR is ready to merge.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
+            "pr_number": "77",
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads_count": 0,
+            "review_threads_complete": true,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quoted snapshot PR number should reduce");
+
+    assert_eq!(decision.decision, "start_quality_gate");
+    assert_eq!(decision.next_state, "quality_gate_pending");
+}
+
+#[test]
+fn ready_to_merge_snapshot_for_different_pr_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent attached ready evidence copied from another PR.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
+            "pr_number": 88,
+            "pr_url": "https://github.com/owner/repo/pull/88",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads_count": 0,
+            "review_threads_complete": true,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("wrong PR ready evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+}
+
+#[test]
+fn ready_to_merge_snapshot_with_required_review_blocks() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent claimed the PR is ready without an approval.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads_count": 0,
+            "review_threads_complete": true,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "REVIEW_REQUIRED",
+            "is_draft": false
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing approval should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
+fn ready_to_merge_snapshot_with_unresolved_thread_array_blocks_even_when_count_zero() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "sweep_pr_feedback",
+        "Runtime agent reported contradictory unresolved review-thread evidence.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads_count": 0,
+            "active_unresolved_review_threads": [
+                {"id": "thread-1", "path": "src/lib.rs", "line": 10}
+            ],
+            "review_threads_complete": true,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
+        }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("contradictory unresolved-thread evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+}
+
+#[test]
+fn child_pr_feedback_ready_signal_without_snapshot_blocks() {
+    let instance = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "inspecting",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child-1");
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime child workflow claimed the PR is ready to merge.",
+    )
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("child missing snapshot should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    DecisionValidator::pr_feedback()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("child missing snapshot block should validate");
+}
+
+#[test]
+fn child_pr_feedback_ready_snapshot_for_different_subject_pr_blocks() {
+    let instance = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "inspecting",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child-1");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "inspecting",
+        "record_ready_to_merge",
+        "ready_to_merge",
+        "Agent reported the child PR is ready.",
+    )
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime child workflow attached ready evidence copied from another PR.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
+            "pr_number": 88,
+            "pr_url": "https://github.com/owner/repo/pull/88",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "active_unresolved_review_threads_count": 0,
+            "review_threads_complete": true,
+            "status_check_rollup_state": "SUCCESS",
+            "merge_state_status": "CLEAN",
+            "review_decision": "APPROVED",
+            "is_draft": false
+        }),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("wrong child PR ready evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("PR readiness evidence is missing"));
+}

@@ -302,6 +302,114 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
 }
 
 #[tokio::test]
+async fn workflow_runtime_tree_endpoint_splits_running_lease_states() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1170"),
+    )
+    .with_id("issue-1170")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 1170,
+    }));
+    store.upsert_instance(&workflow).await?;
+
+    for activity in ["implement_issue", "inspect_pr_feedback"] {
+        let command =
+            harness_workflow::runtime::WorkflowCommand::enqueue_activity(activity, activity);
+        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+        store
+            .enqueue_runtime_job(
+                &command_id,
+                harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+                "codex-high",
+                serde_json::json!({
+                    "workflow_id": workflow.id,
+                    "activity": activity,
+                }),
+            )
+            .await?;
+    }
+
+    let active = store
+        .claim_next_runtime_job(
+            "active-worker",
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await?
+        .expect("active runtime job should be claimed");
+    store
+        .record_runtime_event(
+            &active.id,
+            "RuntimeTurnStarted",
+            serde_json::json!({ "owner": "active-worker" }),
+        )
+        .await?;
+    let expired = store
+        .claim_next_runtime_job(
+            "expired-worker",
+            chrono::Utc::now() - chrono::Duration::minutes(5),
+        )
+        .await?
+        .expect("expired runtime job should be claimed");
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["summary"]["runtime_job_statuses"]["running"], 2);
+    assert_eq!(
+        body["summary"]["running_job_lease_statuses"]["active_leased"],
+        1
+    );
+    assert_eq!(
+        body["summary"]["running_job_lease_statuses"]["expired_lease"],
+        1
+    );
+
+    let commands = body["workflows"][0]["commands"]
+        .as_array()
+        .expect("commands should be an array");
+    let active_job = commands
+        .iter()
+        .flat_map(|command| command["runtime_jobs"].as_array().into_iter().flatten())
+        .find(|job| job["id"] == active.id)
+        .expect("active job should be exposed");
+    assert_eq!(active_job["lease_state"], "active_leased");
+    assert_eq!(active_job["in_flight_model_turn"], true);
+    assert!(active_job["last_runtime_observation_at"].is_string());
+
+    let expired_job = commands
+        .iter()
+        .flat_map(|command| command["runtime_jobs"].as_array().into_iter().flatten())
+        .find(|job| job["id"] == expired.id)
+        .expect("expired job should be exposed");
+    assert_eq!(expired_job["lease_state"], "expired_lease");
+    assert_eq!(expired_job["in_flight_model_turn"], false);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn workflow_runtime_tree_endpoint_limits_runtime_jobs_per_command() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

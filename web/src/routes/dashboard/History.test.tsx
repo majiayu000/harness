@@ -4,14 +4,14 @@ import { History } from "./History";
 import type { Task } from "@/types";
 
 vi.mock("@/lib/queries", () => ({
+  useAllTasks: vi.fn(),
   useDashboard: vi.fn(),
-  useTasks: vi.fn(),
 }));
 
-import { useDashboard, useTasks } from "@/lib/queries";
+import { useAllTasks, useDashboard } from "@/lib/queries";
 
 const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
-const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
+const mockUseAllTasks = useAllTasks as ReturnType<typeof vi.fn>;
 
 function makeHistoryTask(id: string, overrides: Partial<Task> = {}): Task {
   return {
@@ -75,7 +75,7 @@ describe("<History>", () => {
       created_at: "2026-02-01T00:00:00Z",
       description: "Broken review run",
     });
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: historyTaskList([...doneTasks, failedTask]),
       isLoading: false,
       isError: false,
@@ -83,7 +83,7 @@ describe("<History>", () => {
 
     render(<History />);
 
-    expect(mockUseTasks).toHaveBeenCalledWith({
+    expect(mockUseAllTasks).toHaveBeenCalledWith({
       status: "done,failed,cancelled",
       limit: 500,
       project_id: undefined,
@@ -107,7 +107,7 @@ describe("<History>", () => {
     mockUseDashboard.mockReturnValue({
       data: { projects: [{ id: "harness", root: "/work/harness" }] },
     });
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: historyTaskList([
         makeHistoryTask("task-a", {
           description: "Fix auth callback",
@@ -126,7 +126,7 @@ describe("<History>", () => {
 
     render(<History projectFilter="harness" />);
 
-    expect(mockUseTasks).toHaveBeenCalledWith({
+    expect(mockUseAllTasks).toHaveBeenCalledWith({
       status: "done,failed,cancelled",
       limit: 500,
       project_id: "/work/harness",

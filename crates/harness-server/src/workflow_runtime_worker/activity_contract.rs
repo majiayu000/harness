@@ -1,10 +1,11 @@
 use harness_workflow::runtime::{
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
-    ISSUE_STATE_ARTIFACT, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
-    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
-    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, ISSUE_STATE_ARTIFACT,
+    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
+    PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID,
+    REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -130,14 +131,27 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
                 ])
                 .requires("pull_request_artifact_or_closed_issue_signal")
         }
+        (GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_PLAN_ACTIVITY) => {
+            ActivityContract::new(workflow_definition, activity)
+                .with_accepted_signals(vec![ISSUE_PLAN_READY_SIGNAL])
+                .with_accepted_artifacts(vec![ISSUE_PLAN_ARTIFACT])
+                .requires("issue_plan_artifact_or_ready_signal")
+        }
         (GITHUB_ISSUE_PR_DEFINITION_ID, "replan_issue") => {
             ActivityContract::new(workflow_definition, activity)
                 .with_accepted_artifacts(vec!["workflow_decision"])
         }
-        (GITHUB_ISSUE_PR_DEFINITION_ID, "address_pr_feedback") => {
-            ActivityContract::new(workflow_definition, activity)
-                .with_accepted_artifacts(vec!["workflow_decision"])
-        }
+        (GITHUB_ISSUE_PR_DEFINITION_ID, "address_pr_feedback") => ActivityContract::new(
+            workflow_definition,
+            activity,
+        )
+        .with_accepted_signals(vec![ISSUE_CLOSED_SIGNAL, ISSUE_ALREADY_RESOLVED_SIGNAL])
+        .with_accepted_artifacts(vec![
+            "workflow_decision",
+            PR_REPAIR_SNAPSHOT_ARTIFACT,
+            ISSUE_STATE_ARTIFACT,
+        ])
+        .requires("pr_repair_snapshot_with_action_and_passing_validation_or_closed_issue_evidence"),
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)
                 .with_accepted_artifacts(vec!["validation_report"])
@@ -177,6 +191,11 @@ fn pr_feedback_contract(workflow_definition: &str, activity: &str) -> ActivityCo
             "ChangesRequested",
             "ChecksFailed",
         ])
+        .with_accepted_artifacts(vec![
+            "workflow_decision",
+            SERVER_PR_SNAPSHOT_ARTIFACT,
+            PR_FEEDBACK_SNAPSHOT_ARTIFACT,
+        ])
         .with_explicit_noop_signals(vec!["NoFeedbackFound"])
-        .requires("at_least_one_feedback_outcome_signal")
+        .requires("at_least_one_feedback_outcome_signal; ready_to_merge_requires_current_pr_readiness_snapshot")
 }

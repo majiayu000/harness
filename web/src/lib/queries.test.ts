@@ -2,7 +2,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
-import { useTasks, useWorktrees, useTaskDetail, useTaskStream } from "./queries";
+import { useAllTasks, useTasks, useWorktrees, useTaskDetail, useTaskStream } from "./queries";
 import { TOKEN_KEY } from "./api";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -183,6 +183,46 @@ describe("useTasks", () => {
       }),
     );
     expect(result.current.data?.data).toMatchObject([{ id: "t1", status: "implementing" }]);
+  });
+});
+
+describe("useAllTasks", () => {
+  it("follows task list cursors and returns the combined rows", async () => {
+    const firstPage = {
+      data: [{ id: "first", status: "done", turn: 1, project: null }],
+      page: { limit: 1, has_more: true, next_cursor: "cursor-2" },
+      counts: {
+        total: 2,
+        running: 0,
+        failed: 0,
+        by_status: { done: 2 },
+        by_scheduler_state: {},
+      },
+    };
+    const secondPage = {
+      data: [{ id: "second", status: "done", turn: 1, project: null }],
+      page: { limit: 1, has_more: false, next_cursor: null },
+      counts: firstPage.counts,
+    };
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === "/tasks?status=done&limit=1") {
+        return Promise.resolve(new Response(JSON.stringify(firstPage), { status: 200 }));
+      }
+      if (url === "/tasks?status=done&limit=1&cursor=cursor-2") {
+        return Promise.resolve(new Response(JSON.stringify(secondPage), { status: 200 }));
+      }
+      return Promise.resolve(new Response("not found", { status: 404 }));
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useAllTasks({ status: "done", limit: 1 }), {
+      wrapper: makeWrapper(),
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.data?.data.map((task) => task.id)).toEqual(["first", "second"]);
+    expect(result.current.data?.page.has_more).toBe(false);
+    expect(result.current.data?.page.next_cursor).toBeNull();
   });
 });
 

@@ -180,6 +180,8 @@ impl ActivityResultEnvelope {
         let mut result = ActivityResult::failed(activity, summary, error.clone());
         if turn_error_is_timeout(&error) {
             result = result.with_error_kind(ActivityErrorKind::Timeout);
+        } else if turn_error_is_non_retryable_agent_limit(&error) {
+            result = result.with_error_kind(ActivityErrorKind::Configuration);
         }
         Self {
             extraction_strategy: ActivityResultExtractionStrategy::NotAttempted,
@@ -256,6 +258,11 @@ fn activity_result_envelope_from_turn(
 fn turn_error_is_timeout(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     normalized.contains("timed out") || normalized.contains("timeout reached")
+}
+
+fn turn_error_is_non_retryable_agent_limit(error: &str) -> bool {
+    harness_core::error::is_quota_failure_message(error)
+        || harness_core::error::is_billing_failure_message(error)
 }
 
 enum StructuredActivityResult {
@@ -770,3 +777,7 @@ Final result:
             .artifact
     }
 }
+
+#[cfg(test)]
+#[path = "activity_result_limit_tests.rs"]
+mod limit_tests;

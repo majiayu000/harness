@@ -311,6 +311,8 @@ pub struct AgentReviewConfig {
     /// Agent name to use as reviewer. Empty string = auto-select.
     pub reviewer_agent: String,
     pub max_rounds: u32,
+    /// Total wall-clock seconds allowed for hosted review waiting before failing.
+    pub review_wait_budget_secs: u64,
     /// Command to trigger review bot re-review (e.g. "/gemini review", "/reviewbot run").
     pub review_bot_command: String,
     /// Automatically post review_bot_command as a PR comment when a task completes with a PR.
@@ -359,6 +361,8 @@ impl<'de> Deserialize<'de> for AgentReviewConfig {
             #[serde(default)]
             max_rounds: Option<u32>,
             #[serde(default)]
+            review_wait_budget_secs: Option<u64>,
+            #[serde(default)]
             review_bot_command: Option<String>,
             #[serde(default)]
             review_bot_auto_trigger: Option<bool>,
@@ -383,6 +387,9 @@ impl<'de> Deserialize<'de> for AgentReviewConfig {
         let max_rounds = raw
             .max_rounds
             .unwrap_or_else(default_max_agent_review_rounds);
+        let review_wait_budget_secs = raw
+            .review_wait_budget_secs
+            .unwrap_or_else(default_review_wait_budget_secs);
         let fallback_chain = raw
             .fallback_chain
             .unwrap_or_else(default_review_fallback_chain);
@@ -420,6 +427,7 @@ impl<'de> Deserialize<'de> for AgentReviewConfig {
             codex_github_bot: merge_external_bot_config(raw.codex_github_bot, default_codex_bot),
             reviewer_agent,
             max_rounds,
+            review_wait_budget_secs,
             review_bot_command,
             review_bot_auto_trigger,
             reviewer_name,
@@ -455,6 +463,7 @@ impl Default for AgentReviewConfig {
             ),
             reviewer_agent: default_reviewer_agent(),
             max_rounds: default_max_agent_review_rounds(),
+            review_wait_budget_secs: default_review_wait_budget_secs(),
             review_bot_command: default_review_bot_command(),
             review_bot_auto_trigger: default_review_bot_auto_trigger(),
             reviewer_name: default_reviewer_name(),
@@ -493,6 +502,10 @@ fn default_max_agent_review_rounds() -> u32 {
     3
 }
 
+fn default_review_wait_budget_secs() -> u64 {
+    3600
+}
+
 fn default_required_review_providers(enabled: bool) -> Vec<String> {
     if enabled {
         vec!["codex_cli_review".to_string()]
@@ -515,10 +528,17 @@ fn default_review_fallback_chain() -> Vec<String> {
 fn normalize_external_bot_chain(chain: &[String]) -> Vec<String> {
     chain
         .iter()
-        .map(|provider| match provider.as_str() {
-            "gemini" | "gemini_github_bot" => "gemini_github_bot".to_string(),
-            "codex" | "codex_github_bot" => "codex_github_bot".to_string(),
-            _ => provider.clone(),
+        .filter_map(|provider| {
+            let trimmed = provider.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let normalized = trimmed.to_ascii_lowercase();
+            Some(match normalized.as_str() {
+                "gemini" | "gemini_github_bot" => "gemini_github_bot".to_string(),
+                "codex" | "codex_github_bot" => "codex_github_bot".to_string(),
+                _ => normalized,
+            })
         })
         .collect()
 }
