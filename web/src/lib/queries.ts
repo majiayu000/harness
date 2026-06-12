@@ -7,6 +7,7 @@ import type {
   EvalQualitySnapshotResponse,
   EvalRunsResponse,
   FullTask,
+  OperatorMonitorPayload,
   OperatorSnapshotPayload,
   OverviewPayload,
   StreamItem,
@@ -33,6 +34,14 @@ export function useOperatorSnapshot() {
   return useQuery<OperatorSnapshotPayload, Error>({
     queryKey: ["operator-snapshot"],
     queryFn: ({ signal }) => apiJson<OperatorSnapshotPayload>("/api/operator-snapshot", { signal }),
+    refetchInterval: 30_000,
+  });
+}
+
+export function useOperatorMonitor() {
+  return useQuery<OperatorMonitorPayload, Error>({
+    queryKey: ["operator-monitor"],
+    queryFn: ({ signal }) => apiJson<OperatorMonitorPayload>("/api/operator-monitor", { signal }),
     refetchInterval: 30_000,
   });
 }
