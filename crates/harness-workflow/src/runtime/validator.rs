@@ -3,6 +3,10 @@ use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::fmt;
 
+#[cfg(test)]
+#[path = "validator_tests.rs"]
+mod tests;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionRule {
     pub from_state: Option<String>,
@@ -212,6 +216,7 @@ impl TransitionAllowlist {
             .allow("quality_gate_pending", "quality_gate_pending", [Wait])
             .allow("ready_to_merge", "ready_to_merge", [Wait])
             .allow("ready_to_merge", "done", [MarkDone])
+            .allow("blocked", "done", [MarkDone])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
@@ -401,6 +406,7 @@ pub enum WorkflowDecisionRejectionKind {
     TerminalReopenDenied,
     RequiredCommandMissing,
     InvalidCommandPayload,
+    MissingTerminalEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,15 +435,28 @@ impl std::error::Error for WorkflowDecisionRejection {}
 #[derive(Debug, Clone)]
 pub struct DecisionValidator {
     allowlist: TransitionAllowlist,
+    kind: DecisionValidatorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionValidatorKind {
+    Generic,
+    GithubIssuePr,
 }
 
 impl DecisionValidator {
     pub fn new(allowlist: TransitionAllowlist) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            kind: DecisionValidatorKind::Generic,
+        }
     }
 
     pub fn github_issue_pr() -> Self {
-        Self::new(TransitionAllowlist::github_issue_pr_defaults())
+        Self {
+            allowlist: TransitionAllowlist::github_issue_pr_defaults(),
+            kind: DecisionValidatorKind::GithubIssuePr,
+        }
     }
 
     pub fn repo_backlog() -> Self {
@@ -524,7 +543,8 @@ impl DecisionValidator {
             ));
         };
 
-        self.validate_commands(rule, decision, context)
+        self.validate_commands(rule, decision, context)?;
+        self.validate_workflow_specific_rules(decision, context)
     }
 
     pub fn transition_rules_from<'a>(
@@ -606,6 +626,17 @@ impl DecisionValidator {
         Ok(())
     }
 
+    fn validate_workflow_specific_rules(
+        &self,
+        decision: &WorkflowDecision,
+        context: &ValidationContext,
+    ) -> Result<(), WorkflowDecisionRejection> {
+        if self.kind == DecisionValidatorKind::GithubIssuePr {
+            validate_github_issue_pr_decision(decision, context)?;
+        }
+        Ok(())
+    }
+
     fn validate_command_payload(
         &self,
         command: &WorkflowCommand,
@@ -676,6 +707,65 @@ impl DecisionValidator {
 
         Ok(())
     }
+}
+
+fn validate_github_issue_pr_decision(
+    decision: &WorkflowDecision,
+    context: &ValidationContext,
+) -> Result<(), WorkflowDecisionRejection> {
+    if decision.observed_state == "blocked" && decision.next_state == "done" {
+        validate_blocked_done_reconciliation(decision, context)?;
+    }
+    Ok(())
+}
+
+fn validate_blocked_done_reconciliation(
+    decision: &WorkflowDecision,
+    context: &ValidationContext,
+) -> Result<(), WorkflowDecisionRejection> {
+    if context.actor != "reconciliation" || decision.decision != "reconcile_pr_merged" {
+        return Err(missing_terminal_evidence(
+            "blocked issue workflows can only be marked done by PR-merge reconciliation",
+        ));
+    }
+
+    let has_pr_command = decision.commands.iter().any(|command| {
+        command.command_type == WorkflowCommandType::MarkDone
+            && command
+                .command
+                .get("pr_number")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+            && command
+                .command
+                .get("pr_url")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+    });
+    if !has_pr_command {
+        return Err(missing_terminal_evidence(
+            "blocked issue PR-merge reconciliation requires pr_number and pr_url evidence",
+        ));
+    }
+
+    if !decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "github_pr")
+    {
+        return Err(missing_terminal_evidence(
+            "blocked issue PR-merge reconciliation requires github_pr evidence",
+        ));
+    }
+
+    Ok(())
+}
+
+fn missing_terminal_evidence(message: impl Into<String>) -> WorkflowDecisionRejection {
+    WorkflowDecisionRejection::new(
+        WorkflowDecisionRejectionKind::MissingTerminalEvidence,
+        message,
+    )
 }
 
 fn is_replan_command(command: &WorkflowCommand) -> bool {

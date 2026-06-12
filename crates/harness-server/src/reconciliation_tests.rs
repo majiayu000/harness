@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
+#[path = "reconciliation_blocked_done_tests.rs"]
+mod blocked_done_tests;
 #[path = "reconciliation_ready_to_merge_tests.rs"]
 mod ready_to_merge_tests;
 
