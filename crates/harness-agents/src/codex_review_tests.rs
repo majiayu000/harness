@@ -36,6 +36,11 @@ fn review_args_use_native_review_subcommand_with_base_without_stdin_prompt() {
     assert!(args
         .windows(2)
         .any(|window| window == ["-c", "approval_policy=\"never\""]));
+    assert!(args.windows(2).any(|window| {
+        window[0] == "-c"
+            && window[1]
+                .starts_with("developer_instructions=\"Return a harness-review-report block.")
+    }));
     assert!(args
         .windows(3)
         .any(|window| window == ["review", "--base", "origin/main"]));
@@ -55,6 +60,9 @@ fn review_args_use_stdin_prompt_without_base() {
 
     assert!(args.iter().any(|arg| arg == "review"));
     assert!(!args.iter().any(|arg| arg == "--base"));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.starts_with("developer_instructions=")));
     assert_eq!(args.last().map(String::as_str), Some("-"));
 }
 
@@ -103,6 +111,9 @@ printf '%s\n' '```'
     assert!(args.lines().any(|line| line == "review"));
     assert!(args.lines().any(|line| line == "--base"));
     assert!(args.lines().any(|line| line == "origin/main"));
+    assert!(args.lines().any(|line| {
+        line.starts_with("developer_instructions=\"structured review instructions")
+    }));
     assert!(!args.lines().any(|line| line == "-"));
     assert_eq!(fs::read_to_string(stdin_file)?, "");
     assert!(response.output.contains("```harness-review-report"));

@@ -149,6 +149,13 @@ impl CodexAgent {
         if let Some(approval_policy) = req.approval_policy.as_deref() {
             push_codex_approval_policy_args(&mut args, approval_policy);
         }
+        if let Some(instructions) = req
+            .instructions
+            .as_deref()
+            .filter(|_| review_uses_config_instructions(req))
+        {
+            push_codex_developer_instructions_args(&mut args, instructions);
+        }
         if self.cloud.enabled {
             args.push(OsString::from("--ephemeral"));
         }
@@ -281,6 +288,10 @@ fn review_uses_stdin_prompt(req: &CodexReviewRequest) -> bool {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .is_none()
+}
+
+fn review_uses_config_instructions(req: &CodexReviewRequest) -> bool {
+    req.instructions.is_some() && !review_uses_stdin_prompt(req)
 }
 
 #[derive(Debug)]
@@ -734,6 +745,14 @@ fn push_codex_approval_policy_args(args: &mut Vec<OsString>, approval_policy: &s
     args.push(OsString::from("-c"));
     args.push(OsString::from(format!(
         "approval_policy=\"{approval_policy}\""
+    )));
+}
+
+fn push_codex_developer_instructions_args(args: &mut Vec<OsString>, instructions: &str) {
+    let instructions = escape_codex_config_string(instructions);
+    args.push(OsString::from("-c"));
+    args.push(OsString::from(format!(
+        "developer_instructions=\"{instructions}\""
     )));
 }
 
