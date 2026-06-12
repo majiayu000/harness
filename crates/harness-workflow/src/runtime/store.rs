@@ -545,6 +545,30 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn list_recent_instances_by_state(
+        &self,
+        definition_id: &str,
+        state: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND state = $2
+             ORDER BY updated_at DESC
+             LIMIT $3",
+        )
+        .bind(definition_id)
+        .bind(state)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     pub async fn touch_instance(&self, workflow_id: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE workflow_instances SET updated_at = clock_timestamp() WHERE id = $1")
             .bind(workflow_id)

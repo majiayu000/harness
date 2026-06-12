@@ -47,6 +47,7 @@ export interface LegacyQueueCounts {
 export interface SourceActivity {
   source: string;
   running: number;
+  review: number;
   blocked: number;
   failed: number;
   ready_to_merge: number;

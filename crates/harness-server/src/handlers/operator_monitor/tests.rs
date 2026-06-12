@@ -161,6 +161,55 @@ async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> an
     Ok(())
 }
 
+#[tokio::test]
+async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-recent-failed-")?;
+    let workflow_runtime_store = WorkflowRuntimeStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+        Some(&test_helpers::test_database_url()?),
+    )
+    .await?;
+    workflow_runtime_store
+        .upsert_instance(
+            &WorkflowInstance::new(
+                QUALITY_GATE_DEFINITION_ID,
+                1,
+                "failed",
+                WorkflowSubject::new("quality_gate", "quality_gate:old"),
+            )
+            .with_id("old-failed".to_string()),
+        )
+        .await?;
+    workflow_runtime_store
+        .upsert_instance(
+            &WorkflowInstance::new(
+                QUALITY_GATE_DEFINITION_ID,
+                1,
+                "failed",
+                WorkflowSubject::new("quality_gate", "quality_gate:recent"),
+            )
+            .with_id("recent-failed".to_string()),
+        )
+        .await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind("old-failed")
+        .bind(Utc::now() - chrono::Duration::hours(1))
+        .execute(workflow_runtime_store.pool())
+        .await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind("recent-failed")
+        .bind(Utc::now())
+        .execute(workflow_runtime_store.pool())
+        .await?;
+
+    let workflows = list_recent_failed_workflows(&workflow_runtime_store, 1).await?;
+
+    assert_eq!(workflows.len(), 1);
+    assert_eq!(workflows[0].id, "recent-failed");
+    Ok(())
+}
+
 #[test]
 fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     let legacy_row = TaskSummary {
@@ -205,6 +254,7 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
             ),
             workflow("awaiting_dependencies", json!({ "source": "github" })),
             workflow("checking", json!({ "source": "github" })),
+            workflow("awaiting_feedback", json!({ "source": "github" })),
         ],
         &[legacy_row, queued_row],
     );
@@ -213,6 +263,7 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     let source = by_source.pop().expect("source row");
     assert_eq!(source.source, "github");
     assert_eq!(source.ready_to_merge, 1);
+    assert_eq!(source.review, 1);
     assert_eq!(source.running, 1);
     assert_eq!(source.blocked, 1);
 }

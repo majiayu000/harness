@@ -11,7 +11,7 @@ use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary
 use crate::workspace::WorkspaceManager;
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
-use harness_workflow::runtime::WorkflowInstance;
+use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::cmp::Reverse;
@@ -87,6 +87,7 @@ struct LegacyQueueCounts {
 struct SourceActivity {
     source: String,
     running: u64,
+    review: u64,
     blocked: u64,
     failed: u64,
     ready_to_merge: u64,
@@ -263,19 +264,31 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
     workflows.truncate(sample_limit);
     let failed_capacity = sample_limit.saturating_sub(workflows.len());
     if failed_capacity > 0 {
-        let mut failed_workflows = Vec::new();
-        for definition_id in WORKFLOW_DEFINITION_IDS {
-            failed_workflows.extend(
-                store
-                    .list_instances_by_state(definition_id, "failed", WORKFLOW_SAMPLE_LIMIT)
-                    .await?,
-            );
-        }
-        failed_workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
-        failed_workflows.truncate(failed_capacity);
+        let failed_workflows = list_recent_failed_workflows(store, failed_capacity).await?;
         workflows.extend(failed_workflows);
         workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
     }
+    Ok(workflows)
+}
+
+async fn list_recent_failed_workflows(
+    store: &WorkflowRuntimeStore,
+    capacity: usize,
+) -> anyhow::Result<Vec<WorkflowInstance>> {
+    if capacity == 0 {
+        return Ok(Vec::new());
+    }
+    let per_definition_limit = capacity.min(WORKFLOW_SAMPLE_LIMIT as usize) as i64;
+    let mut workflows = Vec::new();
+    for definition_id in WORKFLOW_DEFINITION_IDS {
+        workflows.extend(
+            store
+                .list_recent_instances_by_state(definition_id, "failed", per_definition_limit)
+                .await?,
+        );
+    }
+    workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
+    workflows.truncate(capacity);
     Ok(workflows)
 }
 
@@ -416,6 +429,7 @@ fn add_workflow_source_activity(
         });
     match workflow_bucket(workflow) {
         WorkflowBucket::Running => entry.running += 1,
+        WorkflowBucket::Review => entry.review += 1,
         WorkflowBucket::AwaitingDependencies | WorkflowBucket::Blocked => entry.blocked += 1,
         WorkflowBucket::Failed => entry.failed += 1,
         WorkflowBucket::ReadyToMerge => entry.ready_to_merge += 1,
@@ -460,7 +474,7 @@ fn add_legacy_source_activity(by_source: &mut HashMap<String, SourceActivity>, t
 }
 
 fn source_total(source: &SourceActivity) -> u64 {
-    source.running + source.blocked + source.failed + source.ready_to_merge
+    source.running + source.review + source.blocked + source.failed + source.ready_to_merge
 }
 
 fn operator_actions(
