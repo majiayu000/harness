@@ -3,6 +3,13 @@ use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::fmt;
 
+#[path = "validator_github_issue_pr.rs"]
+mod github_issue_pr_validation;
+
+#[cfg(test)]
+#[path = "validator_tests.rs"]
+mod tests;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionRule {
     pub from_state: Option<String>,
@@ -401,6 +408,7 @@ pub enum WorkflowDecisionRejectionKind {
     TerminalReopenDenied,
     RequiredCommandMissing,
     InvalidCommandPayload,
+    MissingTerminalEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,15 +437,28 @@ impl std::error::Error for WorkflowDecisionRejection {}
 #[derive(Debug, Clone)]
 pub struct DecisionValidator {
     allowlist: TransitionAllowlist,
+    kind: DecisionValidatorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionValidatorKind {
+    Generic,
+    GithubIssuePr,
 }
 
 impl DecisionValidator {
     pub fn new(allowlist: TransitionAllowlist) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            kind: DecisionValidatorKind::Generic,
+        }
     }
 
     pub fn github_issue_pr() -> Self {
-        Self::new(TransitionAllowlist::github_issue_pr_defaults())
+        Self {
+            allowlist: TransitionAllowlist::github_issue_pr_defaults(),
+            kind: DecisionValidatorKind::GithubIssuePr,
+        }
     }
 
     pub fn repo_backlog() -> Self {
@@ -511,6 +532,10 @@ impl DecisionValidator {
             }
         }
 
+        if self.validate_hidden_workflow_transition(decision, context)? {
+            return Ok(());
+        }
+
         let Some(rule) = self
             .allowlist
             .rule_for(&decision.observed_state, &decision.next_state)
@@ -524,7 +549,8 @@ impl DecisionValidator {
             ));
         };
 
-        self.validate_commands(rule, decision, context)
+        self.validate_commands(rule, decision, context)?;
+        self.validate_workflow_specific_rules(decision, context)
     }
 
     pub fn transition_rules_from<'a>(
@@ -604,6 +630,34 @@ impl DecisionValidator {
         }
 
         Ok(())
+    }
+
+    fn validate_workflow_specific_rules(
+        &self,
+        decision: &WorkflowDecision,
+        context: &ValidationContext,
+    ) -> Result<(), WorkflowDecisionRejection> {
+        if self.kind == DecisionValidatorKind::GithubIssuePr {
+            github_issue_pr_validation::validate_decision(decision, context)?;
+        }
+        Ok(())
+    }
+
+    fn validate_hidden_workflow_transition(
+        &self,
+        decision: &WorkflowDecision,
+        context: &ValidationContext,
+    ) -> Result<bool, WorkflowDecisionRejection> {
+        if self.kind != DecisionValidatorKind::GithubIssuePr
+            || !github_issue_pr_validation::is_blocked_done_transition(decision)
+        {
+            return Ok(false);
+        }
+
+        let rule = TransitionRule::new("blocked", "done", [WorkflowCommandType::MarkDone]);
+        self.validate_commands(&rule, decision, context)?;
+        github_issue_pr_validation::validate_blocked_done_reconciliation(decision, context)?;
+        Ok(true)
     }
 
     fn validate_command_payload(
