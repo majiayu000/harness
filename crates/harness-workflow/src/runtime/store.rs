@@ -170,6 +170,16 @@ fn workflow_command_record_from_row(
         updated_at,
     })
 }
+
+fn workflow_instance_from_row(
+    data: String,
+    updated_at: DateTime<Utc>,
+) -> anyhow::Result<WorkflowInstance> {
+    let mut instance: WorkflowInstance = serde_json::from_str(&data)?;
+    instance.updated_at = updated_at;
+    Ok(instance)
+}
+
 impl WorkflowRuntimeStore {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_database_url(path, None).await
@@ -545,6 +555,30 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn list_recent_instances_by_state(
+        &self,
+        definition_id: &str,
+        state: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT data::text, updated_at FROM workflow_instances
+             WHERE definition_id = $1
+               AND state = $2
+             ORDER BY updated_at DESC
+             LIMIT $3",
+        )
+        .bind(definition_id)
+        .bind(state)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
+            .collect()
+    }
+
     pub async fn touch_instance(&self, workflow_id: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE workflow_instances SET updated_at = clock_timestamp() WHERE id = $1")
             .bind(workflow_id)
@@ -694,8 +728,8 @@ impl WorkflowRuntimeStore {
         limit: Option<i64>,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
         let limit = limit.map(|value| value.clamp(1, 500));
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data::text FROM workflow_instances
+        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT data::text, updated_at FROM workflow_instances
              WHERE definition_id = $1
                AND state NOT IN ('done', 'passed', 'failed', 'cancelled')
                AND ($2::text IS NULL OR data->'data'->>'project_id' = $2)
@@ -708,7 +742,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
             .collect()
     }
 

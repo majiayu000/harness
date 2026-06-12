@@ -40,7 +40,7 @@ pub async fn worktrees(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     }
 }
 
-async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse>> {
+pub(crate) async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<WorktreeResponse>> {
     let Some(manager) = state.concurrency.workspace_mgr.as_ref() else {
         return Ok(Vec::new());
     };

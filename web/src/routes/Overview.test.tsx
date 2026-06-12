@@ -1,20 +1,22 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { Overview } from "./Overview";
 import { PaletteProvider } from "@/lib/palette";
 import { DOCS_URL } from "@/lib/links";
-import type { OperatorSnapshotPayload, OverviewPayload } from "@/types";
+import type { OperatorMonitorPayload, OperatorSnapshotPayload, OverviewPayload } from "@/types";
 
 vi.mock("@/lib/queries", () => ({
   useOverview: vi.fn(),
+  useOperatorMonitor: vi.fn(),
   useOperatorSnapshot: vi.fn(),
 }));
 
-import { useOperatorSnapshot, useOverview } from "@/lib/queries";
+import { useOperatorMonitor, useOperatorSnapshot, useOverview } from "@/lib/queries";
 
 const mockUseOverview = useOverview as ReturnType<typeof vi.fn>;
+const mockUseOperatorMonitor = useOperatorMonitor as ReturnType<typeof vi.fn>;
 const mockUseOperatorSnapshot = useOperatorSnapshot as ReturnType<typeof vi.fn>;
 
 function wrap(ui: React.ReactElement) {
@@ -106,7 +108,60 @@ function makeSnapshot(): OperatorSnapshotPayload {
   };
 }
 
+function makeMonitor(): OperatorMonitorPayload {
+  return {
+    generated_at: "2026-04-22T00:00:00Z",
+    sample_limit: 500,
+    health: {
+      status: "ok",
+      degraded_subsystems: [],
+      runtime_log_state: "disabled",
+      runtime_log_path: null,
+      uptime_secs: 1,
+      runtime_hosts_online: 0,
+      runtime_hosts_total: 0,
+    },
+    activity: {
+      runtime_workflows: {
+        pending: 0,
+        running: 1,
+        review: 0,
+        awaiting_dependencies: 0,
+        ready_to_merge: 0,
+        blocked: 0,
+        failed: 0,
+        done: 0,
+        other: 0,
+      },
+      legacy_queue: {
+        queued: 0,
+        running: 1,
+        stalled: 0,
+        failed: 0,
+        done: 0,
+      },
+      by_source: [],
+    },
+    operator_actions: [],
+    failures: [],
+    worktrees: {
+      used: 0,
+      capacity: 1,
+      stale: 0,
+      metrics_state: "unavailable",
+      cards: [],
+    },
+  };
+}
+
 describe("<Overview>", () => {
+  beforeEach(() => {
+    mockUseOperatorMonitor.mockReturnValue({
+      data: makeMonitor(),
+      isError: false,
+    });
+  });
+
   it("shows a degraded status badge when operator snapshot fails even if overview succeeds", () => {
     mockUseOverview.mockReturnValue({
       data: makeOverview(),

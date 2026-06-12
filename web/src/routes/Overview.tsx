@@ -14,6 +14,7 @@ import { EvolutionCard } from "@/components/EvolutionCard";
 import { useOperatorSnapshot, useOverview } from "@/lib/queries";
 import { DOCS_URL } from "@/lib/links";
 import { OperatorPanel } from "./overview/OperatorPanel";
+import { OperatorMonitorPanel } from "./overview/OperatorMonitorPanel";
 import { fmtInt, fmtPct, fmtScore } from "@/lib/format";
 
 const SERIES_COLORS = [
@@ -191,6 +192,8 @@ export function Overview() {
           </div>
 
           <EvolutionCard evolution={data?.evolution ?? null} />
+
+          <OperatorMonitorPanel />
 
           <OperatorPanel />
         </div>
