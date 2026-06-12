@@ -8,7 +8,6 @@
 use crate::http::AppState;
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
 use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary};
-use crate::workspace::WorkspaceManager;
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
@@ -201,8 +200,13 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     );
     let by_source = source_activity(&workflows, &active_tasks);
     let operator_actions = operator_actions(&workflows, generated_at);
-    let failures = grouped_failures(&recent_failures);
+    let failures = grouped_failures(&recent_failures, &workflows);
     let capacity = state.concurrency.task_queue.global_limit() as u64;
+    let local_live_worktrees = state
+        .concurrency
+        .workspace_mgr
+        .as_deref()
+        .map(|manager| manager.live_count());
 
     Ok(OperatorMonitorPayload {
         generated_at: generated_at.to_rfc3339(),
@@ -233,12 +237,10 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         operator_actions,
         failures,
         worktrees: WorktreeSummary {
-            used: (worktree_cards.len() as u64).saturating_add(runtime_host_leases),
+            used: worktree_used_count(local_live_worktrees, worktree_cards.len())
+                .saturating_add(runtime_host_leases),
             capacity,
-            stale: stale_worktree_count(
-                state.concurrency.workspace_mgr.as_deref(),
-                &worktree_cards,
-            ),
+            stale: stale_worktree_count(local_live_worktrees, worktree_cards.len()),
             metrics_state: "unavailable",
             cards: worktree_cards,
         },
@@ -604,36 +606,32 @@ fn action_priority(kind: &str) -> u8 {
     }
 }
 
-fn grouped_failures(failures: &[RecentFailureTask]) -> Vec<FailureGroup> {
+fn grouped_failures(
+    failures: &[RecentFailureTask],
+    workflows: &[WorkflowInstance],
+) -> Vec<FailureGroup> {
     let mut groups: HashMap<FailureGroupKey, FailureGroup> = HashMap::new();
     for failure in failures {
         let raw_message = failure.error.as_deref().unwrap_or("unknown failure");
-        let family = classify_failure_family(raw_message);
-        let key = FailureGroupKey {
-            family,
-            message: normalize_failure_message(raw_message),
-            repo: failure.project.as_deref().map(project_label),
-        };
-        let failed_at = failure.failed_at.clone();
-        let task_id = failure.id.as_str().to_string();
-        let group = groups.entry(key.clone()).or_insert_with(|| FailureGroup {
-            family,
-            severity: failure_severity(family),
-            message: key.message.clone(),
-            first_seen: failed_at.clone(),
-            last_seen: failed_at.clone(),
-            count: 0,
-            repo: key.repo.clone(),
-            task_id: Some(task_id.clone()),
-            retryable: failure_retryable(family),
-            next_action: failure_next_action(family),
-        });
-        group.count += 1;
-        group.first_seen = earlier_timestamp(group.first_seen.as_deref(), failed_at.as_deref());
-        group.last_seen = later_timestamp(group.last_seen.as_deref(), failed_at.as_deref());
-        if group.task_id.is_none() {
-            group.task_id = Some(task_id);
-        }
+        add_failure_group(
+            &mut groups,
+            raw_message,
+            failure.failed_at.clone(),
+            failure.project.as_deref().map(project_label),
+            Some(failure.id.as_str().to_string()),
+        );
+    }
+    for workflow in workflows
+        .iter()
+        .filter(|workflow| workflow.state == "failed")
+    {
+        add_failure_group(
+            &mut groups,
+            &workflow_failure_message(workflow),
+            Some(workflow.updated_at.to_rfc3339()),
+            string_field(&workflow.data, "repo"),
+            Some(workflow_failure_id(workflow)),
+        );
     }
     let mut rows: Vec<FailureGroup> = groups.into_values().collect();
     rows.sort_by(|a, b| {
@@ -645,6 +643,61 @@ fn grouped_failures(failures: &[RecentFailureTask]) -> Vec<FailureGroup> {
     });
     rows.truncate(MAX_FAILURE_GROUPS);
     rows
+}
+
+fn add_failure_group(
+    groups: &mut HashMap<FailureGroupKey, FailureGroup>,
+    raw_message: &str,
+    failed_at: Option<String>,
+    repo: Option<String>,
+    task_id: Option<String>,
+) {
+    let family = classify_failure_family(raw_message);
+    let key = FailureGroupKey {
+        family,
+        message: normalize_failure_message(raw_message),
+        repo,
+    };
+    let group = groups.entry(key.clone()).or_insert_with(|| FailureGroup {
+        family,
+        severity: failure_severity(family),
+        message: key.message.clone(),
+        first_seen: failed_at.clone(),
+        last_seen: failed_at.clone(),
+        count: 0,
+        repo: key.repo.clone(),
+        task_id: task_id.clone(),
+        retryable: failure_retryable(family),
+        next_action: failure_next_action(family),
+    });
+    group.count += 1;
+    group.first_seen = earlier_timestamp(group.first_seen.as_deref(), failed_at.as_deref());
+    group.last_seen = later_timestamp(group.last_seen.as_deref(), failed_at.as_deref());
+    if group.task_id.is_none() {
+        if let Some(task_id) = task_id {
+            group.task_id = Some(task_id);
+        }
+    }
+}
+
+fn workflow_failure_message(workflow: &WorkflowInstance) -> String {
+    ["failure_reason", "previous_error", "last_error", "error"]
+        .into_iter()
+        .find_map(|field| string_field(&workflow.data, field))
+        .unwrap_or_else(|| format!("{} workflow failed", workflow.definition_id))
+}
+
+fn workflow_failure_id(workflow: &WorkflowInstance) -> String {
+    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    projection
+        .submission_handle
+        .map(|task_id| task_id.as_str().to_string())
+        .or_else(|| {
+            projection
+                .legacy_dedupe_task_handle
+                .map(|task_id| task_id.0)
+        })
+        .unwrap_or_else(|| workflow.id.clone())
 }
 
 fn classify_failure_family(message: &str) -> &'static str {
@@ -725,11 +778,12 @@ fn later_timestamp(current: Option<&str>, candidate: Option<&str>) -> Option<Str
         .map(str::to_string)
 }
 
-fn stale_worktree_count(
-    manager: Option<&WorkspaceManager>,
-    cards: &[crate::handlers::worktrees::WorktreeResponse],
-) -> Option<u64> {
-    manager.map(|manager| manager.live_count().saturating_sub(cards.len() as u64))
+fn worktree_used_count(local_live_count: Option<u64>, card_count: usize) -> u64 {
+    local_live_count.unwrap_or(card_count as u64)
+}
+
+fn stale_worktree_count(local_live_count: Option<u64>, card_count: usize) -> Option<u64> {
+    local_live_count.map(|count| count.saturating_sub(card_count as u64))
 }
 
 fn workflow_source(workflow: &WorkflowInstance) -> String {

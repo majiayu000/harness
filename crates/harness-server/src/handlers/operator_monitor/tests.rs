@@ -101,7 +101,7 @@ fn grouped_failures_classifies_and_counts_github_fetch_failures() {
         github_fetch_failure("task-2", 2, "2026-06-12T00:05:00Z"),
     ];
 
-    let groups = grouped_failures(&failures);
+    let groups = grouped_failures(&failures, &[]);
 
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].family, "github_fetch");
@@ -110,6 +110,34 @@ fn grouped_failures_classifies_and_counts_github_fetch_failures() {
     assert_eq!(groups[0].repo.as_deref(), Some("harness"));
     assert!(groups[0].retryable);
     assert_eq!(groups[0].last_seen.as_deref(), Some("2026-06-12T00:05:00Z"));
+}
+
+#[test]
+fn grouped_failures_includes_runtime_only_workflow_failures() {
+    let mut failed_workflow = workflow(
+        "failed",
+        json!({
+            "failure_reason": "Quality gate execution failed.",
+            "repo": "owner/repo",
+        }),
+    )
+    .with_id("quality-gate-workflow".to_string());
+    failed_workflow.updated_at = Utc::now();
+
+    let groups = grouped_failures(&[], &[failed_workflow]);
+
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].message, "Quality gate execution failed.");
+    assert_eq!(groups[0].repo.as_deref(), Some("owner/repo"));
+    assert_eq!(groups[0].task_id.as_deref(), Some("quality-gate-workflow"));
+}
+
+#[test]
+fn worktree_used_count_includes_stale_live_worktrees() {
+    assert_eq!(worktree_used_count(Some(5), 3), 5);
+    assert_eq!(stale_worktree_count(Some(5), 3), Some(2));
+    assert_eq!(worktree_used_count(None, 3), 3);
+    assert_eq!(stale_worktree_count(None, 3), None);
 }
 
 #[tokio::test]
