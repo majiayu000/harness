@@ -133,6 +133,39 @@ fn grouped_failures_includes_runtime_only_workflow_failures() {
 }
 
 #[test]
+fn grouped_failures_deduplicates_workflow_failures_backed_by_task_rows() {
+    let failures = vec![RecentFailureTask {
+        id: TaskId("legacy-task".to_string()),
+        failure_kind: None,
+        external_id: Some("issue:1".to_string()),
+        project: Some("/tmp/harness".to_string()),
+        workspace_path: None,
+        workspace_owner: None,
+        run_generation: 0,
+        error: Some("Quality gate execution failed.".to_string()),
+        failed_at: Some("2026-06-12T00:00:00Z".to_string()),
+    }];
+    let mut failed_workflow = workflow(
+        "failed",
+        json!({
+            "failure_reason": "Quality gate execution failed.",
+            "repo": "owner/repo",
+            "submission_id": "stable-submission",
+            "task_id": "legacy-task",
+        }),
+    )
+    .with_id("workflow-row".to_string());
+    failed_workflow.updated_at = Utc::now();
+
+    let groups = grouped_failures(&failures, &[failed_workflow]);
+
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].message, "Quality gate execution failed.");
+    assert_eq!(groups[0].count, 1);
+    assert_eq!(groups[0].task_id.as_deref(), Some("legacy-task"));
+}
+
+#[test]
 fn worktree_used_count_includes_stale_live_worktrees() {
     assert_eq!(worktree_used_count(Some(5), 3), 5);
     assert_eq!(stale_worktree_count(Some(5), 3), Some(2));

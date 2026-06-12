@@ -618,7 +618,9 @@ fn grouped_failures(
     workflows: &[WorkflowInstance],
 ) -> Vec<FailureGroup> {
     let mut groups: HashMap<FailureGroupKey, FailureGroup> = HashMap::new();
+    let mut represented_task_ids = HashSet::new();
     for failure in failures {
+        represented_task_ids.insert(failure.id.as_str().to_string());
         let raw_message = failure.error.as_deref().unwrap_or("unknown failure");
         add_failure_group(
             &mut groups,
@@ -632,6 +634,13 @@ fn grouped_failures(
         .iter()
         .filter(|workflow| workflow.state == "failed")
     {
+        let workflow_task_ids = workflow_failure_task_ids(workflow);
+        if workflow_task_ids
+            .iter()
+            .any(|task_id| represented_task_ids.contains(task_id))
+        {
+            continue;
+        }
         add_failure_group(
             &mut groups,
             &workflow_failure_message(workflow),
@@ -705,6 +714,18 @@ fn workflow_failure_id(workflow: &WorkflowInstance) -> String {
                 .map(|task_id| task_id.0)
         })
         .unwrap_or_else(|| workflow.id.clone())
+}
+
+fn workflow_failure_task_ids(workflow: &WorkflowInstance) -> HashSet<String> {
+    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let mut ids = HashSet::new();
+    if let Some(task_id) = projection.submission_handle {
+        ids.insert(task_id.as_str().to_string());
+    }
+    if let Some(task_id) = projection.legacy_dedupe_task_handle {
+        ids.insert(task_id.0);
+    }
+    ids
 }
 
 fn classify_failure_family(message: &str) -> &'static str {
