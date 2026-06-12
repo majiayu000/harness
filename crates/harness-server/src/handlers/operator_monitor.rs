@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use harness_workflow::runtime::WorkflowInstance;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,7 +258,7 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
                 .await?,
         );
     }
-    workflows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
     workflows.truncate(WORKFLOW_SAMPLE_LIMIT as usize);
     Ok(workflows)
 }
