@@ -97,6 +97,16 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         .is_some_and(
             |items| items.contains(&json!("fresh PR state checked before final response"))
         ));
+    assert!(schema["agent_summary_contract"]["must_include"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item
+            .as_str()
+            .is_some_and(|value| value.contains("pr_hygiene update/rebase")))));
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["required_summary"]
+            .as_str()
+            .is_some_and(|value| value.contains("command_input.source=pr_hygiene"))
+    );
     assert_eq!(
         schema["agent_summary_contract"]["artifacts"]["pr_repair_snapshot"]["required_unless"],
         "IssueClosed/IssueAlreadyResolved signal or issue_state artifact proves the issue or PR is already closed/resolved."

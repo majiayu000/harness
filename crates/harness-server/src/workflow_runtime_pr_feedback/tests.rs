@@ -356,6 +356,69 @@ async fn pr_feedback_without_issue_requests_local_review_first() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn pr_hygiene_repair_requests_address_pr_feedback_with_context() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project-hygiene");
+    std::fs::create_dir(&project_root)?;
+    let task_id =
+        synthesized_pr_feedback_task_id(&project_root.to_string_lossy(), Some("owner/repo"), 81);
+
+    let outcome = request_pr_hygiene_repair(
+        &store,
+        PrHygieneRepairRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            task_id: &task_id,
+            pr_number: 81,
+            pr_url: Some("https://github.com/owner/repo/pull/81"),
+            title: Some("Dirty PR"),
+            merge_state_status: Some("DIRTY"),
+            head_oid: Some("abc123"),
+            updated_at: Some("2026-06-10T00:00:00Z"),
+            observed_at: "2026-06-12T00:00:00Z",
+            dirty_age_secs: 172800,
+            dirty_age_to_repair_secs: 172800,
+            dirty_age_to_comment_secs: 604800,
+            rebase_needed_label: "rebase-needed",
+        },
+    )
+    .await?;
+
+    let workflow_id = match outcome {
+        PrFeedbackSweepRequestOutcome::Requested { workflow_id, .. } => workflow_id,
+        other => anyhow::bail!("expected hygiene repair request, got {other:?}"),
+    };
+    let Some(instance) = store.get_instance(&workflow_id).await? else {
+        anyhow::bail!("workflow should exist");
+    };
+    assert_eq!(instance.state, "addressing_feedback");
+    let commands = store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert_eq!(commands[0].command.command["source"], "pr_hygiene");
+    assert_eq!(
+        commands[0].command.command["hygiene"]["dirty_age_secs"],
+        172800
+    );
+    assert_eq!(
+        commands[0].command.command["hygiene"]["rebase_needed_label"],
+        "rebase-needed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> anyhow::Result<()> {
     let Ok(database_url) = resolve_database_url(None) else {
         return Ok(());

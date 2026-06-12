@@ -1,5 +1,8 @@
 use super::*;
-use crate::runtime::{PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT};
+use crate::runtime::{
+    build_pr_hygiene_repair_decision, PrHygieneRepairDecisionInput, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
+};
 
 fn pr_workflow_state(state: &str) -> WorkflowInstance {
     issue_instance(state).with_data(json!({
@@ -21,6 +24,49 @@ fn event_for_result(result: ActivityResult) -> WorkflowEvent {
         "runtime_job_id": "job-1",
         "activity_result": result,
     }))
+}
+
+#[test]
+fn pr_hygiene_repair_decision_preserves_rebase_context() {
+    let instance = issue_instance("awaiting_feedback");
+    let output = build_pr_hygiene_repair_decision(
+        &instance,
+        PrHygieneRepairDecisionInput {
+            dedupe_key: "pr-hygiene:owner/repo:77",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            issue_number: Some(123),
+            repo: Some("owner/repo"),
+            summary: "Runtime PR hygiene found mergeability repair is needed.",
+            hygiene_context: json!({
+                "merge_state_status": "DIRTY",
+                "dirty_age_secs": 172800,
+                "dirty_age_to_repair_secs": 172800,
+                "dirty_age_to_comment_secs": 604800,
+                "rebase_needed_label": "rebase-needed",
+            }),
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::HygieneRepair);
+    assert_eq!(output.decision.decision, "address_pr_feedback");
+    assert_eq!(output.decision.next_state, "addressing_feedback");
+    assert_eq!(
+        output.decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert_eq!(output.decision.commands[0].command["source"], "pr_hygiene");
+    assert_eq!(
+        output.decision.commands[0].command["hygiene"]["rebase_needed_label"],
+        "rebase-needed"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("PR hygiene repair decision should validate");
 }
 
 fn ready_snapshot_artifact() -> ActivityArtifact {

@@ -190,7 +190,7 @@ struct GitHubPrSnapshotGraphQlResponse {
     errors: Option<Value>,
 }
 
-fn errors_is_empty(errors: &Value) -> bool {
+pub(crate) fn errors_is_empty(errors: &Value) -> bool {
     errors.as_array().is_some_and(Vec::is_empty)
 }
 
@@ -432,7 +432,7 @@ fn pr_feedback_summary(signal_type: &str, snapshot: &Value) -> String {
     }
 }
 
-fn value_string(value: Option<&Value>) -> Option<String> {
+pub(crate) fn value_string(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
         .map(str::trim)
@@ -440,7 +440,7 @@ fn value_string(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn value_u64(value: Option<&Value>) -> Option<u64> {
+pub(crate) fn value_u64(value: Option<&Value>) -> Option<u64> {
     value.and_then(|value| {
         value
             .as_u64()

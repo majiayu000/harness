@@ -27,6 +27,12 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert!(cfg.pr_feedback.enabled);
     assert_eq!(cfg.pr_feedback.sweep_interval_secs, 60);
     assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 300);
+    assert!(cfg.pr_feedback.hygiene_enabled);
+    assert_eq!(cfg.pr_feedback.hygiene_interval_secs, 1800);
+    assert_eq!(cfg.pr_feedback.dirty_age_to_repair_secs, 172800);
+    assert_eq!(cfg.pr_feedback.dirty_age_to_comment_secs, 604800);
+    assert_eq!(cfg.pr_feedback.rebase_needed_label, "rebase-needed");
+    assert_eq!(cfg.pr_feedback.hygiene_batch_limit, 25);
     assert!(cfg.repo_backlog.enabled);
     assert_eq!(cfg.repo_backlog.poll_interval_secs, 60);
     assert_eq!(cfg.repo_backlog.batch_limit, 128);
@@ -142,6 +148,12 @@ pr_feedback:
   enabled: false
   sweep_interval_secs: 15
   claim_stale_after_secs: 45
+  hygiene_enabled: false
+  hygiene_interval_secs: 1801
+  dirty_age_to_repair_secs: 1802
+  dirty_age_to_comment_secs: 1803
+  rebase_needed_label: needs-rebase
+  hygiene_batch_limit: 6
 repo_backlog:
   enabled: false
   poll_interval_secs: 20
@@ -241,6 +253,12 @@ Body
     assert!(!cfg.pr_feedback.enabled);
     assert_eq!(cfg.pr_feedback.sweep_interval_secs, 15);
     assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 45);
+    assert!(!cfg.pr_feedback.hygiene_enabled);
+    assert_eq!(cfg.pr_feedback.hygiene_interval_secs, 1801);
+    assert_eq!(cfg.pr_feedback.dirty_age_to_repair_secs, 1802);
+    assert_eq!(cfg.pr_feedback.dirty_age_to_comment_secs, 1803);
+    assert_eq!(cfg.pr_feedback.rebase_needed_label, "needs-rebase");
+    assert_eq!(cfg.pr_feedback.hygiene_batch_limit, 6);
     assert!(!cfg.repo_backlog.enabled);
     assert_eq!(cfg.repo_backlog.poll_interval_secs, 20);
     assert_eq!(cfg.repo_backlog.batch_limit, 9);

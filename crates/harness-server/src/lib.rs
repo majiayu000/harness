@@ -21,6 +21,7 @@ pub mod db;
 pub mod eval_store;
 pub mod event_replay;
 pub(crate) mod github_auth;
+pub(crate) mod github_pr_hygiene;
 pub(crate) mod github_pr_snapshot;
 pub mod handlers;
 pub mod hook_enforcer;

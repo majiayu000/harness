@@ -2,6 +2,7 @@ use super::model::{
     WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
 };
 use super::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
+use serde_json::{json, Value};
 
 pub const PR_FEEDBACK_DEFINITION_ID: &str = "pr_feedback";
 pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
@@ -23,6 +24,7 @@ pub enum PrFeedbackWorkflowAction {
     SweepFeedback,
     InspectFeedback,
     AddressFeedback,
+    HygieneRepair,
     AwaitFeedback,
     RequestQualityGate,
     ReadyToMerge,
@@ -59,6 +61,17 @@ pub struct PrFeedbackSweepDecisionInput<'a> {
     pub issue_number: Option<u64>,
     pub repo: Option<&'a str>,
     pub summary: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrHygieneRepairDecisionInput<'a> {
+    pub dedupe_key: &'a str,
+    pub pr_number: u64,
+    pub pr_url: Option<&'a str>,
+    pub issue_number: Option<u64>,
+    pub repo: Option<&'a str>,
+    pub summary: &'a str,
+    pub hygiene_context: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +355,42 @@ pub fn build_pr_feedback_sweep_decision(
     }
 }
 
+pub fn build_pr_hygiene_repair_decision(
+    instance: &WorkflowInstance,
+    input: PrHygieneRepairDecisionInput<'_>,
+) -> PrFeedbackDecisionOutput {
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "address_pr_feedback",
+        "addressing_feedback",
+        input.summary,
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        input.dedupe_key,
+        json!({
+            "activity": "address_pr_feedback",
+            "source": "pr_hygiene",
+            "pr_number": input.pr_number,
+            "pr_url": input.pr_url,
+            "issue_number": input.issue_number,
+            "repo": input.repo,
+            "review_summary": input.summary,
+            "hygiene": input.hygiene_context,
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "pr_hygiene",
+        hygiene_repair_summary(input),
+    ));
+
+    PrFeedbackDecisionOutput {
+        action: PrFeedbackWorkflowAction::HygieneRepair,
+        decision,
+    }
+}
+
 pub fn build_pr_feedback_inspect_decision(
     instance: &WorkflowInstance,
     input: PrFeedbackInspectDecisionInput<'_>,
@@ -436,6 +485,35 @@ fn feedback_sweep_summary(input: PrFeedbackSweepDecisionInput<'_>) -> String {
     }
     if let Some(repo) = input.repo {
         parts.push(format!("repo={repo}"));
+    }
+    parts.push(input.summary.to_string());
+    parts.join(" ")
+}
+
+fn hygiene_repair_summary(input: PrHygieneRepairDecisionInput<'_>) -> String {
+    let mut parts = vec![format!("pr={}", input.pr_number)];
+    if let Some(pr_url) = input.pr_url {
+        parts.push(format!("url={pr_url}"));
+    }
+    if let Some(issue_number) = input.issue_number {
+        parts.push(format!("issue={issue_number}"));
+    }
+    if let Some(repo) = input.repo {
+        parts.push(format!("repo={repo}"));
+    }
+    if let Some(merge_state_status) = input
+        .hygiene_context
+        .get("merge_state_status")
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("merge_state_status={merge_state_status}"));
+    }
+    if let Some(dirty_age_secs) = input
+        .hygiene_context
+        .get("dirty_age_secs")
+        .and_then(Value::as_u64)
+    {
+        parts.push(format!("dirty_age_secs={dirty_age_secs}"));
     }
     parts.push(input.summary.to_string());
     parts.join(" ")

@@ -751,7 +751,7 @@ fn workflow_project_root(instance: &WorkflowInstance) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn load_runtime_workflow_config(
+pub(super) fn load_runtime_workflow_config(
     project_root: &Path,
     subsystem: &str,
 ) -> anyhow::Result<harness_core::config::workflow::WorkflowConfig> {
@@ -864,7 +864,7 @@ pub(super) async fn run_runtime_repo_backlog_poll_tick(
     Ok(tick)
 }
 
-async fn repo_backlog_project_root(
+pub(super) async fn repo_backlog_project_root(
     repo_config: &harness_core::config::intake::GitHubRepoConfig,
     fallback: &Path,
 ) -> PathBuf {
