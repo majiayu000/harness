@@ -23,6 +23,13 @@ const MAX_OPERATOR_ACTIONS: usize = 40;
 const MAX_FAILURE_GROUPS: usize = 20;
 const MAX_RECENT_FAILURES: i64 = 100;
 const STALLED_AFTER_MINS: u64 = 30;
+const WORKFLOW_DEFINITION_IDS: &[&str] = &[
+    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+    harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
+    harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+    harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+    harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID,
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct OperatorMonitorPayload {
@@ -238,7 +245,21 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(Vec::new());
     };
-    store.list_instances(None, WORKFLOW_SAMPLE_LIMIT).await
+    let mut workflows = Vec::new();
+    for definition_id in WORKFLOW_DEFINITION_IDS {
+        workflows.extend(
+            store
+                .list_nonterminal_instances_by_definition(
+                    definition_id,
+                    None,
+                    Some(WORKFLOW_SAMPLE_LIMIT),
+                )
+                .await?,
+        );
+    }
+    workflows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    workflows.truncate(WORKFLOW_SAMPLE_LIMIT as usize);
+    Ok(workflows)
 }
 
 fn runtime_workflow_counts(workflows: &[WorkflowInstance]) -> RuntimeWorkflowCounts {
@@ -375,7 +396,7 @@ fn add_workflow_source_activity(
         });
     match workflow_bucket(workflow) {
         WorkflowBucket::Running => entry.running += 1,
-        WorkflowBucket::Blocked => entry.blocked += 1,
+        WorkflowBucket::AwaitingDependencies | WorkflowBucket::Blocked => entry.blocked += 1,
         WorkflowBucket::Failed => entry.failed += 1,
         WorkflowBucket::ReadyToMerge => entry.ready_to_merge += 1,
         _ => {}

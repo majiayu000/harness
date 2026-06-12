@@ -135,15 +135,18 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     queued_row.status = crate::task_runner::TaskStatus::Pending;
 
     let mut by_source = source_activity(
-        &[workflow(
-            "ready_to_merge",
-            json!({
-                "source": "github",
-                "task_id": "legacy-row",
-                "pr_number": 7,
-                "pr_url": "https://github.com/owner/repo/pull/7",
-            }),
-        )],
+        &[
+            workflow(
+                "ready_to_merge",
+                json!({
+                    "source": "github",
+                    "task_id": "legacy-row",
+                    "pr_number": 7,
+                    "pr_url": "https://github.com/owner/repo/pull/7",
+                }),
+            ),
+            workflow("awaiting_dependencies", json!({ "source": "github" })),
+        ],
         &[legacy_row, queued_row],
     );
 
@@ -152,5 +155,5 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     assert_eq!(source.source, "github");
     assert_eq!(source.ready_to_merge, 1);
     assert_eq!(source.running, 0);
-    assert_eq!(source.blocked, 0);
+    assert_eq!(source.blocked, 1);
 }
