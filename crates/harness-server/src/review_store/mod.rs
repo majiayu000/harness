@@ -1,4 +1,5 @@
 use harness_core::db::{Migration, PgStoreContext};
+use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
 use std::path::Path;
@@ -17,6 +18,8 @@ type FindingRow = (
     String,
     Option<String>,
 );
+
+pub const REVIEW_STORE_SCHEMA: &str = "review_store";
 
 /// A single finding from a periodic review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +113,14 @@ impl ReviewStore {
         let context = PgStoreContext::from_path(path, configured_database_url)?;
         let pool = context.open_migrated_pool(REVIEW_MIGRATIONS).await?;
         Ok(Self { pool })
+    }
+
+    pub fn shared_schema_context(
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<PgStoreContext> {
+        PostgresBackend::new(configured_database_url.map(ToOwned::to_owned)).store_context(
+            &StoreLocation::SharedSchema(REVIEW_STORE_SCHEMA.to_string()),
+        )
     }
 
     pub async fn open_with_context(
@@ -543,6 +554,57 @@ impl ReviewStore {
     }
 }
 
+pub async fn migrate_legacy_review_store_if_needed(
+    legacy_path: &Path,
+    configured_database_url: Option<&str>,
+    target_store: &ReviewStore,
+) -> anyhow::Result<u64> {
+    let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
+    let legacy_schema = legacy_context.schema();
+    if legacy_schema == REVIEW_STORE_SCHEMA {
+        return Ok(0);
+    }
+
+    let legacy_table: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(format!("\"{legacy_schema}\".review_findings"))
+        .fetch_one(&target_store.pool)
+        .await?;
+    if legacy_table.is_none() {
+        return Ok(0);
+    }
+
+    let copy_sql = format!(
+        "INSERT INTO review_findings (
+            id, review_id, rule_id, priority, impact, confidence, effort,
+            file, line, title, description, action, status, created_at,
+            task_id, claimed_at, real_task_id, failure_count, cooldown_until,
+            project_root
+         )
+         SELECT
+            id, review_id, rule_id, priority, impact, confidence, effort,
+            file, line, title, description, action, status, created_at,
+            task_id, claimed_at, real_task_id, failure_count, cooldown_until,
+            project_root
+         FROM \"{legacy_schema}\".review_findings
+         ON CONFLICT DO NOTHING"
+    );
+    let copied = sqlx::query(&copy_sql)
+        .execute(&target_store.pool)
+        .await?
+        .rows_affected();
+
+    if copied > 0 {
+        tracing::info!(
+            copied,
+            legacy_schema,
+            target_schema = REVIEW_STORE_SCHEMA,
+            "review store migration: backfilled legacy review findings into shared schema"
+        );
+    }
+
+    Ok(copied)
+}
+
 /// Parse the agent's JSON output into a ReviewOutput.
 ///
 /// The agent may wrap the JSON in markdown code fences; this function
@@ -625,6 +687,19 @@ mod tests {
     fn parse_invalid_json_returns_error() {
         let raw = "not json at all";
         assert!(parse_review_output(raw).is_err());
+    }
+
+    #[test]
+    fn shared_schema_context_uses_fixed_review_store_schema() -> anyhow::Result<()> {
+        let context = ReviewStore::shared_schema_context(Some(
+            "postgres://user:pass@localhost:5432/harness",
+        ))?;
+        assert_eq!(context.schema(), REVIEW_STORE_SCHEMA);
+        assert!(
+            context.ownership().is_none(),
+            "shared review store schema must not register path-derived ownership"
+        );
+        Ok(())
     }
 }
 
