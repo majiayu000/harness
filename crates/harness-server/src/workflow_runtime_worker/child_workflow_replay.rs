@@ -1,5 +1,7 @@
 use crate::task_runner::TaskId;
-use harness_workflow::runtime::{RuntimeJob, WorkflowInstance, WorkflowRuntimeStore};
+use harness_workflow::runtime::{
+    RuntimeJob, WorkflowDecisionRecord, WorkflowInstance, WorkflowRuntimeStore,
+};
 use serde_json::Value;
 
 use super::data_helpers::activity_name;
@@ -31,6 +33,46 @@ pub(super) async fn child_start_event_recorded(
                 .and_then(Value::as_str)
                 .is_some_and(|recorded| recorded == command_id)
     }))
+}
+
+pub(super) async fn child_event_id_or_append(
+    store: &WorkflowRuntimeStore,
+    child_id: &str,
+    event_type: &str,
+    payload: Value,
+) -> anyhow::Result<String> {
+    if let Some(event_id) = child_event_id(store, child_id, event_type).await? {
+        return Ok(event_id);
+    }
+    Ok(store
+        .append_event(child_id, event_type, "workflow_runtime_worker", payload)
+        .await?
+        .id)
+}
+
+pub(super) async fn decision_for_event(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    event_id: &str,
+) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+    Ok(store
+        .decisions_for(workflow_id)
+        .await?
+        .into_iter()
+        .find(|record| record.event_id.as_deref() == Some(event_id)))
+}
+
+async fn child_event_id(
+    store: &WorkflowRuntimeStore,
+    child_id: &str,
+    event_type: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(store
+        .events_for(child_id)
+        .await?
+        .into_iter()
+        .find(|event| event.event_type == event_type)
+        .map(|event| event.id))
 }
 
 pub(super) fn child_started_by_command(child: &WorkflowInstance, command_id: &str) -> bool {
