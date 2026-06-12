@@ -139,6 +139,7 @@ async fn get_json(
 fn runtime_tree_path(project_id: Option<&str>, limit: i64) -> String {
     let mut query = form_urlencoded::Serializer::new(String::new());
     query.append_pair("limit", &limit.max(1).to_string());
+    query.append_pair("summary_only", "true");
     if let Some(project_id) = project_id.filter(|value| !value.is_empty()) {
         query.append_pair("project_id", project_id);
     }
@@ -340,7 +341,7 @@ mod tests {
     fn runtime_tree_path_encodes_path_like_project_id() {
         assert_eq!(
             runtime_tree_path(Some("/Users/apple/repo name"), 20),
-            "/api/workflows/runtime/tree?limit=20&project_id=%2FUsers%2Fapple%2Frepo+name"
+            "/api/workflows/runtime/tree?limit=20&summary_only=true&project_id=%2FUsers%2Fapple%2Frepo+name"
         );
     }
 
@@ -348,7 +349,7 @@ mod tests {
     fn runtime_tree_path_clamps_limit_and_encodes_project_id() {
         assert_eq!(
             runtime_tree_path(Some("/project-a"), 0),
-            "/api/workflows/runtime/tree?limit=1&project_id=%2Fproject-a"
+            "/api/workflows/runtime/tree?limit=1&summary_only=true&project_id=%2Fproject-a"
         );
     }
 

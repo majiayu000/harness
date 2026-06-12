@@ -9,6 +9,9 @@ export interface WorkflowRuntimeTreePayload {
     has_more: boolean;
     next_offset?: number | null;
     job_limit: number;
+    command_limit?: number | null;
+    detail?: "compact" | "full";
+    summary_only?: boolean;
   };
   summary?: {
     total_commands: number;
@@ -16,12 +19,18 @@ export interface WorkflowRuntimeTreePayload {
     command_statuses: Record<string, number>;
     runtime_job_statuses: Record<string, number>;
     running_job_lease_statuses?: Record<string, number>;
+    activity_outcomes?: Record<string, number>;
+    jobs_without_activity_envelope?: number;
   };
 }
 
 export interface WorkflowRuntimeTreeNode {
   workflow: WorkflowRuntimeInstance;
   runtime_job_count?: number;
+  event_count?: number;
+  decision_count?: number;
+  rejected_decision_count?: number;
+  command_count?: number;
   events: WorkflowRuntimeEvent[];
   decisions: WorkflowRuntimeDecisionRecord[];
   commands: WorkflowRuntimeCommandNode[];
@@ -97,7 +106,7 @@ export interface WorkflowRuntimeJob {
   lease_state?: string | null;
   in_flight_model_turn?: boolean;
   last_runtime_observation_at?: string | null;
-  input: Record<string, unknown>;
+  input?: Record<string, unknown>;
   output?: Record<string, unknown> | null;
   error?: string | null;
   not_before?: string | null;

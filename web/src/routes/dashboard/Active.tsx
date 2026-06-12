@@ -182,9 +182,11 @@ function workflowRuntimeCounts(nodes: WorkflowRuntimeTreeNode[]) {
 
   const visit = (node: WorkflowRuntimeTreeNode) => {
     workflows += 1;
-    commands += node.commands.length;
-    rejected += rejectedDecisions(node.decisions).length;
-    for (const command of node.commands) jobs += command.runtime_jobs.length;
+    commands += node.command_count ?? node.commands.length;
+    rejected += node.rejected_decision_count ?? rejectedDecisions(node.decisions).length;
+    jobs +=
+      node.runtime_job_count ??
+      node.commands.reduce((total, command) => total + command.runtime_jobs.length, 0);
     for (const child of node.children) visit(child);
   };
   for (const node of nodes) visit(node);
@@ -237,7 +239,8 @@ function WorkflowRuntimeNode({
             {node.workflow.definition_id} - {node.workflow.subject.subject_key}
           </div>
           <div className="mt-0.5 truncate font-mono text-[10px] text-ink-3">
-            {node.events.length} events - {node.commands.length} commands
+            {node.event_count ?? node.events.length} events -{" "}
+            {node.command_count ?? node.commands.length} commands
           </div>
         </div>
         <span className="border border-line bg-bg px-1.5 py-[1px] font-mono text-[10px] text-ink-2">

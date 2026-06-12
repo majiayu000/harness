@@ -157,6 +157,9 @@ export function useWorkflowRuntimeTree(projectId?: string | null) {
     queryFn: ({ signal }) => {
       const params = new URLSearchParams();
       params.set("limit", "100");
+      params.set("detail", "compact");
+      params.set("command_limit", "5");
+      params.set("job_limit", "1");
       if (projectId) params.set("project_id", projectId);
       return apiJson<WorkflowRuntimeTreePayload>(`/api/workflows/runtime/tree?${params}`, {
         signal,

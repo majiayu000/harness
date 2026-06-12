@@ -2,7 +2,7 @@ use super::errors::RuntimeJobNotFoundError;
 use super::model::{
     ActivityResult, ActivityStatus, RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind,
     WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowInstance,
+    WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowInstance, WorkflowLease,
 };
 use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
 use super::prompt_task::PROMPT_TASK_DEFINITION_ID;
@@ -15,7 +15,7 @@ use super::validator::{DecisionValidator, ValidationContext};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::db::PgStoreContext;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
 use std::collections::BTreeMap;
@@ -39,6 +39,14 @@ pub struct WorkflowInstancePage {
     pub offset: i64,
 }
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkflowRuntimeDetailCounts {
+    pub event_count: usize,
+    pub decision_count: usize,
+    pub rejected_decision_count: usize,
+    pub command_count: usize,
+    pub runtime_job_count: usize,
+}
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WorkflowRuntimeSummaryCounts {
     pub total_commands: usize,
     pub total_runtime_jobs: usize,
@@ -47,6 +55,30 @@ pub struct WorkflowRuntimeSummaryCounts {
     pub running_job_lease_statuses: BTreeMap<String, usize>,
     pub activity_outcomes: BTreeMap<String, usize>,
     pub jobs_without_activity_envelope: usize,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeJobCompactRecord {
+    pub id: String,
+    pub command_id: String,
+    pub runtime_kind: RuntimeKind,
+    pub runtime_profile: String,
+    pub status: RuntimeJobStatus,
+    pub lease: Option<WorkflowLease>,
+    pub lease_generation: u64,
+    pub error: Option<String>,
+    pub not_before: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RuntimeEventSummary {
+    pub runtime_job_id: String,
+    pub runtime_event_count: usize,
+    pub latest_runtime_event_type: Option<String>,
+    pub prompt_packet_digest: Option<String>,
+    pub latest_runtime_event_at: Option<DateTime<Utc>>,
+    pub latest_turn_sequence: Option<u64>,
+    pub latest_activity_result_sequence: Option<u64>,
 }
 pub struct WorkflowDecisionTransition<'a> {
     pub expected_state: &'a str,
@@ -75,6 +107,28 @@ type WorkflowCommandRecordRow = (
     Option<String>,
     Option<DateTime<Utc>>,
     String,
+    DateTime<Utc>,
+    DateTime<Utc>,
+);
+type RuntimeEventSummaryRow = (
+    String,
+    i64,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+type RuntimeJobCompactRecordRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<DateTime<Utc>>,
     DateTime<Utc>,
     DateTime<Utc>,
 );
@@ -819,6 +873,109 @@ impl WorkflowRuntimeStore {
         Ok(by_workflow)
     }
 
+    pub async fn detail_counts_for_workflows(
+        &self,
+        workflow_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, WorkflowRuntimeDetailCounts>> {
+        if workflow_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT selected.workflow_id,
+                    COALESCE(events.event_count, 0),
+                    COALESCE(decisions.decision_count, 0),
+                    COALESCE(decisions.rejected_decision_count, 0),
+                    COALESCE(commands.command_count, 0),
+                    COALESCE(jobs.runtime_job_count, 0)
+             FROM unnest($1::text[]) AS selected(workflow_id)
+             LEFT JOIN LATERAL (
+                 SELECT COUNT(*) AS event_count
+                 FROM workflow_events
+                 WHERE workflow_id = selected.workflow_id
+             ) AS events ON true
+             LEFT JOIN LATERAL (
+                 SELECT COUNT(*) AS decision_count,
+                        COUNT(*) FILTER (WHERE accepted = false) AS rejected_decision_count
+                 FROM workflow_decisions
+                 WHERE workflow_id = selected.workflow_id
+             ) AS decisions ON true
+             LEFT JOIN LATERAL (
+                 SELECT COUNT(*) AS command_count
+                 FROM workflow_commands
+                 WHERE workflow_id = selected.workflow_id
+             ) AS commands ON true
+             LEFT JOIN LATERAL (
+                 SELECT COUNT(runtime_jobs.id) AS runtime_job_count
+                 FROM workflow_commands
+                 JOIN runtime_jobs ON runtime_jobs.command_id = workflow_commands.id
+                 WHERE workflow_commands.workflow_id = selected.workflow_id
+             ) AS jobs ON true",
+        )
+        .bind(workflow_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    workflow_id,
+                    event_count,
+                    decision_count,
+                    rejected_decision_count,
+                    command_count,
+                    runtime_job_count,
+                )| {
+                    (
+                        workflow_id,
+                        WorkflowRuntimeDetailCounts {
+                            event_count: event_count.max(0) as usize,
+                            decision_count: decision_count.max(0) as usize,
+                            rejected_decision_count: rejected_decision_count.max(0) as usize,
+                            command_count: command_count.max(0) as usize,
+                            runtime_job_count: runtime_job_count.max(0) as usize,
+                        },
+                    )
+                },
+            )
+            .collect())
+    }
+
+    pub async fn rejected_decisions_for_workflows_limited(
+        &self,
+        workflow_ids: &[String],
+        per_workflow_limit: i64,
+    ) -> anyhow::Result<BTreeMap<String, Vec<WorkflowDecisionRecord>>> {
+        if workflow_ids.is_empty() || per_workflow_limit <= 0 {
+            return Ok(BTreeMap::new());
+        }
+        let per_workflow_limit = per_workflow_limit.clamp(1, 20);
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT decision.workflow_id, decision.data
+             FROM unnest($1::text[]) AS selected(workflow_id)
+             JOIN LATERAL (
+                 SELECT workflow_id, data::text AS data, created_at
+                 FROM workflow_decisions
+                 WHERE workflow_id = selected.workflow_id
+                   AND accepted = false
+                 ORDER BY created_at DESC
+                 LIMIT $2
+             ) AS decision ON true
+             ORDER BY decision.workflow_id ASC, decision.created_at DESC",
+        )
+        .bind(workflow_ids)
+        .bind(per_workflow_limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_workflow = BTreeMap::new();
+        for (workflow_id, data) in rows {
+            by_workflow
+                .entry(workflow_id)
+                .or_insert_with(Vec::new)
+                .push(serde_json::from_str(&data)?);
+        }
+        Ok(by_workflow)
+    }
+
     pub async fn enqueue_command(
         &self,
         workflow_id: &str,
@@ -878,6 +1035,45 @@ impl WorkflowRuntimeStore {
              ORDER BY workflow_id ASC, created_at ASC",
         )
         .bind(workflow_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_workflow = BTreeMap::new();
+        for row in rows {
+            let record = workflow_command_record_from_row(row)?;
+            by_workflow
+                .entry(record.workflow_id.clone())
+                .or_insert_with(Vec::new)
+                .push(record);
+        }
+        Ok(by_workflow)
+    }
+
+    pub async fn commands_for_workflows_limited(
+        &self,
+        workflow_ids: &[String],
+        per_workflow_limit: i64,
+    ) -> anyhow::Result<BTreeMap<String, Vec<WorkflowCommandRecord>>> {
+        if workflow_ids.is_empty() || per_workflow_limit <= 0 {
+            return Ok(BTreeMap::new());
+        }
+        let per_workflow_limit = per_workflow_limit.clamp(1, 50);
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
+            "SELECT command.id, command.workflow_id, command.decision_id, command.status,
+                    command.dispatch_owner, command.dispatch_lease_expires_at, command.data,
+                    command.created_at, command.updated_at
+             FROM unnest($1::text[]) AS selected(workflow_id)
+             JOIN LATERAL (
+                 SELECT id, workflow_id, decision_id, status, dispatch_owner,
+                        dispatch_lease_expires_at, data::text AS data, created_at, updated_at
+                 FROM workflow_commands
+                 WHERE workflow_id = selected.workflow_id
+                 ORDER BY created_at DESC
+                 LIMIT $2
+             ) AS command ON true
+             ORDER BY command.workflow_id ASC, command.created_at ASC",
+        )
+        .bind(workflow_ids)
+        .bind(per_workflow_limit)
         .fetch_all(&self.pool)
         .await?;
         let mut by_workflow = BTreeMap::new();
@@ -1320,6 +1516,82 @@ impl WorkflowRuntimeStore {
                 .push(serde_json::from_str(&data)?);
         }
         Ok(by_job)
+    }
+
+    pub async fn runtime_event_summaries_for_jobs(
+        &self,
+        runtime_job_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, RuntimeEventSummary>> {
+        if runtime_job_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<RuntimeEventSummaryRow> = sqlx::query_as(
+            "SELECT selected.runtime_job_id,
+                    COALESCE(counts.runtime_event_count, 0),
+                    latest.event_type,
+                    latest.created_at,
+                    prompt.prompt_packet_digest,
+                    counts.latest_turn_sequence,
+                    counts.latest_activity_result_sequence
+             FROM unnest($1::text[]) AS selected(runtime_job_id)
+             LEFT JOIN LATERAL (
+                 SELECT COUNT(*) AS runtime_event_count,
+                        MAX(sequence) FILTER (WHERE event_type = 'RuntimeTurnStarted')
+                            AS latest_turn_sequence,
+                        MAX(sequence) FILTER (WHERE event_type = 'ActivityResultReady')
+                            AS latest_activity_result_sequence
+                 FROM runtime_events
+                 WHERE runtime_job_id = selected.runtime_job_id
+             ) AS counts ON true
+             LEFT JOIN LATERAL (
+                 SELECT event_type, created_at
+                 FROM runtime_events
+                 WHERE runtime_job_id = selected.runtime_job_id
+                 ORDER BY sequence DESC
+                 LIMIT 1
+             ) AS latest ON true
+             LEFT JOIN LATERAL (
+                 SELECT data #>> '{event,prompt_packet_digest}' AS prompt_packet_digest
+                 FROM runtime_events
+                 WHERE runtime_job_id = selected.runtime_job_id
+                   AND event_type = 'RuntimePromptPrepared'
+                   AND data #>> '{event,prompt_packet_digest}' IS NOT NULL
+                 ORDER BY sequence DESC
+                 LIMIT 1
+             ) AS prompt ON true",
+        )
+        .bind(runtime_job_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    runtime_job_id,
+                    runtime_event_count,
+                    latest_runtime_event_type,
+                    latest_runtime_event_at,
+                    prompt_packet_digest,
+                    latest_turn_sequence,
+                    latest_activity_result_sequence,
+                )| {
+                    (
+                        runtime_job_id.clone(),
+                        RuntimeEventSummary {
+                            runtime_job_id,
+                            runtime_event_count: runtime_event_count.max(0) as usize,
+                            latest_runtime_event_type,
+                            prompt_packet_digest,
+                            latest_runtime_event_at,
+                            latest_turn_sequence: latest_turn_sequence
+                                .and_then(|sequence| u64::try_from(sequence).ok()),
+                            latest_activity_result_sequence: latest_activity_result_sequence
+                                .and_then(|sequence| u64::try_from(sequence).ok()),
+                        },
+                    )
+                },
+            )
+            .collect())
     }
 
     pub async fn complete_runtime_job_if_owned(
@@ -1844,6 +2116,79 @@ impl WorkflowRuntimeStore {
         Ok(by_command)
     }
 
+    pub async fn compact_runtime_jobs_for_commands_limited(
+        &self,
+        command_ids: &[String],
+        per_command_limit: i64,
+    ) -> anyhow::Result<BTreeMap<String, Vec<RuntimeJobCompactRecord>>> {
+        if command_ids.is_empty() || per_command_limit <= 0 {
+            return Ok(BTreeMap::new());
+        }
+        let per_command_limit = per_command_limit.clamp(1, 50);
+        let rows: Vec<RuntimeJobCompactRecordRow> = sqlx::query_as(
+            "SELECT job.command_id, job.id, job.runtime_kind, job.runtime_profile,
+                    job.status, (job.data->'lease')::text AS lease,
+                    COALESCE((job.data->>'lease_generation')::bigint, 0),
+                    job.data->>'error',
+                    (job.data->>'not_before')::timestamptz,
+                    job.created_at, job.updated_at
+             FROM unnest($1::text[]) AS selected(command_id)
+             JOIN LATERAL (
+                 SELECT command_id, id, runtime_kind, runtime_profile, status, data,
+                        created_at, updated_at,
+                        (data->>'created_at')::timestamptz AS job_created_at
+                 FROM runtime_jobs
+                 WHERE command_id = selected.command_id
+                 ORDER BY created_at DESC, (data->>'created_at')::timestamptz DESC
+                 LIMIT $2
+             ) AS job ON true
+             ORDER BY job.command_id ASC, job.created_at ASC, job.job_created_at ASC",
+        )
+        .bind(command_ids)
+        .bind(per_command_limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_command = BTreeMap::new();
+        for (
+            command_id,
+            id,
+            runtime_kind,
+            runtime_profile,
+            status,
+            lease_json,
+            lease_generation,
+            error,
+            not_before,
+            created_at,
+            updated_at,
+        ) in rows
+        {
+            let lease = lease_json
+                .as_deref()
+                .filter(|value| *value != "null")
+                .map(serde_json::from_str)
+                .transpose()?;
+            let record = RuntimeJobCompactRecord {
+                id,
+                command_id: command_id.clone(),
+                runtime_kind: enum_from_str(&runtime_kind)?,
+                runtime_profile,
+                status: enum_from_str(&status)?,
+                lease,
+                lease_generation: lease_generation.max(0) as u64,
+                error,
+                not_before,
+                created_at,
+                updated_at,
+            };
+            by_command
+                .entry(command_id)
+                .or_insert_with(Vec::new)
+                .push(record);
+        }
+        Ok(by_command)
+    }
+
     pub async fn runtime_turns_started_for_workflow(
         &self,
         workflow_id: &str,
@@ -1888,6 +2233,13 @@ pub(super) fn enum_str(value: &impl Serialize) -> anyhow::Result<String> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("serialized enum did not produce a string"))
+}
+
+fn enum_from_str<T>(value: &str) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    Ok(serde_json::from_value(Value::String(value.to_string()))?)
 }
 
 async fn runtime_job_for_command_tx(
