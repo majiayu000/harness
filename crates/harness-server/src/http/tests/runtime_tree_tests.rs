@@ -315,12 +315,20 @@ async fn workflow_runtime_tree_endpoint_defaults_to_compact_polling_shape() -> a
             )
             .await?;
     }
+    let primitive_command = harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::Wait,
+        "issue-1165-wait",
+        serde_json::json!("wait for review"),
+    );
+    store
+        .enqueue_command(&workflow.id, None, &primitive_command)
+        .await?;
 
     let response = workflow_runtime_app(state)
         .oneshot(
             Request::builder()
                 .uri(
-                    "/api/workflows/runtime/tree?project_id=%2Fproject-a&command_limit=1&job_limit=1",
+                    "/api/workflows/runtime/tree?project_id=%2Fproject-a&command_limit=3&job_limit=1",
                 )
                 .body(Body::empty())?,
         )
@@ -328,15 +336,15 @@ async fn workflow_runtime_tree_endpoint_defaults_to_compact_polling_shape() -> a
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await?;
     assert_eq!(body["pagination"]["detail"], "compact");
-    assert_eq!(body["pagination"]["command_limit"], 1);
-    assert_eq!(body["summary"]["total_commands"], 2);
+    assert_eq!(body["pagination"]["command_limit"], 3);
+    assert_eq!(body["summary"]["total_commands"], 3);
     assert_eq!(body["summary"]["total_runtime_jobs"], 2);
 
     let node = &body["workflows"][0];
     assert_eq!(node["event_count"], 1);
     assert_eq!(node["decision_count"], 2);
     assert_eq!(node["rejected_decision_count"], 1);
-    assert_eq!(node["command_count"], 2);
+    assert_eq!(node["command_count"], 3);
     assert_eq!(node["runtime_job_count"], 2);
     assert_eq!(node["events"].as_array().expect("events array").len(), 0);
     assert_eq!(
@@ -348,13 +356,23 @@ async fn workflow_runtime_tree_endpoint_defaults_to_compact_polling_shape() -> a
         "replan limit exhausted"
     );
     let commands = node["commands"].as_array().expect("commands array");
-    assert_eq!(commands.len(), 1);
+    assert_eq!(commands.len(), 3);
+    let implement_command = commands
+        .iter()
+        .find(|command| {
+            command["command"]["command"]["activity"].as_str() == Some("implement_issue")
+        })
+        .expect("compact response should include an implement command");
+    assert!(implement_command["command"]["command"]["large_payload"].is_null());
+    let primitive_command = commands
+        .iter()
+        .find(|command| command["command"]["dedupe_key"].as_str() == Some("issue-1165-wait"))
+        .expect("compact response should include the primitive command");
     assert_eq!(
-        commands[0]["command"]["command"]["activity"],
-        "implement_issue"
+        primitive_command["command"]["command"],
+        serde_json::json!("wait for review")
     );
-    assert!(commands[0]["command"]["command"]["large_payload"].is_null());
-    let jobs = commands[0]["runtime_jobs"]
+    let jobs = implement_command["runtime_jobs"]
         .as_array()
         .expect("runtime jobs array");
     assert_eq!(jobs.len(), 1);
@@ -423,6 +441,8 @@ async fn workflow_runtime_tree_endpoint_returns_summary_only_shape() -> anyhow::
     let body = response_json(response).await?;
     assert_eq!(body["total_workflows"], 1);
     assert_eq!(body["pagination"]["returned"], 0);
+    assert_eq!(body["pagination"]["has_more"], false);
+    assert_eq!(body["pagination"]["next_offset"], serde_json::Value::Null);
     assert_eq!(body["pagination"]["summary_only"], true);
     assert_eq!(body["pagination"]["detail"], "compact");
     assert_eq!(body["summary"]["total_commands"], 1);

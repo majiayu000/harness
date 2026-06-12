@@ -364,7 +364,7 @@ impl WorkflowRuntimeTreePagination {
         let offset = offset.max(0) as usize;
         let total = total.max(0) as usize;
         let next_offset = offset.saturating_add(returned);
-        let has_more = next_offset < total;
+        let has_more = !summary_only && next_offset < total;
         Self {
             limit,
             offset,
@@ -881,25 +881,36 @@ async fn build_compact_workflow_runtime_nodes(
 }
 
 fn compact_workflow_command(command: WorkflowCommand) -> WorkflowCommand {
+    let WorkflowCommand {
+        command_type,
+        dedupe_key,
+        command,
+    } = command;
+    let Value::Object(object) = command else {
+        return WorkflowCommand {
+            command_type,
+            dedupe_key,
+            command,
+        };
+    };
+
     let mut payload = serde_json::Map::new();
-    if let Some(object) = command.command.as_object() {
-        for key in [
-            "activity",
-            "definition_id",
-            "subject_key",
-            "pr_number",
-            "pr_url",
-            "reason",
-            "concern",
-        ] {
-            if let Some(value) = object.get(key) {
-                payload.insert(key.to_string(), value.clone());
-            }
+    for key in [
+        "activity",
+        "definition_id",
+        "subject_key",
+        "pr_number",
+        "pr_url",
+        "reason",
+        "concern",
+    ] {
+        if let Some(value) = object.get(key) {
+            payload.insert(key.to_string(), value.clone());
         }
     }
     WorkflowCommand {
-        command_type: command.command_type,
-        dedupe_key: command.dedupe_key,
+        command_type,
+        dedupe_key,
         command: Value::Object(payload),
     }
 }
