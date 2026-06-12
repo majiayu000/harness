@@ -1665,6 +1665,41 @@ fn runtime_completion_reducer_blocks_invalid_structured_workflow_decision() {
 }
 
 #[test]
+fn runtime_completion_reducer_blocks_unknown_success_without_structured_decision() {
+    let instance = issue_instance("awaiting_feedback");
+    let result = ActivityResult::succeeded(
+        "unexpected_activity",
+        "Unexpected activity completed without a workflow decision.",
+    );
+    let event = runtime_completion_event(&instance, "unexpected_activity", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("unknown success should block instead of silently producing no decision");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .reason
+        .contains("no reducer fallback was available"));
+    assert!(decision
+        .commands
+        .iter()
+        .any(|command| command.command_type == WorkflowCommandType::MarkBlocked));
+    assert!(decision
+        .commands
+        .iter()
+        .any(|command| command.command_type == WorkflowCommandType::RequestOperatorAttention));
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("unknown successful activity should reduce to a valid blocked decision");
+}
+
+#[test]
 fn repo_backlog_open_issue_without_workflow_starts_child_workflow() {
     let instance = repo_backlog_instance("idle");
     let output = build_open_issue_without_workflow_decision(

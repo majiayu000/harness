@@ -240,6 +240,10 @@ fn reduce_success(
         return Some(decision);
     }
 
+    if known_success_without_decision(instance, result) {
+        return None;
+    }
+
     let (next_state, decision, reason) = match (
         instance.definition_id.as_str(),
         instance.state.as_str(),
@@ -294,7 +298,15 @@ fn reduce_success(
             "finish_prompt_task",
             "prompt implementation activity completed successfully",
         ),
-        _ => return None,
+        _ => {
+            let reason = format!(
+                "runtime activity `{}` succeeded for workflow `{}` in state `{}`, but no reducer fallback was available",
+                result.activity, instance.definition_id, instance.state
+            );
+            return Some(invalid_agent_output_blocked_decision(
+                instance, event, result, &reason,
+            ));
+        }
     };
 
     let mut workflow_decision =
@@ -331,6 +343,18 @@ fn reduce_success(
     }
 
     Some(workflow_decision.high_confidence())
+}
+
+fn known_success_without_decision(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+    (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) == (
+        PR_FEEDBACK_DEFINITION_ID,
+        "inspecting",
+        super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY,
+    )
 }
 
 fn workflow_decision_from_activity_result(
