@@ -20,7 +20,9 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
 use std::collections::BTreeMap;
 use std::path::Path;
-use uuid::Uuid;
+
+#[path = "store/commands.rs"]
+mod command_store;
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
 }
@@ -312,36 +314,18 @@ impl WorkflowRuntimeStore {
         .await?;
 
         for command in &decision.commands {
-            let command_data = to_jsonb_string(command)?;
-            let command_type = enum_str(&command.command_type)?;
-            sqlx::query(
-                "INSERT INTO workflow_commands
-                    (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-                 ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
-                    status = CASE
-                        WHEN workflow_commands.status = 'pending' THEN EXCLUDED.status
-                        ELSE workflow_commands.status
-                    END,
-                    updated_at = CASE
-                        WHEN workflow_commands.status = 'pending'
-                             AND workflow_commands.status <> EXCLUDED.status
-                        THEN CURRENT_TIMESTAMP
-                        ELSE workflow_commands.updated_at
-                    END",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(&final_instance.id)
-            .bind(&record.id)
-            .bind(&command_type)
-            .bind(&command.dedupe_key)
-            .bind(if command.requires_runtime_job() {
-                transition.command_status.as_str()
+            let status = if command.requires_runtime_job() {
+                transition.command_status
             } else {
-                WorkflowCommandStatus::HandledInline.as_str()
-            })
-            .bind(&command_data)
-            .execute(&mut *tx)
+                WorkflowCommandStatus::HandledInline
+            };
+            command_store::insert_tx(
+                &mut tx,
+                &final_instance.id,
+                Some(&record.id),
+                command,
+                status,
+            )
             .await?;
         }
 
@@ -851,35 +835,7 @@ impl WorkflowRuntimeStore {
         command: &WorkflowCommand,
         status: WorkflowCommandStatus,
     ) -> anyhow::Result<String> {
-        let data = to_jsonb_string(command)?;
-        let command_type = enum_str(&command.command_type)?;
-        let (id,): (String,) = sqlx::query_as(
-            "INSERT INTO workflow_commands
-                (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-             ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
-                status = CASE
-                    WHEN workflow_commands.status = 'pending' THEN EXCLUDED.status
-                    ELSE workflow_commands.status
-                END,
-                updated_at = CASE
-                    WHEN workflow_commands.status = 'pending'
-                         AND workflow_commands.status <> EXCLUDED.status
-                    THEN CURRENT_TIMESTAMP
-                    ELSE workflow_commands.updated_at
-                END
-             RETURNING id",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(workflow_id)
-        .bind(decision_id)
-        .bind(&command_type)
-        .bind(&command.dedupe_key)
-        .bind(status.as_str())
-        .bind(&data)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(id)
+        command_store::insert(&self.pool, workflow_id, decision_id, command, status).await
     }
 
     pub async fn commands_for(
@@ -1594,7 +1550,7 @@ impl WorkflowRuntimeStore {
                                 } else {
                                     WorkflowCommandStatus::HandledInline
                                 };
-                                insert_workflow_command_tx(
+                                command_store::insert_tx(
                                     &mut tx,
                                     &instance.id,
                                     Some(&record.id),
@@ -1653,7 +1609,7 @@ impl WorkflowRuntimeStore {
             return Ok(None);
         }
 
-        job.claim(owner, next_lease_expires_at);
+        job.renew_lease(owner, next_lease_expires_at);
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         sqlx::query(
@@ -1683,6 +1639,25 @@ impl WorkflowRuntimeStore {
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub async fn runtime_job_matches_running_lease(
+        &self,
+        expected: &RuntimeJob,
+    ) -> anyhow::Result<bool> {
+        let Some(expected_lease) = expected.lease.as_ref() else {
+            return Ok(false);
+        };
+        let Some(current) = self.get_runtime_job(&expected.id).await? else {
+            return Ok(false);
+        };
+        let Some(current_lease) = current.lease.as_ref() else {
+            return Ok(false);
+        };
+        Ok(current.status == RuntimeJobStatus::Running
+            && current.lease_generation == expected.lease_generation
+            && current_lease.owner == expected_lease.owner
+            && current_lease.expires_at >= expected_lease.expires_at)
     }
 
     pub async fn runtime_jobs_for_command(
@@ -1950,44 +1925,6 @@ async fn insert_decision_record_tx(
     .execute(&mut **tx)
     .await?;
     Ok(())
-}
-
-async fn insert_workflow_command_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_id: &str,
-    decision_id: Option<&str>,
-    command: &WorkflowCommand,
-    status: WorkflowCommandStatus,
-) -> anyhow::Result<String> {
-    let data = to_jsonb_string(command)?;
-    let command_type = enum_str(&command.command_type)?;
-    let (id,): (String,) = sqlx::query_as(
-        "INSERT INTO workflow_commands
-            (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-         ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
-            status = CASE
-                WHEN workflow_commands.status = 'pending' THEN EXCLUDED.status
-                ELSE workflow_commands.status
-            END,
-            updated_at = CASE
-                WHEN workflow_commands.status = 'pending'
-                     AND workflow_commands.status <> EXCLUDED.status
-                THEN CURRENT_TIMESTAMP
-                ELSE workflow_commands.updated_at
-            END
-         RETURNING id",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(workflow_id)
-    .bind(decision_id)
-    .bind(&command_type)
-    .bind(&command.dedupe_key)
-    .bind(status.as_str())
-    .bind(&data)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(id)
 }
 
 async fn load_or_insert_initial_instance_tx(

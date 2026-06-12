@@ -23,6 +23,7 @@ This design covers every workflow definition currently wired through the runtime
 5. **Transitions that require work must create commands.** The validator enforces required command types for workflow transitions such as repo backlog scan, sprint planning, and child workflow dispatch. A state move without the command that makes the next state progress is rejected.
 6. **Terminal states are not ordinary scheduler candidates.** Normal sweepers must not reopen `failed`, `done`, or `cancelled` workflows. Recovery from a terminal state requires an explicit recovery path and validation context.
 7. **Runtime job completion is lease-owned.** A worker may complete a runtime job only while it still owns the exact running job lease. Late output from an expired lease is ignored and cannot overwrite a reclaimed job, even when the next worker reuses the same owner name.
+8. **Server-owned lifecycle side effects are replay-idempotent.** Built-in activities that create or update child workflow state must check the exact running runtime job lease before writing. If a worker crashes after child workflow start or auto-submit side effects but before parent completion commits, replay must reuse the same parent command/runtime job markers and must not append duplicate child start/submission events or duplicate child commands.
 
 ## Agent Output Boundary
 
@@ -109,6 +110,7 @@ Required checks for this hardening layer:
 | Terminal boundary | Repo backlog `failed` is not an ordinary poll candidate |
 | Activity result parsing | Missing/malformed/mismatched structured results become configuration failures |
 | Runtime job lease ownership | Stale worker completion is ignored after another worker reclaims the job |
+| Child workflow replay | Reclaimed child workflow start jobs reuse prior child start/submission side effects for the same parent command without duplicating child events or commands |
 
 ## Non-Goals
 

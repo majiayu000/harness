@@ -35,6 +35,8 @@ mod runtime_dispatch_tests;
 mod runtime_task_route_tests;
 mod runtime_tree_tests;
 mod runtime_worker_followup_tests;
+mod runtime_worker_non_issue_replay_tests;
+mod runtime_worker_replay_tests;
 mod runtime_worker_tests;
 mod runtime_worker_workspace_tests;
 mod task_detail_sse_tests;

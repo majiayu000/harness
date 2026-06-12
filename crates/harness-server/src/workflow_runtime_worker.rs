@@ -1,6 +1,8 @@
 mod activity_contract;
 mod activity_result;
 mod child_workflow;
+mod child_workflow_non_issue;
+mod child_workflow_replay;
 mod data_helpers;
 mod executor;
 mod pr_feedback_inspection;

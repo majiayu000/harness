@@ -519,6 +519,8 @@ pub struct RuntimeJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<WorkflowLease>,
     #[serde(default)]
+    pub lease_generation: u64,
+    #[serde(default)]
     pub input: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
@@ -545,6 +547,7 @@ impl RuntimeJob {
             runtime_profile: runtime_profile.into(),
             status: RuntimeJobStatus::Pending,
             lease: None,
+            lease_generation: 0,
             input,
             output: None,
             error: None,
@@ -561,6 +564,11 @@ impl RuntimeJob {
 
     pub fn claim(&mut self, owner: impl Into<String>, expires_at: DateTime<Utc>) {
         self.status = RuntimeJobStatus::Running;
+        self.lease_generation = self.lease_generation.saturating_add(1);
+        self.renew_lease(owner, expires_at);
+    }
+
+    pub fn renew_lease(&mut self, owner: impl Into<String>, expires_at: DateTime<Utc>) {
         self.lease = Some(WorkflowLease {
             owner: owner.into(),
             expires_at,
