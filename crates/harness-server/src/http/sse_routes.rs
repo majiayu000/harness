@@ -153,7 +153,8 @@ async fn runtime_task_sse_stream(
         return Ok(None);
     };
     let Some(workflow) =
-        crate::workflow_runtime_submission::runtime_issue_by_task_id(&store, &task_id).await?
+        crate::workflow_runtime_submission::runtime_issue_by_submission_id(&store, &task_id)
+            .await?
     else {
         return Ok(None);
     };

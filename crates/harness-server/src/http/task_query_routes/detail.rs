@@ -14,6 +14,7 @@ struct FullTaskResponse {
 struct RuntimeTaskResponse {
     id: String,
     task_id: String,
+    submission_id: String,
     task_kind: TaskKind,
     status: String,
     execution_path: &'static str,
@@ -91,7 +92,10 @@ async fn runtime_task_response_by_handle(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(None);
     };
-    let Some(workflow) = store.get_instance_by_task_id(task_id.as_str()).await? else {
+    let Some(workflow) = store
+        .get_instance_by_submission_id(task_id.as_str())
+        .await?
+    else {
         return Ok(None);
     };
     let issue = workflow
@@ -106,9 +110,13 @@ async fn runtime_task_response_by_handle(
         return Ok(None);
     };
     let external_id = runtime_external_id(task_kind, &workflow.data, issue);
+    let submission_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
+        .unwrap_or_else(|| task_id.clone())
+        .0;
     Ok(Some(RuntimeTaskResponse {
-        id: task_id.as_str().to_string(),
-        task_id: task_id.as_str().to_string(),
+        id: submission_id.clone(),
+        task_id: submission_id.clone(),
+        submission_id,
         task_kind,
         status: workflow.state.clone(),
         execution_path: "workflow_runtime",
@@ -412,7 +420,10 @@ async fn runtime_proof_by_handle(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(RuntimeProofLookup::Missing);
     };
-    let Some(workflow) = store.get_instance_by_task_id(task_id.as_str()).await? else {
+    let Some(workflow) = store
+        .get_instance_by_submission_id(task_id.as_str())
+        .await?
+    else {
         return Ok(RuntimeProofLookup::Missing);
     };
     let status = RuntimeWorkflowProjection::from_workflow(&workflow).task_status;
@@ -421,8 +432,13 @@ async fn runtime_proof_by_handle(
     }
     let events = store.events_for(&workflow.id).await?;
     let decisions = store.decisions_for(&workflow.id).await?;
+    let proof_task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
+        .unwrap_or_else(|| task_id.clone());
     Ok(RuntimeProofLookup::Terminal(proof_from_runtime_workflow(
-        task_id, &workflow, &events, &decisions,
+        &proof_task_id,
+        &workflow,
+        &events,
+        &decisions,
     )))
 }
 

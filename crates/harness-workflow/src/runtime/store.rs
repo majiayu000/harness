@@ -483,14 +483,32 @@ impl WorkflowRuntimeStore {
         &self,
         task_id: &str,
     ) -> anyhow::Result<Option<WorkflowInstance>> {
+        self.get_instance_by_submission_id(task_id).await
+    }
+
+    pub async fn get_instance_by_submission_id(
+        &self,
+        submission_id: &str,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT data::text FROM workflow_instances
-             WHERE data->'data'->>'task_id' = $1
-                OR data->'data'->'task_ids' ? $1
-             ORDER BY updated_at DESC
+             WHERE data->'data'->>'submission_id' = $1
+                OR (
+                    NULLIF(data->'data'->>'submission_id', '') IS NULL
+                    AND (
+                        data->'data'->>'task_id' = $1
+                        OR data->'data'->'task_ids' ? $1
+                    )
+                )
+             ORDER BY
+               CASE
+                 WHEN data->'data'->>'submission_id' = $1 THEN 0
+                 ELSE 1
+               END,
+               updated_at DESC
              LIMIT 1",
         )
-        .bind(task_id)
+        .bind(submission_id)
         .fetch_optional(&self.pool)
         .await?;
         row.map(|(data,)| serde_json::from_str(&data))
@@ -702,11 +720,11 @@ impl WorkflowRuntimeStore {
                    OR (data->>'created_at')::timestamptz < $3
                    OR (
                        (data->>'created_at')::timestamptz = $3
-                       AND COALESCE(data->'data'->'task_ids'->>0, data->'data'->>'task_id', id) < COALESCE($4::text, '')
+                       AND COALESCE(data->'data'->>'submission_id', data->'data'->'task_ids'->>0, data->'data'->>'task_id', id) < COALESCE($4::text, '')
                    )
                )
              ORDER BY (data->>'created_at')::timestamptz DESC,
-                      COALESCE(data->'data'->'task_ids'->>0, data->'data'->>'task_id', id) DESC
+                      COALESCE(data->'data'->>'submission_id', data->'data'->'task_ids'->>0, data->'data'->>'task_id', id) DESC
              LIMIT $5",
         )
         .bind(definition_id)

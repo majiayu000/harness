@@ -98,11 +98,13 @@ pub(crate) async fn record_prompt_submission(
     persist_prompt_submission(store, &ctx).await
 }
 
-pub(crate) async fn runtime_issue_by_task_id(
+pub(crate) async fn runtime_issue_by_submission_id(
     store: &WorkflowRuntimeStore,
-    task_id: &TaskId,
+    submission_id: &TaskId,
 ) -> anyhow::Result<Option<WorkflowInstance>> {
-    store.get_instance_by_task_id(task_id.as_str()).await
+    store
+        .get_instance_by_submission_id(submission_id.as_str())
+        .await
 }
 
 pub(crate) fn runtime_issue_task_handle(instance: &WorkflowInstance) -> Option<TaskId> {

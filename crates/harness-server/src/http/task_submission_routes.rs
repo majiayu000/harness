@@ -248,7 +248,10 @@ async fn runtime_workflow_by_handle(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(None);
     };
-    let Some(workflow) = store.get_instance_by_task_id(task_id.as_str()).await? else {
+    let Some(workflow) = store
+        .get_instance_by_submission_id(task_id.as_str())
+        .await?
+    else {
         return Ok(None);
     };
     if is_runtime_submission_definition(&workflow.definition_id) {
@@ -516,6 +519,27 @@ mod tests {
     }
 
     #[test]
+    fn runtime_submission_handle_prefers_explicit_submission_id() {
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:1129"),
+        )
+        .with_data(json!({
+            "submission_id": "stable-submission",
+            "task_id": "retry-handle",
+            "task_ids": ["stable-submission", "retry-handle"]
+        }));
+        let fallback = harness_core::types::TaskId::from_str("fallback-handle");
+
+        assert_eq!(
+            runtime_submission_handle(&workflow, &fallback),
+            "stable-submission"
+        );
+    }
+
+    #[test]
     fn runtime_job_artifacts_keep_submission_handle() -> anyhow::Result<()> {
         let result = ActivityResult::succeeded("implement_issue", "done").with_artifact(
             ActivityArtifact::new("pull_request", json!({"number": 1157})),
@@ -589,8 +613,8 @@ mod tests {
         state.core.workflow_runtime_store = Some(store.clone());
         let state = Arc::new(state);
 
-        let lookup_task_id = harness_core::types::TaskId::from_str("runtime-route-handle");
         let canonical_task_id = harness_core::types::TaskId::from_str("runtime-canonical-handle");
+        let retry_task_id = harness_core::types::TaskId::from_str("runtime-route-handle");
         let workflow = WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
@@ -599,8 +623,9 @@ mod tests {
         )
         .with_id("runtime-route-workflow")
         .with_data(json!({
-            "task_id": lookup_task_id.as_str(),
-            "task_ids": [canonical_task_id.as_str(), lookup_task_id.as_str()],
+            "submission_id": canonical_task_id.as_str(),
+            "task_id": retry_task_id.as_str(),
+            "task_ids": [canonical_task_id.as_str(), retry_task_id.as_str()],
             "issue_number": 1128,
             "repo": "owner/repo",
             "project_id": "/tmp/project"
@@ -638,7 +663,7 @@ mod tests {
         assert!(state
             .core
             .tasks
-            .get_with_db_fallback(&lookup_task_id)
+            .get_with_db_fallback(&canonical_task_id)
             .await?
             .is_none());
 
@@ -649,17 +674,17 @@ mod tests {
             .route("/tasks/{id}/prompts", get(get_task_prompts))
             .with_state(state);
 
-        let detail = get_json(&app, "/tasks/runtime-route-handle").await?;
-        assert_eq!(detail["id"], "runtime-route-handle");
+        let detail = get_json(&app, "/tasks/runtime-canonical-handle").await?;
+        assert_eq!(detail["id"], "runtime-canonical-handle");
         assert_eq!(detail["task_id"], "runtime-canonical-handle");
         assert_eq!(detail["submission_id"], "runtime-canonical-handle");
         assert_eq!(detail["workflow_id"], "runtime-route-workflow");
 
-        let artifacts = get_json(&app, "/tasks/runtime-route-handle/artifacts").await?;
+        let artifacts = get_json(&app, "/tasks/runtime-canonical-handle/artifacts").await?;
         assert_eq!(artifacts[0]["task_id"], "runtime-canonical-handle");
         assert_eq!(artifacts[0]["artifact_type"], "pull_request");
 
-        let prompts = get_json(&app, "/tasks/runtime-route-handle/prompts").await?;
+        let prompts = get_json(&app, "/tasks/runtime-canonical-handle/prompts").await?;
         assert_eq!(
             prompts
                 .as_array()

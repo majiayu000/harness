@@ -90,8 +90,9 @@ Legacy task rows keep `task_id` as the primary id and omit `workflow_id`.
 
 The `{id}` parameter addresses a submission handle during migration:
 
-- runtime-owned rows resolve by `submission_id` or any historical `task_id`
-  alias recorded in `data.task_ids`
+- runtime-owned rows with explicit `submission_id` resolve by `submission_id`
+- persisted runtime rows without `submission_id` continue to resolve by the
+  historical `task_id` alias recorded in `data.task_ids` or `data.task_id`
 - legacy rows resolve by real `TaskStore` task id
 
 The response for a runtime-owned row must include `workflow_id` so clients do
@@ -159,7 +160,8 @@ must not require a legacy `TaskStore` row once #1128 lands.
 
 - Remove runtime-owned reliance on `data.task_id` as the public handle.
 - Keep historical alias lookup only for persisted workflows that predate
-  `submission_id`, or remove it with an explicit migration.
+  `submission_id`; rows with explicit `submission_id` must not use retry
+  `task_id` values as public lookup aliases.
 - Remove `/tasks` compatibility branches that only exist to make runtime-owned
   workflows look like legacy task rows.
 
@@ -184,3 +186,6 @@ implementation:
   routes document their identity ownership
 - runtime-owned responses expose `workflow_id`
 - runtime-owned flows do not require a legacy `TaskStore` row
+- rows with explicit `submission_id` resolve through that handle, while
+  historical `task_id` aliases remain limited to rows that predate
+  `submission_id`
