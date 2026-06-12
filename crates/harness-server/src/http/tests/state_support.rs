@@ -253,9 +253,8 @@ pub(super) async fn make_test_state_with_project_root(
     mut config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
-    let _ = crate::test_helpers::test_database_url()?;
     let db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
-    let database_url = crate::test_helpers::ensure_test_database_url_override()?;
+    let database_url = crate::test_helpers::test_database_url()?;
     config.server.database_url = Some(database_url.clone());
     let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
         (cfg.enabled && crate::intake::feishu::has_verification_token(cfg))
@@ -324,6 +323,7 @@ pub(super) async fn make_test_state_with_project_root(
         None,
         vec![],
     );
+    drop(db_state_guard);
     Ok(Arc::new(AppState {
         core: crate::http::CoreServices {
             server,
@@ -366,7 +366,7 @@ pub(super) async fn make_test_state_with_project_root(
             workspace_mgr: None,
         },
         #[cfg(test)]
-        _db_state_guard: Some(db_state_guard),
+        _db_state_guard: None,
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),

@@ -64,13 +64,12 @@ fn http_listener_starts_before_background_work() {
 async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
     // Hold the shared HOME_LOCK so no sibling test races on HOME.
     let _lock = HOME_LOCK.lock().await;
-    let _ = crate::test_helpers::test_database_url()?;
 
     let sandbox = tempfile::tempdir()?;
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
     let data_dir = sandbox.path().join("data");
-    let database_url = crate::test_helpers::ensure_test_database_url_override()?;
+    let database_url = crate::test_helpers::test_database_url()?;
 
     // Redirect HOME to an empty sandbox directory so that
     // $HOME/.harness/skills/ cannot shadow the persisted skill under

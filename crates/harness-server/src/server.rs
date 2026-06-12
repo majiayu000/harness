@@ -83,6 +83,8 @@ impl HarnessServer {
         agent_registry: AgentRegistry,
     ) -> Self {
         config.apply_derived_defaults();
+        #[cfg(test)]
+        crate::test_helpers::configure_test_pg_pool_defaults();
         let retention_days = config.observe.log_retention_days;
         Self {
             config,

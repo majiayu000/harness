@@ -141,7 +141,7 @@ async fn make_read_only_route_test_state_with_project_root(
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
     let db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
-    let database_url = crate::test_helpers::ensure_test_database_url_override()?;
+    let database_url = crate::test_helpers::test_database_url()?;
     config.server.database_url = Some(database_url.clone());
     let feishu_intake = config.intake.feishu.as_ref().and_then(|cfg| {
         (cfg.enabled && crate::intake::feishu::has_verification_token(cfg))
