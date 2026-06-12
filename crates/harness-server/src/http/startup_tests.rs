@@ -64,7 +64,6 @@ fn http_listener_starts_before_background_work() {
 async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
     // Hold the shared HOME_LOCK so no sibling test races on HOME.
     let _lock = HOME_LOCK.lock().await;
-    let _ = crate::test_helpers::test_database_url()?;
 
     let sandbox = tempfile::tempdir()?;
     let project_root = sandbox.path().join("project");

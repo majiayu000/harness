@@ -253,7 +253,6 @@ pub(super) async fn make_test_state_with_project_root(
     mut config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
-    let _ = crate::test_helpers::test_database_url()?;
     let db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
     let database_url = crate::test_helpers::test_database_url()?;
     config.server.database_url = Some(database_url.clone());
