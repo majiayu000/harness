@@ -115,6 +115,16 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         },
     )
     .await?;
+    let mut submitted_child = store
+        .get_instance(&child_id)
+        .await?
+        .expect("child workflow should exist after submission");
+    if let Some(data) = submitted_child.data.as_object_mut() {
+        data.remove("submission_id");
+        data.remove("task_id");
+        data.remove("task_ids");
+    }
+    store.upsert_instance(&submitted_child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,
@@ -151,6 +161,8 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         child_commands[0].command.activity_name(),
         Some("plan_issue")
     );
+    let child_decisions = store.decisions_for(&child_id).await?;
+    assert_eq!(child_decisions.len(), 1);
     let parent_after = store
         .get_instance("repo-backlog-auto-submit-replay")
         .await?

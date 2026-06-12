@@ -56,7 +56,7 @@ fn child_started_by_command(child: &WorkflowInstance, command_id: &str) -> bool 
         .is_some_and(|recorded| recorded == command_id)
 }
 
-fn issue_submission_recorded(child: &WorkflowInstance, task_id: &TaskId) -> bool {
+fn issue_submission_data_recorded(child: &WorkflowInstance, task_id: &TaskId) -> bool {
     let task_id = task_id.as_str();
     child
         .data
@@ -74,6 +74,33 @@ fn issue_submission_recorded(child: &WorkflowInstance, task_id: &TaskId) -> bool
                     .filter_map(Value::as_str)
                     .any(|recorded| recorded == task_id)
             })
+}
+
+async fn issue_submission_event_recorded(
+    store: &WorkflowRuntimeStore,
+    child_id: &str,
+    task_id: &TaskId,
+) -> anyhow::Result<bool> {
+    let task_id = task_id.as_str();
+    Ok(store.events_for(child_id).await?.iter().any(|event| {
+        event.event_type == "IssueSubmitted"
+            && event
+                .event
+                .get("task_id")
+                .and_then(Value::as_str)
+                .is_some_and(|recorded| recorded == task_id)
+    }))
+}
+
+async fn issue_submission_recorded(
+    store: &WorkflowRuntimeStore,
+    child: &WorkflowInstance,
+    task_id: &TaskId,
+) -> anyhow::Result<bool> {
+    if issue_submission_data_recorded(child, task_id) {
+        return Ok(true);
+    }
+    issue_submission_event_recorded(store, &child.id, task_id).await
 }
 
 pub(super) async fn execute_start_child_workflow(
@@ -182,7 +209,7 @@ pub(super) async fn execute_start_child_workflow(
             "repo-backlog:{}:issue:{issue_number}",
             repo.unwrap_or("<none>")
         ));
-        if !issue_submission_recorded(&child, &task_id) {
+        if !issue_submission_recorded(store, &child, &task_id).await? {
             let source = optional_string(command, "source").unwrap_or_else(|| "github".to_string());
             let external_id =
                 optional_string(command, "external_id").unwrap_or_else(|| issue_number.to_string());
