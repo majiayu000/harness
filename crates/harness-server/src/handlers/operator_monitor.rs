@@ -87,6 +87,7 @@ struct LegacyQueueCounts {
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
 struct SourceActivity {
     source: String,
+    pending: u64,
     running: u64,
     review: u64,
     blocked: u64,
@@ -490,6 +491,7 @@ fn add_workflow_source_activity(
             ..Default::default()
         });
     match workflow_bucket(workflow) {
+        WorkflowBucket::Pending => entry.pending += 1,
         WorkflowBucket::Running => entry.running += 1,
         WorkflowBucket::Review => entry.review += 1,
         WorkflowBucket::AwaitingDependencies | WorkflowBucket::Blocked => entry.blocked += 1,
@@ -536,7 +538,12 @@ fn add_legacy_source_activity(by_source: &mut HashMap<String, SourceActivity>, t
 }
 
 fn source_total(source: &SourceActivity) -> u64 {
-    source.running + source.review + source.blocked + source.failed + source.ready_to_merge
+    source.pending
+        + source.running
+        + source.review
+        + source.blocked
+        + source.failed
+        + source.ready_to_merge
 }
 
 fn operator_actions(

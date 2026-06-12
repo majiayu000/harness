@@ -11,7 +11,7 @@ function fmtDuration(seconds: number): string {
 }
 
 function sourceTotal(source: SourceActivity): number {
-  return source.running + source.review + source.blocked + source.failed + source.ready_to_merge;
+  return source.pending + source.running + source.review + source.blocked + source.failed + source.ready_to_merge;
 }
 
 function Metric({ label, value, tone = "default" }: { label: string; value: string | number; tone?: "default" | "ok" | "warn" | "err" }) {
@@ -71,6 +71,7 @@ function SourceRow({ source }: { source: SourceActivity }) {
   return (
     <tr className="border-b border-line last:border-b-0">
       <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{source.source}</td>
+      <td className="px-3 py-2 text-right font-mono text-[11px] text-ink-3">{fmtInt(source.pending)}</td>
       <td className="px-3 py-2 text-right font-mono text-[11px] text-ink-1">{fmtInt(source.running)}</td>
       <td className="px-3 py-2 text-right font-mono text-[11px] text-ink-2">{fmtInt(source.review)}</td>
       <td className="px-3 py-2 text-right font-mono text-[11px] text-sand">{fmtInt(source.ready_to_merge)}</td>

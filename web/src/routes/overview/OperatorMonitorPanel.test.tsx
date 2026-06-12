@@ -52,6 +52,7 @@ function makeMonitor(): OperatorMonitorPayload {
       by_source: [
         {
           source: "github",
+          pending: 1,
           running: 2,
           review: 1,
           ready_to_merge: 1,

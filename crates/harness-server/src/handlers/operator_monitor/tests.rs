@@ -372,6 +372,7 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
             workflow("awaiting_dependencies", json!({ "source": "github" })),
             workflow("checking", json!({ "source": "github" })),
             workflow("awaiting_feedback", json!({ "source": "github" })),
+            workflow("scheduled", json!({ "source": "github" })),
         ],
         &[legacy_row, queued_row],
     );
@@ -379,6 +380,7 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     assert_eq!(by_source.len(), 1);
     let source = by_source.pop().expect("source row");
     assert_eq!(source.source, "github");
+    assert_eq!(source.pending, 1);
     assert_eq!(source.ready_to_merge, 1);
     assert_eq!(source.review, 1);
     assert_eq!(source.running, 1);
