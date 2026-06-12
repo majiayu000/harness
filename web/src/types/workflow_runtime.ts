@@ -85,7 +85,7 @@ export interface WorkflowRuntimeCommandNode {
   command: {
     command_type: string;
     dedupe_key: string;
-    command: Record<string, unknown>;
+    command: unknown;
   };
   runtime_job_count?: number;
   runtime_jobs: WorkflowRuntimeJob[];
