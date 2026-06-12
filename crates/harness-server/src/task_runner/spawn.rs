@@ -797,6 +797,8 @@ where
                 workspace_path = %lease.workspace_path.display(),
                 workspace_owner = %lease.owner_session,
                 run_generation = lease.run_generation,
+                workspace_project_key = %lease.project_key,
+                workspace_slot_index = lease.slot_index,
                 workspace_decision = ?lease.decision,
                 "workspace admitted"
             );
@@ -950,7 +952,7 @@ where
                     tracing::warn!("workspace cleanup failed for {id:?}: {e}");
                 }
             } else {
-                wmgr.release_workspace(&id);
+                wmgr.release_workspace(&id).await;
             }
         }
 

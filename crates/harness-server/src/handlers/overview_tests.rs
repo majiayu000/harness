@@ -426,10 +426,13 @@ async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()>
                 source_repo: dir.path().to_path_buf(),
                 repo: None,
                 runtime_workflow_id: None,
+                project_key: "test-project".to_string(),
+                slot_index: i as u32,
                 branch: format!("harness/fake-{i}"),
                 created_at: std::time::SystemTime::now(),
                 owner_session: format!("session-{i}"),
                 run_generation: 1,
+                _pool_permit: None,
             },
         );
     }

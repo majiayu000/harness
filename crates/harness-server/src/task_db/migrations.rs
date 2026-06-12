@@ -18,6 +18,7 @@ use harness_core::db::Migration;
 /// v21 – add workspace lifecycle ownership and failure classification columns.
 /// v22 – add scheduler_state column as the single authoritative ownership/recovery contract.
 /// v23 – add indexes for server-side task list filters.
+/// v24 – add persisted workspace lease rows for the per-project worktree pool.
 pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -174,5 +175,10 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
               ON tasks(source, created_at DESC); \
               CREATE INDEX IF NOT EXISTS idx_tasks_kind_created \
               ON tasks(task_kind, created_at DESC)",
+    },
+    Migration {
+        version: 24,
+        description: "create workspace leases table",
+        sql: crate::workspace_lease_store::WORKSPACE_LEASES_TABLE_SQL,
     },
 ];

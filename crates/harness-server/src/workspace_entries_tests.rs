@@ -23,10 +23,13 @@ fn workspace_entries_return_active_workspace_metadata_sorted_by_task_id() {
                 source_repo: source_repo.clone(),
                 repo: Some("owner/repo".to_string()),
                 runtime_workflow_id: Some("workflow-1".to_string()),
+                project_key: "test-project".to_string(),
+                slot_index: 0,
                 branch: format!("harness/{}", task_id.0),
                 created_at,
                 owner_session: mgr.owner_session.clone(),
                 run_generation: 1,
+                _pool_permit: None,
             },
         );
         mgr.active_paths.insert(workspace_path, task_id);

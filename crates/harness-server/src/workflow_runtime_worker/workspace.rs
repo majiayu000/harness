@@ -184,7 +184,7 @@ pub(super) async fn finish_runtime_workspace(
         }
         workspace_mgr.remove_workspace(task_id).await?;
     } else {
-        workspace_mgr.release_workspace(task_id);
+        workspace_mgr.release_workspace(task_id).await;
     }
     hook_result
 }
@@ -221,12 +221,14 @@ pub(super) async fn cleanup_terminal_runtime_workspace(
         .get("repo")
         .and_then(serde_json::Value::as_str)
         .or(workflow_document.config.source.repo.as_deref());
-    let workspace_path = workspace_mgr.workspace_path_for(
-        &task_id,
-        &source_project_root,
-        Some(workflow.subject.subject_key.as_str()),
-        repo,
-    );
+    let workspace_path = workspace_mgr
+        .workspace_path_for_cleanup(
+            &task_id,
+            &source_project_root,
+            Some(workflow.subject.subject_key.as_str()),
+            repo,
+        )
+        .await;
     if workspace_path.exists() {
         if let Some(hook) = workflow_document.config.hooks.before_remove.as_deref() {
             if let Err(error) = run_workflow_hook(
@@ -248,7 +250,7 @@ pub(super) async fn cleanup_terminal_runtime_workspace(
             .cleanup_workspace_for_retry(&task_id, &source_project_root, Some(&workspace_path))
             .await
     } else {
-        workspace_mgr.release_workspace(&task_id);
+        workspace_mgr.release_workspace(&task_id).await;
         Ok(())
     }
 }

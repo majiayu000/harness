@@ -353,7 +353,7 @@ async fn create_workspace_persists_owner_record_outside_checkout_root() {
 }
 
 #[tokio::test]
-async fn deterministic_issue_workspace_reuses_existing_directory_for_new_task() {
+async fn pool_slot_reuse_resets_existing_directory_for_new_task() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
     let branch = current_branch(source.path());
@@ -382,7 +382,7 @@ async fn deterministic_issue_workspace_reuses_existing_directory_for_new_task() 
         .expect("create first workspace");
     let marker = first.workspace_path.join("handoff.txt");
     std::fs::write(&marker, "keep this file").expect("write marker");
-    mgr.release_workspace(&first_task);
+    mgr.release_workspace(&first_task).await;
 
     let second = mgr
         .create_workspace(
@@ -398,20 +398,20 @@ async fn deterministic_issue_workspace_reuses_existing_directory_for_new_task() 
         .expect("reuse deterministic workspace");
 
     assert_eq!(first.workspace_path, second.workspace_path);
-    assert_eq!(second.decision, WorkspaceAcquireDecision::ReusedRecovered);
+    assert_eq!(second.decision, WorkspaceAcquireDecision::RecreatedStale);
     assert!(
-        second.workspace_path.join("handoff.txt").exists(),
-        "reused workspace must preserve prior task output"
+        !second.workspace_path.join("handoff.txt").exists(),
+        "reused pool slot must be reset before the next task"
     );
     let owner = read_owner_record(&second.workspace_path).expect("owner record");
-    assert_eq!(owner.task_id, second_task.0);
+    assert_eq!(owner.task_id, "issue:42");
     assert!(owner.workspace_key.is_some());
 
     mgr.remove_workspace(&second_task).await.expect("remove");
 }
 
 #[tokio::test]
-async fn create_workspace_blocks_inflight_duplicate_deterministic_path() {
+async fn create_workspace_allocates_distinct_slots_for_concurrent_same_repo_tasks() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
     let branch = current_branch(source.path());
@@ -424,20 +424,9 @@ async fn create_workspace_blocks_inflight_duplicate_deterministic_path() {
     let mgr = WorkspaceManager::new(config).expect("new");
     let first_task = harness_core::types::TaskId("task-first".to_string());
     let second_task = harness_core::types::TaskId("task-second".to_string());
-    let workspace_key = derive_workspace_key(
-        &first_task,
-        Some("issue:42"),
-        Some("owner/repo"),
-        Some(source.path()),
-    );
-    let reserved_path = mgr.config.root.join(workspace_key);
-
-    mgr.active_paths
-        .insert(reserved_path.clone(), first_task.clone());
-
-    let err = mgr
+    let first = mgr
         .create_workspace(
-            &second_task,
+            &first_task,
             source.path(),
             "origin",
             &branch,
@@ -446,19 +435,143 @@ async fn create_workspace_blocks_inflight_duplicate_deterministic_path() {
             Some("owner/repo"),
         )
         .await
-        .expect_err("second task should be blocked by the path reservation");
+        .expect("first task should acquire a pool slot");
+    let second = mgr
+        .create_workspace(
+            &second_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:43"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect("second task should acquire a different pool slot");
 
+    assert_ne!(first.workspace_path, second.workspace_path);
+    assert_eq!(first.slot_index, 0);
+    assert_eq!(second.slot_index, 1);
+    assert_eq!(mgr.live_count(), 2);
+
+    mgr.remove_workspace(&first_task)
+        .await
+        .expect("remove first");
+    mgr.remove_workspace(&second_task)
+        .await
+        .expect("remove second");
+}
+
+#[tokio::test]
+async fn create_workspace_waits_when_project_pool_is_full() {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let mgr = std::sync::Arc::new(
+        WorkspaceManager::new_with_pool(
+            config,
+            WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+            None,
+        )
+        .expect("new"),
+    );
+    let first_task = harness_core::types::TaskId("pool-full-first".to_string());
+    let second_task = harness_core::types::TaskId("pool-full-second".to_string());
+
+    let first = mgr
+        .create_workspace(
+            &first_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect("first task should acquire the only slot");
+    assert_eq!(first.slot_index, 0);
+
+    let mgr_for_second = mgr.clone();
+    let source_path = source.path().to_path_buf();
+    let branch_for_second = branch.clone();
+    let second_task_for_spawn = second_task.clone();
+    let second_handle = tokio::spawn(async move {
+        mgr_for_second
+            .create_workspace(
+                &second_task_for_spawn,
+                &source_path,
+                "origin",
+                &branch_for_second,
+                1,
+                Some("issue:43"),
+                Some("owner/repo"),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(
-        err.to_string().contains("already reserved by active task"),
-        "error should identify the in-flight deterministic path owner: {err}"
+        !second_handle.is_finished(),
+        "second acquire should wait while the only slot is leased"
     );
-    assert!(mgr.get_workspace(&second_task).is_none());
+
+    mgr.release_workspace(&first_task).await;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), second_handle)
+        .await
+        .expect("second acquire should unblock")
+        .expect("second task should join")
+        .expect("second task should acquire after release");
+    assert_eq!(second.slot_index, 0);
+    assert_eq!(second.decision, WorkspaceAcquireDecision::RecreatedStale);
+
+    mgr.remove_workspace(&second_task)
+        .await
+        .expect("remove second");
+}
+
+#[tokio::test]
+async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = WorkspaceLeaseStore::open(&dir.path().join("workspace-leases")).await?;
+    let task_id = harness_core::types::TaskId("lease-store-task".to_string());
+    let record = WorkspaceLeaseRecord {
+        project_key: "project-a".to_string(),
+        slot_index: 0,
+        task_id: task_id.clone(),
+        workspace_path: dir.path().join("workspaces/project-a-slot-0"),
+        source_repo: dir.path().join("repo"),
+        repo: Some("owner/repo".to_string()),
+        runtime_workflow_id: Some("workflow-1".to_string()),
+        owner_session: "session-a".to_string(),
+        run_generation: 1,
+        process_id: std::process::id(),
+    };
+
+    store.upsert_lease(&record).await?;
+    assert_eq!(store.list_leased().await?.len(), 1);
     assert_eq!(
-        mgr.active_paths
-            .get(&reserved_path)
-            .map(|owner| owner.value().clone()),
-        Some(first_task)
+        store.latest_workspace_path_for_task(&task_id).await?,
+        Some(record.workspace_path.clone())
     );
+    assert!(
+        store
+            .release_slot(&record.project_key, record.slot_index, &task_id)
+            .await?,
+        "release should update the active lease"
+    );
+    assert!(store.list_leased().await?.is_empty());
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -757,7 +870,10 @@ async fn create_workspace_reconciles_stale_directory() {
     let task_id = harness_core::types::TaskId("stale-task-check-001".to_string());
 
     // Pre-create the directory to simulate a stale worktree from a previous failed run.
-    let stale_path = workspaces.path().join("stale-task-check-001");
+    let pool_key = crate::workspace_pool::derive_workspace_pool_key(source.path(), None);
+    let stale_path = workspaces
+        .path()
+        .join(crate::workspace_pool::workspace_slot_key(&pool_key, 0));
     std::fs::create_dir_all(&stale_path).expect("create stale dir");
 
     let result = mgr
@@ -1267,10 +1383,15 @@ async fn is_registered_worktree_matches_relative_workspace_paths() {
     let mgr = WorkspaceManager::new(config).expect("new");
     let task_id = harness_core::types::TaskId("test-task-relative-path".to_string());
 
-    mgr.create_workspace(&task_id, &source, "origin", &branch, 1, None, None)
+    let lease = mgr
+        .create_workspace(&task_id, &source, "origin", &branch, 1, None, None)
         .await
         .expect("create");
-    let relative_workspace_path = PathBuf::from("workspaces").join(sanitize_task_id(&task_id.0));
+    let relative_workspace_path = lease
+        .workspace_path
+        .strip_prefix(std::fs::canonicalize(sandbox.path()).expect("canonical sandbox"))
+        .expect("workspace should be under sandbox")
+        .to_path_buf();
 
     assert!(
         is_registered_worktree(&source, &relative_workspace_path).await,
@@ -1463,7 +1584,7 @@ async fn reconcile_disk_skips_uuid_keyed_workspace() {
         .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
         .await
         .expect("create workspace");
-    mgr.release_workspace(&task_id);
+    mgr.release_workspace(&task_id).await;
 
     let summary = mgr
         .reconcile_disk_workspaces(source.path(), "gh", 20, None)

@@ -72,6 +72,8 @@ pub mod trusted_proxy;
 pub mod webhook;
 pub mod websocket;
 pub mod workspace;
+pub(crate) mod workspace_lease_store;
+pub(crate) mod workspace_pool;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;

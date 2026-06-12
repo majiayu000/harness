@@ -1,9 +1,11 @@
 pub(crate) mod engines;
 pub(crate) mod intake;
 pub(crate) mod registry;
+pub(crate) mod registry_failures;
 pub(crate) mod registry_migration;
 pub(crate) mod services;
 pub(crate) mod storage;
+pub(crate) mod workspace_pool_config;
 
 #[cfg(test)]
 tokio::task_local! {

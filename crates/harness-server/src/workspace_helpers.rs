@@ -27,7 +27,7 @@ pub(super) fn sanitize_task_id(id: &str) -> String {
 /// `my_org_repo`). The `/` org-repo separator maps to `_`. GitHub organisation
 /// names cannot contain underscores (only `[a-zA-Z0-9-]`), so the `owner_repo`
 /// output is unambiguous for valid GitHub slugs.
-pub(super) fn sanitize_repo_slug(s: &str) -> String {
+pub(crate) fn sanitize_repo_slug(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '.' || c == '_' {
@@ -43,7 +43,7 @@ pub(super) fn sanitize_repo_slug(s: &str) -> String {
 ///
 /// This is a deterministic, stable hash with no external dependencies, used to
 /// produce a unique project scope component in deterministic workspace keys.
-pub(super) fn fnv1a_8(s: &str) -> String {
+pub(crate) fn fnv1a_8(s: &str) -> String {
     let mut hash: u32 = 0x811c9dc5;
     for b in s.bytes() {
         hash ^= u32::from(b);
@@ -189,20 +189,6 @@ pub(super) fn task_summary_workspace_path(root: &Path, task: &TaskSummary) -> Pa
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join(sanitize_task_id(&task.id.0)))
-}
-
-pub(super) fn owner_record_matches_workspace(
-    record: &WorkspaceOwnerRecord,
-    task_id: &TaskId,
-    workspace_key: &str,
-    run_generation: u32,
-) -> bool {
-    let identity_matches = record
-        .workspace_key
-        .as_deref()
-        .map(|key| key == workspace_key)
-        .unwrap_or(record.task_id == task_id.0);
-    identity_matches && record.run_generation == run_generation
 }
 
 pub(super) fn write_owner_record(

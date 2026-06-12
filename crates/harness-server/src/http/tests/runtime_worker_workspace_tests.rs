@@ -73,10 +73,13 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
             source_repo: project_root.clone(),
             repo: Some("owner/repo".to_string()),
             runtime_workflow_id: Some(workflow.id.clone()),
+            project_key: "test-project".to_string(),
+            slot_index: 0,
             branch: "harness/runtime-wf-github-issue-pr-test".to_string(),
             created_at: std::time::SystemTime::now(),
             owner_session: workspace_mgr.owner_session.clone(),
             run_generation: 1,
+            _pool_permit: None,
         },
     );
     workspace_mgr
