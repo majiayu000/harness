@@ -1,6 +1,6 @@
 use super::*;
 use chrono::Utc;
-use harness_core::db::resolve_database_url;
+use harness_core::db::{pg_open_pool, resolve_database_url, PgStoreContext};
 
 async fn open_test_store() -> anyhow::Result<Option<ReviewStore>> {
     if resolve_database_url(None).is_err() {
@@ -9,6 +9,14 @@ async fn open_test_store() -> anyhow::Result<Option<ReviewStore>> {
     let dir = tempfile::tempdir()?;
     let store = ReviewStore::open(&dir.path().join("review.db")).await?;
     Ok(Some(store))
+}
+
+fn unique_test_schema(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos();
+    format!("{prefix}_{nanos}")
 }
 
 fn make_finding(id: &str, rule_id: &str, file: &str, priority: &str) -> ReviewFinding {
@@ -26,6 +34,69 @@ fn make_finding(id: &str, rule_id: &str, file: &str, priority: &str) -> ReviewFi
         action: "fix it".into(),
         task_id: None,
     }
+}
+
+#[tokio::test]
+async fn legacy_review_store_migration_backfills_shared_schema() -> anyhow::Result<()> {
+    let database_url = match resolve_database_url(None) {
+        Ok(url) => url,
+        Err(_) => return Ok(()),
+    };
+    let dir = tempfile::tempdir()?;
+    let legacy_path = dir.path().join("reviews.db");
+    let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
+        .schema()
+        .to_owned();
+    let target_schema = unique_test_schema("review_store_test");
+    let setup_pool = pg_open_pool(&database_url).await?;
+    let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+    let target_store = ReviewStore::open_with_context(&target_context, &setup_pool).await?;
+    let legacy_store =
+        ReviewStore::open_with_database_url(&legacy_path, Some(&database_url)).await?;
+
+    let result = async {
+        legacy_store
+            .persist_findings(
+                "/tmp/project-a",
+                "rev-legacy",
+                &[make_finding("F1", "RS-03", "src/lib.rs", "P1")],
+            )
+            .await?;
+
+        let copied =
+            migrate_legacy_review_store_if_needed(&legacy_path, Some(&database_url), &target_store)
+                .await?;
+        assert_eq!(copied, 1, "one legacy finding should be copied");
+
+        let copied_again =
+            migrate_legacy_review_store_if_needed(&legacy_path, Some(&database_url), &target_store)
+                .await?;
+        assert_eq!(copied_again, 0, "migration must be idempotent");
+
+        let spawnable = target_store
+            .list_spawnable_findings("rev-legacy", &["P1"])
+            .await?;
+        assert_eq!(spawnable.len(), 1);
+        assert_eq!(spawnable[0].rule_id, "RS-03");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    legacy_store.pool().close().await;
+    target_store.pool().close().await;
+    sqlx::query(&format!(
+        "DROP SCHEMA IF EXISTS \"{legacy_schema}\" CASCADE"
+    ))
+    .execute(&setup_pool)
+    .await?;
+    sqlx::query(&format!(
+        "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
+    ))
+    .execute(&setup_pool)
+    .await?;
+    setup_pool.close().await;
+
+    result
 }
 
 async fn get_cooldown(

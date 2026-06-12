@@ -101,26 +101,40 @@ async fn build_review_store(
         }
     };
 
-    let context =
-        match harness_core::db::PgStoreContext::from_path(&review_db_path, Some(&database_url)) {
-            Ok(context) => context,
-            Err(error) => {
-                setup_pool.close().await;
-                return Ok((
-                    None,
-                    StoreStartupResult::optional("review_store").failed(error.to_string()),
-                ));
-            }
-        };
+    let context = match crate::review_store::ReviewStore::shared_schema_context(Some(&database_url))
+    {
+        Ok(context) => context,
+        Err(error) => {
+            setup_pool.close().await;
+            return Ok((
+                None,
+                StoreStartupResult::optional("review_store").failed(error.to_string()),
+            ));
+        }
+    };
     let review_store =
         crate::review_store::ReviewStore::open_with_context(&context, &setup_pool).await;
     setup_pool.close().await;
 
     match review_store {
-        Ok(store) => Ok((
-            Some(Arc::new(store)),
-            StoreStartupResult::optional("review_store"),
-        )),
+        Ok(store) => {
+            match crate::review_store::migrate_legacy_review_store_if_needed(
+                &review_db_path,
+                Some(&database_url),
+                &store,
+            )
+            .await
+            {
+                Ok(_) => Ok((
+                    Some(Arc::new(store)),
+                    StoreStartupResult::optional("review_store"),
+                )),
+                Err(error) => Ok((
+                    None,
+                    StoreStartupResult::optional("review_store").failed(error.to_string()),
+                )),
+            }
+        }
         Err(error) => Ok((
             None,
             StoreStartupResult::optional("review_store").failed(error.to_string()),
