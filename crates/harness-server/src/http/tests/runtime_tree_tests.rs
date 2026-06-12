@@ -162,7 +162,7 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     let response = workflow_runtime_app(state)
         .oneshot(
             Request::builder()
-                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a")
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a&detail=full")
                 .body(Body::empty())?,
         )
         .await?;
@@ -172,12 +172,17 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     assert_eq!(body["pagination"]["limit"], 100);
     assert_eq!(body["pagination"]["offset"], 0);
     assert_eq!(body["pagination"]["returned"], 2);
+    assert_eq!(body["pagination"]["detail"], "full");
+    assert_eq!(body["pagination"]["summary_only"], false);
     assert_eq!(body["summary"]["total_commands"], 1);
     assert_eq!(body["summary"]["total_runtime_jobs"], 1);
     assert_eq!(body["workflows"][0]["workflow"]["id"], "repo-backlog");
     let child_node = &body["workflows"][0]["children"][0];
     assert_eq!(child_node["workflow"]["id"], "issue-123");
     assert_eq!(child_node["runtime_job_count"], 1);
+    assert_eq!(child_node["event_count"], 1);
+    assert_eq!(child_node["decision_count"], 1);
+    assert_eq!(child_node["command_count"], 1);
     assert_eq!(
         child_node["decisions"][0]["rejection_reason"],
         "replan limit exhausted"
@@ -219,6 +224,235 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
         child_node["commands"][0]["runtime_jobs"][0]["activity_result_envelope"]["final_result"]
             ["status"],
         "succeeded"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_tree_endpoint_defaults_to_compact_polling_shape() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1165"),
+    )
+    .with_id("issue-1165")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 1165,
+    }));
+    store.upsert_instance(&workflow).await?;
+    store
+        .append_event(
+            &workflow.id,
+            "IssueSubmitted",
+            "workflow-runtime-test",
+            serde_json::json!({ "large_payload": "x".repeat(1024) }),
+        )
+        .await?;
+    let accepted = harness_workflow::runtime::WorkflowDecisionRecord::accepted(
+        harness_workflow::runtime::WorkflowDecision::new(
+            workflow.id.clone(),
+            "implementing",
+            "wait",
+            "implementing",
+            "No-op decision used to prove compact counts include accepted decisions.",
+        ),
+        None,
+    );
+    store.record_decision(&accepted).await?;
+    let rejected = harness_workflow::runtime::WorkflowDecisionRecord::rejected(
+        harness_workflow::runtime::WorkflowDecision::new(
+            workflow.id.clone(),
+            "implementing",
+            "run_replan",
+            "replanning",
+            "Rejected decision should remain visible as a compact hint.",
+        ),
+        None,
+        "replan limit exhausted",
+    );
+    store.record_decision(&rejected).await?;
+
+    for index in 0..2 {
+        let command = harness_workflow::runtime::WorkflowCommand::new(
+            harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
+            format!("issue-1165-implement-{index}"),
+            serde_json::json!({
+                "activity": "implement_issue",
+                "large_payload": "x".repeat(1024),
+            }),
+        );
+        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+        let runtime_job = store
+            .enqueue_runtime_job(
+                &command_id,
+                harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+                "codex-high",
+                serde_json::json!({ "large_input": "x".repeat(1024) }),
+            )
+            .await?;
+        store
+            .record_runtime_event(
+                &runtime_job.id,
+                "RuntimePromptPrepared",
+                serde_json::json!({
+                    "prompt_packet_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    "large_payload": "x".repeat(1024),
+                }),
+            )
+            .await?;
+    }
+    let primitive_command = harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::Wait,
+        "issue-1165-wait",
+        serde_json::json!("wait for review"),
+    );
+    store
+        .enqueue_command(&workflow.id, None, &primitive_command)
+        .await?;
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/api/workflows/runtime/tree?project_id=%2Fproject-a&command_limit=3&job_limit=1",
+                )
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["pagination"]["detail"], "compact");
+    assert_eq!(body["pagination"]["command_limit"], 3);
+    assert_eq!(body["summary"]["total_commands"], 3);
+    assert_eq!(body["summary"]["total_runtime_jobs"], 2);
+
+    let node = &body["workflows"][0];
+    assert_eq!(node["event_count"], 1);
+    assert_eq!(node["decision_count"], 2);
+    assert_eq!(node["rejected_decision_count"], 1);
+    assert_eq!(node["command_count"], 3);
+    assert_eq!(node["runtime_job_count"], 2);
+    assert_eq!(node["events"].as_array().expect("events array").len(), 0);
+    assert_eq!(
+        node["decisions"].as_array().expect("decisions array").len(),
+        1
+    );
+    assert_eq!(
+        node["decisions"][0]["rejection_reason"],
+        "replan limit exhausted"
+    );
+    let commands = node["commands"].as_array().expect("commands array");
+    assert_eq!(commands.len(), 3);
+    let implement_command = commands
+        .iter()
+        .find(|command| {
+            command["command"]["command"]["activity"].as_str() == Some("implement_issue")
+        })
+        .expect("compact response should include an implement command");
+    assert!(implement_command["command"]["command"]["large_payload"].is_null());
+    let primitive_command = commands
+        .iter()
+        .find(|command| command["command"]["dedupe_key"].as_str() == Some("issue-1165-wait"))
+        .expect("compact response should include the primitive command");
+    assert_eq!(
+        primitive_command["command"]["command"],
+        serde_json::json!("wait for review")
+    );
+    let jobs = implement_command["runtime_jobs"]
+        .as_array()
+        .expect("runtime jobs array");
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0]["input"].is_null());
+    assert!(jobs[0]["output"].is_null());
+    assert_eq!(jobs[0]["runtime_event_count"], 1);
+    assert_eq!(
+        jobs[0]["latest_runtime_event_type"],
+        "RuntimePromptPrepared"
+    );
+    assert_eq!(
+        jobs[0]["prompt_packet_digest"],
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_tree_endpoint_returns_summary_only_shape() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1166"),
+    )
+    .with_id("issue-1166")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 1166,
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "issue-1166-implement",
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            serde_json::json!({ "workflow_id": workflow.id }),
+        )
+        .await?;
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a&summary_only=true")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["total_workflows"], 1);
+    assert_eq!(body["pagination"]["returned"], 0);
+    assert_eq!(body["pagination"]["has_more"], false);
+    assert_eq!(body["pagination"]["next_offset"], serde_json::Value::Null);
+    assert_eq!(body["pagination"]["summary_only"], true);
+    assert_eq!(body["pagination"]["detail"], "compact");
+    assert_eq!(body["summary"]["total_commands"], 1);
+    assert_eq!(body["summary"]["total_runtime_jobs"], 1);
+    assert_eq!(
+        body["workflows"]
+            .as_array()
+            .expect("workflows should be an array")
+            .len(),
+        0
     );
     Ok(())
 }

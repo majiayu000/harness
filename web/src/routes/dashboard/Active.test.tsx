@@ -333,6 +333,7 @@ describe("<Active>", () => {
                   created_at: "2026-04-30T00:00:00Z",
                   updated_at: "2026-04-30T00:00:00Z",
                 },
+                rejected_decision_count: 6,
                 events: [
                   {
                     id: "event-1",
@@ -428,6 +429,7 @@ describe("<Active>", () => {
     expect(screen.getByText("2 expired/missing")).toBeInTheDocument();
     expect(screen.getByText("repo_backlog - owner/repo")).toBeInTheDocument();
     expect(screen.getByText("github_issue_pr - issue:123")).toBeInTheDocument();
+    expect(screen.getByText("rejected 6")).toBeInTheDocument();
     expect(screen.getByText("activity: replan_issue")).toBeInTheDocument();
     expect(screen.getByText("7 jobs")).toBeInTheDocument();
     expect(

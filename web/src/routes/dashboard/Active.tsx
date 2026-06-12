@@ -102,7 +102,11 @@ function fallbackTriggerLabel(trigger?: string | null): string | null {
 }
 
 function commandLabel(command: WorkflowRuntimeCommandNode): string {
-  const activity = command.command.command.activity;
+  const payload = command.command.command;
+  const activity =
+    payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>).activity
+      : null;
   if (typeof activity === "string" && activity.trim()) return activity;
   return command.command.command_type.replaceAll("_", " ");
 }
@@ -174,6 +178,10 @@ function rejectedDecisions(decisions: WorkflowRuntimeDecisionRecord[]) {
   return decisions.filter((decision) => !decision.accepted);
 }
 
+function rejectedDecisionCount(node: WorkflowRuntimeTreeNode) {
+  return node.rejected_decision_count ?? rejectedDecisions(node.decisions).length;
+}
+
 function workflowRuntimeCounts(nodes: WorkflowRuntimeTreeNode[]) {
   let workflows = 0;
   let commands = 0;
@@ -182,9 +190,11 @@ function workflowRuntimeCounts(nodes: WorkflowRuntimeTreeNode[]) {
 
   const visit = (node: WorkflowRuntimeTreeNode) => {
     workflows += 1;
-    commands += node.commands.length;
-    rejected += rejectedDecisions(node.decisions).length;
-    for (const command of node.commands) jobs += command.runtime_jobs.length;
+    commands += node.command_count ?? node.commands.length;
+    rejected += rejectedDecisionCount(node);
+    jobs +=
+      node.runtime_job_count ??
+      node.commands.reduce((total, command) => total + command.runtime_jobs.length, 0);
     for (const child of node.children) visit(child);
   };
   for (const node of nodes) visit(node);
@@ -224,6 +234,7 @@ function WorkflowRuntimeNode({
   cancellingWorkflowIds?: Set<string>;
 }) {
   const rejected = rejectedDecisions(node.decisions);
+  const rejectedCount = rejectedDecisionCount(node);
   const canCancel = runtimeWorkflowCanCancel(node.workflow);
   const cancelling = cancellingWorkflowIds?.has(node.workflow.id) ?? false;
   return (
@@ -237,15 +248,16 @@ function WorkflowRuntimeNode({
             {node.workflow.definition_id} - {node.workflow.subject.subject_key}
           </div>
           <div className="mt-0.5 truncate font-mono text-[10px] text-ink-3">
-            {node.events.length} events - {node.commands.length} commands
+            {node.event_count ?? node.events.length} events -{" "}
+            {node.command_count ?? node.commands.length} commands
           </div>
         </div>
         <span className="border border-line bg-bg px-1.5 py-[1px] font-mono text-[10px] text-ink-2">
           {workflowLabel(node.workflow.state)}
         </span>
-        {rejected.length > 0 ? (
+        {rejectedCount > 0 ? (
           <span className="border border-rust/40 bg-rust/10 px-1.5 py-[1px] font-mono text-[10px] text-rust">
-            rejected {rejected.length}
+            rejected {rejectedCount}
           </span>
         ) : null}
         {canCancel && onCancel ? (

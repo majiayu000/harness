@@ -602,6 +602,7 @@ collect_runtime_tree_artifact() {
     --data-urlencode "project_id=$project_root" \
     --data-urlencode "limit=100" \
     --data-urlencode "job_limit=5" \
+    --data-urlencode "detail=full" \
     "$SERVER_URL/api/workflows/runtime/tree" \
     > "$RUNTIME_TREE_FINAL_JSON" 2>"$RUNTIME_TREE_FINAL_ERROR"; then
     python3 "$SCRIPT_DIR/evaluate_pr_repair_artifacts.py" merge-runtime-tree \
