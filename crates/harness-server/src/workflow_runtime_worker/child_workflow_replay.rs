@@ -83,26 +83,6 @@ pub(super) fn child_started_by_command(child: &WorkflowInstance, command_id: &st
         .is_some_and(|recorded| recorded == command_id)
 }
 
-fn issue_submission_data_recorded(child: &WorkflowInstance, task_id: &TaskId) -> bool {
-    let task_id = task_id.as_str();
-    child
-        .data
-        .get("submission_id")
-        .or_else(|| child.data.get("task_id"))
-        .and_then(Value::as_str)
-        .is_some_and(|recorded| recorded == task_id)
-        || child
-            .data
-            .get("task_ids")
-            .and_then(Value::as_array)
-            .is_some_and(|task_ids| {
-                task_ids
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .any(|recorded| recorded == task_id)
-            })
-}
-
 async fn issue_submission_event_recorded(
     store: &WorkflowRuntimeStore,
     child_id: &str,
@@ -157,8 +137,5 @@ pub(super) async fn issue_submission_recorded(
     child: &WorkflowInstance,
     task_id: &TaskId,
 ) -> anyhow::Result<bool> {
-    if issue_submission_data_recorded(child, task_id) {
-        return Ok(true);
-    }
     issue_submission_side_effects_recorded(store, child, task_id).await
 }

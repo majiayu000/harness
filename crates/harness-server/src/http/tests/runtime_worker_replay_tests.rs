@@ -337,3 +337,172 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
     assert_eq!(parent_after.state, "idle");
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_id_data(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-auto-submit-reopen");
+    std::fs::create_dir_all(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        1,
+        "dispatching",
+        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+    )
+    .with_id("repo-backlog-auto-submit-reopen")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+    }));
+    store.upsert_instance(&parent).await?;
+    let first_command = harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
+        "repo-backlog:owner/repo:issue:131:start:first",
+        serde_json::json!({
+            "definition_id": "github_issue_pr",
+            "subject_key": "issue:131",
+            "repo": "owner/repo",
+            "labels": ["harness"],
+            "source": "github",
+            "external_id": "131",
+            "auto_submit": true,
+        }),
+    );
+    let first_command_id = store
+        .enqueue_command(&parent.id, None, &first_command)
+        .await?;
+    store
+        .enqueue_runtime_job(
+            &first_command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": parent.id.clone(),
+                "command_id": first_command_id,
+                "command_type": first_command.command_type,
+                "dedupe_key": first_command.dedupe_key.clone(),
+                "activity": first_command.runtime_activity_key(),
+                "command": first_command.command.clone(),
+            }),
+        )
+        .await?;
+
+    let first_tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(first_tick.succeeded, 1);
+    assert_eq!(first_tick.failed, 0);
+    let child_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 131);
+    let mut child = store
+        .get_instance(&child_id)
+        .await?
+        .expect("child workflow should be created by the first submission");
+    assert_eq!(child.state, "planning");
+    assert_eq!(
+        child
+            .data
+            .get("task_id")
+            .and_then(serde_json::Value::as_str),
+        Some("repo-backlog:owner/repo:issue:131")
+    );
+    let first_child_commands = store.commands_for(&child_id).await?;
+    assert_eq!(first_child_commands.len(), 1);
+    store
+        .mark_command_status(
+            &first_child_commands[0].id,
+            harness_workflow::runtime::WorkflowCommandStatus::Completed,
+        )
+        .await?;
+    child.state = "failed".to_string();
+    store.upsert_instance(&child).await?;
+    let mut parent = store
+        .get_instance("repo-backlog-auto-submit-reopen")
+        .await?
+        .expect("parent workflow should still exist");
+    parent.state = "dispatching".to_string();
+    store.upsert_instance(&parent).await?;
+    let second_command = harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
+        "repo-backlog:owner/repo:issue:131:start:second",
+        serde_json::json!({
+            "definition_id": "github_issue_pr",
+            "subject_key": "issue:131",
+            "repo": "owner/repo",
+            "labels": ["harness"],
+            "source": "github",
+            "external_id": "131",
+            "auto_submit": true,
+        }),
+    );
+    let second_command_id = store
+        .enqueue_command(&parent.id, None, &second_command)
+        .await?;
+    store
+        .enqueue_runtime_job(
+            &second_command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": parent.id,
+                "command_id": second_command_id,
+                "command_type": second_command.command_type,
+                "dedupe_key": second_command.dedupe_key.clone(),
+                "activity": second_command.runtime_activity_key(),
+                "command": second_command.command.clone(),
+            }),
+        )
+        .await?;
+
+    let second_tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(second_tick.succeeded, 1);
+    assert_eq!(second_tick.failed, 0);
+    let reopened_child = store
+        .get_instance(&child_id)
+        .await?
+        .expect("child workflow should still exist");
+    assert_eq!(reopened_child.state, "planning");
+    let child_events = store.events_for(&child_id).await?;
+    assert_eq!(
+        child_events
+            .iter()
+            .filter(|event| event.event_type == "IssueSubmitted")
+            .count(),
+        2
+    );
+    let child_commands = store.commands_for(&child_id).await?;
+    assert_eq!(child_commands.len(), 2);
+    let fresh_command = child_commands
+        .iter()
+        .find(|record| record.id != first_child_commands[0].id)
+        .expect("fresh submission command should be enqueued");
+    assert_eq!(
+        fresh_command.status,
+        harness_workflow::runtime::WorkflowCommandStatus::Pending
+    );
+    assert_eq!(fresh_command.command.activity_name(), Some("plan_issue"));
+    assert!(fresh_command.command.dedupe_key.contains(":event:"));
+    Ok(())
+}
