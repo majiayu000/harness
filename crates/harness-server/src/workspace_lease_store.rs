@@ -2,7 +2,9 @@ use crate::task_runner::TaskId;
 use harness_core::db::PgStoreContext;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceLeaseRecord {
@@ -29,7 +31,6 @@ impl WorkspaceLeaseStore {
         setup_pool: &PgPool,
     ) -> anyhow::Result<Self> {
         let pool = context.open_pool_with_setup_pool(setup_pool).await?;
-        ensure_workspace_leases_table(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -41,8 +42,11 @@ impl WorkspaceLeaseStore {
         Ok(Self { pool })
     }
 
-    pub(crate) async fn upsert_lease(&self, record: &WorkspaceLeaseRecord) -> anyhow::Result<()> {
-        sqlx::query(
+    pub(crate) async fn try_acquire_lease(
+        &self,
+        record: &WorkspaceLeaseRecord,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
             "INSERT INTO workspace_leases (
                 project_key, slot_index, task_id, workspace_path, source_repo, repo,
                 runtime_workflow_id, owner_session, run_generation, process_id,
@@ -61,7 +65,12 @@ impl WorkspaceLeaseStore {
                 state = 'leased',
                 acquired_at = CURRENT_TIMESTAMP,
                 released_at = NULL,
-                last_used_at = CURRENT_TIMESTAMP",
+                last_used_at = CURRENT_TIMESTAMP
+             WHERE workspace_leases.state <> 'leased'
+                OR (
+                    workspace_leases.task_id = EXCLUDED.task_id
+                    AND workspace_leases.owner_session = EXCLUDED.owner_session
+                )",
         )
         .bind(&record.project_key)
         .bind(record.slot_index as i64)
@@ -75,7 +84,25 @@ impl WorkspaceLeaseStore {
         .bind(record.process_id as i64)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub(crate) async fn leased_slots_for_project(
+        &self,
+        project_key: &str,
+    ) -> anyhow::Result<HashSet<u32>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT slot_index
+             FROM workspace_leases
+             WHERE project_key = $1
+               AND state = 'leased'",
+        )
+        .bind(project_key)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(slot,)| Ok(u32::try_from(slot)?))
+            .collect()
     }
 
     pub(crate) async fn release_slot(
@@ -117,22 +144,58 @@ impl WorkspaceLeaseStore {
         Ok(result.rows_affected())
     }
 
-    pub(crate) async fn release_foreign_active_leases(
+    pub(crate) async fn release_foreign_orphaned_leases(
         &self,
         current_owner_session: &str,
     ) -> anyhow::Result<u64> {
+        let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(
+            "SELECT project_key, slot_index, task_id, workspace_path, source_repo, repo,
+                    runtime_workflow_id, owner_session, run_generation, process_id
+             FROM workspace_leases
+             WHERE state = 'leased'
+               AND owner_session <> $1",
+        )
+        .bind(current_owner_session)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut system = System::new();
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
+
+        let mut released = 0;
+        for row in rows {
+            let record = WorkspaceLeaseRecord::try_from(row)?;
+            if process_is_alive(&system, record.process_id) {
+                continue;
+            }
+            if self.release_exact_lease(&record).await? {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
+    async fn release_exact_lease(&self, record: &WorkspaceLeaseRecord) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE workspace_leases
              SET state = 'released',
                  released_at = CURRENT_TIMESTAMP,
                  last_used_at = CURRENT_TIMESTAMP
-             WHERE state = 'leased'
-               AND owner_session <> $1",
+             WHERE project_key = $1
+               AND slot_index = $2
+               AND task_id = $3
+               AND owner_session = $4
+               AND process_id = $5
+               AND state = 'leased'",
         )
-        .bind(current_owner_session)
+        .bind(&record.project_key)
+        .bind(record.slot_index as i64)
+        .bind(record.task_id.as_str())
+        .bind(&record.owner_session)
+        .bind(record.process_id as i64)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected())
+        Ok(result.rows_affected() > 0)
     }
 
     pub(crate) async fn latest_workspace_path_for_task(
@@ -165,6 +228,10 @@ impl WorkspaceLeaseStore {
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
     }
+}
+
+fn process_is_alive(system: &System, process_id: u32) -> bool {
+    process_id != 0 && system.process(sysinfo::Pid::from_u32(process_id)).is_some()
 }
 
 #[derive(sqlx::FromRow)]
@@ -200,6 +267,7 @@ impl TryFrom<WorkspaceLeaseRow> for WorkspaceLeaseRecord {
     }
 }
 
+#[cfg(test)]
 async fn ensure_workspace_leases_table(pool: &PgPool) -> anyhow::Result<()> {
     for statement in WORKSPACE_LEASES_TABLE_SQL
         .split(';')

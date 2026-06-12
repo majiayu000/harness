@@ -47,7 +47,7 @@ impl WorkspaceManager {
         let mut summary = StartupReconciliation::default();
         if let Some(store) = self.lease_store.as_ref() {
             match store
-                .release_foreign_active_leases(&self.owner_session)
+                .release_foreign_orphaned_leases(&self.owner_session)
                 .await
             {
                 Ok(released) => {

@@ -103,8 +103,16 @@ pub(crate) fn workspace_slot_key(project_key: &str, slot_index: u32) -> String {
 }
 
 pub(crate) fn project_limit_key(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(path))
+    let absolute = if path.is_absolute() {
+        PathBuf::from(path)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| PathBuf::from(path))
+    };
+    absolute
+        .canonicalize()
+        .unwrap_or(absolute)
         .to_string_lossy()
         .into_owned()
 }
