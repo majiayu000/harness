@@ -20,10 +20,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const WORKFLOW_SAMPLE_LIMIT: i64 = 500;
+const FAILED_WORKFLOW_SAMPLE_RESERVE: usize = 100;
 const MAX_OPERATOR_ACTIONS: usize = 40;
 const MAX_FAILURE_GROUPS: usize = 20;
 const MAX_RECENT_FAILURES: i64 = 100;
 const STALLED_AFTER_MINS: u64 = 30;
+const OPERATOR_ACTION_STATES: &[&str] = &["ready_to_merge", "awaiting_feedback", "blocked"];
 const WORKFLOW_DEFINITION_IDS: &[&str] = &[
     harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
     harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
@@ -247,7 +249,14 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(Vec::new());
     };
-    let mut workflows = Vec::new();
+    list_runtime_workflows_from_store(store).await
+}
+
+async fn list_runtime_workflows_from_store(
+    store: &WorkflowRuntimeStore,
+) -> anyhow::Result<Vec<WorkflowInstance>> {
+    let mut workflows = list_operator_action_workflows(store).await?;
+    workflows.extend(list_recent_failed_workflows(store, FAILED_WORKFLOW_SAMPLE_RESERVE).await?);
     let sample_limit = WORKFLOW_SAMPLE_LIMIT as usize;
     for definition_id in WORKFLOW_DEFINITION_IDS {
         workflows.extend(
@@ -260,32 +269,66 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
                 .await?,
         );
     }
+    dedupe_workflows(&mut workflows);
     truncate_workflow_sample(&mut workflows, sample_limit);
-    let failed_capacity = sample_limit.saturating_sub(workflows.len());
-    if failed_capacity > 0 {
-        let failed_workflows = list_recent_failed_workflows(store, failed_capacity).await?;
-        workflows.extend(failed_workflows);
-        workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
-    }
     Ok(workflows)
 }
 
 fn truncate_workflow_sample(workflows: &mut Vec<WorkflowInstance>, limit: usize) {
-    workflows.sort_by(|a, b| {
-        workflow_sample_priority(a)
-            .cmp(&workflow_sample_priority(b))
-            .then_with(|| b.updated_at.cmp(&a.updated_at))
-    });
-    workflows.truncate(limit);
-    workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
+    let mut operator_actions = Vec::new();
+    let mut failed = Vec::new();
+    let mut other = Vec::new();
+    for workflow in workflows.drain(..) {
+        if workflow_action_kind(workflow.state.as_str()).is_some() {
+            operator_actions.push(workflow);
+        } else if workflow.state == "failed" {
+            failed.push(workflow);
+        } else {
+            other.push(workflow);
+        }
+    }
+    for group in [&mut operator_actions, &mut failed, &mut other] {
+        group.sort_by_key(|workflow| Reverse(workflow.updated_at));
+    }
+
+    let mut selected = Vec::with_capacity(limit);
+    let failed_reserve = failed.len().min(FAILED_WORKFLOW_SAMPLE_RESERVE).min(limit);
+    selected.extend(failed.drain(..failed_reserve));
+
+    let action_count = operator_actions
+        .len()
+        .min(limit.saturating_sub(selected.len()));
+    selected.extend(operator_actions.drain(..action_count));
+
+    let failed_count = failed.len().min(limit.saturating_sub(selected.len()));
+    selected.extend(failed.drain(..failed_count));
+
+    let other_count = other.len().min(limit.saturating_sub(selected.len()));
+    selected.extend(other.drain(..other_count));
+
+    selected.sort_by_key(|workflow| Reverse(workflow.updated_at));
+    *workflows = selected;
 }
 
-fn workflow_sample_priority(workflow: &WorkflowInstance) -> u8 {
-    if workflow_action_kind(workflow.state.as_str()).is_some() {
-        0
-    } else {
-        1
+async fn list_operator_action_workflows(
+    store: &WorkflowRuntimeStore,
+) -> anyhow::Result<Vec<WorkflowInstance>> {
+    let mut workflows = Vec::new();
+    for definition_id in WORKFLOW_DEFINITION_IDS {
+        for state in OPERATOR_ACTION_STATES {
+            workflows.extend(
+                store
+                    .list_recent_instances_by_state(definition_id, state, WORKFLOW_SAMPLE_LIMIT)
+                    .await?,
+            );
+        }
     }
+    Ok(workflows)
+}
+
+fn dedupe_workflows(workflows: &mut Vec<WorkflowInstance>) {
+    let mut seen = HashSet::new();
+    workflows.retain(|workflow| seen.insert(workflow.id.clone()));
 }
 
 async fn list_recent_failed_workflows(

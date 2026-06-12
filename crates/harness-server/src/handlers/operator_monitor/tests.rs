@@ -57,7 +57,7 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
 }
 
 #[test]
-fn workflow_sample_truncation_preserves_operator_action_states() {
+fn workflow_sample_truncation_preserves_operator_action_and_failed_states() {
     let base = Utc::now();
     let mut workflows = (0..500)
         .map(|index| {
@@ -78,12 +78,19 @@ fn workflow_sample_truncation_preserves_operator_action_states() {
     .with_id("older-ready".to_string());
     ready.updated_at = base - chrono::Duration::hours(1);
     workflows.push(ready);
+    let mut failed =
+        workflow("failed", json!({ "source": "quality_gate" })).with_id("older-failed".to_string());
+    failed.updated_at = base - chrono::Duration::hours(2);
+    workflows.push(failed);
 
     truncate_workflow_sample(&mut workflows, 500);
 
     assert!(workflows
         .iter()
         .any(|workflow| workflow.id == "older-ready"));
+    assert!(workflows
+        .iter()
+        .any(|workflow| workflow.id == "older-failed"));
     assert_eq!(workflows.len(), 500);
 }
 
@@ -238,6 +245,57 @@ async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result
 
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0].id, "recent-failed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_workflow_sampling_fetches_action_states_before_definition_cap(
+) -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-action-cap-")?;
+    let workflow_runtime_store = WorkflowRuntimeStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+        Some(&test_helpers::test_database_url()?),
+    )
+    .await?;
+    workflow_runtime_store
+        .upsert_instance(
+            &workflow(
+                "ready_to_merge",
+                json!({
+                    "source": "github",
+                    "pr_number": 7,
+                    "pr_url": "https://github.com/owner/repo/pull/7",
+                }),
+            )
+            .with_id("older-ready".to_string()),
+        )
+        .await?;
+    for index in 0..500 {
+        workflow_runtime_store
+            .upsert_instance(
+                &workflow("checking", json!({ "source": "repo_backlog" }))
+                    .with_id(format!("checking-{index}")),
+            )
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE workflow_instances SET updated_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+    )
+    .bind("older-ready")
+    .execute(workflow_runtime_store.pool())
+    .await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = NOW() WHERE state = $1")
+        .bind("checking")
+        .execute(workflow_runtime_store.pool())
+        .await?;
+
+    let workflows = list_runtime_workflows_from_store(&workflow_runtime_store).await?;
+
+    assert_eq!(workflows.len(), WORKFLOW_SAMPLE_LIMIT as usize);
+    assert!(workflows
+        .iter()
+        .any(|workflow| workflow.id == "older-ready"));
     Ok(())
 }
 
