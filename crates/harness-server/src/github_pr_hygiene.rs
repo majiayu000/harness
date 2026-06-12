@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::github_pr_snapshot::{errors_is_empty, value_string, value_u64};
 
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
+const OPEN_PR_HYGIENE_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitHubOpenPrHygiene {
@@ -66,11 +67,11 @@ async fn fetch_open_pr_hygiene_with_client(
     let mut after = None;
     let limit = limit.max(1);
     while prs.len() < limit {
-        let first = (limit - prs.len()).min(100);
+        let first = OPEN_PR_HYGIENE_PAGE_SIZE;
         let page =
             fetch_open_pr_hygiene_page(client, repo_slug, github_token, first, after.as_deref())
                 .await?;
-        prs.extend(page.prs);
+        append_mergeability_repair_candidates(&mut prs, page.prs, limit);
         if !page.has_next_page || prs.len() >= limit {
             break;
         }
@@ -99,7 +100,7 @@ async fn fetch_open_pr_hygiene_page(
               states: OPEN
               first: $first
               after: $after
-              orderBy: {field: UPDATED_AT, direction: DESC}
+              orderBy: {field: UPDATED_AT, direction: ASC}
             ) {
               pageInfo {
                 hasNextPage
@@ -161,6 +162,20 @@ async fn fetch_open_pr_hygiene_page(
         .filter(|pull_requests| !pull_requests.is_null())
         .ok_or_else(|| anyhow::anyhow!("GitHub PR hygiene query returned no PR connection"))?;
     parse_open_pr_hygiene_page(repo_slug, &connection)
+}
+
+fn append_mergeability_repair_candidates(
+    prs: &mut Vec<GitHubOpenPrHygiene>,
+    page_prs: Vec<GitHubOpenPrHygiene>,
+    limit: usize,
+) {
+    let remaining = limit.saturating_sub(prs.len());
+    prs.extend(
+        page_prs
+            .into_iter()
+            .filter(GitHubOpenPrHygiene::requires_mergeability_repair)
+            .take(remaining),
+    );
 }
 
 fn parse_open_pr_hygiene_page(
@@ -305,6 +320,44 @@ mod tests {
         let pr = parse_open_pr_hygiene_node("owner/repo", &node)?;
 
         assert!(!pr.requires_mergeability_repair());
+        Ok(())
+    }
+
+    #[test]
+    fn github_pr_hygiene_collects_repair_candidates_past_clean_prs() -> anyhow::Result<()> {
+        let connection = json!({
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [
+                {
+                    "number": 80,
+                    "url": "https://github.com/owner/repo/pull/80",
+                    "mergeStateStatus": "CLEAN",
+                    "updatedAt": "2026-06-10T00:00:00Z",
+                    "labels": {"nodes": []}
+                },
+                {
+                    "number": 81,
+                    "url": "https://github.com/owner/repo/pull/81",
+                    "mergeStateStatus": "DIRTY",
+                    "updatedAt": "2026-06-10T01:00:00Z",
+                    "labels": {"nodes": []}
+                },
+                {
+                    "number": 82,
+                    "url": "https://github.com/owner/repo/pull/82",
+                    "mergeStateStatus": "BEHIND",
+                    "updatedAt": "2026-06-10T02:00:00Z",
+                    "labels": {"nodes": []}
+                }
+            ]
+        });
+        let page = parse_open_pr_hygiene_page("owner/repo", &connection)?;
+        let mut prs = Vec::new();
+
+        append_mergeability_repair_candidates(&mut prs, page.prs, 1);
+
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].pr_number, 81);
         Ok(())
     }
 }
