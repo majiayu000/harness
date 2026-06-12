@@ -222,6 +222,10 @@ fn reduce_success(
         return None;
     }
 
+    if stale_success_completion(instance, result) {
+        return None;
+    }
+
     if let Some(decision) = structured_decision.as_ref() {
         let reason = format!(
             "runtime activity `{}` emitted workflow_decision `{}` for workflow `{}` in state `{}`, but the decision to `{}` did not validate and no domain fallback was available",
@@ -294,7 +298,16 @@ fn reduce_success(
             "finish_prompt_task",
             "prompt implementation activity completed successfully",
         ),
-        _ => return None,
+        _ if known_success_without_decision(instance, event, result) => return None,
+        _ => {
+            let reason = format!(
+                "runtime activity `{}` succeeded for workflow `{}` in state `{}`, but no reducer fallback was available",
+                result.activity, instance.definition_id, instance.state
+            );
+            return Some(invalid_agent_output_blocked_decision(
+                instance, event, result, &reason,
+            ));
+        }
     };
 
     let mut workflow_decision =
@@ -331,6 +344,60 @@ fn reduce_success(
     }
 
     Some(workflow_decision.high_confidence())
+}
+
+fn known_success_without_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> bool {
+    if event_command_type(event) == Some(WorkflowCommandType::StartChildWorkflow.as_str()) {
+        return true;
+    }
+
+    if stale_success_completion(instance, result) {
+        return true;
+    }
+
+    (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) == (
+        PR_FEEDBACK_DEFINITION_ID,
+        "inspecting",
+        super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY,
+    )
+}
+
+fn stale_success_completion(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+    if instance.is_terminal() {
+        return true;
+    }
+
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
+        return false;
+    }
+
+    match result.activity.as_str() {
+        "sweep_pr_feedback" | super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY => matches!(
+            instance.state.as_str(),
+            "addressing_feedback"
+                | "local_review_gate"
+                | "quality_gate_pending"
+                | "ready_to_merge"
+                | "blocked"
+        ),
+        super::pr_feedback::LOCAL_REVIEW_ACTIVITY => matches!(
+            instance.state.as_str(),
+            "awaiting_feedback"
+                | "addressing_feedback"
+                | "quality_gate_pending"
+                | "ready_to_merge"
+                | "blocked"
+        ),
+        _ => false,
+    }
 }
 
 fn workflow_decision_from_activity_result(
