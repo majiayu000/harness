@@ -173,6 +173,61 @@ async fn sequential_whitespace_output_aborts_remaining_steps() -> anyhow::Result
     Ok(())
 }
 
+#[tokio::test]
+async fn concurrent_subtasks_release_pool_slots_before_creating_all_workspaces(
+) -> anyhow::Result<()> {
+    let source = tempfile::tempdir()?;
+    let base_branch = init_git_repo(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let workspace_mgr = Arc::new(WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            auto_cleanup: true,
+            ..Default::default()
+        },
+        crate::workspace_pool::WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        None,
+    )?);
+    let agent = Arc::new(SequencedAgent::new(["first", "second", "third"]));
+    let subtasks = (0..3)
+        .map(|i| SubtaskSpec {
+            prompt: format!("parallel step {i}"),
+            depends_on_indices: Vec::new(),
+        })
+        .collect();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_parallel_subtasks(
+            &harness_core::types::TaskId("parallel-pool-capacity".to_string()),
+            agent.clone(),
+            subtasks,
+            workspace_mgr.clone(),
+            source.path(),
+            "origin",
+            &base_branch,
+            Vec::new(),
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("parallel subtasks should not stall on workspace pool capacity");
+
+    assert!(!result.is_sequential);
+    assert_eq!(agent.prompt_count(), 3);
+    assert_eq!(result.results.len(), 3);
+    assert!(
+        result
+            .results
+            .iter()
+            .all(|subtask| subtask.response.is_some() && subtask.error.is_none()),
+        "all subtasks should complete successfully"
+    );
+    assert_eq!(workspace_mgr.live_count(), 0);
+
+    Ok(())
+}
+
 #[test]
 fn decompose_no_files_returns_original() {
     let prompt = "Fix the login bug";
