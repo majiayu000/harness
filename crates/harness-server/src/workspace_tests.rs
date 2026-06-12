@@ -807,6 +807,151 @@ async fn shared_lease_store_allocates_next_slot_without_stealing_live_foreign_le
 }
 
 #[tokio::test]
+async fn shared_lease_store_waits_when_persisted_slots_are_full() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let lease_db = tempfile::tempdir().expect("tempdir");
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("workspace-leases")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let pool_config = WorkspacePoolConfig::new(1, std::collections::HashMap::new());
+    let mgr_a =
+        WorkspaceManager::new_with_pool(config.clone(), pool_config.clone(), Some(store.clone()))?;
+    let mgr_b = std::sync::Arc::new(WorkspaceManager::new_with_pool(
+        config,
+        pool_config,
+        Some(store.clone()),
+    )?);
+    let first_task = harness_core::types::TaskId("shared-store-full-first".to_string());
+    let second_task = harness_core::types::TaskId("shared-store-full-second".to_string());
+
+    let first = mgr_a
+        .create_workspace(
+            &first_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await?;
+    assert_eq!(first.slot_index, 0);
+
+    let source_path = source.path().to_path_buf();
+    let branch_for_second = branch.clone();
+    let second_task_for_spawn = second_task.clone();
+    let mgr_b_for_spawn = mgr_b.clone();
+    let second_handle = tokio::spawn(async move {
+        mgr_b_for_spawn
+            .create_workspace(
+                &second_task_for_spawn,
+                &source_path,
+                "origin",
+                &branch_for_second,
+                1,
+                Some("issue:43"),
+                Some("owner/repo"),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !second_handle.is_finished(),
+        "second manager should wait while the shared lease table is full"
+    );
+
+    mgr_a.release_workspace(&first_task).await;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), second_handle)
+        .await
+        .expect("second acquire should unblock")
+        .expect("second task should join")?;
+    assert_eq!(second.slot_index, 0);
+    assert_eq!(second.workspace_path, first.workspace_path);
+
+    mgr_b.remove_workspace(&second_task).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remove_workspace_releases_persisted_slot_after_cleanup_hook_finishes() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let lease_db = tempfile::tempdir().expect("tempdir");
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("workspace-leases")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        before_remove_hook: Some("sh hold-remove.sh".to_string()),
+        hook_timeout_secs: 5,
+        ..Default::default()
+    };
+    let mgr = std::sync::Arc::new(WorkspaceManager::new_with_pool(
+        config,
+        WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        Some(store.clone()),
+    )?);
+    let task_id = harness_core::types::TaskId("remove-holds-lease".to_string());
+
+    let lease = mgr
+        .create_workspace(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await?;
+    std::fs::write(lease.workspace_path.join("hold-remove.sh"), "sleep 1\n")?;
+    assert_eq!(store.list_leased().await?.len(), 1);
+
+    let task_id_for_spawn = task_id.clone();
+    let mgr_for_spawn = mgr.clone();
+    let remove_handle =
+        tokio::spawn(async move { mgr_for_spawn.remove_workspace(&task_id_for_spawn).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        store.list_leased().await?.len(),
+        1,
+        "persisted lease should remain held while removal hook is still running"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), remove_handle)
+        .await
+        .expect("remove should finish")
+        .expect("remove task should join")?;
+    assert!(
+        store.list_leased().await?.is_empty(),
+        "persisted lease should release after cleanup completes"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn cleanup_workspace_for_retry_skips_path_reserved_by_different_active_task() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());

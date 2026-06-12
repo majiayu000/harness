@@ -304,7 +304,6 @@ impl WorkspaceManager {
             None => return Ok(()),
         };
         self.released_paths.remove(task_id);
-        self.release_persisted_lease(task_id, &entry).await;
 
         // Run before_remove_hook if set. Non-fatal on failure.
         if let Some(hook) = &self.config.before_remove_hook {
@@ -332,6 +331,7 @@ impl WorkspaceManager {
                 entry.workspace_path
             );
         }
+        self.release_persisted_lease(task_id, &entry).await;
         Ok(())
     }
 

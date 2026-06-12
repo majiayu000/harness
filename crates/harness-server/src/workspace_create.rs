@@ -1,6 +1,8 @@
 use super::workspace_helpers::*;
 use super::*;
 
+const PERSISTED_SLOT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 impl WorkspaceManager {
     /// Create a git worktree for the given task under `config.root/<sanitized_task_id>`.
     ///
@@ -138,23 +140,6 @@ impl WorkspaceManager {
         } else {
             None
         };
-        let local_occupied_slots = self.occupied_slots_for_project(&project_key);
-        let mut persisted_occupied_slots = if let Some(store) = self.lease_store.as_ref() {
-            match store.leased_slots_for_project(&project_key).await {
-                Ok(slots) => slots,
-                Err(err) => {
-                    return Err(WorkspaceLifecycleError::CreateFailed {
-                        workspace_path: self.config.root.join(&project_key),
-                        workspace_owner: None,
-                        message: format!(
-                            "failed to inspect persisted workspace leases for project {project_key}: {err}"
-                        ),
-                    });
-                }
-            }
-        } else {
-            std::collections::HashSet::new()
-        };
         let preferred_released_lease = if options.reuse_existing_workspace {
             if let Some(store) = self.lease_store.as_ref() {
                 match store.latest_released_lease_for_task(task_id).await {
@@ -187,14 +172,41 @@ impl WorkspaceManager {
                     .and_then(|path| slot_index_from_workspace_path(&project_key, path))
                     .filter(|slot| *slot < capacity as u32)
             });
+        let wait_for_persisted_slot = self.lease_store.is_some();
         let (slot_index, _workspace_key, workspace_path, reacquired_released_task_slot) = loop {
-            let mut occupied_slots = local_occupied_slots.clone();
+            let mut occupied_slots = self.occupied_slots_for_project(&project_key);
+            let persisted_occupied_slots = if let Some(store) = self.lease_store.as_ref() {
+                match store.leased_slots_for_project(&project_key).await {
+                    Ok(slots) => slots,
+                    Err(err) => {
+                        return Err(WorkspaceLifecycleError::CreateFailed {
+                            workspace_path: self.config.root.join(&project_key),
+                            workspace_owner: None,
+                            message: format!(
+                                "failed to inspect persisted workspace leases for project {project_key}: {err}"
+                            ),
+                        });
+                    }
+                }
+            } else {
+                std::collections::HashSet::new()
+            };
             occupied_slots.extend(persisted_occupied_slots.iter().copied());
             let preferred_slot =
                 preferred_released_slot.filter(|slot| !occupied_slots.contains(slot));
             let Some(slot_index) =
                 preferred_slot.or_else(|| select_available_slot(capacity, &occupied_slots))
             else {
+                if wait_for_persisted_slot {
+                    tracing::debug!(
+                        task_id = %task_id.0,
+                        project_key = %project_key,
+                        capacity,
+                        "workspace pool waiting for a persisted slot to be released"
+                    );
+                    tokio::time::sleep(PERSISTED_SLOT_RETRY_DELAY).await;
+                    continue;
+                }
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     workspace_path: self.config.root.join(&project_key),
                     workspace_owner: None,
@@ -236,10 +248,10 @@ impl WorkspaceManager {
                     )
                 }
                 Ok(false) => {
-                    persisted_occupied_slots.insert(slot_index);
                     if preferred_released_slot == Some(slot_index) {
                         preferred_released_slot = None;
                     }
+                    tokio::task::yield_now().await;
                 }
                 Err(err) => {
                     return Err(WorkspaceLifecycleError::CreateFailed {
