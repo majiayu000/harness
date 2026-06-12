@@ -393,9 +393,8 @@ enum WorkflowBucket {
 fn workflow_bucket(workflow: &WorkflowInstance) -> WorkflowBucket {
     match workflow.state.as_str() {
         "scheduled" | "discovered" => WorkflowBucket::Pending,
-        "checking" | "dispatching" | "planning_batch" | "reconciling" | "scanning" => {
-            WorkflowBucket::Running
-        }
+        "checking" | "dispatching" | "inspecting" | "planning_batch" | "reconciling"
+        | "scanning" => WorkflowBucket::Running,
         "awaiting_dependencies" => WorkflowBucket::AwaitingDependencies,
         "ready_to_merge" => WorkflowBucket::ReadyToMerge,
         "blocked" => WorkflowBucket::Blocked,

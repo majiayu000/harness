@@ -39,6 +39,7 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
     let workflows = vec![
         workflow("implementing", json!({})),
         workflow("checking", json!({})),
+        workflow("inspecting", json!({})),
         workflow("awaiting_feedback", json!({})),
         workflow("ready_to_merge", json!({})),
         workflow("awaiting_dependencies", json!({})),
@@ -48,7 +49,7 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
 
     let counts = runtime_workflow_counts(&workflows);
 
-    assert_eq!(counts.running, 2);
+    assert_eq!(counts.running, 3);
     assert_eq!(counts.review, 1);
     assert_eq!(counts.ready_to_merge, 1);
     assert_eq!(counts.awaiting_dependencies, 1);
@@ -455,6 +456,7 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
             ),
             workflow("awaiting_dependencies", json!({ "source": "github" })),
             workflow("checking", json!({ "source": "github" })),
+            workflow("inspecting", json!({ "source": "github" })),
             workflow("awaiting_feedback", json!({ "source": "github" })),
             workflow("scheduled", json!({ "source": "github" })),
         ],
@@ -467,6 +469,6 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     assert_eq!(source.pending, 1);
     assert_eq!(source.ready_to_merge, 1);
     assert_eq!(source.review, 1);
-    assert_eq!(source.running, 1);
+    assert_eq!(source.running, 2);
     assert_eq!(source.blocked, 1);
 }
