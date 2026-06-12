@@ -841,13 +841,18 @@ impl DefaultExecutionService {
 
         match outcome {
             crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
+                workflow_id,
                 task_id,
                 ..
             }
             | crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                workflow_id,
                 task_id,
                 ..
-            } => Ok(TaskId::from_str(&task_id)),
+            } => {
+                runtime_submission_response_handle(store, &workflow_id, &TaskId::from_str(&task_id))
+                    .await
+            }
             crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::NotCandidate {
                 workflow_id,
                 state,
