@@ -630,10 +630,15 @@ async fn enqueue_background_prompt_submission_reopens_blocked_runtime_workflow(
         .await?
         .expect("blocked workflow should be reopened");
     assert_eq!(instance.state, "implementing");
-    assert_eq!(instance.data["task_id"], task_id.as_str());
+    assert_eq!(task_id.as_str(), "old-prompt-task");
+    assert_eq!(instance.data["submission_id"], task_id.as_str());
+    let retry_task_id = instance.data["task_id"]
+        .as_str()
+        .expect("retry task id should be recorded");
+    assert_ne!(retry_task_id, task_id.as_str());
     assert_eq!(
         instance.data["task_ids"],
-        serde_json::json!(["old-prompt-task", task_id.as_str()])
+        serde_json::json!(["old-prompt-task", retry_task_id])
     );
     assert!(instance.data.get("prompt").is_none());
     let prompt_ref = instance.data["prompt_ref"]
