@@ -180,7 +180,11 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         .sum();
     let runtime_log_state = state.core.server.runtime_logs.state.as_str();
     let degraded_subsystems = state.degraded_subsystems.clone();
-    let health_status = if degraded_subsystems.is_empty() && runtime_log_state != "degraded" {
+    let runtime_state_dirty = state.is_runtime_state_dirty();
+    let health_status = if degraded_subsystems.is_empty()
+        && runtime_log_state != "degraded"
+        && !runtime_state_dirty
+    {
         "ok"
     } else {
         "degraded"
@@ -557,9 +561,15 @@ fn operator_actions(
         };
         let projection = RuntimeWorkflowProjection::from_workflow(workflow);
         let task_id = projection
-            .submission_handle
+            .legacy_dedupe_task_handle
             .as_ref()
-            .map(|task_id| task_id.as_str().to_string());
+            .map(|task_id| task_id.0.clone())
+            .or_else(|| {
+                projection
+                    .submission_handle
+                    .as_ref()
+                    .map(|task_id| task_id.as_str().to_string())
+            });
         let repo = string_field(&workflow.data, "repo");
         let issue = u64_field(&workflow.data, "issue_number");
         let pr = u64_field(&workflow.data, "pr_number");

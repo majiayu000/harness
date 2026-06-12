@@ -207,6 +207,57 @@ async fn endpoint_returns_monitor_payload_on_fresh_state() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn endpoint_marks_health_degraded_when_runtime_state_is_dirty() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-dirty-state-")?;
+    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    state
+        .runtime_state_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let app = Router::new()
+        .route("/api/operator-monitor", get(operator_monitor))
+        .with_state(state);
+
+    let req = axum::http::Request::builder()
+        .uri("/api/operator-monitor")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+
+    assert_eq!(body["health"]["status"], "degraded");
+    Ok(())
+}
+
+#[test]
+fn operator_actions_link_evidence_to_current_legacy_task_id() {
+    let mut ready = workflow(
+        "ready_to_merge",
+        json!({
+            "repo": "owner/repo",
+            "pr_number": 7,
+            "pr_url": "https://github.com/owner/repo/pull/7",
+            "submission_id": "stable-submission",
+            "task_id": "current-task",
+        }),
+    )
+    .with_id("ready-workflow".to_string());
+    ready.updated_at = Utc::now();
+
+    let actions = operator_actions(&[ready], Utc::now());
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].task_id.as_deref(), Some("current-task"));
+    assert_eq!(
+        actions[0].evidence_url.as_deref(),
+        Some("/tasks/current-task")
+    );
+}
+
+#[tokio::test]
 async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-failed-runtime-")?;
