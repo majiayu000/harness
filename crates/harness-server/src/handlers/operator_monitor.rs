@@ -163,6 +163,10 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
 
     let dashboard_counts = state.task_svc.count_for_dashboard().await;
     let runtime_hosts = state.runtime_hosts.list_hosts();
+    let runtime_host_leases: u64 = runtime_hosts
+        .iter()
+        .map(|host| state.core.tasks.active_runtime_host_lease_count(&host.id) as u64)
+        .sum();
     let runtime_log_state = state.core.server.runtime_logs.state.as_str();
     let degraded_subsystems = state.degraded_subsystems.clone();
     let health_status = if degraded_subsystems.is_empty() && runtime_log_state != "degraded" {
@@ -212,7 +216,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         operator_actions,
         failures,
         worktrees: WorktreeSummary {
-            used: worktree_cards.len() as u64,
+            used: (worktree_cards.len() as u64).saturating_add(runtime_host_leases),
             capacity,
             stale: stale_worktree_count(
                 state.concurrency.workspace_mgr.as_deref(),
@@ -563,27 +567,19 @@ fn normalize_failure_message(message: &str) -> String {
 }
 
 fn earlier_timestamp(current: Option<&str>, candidate: Option<&str>) -> Option<String> {
-    Some(
-        match (current, candidate) {
-            (Some(current), Some(candidate)) => current.min(candidate),
-            (Some(current), None) => current,
-            (None, Some(candidate)) => candidate,
-            (None, None) => return None,
-        }
-        .to_string(),
-    )
+    current
+        .into_iter()
+        .chain(candidate)
+        .min()
+        .map(str::to_string)
 }
 
 fn later_timestamp(current: Option<&str>, candidate: Option<&str>) -> Option<String> {
-    Some(
-        match (current, candidate) {
-            (Some(current), Some(candidate)) => current.max(candidate),
-            (Some(current), None) => current,
-            (None, Some(candidate)) => candidate,
-            (None, None) => return None,
-        }
-        .to_string(),
-    )
+    current
+        .into_iter()
+        .chain(candidate)
+        .max()
+        .map(str::to_string)
 }
 
 fn stale_worktree_count(
