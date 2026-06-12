@@ -33,16 +33,6 @@ pub(crate) async fn lookup_prompt_submission_prompt_durable(
     Ok(Some(prompt))
 }
 
-pub(super) async fn persist_prompt_submission_prompt(
-    store: &WorkflowRuntimeStore,
-    prompt_ref: &str,
-    prompt: &str,
-) -> anyhow::Result<()> {
-    store.upsert_prompt_payload(prompt_ref, prompt).await?;
-    cache_prompt_submission_prompt(prompt_ref, prompt);
-    Ok(())
-}
-
 pub(super) fn cache_prompt_submission_prompt(prompt_ref: &str, prompt: &str) {
     if let Ok(mut prompts) = prompt_submission_prompts().lock() {
         prompts.insert(prompt_ref.to_string(), prompt.to_string());

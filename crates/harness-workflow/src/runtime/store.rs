@@ -23,6 +23,12 @@ use std::path::Path;
 
 #[path = "store/commands.rs"]
 mod command_store;
+#[path = "store/submission_commit.rs"]
+mod submission_commit;
+pub use submission_commit::{
+    WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
+    WorkflowSubmissionPromptPayload,
+};
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
 }
@@ -1979,6 +1985,17 @@ async fn insert_event_tx(
     source: &str,
     payload: Value,
 ) -> anyhow::Result<WorkflowEvent> {
+    insert_event_tx_with_id(tx, workflow_id, event_type, source, payload, None).await
+}
+
+async fn insert_event_tx_with_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+    event_type: &str,
+    source: &str,
+    payload: Value,
+    event_id: Option<&str>,
+) -> anyhow::Result<WorkflowEvent> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("workflow_events:{workflow_id}"))
         .execute(&mut **tx)
@@ -1989,8 +2006,11 @@ async fn insert_event_tx(
     .bind(workflow_id)
     .fetch_one(&mut **tx)
     .await?;
-    let event = WorkflowEvent::new(workflow_id, next_sequence as u64, event_type, source)
+    let mut event = WorkflowEvent::new(workflow_id, next_sequence as u64, event_type, source)
         .with_payload(payload);
+    if let Some(event_id) = event_id {
+        event.id = event_id.to_string();
+    }
     let event_data = to_jsonb_string(&event)?;
     sqlx::query(
         "INSERT INTO workflow_events

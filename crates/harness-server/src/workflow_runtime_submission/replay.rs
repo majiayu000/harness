@@ -4,14 +4,13 @@ use harness_workflow::runtime::{
 };
 
 pub(super) struct SubmissionEventSelection {
-    pub(super) event_id: String,
+    pub(super) event_id: Option<String>,
     pub(super) has_prior_attempt: bool,
-    pub(super) replay_existing: bool,
 }
 
 impl SubmissionEventSelection {
     pub(super) fn disambiguates_command_dedupe(&self) -> bool {
-        self.has_prior_attempt && !self.replay_existing
+        self.has_prior_attempt && self.event_id.is_none()
     }
 }
 
