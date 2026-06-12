@@ -240,10 +240,6 @@ fn reduce_success(
         return Some(decision);
     }
 
-    if known_success_without_decision(instance, result) {
-        return None;
-    }
-
     let (next_state, decision, reason) = match (
         instance.definition_id.as_str(),
         instance.state.as_str(),
@@ -298,6 +294,7 @@ fn reduce_success(
             "finish_prompt_task",
             "prompt implementation activity completed successfully",
         ),
+        _ if known_success_without_decision(instance, event, result) => return None,
         _ => {
             let reason = format!(
                 "runtime activity `{}` succeeded for workflow `{}` in state `{}`, but no reducer fallback was available",
@@ -345,7 +342,19 @@ fn reduce_success(
     Some(workflow_decision.high_confidence())
 }
 
-fn known_success_without_decision(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+fn known_success_without_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> bool {
+    if instance.is_terminal() {
+        return true;
+    }
+
+    if event_command_type(event) == Some(WorkflowCommandType::StartChildWorkflow.as_str()) {
+        return true;
+    }
+
     (
         instance.definition_id.as_str(),
         instance.state.as_str(),

@@ -1700,6 +1700,56 @@ fn runtime_completion_reducer_blocks_unknown_success_without_structured_decision
 }
 
 #[test]
+fn runtime_completion_reducer_ignores_child_workflow_start_ack_without_parent_decision() {
+    let instance = issue_instance("quality_gate_pending");
+    let command = WorkflowCommand::start_child_workflow(
+        QUALITY_GATE_DEFINITION_ID,
+        "pr:77",
+        "quality-gate:issue-123:77",
+    );
+    let result = ActivityResult::succeeded(
+        WorkflowCommandType::StartChildWorkflow.as_str(),
+        "Quality gate child workflow started.",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event).expect("event should parse");
+
+    assert!(
+        decision.is_none(),
+        "child workflow start acknowledgement should wait for child completion"
+    );
+}
+
+#[test]
+fn runtime_completion_reducer_ignores_success_for_already_terminal_workflow() {
+    let instance = issue_instance("done");
+    let result = ActivityResult::succeeded(
+        "implement_issue",
+        "Workflow was already terminal before runtime execution.",
+    );
+    let event = runtime_completion_event(&instance, "implement_issue", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event).expect("event should parse");
+
+    assert!(
+        decision.is_none(),
+        "stale terminal workflow completion should not produce a new decision"
+    );
+}
+
+#[test]
 fn repo_backlog_open_issue_without_workflow_starts_child_workflow() {
     let instance = repo_backlog_instance("idle");
     let output = build_open_issue_without_workflow_decision(
