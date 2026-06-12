@@ -215,6 +215,25 @@ impl WorkspaceLeaseStore {
         Ok(row.map(|(path,)| PathBuf::from(path)))
     }
 
+    pub(crate) async fn latest_released_lease_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> anyhow::Result<Option<WorkspaceLeaseRecord>> {
+        let row = sqlx::query_as::<_, WorkspaceLeaseRow>(
+            "SELECT project_key, slot_index, task_id, workspace_path, source_repo, repo,
+                    runtime_workflow_id, owner_session, run_generation, process_id
+             FROM workspace_leases
+             WHERE task_id = $1
+               AND state = 'released'
+             ORDER BY last_used_at DESC
+             LIMIT 1",
+        )
+        .bind(task_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     #[cfg(test)]
     pub(crate) async fn list_leased(&self) -> anyhow::Result<Vec<WorkspaceLeaseRecord>> {
         let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(

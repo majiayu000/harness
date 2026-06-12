@@ -131,6 +131,13 @@ impl WorkspaceManager {
         let owner_record_task_id = external_id.unwrap_or(task_id.0.as_str()).to_string();
         let owner_record_workspace_key =
             derive_workspace_key(task_id, external_id, repo, Some(source_repo));
+        let released_path_for_task = if options.reuse_existing_workspace {
+            self.released_paths
+                .get(task_id)
+                .map(|entry| entry.value().clone())
+        } else {
+            None
+        };
         let local_occupied_slots = self.occupied_slots_for_project(&project_key);
         let mut persisted_occupied_slots = if let Some(store) = self.lease_store.as_ref() {
             match store.leased_slots_for_project(&project_key).await {
@@ -148,10 +155,46 @@ impl WorkspaceManager {
         } else {
             std::collections::HashSet::new()
         };
-        let (slot_index, _workspace_key, workspace_path) = loop {
+        let preferred_released_lease = if options.reuse_existing_workspace {
+            if let Some(store) = self.lease_store.as_ref() {
+                match store.latest_released_lease_for_task(task_id).await {
+                    Ok(record) => record.filter(|record| {
+                        record.project_key == project_key && record.slot_index < capacity as u32
+                    }),
+                    Err(err) => {
+                        return Err(WorkspaceLifecycleError::CreateFailed {
+                            workspace_path: self.config.root.join(&project_key),
+                            workspace_owner: None,
+                            message: format!(
+                                "failed to inspect released workspace lease for task {}: {err}",
+                                task_id.0
+                            ),
+                        });
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut preferred_released_slot = preferred_released_lease
+            .as_ref()
+            .map(|record| record.slot_index)
+            .or_else(|| {
+                released_path_for_task
+                    .as_deref()
+                    .and_then(|path| slot_index_from_workspace_path(&project_key, path))
+                    .filter(|slot| *slot < capacity as u32)
+            });
+        let (slot_index, _workspace_key, workspace_path, reacquired_released_task_slot) = loop {
             let mut occupied_slots = local_occupied_slots.clone();
             occupied_slots.extend(persisted_occupied_slots.iter().copied());
-            let Some(slot_index) = select_available_slot(capacity, &occupied_slots) else {
+            let preferred_slot =
+                preferred_released_slot.filter(|slot| !occupied_slots.contains(slot));
+            let Some(slot_index) =
+                preferred_slot.or_else(|| select_available_slot(capacity, &occupied_slots))
+            else {
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     workspace_path: self.config.root.join(&project_key),
                     workspace_owner: None,
@@ -162,6 +205,7 @@ impl WorkspaceManager {
             };
             let workspace_key = workspace_slot_key(&project_key, slot_index);
             let workspace_path = self.config.root.join(&workspace_key);
+            let selected_released_task_slot = preferred_slot == Some(slot_index);
             let lease_record = WorkspaceLeaseRecord {
                 project_key: project_key.clone(),
                 slot_index,
@@ -175,12 +219,27 @@ impl WorkspaceManager {
                 process_id: std::process::id(),
             };
             let Some(store) = self.lease_store.as_ref() else {
-                break (slot_index, workspace_key, workspace_path);
+                break (
+                    slot_index,
+                    workspace_key,
+                    workspace_path,
+                    selected_released_task_slot,
+                );
             };
             match store.try_acquire_lease(&lease_record).await {
-                Ok(true) => break (slot_index, workspace_key, workspace_path),
+                Ok(true) => {
+                    break (
+                        slot_index,
+                        workspace_key,
+                        workspace_path,
+                        selected_released_task_slot,
+                    )
+                }
                 Ok(false) => {
                     persisted_occupied_slots.insert(slot_index);
+                    if preferred_released_slot == Some(slot_index) {
+                        preferred_released_slot = None;
+                    }
                 }
                 Err(err) => {
                     return Err(WorkspaceLifecycleError::CreateFailed {
@@ -326,6 +385,9 @@ impl WorkspaceManager {
                 });
             }
         };
+        let reacquired_released_task_path = released_path_for_task
+            .as_ref()
+            .is_some_and(|path| path == &workspace_path);
 
         if !fetch_output.status.success() {
             let stderr = String::from_utf8_lossy(&fetch_output.stderr);
@@ -372,7 +434,15 @@ impl WorkspaceManager {
                     ),
                 });
             }
-            let can_reuse_without_reset = false;
+            let owner_record_matches_current_workspace =
+                owner_record.as_ref().is_some_and(|record| {
+                    record.task_id == owner_record_task_id
+                        || record.workspace_key.as_deref()
+                            == Some(owner_record_workspace_key.as_str())
+                });
+            let can_reuse_without_reset = options.reuse_existing_workspace
+                && (reacquired_released_task_slot || reacquired_released_task_path)
+                && owner_record_matches_current_workspace;
             if can_reuse_without_reset {
                 decision = WorkspaceAcquireDecision::ReusedRecovered;
                 tracing::info!(
@@ -686,4 +756,10 @@ async fn reset_registered_worktree(
     }
 
     Ok(())
+}
+
+fn slot_index_from_workspace_path(project_key: &str, workspace_path: &Path) -> Option<u32> {
+    let name = workspace_path.file_name()?.to_str()?;
+    let prefix = format!("{project_key}__slot_");
+    name.strip_prefix(&prefix)?.parse().ok()
 }

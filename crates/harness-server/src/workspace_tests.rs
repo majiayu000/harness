@@ -428,6 +428,60 @@ async fn pool_slot_reuse_resets_existing_directory_for_new_task() {
 }
 
 #[tokio::test]
+async fn pool_slot_reuse_preserves_released_same_task_workspace() {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        auto_cleanup: false,
+        ..Default::default()
+    };
+    let mgr = WorkspaceManager::new(config).expect("new");
+    let task_id = harness_core::types::TaskId("runtime-workflow-task".to_string());
+
+    let first = mgr
+        .create_workspace(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect("create first workspace");
+    let marker = first.workspace_path.join("handoff.txt");
+    std::fs::write(&marker, "preserve this file").expect("write marker");
+    mgr.release_workspace(&task_id).await;
+
+    let second = mgr
+        .create_workspace(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect("reuse released workflow workspace");
+
+    assert_eq!(first.workspace_path, second.workspace_path);
+    assert_eq!(second.decision, WorkspaceAcquireDecision::ReusedRecovered);
+    assert!(
+        second.workspace_path.join("handoff.txt").exists(),
+        "same workflow workspace reuse must preserve non-terminal activity state"
+    );
+
+    mgr.remove_workspace(&task_id).await.expect("remove");
+}
+
+#[tokio::test]
 async fn create_workspace_allocates_distinct_slots_for_concurrent_same_repo_tasks() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
