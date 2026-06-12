@@ -2,7 +2,10 @@ use super::*;
 use crate::test_helpers;
 use axum::{body::to_bytes, routing::get, Router};
 use harness_core::types::TaskId;
-use harness_workflow::runtime::{WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID};
+use harness_workflow::runtime::{
+    WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    QUALITY_GATE_DEFINITION_ID,
+};
 
 fn workflow(state: &str, data: Value) -> WorkflowInstance {
     WorkflowInstance::new(
@@ -101,6 +104,60 @@ async fn endpoint_returns_monitor_payload_on_fresh_state() -> anyhow::Result<()>
         assert!(body.get(key).is_some(), "missing top-level key: {key}");
     }
     assert_eq!(body["worktrees"]["metrics_state"], "unavailable");
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-failed-runtime-")?;
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    let workflow_runtime_store = Arc::new(
+        WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+            Some(&test_helpers::test_database_url()?),
+        )
+        .await?,
+    );
+    workflow_runtime_store
+        .upsert_instance(
+            &WorkflowInstance::new(
+                QUALITY_GATE_DEFINITION_ID,
+                1,
+                "failed",
+                WorkflowSubject::new("quality_gate", "quality_gate:1"),
+            )
+            .with_id("quality-gate-failed".to_string())
+            .with_data(json!({
+                "source": "quality_gate",
+                "repo": "owner/repo",
+            })),
+        )
+        .await?;
+    state.core.workflow_runtime_store = Some(workflow_runtime_store);
+
+    let app = Router::new()
+        .route("/api/operator-monitor", get(operator_monitor))
+        .with_state(Arc::new(state));
+
+    let req = axum::http::Request::builder()
+        .uri("/api/operator-monitor")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+
+    assert_eq!(body["activity"]["runtime_workflows"]["failed"], 1);
+    let sources = body["activity"]["by_source"]
+        .as_array()
+        .expect("source rows");
+    let quality_gate = sources
+        .iter()
+        .find(|source| source["source"] == "quality_gate")
+        .expect("quality gate source row");
+    assert_eq!(quality_gate["failed"], 1);
     Ok(())
 }
 

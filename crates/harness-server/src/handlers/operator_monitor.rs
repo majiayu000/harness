@@ -247,6 +247,7 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
         return Ok(Vec::new());
     };
     let mut workflows = Vec::new();
+    let sample_limit = WORKFLOW_SAMPLE_LIMIT as usize;
     for definition_id in WORKFLOW_DEFINITION_IDS {
         workflows.extend(
             store
@@ -259,7 +260,22 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
         );
     }
     workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
-    workflows.truncate(WORKFLOW_SAMPLE_LIMIT as usize);
+    workflows.truncate(sample_limit);
+    let failed_capacity = sample_limit.saturating_sub(workflows.len());
+    if failed_capacity > 0 {
+        let mut failed_workflows = Vec::new();
+        for definition_id in WORKFLOW_DEFINITION_IDS {
+            failed_workflows.extend(
+                store
+                    .list_instances_by_state(definition_id, "failed", WORKFLOW_SAMPLE_LIMIT)
+                    .await?,
+            );
+        }
+        failed_workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
+        failed_workflows.truncate(failed_capacity);
+        workflows.extend(failed_workflows);
+        workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
+    }
     Ok(workflows)
 }
 
