@@ -4,7 +4,7 @@ use super::{
     EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use super::{
-    prompt_memory::{persist_prompt_submission_prompt, remove_prompt_submission_prompt_durable},
+    prompt_memory::{cache_prompt_submission_prompt, remove_prompt_submission_prompt},
     replay::{
         decision_for_event, disambiguate_submission_command_dedupe, submission_event_for_replay,
         SubmissionEventSelection,
@@ -13,6 +13,7 @@ use super::{
 use harness_workflow::runtime::{
     DecisionValidator, ValidationContext, WorkflowCommandStatus, WorkflowDecision,
     WorkflowInstance, WorkflowRuntimeStore, WorkflowSubmissionDecisionTransition,
+    WorkflowSubmissionPromptPayload,
 };
 use serde_json::json;
 
@@ -72,6 +73,7 @@ pub(super) async fn apply_decision(
                     rejection_reason: Some(&reason),
                     final_instance: None,
                     command_status: WorkflowCommandStatus::Pending,
+                    prompt_payload: None,
                 })
                 .await?
                 .ok_or_else(|| submission_commit_conflict(&instance.id))?;
@@ -111,6 +113,7 @@ pub(super) async fn apply_decision(
             rejection_reason: None,
             final_instance: Some(&final_instance),
             command_status: WorkflowCommandStatus::Pending,
+            prompt_payload: None,
         })
         .await?
         .ok_or_else(|| submission_commit_conflict(&instance.id))?;
@@ -179,6 +182,7 @@ pub(super) async fn apply_prompt_decision(
                     rejection_reason: Some(&reason),
                     final_instance: None,
                     command_status: WorkflowCommandStatus::Pending,
+                    prompt_payload: None,
                 })
                 .await?
                 .ok_or_else(|| submission_commit_conflict(&instance.id))?;
@@ -194,7 +198,9 @@ pub(super) async fn apply_prompt_decision(
 
     let prompt_ref = string_field(&accepted_data, "prompt_ref")?;
     let previous_prompt_ref = optional_string_field(&instance.data, "prompt_ref");
-    persist_prompt_submission_prompt(store, &prompt_ref, ctx.prompt).await?;
+    let previous_prompt_ref_to_remove = previous_prompt_ref
+        .as_deref()
+        .filter(|previous_prompt_ref| *previous_prompt_ref != prompt_ref.as_str());
     let committed_decision = existing_record
         .as_ref()
         .map(|record| &record.decision)
@@ -221,15 +227,16 @@ pub(super) async fn apply_prompt_decision(
             rejection_reason: None,
             final_instance: Some(&final_instance),
             command_status: WorkflowCommandStatus::Pending,
+            prompt_payload: Some(WorkflowSubmissionPromptPayload {
+                prompt_ref: &prompt_ref,
+                prompt: ctx.prompt,
+                previous_prompt_ref: previous_prompt_ref_to_remove,
+            }),
         })
         .await?
         .ok_or_else(|| submission_commit_conflict(&instance.id))?;
-    if let Some(previous_prompt_ref) = previous_prompt_ref
-        .as_deref()
-        .filter(|previous_prompt_ref| *previous_prompt_ref != prompt_ref.as_str())
-    {
-        remove_prompt_submission_prompt_durable(store, Some(previous_prompt_ref)).await?;
-    }
+    cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
+    remove_prompt_submission_prompt(previous_prompt_ref_to_remove);
     Ok(WorkflowSubmissionRuntimeRecord {
         workflow_id: instance.id,
         accepted: true,

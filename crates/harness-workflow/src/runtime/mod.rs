@@ -82,6 +82,7 @@ pub use status::WorkflowCommandStatus;
 pub use store::{
     WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
+    WorkflowSubmissionPromptPayload,
 };
 pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,

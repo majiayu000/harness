@@ -27,6 +27,7 @@ mod command_store;
 mod submission_commit;
 pub use submission_commit::{
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
+    WorkflowSubmissionPromptPayload,
 };
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,

@@ -23,6 +23,13 @@ pub struct WorkflowSubmissionDecisionTransition<'a> {
     pub rejection_reason: Option<&'a str>,
     pub final_instance: Option<&'a WorkflowInstance>,
     pub command_status: WorkflowCommandStatus,
+    pub prompt_payload: Option<WorkflowSubmissionPromptPayload<'a>>,
+}
+
+pub struct WorkflowSubmissionPromptPayload<'a> {
+    pub prompt_ref: &'a str,
+    pub prompt: &'a str,
+    pub previous_prompt_ref: Option<&'a str>,
 }
 
 pub struct WorkflowSubmissionDecisionCommit {
@@ -127,6 +134,13 @@ impl WorkflowRuntimeStore {
             let final_instance = transition.final_instance.ok_or_else(|| {
                 anyhow::anyhow!("accepted workflow submission requires a final instance")
             })?;
+            if let Some(prompt_payload) = transition.prompt_payload {
+                upsert_prompt_payload_tx(&mut tx, prompt_payload.prompt_ref, prompt_payload.prompt)
+                    .await?;
+                if let Some(previous_prompt_ref) = prompt_payload.previous_prompt_ref {
+                    delete_prompt_payload_tx(&mut tx, previous_prompt_ref).await?;
+                }
+            }
             for command in &record.decision.commands {
                 command_ids.push(
                     command_store::insert_tx(
@@ -192,6 +206,42 @@ async fn load_submission_instance_tx(
         return Ok(Some(initial.clone()));
     }
     select_instance_for_update_tx(tx, transition.workflow_id).await
+}
+
+async fn upsert_prompt_payload_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    prompt_ref: &str,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    if prompt_ref.trim().is_empty() {
+        anyhow::bail!("workflow prompt payload prompt_ref must not be empty");
+    }
+    sqlx::query(
+        "INSERT INTO workflow_prompt_payloads (prompt_ref, prompt)
+         VALUES ($1, $2)
+         ON CONFLICT (prompt_ref) DO UPDATE SET
+            prompt = EXCLUDED.prompt,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(prompt_ref)
+    .bind(prompt)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn delete_prompt_payload_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    prompt_ref: &str,
+) -> anyhow::Result<()> {
+    if prompt_ref.trim().is_empty() {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM workflow_prompt_payloads WHERE prompt_ref = $1")
+        .bind(prompt_ref)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -261,6 +311,7 @@ mod tests {
                 rejection_reason: None,
                 final_instance: Some(&final_instance),
                 command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
             })
             .await?
             .expect("initial submission commit should be accepted");
@@ -292,6 +343,7 @@ mod tests {
                 rejection_reason: None,
                 final_instance: Some(&final_instance),
                 command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
             })
             .await?
             .expect("submission replay should reuse the accepted decision");
