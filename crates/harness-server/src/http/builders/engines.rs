@@ -104,6 +104,10 @@ pub(crate) async fn build_engines(
                             harness_observe::event_store::EventStore::shared_schema_context(Some(
                                 &database_url,
                             ))?;
+                        super::ensure_startup_context_not_path_derived(
+                            "event_store",
+                            &event_context,
+                        )?;
                         let store = harness_observe::event_store::EventStore::with_policies_and_otel_shared_with_context(
                             data_dir,
                             &event_context,
