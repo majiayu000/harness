@@ -2227,6 +2227,63 @@ async fn reconcile_disk_removes_closed_issue_pool_slot_workspace() {
     );
 }
 
+#[tokio::test]
+async fn reconcile_disk_skips_live_persisted_lease_from_other_manager() -> anyhow::Result<()> {
+    let _env_guard = async_env_lock().lock().await;
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("workspace-leases")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let mgr_a = WorkspaceManager::new_with_pool(
+        config.clone(),
+        WorkspacePoolConfig::default(),
+        Some(store.clone()),
+    )?;
+    let mgr_b =
+        WorkspaceManager::new_with_pool(config, WorkspacePoolConfig::default(), Some(store))?;
+    let task_id = harness_core::types::TaskId("live-closed-issue-slot".to_string());
+
+    let lease = mgr_a
+        .create_workspace(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("myorg/my-repo"),
+        )
+        .await
+        .expect("create pool slot workspace");
+
+    let api_base =
+        github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
+    let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+    let summary = mgr_b
+        .reconcile_disk_workspaces(source.path(), "gh", 20, None)
+        .await;
+
+    assert_eq!(summary.removed, 0);
+    assert_eq!(summary.skipped_open, 1);
+    assert!(
+        lease.workspace_path.exists(),
+        "disk GC must not remove a workspace with a persisted live lease from another manager"
+    );
+
+    mgr_a.remove_workspace(&task_id).await?;
+    Ok(())
+}
+
 /// reconcile_disk_workspaces: preserves an open-issue workspace.
 #[tokio::test]
 async fn reconcile_disk_skips_open_issue_workspace() {

@@ -231,6 +231,29 @@ impl WorkspaceManager {
                 summary.skipped_open += 1;
                 continue;
             }
+            if let Some(store) = self.lease_store.as_ref() {
+                match store.leased_workspace_path(&path).await {
+                    Ok(Some(record)) => {
+                        tracing::debug!(
+                            workspace_path = ?path,
+                            owner_session = %record.owner_session,
+                            task_id = %record.task_id.0,
+                            "reconcile_disk_workspaces: skipping workspace with persisted live lease"
+                        );
+                        summary.skipped_open += 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            workspace_path = ?path,
+                            "reconcile_disk_workspaces: failed to inspect persisted workspace lease: {error}"
+                        );
+                        summary.skipped_open += 1;
+                        continue;
+                    }
+                }
+            }
 
             let owner_record = read_owner_record(&path);
             let Some(owner_record) = owner_record.as_ref() else {

@@ -240,6 +240,25 @@ impl WorkspaceLeaseStore {
         row.map(TryInto::try_into).transpose()
     }
 
+    pub(crate) async fn leased_workspace_path(
+        &self,
+        workspace_path: &std::path::Path,
+    ) -> anyhow::Result<Option<WorkspaceLeaseRecord>> {
+        let row = sqlx::query_as::<_, WorkspaceLeaseRow>(
+            "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
+                    runtime_workflow_id, owner_session, run_generation, process_id
+             FROM workspace_leases
+             WHERE workspace_path = $1
+               AND state = 'leased'
+             ORDER BY last_used_at DESC
+             LIMIT 1",
+        )
+        .bind(workspace_path.to_string_lossy().as_ref())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     #[cfg(test)]
     pub(crate) async fn list_leased(&self) -> anyhow::Result<Vec<WorkspaceLeaseRecord>> {
         let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(

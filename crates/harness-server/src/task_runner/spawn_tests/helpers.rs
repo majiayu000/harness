@@ -2,6 +2,7 @@ use super::super::*;
 use async_trait::async_trait;
 use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
 use harness_core::types::{Capability, ContextItem, ExecutionPhase, TokenUsage};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{sleep, Duration, Instant};
 
 pub(super) struct CapturingAgent {
@@ -87,6 +88,58 @@ impl harness_core::interceptor::TurnInterceptor for BlockingInterceptor {
 
     async fn pre_execute(&self, _req: &AgentRequest) -> harness_core::interceptor::InterceptResult {
         harness_core::interceptor::InterceptResult::block("test block")
+    }
+}
+
+pub(super) struct BlockingAgent {
+    started: AtomicBool,
+    notify_started: tokio::sync::Notify,
+}
+
+impl BlockingAgent {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: AtomicBool::new(false),
+            notify_started: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(super) async fn wait_started(&self, timeout: Duration) -> anyhow::Result<()> {
+        if self.started.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        tokio::time::timeout(timeout, self.notify_started.notified()).await?;
+        Ok(())
+    }
+
+    fn mark_started(&self) {
+        self.started.store(true, Ordering::SeqCst);
+        self.notify_started.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl harness_core::agent::CodeAgent for BlockingAgent {
+    fn name(&self) -> &str {
+        "blocking-mock"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.mark_started();
+        std::future::pending::<harness_core::error::Result<AgentResponse>>().await
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        _tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.mark_started();
+        std::future::pending::<harness_core::error::Result<()>>().await
     }
 }
 

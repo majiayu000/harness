@@ -551,6 +551,7 @@ where
     let store_watcher = store.clone();
     let events_watcher = events.clone();
     let id_watcher = id.clone();
+    let workspace_mgr_watcher = workspace_mgr.clone();
     let interceptors = Arc::new(interceptors);
     let detect_worktree = Arc::new(detect_worktree);
     // Clones used to store the abort handle after the main future is spawned
@@ -994,6 +995,9 @@ where
                 // abort() was called by the cancel endpoint; status already set to
                 // Cancelled before abort() was called — do not overwrite with Failed.
                 tracing::info!("task {id_watcher:?} cancelled via abort");
+                if let Some(wmgr) = workspace_mgr_watcher.as_ref() {
+                    wmgr.release_workspace(&id_watcher).await;
+                }
             }
             Err(join_err) => {
                 tracing::error!("task {id_watcher:?} panicked: {join_err}");
