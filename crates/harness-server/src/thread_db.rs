@@ -7,19 +7,30 @@ use std::path::Path;
 
 pub const THREAD_DB_SCHEMA: &str = "thread_db";
 
-static THREAD_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "create threads table",
-    sql: "CREATE TABLE IF NOT EXISTS threads (
-        id          TEXT PRIMARY KEY,
-        cwd         TEXT NOT NULL,
-        status      TEXT NOT NULL DEFAULT 'idle',
-        turns       TEXT NOT NULL DEFAULT '[]',
-        metadata    TEXT NOT NULL DEFAULT '{}',
-        created_at  TIMESTAMPTZ NOT NULL,
-        updated_at  TIMESTAMPTZ NOT NULL
-    )",
-}];
+static THREAD_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "create threads table",
+        sql: "CREATE TABLE IF NOT EXISTS threads (
+            id          TEXT PRIMARY KEY,
+            cwd         TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'idle',
+            turns       TEXT NOT NULL DEFAULT '[]',
+            metadata    TEXT NOT NULL DEFAULT '{}',
+            created_at  TIMESTAMPTZ NOT NULL,
+            updated_at  TIMESTAMPTZ NOT NULL
+        )",
+    },
+    Migration {
+        version: 2,
+        description: "record legacy thread backfills",
+        sql: "CREATE TABLE IF NOT EXISTS thread_db_legacy_backfills (
+            legacy_schema TEXT PRIMARY KEY,
+            copied_rows   BIGINT NOT NULL DEFAULT 0,
+            backfilled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    },
+];
 
 #[derive(Clone)]
 pub struct ThreadDb {
@@ -136,6 +147,16 @@ pub async fn migrate_legacy_thread_db_if_needed(
         return Ok(0);
     }
 
+    let already_backfilled: Option<String> = sqlx::query_scalar(
+        "SELECT legacy_schema FROM thread_db_legacy_backfills WHERE legacy_schema = $1",
+    )
+    .bind(legacy_schema)
+    .fetch_optional(&target_db.pool)
+    .await?;
+    if already_backfilled.is_some() {
+        return Ok(0);
+    }
+
     let legacy_table: Option<String> = sqlx::query_scalar(
         "SELECT table_name::text
          FROM information_schema.tables
@@ -160,6 +181,15 @@ pub async fn migrate_legacy_thread_db_if_needed(
         .execute(&target_db.pool)
         .await?
         .rows_affected();
+    sqlx::query(
+        "INSERT INTO thread_db_legacy_backfills (legacy_schema, copied_rows)
+         VALUES ($1, $2)
+         ON CONFLICT (legacy_schema) DO NOTHING",
+    )
+    .bind(legacy_schema)
+    .bind(copied as i64)
+    .execute(&target_db.pool)
+    .await?;
 
     if copied > 0 {
         tracing::info!(
@@ -428,6 +458,19 @@ mod tests {
                 .await?
                 .expect("legacy thread should be present in the shared schema");
             assert_eq!(loaded.project_root, PathBuf::from("/legacy/project"));
+
+            assert!(target_db.delete(thread_id.as_str()).await?);
+            let copied_after_delete =
+                migrate_legacy_thread_db_if_needed(&legacy_path, Some(&database_url), &target_db)
+                    .await?;
+            assert_eq!(
+                copied_after_delete, 0,
+                "completed migration must not recopy legacy threads"
+            );
+            assert!(
+                target_db.get(thread_id.as_str()).await?.is_none(),
+                "completed migration must not resurrect deleted shared threads"
+            );
             Ok::<(), anyhow::Error>(())
         })
         .catch_unwind()
