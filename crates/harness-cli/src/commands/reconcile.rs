@@ -109,7 +109,7 @@ async fn open_task_store(config: &HarnessConfig) -> Result<Arc<TaskStore>> {
     let database_url = resolve_database_url(config.server.database_url.as_deref())?;
     let setup_pool = pg_open_pool(&database_url).await?;
     let task_context = harness_server::task_db::TaskDb::shared_schema_context(Some(&database_url))?;
-    TaskStore::open_shared_with_data_dir(
+    TaskStore::open_shared_for_reconciliation_with_data_dir(
         &db_path,
         &task_context,
         &setup_pool,
@@ -195,11 +195,23 @@ mod tests {
             TaskDb::open_shared_with_data_dir(&task_context, &setup_pool, &other_data_dir).await?;
         let target_id = TaskId("reconcile-shared-target".to_string());
         let other_id = TaskId("reconcile-shared-other".to_string());
+        let running_id = TaskId("reconcile-shared-running".to_string());
         target_db
-            .insert(&task_state(&target_id, &target_data_dir))
+            .insert(&task_state(
+                &target_id,
+                &target_data_dir,
+                TaskStatus::Pending,
+            ))
             .await?;
         other_db
-            .insert(&task_state(&other_id, &other_data_dir))
+            .insert(&task_state(&other_id, &other_data_dir, TaskStatus::Pending))
+            .await?;
+        target_db
+            .insert(&task_state(
+                &running_id,
+                &target_data_dir,
+                TaskStatus::Implementing,
+            ))
             .await?;
 
         let mut config = HarnessConfig::default();
@@ -215,15 +227,33 @@ mod tests {
             store.get_with_db_fallback(&other_id).await?.is_none(),
             "reconcile task store must not see tasks from another data_dir"
         );
+        let running_task = store
+            .get_with_db_fallback(&running_id)
+            .await?
+            .expect("reconcile task store should load active running tasks");
+        assert_eq!(
+            running_task.status,
+            TaskStatus::Implementing,
+            "reconcile task store must not run startup recovery side effects"
+        );
+        let persisted_running = target_db
+            .get(running_id.as_str())
+            .await?
+            .expect("running task should remain persisted");
+        assert_eq!(
+            persisted_running.status,
+            TaskStatus::Implementing,
+            "opening reconcile task store must not fail running tasks in storage"
+        );
 
         Ok(())
     }
 
-    fn task_state(id: &TaskId, project_root: &std::path::Path) -> TaskState {
+    fn task_state(id: &TaskId, project_root: &std::path::Path, status: TaskStatus) -> TaskState {
         TaskState {
             id: id.clone(),
             task_kind: TaskKind::Prompt,
-            status: TaskStatus::Pending,
+            status,
             failure_kind: None,
             turn: 0,
             pr_url: None,
