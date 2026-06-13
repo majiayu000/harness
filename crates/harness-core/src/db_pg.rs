@@ -1,4 +1,4 @@
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::Acquire as _;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -583,6 +583,41 @@ impl<'a> PgMigrator<'a> {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        // Keep the schema-level lock and migration work on one connection; some
+        // deployments intentionally run store pools with a single session.
+        sqlx::query(
+            "SELECT pg_advisory_lock(hashtext(current_database()), hashtext(current_schema()))",
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        let result = self.run_locked(&mut conn).await;
+        let unlock_result: Result<bool, sqlx::Error> = sqlx::query_scalar(
+            "SELECT pg_advisory_unlock(hashtext(current_database()), hashtext(current_schema()))",
+        )
+        .fetch_one(&mut *conn)
+        .await;
+
+        match (result, unlock_result) {
+            (Ok(()), Ok(true)) => Ok(()),
+            (Ok(()), Ok(false)) => Err(anyhow::anyhow!(
+                "Postgres migration advisory lock was not held at release time"
+            )),
+            (Ok(()), Err(error)) => Err(anyhow::anyhow!(
+                "failed to release Postgres migration advisory lock: {error}"
+            )),
+            (Err(error), Ok(true)) => Err(error),
+            (Err(error), Ok(false)) => Err(anyhow::anyhow!(
+                "{error}; Postgres migration advisory lock was not held at release time"
+            )),
+            (Err(error), Err(unlock_error)) => Err(anyhow::anyhow!(
+                "{error}; additionally failed to release Postgres migration advisory lock: {unlock_error}"
+            )),
+        }
+    }
+
+    async fn run_locked(&self, conn: &mut PgConnection) -> anyhow::Result<()> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version     BIGINT PRIMARY KEY,
@@ -590,12 +625,12 @@ impl<'a> PgMigrator<'a> {
                 applied_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
-        .execute(self.pool)
+        .execute(&mut *conn)
         .await?;
 
         let rows: Vec<(i64,)> =
             sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version ASC")
-                .fetch_all(self.pool)
+                .fetch_all(&mut *conn)
                 .await?;
         let applied: HashSet<u32> = rows.into_iter().map(|(v,)| v as u32).collect();
 
@@ -607,13 +642,13 @@ impl<'a> PgMigrator<'a> {
         pending.sort_by_key(|m| m.version);
 
         for migration in pending {
-            self.apply(migration).await?;
+            self.apply(conn, migration).await?;
         }
         Ok(())
     }
 
-    async fn apply(&self, migration: &Migration) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+    async fn apply(&self, conn: &mut PgConnection, migration: &Migration) -> anyhow::Result<()> {
+        let mut tx = conn.begin().await?;
         for stmt in crate::db_pg_split::pg_split_statements(migration.sql) {
             let mut statement_tx = (&mut tx).begin().await?;
             match sqlx::query(&stmt).execute(&mut *statement_tx).await {

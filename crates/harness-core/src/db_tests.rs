@@ -241,6 +241,43 @@ db_test!(migrator_is_idempotent_on_rerun, {
     Ok(())
 });
 
+db_test!(migrator_serializes_concurrent_runs_for_same_schema, {
+    let path = db_path("mig-concurrent.db")?;
+    let pool_a = open_pool(&path).await?;
+    let pool_b = open_pool(&path).await?;
+    let migrations = [
+        Migration {
+            version: 1,
+            description: "create concurrent items table",
+            sql: "SELECT pg_sleep(0.05);
+                  CREATE TABLE IF NOT EXISTS concurrent_items (
+                      id TEXT PRIMARY KEY,
+                      value TEXT NOT NULL
+                  )",
+        },
+        Migration {
+            version: 2,
+            description: "add concurrent tag column",
+            sql: "ALTER TABLE concurrent_items ADD COLUMN IF NOT EXISTS tag TEXT",
+        },
+    ];
+
+    let migrator_a = Migrator::new(&pool_a, &migrations);
+    let migrator_b = Migrator::new(&pool_b, &migrations);
+    let run_a = migrator_a.run();
+    let run_b = migrator_b.run();
+    let (result_a, result_b) = tokio::join!(run_a, run_b);
+    result_a?;
+    result_b?;
+
+    assert_eq!(applied_versions(&pool_a).await?, vec![1, 2]);
+    assert_eq!(
+        table_columns(&pool_a, "concurrent_items").await?,
+        vec!["id", "value", "tag"]
+    );
+    Ok(())
+});
+
 db_test!(migrator_tolerates_duplicate_column_on_alter_table, {
     let pool = open_pool(&db_path("mig.db")?).await?;
     sqlx::query("CREATE TABLE items (id TEXT PRIMARY KEY, value TEXT NOT NULL, tag TEXT)")
