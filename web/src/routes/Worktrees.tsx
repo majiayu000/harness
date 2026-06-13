@@ -259,7 +259,7 @@ export function Worktrees() {
               <div className="flex flex-col items-center justify-center gap-3 py-24 text-ink-3">
                 <span className="font-mono text-[13px]">No active worktrees</span>
                 <Link
-                  to="/?tab=submit"
+                  to="/dashboard?tab=submit"
                   className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
                 >
                   Submit task

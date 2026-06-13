@@ -158,6 +158,7 @@ fn authed_app(state: Arc<AppState>) -> Router {
     use axum::middleware;
     Router::new()
         .route("/", get(crate::dashboard::index))
+        .route("/dashboard", get(crate::dashboard::index))
         .route("/health", get(health_check))
         .route("/tasks", get(list_tasks))
         .layer(middleware::from_fn_with_state(
@@ -167,7 +168,7 @@ fn authed_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// / is now exempt from auth — dashboard HTML embeds no secrets.
+/// / and /dashboard are exempt from auth because dashboard HTML embeds no secrets.
 #[tokio::test]
 async fn dashboard_exempt_from_auth_when_token_configured() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -182,10 +183,20 @@ async fn dashboard_exempt_from_auth_when_token_configured() -> anyhow::Result<()
     let app = authed_app(state);
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/").body(Body::empty())?)
         .await?;
 
-    // Dashboard is now exempt from auth — HTML contains no secrets.
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard?tab=submit")
+                .body(Body::empty())?,
+        )
+        .await?;
+
     assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
@@ -223,7 +234,18 @@ async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
     let app = authed_app(state);
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard?tab=submit")
+                .body(Body::empty())?,
+        )
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);

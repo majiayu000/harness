@@ -17,6 +17,7 @@ use super::{
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(crate::dashboard::index))
+        .route("/dashboard", get(crate::dashboard::index))
         .route("/overview", get(crate::overview::index))
         .route("/usage", get(crate::dashboard::index))
         .route("/worktrees", get(crate::dashboard::index))

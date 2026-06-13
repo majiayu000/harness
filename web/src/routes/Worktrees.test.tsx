@@ -304,7 +304,7 @@ describe("<Worktrees>", () => {
 
     expect(screen.getByRole("link", { name: "Submit task" })).toHaveAttribute(
       "href",
-      "/?tab=submit",
+      "/dashboard?tab=submit",
     );
   });
 });
