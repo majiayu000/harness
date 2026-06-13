@@ -1,8 +1,11 @@
 use harness_core::db::{Migration, PgStoreContext};
+use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+pub const PROJECT_REGISTRY_SCHEMA: &str = "project_registry";
 
 /// A registered project with its root path and optional config overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,45 +53,137 @@ static PROJECT_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_projects_root_created_at
               ON projects ((data::jsonb ->> 'root'), created_at DESC)",
     },
+    Migration {
+        version: 4,
+        description: "scope projects within shared schema",
+        sql: "ALTER TABLE projects ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE projects
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE projects ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE projects ALTER COLUMN store_key SET NOT NULL;
+              ALTER TABLE projects DROP CONSTRAINT IF EXISTS projects_pkey;
+              ALTER TABLE projects ADD CONSTRAINT projects_pkey PRIMARY KEY (store_key, id);
+              DROP INDEX IF EXISTS idx_projects_name_created_at;
+              DROP INDEX IF EXISTS idx_projects_root_created_at;
+              CREATE INDEX IF NOT EXISTS idx_projects_store_created_at
+              ON projects (store_key, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_projects_store_name_created_at
+              ON projects (store_key, (data::jsonb ->> 'name'), created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_projects_store_root_created_at
+              ON projects (store_key, (data::jsonb ->> 'root'), created_at DESC)",
+    },
+    Migration {
+        version: 5,
+        description: "record legacy project registry backfills",
+        sql: "CREATE TABLE IF NOT EXISTS project_registry_legacy_backfills (
+            store_key     TEXT NOT NULL DEFAULT current_schema(),
+            legacy_schema TEXT NOT NULL,
+            copied_rows   BIGINT NOT NULL DEFAULT 0,
+            backfilled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (store_key, legacy_schema)
+        )",
+    },
 ];
 
 /// Registry of projects backed by Postgres. Survives server restarts.
 pub struct ProjectRegistry {
     pool: PgPool,
+    schema: String,
+    store_key: String,
 }
 
 impl ProjectRegistry {
-    pub async fn open(path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
+    pub async fn open(path: &Path) -> anyhow::Result<Arc<Self>> {
         Self::open_with_database_url(path, None).await
     }
 
     pub async fn open_with_database_url(
-        path: &std::path::Path,
+        path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Arc<Self>> {
         let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let schema = context.schema().to_owned();
+        let store_key = schema.clone();
         let pool = context.open_migrated_pool(PROJECT_MIGRATIONS).await?;
-        Ok(Arc::new(Self { pool }))
+        Ok(Arc::new(Self {
+            pool,
+            schema,
+            store_key,
+        }))
+    }
+
+    pub fn shared_schema_context(
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<PgStoreContext> {
+        PostgresBackend::new(configured_database_url.map(ToOwned::to_owned)).store_context(
+            &StoreLocation::SharedSchema(PROJECT_REGISTRY_SCHEMA.to_string()),
+        )
     }
 
     pub async fn open_with_context(
         context: &PgStoreContext,
         setup_pool: &PgPool,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_context_and_store_key(context, setup_pool, context.schema().to_owned())
+            .await
+    }
+
+    pub async fn open_shared_with_data_dir(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        data_dir: &Path,
+    ) -> anyhow::Result<Arc<Self>> {
+        let store_key = Self::store_key_for_data_dir(data_dir);
+        Self::open_with_context_and_store_key(context, setup_pool, store_key).await
+    }
+
+    async fn open_with_context_and_store_key(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        store_key: String,
+    ) -> anyhow::Result<Arc<Self>> {
+        let schema = context.schema().to_owned();
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, PROJECT_MIGRATIONS)
             .await?;
-        Ok(Arc::new(Self { pool }))
+        Ok(Arc::new(Self {
+            pool,
+            schema,
+            store_key,
+        }))
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub fn store_key_for_data_dir(data_dir: &Path) -> String {
+        let path = data_dir.canonicalize().unwrap_or_else(|_| {
+            if data_dir.is_absolute() {
+                data_dir.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|current| current.join(data_dir))
+                    .unwrap_or_else(|_| data_dir.to_path_buf())
+            }
+        });
+        path.to_string_lossy().into_owned()
+    }
+
+    pub fn store_key(&self) -> &str {
+        &self.store_key
     }
 
     /// Register or update a project.
     pub async fn register(&self, project: Project) -> anyhow::Result<()> {
         let data = serde_json::to_string(&project)?;
         sqlx::query(
-            "INSERT INTO projects (id, data) VALUES ($1, $2)
-             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
+            "INSERT INTO projects (store_key, id, data) VALUES ($1, $2, $3)
+             ON CONFLICT(store_key, id) DO UPDATE SET data = EXCLUDED.data,
                  updated_at = CURRENT_TIMESTAMP",
         )
+        .bind(&self.store_key)
         .bind(&project.id)
         .bind(&data)
         .execute(&self.pool)
@@ -98,10 +193,12 @@ impl ProjectRegistry {
 
     /// List all registered projects ordered by creation time (newest first).
     pub async fn list(&self) -> anyhow::Result<Vec<Project>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data FROM projects ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM projects WHERE store_key = $1 ORDER BY created_at DESC",
+        )
+        .bind(&self.store_key)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
@@ -109,10 +206,12 @@ impl ProjectRegistry {
 
     /// Get a project by ID.
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<Project>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM projects WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data FROM projects WHERE store_key = $1 AND id = $2")
+                .bind(&self.store_key)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
             None => Ok(None),
@@ -121,7 +220,8 @@ impl ProjectRegistry {
 
     /// Remove a project by ID. Returns `true` if it existed.
     pub async fn remove(&self, id: &str) -> anyhow::Result<bool> {
-        let result = sqlx::query("DELETE FROM projects WHERE id = $1")
+        let result = sqlx::query("DELETE FROM projects WHERE store_key = $1 AND id = $2")
+            .bind(&self.store_key)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -138,10 +238,11 @@ impl ProjectRegistry {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT data
              FROM projects
-             WHERE data::jsonb ->> 'name' = $1
+             WHERE store_key = $1 AND data::jsonb ->> 'name' = $2
              ORDER BY created_at DESC
              LIMIT 1",
         )
+        .bind(&self.store_key)
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
@@ -158,10 +259,11 @@ impl ProjectRegistry {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT data
              FROM projects
-             WHERE data::jsonb ->> 'root' = $1
+             WHERE store_key = $1 AND data::jsonb ->> 'root' = $2
              ORDER BY created_at DESC
              LIMIT 1",
         )
+        .bind(&self.store_key)
         .bind(root_str.as_ref())
         .fetch_optional(&self.pool)
         .await?;
@@ -170,6 +272,81 @@ impl ProjectRegistry {
             None => Ok(None),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+pub async fn migrate_legacy_project_registry_if_needed(
+    legacy_path: &Path,
+    configured_database_url: Option<&str>,
+    target_registry: &ProjectRegistry,
+) -> anyhow::Result<u64> {
+    let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
+    let legacy_schema = legacy_context.schema();
+    if legacy_schema == target_registry.schema() {
+        return Ok(0);
+    }
+
+    let already_backfilled: Option<String> = sqlx::query_scalar(
+        "SELECT legacy_schema
+         FROM project_registry_legacy_backfills
+         WHERE store_key = $1 AND legacy_schema = $2",
+    )
+    .bind(target_registry.store_key())
+    .bind(legacy_schema)
+    .fetch_optional(&target_registry.pool)
+    .await?;
+    if already_backfilled.is_some() {
+        return Ok(0);
+    }
+
+    let legacy_table: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(format!("\"{legacy_schema}\".projects"))
+        .fetch_one(&target_registry.pool)
+        .await?;
+    if legacy_table.is_none() {
+        return Ok(0);
+    }
+
+    let mut tx = target_registry.pool.begin().await?;
+    let copy_sql = format!(
+        "INSERT INTO projects (store_key, id, data, created_at, updated_at)
+         SELECT $1, id, data, created_at, updated_at
+         FROM \"{legacy_schema}\".projects
+         ON CONFLICT (store_key, id) DO NOTHING"
+    );
+    let copied = sqlx::query(&copy_sql)
+        .bind(target_registry.store_key())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    sqlx::query(
+        "INSERT INTO project_registry_legacy_backfills (store_key, legacy_schema, copied_rows)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (store_key, legacy_schema) DO NOTHING",
+    )
+    .bind(target_registry.store_key())
+    .bind(legacy_schema)
+    .bind(copied as i64)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    if copied > 0 {
+        tracing::info!(
+            copied,
+            legacy_schema,
+            target_schema = target_registry.schema(),
+            "project registry migration: backfilled legacy projects into shared schema"
+        );
+    }
+
+    Ok(copied)
 }
 
 /// Check that `canonical_root` falls under at least one of the
@@ -211,187 +388,5 @@ pub fn validate_project_root(root: &std::path::Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use harness_core::db::resolve_database_url;
-
-    async fn open_test_registry(name: &str) -> anyhow::Result<Option<Arc<ProjectRegistry>>> {
-        if resolve_database_url(None).is_err() {
-            return Ok(None);
-        }
-        let dir = tempfile::tempdir()?;
-        let registry = ProjectRegistry::open(&dir.path().join(name)).await?;
-        Ok(Some(registry))
-    }
-
-    #[tokio::test]
-    async fn register_and_get_roundtrip() -> anyhow::Result<()> {
-        let Some(registry) = open_test_registry("projects.db").await? else {
-            return Ok(());
-        };
-
-        let project = Project {
-            id: "my-project".to_string(),
-            root: PathBuf::from("/tmp/my-project"),
-            name: None,
-            max_concurrent: None,
-            default_agent: None,
-            active: true,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        registry.register(project.clone()).await?;
-
-        let loaded = registry
-            .get("my-project")
-            .await?
-            .expect("project should exist");
-        assert_eq!(loaded.id, "my-project");
-        assert_eq!(loaded.root, PathBuf::from("/tmp/my-project"));
-        assert!(loaded.active);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn list_returns_all_projects() -> anyhow::Result<()> {
-        let Some(registry) = open_test_registry("projects.db").await? else {
-            return Ok(());
-        };
-
-        for i in 0..3u32 {
-            registry
-                .register(Project {
-                    id: format!("p{i}"),
-                    root: PathBuf::from(format!("/tmp/p{i}")),
-                    name: None,
-                    max_concurrent: None,
-                    default_agent: None,
-                    active: true,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                })
-                .await?;
-        }
-
-        let all = registry.list().await?;
-        assert_eq!(all.len(), 3);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn remove_returns_true_when_found() -> anyhow::Result<()> {
-        let Some(registry) = open_test_registry("projects.db").await? else {
-            return Ok(());
-        };
-
-        registry
-            .register(Project {
-                id: "to-delete".to_string(),
-                root: PathBuf::from("/tmp/x"),
-                name: None,
-                max_concurrent: None,
-                default_agent: None,
-                active: true,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await?;
-
-        assert!(registry.remove("to-delete").await?);
-        assert!(registry.get("to-delete").await?.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn remove_returns_false_when_missing() -> anyhow::Result<()> {
-        let Some(registry) = open_test_registry("projects.db").await? else {
-            return Ok(());
-        };
-        assert!(!registry.remove("nonexistent").await?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn resolve_path_returns_root() -> anyhow::Result<()> {
-        let Some(registry) = open_test_registry("projects.db").await? else {
-            return Ok(());
-        };
-
-        registry
-            .register(Project {
-                id: "harness".to_string(),
-                root: PathBuf::from("/home/user/harness"),
-                name: None,
-                max_concurrent: None,
-                default_agent: None,
-                active: true,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await?;
-
-        let path = registry.resolve_path("harness").await?;
-        assert_eq!(path, Some(PathBuf::from("/home/user/harness")));
-        assert!(registry.resolve_path("unknown").await?.is_none());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn survives_reopen() -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
-            return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let db_path = dir.path().join("projects.db");
-
-        {
-            let registry = ProjectRegistry::open(&db_path).await?;
-            registry
-                .register(Project {
-                    id: "persistent".to_string(),
-                    root: PathBuf::from("/tmp/persistent"),
-                    name: None,
-                    max_concurrent: Some(2),
-                    default_agent: Some("claude".to_string()),
-                    active: true,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                })
-                .await?;
-        }
-
-        let registry = ProjectRegistry::open(&db_path).await?;
-        let loaded = registry
-            .get("persistent")
-            .await?
-            .expect("should survive reopen");
-        assert_eq!(loaded.max_concurrent, Some(2));
-        assert_eq!(loaded.default_agent.as_deref(), Some("claude"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn get_by_root_returns_canonical_match() -> anyhow::Result<()> {
-        let Some(registry) = open_test_registry("projects.db").await? else {
-            return Ok(());
-        };
-
-        let dir = tempfile::tempdir()?;
-        let canonical_root = dir.path().canonicalize()?;
-        registry
-            .register(Project {
-                id: "root-keyed".to_string(),
-                root: canonical_root.clone(),
-                name: Some("root-keyed".to_string()),
-                max_concurrent: Some(2),
-                default_agent: Some("codex".to_string()),
-                active: true,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .await?;
-
-        let loaded = registry
-            .get_by_root(dir.path())
-            .await?
-            .expect("project should resolve by canonical root");
-        assert_eq!(loaded.id, "root-keyed");
-        assert_eq!(loaded.root, canonical_root);
-        assert_eq!(loaded.default_agent.as_deref(), Some("codex"));
-        Ok(())
-    }
-}
+#[path = "project_registry_tests.rs"]
+mod tests;
