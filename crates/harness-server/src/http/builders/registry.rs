@@ -67,10 +67,10 @@ pub(crate) async fn build_registry(
             None
         }
         None => match async {
-            let thread_db = crate::thread_db::ThreadDb::open_with_context_and_scope(
+            let thread_db = crate::thread_db::ThreadDb::open_shared_with_data_dir(
                 &thread_context,
                 &setup_pool,
-                crate::thread_db::ThreadDb::scope_for_data_dir(data_dir),
+                data_dir,
             )
             .await?;
             crate::thread_db::migrate_legacy_thread_db_if_needed(
