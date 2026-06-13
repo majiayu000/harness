@@ -86,6 +86,7 @@ pub fn reduce_runtime_job_completed(
     let decision = match result.status {
         ActivityStatus::Succeeded => reduce_success(instance, event, &result),
         ActivityStatus::Blocked => github_issue_closed_decision(instance, event, &result)
+            .or_else(|| scope_too_large_decision(instance, event, &result))
             .or_else(|| Some(runtime_blocked_decision(instance, event, &result))),
         ActivityStatus::Failed => Some(
             retry_failed_activity_decision(instance, event, &result)
