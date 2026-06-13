@@ -185,6 +185,84 @@ async fn reconcile_disk_skips_live_persisted_lease_from_other_manager() -> anyho
     Ok(())
 }
 
+#[tokio::test]
+async fn reconcile_disk_releases_dead_persisted_lease_before_cleanup() -> anyhow::Result<()> {
+    let _env_guard = async_env_lock().lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("workspace-leases")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let creator = WorkspaceManager::new(config.clone())?;
+    let reconciler = WorkspaceManager::new_with_pool(
+        config,
+        WorkspacePoolConfig::default(),
+        Some(store.clone()),
+    )?;
+    let task_id = harness_core::types::TaskId("dead-closed-issue-slot".to_string());
+
+    let lease = creator
+        .create_workspace(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("myorg/my-repo"),
+        )
+        .await?;
+    creator.release_workspace(&task_id).await;
+
+    let owner = read_owner_record(&lease.workspace_path).expect("owner record");
+    let stale_record = WorkspaceLeaseRecord {
+        project_key: "dead-project".to_string(),
+        slot_index: 0,
+        task_id: task_id.clone(),
+        workspace_key: owner.workspace_key.expect("owner workspace key"),
+        workspace_path: lease.workspace_path.clone(),
+        source_repo: source.path().to_path_buf(),
+        repo: Some("myorg/my-repo".to_string()),
+        runtime_workflow_id: Some("workflow-dead".to_string()),
+        owner_session: "dead-foreign-session".to_string(),
+        run_generation: 1,
+        process_id: u32::MAX,
+    };
+    assert!(store.try_acquire_lease(&stale_record).await?);
+
+    let api_base =
+        github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
+    let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+    let summary = reconciler
+        .reconcile_disk_workspaces(source.path(), "gh", 20, None)
+        .await;
+
+    assert_eq!(summary.released_leases, 1);
+    assert_eq!(summary.removed, 1);
+    assert!(
+        !lease.workspace_path.exists(),
+        "closed issue workspace with dead persisted lease should be removed"
+    );
+    assert!(
+        store.list_leased().await?.is_empty(),
+        "dead persisted lease should be released before disk GC preservation checks"
+    );
+
+    Ok(())
+}
+
 /// reconcile_disk_workspaces: preserves an open-issue workspace.
 #[tokio::test]
 async fn reconcile_disk_skips_open_issue_workspace() {

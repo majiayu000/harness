@@ -604,6 +604,7 @@ printf 'second\n'
 async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let started_marker = dir.path().join("timeout-started.txt");
+    let descendant_marker = dir.path().join("timeout-descendant-started.txt");
     let marker = dir.path().join("timeout-marker.txt");
     let script = dir.path().join("mock-claude-timeout.sh");
     // sync_all() ensures the kernel flushes dirty pages before exec;
@@ -613,8 +614,9 @@ async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
         let mut f = fs::File::create(&script).expect("create timeout script");
         f.write_all(
             format!(
-                "#!/bin/sh\nset -eu\necho started > \"{}\"\nsleep 5\necho reached > \"{}\"\n",
+                "#!/bin/sh\nset -eu\necho started > \"{}\"\n( echo descendant > \"{}\"; sleep 1; echo reached > \"{}\" ) &\nsleep 5\n",
                 started_marker.display(),
+                descendant_marker.display(),
                 marker.display()
             )
             .as_bytes(),
@@ -656,6 +658,10 @@ async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
         let outcome = timeout(Duration::from_secs(1), handle).await;
         panic!("stream process did not stay alive long enough to observe startup: {outcome:?}");
     }
+    if !wait_for_path(&descendant_marker, Duration::from_secs(10)).await {
+        let outcome = timeout(Duration::from_secs(1), handle).await;
+        panic!("stream process did not start descendant before cancellation: {outcome:?}");
+    }
 
     handle.abort();
     let join_err = timeout(Duration::from_secs(2), handle)
@@ -667,9 +673,9 @@ async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
         "expected cancelled join error after abort, got: {join_err}"
     );
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
         !marker.exists(),
-        "process should be killed when stream future is dropped"
+        "process group descendant should be killed when stream future is dropped"
     );
 }

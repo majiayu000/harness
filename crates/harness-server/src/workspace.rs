@@ -208,6 +208,7 @@ pub(crate) struct DiskReconciliationSummary {
     pub(crate) removed: u32,
     pub(crate) skipped_uuid: u32,
     pub(crate) skipped_open: u32,
+    pub(crate) released_leases: u32,
 }
 
 pub struct WorkspaceManager {

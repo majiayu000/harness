@@ -530,6 +530,7 @@ impl CodeAgent for CodexAgent {
             );
             harness_core::error::HarnessError::AgentExecution(message)
         })?;
+        let mut child = crate::ManagedChild::new(child, "codex execute");
         let output = child.wait_with_output().await.map_err(|err| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for codex: {err}"
@@ -623,7 +624,7 @@ impl CodeAgent for CodexAgent {
             wrapped_command.engine,
             "execute_stream",
         );
-        let mut child = cmd.spawn().map_err(|error| {
+        let child = cmd.spawn().map_err(|error| {
             let message = codex_spawn_failure_message(
                 &error,
                 &wrapped_command.program,
@@ -639,10 +640,11 @@ impl CodeAgent for CodexAgent {
             );
             harness_core::error::HarnessError::AgentExecution(message)
         })?;
+        let mut child = crate::ManagedChild::new(child, "codex execute_stream");
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.inner_mut().stderr.take() {
             let agent = self.name().to_string();
             let captured = Arc::clone(&stderr_capture);
             stderr_task = Some(tokio::spawn(async move {
@@ -654,16 +656,14 @@ impl CodeAgent for CodexAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        let stream_result = stream_codex_exec_output(&mut child, &tx, idle_timeout).await;
+        let stream_result = stream_codex_exec_output(child.inner_mut(), &tx, idle_timeout).await;
         let stream_send_failed = matches!(
             &stream_result,
             Err(harness_core::error::HarnessError::AgentExecution(message))
                 if message.contains("stream send failed")
         );
         if stream_result.is_err() {
-            #[cfg(unix)]
-            crate::kill_process_group(&child);
-            let _ = child.start_kill();
+            child.terminate_now();
         }
         if stream_send_failed {
             return Err(stream_result.expect_err("stream send failures return an error"));

@@ -229,6 +229,19 @@ impl WorkspaceManager {
         github_token: Option<&str>,
     ) -> DiskReconciliationSummary {
         let mut summary = DiskReconciliationSummary::default();
+        if let Some(store) = self.lease_store.as_ref() {
+            match store
+                .release_foreign_orphaned_leases(&self.owner_session)
+                .await
+            {
+                Ok(released) => {
+                    summary.released_leases = released.min(u64::from(u32::MAX)) as u32;
+                }
+                Err(error) => {
+                    tracing::warn!("workspace disk lease reconciliation failed: {error}");
+                }
+            }
+        }
         let read_dir = match std::fs::read_dir(&self.config.root) {
             Ok(rd) => rd,
             Err(e) => {
@@ -341,6 +354,7 @@ impl WorkspaceManager {
             removed = summary.removed,
             skipped_uuid = summary.skipped_uuid,
             skipped_open = summary.skipped_open,
+            released_leases = summary.released_leases,
             "reconcile_disk_workspaces: scan complete"
         );
         summary

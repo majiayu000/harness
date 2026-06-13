@@ -369,13 +369,15 @@ sleep 30
 async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let started_marker = dir.path().join("timeout-started.txt");
+    let descendant_marker = dir.path().join("timeout-descendant-started.txt");
     let marker = dir.path().join("timeout-marker.txt");
     let script = dir.path().join("mock-codex-timeout.sh");
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\nset -eu\necho started > \"{}\"\nsleep 5\necho reached > \"{}\"\n",
+            "#!/bin/sh\nset -eu\necho started > \"{}\"\n( echo descendant > \"{}\"; sleep 1; echo reached > \"{}\" ) &\nsleep 5\n",
             started_marker.display(),
+            descendant_marker.display(),
             marker.display()
         ),
     )
@@ -406,6 +408,13 @@ async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
         "startup marker",
     )
     .await;
+    assert_path_observed_before_task_exit(
+        &descendant_marker,
+        &mut handle,
+        Duration::from_secs(20),
+        "descendant startup marker",
+    )
+    .await;
 
     handle.abort();
     let join_err = timeout(Duration::from_secs(2), handle)
@@ -417,10 +426,10 @@ async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
         "expected cancelled join error after abort, got: {join_err}"
     );
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
         !marker.exists(),
-        "process should be killed when stream future is dropped"
+        "process group descendant should be killed when stream future is dropped"
     );
 }
 
