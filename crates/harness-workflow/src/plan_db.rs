@@ -1,3 +1,4 @@
+use anyhow::Context;
 use harness_core::db::{Migration, PgStoreContext};
 use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
@@ -109,7 +110,7 @@ impl PlanDb {
         setup_pool: &PgPool,
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
-        let store_key = Self::store_key_for_data_dir(data_dir);
+        let store_key = Self::store_key_for_data_dir(data_dir)?;
         Self::open_with_context_and_store_key(context, setup_pool, store_key).await
     }
 
@@ -146,12 +147,17 @@ impl PlanDb {
         &self.schema
     }
 
-    pub fn store_key_for_data_dir(data_dir: &Path) -> String {
-        data_dir
-            .canonicalize()
-            .unwrap_or_else(|_| data_dir.to_path_buf())
-            .to_string_lossy()
-            .into_owned()
+    pub fn store_key_for_data_dir(data_dir: &Path) -> anyhow::Result<String> {
+        std::fs::create_dir_all(data_dir).with_context(|| {
+            format!("failed to create plan db data dir '{}'", data_dir.display())
+        })?;
+        let canonical = data_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize plan db data dir '{}'",
+                data_dir.display()
+            )
+        })?;
+        Ok(canonical.to_string_lossy().into_owned())
     }
 
     pub fn store_key(&self) -> &str {
@@ -432,6 +438,23 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn store_key_creates_data_dir_before_canonicalizing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("missing").join("data");
+        assert!(!data_dir.exists());
+
+        let store_key = PlanDb::store_key_for_data_dir(&data_dir)?;
+
+        assert!(data_dir.is_dir());
+        assert_eq!(
+            store_key,
+            data_dir.canonicalize()?.to_string_lossy().into_owned()
+        );
+        assert_eq!(store_key, PlanDb::store_key_for_data_dir(&data_dir)?);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn plan_db_roundtrip() -> anyhow::Result<()> {
         let Some((db, dir, _permit)) = open_test_store().await? else {
@@ -609,6 +632,9 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies the upgrade contract: a database with v1+v2 migrations (data TEXT)
+    /// is correctly upgraded to v3 (JSONB column) and v4 (GIN index), and that
+    /// pre-existing TEXT rows survive the `USING data::jsonb` cast.
     #[tokio::test]
     async fn legacy_plan_db_migration_backfills_once() -> anyhow::Result<()> {
         let Ok(database_url) = resolve_database_url(None) else {
@@ -713,9 +739,6 @@ mod tests {
         }
     }
 
-    /// Verifies the upgrade contract: a database with v1+v2 migrations (data TEXT)
-    /// is correctly upgraded to v3 (JSONB column) and v4 (GIN index), and that
-    /// pre-existing TEXT rows survive the `USING data::jsonb` cast.
     #[tokio::test]
     async fn migration_contract_text_to_jsonb_gin() -> anyhow::Result<()> {
         let Ok(database_url) = resolve_database_url(None) else {
@@ -742,10 +765,10 @@ mod tests {
 
         let pool = pg_open_pool_schematized(&database_url, &schema).await?;
 
-        // Simulate a pre-existing v1+v2 database where data is TEXT
+        // Simulate a pre-existing v1+v2 database where data is TEXT.
         PgMigrator::new(&pool, &PLAN_MIGRATIONS[..2]).run().await?;
 
-        // Insert a row with valid JSON stored as TEXT
+        // Insert a row with valid JSON stored as TEXT.
         let plan_id = ExecPlanId::new();
         sqlx::query("INSERT INTO exec_plans (id, data) VALUES ($1, $2)")
             .bind(plan_id.as_str())
@@ -753,10 +776,10 @@ mod tests {
             .execute(&pool)
             .await?;
 
-        // Apply the remaining migrations (v3: TEXT→JSONB, v4: GIN index)
+        // Apply the remaining migrations (v3: TEXT to JSONB, v4: GIN index).
         PgMigrator::new(&pool, PLAN_MIGRATIONS).run().await?;
 
-        // Assert: data column is now jsonb
+        // Assert: data column is now jsonb.
         let (col_type,): (String,) = sqlx::query_as(
             "SELECT data_type FROM information_schema.columns
              WHERE table_schema = current_schema()
@@ -770,7 +793,7 @@ mod tests {
             "data column must be jsonb after migration"
         );
 
-        // Assert: GIN index was created
+        // Assert: GIN index was created.
         let idx: Option<(String,)> = sqlx::query_as(
             "SELECT indexname::text FROM pg_indexes
              WHERE schemaname = current_schema()
@@ -784,7 +807,7 @@ mod tests {
             "idx_exec_plans_data_gin must exist after migration"
         );
 
-        // Assert: pre-existing TEXT row survived the JSONB conversion
+        // Assert: pre-existing TEXT row survived the JSONB conversion.
         let (data,): (String,) = sqlx::query_as("SELECT data::text FROM exec_plans WHERE id = $1")
             .bind(plan_id.as_str())
             .fetch_one(&pool)
