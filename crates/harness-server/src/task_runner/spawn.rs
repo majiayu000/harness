@@ -1001,11 +1001,11 @@ where
                         final_state.as_ref(),
                         wmgr.config.auto_cleanup,
                     ) {
-                        if let Err(e) = wmgr.remove_workspace(&id_watcher).await {
+                        if let Err(e) = wmgr.remove_workspace_family(&id_watcher).await {
                             tracing::warn!("workspace cleanup failed for {id_watcher:?}: {e}");
                         }
                     } else {
-                        wmgr.release_workspace(&id_watcher).await;
+                        wmgr.release_workspace_family(&id_watcher).await;
                     }
                 }
             }

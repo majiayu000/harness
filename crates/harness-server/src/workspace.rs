@@ -305,7 +305,17 @@ impl WorkspaceManager {
     pub async fn remove_workspace(&self, task_id: &TaskId) -> anyhow::Result<()> {
         let entry = match self.remove_active_workspace(task_id) {
             Some(entry) => entry,
-            None => return Ok(()),
+            None => {
+                if let Some(store) = self.lease_store.as_ref() {
+                    if let Err(error) = store.release_task(task_id).await {
+                        tracing::warn!(
+                            task_id = %task_id.0,
+                            "failed to release persisted workspace lease for inactive removed task: {error}"
+                        );
+                    }
+                }
+                return Ok(());
+            }
         };
         self.released_paths.remove(task_id);
         self.released_workspace_paths.remove(&entry.workspace_key);
@@ -340,6 +350,30 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    pub(crate) async fn remove_workspace_family(&self, task_id: &TaskId) -> anyhow::Result<()> {
+        let mut first_error = None;
+        if let Err(error) = self.remove_workspace(task_id).await {
+            first_error = Some(error);
+        }
+        for subtask_id in crate::parallel_dispatch::synthetic_subtask_ids(task_id) {
+            if let Err(error) = self.remove_workspace(&subtask_id).await {
+                tracing::warn!(
+                    task_id = %task_id.0,
+                    subtask_id = %subtask_id.0,
+                    "failed to remove synthetic subtask workspace: {error}"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Release the in-memory lease without deleting the workspace on disk.
     ///
     /// Used when `auto_cleanup=false` so a later task with the same deterministic
@@ -359,6 +393,13 @@ impl WorkspaceManager {
                     "failed to release persisted workspace lease for inactive task: {error}"
                 );
             }
+        }
+    }
+
+    pub(crate) async fn release_workspace_family(&self, task_id: &TaskId) {
+        self.release_workspace(task_id).await;
+        for subtask_id in crate::parallel_dispatch::synthetic_subtask_ids(task_id) {
+            self.release_workspace(&subtask_id).await;
         }
     }
 

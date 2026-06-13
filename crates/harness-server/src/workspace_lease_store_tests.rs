@@ -152,6 +152,73 @@ async fn workspace_lease_store_releases_only_dead_foreign_processes() -> anyhow:
 }
 
 #[tokio::test]
+async fn release_workspace_family_releases_bounded_synthetic_subtask_leases() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store =
+        std::sync::Arc::new(WorkspaceLeaseStore::open(&dir.path().join("workspace-leases")).await?);
+    let manager = WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: dir.path().join("workspaces"),
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(8, std::collections::HashMap::new()),
+        Some(store.clone()),
+    )?;
+    let parent_task = harness_core::types::TaskId("lease-family-parent".to_string());
+    let bounded_ids = [
+        parent_task.clone(),
+        crate::parallel_dispatch::sequential_subtask_id(&parent_task),
+        crate::parallel_dispatch::parallel_subtask_id(&parent_task, 0),
+        crate::parallel_dispatch::parallel_subtask_id(
+            &parent_task,
+            crate::parallel_dispatch::MAX_PARALLEL - 1,
+        ),
+    ];
+    let unrelated_prefix_task = crate::parallel_dispatch::parallel_subtask_id(
+        &parent_task,
+        crate::parallel_dispatch::MAX_PARALLEL,
+    );
+    let process_started_at = WorkspaceLeaseStore::current_process_started_at()?;
+
+    for (slot_index, task_id) in bounded_ids
+        .iter()
+        .cloned()
+        .chain(std::iter::once(unrelated_prefix_task.clone()))
+        .enumerate()
+    {
+        let record = WorkspaceLeaseRecord {
+            project_key: "project-a".to_string(),
+            slot_index: u32::try_from(slot_index)?,
+            task_id,
+            workspace_key: format!("workspace-{slot_index}"),
+            workspace_path: dir
+                .path()
+                .join(format!("workspaces/project-a-slot-{slot_index}")),
+            source_repo: dir.path().join("repo"),
+            repo: Some("owner/repo".to_string()),
+            runtime_workflow_id: Some("workflow-1".to_string()),
+            owner_session: "session-a".to_string(),
+            run_generation: 1,
+            process_id: std::process::id(),
+            process_started_at,
+        };
+        assert!(store.try_acquire_lease(&record).await?);
+    }
+
+    manager.release_workspace_family(&parent_task).await;
+
+    let leased = store.list_leased().await?;
+    assert_eq!(leased.len(), 1);
+    assert_eq!(leased[0].task_id, unrelated_prefix_task);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_lease_store_releases_pid_reuse_mismatch() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

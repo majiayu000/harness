@@ -24,7 +24,7 @@ impl Drop for AbortOnDrop {
 /// Maximum number of parallel subtasks — caps both chunk count in `decompose`
 /// and concurrent agent executions in `run_parallel_subtasks`.
 /// Wire up `--max-parallel` CLI flag to override this in a follow-up (see #638).
-const MAX_PARALLEL: usize = 8;
+pub(crate) const MAX_PARALLEL: usize = 8;
 
 /// Maximum number of sequential steps accepted from a numbered-list prompt.
 ///
@@ -39,6 +39,21 @@ const PARALLEL_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "cpp", "c", "h", "toml",
     "yaml", "yml", "json", "sh", "md",
 ];
+
+pub(crate) fn sequential_subtask_id(task_id: &TaskId) -> TaskId {
+    TaskId::from_str(&format!("{}-seq", task_id.as_str()))
+}
+
+pub(crate) fn parallel_subtask_id(task_id: &TaskId, index: usize) -> TaskId {
+    TaskId::from_str(&format!("{}-p{index}", task_id.as_str()))
+}
+
+pub(crate) fn synthetic_subtask_ids(task_id: &TaskId) -> Vec<TaskId> {
+    let mut ids = Vec::with_capacity(MAX_PARALLEL + 1);
+    ids.push(sequential_subtask_id(task_id));
+    ids.extend((0..MAX_PARALLEL).map(|index| parallel_subtask_id(task_id, index)));
+    ids
+}
 
 /// Build the `allowed_write_paths` list for a capability token.
 ///
@@ -321,7 +336,7 @@ async fn run_sequential_subtasks(
     let mut results = Vec::with_capacity(total);
 
     // One shared workspace for all sequential steps — step N sees step N-1 outputs.
-    let seq_id = harness_core::types::TaskId(format!("{}-seq", task_id.0));
+    let seq_id = sequential_subtask_id(task_id);
     // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
     let workspace = match workspace_mgr
         .create_workspace(&seq_id, source_repo, remote, base_branch, 1, None, None)
@@ -462,7 +477,7 @@ async fn run_concurrent_subtasks(
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
 
     for (i, spec) in subtasks.into_iter().enumerate() {
-        let sub_id = harness_core::types::TaskId(format!("{}-p{i}", task_id.0));
+        let sub_id = parallel_subtask_id(task_id, i);
         let agent = agent.clone();
         let context = context.clone();
         let workspace_mgr = workspace_mgr.clone();

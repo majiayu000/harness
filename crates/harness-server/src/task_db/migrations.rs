@@ -180,11 +180,52 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 24,
         description: "create workspace leases table",
-        sql: crate::workspace_lease_store::WORKSPACE_LEASES_TABLE_SQL,
+        sql: crate::workspace_lease_store::WORKSPACE_LEASES_TABLE_V24_SQL,
     },
     Migration {
         version: 25,
         description: "add process start-time proof to workspace leases",
-        sql: "ALTER TABLE workspace_leases ADD COLUMN IF NOT EXISTS process_started_at BIGINT NOT NULL DEFAULT 0",
+        sql: "ALTER TABLE workspace_leases ADD COLUMN process_started_at BIGINT NOT NULL DEFAULT 0",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_lease_process_started_migration_uses_plain_add_column() {
+        let create_migration = TASK_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 24)
+            .expect("v24 migration should exist");
+        let migration = TASK_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 25)
+            .expect("v25 migration should exist");
+
+        assert!(
+            !create_migration.sql.contains("process_started_at"),
+            "v24 should create the legacy workspace_leases shape so v25 can add the column"
+        );
+        assert!(
+            migration
+                .sql
+                .contains("ALTER TABLE workspace_leases ADD COLUMN process_started_at"),
+            "v25 should add process_started_at"
+        );
+        assert!(
+            !migration.sql.to_ascii_uppercase().contains("IF NOT EXISTS"),
+            "SQLite rejects ALTER TABLE ADD COLUMN IF NOT EXISTS"
+        );
+    }
+
+    #[test]
+    fn workspace_lease_create_table_includes_process_started_at() {
+        assert!(
+            crate::workspace_lease_store::WORKSPACE_LEASES_TABLE_SQL
+                .contains("process_started_at  BIGINT NOT NULL DEFAULT 0"),
+            "new workspace_leases tables should include process_started_at without v25"
+        );
+    }
+}

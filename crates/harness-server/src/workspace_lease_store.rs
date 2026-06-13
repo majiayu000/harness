@@ -356,6 +356,7 @@ async fn ensure_workspace_leases_table(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) const WORKSPACE_LEASES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS workspace_leases (
     project_key         TEXT NOT NULL,
     slot_index          BIGINT NOT NULL,
@@ -369,6 +370,32 @@ pub(crate) const WORKSPACE_LEASES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS 
     run_generation      BIGINT NOT NULL,
     process_id          BIGINT NOT NULL,
     process_started_at  BIGINT NOT NULL DEFAULT 0,
+    state               TEXT NOT NULL DEFAULT 'leased',
+    acquired_at         TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    released_at         TIMESTAMPTZ,
+    last_used_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(project_key, slot_index)
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_leases_task_state
+    ON workspace_leases(task_id, state);
+CREATE INDEX IF NOT EXISTS idx_workspace_leases_workspace_key_state
+    ON workspace_leases(project_key, workspace_key, state);
+CREATE INDEX IF NOT EXISTS idx_workspace_leases_state_owner
+    ON workspace_leases(state, owner_session)";
+
+pub(crate) const WORKSPACE_LEASES_TABLE_V24_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS workspace_leases (
+    project_key         TEXT NOT NULL,
+    slot_index          BIGINT NOT NULL,
+    task_id             TEXT NOT NULL,
+    workspace_key       TEXT NOT NULL,
+    workspace_path      TEXT NOT NULL,
+    source_repo         TEXT NOT NULL,
+    repo                TEXT,
+    runtime_workflow_id TEXT,
+    owner_session       TEXT NOT NULL,
+    run_generation      BIGINT NOT NULL,
+    process_id          BIGINT NOT NULL,
     state               TEXT NOT NULL DEFAULT 'leased',
     acquired_at         TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     released_at         TIMESTAMPTZ,
