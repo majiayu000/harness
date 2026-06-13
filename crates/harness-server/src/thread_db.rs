@@ -136,10 +136,14 @@ pub async fn migrate_legacy_thread_db_if_needed(
         return Ok(0);
     }
 
-    let legacy_table: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
-        .bind(format!("\"{legacy_schema}\".threads"))
-        .fetch_one(&target_db.pool)
-        .await?;
+    let legacy_table: Option<String> = sqlx::query_scalar(
+        "SELECT table_name::text
+         FROM information_schema.tables
+         WHERE table_schema = $1 AND table_name = 'threads'",
+    )
+    .bind(legacy_schema)
+    .fetch_optional(&target_db.pool)
+    .await?;
     if legacy_table.is_none() {
         return Ok(0);
     }
@@ -202,15 +206,18 @@ impl ThreadRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use harness_core::db::{pg_open_pool, resolve_database_url};
     use std::path::PathBuf;
 
     fn unique_test_schema(prefix: &str) -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before UNIX epoch")
             .as_nanos();
-        format!("{prefix}_{nanos}")
+        format!("{prefix}_{nanos}_{count}")
     }
 
     async fn open_test_db() -> anyhow::Result<Option<ThreadDb>> {
@@ -401,7 +408,7 @@ mod tests {
         let target_db = ThreadDb::open_with_context(&target_context, &setup_pool).await?;
         let legacy_db = ThreadDb::open_with_database_url(&legacy_path, Some(&database_url)).await?;
 
-        let result = async {
+        let result = std::panic::AssertUnwindSafe(async {
             let thread = Thread::new(PathBuf::from("/legacy/project"));
             let thread_id = thread.id.clone();
             legacy_db.insert(&thread).await?;
@@ -422,23 +429,27 @@ mod tests {
                 .expect("legacy thread should be present in the shared schema");
             assert_eq!(loaded.project_root, PathBuf::from("/legacy/project"));
             Ok::<(), anyhow::Error>(())
-        }
+        })
+        .catch_unwind()
         .await;
 
         legacy_db.pool.close().await;
         target_db.pool.close().await;
-        sqlx::query(&format!(
+        let _ = sqlx::query(&format!(
             "DROP SCHEMA IF EXISTS \"{legacy_schema}\" CASCADE"
         ))
         .execute(&setup_pool)
-        .await?;
-        sqlx::query(&format!(
+        .await;
+        let _ = sqlx::query(&format!(
             "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
         ))
         .execute(&setup_pool)
-        .await?;
+        .await;
         setup_pool.close().await;
 
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }
