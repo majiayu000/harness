@@ -91,6 +91,7 @@ pub(crate) async fn build_storage_with_database_url(
     };
 
     let task_context = crate::task_db::TaskDb::shared_schema_context(Some(&database_url))?;
+    super::ensure_startup_context_not_path_derived("tasks", &task_context)?;
     let (tasks, task_result) = match super::forced_startup_error("tasks") {
         Some(error) => (None, StoreStartupResult::critical("tasks").failed(error)),
         None => match TaskStore::open_shared_with_data_dir(
@@ -118,6 +119,7 @@ pub(crate) async fn build_storage_with_database_url(
         None => {
             match async {
                 let eval_context = EvalStore::shared_schema_context(Some(&database_url))?;
+                super::ensure_startup_context_not_path_derived("eval_store", &eval_context)?;
                 let store =
                     EvalStore::open_shared_with_data_dir(&eval_context, &setup_pool, data_dir)
                         .await?;
@@ -147,6 +149,7 @@ pub(crate) async fn build_storage_with_database_url(
         None => {
             match async {
                 let q_value_context = QValueStore::shared_schema_context(Some(&database_url))?;
+                super::ensure_startup_context_not_path_derived("q_value_store", &q_value_context)?;
                 let store =
                     QValueStore::open_shared_with_data_dir(&q_value_context, &setup_pool, data_dir)
                         .await?;
