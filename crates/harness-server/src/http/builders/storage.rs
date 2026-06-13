@@ -138,27 +138,32 @@ pub(crate) async fn build_storage_with_database_url(
             None,
             StoreStartupResult::optional("q_value_store").failed(error),
         ),
-        None => match harness_core::db::PgStoreContext::from_path(
-            &q_values_db_path,
-            Some(&database_url),
-        ) {
-            Ok(q_value_context) => {
-                match QValueStore::open_with_context(&q_value_context, &setup_pool).await {
-                    Ok(store) => (
-                        Some(Arc::new(store)),
-                        StoreStartupResult::optional("q_value_store"),
-                    ),
-                    Err(error) => (
-                        None,
-                        StoreStartupResult::optional("q_value_store").failed(error.to_string()),
-                    ),
-                }
+        None => {
+            match async {
+                let q_value_context = QValueStore::shared_schema_context(Some(&database_url))?;
+                let store =
+                    QValueStore::open_shared_with_data_dir(&q_value_context, &setup_pool, data_dir)
+                        .await?;
+                crate::q_value_store::migrate_legacy_q_value_store_if_needed(
+                    &q_values_db_path,
+                    Some(&database_url),
+                    &store,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(store)
             }
-            Err(error) => (
-                None,
-                StoreStartupResult::optional("q_value_store").failed(error.to_string()),
-            ),
-        },
+            .await
+            {
+                Ok(store) => (
+                    Some(Arc::new(store)),
+                    StoreStartupResult::optional("q_value_store"),
+                ),
+                Err(error) => (
+                    None,
+                    StoreStartupResult::optional("q_value_store").failed(error.to_string()),
+                ),
+            }
+        }
     };
 
     if let Some(error) = q_value_result.error.as_deref() {
@@ -226,6 +231,28 @@ mod tests {
         assert_eq!(
             tasks.task_db_store_key_for_test(),
             crate::task_db::TaskDb::store_key_for_data_dir(dir.path()).expect("store key")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_storage_opens_q_value_store_from_shared_schema() {
+        let database_url = match harness_core::db::resolve_database_url(None) {
+            Ok(url) => url,
+            Err(_) => return,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = build_storage_with_database_url(dir.path(), Some(&database_url))
+            .await
+            .expect("build_storage should succeed");
+        let q_values = bundle.q_values.expect("q_value store should be ready");
+
+        assert_eq!(
+            q_values.schema_for_test(),
+            crate::q_value_store::Q_VALUE_STORE_SCHEMA
+        );
+        assert_eq!(
+            q_values.store_key_for_test(),
+            crate::q_value_store::QValueStore::store_key_for_data_dir(dir.path())
         );
     }
 
