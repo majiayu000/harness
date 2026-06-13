@@ -670,6 +670,14 @@ impl CodeAgent for CodexAgent {
         if stream_result.is_err() && !stream_process_exited {
             child.terminate_now();
         }
+        let status = child
+            .wait_and_cleanup_descendants()
+            .await
+            .map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed waiting for codex process: {error}"
+                ))
+            })?;
         if stream_send_failed {
             return Err(stream_result.expect_err("stream send failures return an error"));
         }
@@ -695,11 +703,6 @@ impl CodeAgent for CodexAgent {
                 return Err(enrich_stream_exit_error(error, &stderr));
             }
         };
-        let status = child.wait().await.map_err(|error| {
-            harness_core::error::HarnessError::AgentExecution(format!(
-                "failed waiting for codex process: {error}"
-            ))
-        })?;
         if !status.success() {
             let stderr = captured_stderr_tail(&stderr_capture);
             return Err(codex_nonzero_exit_error(

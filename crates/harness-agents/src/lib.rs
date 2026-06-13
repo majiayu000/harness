@@ -105,6 +105,20 @@ impl ManagedChild {
         self.child.wait().await
     }
 
+    pub(crate) async fn wait_and_cleanup_descendants(
+        &mut self,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.wait().await?;
+        self.cleanup_after_child_exit().await?;
+        Ok(status)
+    }
+
+    pub(crate) async fn cleanup_after_child_exit(&mut self) -> std::io::Result<()> {
+        self.kill_descendants_after_child_exit().await?;
+        self.cleanup_disarmed = true;
+        Ok(())
+    }
+
     pub(crate) async fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
         use tokio::io::AsyncReadExt;
 
@@ -125,11 +139,9 @@ impl ManagedChild {
             Ok::<_, std::io::Error>(bytes)
         });
 
-        let status = self.wait().await?;
-        self.kill_descendants_after_child_exit().await?;
+        let status = self.wait_and_cleanup_descendants().await?;
         let stdout = join_reader(stdout_task).await?;
         let stderr = join_reader(stderr_task).await?;
-        self.cleanup_disarmed = true;
 
         Ok(std::process::Output {
             status,

@@ -343,6 +343,20 @@ impl CodeAgent for ClaudeCodeAgent {
         );
         if stream_result.is_err() && !stream_process_exited {
             child.terminate_now();
+            child
+                .wait_and_cleanup_descendants()
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "failed waiting for claude process: {error}"
+                    ))
+                })?;
+        } else {
+            child.cleanup_after_child_exit().await.map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed cleaning up claude process: {error}"
+                ))
+            })?;
         }
         if stream_send_failed {
             return Err(stream_result.expect_err("stream send failures return an error"));

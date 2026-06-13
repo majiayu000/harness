@@ -289,13 +289,21 @@ exit 1
 }
 
 #[tokio::test]
-async fn execute_stream_waits_for_late_stderr_before_classifying_exit() {
-    let (dir, script) = write_executable_script(
+async fn execute_stream_kills_descendant_that_keeps_stderr_pipe_open_after_root_exit() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let descendant_marker = dir.path().join("stream-descendant-started.txt");
+    let marker = dir.path().join("stream-descendant-reached.txt");
+    let (script_dir, script) = write_executable_script(&format!(
         r#"
-(sleep 0.2; echo 'quota exhausted: retry later' >&2) >/dev/null &
-exit 1
+( echo descendant > "{}"; sleep 1; echo reached > "{}"; sleep 30 ) >&2 &
+while [ ! -f "{}" ]; do sleep 0.01; done
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_0","type":"agent_message","text":"root done"}}}}'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":1,"output_tokens":1}}}}'
 "#,
-    );
+        descendant_marker.display(),
+        marker.display(),
+        descendant_marker.display()
+    ));
     let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
     let request = AgentRequest {
         prompt: "ignored".to_string(),
@@ -304,15 +312,21 @@ exit 1
     };
 
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    let err = agent
-        .execute_stream(request, tx)
+    timeout(Duration::from_secs(5), agent.execute_stream(request, tx))
         .await
-        .expect_err("stream execution should fail");
+        .expect("execute_stream should not wait for descendant-held stderr")
+        .expect("stream execution should succeed");
 
     assert!(
-        matches!(err, harness_core::error::HarnessError::QuotaExhausted(_)),
-        "expected late stderr to influence streamed exit classification, got: {err}"
+        descendant_marker.exists(),
+        "descendant should start before process-group cleanup runs"
     );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !marker.exists(),
+        "stream cleanup should kill descendants before they can mutate the workspace"
+    );
+    drop(script_dir);
 }
 
 #[tokio::test]
