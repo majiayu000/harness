@@ -554,11 +554,13 @@ pub(crate) async fn build_registry(
                 let context = crate::runtime_state_store::RuntimeStateStore::shared_schema_context(
                     Some(&database_url),
                 )?;
-                let store = crate::runtime_state_store::RuntimeStateStore::open_with_context(
-                    &context,
-                    &setup_pool,
-                )
-                .await?;
+                let store =
+                    crate::runtime_state_store::RuntimeStateStore::open_shared_with_data_dir(
+                        &context,
+                        &setup_pool,
+                        data_dir,
+                    )
+                    .await?;
                 crate::runtime_state_store::migrate_legacy_runtime_state_store_if_needed(
                     &runtime_state_db_path,
                     Some(&database_url),

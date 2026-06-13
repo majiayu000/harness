@@ -65,14 +65,24 @@ async fn legacy_runtime_state_migration_backfills_once() -> anyhow::Result<()> {
         Err(_) => return Ok(()),
     };
     let dir = tempfile::tempdir()?;
-    let legacy_path = dir.path().join("runtime_state.db");
+    let target_data_dir = dir.path().join("target-data");
+    let other_data_dir = dir.path().join("other-data");
+    let legacy_path = target_data_dir.join("runtime_state.db");
     let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
     let target_schema = unique_test_schema("runtime_state_store_test");
     let setup_pool = pg_open_pool(&database_url).await?;
     let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
-    let target_store = RuntimeStateStore::open_with_context(&target_context, &setup_pool).await?;
+    let target_store = RuntimeStateStore::open_shared_with_data_dir(
+        &target_context,
+        &setup_pool,
+        &target_data_dir,
+    )
+    .await?;
+    let other_store =
+        RuntimeStateStore::open_shared_with_data_dir(&target_context, &setup_pool, &other_data_dir)
+            .await?;
     let legacy_store =
         RuntimeStateStore::open_with_database_url(&legacy_path, Some(&database_url)).await?;
 
@@ -103,6 +113,10 @@ async fn legacy_runtime_state_migration_backfills_once() -> anyhow::Result<()> {
             .expect("legacy snapshot should be present in the shared schema");
         assert_eq!(loaded.hosts.len(), 1);
         assert_eq!(loaded.hosts[0].id, "legacy-host");
+        assert!(
+            other_store.load_snapshot().await?.is_none(),
+            "other data_dir scopes must not hydrate legacy runtime state"
+        );
 
         target_store
             .persist_snapshot(vec![make_host("shared-host")], vec![])
@@ -146,6 +160,7 @@ async fn legacy_runtime_state_migration_backfills_once() -> anyhow::Result<()> {
 
     legacy_store.pool().close().await;
     target_store.pool().close().await;
+    other_store.pool().close().await;
     let _ = sqlx::query(&format!(
         "DROP SCHEMA IF EXISTS \"{legacy_schema}\" CASCADE"
     ))
@@ -224,7 +239,8 @@ async fn build_app_state_restores_runtime_snapshot() -> anyhow::Result<()> {
 }
 
 async fn delete_snapshot(store: &RuntimeStateStore) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM runtime_state")
+    sqlx::query("DELETE FROM runtime_state WHERE store_key = $1")
+        .bind(store.store_key())
         .execute(store.pool())
         .await?;
     Ok(())

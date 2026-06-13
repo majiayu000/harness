@@ -50,16 +50,51 @@ static RUNTIME_STATE_MIGRATIONS: &[Migration] = &[
         version: 2,
         description: "record legacy runtime state backfills",
         sql: "CREATE TABLE IF NOT EXISTS runtime_state_store_legacy_backfills (
-            legacy_schema TEXT PRIMARY KEY,
+            store_key     TEXT NOT NULL DEFAULT current_schema(),
+            legacy_schema TEXT NOT NULL,
             copied_rows   BIGINT NOT NULL DEFAULT 0,
-            backfilled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            backfilled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (store_key, legacy_schema)
         )",
+    },
+    Migration {
+        version: 3,
+        description: "scope runtime state within shared schema",
+        sql: "ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE runtime_state
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE runtime_state ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE runtime_state ALTER COLUMN store_key SET NOT NULL;
+              ALTER TABLE runtime_state DROP CONSTRAINT IF EXISTS runtime_state_pkey;
+              ALTER TABLE runtime_state ADD CONSTRAINT runtime_state_pkey PRIMARY KEY (store_key, id);
+              CREATE INDEX IF NOT EXISTS idx_runtime_state_store_updated_at
+              ON runtime_state (store_key, updated_at DESC)",
+    },
+    Migration {
+        version: 4,
+        description: "scope legacy runtime state backfill markers",
+        sql: "ALTER TABLE runtime_state_store_legacy_backfills
+              ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE runtime_state_store_legacy_backfills
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE runtime_state_store_legacy_backfills
+              ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE runtime_state_store_legacy_backfills
+              ALTER COLUMN store_key SET NOT NULL;
+              ALTER TABLE runtime_state_store_legacy_backfills
+              DROP CONSTRAINT IF EXISTS runtime_state_store_legacy_backfills_pkey;
+              ALTER TABLE runtime_state_store_legacy_backfills
+              ADD CONSTRAINT runtime_state_store_legacy_backfills_pkey
+              PRIMARY KEY (store_key, legacy_schema)",
     },
 ];
 
 pub struct RuntimeStateStore {
     pool: PgPool,
     schema: String,
+    store_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +121,13 @@ impl RuntimeStateStore {
     ) -> anyhow::Result<Self> {
         let context = PgStoreContext::from_path(path, configured_database_url)?;
         let schema = context.schema().to_owned();
+        let store_key = schema.clone();
         let pool = context.open_migrated_pool(RUNTIME_STATE_MIGRATIONS).await?;
-        Ok(Self { pool, schema })
+        Ok(Self {
+            pool,
+            schema,
+            store_key,
+        })
     }
 
     pub fn shared_schema_context(
@@ -102,15 +142,49 @@ impl RuntimeStateStore {
         context: &PgStoreContext,
         setup_pool: &PgPool,
     ) -> anyhow::Result<Self> {
+        Self::open_with_context_and_store_key(context, setup_pool, context.schema().to_owned())
+            .await
+    }
+
+    pub async fn open_shared_with_data_dir(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        data_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let store_key = Self::store_key_for_data_dir(data_dir);
+        Self::open_with_context_and_store_key(context, setup_pool, store_key).await
+    }
+
+    async fn open_with_context_and_store_key(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        store_key: String,
+    ) -> anyhow::Result<Self> {
         let schema = context.schema().to_owned();
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, RUNTIME_STATE_MIGRATIONS)
             .await?;
-        Ok(Self { pool, schema })
+        Ok(Self {
+            pool,
+            schema,
+            store_key,
+        })
     }
 
     pub fn schema(&self) -> &str {
         &self.schema
+    }
+
+    pub fn store_key_for_data_dir(data_dir: &Path) -> String {
+        data_dir
+            .canonicalize()
+            .unwrap_or_else(|_| data_dir.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn store_key(&self) -> &str {
+        &self.store_key
     }
 
     pub async fn load_snapshot(&self) -> anyhow::Result<Option<RuntimeStateSnapshot>> {
@@ -120,10 +194,12 @@ impl RuntimeStateStore {
     pub async fn try_load_snapshot(
         &self,
     ) -> anyhow::Result<(Option<RuntimeStateSnapshot>, LoadSnapshotOutcome)> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM runtime_state WHERE id = $1")
-            .bind(SNAPSHOT_ID)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data FROM runtime_state WHERE store_key = $1 AND id = $2")
+                .bind(&self.store_key)
+                .bind(SNAPSHOT_ID)
+                .fetch_optional(&self.pool)
+                .await?;
 
         let snapshot: RuntimeStateSnapshot = match row {
             Some((data,)) => serde_json::from_str(&data)?,
@@ -157,10 +233,11 @@ impl RuntimeStateStore {
         let snapshot = RuntimeStateSnapshot::new(hosts, project_caches);
         let data = serde_json::to_string(&snapshot)?;
         sqlx::query(
-            "INSERT INTO runtime_state (id, data) VALUES ($1, $2)
-             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
+            "INSERT INTO runtime_state (store_key, id, data) VALUES ($1, $2, $3)
+             ON CONFLICT(store_key, id) DO UPDATE SET data = EXCLUDED.data,
                  updated_at = CURRENT_TIMESTAMP",
         )
+        .bind(&self.store_key)
         .bind(SNAPSHOT_ID)
         .bind(&data)
         .execute(&self.pool)
@@ -187,8 +264,11 @@ pub async fn migrate_legacy_runtime_state_store_if_needed(
     }
 
     let already_backfilled: Option<String> = sqlx::query_scalar(
-        "SELECT legacy_schema FROM runtime_state_store_legacy_backfills WHERE legacy_schema = $1",
+        "SELECT legacy_schema
+         FROM runtime_state_store_legacy_backfills
+         WHERE store_key = $1 AND legacy_schema = $2",
     )
+    .bind(target_store.store_key())
     .bind(legacy_schema)
     .fetch_optional(&target_store.pool)
     .await?;
@@ -205,21 +285,23 @@ pub async fn migrate_legacy_runtime_state_store_if_needed(
     }
 
     let copy_sql = format!(
-        "INSERT INTO runtime_state (id, data, created_at, updated_at)
-         SELECT id, data, created_at, updated_at
+        "INSERT INTO runtime_state (store_key, id, data, created_at, updated_at)
+         SELECT $1, id, data, created_at, updated_at
          FROM \"{legacy_schema}\".runtime_state
-         ON CONFLICT (id) DO NOTHING"
+         ON CONFLICT (store_key, id) DO NOTHING"
     );
     let copied = sqlx::query(&copy_sql)
+        .bind(target_store.store_key())
         .execute(&target_store.pool)
         .await?
         .rows_affected();
 
     sqlx::query(
-        "INSERT INTO runtime_state_store_legacy_backfills (legacy_schema, copied_rows)
-         VALUES ($1, $2)
-         ON CONFLICT (legacy_schema) DO NOTHING",
+        "INSERT INTO runtime_state_store_legacy_backfills (store_key, legacy_schema, copied_rows)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (store_key, legacy_schema) DO NOTHING",
     )
+    .bind(target_store.store_key())
     .bind(legacy_schema)
     .bind(copied as i64)
     .execute(&target_store.pool)
