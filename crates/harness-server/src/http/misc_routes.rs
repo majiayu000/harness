@@ -34,7 +34,7 @@ const WORKFLOW_RUNTIME_TREE_MAX_REJECTED_DECISION_LIMIT: i64 = 20;
 
 #[derive(Debug)]
 struct IntakeRecentDispatch {
-    sort_at: Option<chrono::DateTime<chrono::Utc>>,
+    sort_at: Option<i64>,
     payload: serde_json::Value,
 }
 
@@ -1481,7 +1481,7 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
             .filter(|workflow| runtime_workflow_intake_source(workflow).is_some())
             .filter_map(runtime_issue_recent_dispatch),
     );
-    recent_dispatches.sort_by(|left, right| right.sort_at.cmp(&left.sort_at));
+    recent_dispatches.sort_by_key(|dispatch| std::cmp::Reverse(dispatch.sort_at));
     let recent_dispatches: Vec<serde_json::Value> = recent_dispatches
         .into_iter()
         .take(10)
@@ -1545,7 +1545,7 @@ fn runtime_issue_recent_dispatch(workflow: &WorkflowInstance) -> Option<IntakeRe
     let task_id = projection.submission_handle?;
     let source = runtime_workflow_intake_source(workflow)?;
     Some(IntakeRecentDispatch {
-        sort_at: Some(workflow.created_at),
+        sort_at: Some(workflow.created_at.timestamp_micros()),
         payload: json!({
             "source": source,
             "external_id": runtime_workflow_external_id(workflow),
@@ -1558,10 +1558,10 @@ fn runtime_issue_recent_dispatch(workflow: &WorkflowInstance) -> Option<IntakeRe
     })
 }
 
-fn parse_rfc3339_utc(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+fn parse_rfc3339_utc(value: Option<&str>) -> Option<i64> {
     value
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&chrono::Utc))
+        .map(|value| value.timestamp_micros())
 }
 
 fn workflow_runtime_submissions_expected_but_unavailable(state: &AppState) -> bool {
