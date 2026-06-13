@@ -8,12 +8,13 @@ use super::registry_migration::{
     repair_corrupt_project_ids,
 };
 use crate::http::state::StoreStartupResult;
+use crate::plan_db::PlanDb;
 use crate::server::HarnessServer;
 
 /// Outputs of the registry initialization phase.
 pub(crate) struct RegistryBundle {
     pub thread_db: Option<crate::thread_db::ThreadDb>,
-    pub plan_db: Option<crate::plan_db::PlanDb>,
+    pub plan_db: Option<PlanDb>,
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
     pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     pub project_workflow_store:
@@ -58,7 +59,6 @@ pub(crate) async fn build_registry(
         }
     };
 
-    // ── Thread DB ─────────────────────────────────────────────────────────────
     let thread_db_path = harness_core::config::dirs::default_db_path(data_dir, "threads");
     let thread_context = crate::thread_db::ThreadDb::shared_schema_context(Some(&database_url))?;
     let thread_db = match super::forced_startup_error("thread_db") {
@@ -112,26 +112,32 @@ pub(crate) async fn build_registry(
         }
     }
 
-    // ── Plan DB + cache ───────────────────────────────────────────────────────
     let plans_db_path = harness_core::config::dirs::default_db_path(data_dir, "plans");
-    let plan_context =
-        harness_core::db::PgStoreContext::from_path(&plans_db_path, Some(&database_url))?;
     let plan_db = match super::forced_startup_error("plan_db") {
         Some(error) => {
             startup_results.push(StoreStartupResult::critical("plan_db").failed(error));
             None
         }
-        None => match crate::plan_db::PlanDb::open_with_context(&plan_context, &setup_pool).await {
-            Ok(plan_db) => {
-                startup_results.push(StoreStartupResult::critical("plan_db"));
-                Some(plan_db)
+        None => {
+            match PlanDb::open_shared_with_legacy_backfill(
+                Some(&database_url),
+                &setup_pool,
+                data_dir,
+                &plans_db_path,
+            )
+            .await
+            {
+                Ok(plan_db) => {
+                    startup_results.push(StoreStartupResult::critical("plan_db"));
+                    Some(plan_db)
+                }
+                Err(error) => {
+                    startup_results
+                        .push(StoreStartupResult::critical("plan_db").failed(error.to_string()));
+                    None
+                }
             }
-            Err(error) => {
-                startup_results
-                    .push(StoreStartupResult::critical("plan_db").failed(error.to_string()));
-                None
-            }
-        },
+        }
     };
 
     let plans_md_dir = data_dir.join("plans");
@@ -637,7 +643,6 @@ mod tests {
         let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
             .await
             .expect("build_registry should succeed");
-        // The default project is always auto-registered; registry should have exactly 1 entry.
         let project_registry = bundle.project_registry.as_ref().unwrap_or_else(|| {
             panic!(
                 "project registry should be ready: {:?}",
@@ -646,7 +651,6 @@ mod tests {
         });
         let projects = project_registry.list().await.expect("list projects");
         assert_eq!(projects.len(), 1, "expected only the default project");
-        // ID is the canonical path of the project root, not the literal "default".
         let canonical = dir
             .path()
             .canonicalize()
@@ -659,7 +663,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
 
-        // Pre-insert a plan directly into the DB before calling build_registry.
         let plan_db = crate::plan_db::PlanDb::open(&harness_core::config::dirs::default_db_path(
             dir.path(),
             "plans",
