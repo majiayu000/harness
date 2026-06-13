@@ -334,3 +334,80 @@ async fn create_workspace_waits_when_project_pool_is_full() {
         .await
         .expect("remove second");
 }
+
+#[tokio::test]
+async fn create_workspace_enforces_project_capacity_across_repo_slugs() {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let mgr = std::sync::Arc::new(
+        WorkspaceManager::new_with_pool(
+            config,
+            WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+            None,
+        )
+        .expect("new"),
+    );
+    let first_task = harness_core::types::TaskId("pool-repo-a".to_string());
+    let second_task = harness_core::types::TaskId("pool-repo-b".to_string());
+
+    let first = mgr
+        .create_workspace(
+            &first_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo-a"),
+        )
+        .await
+        .expect("first repo should acquire the only project permit");
+    assert_eq!(first.slot_index, 0);
+
+    let mgr_for_second = mgr.clone();
+    let source_path = source.path().to_path_buf();
+    let branch_for_second = branch.clone();
+    let second_task_for_spawn = second_task.clone();
+    let second_handle = tokio::spawn(async move {
+        mgr_for_second
+            .create_workspace(
+                &second_task_for_spawn,
+                &source_path,
+                "origin",
+                &branch_for_second,
+                1,
+                Some("issue:43"),
+                Some("owner/repo-b"),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !second_handle.is_finished(),
+        "repo-specific workspace keys must still share the source-project capacity"
+    );
+
+    mgr.release_workspace(&first_task).await;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), second_handle)
+        .await
+        .expect("second acquire should unblock")
+        .expect("second task should join")
+        .expect("second repo should acquire after project permit release");
+    assert_eq!(second.slot_index, 0);
+    assert_ne!(
+        first.workspace_path, second.workspace_path,
+        "repo slug remains part of the workspace slot path"
+    );
+
+    mgr.remove_workspace(&second_task)
+        .await
+        .expect("remove second");
+}
