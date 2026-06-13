@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use harness_core::config::misc::OtelConfig;
-use harness_core::db::{Migration, PgStoreContext};
+use harness_core::db::{pg_open_pool, PgStoreContext};
 use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     SessionId, Severity, Violation,
@@ -9,47 +9,12 @@ use sqlx::postgres::PgPool;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-static EVENT_MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        description: "create events table with indexes",
-        sql: "CREATE TABLE IF NOT EXISTS events (
-        id          TEXT PRIMARY KEY,
-        ts          TEXT NOT NULL,
-        session_id  TEXT NOT NULL,
-        hook        TEXT NOT NULL,
-        tool        TEXT NOT NULL,
-        decision    TEXT NOT NULL,
-        reason      TEXT,
-        detail      TEXT,
-        duration_ms BIGINT
-    );
-    CREATE INDEX IF NOT EXISTS idx_events_session_id ON events (session_id);
-    CREATE INDEX IF NOT EXISTS idx_events_hook ON events (hook);
-    CREATE INDEX IF NOT EXISTS idx_events_decision ON events (decision);
-    CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts)",
-    },
-    Migration {
-        version: 2,
-        description: "add content column to events table",
-        sql: "ALTER TABLE events ADD COLUMN content TEXT",
-    },
-    Migration {
-        version: 3,
-        description: "create scan_watermarks table",
-        sql: "CREATE TABLE IF NOT EXISTS scan_watermarks (
-            project      TEXT NOT NULL,
-            agent_id     TEXT NOT NULL,
-            last_scan_ts TEXT NOT NULL,
-            PRIMARY KEY (project, agent_id)
-        )",
-    },
-    Migration {
-        version: 4,
-        description: "add metadata column to events table",
-        sql: "ALTER TABLE events ADD COLUMN metadata TEXT",
-    },
-];
+mod legacy;
+mod migrations;
+
+pub use legacy::migrate_legacy_event_store_if_needed;
+use migrations::EVENT_MIGRATIONS;
+pub use migrations::EVENT_STORE_SCHEMA;
 
 /// Event store backed by Postgres.
 ///
@@ -58,6 +23,8 @@ static EVENT_MIGRATIONS: &[Migration] = &[
 /// an archive.
 pub struct EventStore {
     pool: PgPool,
+    schema: String,
+    store_key: String,
     data_dir: PathBuf,
     otel_pipeline: Mutex<Option<crate::otel_export::OtelPipeline>>,
     session_renewal_secs: u64,
@@ -72,21 +39,17 @@ impl EventStore {
         data_dir: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(data_dir)?;
-        let data_dir = data_dir.to_path_buf();
-        let context =
-            PgStoreContext::from_path(&data_dir.join("events.db"), configured_database_url)?;
-        let pool = context.open_migrated_pool(EVENT_MIGRATIONS).await?;
+        let context = Self::shared_schema_context(configured_database_url)?;
+        let setup_pool = pg_open_pool(context.database_url()).await?;
+        let store = Self::new_shared_with_context(data_dir, &context, &setup_pool).await;
+        setup_pool.close().await;
+        store
+    }
 
-        let store = Self {
-            pool,
-            data_dir,
-            otel_pipeline: Mutex::new(None),
-            session_renewal_secs: 1800,
-        };
-
-        store.migrate_from_jsonl().await;
-        Ok(store)
+    pub fn shared_schema_context(
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<PgStoreContext> {
+        PgStoreContext::from_schema(EVENT_STORE_SCHEMA, configured_database_url)
     }
 
     pub async fn new_with_context(
@@ -94,18 +57,68 @@ impl EventStore {
         context: &PgStoreContext,
         setup_pool: &PgPool,
     ) -> anyhow::Result<Self> {
+        let store_key = context.schema().to_owned();
+        let store =
+            Self::new_with_context_and_store_key(data_dir, context, setup_pool, store_key).await?;
+        store.migrate_from_jsonl().await;
+        Ok(store)
+    }
+
+    pub async fn new_shared_with_context(
+        data_dir: &Path,
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+    ) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let store_key = Self::store_key_for_data_dir(data_dir)?;
+        let store =
+            Self::new_with_context_and_store_key(data_dir, context, setup_pool, store_key).await?;
+        migrate_legacy_event_store_if_needed(
+            &data_dir.join("events.db"),
+            Some(context.database_url()),
+            &store,
+        )
+        .await?;
+        store.migrate_from_jsonl().await;
+        Ok(store)
+    }
+
+    async fn new_with_context_and_store_key(
+        data_dir: &Path,
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        store_key: String,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, EVENT_MIGRATIONS)
             .await?;
-        let store = Self {
+        Ok(Self {
             pool,
+            schema: context.schema().to_owned(),
+            store_key,
             data_dir: data_dir.to_path_buf(),
             otel_pipeline: Mutex::new(None),
             session_renewal_secs: 1800,
-        };
-        store.migrate_from_jsonl().await;
-        Ok(store)
+        })
+    }
+
+    pub fn store_key_for_data_dir(data_dir: &Path) -> anyhow::Result<String> {
+        let canonical = data_dir.canonicalize().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to canonicalize event store data_dir {}: {error}",
+                data_dir.display()
+            )
+        })?;
+        Ok(canonical.to_string_lossy().into_owned())
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub fn store_key(&self) -> &str {
+        &self.store_key
     }
 
     /// Close the connection pool.
@@ -125,6 +138,8 @@ impl EventStore {
         };
         Self {
             pool,
+            schema: String::new(),
+            store_key: String::new(),
             data_dir: PathBuf::new(),
             otel_pipeline: Mutex::new(None),
             session_renewal_secs: 1800,
@@ -152,14 +167,16 @@ impl EventStore {
 
         loop {
             let result = sqlx::query(
-                "DELETE FROM events WHERE id IN (
+                "DELETE FROM events WHERE store_key = $1 AND id IN (
                     SELECT id FROM events
-                    WHERE ts < $1
+                    WHERE store_key = $1
+                      AND ts < $2
                       AND hook NOT LIKE 'periodic_review:%'
                       AND hook NOT LIKE 'periodic_retry:%'
                     LIMIT 500
                 )",
             )
+            .bind(&self.store_key)
             .bind(&cutoff_str)
             .execute(&self.pool)
             .await?;
@@ -173,15 +190,18 @@ impl EventStore {
 
         loop {
             let result = sqlx::query(
-                "DELETE FROM events WHERE id IN (
+                "DELETE FROM events WHERE store_key = $1 AND id IN (
                     SELECT e.id FROM events e
-                    WHERE (e.hook LIKE 'periodic_review:%' OR e.hook = 'periodic_retry:summary')
+                    WHERE e.store_key = $1
+                    AND (e.hook LIKE 'periodic_review:%' OR e.hook = 'periodic_retry:summary')
                     AND e.ts < (
-                        SELECT MAX(e2.ts) FROM events e2 WHERE e2.hook = e.hook
+                        SELECT MAX(e2.ts) FROM events e2
+                        WHERE e2.store_key = $1 AND e2.hook = e.hook
                     )
                     LIMIT 500
                 )",
             )
+            .bind(&self.store_key)
             .execute(&self.pool)
             .await?;
             let batch = result.rows_affected();
@@ -247,6 +267,21 @@ impl EventStore {
         Ok(store)
     }
 
+    pub async fn with_policies_and_otel_shared_with_context(
+        data_dir: &Path,
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        session_renewal_secs: u64,
+        log_retention_days: u32,
+        otel_config: &OtelConfig,
+    ) -> anyhow::Result<Self> {
+        let mut store = Self::new_shared_with_context(data_dir, context, setup_pool).await?;
+        store
+            .apply_policies_and_otel(session_renewal_secs, log_retention_days, otel_config)
+            .await?;
+        Ok(store)
+    }
+
     async fn apply_policies_and_otel(
         &mut self,
         session_renewal_secs: u64,
@@ -286,9 +321,10 @@ impl EventStore {
     async fn migrate_from_jsonl(&self) {
         use std::io::BufRead as _;
 
-        // Fast-path: if any events are already in the DB, assume a prior
-        // successful migration and skip the per-line replay entirely.
-        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+        // Fast-path only for this data directory. Other store keys in the
+        // shared schema must not suppress this store's legacy import.
+        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE store_key = $1")
+            .bind(&self.store_key)
             .fetch_one(&self.pool)
             .await
         {
@@ -350,10 +386,11 @@ impl EventStore {
         };
         sqlx::query(
             "INSERT INTO events
-                (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             ON CONFLICT (id) DO NOTHING",
+                (store_key, id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             ON CONFLICT (store_key, id) DO NOTHING",
         )
+        .bind(&self.store_key)
         .bind(event.id.as_str())
         .bind(&ts)
         .bind(event.session_id.as_str())
@@ -387,9 +424,9 @@ impl EventStore {
         };
         let mut sql = format!(
             "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, {content_col}, metadata
-             FROM events WHERE 1=1",
+             FROM events WHERE store_key = $1",
         );
-        let mut param_count = 0usize;
+        let mut param_count = 1usize;
         if filters.session_id.is_some() {
             param_count += 1;
             sql.push_str(&format!(" AND session_id = ${param_count}"));
@@ -421,7 +458,7 @@ impl EventStore {
             sql.push_str(&format!(" LIMIT {limit}"));
         }
 
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(&sql).bind(&self.store_key);
 
         if let Some(ref sid) = filters.session_id {
             q = q.bind(sid.as_str());
@@ -651,8 +688,10 @@ impl EventStore {
         agent_id: &str,
     ) -> anyhow::Result<Option<DateTime<Utc>>> {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT last_scan_ts FROM scan_watermarks WHERE project = $1 AND agent_id = $2",
+            "SELECT last_scan_ts FROM scan_watermarks
+             WHERE store_key = $1 AND project = $2 AND agent_id = $3",
         )
+        .bind(&self.store_key)
         .bind(project)
         .bind(agent_id)
         .fetch_optional(&self.pool)
@@ -675,10 +714,12 @@ impl EventStore {
         ts: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO scan_watermarks (project, agent_id, last_scan_ts)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (project, agent_id) DO UPDATE SET last_scan_ts = EXCLUDED.last_scan_ts",
+            "INSERT INTO scan_watermarks (store_key, project, agent_id, last_scan_ts)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (store_key, project, agent_id)
+             DO UPDATE SET last_scan_ts = EXCLUDED.last_scan_ts",
         )
+        .bind(&self.store_key)
         .bind(project)
         .bind(agent_id)
         .bind(ts.to_rfc3339())
@@ -748,6 +789,9 @@ impl EventStore {
             .is_none()
     }
 }
+
+#[cfg(test)]
+mod shared_schema_tests;
 
 #[cfg(test)]
 mod store_tests;

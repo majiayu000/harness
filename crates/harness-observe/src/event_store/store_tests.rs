@@ -176,9 +176,10 @@ async fn query_deserializes_rows_without_metadata() -> anyhow::Result<()> {
 
     sqlx::query(
         "INSERT INTO events
-            (id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            (store_key, id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
+    .bind(store.store_key())
     .bind("legacy-event")
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(SessionId::new().as_str())
