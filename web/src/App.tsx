@@ -48,6 +48,7 @@ export function App() {
         <ScrollToHash />
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/overview" element={<Overview />} />
           <Route path="/usage" element={<UsageMonitor />} />
           <Route path="/worktrees" element={<Worktrees />} />
