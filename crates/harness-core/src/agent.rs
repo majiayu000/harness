@@ -197,6 +197,7 @@ pub struct TurnRequest {
     pub project_root: PathBuf,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub execution_phase: Option<ExecutionPhase>,
     pub sandbox_mode: Option<SandboxMode>,
     pub approval_policy: Option<String>,
     pub allowed_tools: Vec<String>,

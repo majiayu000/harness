@@ -668,6 +668,18 @@ pub enum ExecutionPhase {
 }
 
 impl ExecutionPhase {
+    /// Stable snake_case label used in telemetry and persistence.
+    pub fn label(self) -> &'static str {
+        match self {
+            ExecutionPhase::Planning => "planning",
+            ExecutionPhase::Execution => "execution",
+            ExecutionPhase::Validation => "validation",
+            ExecutionPhase::Rebase => "rebase",
+            ExecutionPhase::SimpleReview => "simple_review",
+            ExecutionPhase::Triage => "triage",
+        }
+    }
+
     /// Returns the Claude Code CLI `--effort` level for this phase.
     pub fn effort_level(self) -> &'static str {
         match self {
@@ -683,8 +695,8 @@ impl ExecutionPhase {
 /// Per-phase model selection configuration.
 ///
 /// Maps each `ExecutionPhase` to a `BudgetTier`, then maps tiers to model identifiers.
-/// When configured on `ClaudeCodeAgent`, the model is selected by phase rather than
-/// the flat `default_model`. Falls back to `req.model` or `default_model` when no
+/// When configured on `ClaudeCodeAgent`, the phase model is used when the request
+/// does not provide an explicit model. Falls back to `default_model` when no
 /// `execution_phase` is set on the `AgentRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReasoningBudget {
@@ -997,5 +1009,11 @@ mod tests {
         let back: ExecutionPhase = serde_json::from_str("\"rebase\"")?;
         assert_eq!(back, ExecutionPhase::Rebase);
         Ok(())
+    }
+
+    #[test]
+    fn execution_phase_label_uses_serde_snake_case() {
+        assert_eq!(ExecutionPhase::Rebase.label(), "rebase");
+        assert_eq!(ExecutionPhase::SimpleReview.label(), "simple_review");
     }
 }

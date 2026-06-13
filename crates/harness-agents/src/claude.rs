@@ -1,6 +1,10 @@
 use crate::claude_stream::{
     claude_stdout_tail, parse_claude_stream_output, stream_claude_code_output,
 };
+use crate::provider_backpressure::{
+    ProviderBackpressureGate, ProviderBackpressurePermit, ProviderPhase,
+    PROVIDER_WAIT_HEARTBEAT_INTERVAL, PROVIDER_WAIT_INITIAL_HEARTBEAT_DELAY,
+};
 use crate::streaming::{
     captured_stderr_tail, enrich_stream_exit_error, filter_agent_stderr_with_capture,
     log_captured_stderr, send_stream_item,
@@ -17,17 +21,19 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 pub struct ClaudeCodeAgent {
     pub cli_path: PathBuf,
     pub default_model: String,
     pub sandbox_mode: SandboxMode,
-    /// Per-phase model selection. When set, model is chosen based on
-    /// `req.execution_phase`. Falls back to `req.model` or `default_model`.
+    /// Per-phase model selection. When set, model is chosen from
+    /// `req.model`, then `req.execution_phase`, then `default_model`.
     pub reasoning_budget: Option<ReasoningBudget>,
     /// Maximum seconds of idle silence on the output stream before the
     /// subprocess is declared a zombie and terminated. `None` = no timeout.
     pub stream_timeout_secs: Option<u64>,
+    pub provider_gate: ProviderBackpressureGate,
 }
 
 impl ClaudeCodeAgent {
@@ -38,6 +44,7 @@ impl ClaudeCodeAgent {
             sandbox_mode,
             reasoning_budget: None,
             stream_timeout_secs: Some(3600),
+            provider_gate: ProviderBackpressureGate::disabled(),
         }
     }
 
@@ -60,11 +67,19 @@ impl ClaudeCodeAgent {
         self
     }
 
+    pub fn with_provider_backpressure_gate(mut self, gate: ProviderBackpressureGate) -> Self {
+        self.provider_gate = gate;
+        self
+    }
+
     fn resolve_model<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
+        if let Some(model) = req.model.as_deref() {
+            return model;
+        }
         if let (Some(budget), Some(phase)) = (&self.reasoning_budget, req.execution_phase) {
             return budget.model_for_phase(phase);
         }
-        req.model.as_deref().unwrap_or(&self.default_model)
+        &self.default_model
     }
 
     fn effective_sandbox_mode(&self, req: &AgentRequest) -> SandboxMode {
@@ -115,12 +130,12 @@ impl ClaudeCodeAgent {
             base_args.push(OsString::from(tools.join(",")));
         }
 
-        if let Some(phase) = req.execution_phase {
-            base_args.push(OsString::from("--effort"));
-            base_args.push(OsString::from(phase.effort_level()));
-        } else if let Some(reasoning_effort) = req.reasoning_effort.as_deref() {
+        if let Some(reasoning_effort) = req.reasoning_effort.as_deref() {
             base_args.push(OsString::from("--effort"));
             base_args.push(OsString::from(reasoning_effort));
+        } else if let Some(phase) = req.execution_phase {
+            base_args.push(OsString::from("--effort"));
+            base_args.push(OsString::from(phase.effort_level()));
         }
 
         if let Some(budget) = req.max_budget_usd {
@@ -191,6 +206,15 @@ impl CodeAgent for ClaudeCodeAgent {
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
+
+        let _provider_permit = self
+            .provider_gate
+            .acquire(
+                req.execution_phase,
+                req.prompt.chars().count(),
+                req.prompt.len(),
+            )
+            .await?;
 
         let child = cmd.spawn().map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
@@ -283,6 +307,14 @@ impl CodeAgent for ClaudeCodeAgent {
             "claude execute_stream: full command args"
         );
 
+        let provider_permit =
+            acquire_provider_permit_with_stream_heartbeat(&self.provider_gate, &req, &tx).await?;
+        tracing::debug!(
+            phase = provider_permit.phase().label(),
+            waited_ms = provider_permit.waited_ms(),
+            "claude execute_stream admitted by provider gate"
+        );
+
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
@@ -371,6 +403,48 @@ impl CodeAgent for ClaudeCodeAgent {
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }
+}
+
+async fn acquire_provider_permit_with_stream_heartbeat(
+    gate: &ProviderBackpressureGate,
+    req: &AgentRequest,
+    tx: &mpsc::Sender<StreamItem>,
+) -> harness_core::error::Result<ProviderBackpressurePermit> {
+    let prompt_chars = req.prompt.chars().count();
+    let prompt_bytes = req.prompt.len();
+    if !gate.is_enabled() {
+        return gate
+            .acquire(req.execution_phase, prompt_chars, prompt_bytes)
+            .await;
+    }
+
+    let phase = ProviderPhase::from_execution_phase(req.execution_phase);
+    let mut acquire = Box::pin(gate.acquire(req.execution_phase, prompt_chars, prompt_bytes));
+    let mut heartbeat = Box::pin(tokio::time::sleep(PROVIDER_WAIT_INITIAL_HEARTBEAT_DELAY));
+    loop {
+        tokio::select! {
+            permit = &mut acquire => return permit,
+            _ = &mut heartbeat => {
+                send_stream_item(
+                    tx,
+                    StreamItem::Warning {
+                        message: provider_wait_message(phase),
+                    },
+                    "claude",
+                    "provider capacity wait",
+                )
+                .await?;
+                heartbeat.as_mut().reset(tokio::time::Instant::now() + PROVIDER_WAIT_HEARTBEAT_INTERVAL);
+            }
+        }
+    }
+}
+
+fn provider_wait_message(phase: ProviderPhase) -> String {
+    format!(
+        "Waiting for Claude provider capacity for {} phase",
+        phase.label()
+    )
 }
 
 #[cfg(test)]

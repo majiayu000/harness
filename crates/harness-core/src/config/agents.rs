@@ -1,5 +1,6 @@
-use crate::types::ReasoningBudget;
+use crate::types::{ExecutionPhase, ReasoningBudget};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 /// Preset capability profile that determines which tools an agent may use.
@@ -619,6 +620,12 @@ pub struct ClaudeAgentConfig {
     /// based on the `execution_phase` field of each `AgentRequest`.
     #[serde(default)]
     pub reasoning_budget: Option<ReasoningBudget>,
+    /// Optional provider-side admission limits for Claude CLI sessions.
+    ///
+    /// These limits are independent of task concurrency. When configured, tasks
+    /// may wait for Claude capacity before spawning a Claude process.
+    #[serde(default)]
+    pub provider_backpressure: ClaudeProviderBackpressureConfig,
 }
 
 impl Default for ClaudeAgentConfig {
@@ -627,6 +634,51 @@ impl Default for ClaudeAgentConfig {
             cli_path: PathBuf::from("claude"),
             default_model: "sonnet".to_string(),
             reasoning_budget: Some(ReasoningBudget::default()),
+            provider_backpressure: ClaudeProviderBackpressureConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClaudeProviderBackpressureConfig {
+    /// Global cap for concurrently running Claude CLI sessions. Omitted means
+    /// no global provider cap.
+    #[serde(default)]
+    pub max_concurrent_sessions: Option<NonZeroUsize>,
+    /// Optional phase-specific caps. These are acquired before the global cap
+    /// so planning/triage waiters do not hold global capacity while queued.
+    #[serde(default)]
+    pub phase_limits: ClaudeProviderPhaseLimits,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClaudeProviderPhaseLimits {
+    #[serde(default)]
+    pub triage: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub planning: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub execution: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub validation: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub rebase: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub simple_review: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub unknown: Option<NonZeroUsize>,
+}
+
+impl ClaudeProviderPhaseLimits {
+    pub fn limit_for_phase(&self, phase: Option<ExecutionPhase>) -> Option<NonZeroUsize> {
+        match phase {
+            Some(ExecutionPhase::Triage) => self.triage,
+            Some(ExecutionPhase::Planning) => self.planning,
+            Some(ExecutionPhase::Execution) => self.execution,
+            Some(ExecutionPhase::Validation) => self.validation,
+            Some(ExecutionPhase::Rebase) => self.rebase,
+            Some(ExecutionPhase::SimpleReview) => self.simple_review,
+            None => self.unknown,
         }
     }
 }

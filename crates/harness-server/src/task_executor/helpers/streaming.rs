@@ -4,7 +4,8 @@ use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::types::{
-    Decision, Event, EventMetadata, Item, SessionId, TokenUsage, TurnFailure, TurnTelemetry,
+    Decision, Event, EventMetadata, ExecutionPhase, Item, SessionId, TokenUsage, TurnFailure,
+    TurnTelemetry,
 };
 use harness_observe::event_store::EventStore;
 use harness_observe::usage::UsageMetrics;
@@ -98,6 +99,50 @@ mod tests {
     }
 
     #[test]
+    fn build_prompt_input_event_records_size_payload() -> anyhow::Result<()> {
+        let task_id = TaskId::from_str("prompt-size-task");
+        let event = build_prompt_input_event(
+            &task_id,
+            3,
+            "planning",
+            "claude",
+            Some("sonnet"),
+            "/repo",
+            "hello world",
+            2,
+        );
+
+        assert_eq!(event.hook, "llm_prompt_input");
+        assert_eq!(event.tool, "claude");
+        assert_eq!(event.metadata.as_ref().and_then(|m| m.turn), Some(3));
+        assert_eq!(
+            event.metadata.as_ref().and_then(|m| m.phase.as_deref()),
+            Some("planning")
+        );
+        let payload: serde_json::Value = serde_json::from_str(
+            event
+                .content
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing prompt input content"))?,
+        )?;
+        assert_eq!(payload["agent"], "claude");
+        assert_eq!(payload["prompt_chars"], 11);
+        assert_eq!(payload["prompt_bytes"], 11);
+        assert_eq!(payload["context_items"], 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn execution_phase_label_preserves_simple_review_snake_case() {
+        assert_eq!(
+            execution_phase_label(Some(ExecutionPhase::SimpleReview)),
+            "simple_review"
+        );
+        assert_eq!(execution_phase_label(None), "unknown");
+    }
+
+    #[test]
     fn usage_project_label_prefers_canonical_task_root() {
         let canonical = Path::new("/repo/main");
         let workspace = Path::new("/tmp/harness-worktree");
@@ -155,6 +200,87 @@ async fn log_llm_usage_event(
     }
 }
 
+async fn log_prompt_input_event(
+    events: &EventStore,
+    task_id: &TaskId,
+    turn: u32,
+    phase: &str,
+    agent: &str,
+    model: Option<&str>,
+    project: &str,
+    prompt: &str,
+    context_items: usize,
+) {
+    let event = build_prompt_input_event(
+        task_id,
+        turn,
+        phase,
+        agent,
+        model,
+        project,
+        prompt,
+        context_items,
+    );
+    if let Err(error) = events.log(&event).await {
+        tracing::warn!(
+            task_id = %task_id,
+            agent,
+            "failed to log llm_prompt_input event: {error}"
+        );
+    }
+}
+
+fn build_prompt_input_event(
+    task_id: &TaskId,
+    turn: u32,
+    phase: &str,
+    agent: &str,
+    model: Option<&str>,
+    project: &str,
+    prompt: &str,
+    context_items: usize,
+) -> Event {
+    let reported_at = Utc::now();
+    let prompt_chars = prompt.chars().count();
+    let prompt_bytes = prompt.len();
+    let payload = serde_json::json!({
+        "agent": agent,
+        "model": model.unwrap_or("unknown"),
+        "task_id": task_id.as_str(),
+        "project": project,
+        "phase": phase,
+        "turn": turn,
+        "ts": reported_at.to_rfc3339(),
+        "prompt_chars": prompt_chars,
+        "prompt_bytes": prompt_bytes,
+        "context_items": context_items,
+    });
+    let mut event = Event::new(
+        SessionId::new(),
+        "llm_prompt_input",
+        agent,
+        Decision::Complete,
+    );
+    event.ts = reported_at;
+    event.detail = Some(format!(
+        "task_id={} project={} model={} prompt_chars={} prompt_bytes={}",
+        task_id.as_str(),
+        project,
+        model.unwrap_or("unknown"),
+        prompt_chars,
+        prompt_bytes
+    ));
+    event.content = Some(payload.to_string());
+    event.metadata = Some(EventMetadata {
+        task_id: Some(task_id.clone()),
+        turn: Some(turn),
+        phase: Some(phase.to_string()),
+        telemetry: None,
+        failure: None,
+    });
+    event
+}
+
 fn build_llm_usage_event(
     task_id: &TaskId,
     turn: u32,
@@ -206,6 +332,10 @@ fn usage_project_label(task_project_root: Option<&Path>, request_project_root: &
         .unwrap_or(request_project_root)
         .to_string_lossy()
         .into_owned()
+}
+
+fn execution_phase_label(phase: Option<ExecutionPhase>) -> String {
+    phase.map_or_else(|| "unknown".to_string(), |phase| phase.label().to_string())
 }
 
 /// Scan `output_slice` for a `CREATED_ISSUE=` sentinel and, when a new issue
@@ -279,10 +409,7 @@ pub(crate) async fn run_agent_streaming_with_options(
     let task_project_root = store.get(task_id).and_then(|state| state.project_root);
     let project = usage_project_label(task_project_root.as_deref(), &req.project_root);
     let is_prompt_only = is_prompt_only_task(store, task_id);
-    let phase_str = req
-        .execution_phase
-        .map(|p| format!("{p:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".into());
+    let phase_str = execution_phase_label(req.execution_phase);
     if !is_prompt_only {
         let redacted_prompt = crate::redact::redact_secrets(&req.prompt, &req.env_vars);
         if let Err(e) = store
@@ -290,6 +417,22 @@ pub(crate) async fn run_agent_streaming_with_options(
             .await
         {
             tracing::warn!(task_id = %task_id, turn, "failed to persist prompt: {e}");
+        }
+    }
+    if agent_name == "claude" {
+        if let Some(events) = current_usage_event_store() {
+            log_prompt_input_event(
+                &events,
+                task_id,
+                turn,
+                &phase_str,
+                &agent_name,
+                requested_model.as_deref(),
+                &project,
+                &req.prompt,
+                req.context.len(),
+            )
+            .await;
         }
     }
 

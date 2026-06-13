@@ -1,7 +1,11 @@
 use super::*;
 use crate::claude_stream::parse_claude_stream_output;
+use crate::provider_backpressure::ProviderBackpressureGate;
+use harness_core::config::agents::ClaudeProviderBackpressureConfig;
 use harness_core::{types::ExecutionPhase, types::Item, types::ReasoningBudget};
 use std::fs;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -198,6 +202,25 @@ fn resolve_model_uses_phase_when_budget_configured() {
 }
 
 #[test]
+fn resolve_model_prefers_request_model_over_phase_budget() {
+    let budget = ReasoningBudget::default();
+    let agent = ClaudeCodeAgent::new(
+        PathBuf::from("claude"),
+        "default-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    )
+    .with_reasoning_budget(budget);
+
+    let req = AgentRequest {
+        model: Some("runtime-profile-model".to_string()),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..AgentRequest::default()
+    };
+
+    assert_eq!(agent.resolve_model(&req), "runtime-profile-model");
+}
+
+#[test]
 fn resolve_model_falls_back_to_req_model_when_no_budget() {
     let agent = ClaudeCodeAgent::new(
         PathBuf::from("claude"),
@@ -237,6 +260,26 @@ fn base_args_uses_request_reasoning_effort_when_phase_is_absent() {
     assert!(args
         .windows(2)
         .any(|window| window == ["--effort", "medium"]));
+}
+
+#[test]
+fn base_args_prefers_request_reasoning_effort_over_phase_effort() {
+    let agent = ClaudeCodeAgent::new(
+        PathBuf::from("claude"),
+        "default-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    );
+    let req = AgentRequest {
+        reasoning_effort: Some("medium".to_string()),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..AgentRequest::default()
+    };
+
+    let args = args_to_strings(&agent.base_args(&req));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["--effort", "medium"]));
+    assert!(!args.windows(2).any(|window| window == ["--effort", "max"]));
 }
 
 #[test]
@@ -402,6 +445,113 @@ printf 'world\n'
         }
         other => panic!("unexpected completed event payload: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn execute_stream_waits_for_provider_capacity_before_spawn() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let started = dir.path().join("started.txt");
+    let release = dir.path().join("release.txt");
+    let script = dir.path().join("mock-claude-provider-gate.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -eu\necho \"$RUN_ID\" >> \"{}\"\nif [ \"$RUN_ID\" = first ]; then while [ ! -f \"{}\" ]; do sleep 0.02; done; fi\nprintf 'done-%s\\n' \"$RUN_ID\"\n",
+            started.display(),
+            release.display()
+        ),
+    )
+    .expect("write script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("set executable permissions");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let gate = ProviderBackpressureGate::from_claude_config(&ClaudeProviderBackpressureConfig {
+        max_concurrent_sessions: Some(NonZeroUsize::new(1).expect("non-zero limit")),
+        ..ClaudeProviderBackpressureConfig::default()
+    });
+    let agent = Arc::new(
+        ClaudeCodeAgent::new(
+            script,
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        )
+        .with_provider_backpressure_gate(gate),
+    );
+
+    let mut first_req = AgentRequest {
+        prompt: "first".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+    first_req
+        .env_vars
+        .insert("RUN_ID".to_string(), "first".to_string());
+    let first_agent = agent.clone();
+    let first = tokio::spawn(async move {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        first_agent.execute_stream(first_req, tx).await
+    });
+
+    assert!(wait_for_path(&started, Duration::from_secs(10)).await);
+    assert!(fs::read_to_string(&started)
+        .expect("started marker")
+        .contains("first"));
+
+    let mut second_req = AgentRequest {
+        prompt: "second".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+    second_req
+        .env_vars
+        .insert("RUN_ID".to_string(), "second".to_string());
+    let second_agent = agent.clone();
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(8);
+    let second =
+        tokio::spawn(async move { second_agent.execute_stream(second_req, second_tx).await });
+
+    let wait_event = timeout(Duration::from_secs(2), second_rx.recv())
+        .await
+        .expect("queued Claude stream should emit provider wait activity")
+        .expect("second stream closed before provider wait activity");
+    match wait_event {
+        StreamItem::Warning { message } => {
+            assert!(
+                message.contains("Waiting for Claude provider capacity"),
+                "unexpected provider wait message: {message}"
+            );
+        }
+        other => panic!("expected provider wait warning before spawn, got {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started_before_release = fs::read_to_string(&started).unwrap_or_default();
+    assert!(
+        !started_before_release.contains("second"),
+        "second process must not spawn while provider capacity is saturated"
+    );
+
+    fs::write(&release, "release").expect("release first process");
+    timeout(Duration::from_secs(2), first)
+        .await
+        .expect("first should finish")
+        .expect("first task should join")
+        .expect("first stream should succeed");
+    timeout(Duration::from_secs(2), second)
+        .await
+        .expect("second should finish after first releases provider capacity")
+        .expect("second task should join")
+        .expect("second stream should succeed");
+    assert!(fs::read_to_string(&started)
+        .expect("started marker")
+        .contains("second"));
 }
 
 #[tokio::test]

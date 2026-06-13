@@ -39,6 +39,17 @@ sandbox_mode = "danger-full-access"
 [agents.claude]
 cli_path = "claude"
 default_model = "sonnet"
+# Optional provider-side cap independent of task concurrency. When saturated,
+# Harness waits here instead of spawning another Claude process.
+# [agents.claude.provider_backpressure]
+# max_concurrent_sessions = 2
+#
+# Optional per-phase caps keep triage/planning from crowding execution/review.
+# [agents.claude.provider_backpressure.phase_limits]
+# triage = 1
+# planning = 1
+# execution = 2
+# simple_review = 1
 
 [agents.codex]
 cli_path = "codex"

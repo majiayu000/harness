@@ -195,12 +195,17 @@ pub async fn run(
         harness_agents::registry::AgentRegistry::new(&serve_config.agents.default_agent);
     agent_registry
         .set_complexity_preferences(serve_config.agents.complexity_preferred_agents.clone());
+    let claude_provider_gate =
+        harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config(
+            &serve_config.agents.claude.provider_backpressure,
+        );
     let mut claude_agent = harness_agents::claude::ClaudeCodeAgent::new(
         serve_config.agents.claude.cli_path.clone(),
         serve_config.agents.claude.default_model.clone(),
         serve_config.agents.sandbox_mode,
     )
-    .with_no_session_persistence_probe();
+    .with_no_session_persistence_probe()
+    .with_provider_backpressure_gate(claude_provider_gate.clone());
     if let Some(budget) = serve_config.agents.claude.reasoning_budget.clone() {
         claude_agent = claude_agent.with_reasoning_budget(budget);
     }
@@ -209,10 +214,13 @@ pub async fn run(
     agent_registry
         .register_adapter_with_strategy(
             "claude",
-            Arc::new(harness_agents::claude_adapter::ClaudeAdapter::new(
-                serve_config.agents.claude.cli_path.clone(),
-                serve_config.agents.claude.default_model.clone(),
-            )),
+            Arc::new(
+                harness_agents::claude_adapter::ClaudeAdapter::new(
+                    serve_config.agents.claude.cli_path.clone(),
+                    serve_config.agents.claude.default_model.clone(),
+                )
+                .with_provider_backpressure_gate(claude_provider_gate),
+            ),
             harness_agents::registry::AdapterExecutionStrategy::ControlOnly,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
