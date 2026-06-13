@@ -80,6 +80,7 @@ impl WorkspaceManager {
             }
         };
         let project_key = pool_permit.project_key.clone();
+        let workspace_project_key = pool_permit.workspace_project_key.clone();
         let capacity = pool_permit.capacity;
         let mut pool_permit = Some(pool_permit.permit);
         let slot_lock = self.pool.selection_lock(&project_key);
@@ -108,14 +109,14 @@ impl WorkspaceManager {
         // Validate inputs to prevent unexpected git behavior.
         if !is_valid_branch_name(base_branch) {
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: self.config.root.join(&project_key),
+                workspace_path: self.config.root.join(&workspace_project_key),
                 workspace_owner: None,
                 message: format!("invalid base_branch: {base_branch:?}"),
             });
         }
         if !is_valid_branch_name(remote) {
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: self.config.root.join(&project_key),
+                workspace_path: self.config.root.join(&workspace_project_key),
                 workspace_owner: None,
                 message: format!("invalid remote: {remote:?}"),
             });
@@ -124,7 +125,7 @@ impl WorkspaceManager {
         let branch = format!("{}{}", options.branch_prefix, task_id.0);
         if !is_valid_branch_name(&branch) {
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: self.config.root.join(&project_key),
+                workspace_path: self.config.root.join(&workspace_project_key),
                 workspace_owner: None,
                 message: format!("invalid workspace branch: {branch:?}"),
             });
@@ -161,7 +162,7 @@ impl WorkspaceManager {
                     }),
                     Err(err) => {
                         return Err(WorkspaceLifecycleError::CreateFailed {
-                            workspace_path: self.config.root.join(&project_key),
+                            workspace_path: self.config.root.join(&workspace_project_key),
                             workspace_owner: None,
                             message: format!(
                                 "failed to inspect released workspace lease for workspace key {}: {err}",
@@ -182,13 +183,13 @@ impl WorkspaceManager {
             .or_else(|| {
                 released_path_for_task
                     .as_deref()
-                    .and_then(|path| slot_index_from_workspace_path(&project_key, path))
+                    .and_then(|path| slot_index_from_workspace_path(&workspace_project_key, path))
                     .filter(|slot| *slot < capacity as u32)
             })
             .or_else(|| {
                 released_path_for_workspace_key
                     .as_deref()
-                    .and_then(|path| slot_index_from_workspace_path(&project_key, path))
+                    .and_then(|path| slot_index_from_workspace_path(&workspace_project_key, path))
                     .filter(|slot| *slot < capacity as u32)
             });
         let wait_for_persisted_slot = self.lease_store.is_some();
@@ -199,7 +200,7 @@ impl WorkspaceManager {
                     Ok(slots) => slots,
                     Err(err) => {
                         return Err(WorkspaceLifecycleError::CreateFailed {
-                            workspace_path: self.config.root.join(&project_key),
+                            workspace_path: self.config.root.join(&workspace_project_key),
                             workspace_owner: None,
                             message: format!(
                                 "failed to inspect persisted workspace leases for project {project_key}: {err}"
@@ -227,14 +228,14 @@ impl WorkspaceManager {
                     continue;
                 }
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: self.config.root.join(&project_key),
+                    workspace_path: self.config.root.join(&workspace_project_key),
                     workspace_owner: None,
                     message: format!(
                         "workspace pool exhausted for project {project_key}; no free persisted slot after acquiring permit"
                     ),
                 });
             };
-            let workspace_key = workspace_slot_key(&project_key, slot_index);
+            let workspace_key = workspace_slot_key(&workspace_project_key, slot_index);
             let workspace_path = self.config.root.join(&workspace_key);
             let selected_released_task_slot = preferred_slot == Some(slot_index);
             let process_started_at = if self.lease_store.is_some() {

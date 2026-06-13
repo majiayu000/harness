@@ -63,19 +63,20 @@ impl WorkspacePool {
         source_repo: &Path,
         repo: Option<&str>,
     ) -> anyhow::Result<WorkspacePoolPermit> {
-        let capacity_key = project_limit_key(source_repo);
+        let project_key = project_limit_key(source_repo);
         let capacity = self.config.capacity_for(source_repo);
-        let project_key = derive_workspace_pool_key(source_repo, repo);
+        let workspace_project_key = derive_workspace_pool_key(source_repo, repo);
         let semaphore = self
             .semaphores
-            .entry(capacity_key.clone())
+            .entry(project_key.clone())
             .or_insert_with(|| Arc::new(Semaphore::new(capacity)))
             .clone();
         let permit = semaphore.acquire_owned().await.map_err(|_| {
-            anyhow::anyhow!("workspace pool semaphore closed for project {capacity_key}")
+            anyhow::anyhow!("workspace pool semaphore closed for project {project_key}")
         })?;
         Ok(WorkspacePoolPermit {
             project_key,
+            workspace_project_key,
             capacity,
             permit,
         })
@@ -90,7 +91,10 @@ impl WorkspacePool {
 }
 
 pub(crate) struct WorkspacePoolPermit {
+    /// Source-project-scoped key used for capacity and persisted lease rows.
     pub(crate) project_key: String,
+    /// Repo-scoped key used for workspace slot directory names.
+    pub(crate) workspace_project_key: String,
     pub(crate) capacity: usize,
     pub(crate) permit: OwnedSemaphorePermit,
 }
