@@ -76,6 +76,31 @@ pub(crate) struct ActiveWorkspace {
     pub(crate) _pool_permit: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveWorkspaceSnapshot {
+    workspace_path: PathBuf,
+    source_repo: PathBuf,
+    workspace_key: String,
+    project_key: String,
+    slot_index: u32,
+    owner_session: String,
+    run_generation: u32,
+}
+
+impl From<&ActiveWorkspace> for ActiveWorkspaceSnapshot {
+    fn from(active: &ActiveWorkspace) -> Self {
+        Self {
+            workspace_path: active.workspace_path.clone(),
+            source_repo: active.source_repo.clone(),
+            workspace_key: active.workspace_key.clone(),
+            project_key: active.project_key.clone(),
+            slot_index: active.slot_index,
+            owner_session: active.owner_session.clone(),
+            run_generation: active.run_generation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceEntry {
     pub task_id: TaskId,
@@ -274,21 +299,23 @@ impl WorkspaceManager {
             .collect()
     }
 
-    async fn release_persisted_lease(&self, task_id: &TaskId, entry: &ActiveWorkspace) {
+    async fn release_persisted_slot(&self, task_id: &TaskId, project_key: &str, slot_index: u32) {
         let Some(store) = self.lease_store.as_ref() else {
             return;
         };
-        if let Err(error) = store
-            .release_slot(&entry.project_key, entry.slot_index, task_id)
-            .await
-        {
+        if let Err(error) = store.release_slot(project_key, slot_index, task_id).await {
             tracing::warn!(
                 task_id = %task_id.0,
-                project_key = %entry.project_key,
-                slot_index = entry.slot_index,
+                project_key = %project_key,
+                slot_index,
                 "failed to release persisted workspace lease: {error}"
             );
         }
+    }
+
+    async fn release_persisted_lease(&self, task_id: &TaskId, entry: &ActiveWorkspace) {
+        self.release_persisted_slot(task_id, &entry.project_key, entry.slot_index)
+            .await;
     }
 
     async fn cleanup_workspace_path_locked(
@@ -303,8 +330,12 @@ impl WorkspaceManager {
     /// Remove the workspace for the given task. Runs `before_remove_hook` first (non-fatal).
     /// Idempotent: returns Ok if the task has no active workspace.
     pub async fn remove_workspace(&self, task_id: &TaskId) -> anyhow::Result<()> {
-        let entry = match self.remove_active_workspace(task_id) {
-            Some(entry) => entry,
+        let snapshot = match self
+            .active
+            .get(task_id)
+            .map(|entry| ActiveWorkspaceSnapshot::from(entry.value()))
+        {
+            Some(snapshot) => snapshot,
             None => {
                 if let Some(store) = self.lease_store.as_ref() {
                     if let Err(error) = store.release_task(task_id).await {
@@ -317,15 +348,13 @@ impl WorkspaceManager {
                 return Ok(());
             }
         };
-        self.released_paths.remove(task_id);
-        self.released_workspace_paths.remove(&entry.workspace_key);
 
         // Run before_remove_hook if set. Non-fatal on failure.
         if let Some(hook) = &self.config.before_remove_hook {
             let timeout_secs = self.config.hook_timeout_secs;
             match timeout(
                 Duration::from_secs(timeout_secs),
-                run_hook(hook, &entry.workspace_path),
+                run_hook(hook, &snapshot.workspace_path),
             )
             .await
             {
@@ -338,15 +367,34 @@ impl WorkspaceManager {
         }
 
         if let Err(e) = self
-            .cleanup_workspace_path_locked(&entry.source_repo, &entry.workspace_path)
+            .cleanup_workspace_path_locked(&snapshot.source_repo, &snapshot.workspace_path)
             .await
         {
             tracing::warn!(
                 "git worktree remove failed for {:?}: {e}",
-                entry.workspace_path
+                snapshot.workspace_path
             );
         }
-        self.release_persisted_lease(task_id, &entry).await;
+        let removed = self
+            .active
+            .remove_if(task_id, |_, active| {
+                active.workspace_path == snapshot.workspace_path
+                    && active.owner_session == snapshot.owner_session
+                    && active.run_generation == snapshot.run_generation
+            })
+            .map(|(_, active)| active);
+        if let Some(entry) = removed {
+            self.release_active_path(task_id, &entry.workspace_path);
+            self.released_paths.remove(task_id);
+            self.released_workspace_paths.remove(&entry.workspace_key);
+            self.release_persisted_lease(task_id, &entry).await;
+        } else {
+            self.release_persisted_slot(task_id, &snapshot.project_key, snapshot.slot_index)
+                .await;
+            self.released_paths.remove(task_id);
+            self.released_workspace_paths
+                .remove(&snapshot.workspace_key);
+        }
         Ok(())
     }
 

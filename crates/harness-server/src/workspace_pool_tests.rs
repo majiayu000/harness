@@ -131,6 +131,89 @@ async fn pool_slot_reuse_preserves_released_same_task_workspace() {
 }
 
 #[tokio::test]
+async fn remove_workspace_keeps_in_memory_slot_until_cleanup_finishes() -> anyhow::Result<()> {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let mgr = std::sync::Arc::new(WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            before_remove_hook: Some("sh hold-remove.sh".to_string()),
+            hook_timeout_secs: 5,
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        None,
+    )?);
+    let first_task = harness_core::types::TaskId("in-memory-remove-first".to_string());
+    let second_task = harness_core::types::TaskId("in-memory-remove-second".to_string());
+
+    let first = mgr
+        .create_workspace(
+            &first_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await?;
+    std::fs::write(first.workspace_path.join("hold-remove.sh"), "sleep 1\n")?;
+
+    let first_task_for_spawn = first_task.clone();
+    let mgr_for_remove = mgr.clone();
+    let remove_handle =
+        tokio::spawn(async move { mgr_for_remove.remove_workspace(&first_task_for_spawn).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        mgr.live_count(),
+        1,
+        "active workspace reservation should remain while remove hook is running"
+    );
+
+    let source_path = source.path().to_path_buf();
+    let branch_for_second = branch.clone();
+    let second_task_for_spawn = second_task.clone();
+    let mgr_for_second = mgr.clone();
+    let second_handle = tokio::spawn(async move {
+        mgr_for_second
+            .create_workspace(
+                &second_task_for_spawn,
+                &source_path,
+                "origin",
+                &branch_for_second,
+                1,
+                Some("issue:43"),
+                Some("owner/repo"),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !second_handle.is_finished(),
+        "second workspace should wait for the in-memory slot reservation"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), remove_handle)
+        .await
+        .expect("remove should finish")
+        .expect("remove task should join")?;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), second_handle)
+        .await
+        .expect("second acquire should unblock")
+        .expect("second task should join")?;
+    assert_eq!(second.slot_index, 0);
+
+    mgr.remove_workspace(&second_task).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn pool_slot_reuse_uses_workspace_identity_for_new_task_id() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
