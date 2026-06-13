@@ -3,7 +3,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::http::state::StoreStartupResult;
-use crate::{eval_store::EvalStore, q_value_store::QValueStore, task_runner::TaskStore};
+use crate::{
+    eval_store::{migrate_legacy_eval_store_if_needed, EvalStore},
+    q_value_store::QValueStore,
+    task_runner::TaskStore,
+};
 
 /// Outputs of the storage initialization phase.
 pub(crate) struct StorageBundle {
@@ -112,19 +116,21 @@ pub(crate) async fn build_storage_with_database_url(
             StoreStartupResult::optional("eval_store").failed(error),
         ),
         None => {
-            match harness_core::db::PgStoreContext::from_path(&eval_db_path, Some(&database_url)) {
-                Ok(eval_context) => {
-                    match EvalStore::open_with_context(&eval_context, &setup_pool).await {
-                        Ok(store) => (
-                            Some(Arc::new(store)),
-                            StoreStartupResult::optional("eval_store"),
-                        ),
-                        Err(error) => (
-                            None,
-                            StoreStartupResult::optional("eval_store").failed(error.to_string()),
-                        ),
-                    }
-                }
+            match async {
+                let eval_context = EvalStore::shared_schema_context(Some(&database_url))?;
+                let store =
+                    EvalStore::open_shared_with_data_dir(&eval_context, &setup_pool, data_dir)
+                        .await?;
+                migrate_legacy_eval_store_if_needed(&eval_db_path, Some(&database_url), &store)
+                    .await?;
+                Ok::<_, anyhow::Error>(store)
+            }
+            .await
+            {
+                Ok(store) => (
+                    Some(Arc::new(store)),
+                    StoreStartupResult::optional("eval_store"),
+                ),
                 Err(error) => (
                     None,
                     StoreStartupResult::optional("eval_store").failed(error.to_string()),
@@ -254,6 +260,25 @@ mod tests {
             q_values.store_key_for_test(),
             crate::q_value_store::QValueStore::store_key_for_data_dir(dir.path())
                 .expect("store key")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_storage_opens_eval_store_from_shared_schema() {
+        let database_url = match harness_core::db::resolve_database_url(None) {
+            Ok(url) => url,
+            Err(_) => return,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = build_storage_with_database_url(dir.path(), Some(&database_url))
+            .await
+            .expect("build_storage should succeed");
+        let eval_store = bundle.eval_store.expect("eval store should be ready");
+
+        assert_eq!(eval_store.schema(), crate::eval_store::EVAL_STORE_SCHEMA);
+        assert_eq!(
+            eval_store.store_key(),
+            crate::eval_store::EvalStore::store_key_for_data_dir(dir.path()).expect("store key")
         );
     }
 
