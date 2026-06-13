@@ -202,6 +202,25 @@ fn resolve_model_uses_phase_when_budget_configured() {
 }
 
 #[test]
+fn resolve_model_prefers_request_model_over_phase_budget() {
+    let budget = ReasoningBudget::default();
+    let agent = ClaudeCodeAgent::new(
+        PathBuf::from("claude"),
+        "default-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    )
+    .with_reasoning_budget(budget);
+
+    let req = AgentRequest {
+        model: Some("runtime-profile-model".to_string()),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..AgentRequest::default()
+    };
+
+    assert_eq!(agent.resolve_model(&req), "runtime-profile-model");
+}
+
+#[test]
 fn resolve_model_falls_back_to_req_model_when_no_budget() {
     let agent = ClaudeCodeAgent::new(
         PathBuf::from("claude"),
@@ -241,6 +260,26 @@ fn base_args_uses_request_reasoning_effort_when_phase_is_absent() {
     assert!(args
         .windows(2)
         .any(|window| window == ["--effort", "medium"]));
+}
+
+#[test]
+fn base_args_prefers_request_reasoning_effort_over_phase_effort() {
+    let agent = ClaudeCodeAgent::new(
+        PathBuf::from("claude"),
+        "default-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    );
+    let req = AgentRequest {
+        reasoning_effort: Some("medium".to_string()),
+        execution_phase: Some(ExecutionPhase::Planning),
+        ..AgentRequest::default()
+    };
+
+    let args = args_to_strings(&agent.base_args(&req));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["--effort", "medium"]));
+    assert!(!args.windows(2).any(|window| window == ["--effort", "max"]));
 }
 
 #[test]

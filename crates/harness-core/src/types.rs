@@ -695,8 +695,8 @@ impl ExecutionPhase {
 /// Per-phase model selection configuration.
 ///
 /// Maps each `ExecutionPhase` to a `BudgetTier`, then maps tiers to model identifiers.
-/// When configured on `ClaudeCodeAgent`, the model is selected by phase rather than
-/// the flat `default_model`. Falls back to `req.model` or `default_model` when no
+/// When configured on `ClaudeCodeAgent`, the phase model is used when the request
+/// does not provide an explicit model. Falls back to `default_model` when no
 /// `execution_phase` is set on the `AgentRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReasoningBudget {

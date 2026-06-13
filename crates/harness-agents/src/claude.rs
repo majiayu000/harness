@@ -27,8 +27,8 @@ pub struct ClaudeCodeAgent {
     pub cli_path: PathBuf,
     pub default_model: String,
     pub sandbox_mode: SandboxMode,
-    /// Per-phase model selection. When set, model is chosen based on
-    /// `req.execution_phase`. Falls back to `req.model` or `default_model`.
+    /// Per-phase model selection. When set, model is chosen from
+    /// `req.model`, then `req.execution_phase`, then `default_model`.
     pub reasoning_budget: Option<ReasoningBudget>,
     /// Maximum seconds of idle silence on the output stream before the
     /// subprocess is declared a zombie and terminated. `None` = no timeout.
@@ -73,10 +73,13 @@ impl ClaudeCodeAgent {
     }
 
     fn resolve_model<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
+        if let Some(model) = req.model.as_deref() {
+            return model;
+        }
         if let (Some(budget), Some(phase)) = (&self.reasoning_budget, req.execution_phase) {
             return budget.model_for_phase(phase);
         }
-        req.model.as_deref().unwrap_or(&self.default_model)
+        &self.default_model
     }
 
     fn effective_sandbox_mode(&self, req: &AgentRequest) -> SandboxMode {
@@ -127,12 +130,12 @@ impl ClaudeCodeAgent {
             base_args.push(OsString::from(tools.join(",")));
         }
 
-        if let Some(phase) = req.execution_phase {
-            base_args.push(OsString::from("--effort"));
-            base_args.push(OsString::from(phase.effort_level()));
-        } else if let Some(reasoning_effort) = req.reasoning_effort.as_deref() {
+        if let Some(reasoning_effort) = req.reasoning_effort.as_deref() {
             base_args.push(OsString::from("--effort"));
             base_args.push(OsString::from(reasoning_effort));
+        } else if let Some(phase) = req.execution_phase {
+            base_args.push(OsString::from("--effort"));
+            base_args.push(OsString::from(phase.effort_level()));
         }
 
         if let Some(budget) = req.max_budget_usd {
