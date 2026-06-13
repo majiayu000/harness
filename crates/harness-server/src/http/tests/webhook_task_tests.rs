@@ -47,14 +47,46 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     assert_eq!(json["status"], "planning");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(state.core.tasks.count(), before_count);
-    assert_runtime_issue_submission(
+    let task_id = json["task_id"]
+        .as_str()
+        .expect("task id should be present")
+        .to_string();
+    let workflow_id = assert_runtime_issue_submission(
         &state,
         dir.path(),
         Some("majiayu000/harness"),
         106,
-        json["task_id"].as_str().expect("task id should be present"),
+        &task_id,
     )
     .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("runtime workflow should be persisted");
+    assert_eq!(instance.data["source"], "github");
+    assert_eq!(instance.data["external_id"], "issue:106");
+    assert_eq!(instance.data["tracker_source"], "github");
+    assert_eq!(instance.data["tracker_external_id"], "issue:106");
+
+    let detail_response = task_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail = response_json(detail_response).await?;
+    assert_eq!(detail["source"], "github");
+    assert_eq!(detail["external_id"], "issue:106");
+    assert_eq!(detail["tracker_source"], "github");
+    assert_eq!(detail["tracker_external_id"], "issue:106");
     Ok(())
 }
 

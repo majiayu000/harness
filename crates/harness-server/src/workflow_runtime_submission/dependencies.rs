@@ -353,6 +353,8 @@ async fn release_issue_after_dependencies(
                 "repo": fields.repo,
                 "issue_number": fields.issue_number,
                 "depends_on": depends_on_strings(depends_on),
+                "tracker_source": fields.tracker_source,
+                "tracker_external_id": fields.tracker_external_id,
                 "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
             }),
         )

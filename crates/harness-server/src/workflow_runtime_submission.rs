@@ -16,6 +16,7 @@ use harness_workflow::runtime::WorkflowCommandType;
 const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
 const EXECUTION_PATH_WORKFLOW_RUNTIME: &str = "workflow_runtime";
 const PROMPT_TASK_DESCRIPTION: &str = "prompt task";
+const GITHUB_TRACKER_SOURCE: &str = "github";
 
 #[path = "workflow_runtime_submission/cancel.rs"]
 mod cancel;
@@ -357,8 +358,43 @@ fn issue_submission_data(
             "dependencies_blocked": ctx.dependencies_blocked,
             "source": ctx.source,
             "external_id": ctx.external_id,
+            "tracker_source": issue_tracker_source(ctx),
+            "tracker_external_id": issue_tracker_external_id(ctx),
         }),
     )
+}
+
+pub(super) fn issue_tracker_source(
+    ctx: &IssueSubmissionRuntimeContext<'_>,
+) -> Option<&'static str> {
+    ctx.source
+        .filter(|source| source.eq_ignore_ascii_case(GITHUB_TRACKER_SOURCE))
+        .map(|_| GITHUB_TRACKER_SOURCE)
+}
+
+pub(super) fn issue_tracker_external_id(ctx: &IssueSubmissionRuntimeContext<'_>) -> Option<String> {
+    issue_tracker_source(ctx)?;
+    Some(canonical_issue_external_id(
+        ctx.external_id,
+        ctx.issue_number,
+    ))
+}
+
+fn canonical_issue_external_id(external_id: Option<&str>, issue_number: u64) -> String {
+    let external_id = external_id
+        .map(str::trim)
+        .filter(|external_id| !external_id.is_empty())
+        .unwrap_or("");
+    if external_id.is_empty() {
+        return format!("issue:{issue_number}");
+    }
+    if external_id.starts_with("issue:") {
+        external_id.to_string()
+    } else if external_id.chars().all(|ch| ch.is_ascii_digit()) {
+        format!("issue:{external_id}")
+    } else {
+        external_id.to_string()
+    }
 }
 
 fn prompt_submission_data(
@@ -407,6 +443,8 @@ struct IssueSubmissionFields {
     labels: Vec<String>,
     force_execute: bool,
     additional_prompt: Option<String>,
+    tracker_source: Option<String>,
+    tracker_external_id: Option<String>,
 }
 
 fn issue_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<IssueSubmissionFields> {
@@ -425,6 +463,8 @@ fn issue_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<IssueS
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
         additional_prompt: optional_string_field(&instance.data, "additional_prompt"),
+        tracker_source: optional_string_field(&instance.data, "tracker_source"),
+        tracker_external_id: optional_string_field(&instance.data, "tracker_external_id"),
     })
 }
 

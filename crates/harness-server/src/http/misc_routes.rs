@@ -12,6 +12,7 @@ use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use super::{state::AppState, task_routes};
+use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::{router, task_runner};
 use harness_workflow::runtime::store::{RuntimeEventSummary, RuntimeJobCompactRecord};
 use harness_workflow::runtime::{
@@ -30,6 +31,12 @@ const WORKFLOW_RUNTIME_TREE_DEFAULT_COMMAND_LIMIT: i64 = 5;
 const WORKFLOW_RUNTIME_TREE_MAX_COMMAND_LIMIT: i64 = 50;
 const WORKFLOW_RUNTIME_TREE_DEFAULT_REJECTED_DECISION_LIMIT: i64 = 3;
 const WORKFLOW_RUNTIME_TREE_MAX_REJECTED_DECISION_LIMIT: i64 = 20;
+
+#[derive(Debug)]
+struct IntakeRecentDispatch {
+    sort_at: Option<i64>,
+    payload: serde_json::Value,
+}
 
 fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
     let error = error?;
@@ -1377,6 +1384,8 @@ pub(crate) async fn github_webhook(
 pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let intake_config = &state.core.server.config.intake;
     let all_tasks = state.core.tasks.list_all();
+    let (runtime_issue_workflows, runtime_degraded) =
+        runtime_issue_workflows_for_intake_status(&state).await;
 
     let github_active: u64 = if let Some(store) = state.core.issue_workflow_store.as_ref() {
         match store.list().await {
@@ -1413,7 +1422,11 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
                     )
             })
             .count() as u64
-    };
+    } + runtime_issue_workflows
+        .iter()
+        .filter(|workflow| runtime_workflow_has_tracker_source(workflow, "github"))
+        .filter(|workflow| !workflow.is_terminal())
+        .count() as u64;
 
     let feishu_active: u64 = all_tasks
         .iter()
@@ -1457,25 +1470,141 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
         "active": dashboard_active,
     });
 
-    let mut recent_dispatches: Vec<serde_json::Value> = all_tasks
+    let mut recent_dispatches: Vec<IntakeRecentDispatch> = all_tasks
         .iter()
         .filter(|t| t.source.is_some())
-        .map(|t| {
-            json!({
-                "source": t.source,
-                "external_id": t.external_id,
-                "task_id": t.id.0,
-                "status": serde_json::to_value(&t.status).unwrap_or(json!("unknown")),
-                "pr_url": t.pr_url,
-            })
-        })
+        .map(legacy_task_recent_dispatch)
         .collect();
-    recent_dispatches.truncate(10);
+    recent_dispatches.extend(
+        runtime_issue_workflows
+            .iter()
+            .filter(|workflow| runtime_workflow_intake_source(workflow).is_some())
+            .filter_map(runtime_issue_recent_dispatch),
+    );
+    recent_dispatches.sort_by_key(|dispatch| std::cmp::Reverse(dispatch.sort_at));
+    let recent_dispatches: Vec<serde_json::Value> = recent_dispatches
+        .into_iter()
+        .take(10)
+        .map(|dispatch| dispatch.payload)
+        .collect();
 
-    Json(json!({
+    let mut response = json!({
         "channels": [github_channel, feishu_channel, dashboard_channel],
         "recent_dispatches": recent_dispatches,
-    }))
+    });
+    if runtime_degraded {
+        response["degraded"] = json!({
+            "partial": true,
+            "missing": ["workflow_runtime_submissions"],
+            "reason": "runtime_submission_summaries_unavailable",
+        });
+    }
+    Json(response)
+}
+
+async fn runtime_issue_workflows_for_intake_status(
+    state: &AppState,
+) -> (Vec<WorkflowInstance>, bool) {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return (
+            Vec::new(),
+            workflow_runtime_submissions_expected_but_unavailable(state),
+        );
+    };
+    match store
+        .list_instances_by_definition(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(workflows) => (workflows, false),
+        Err(error) => {
+            tracing::error!("intake_status: workflow runtime lookup failed: {error}");
+            (Vec::new(), true)
+        }
+    }
+}
+
+fn legacy_task_recent_dispatch(task: &task_runner::TaskState) -> IntakeRecentDispatch {
+    IntakeRecentDispatch {
+        sort_at: parse_rfc3339_utc(task.created_at.as_deref()),
+        payload: json!({
+            "source": task.source,
+            "external_id": task.external_id,
+            "task_id": task.id.0,
+            "status": serde_json::to_value(&task.status).unwrap_or(json!("unknown")),
+            "pr_url": task.pr_url,
+        }),
+    }
+}
+
+fn runtime_issue_recent_dispatch(workflow: &WorkflowInstance) -> Option<IntakeRecentDispatch> {
+    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let task_id = projection.submission_handle?;
+    let source = runtime_workflow_intake_source(workflow)?;
+    Some(IntakeRecentDispatch {
+        sort_at: Some(workflow.created_at.timestamp_micros()),
+        payload: json!({
+            "source": source,
+            "external_id": runtime_workflow_external_id(workflow),
+            "tracker_source": runtime_workflow_tracker_source(workflow),
+            "tracker_external_id": runtime_workflow_tracker_external_id(workflow),
+            "task_id": task_id.0,
+            "status": serde_json::to_value(&projection.task_status).unwrap_or(json!("unknown")),
+            "pr_url": runtime_workflow_data_string(workflow, "pr_url"),
+        }),
+    })
+}
+
+fn parse_rfc3339_utc(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_micros())
+}
+
+fn workflow_runtime_submissions_expected_but_unavailable(state: &AppState) -> bool {
+    state
+        .degraded_subsystems
+        .contains(&"workflow_runtime_store")
+        || state
+            .startup_statuses
+            .iter()
+            .any(|status| status.name == "workflow_runtime_store" && !status.ready)
+}
+
+fn runtime_workflow_has_tracker_source(workflow: &WorkflowInstance, source: &str) -> bool {
+    runtime_workflow_tracker_source(workflow)
+        .or_else(|| runtime_workflow_data_string(workflow, "source"))
+        .as_deref()
+        == Some(source)
+}
+
+fn runtime_workflow_intake_source(workflow: &WorkflowInstance) -> Option<String> {
+    runtime_workflow_data_string(workflow, "source")
+        .or_else(|| runtime_workflow_tracker_source(workflow))
+}
+
+fn runtime_workflow_external_id(workflow: &WorkflowInstance) -> Option<String> {
+    runtime_workflow_data_string(workflow, "external_id")
+        .or_else(|| runtime_workflow_tracker_external_id(workflow))
+}
+
+fn runtime_workflow_tracker_source(workflow: &WorkflowInstance) -> Option<String> {
+    runtime_workflow_data_string(workflow, "tracker_source")
+}
+
+fn runtime_workflow_tracker_external_id(workflow: &WorkflowInstance) -> Option<String> {
+    runtime_workflow_data_string(workflow, "tracker_external_id")
+}
+
+fn runtime_workflow_data_string(workflow: &WorkflowInstance, field: &str) -> Option<String> {
+    workflow
+        .data
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 #[derive(serde::Deserialize)]

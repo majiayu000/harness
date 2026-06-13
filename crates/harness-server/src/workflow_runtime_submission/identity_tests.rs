@@ -45,12 +45,25 @@ async fn issue_submission_records_explicit_submission_id() -> anyhow::Result<()>
         .await?
         .expect("issue workflow should be persisted");
     assert_eq!(instance.data["submission_id"], "issue-submission-id");
+    assert_eq!(instance.data["source"], "github");
+    assert_eq!(instance.data["external_id"], "issue:1129");
+    assert_eq!(instance.data["tracker_source"], "github");
+    assert_eq!(instance.data["tracker_external_id"], "issue:1129");
     assert_eq!(
         runtime_issue_task_handle(&instance)
             .expect("issue workflow should expose submission id")
             .as_str(),
         "issue-submission-id"
     );
+    let events = store.events_for(&workflow_id).await?;
+    let submitted = events
+        .iter()
+        .find(|event| event.event_type == "IssueSubmitted")
+        .expect("issue submission event should be recorded");
+    assert_eq!(submitted.event["source"], "github");
+    assert_eq!(submitted.event["external_id"], "issue:1129");
+    assert_eq!(submitted.event["tracker_source"], "github");
+    assert_eq!(submitted.event["tracker_external_id"], "issue:1129");
     Ok(())
 }
 
