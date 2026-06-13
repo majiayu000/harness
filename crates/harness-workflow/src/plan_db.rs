@@ -1,8 +1,11 @@
 use harness_core::db::{Migration, PgStoreContext};
+use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use harness_exec::plan::ExecPlan;
 use sqlx::postgres::PgPool;
 use std::path::Path;
+
+pub const PLAN_DB_SCHEMA: &str = "plan_db";
 
 static PLAN_MIGRATIONS: &[Migration] = &[
     Migration {
@@ -30,10 +33,37 @@ static PLAN_MIGRATIONS: &[Migration] = &[
         description: "add GIN index on exec_plans.data for JSONB path queries",
         sql: "CREATE INDEX IF NOT EXISTS idx_exec_plans_data_gin ON exec_plans USING GIN (data jsonb_path_ops)",
     },
+    Migration {
+        version: 5,
+        description: "scope exec plans within shared schema",
+        sql: "ALTER TABLE exec_plans ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE exec_plans
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE exec_plans ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE exec_plans ALTER COLUMN store_key SET NOT NULL;
+              ALTER TABLE exec_plans DROP CONSTRAINT IF EXISTS exec_plans_pkey;
+              ALTER TABLE exec_plans ADD CONSTRAINT exec_plans_pkey PRIMARY KEY (store_key, id);
+              CREATE INDEX IF NOT EXISTS idx_exec_plans_store_created_at
+              ON exec_plans(store_key, created_at DESC)",
+    },
+    Migration {
+        version: 6,
+        description: "record legacy plan db backfills",
+        sql: "CREATE TABLE IF NOT EXISTS plan_db_legacy_backfills (
+            store_key     TEXT NOT NULL DEFAULT current_schema(),
+            legacy_schema TEXT NOT NULL,
+            copied_rows   BIGINT NOT NULL DEFAULT 0,
+            backfilled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (store_key, legacy_schema)
+        )",
+    },
 ];
 
 pub struct PlanDb {
     pool: PgPool,
+    schema: String,
+    store_key: String,
     /// Serializes read-modify-write cycles to prevent lost-update races.
     update_lock: tokio::sync::Mutex<()>,
 }
@@ -48,24 +78,84 @@ impl PlanDb {
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
         let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let schema = context.schema().to_owned();
+        let store_key = schema.clone();
         let pool = context.open_migrated_pool(PLAN_MIGRATIONS).await?;
         Ok(Self {
             pool,
+            schema,
+            store_key,
             update_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    pub fn shared_schema_context(
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<PgStoreContext> {
+        PostgresBackend::new(configured_database_url.map(ToOwned::to_owned))
+            .store_context(&StoreLocation::SharedSchema(PLAN_DB_SCHEMA.to_string()))
     }
 
     pub async fn open_with_context(
         context: &PgStoreContext,
         setup_pool: &PgPool,
     ) -> anyhow::Result<Self> {
+        Self::open_with_context_and_store_key(context, setup_pool, context.schema().to_owned())
+            .await
+    }
+
+    pub async fn open_shared_with_data_dir(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        data_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let store_key = Self::store_key_for_data_dir(data_dir);
+        Self::open_with_context_and_store_key(context, setup_pool, store_key).await
+    }
+
+    pub async fn open_shared_with_legacy_backfill(
+        configured_database_url: Option<&str>,
+        setup_pool: &PgPool,
+        data_dir: &Path,
+        legacy_path: &Path,
+    ) -> anyhow::Result<Self> {
+        let context = Self::shared_schema_context(configured_database_url)?;
+        let db = Self::open_shared_with_data_dir(&context, setup_pool, data_dir).await?;
+        migrate_legacy_plan_db_if_needed(legacy_path, configured_database_url, &db).await?;
+        Ok(db)
+    }
+
+    async fn open_with_context_and_store_key(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        store_key: String,
+    ) -> anyhow::Result<Self> {
+        let schema = context.schema().to_owned();
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, PLAN_MIGRATIONS)
             .await?;
         Ok(Self {
             pool,
+            schema,
+            store_key,
             update_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub fn store_key_for_data_dir(data_dir: &Path) -> String {
+        data_dir
+            .canonicalize()
+            .unwrap_or_else(|_| data_dir.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn store_key(&self) -> &str {
+        &self.store_key
     }
 
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
@@ -78,10 +168,11 @@ impl PlanDb {
             data
         };
         sqlx::query(
-            "INSERT INTO exec_plans (id, data) VALUES ($1, $2::jsonb)
-             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
+            "INSERT INTO exec_plans (store_key, id, data) VALUES ($1, $2, $3::jsonb)
+             ON CONFLICT(store_key, id) DO UPDATE SET data = EXCLUDED.data,
                  updated_at = CURRENT_TIMESTAMP",
         )
+        .bind(&self.store_key)
         .bind(plan.id.as_str())
         .bind(&data)
         .execute(&self.pool)
@@ -108,7 +199,8 @@ impl PlanDb {
 
     pub async fn get(&self, id: &ExecPlanId) -> anyhow::Result<Option<ExecPlan>> {
         let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM exec_plans WHERE id = $1")
+            sqlx::query_as("SELECT data::text FROM exec_plans WHERE store_key = $1 AND id = $2")
+                .bind(&self.store_key)
                 .bind(id.as_str())
                 .fetch_optional(&self.pool)
                 .await?;
@@ -119,17 +211,20 @@ impl PlanDb {
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<ExecPlan>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data::text FROM exec_plans ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM exec_plans WHERE store_key = $1 ORDER BY created_at DESC",
+        )
+        .bind(&self.store_key)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
     }
 
     pub async fn delete(&self, id: &ExecPlanId) -> anyhow::Result<bool> {
-        let result = sqlx::query("DELETE FROM exec_plans WHERE id = $1")
+        let result = sqlx::query("DELETE FROM exec_plans WHERE store_key = $1 AND id = $2")
+            .bind(&self.store_key)
             .bind(id.as_str())
             .execute(&self.pool)
             .await?;
@@ -141,8 +236,11 @@ impl PlanDb {
         let filter = serde_json::json!({ "status": status });
         let filter_str = serde_json::to_string(&filter)?;
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data::text FROM exec_plans WHERE data @> $1::jsonb ORDER BY created_at DESC",
+            "SELECT data::text FROM exec_plans
+             WHERE store_key = $1 AND data @> $2::jsonb
+             ORDER BY created_at DESC",
         )
+        .bind(&self.store_key)
         .bind(&filter_str)
         .fetch_all(&self.pool)
         .await?;
@@ -155,8 +253,11 @@ impl PlanDb {
     pub async fn search_by_name(&self, query: &str) -> anyhow::Result<Vec<ExecPlan>> {
         let pattern = format!("%{}%", query);
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data::text FROM exec_plans WHERE data->>'purpose' LIKE $1 ORDER BY created_at DESC",
+            "SELECT data::text FROM exec_plans
+             WHERE store_key = $1 AND data->>'purpose' LIKE $2
+             ORDER BY created_at DESC",
         )
+        .bind(&self.store_key)
         .bind(&pattern)
         .fetch_all(&self.pool)
         .await?;
@@ -208,9 +309,80 @@ impl PlanDb {
     }
 }
 
+pub async fn migrate_legacy_plan_db_if_needed(
+    legacy_path: &Path,
+    configured_database_url: Option<&str>,
+    target_db: &PlanDb,
+) -> anyhow::Result<u64> {
+    let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
+    let legacy_schema = legacy_context.schema();
+    if legacy_schema == target_db.schema() {
+        return Ok(0);
+    }
+
+    let already_backfilled: Option<String> = sqlx::query_scalar(
+        "SELECT legacy_schema
+         FROM plan_db_legacy_backfills
+         WHERE store_key = $1 AND legacy_schema = $2",
+    )
+    .bind(target_db.store_key())
+    .bind(legacy_schema)
+    .fetch_optional(&target_db.pool)
+    .await?;
+    if already_backfilled.is_some() {
+        return Ok(0);
+    }
+
+    let legacy_table: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(format!("\"{legacy_schema}\".exec_plans"))
+        .fetch_one(&target_db.pool)
+        .await?;
+    if legacy_table.is_none() {
+        return Ok(0);
+    }
+
+    let mut tx = target_db.pool.begin().await?;
+    let copy_sql = format!(
+        "INSERT INTO exec_plans (store_key, id, data, created_at, updated_at)
+         SELECT $1, id, replace(data::text, '\\u0000', '')::jsonb, created_at, updated_at
+         FROM \"{legacy_schema}\".exec_plans
+         ON CONFLICT (store_key, id) DO NOTHING"
+    );
+    let copied = sqlx::query(&copy_sql)
+        .bind(target_db.store_key())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    sqlx::query(
+        "INSERT INTO plan_db_legacy_backfills (store_key, legacy_schema, copied_rows)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (store_key, legacy_schema) DO NOTHING",
+    )
+    .bind(target_db.store_key())
+    .bind(legacy_schema)
+    .bind(copied as i64)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    if copied > 0 {
+        tracing::info!(
+            copied,
+            legacy_schema,
+            target_schema = target_db.schema(),
+            "plan db migration: backfilled legacy plans into shared schema"
+        );
+    }
+
+    Ok(copied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use harness_core::db::{
         pg_open_pool, pg_open_pool_schematized, resolve_database_url, PgMigrator,
     };
@@ -236,6 +408,28 @@ mod tests {
         let path = dir.path().join("plans.db");
         let db = PlanDb::open(&path).await?;
         Ok(Some((db, dir, permit)))
+    }
+
+    fn unique_test_schema(prefix: &str) -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_nanos();
+        format!("{prefix}_{nanos}_{count}")
+    }
+
+    #[test]
+    fn shared_schema_context_uses_fixed_plan_db_schema() -> anyhow::Result<()> {
+        let context =
+            PlanDb::shared_schema_context(Some("postgres://user:pass@localhost:5432/harness"))?;
+        assert_eq!(context.schema(), PLAN_DB_SCHEMA);
+        assert!(
+            context.ownership().is_none(),
+            "shared plan_db schema must not register path-derived ownership"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -413,6 +607,110 @@ mod tests {
             "purpose should contain 'a' after NUL stripping"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_plan_db_migration_backfills_once() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let _permit = db_gate().acquire().await?;
+
+        let dir = tempfile::tempdir()?;
+        let target_data_dir = dir.path().join("target-data");
+        let other_data_dir = dir.path().join("other-data");
+        let legacy_path = target_data_dir.join("plans.db");
+        let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
+            .schema()
+            .to_owned();
+        let target_schema = unique_test_schema("plan_db_backfill_test");
+        let setup_pool = pg_open_pool(&database_url).await?;
+        let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+        let target_db =
+            PlanDb::open_shared_with_data_dir(&target_context, &setup_pool, &target_data_dir)
+                .await?;
+        let other_db =
+            PlanDb::open_shared_with_data_dir(&target_context, &setup_pool, &other_data_dir)
+                .await?;
+        let legacy_db = PlanDb::open_with_database_url(&legacy_path, Some(&database_url)).await?;
+
+        let result = std::panic::AssertUnwindSafe(async {
+            let mut legacy_plan = ExecPlan::from_spec("# Legacy plan", &target_data_dir)?;
+            legacy_plan.purpose = "legacy plan".to_string();
+            legacy_db.upsert(&legacy_plan).await?;
+
+            let copied =
+                migrate_legacy_plan_db_if_needed(&legacy_path, Some(&database_url), &target_db)
+                    .await?;
+            assert_eq!(copied, 1, "one legacy plan should be copied");
+
+            let copied_again =
+                migrate_legacy_plan_db_if_needed(&legacy_path, Some(&database_url), &target_db)
+                    .await?;
+            assert_eq!(copied_again, 0, "migration must be idempotent");
+
+            let loaded = target_db
+                .get(&legacy_plan.id)
+                .await?
+                .expect("legacy plan should be present in the shared schema");
+            assert_eq!(loaded.purpose, "legacy plan");
+            assert!(
+                other_db.get(&legacy_plan.id).await?.is_none(),
+                "other data_dir scopes must not hydrate legacy plans"
+            );
+
+            let mut shared_plan = loaded;
+            shared_plan.purpose = "shared update".to_string();
+            target_db.upsert(&shared_plan).await?;
+            let copied_after_shared_update =
+                migrate_legacy_plan_db_if_needed(&legacy_path, Some(&database_url), &target_db)
+                    .await?;
+            assert_eq!(
+                copied_after_shared_update, 0,
+                "completed migration must not overwrite updated shared plans"
+            );
+            let updated = target_db
+                .get(&legacy_plan.id)
+                .await?
+                .expect("updated shared plan should remain");
+            assert_eq!(updated.purpose, "shared update");
+
+            target_db.delete(&legacy_plan.id).await?;
+            let copied_after_shared_delete =
+                migrate_legacy_plan_db_if_needed(&legacy_path, Some(&database_url), &target_db)
+                    .await?;
+            assert_eq!(
+                copied_after_shared_delete, 0,
+                "completed migration must not resurrect deleted shared plans"
+            );
+            assert!(
+                target_db.get(&legacy_plan.id).await?.is_none(),
+                "deleted shared plan must stay deleted"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .catch_unwind()
+        .await;
+
+        legacy_db.pool.close().await;
+        target_db.pool.close().await;
+        other_db.pool.close().await;
+        let _ = sqlx::query(&format!(
+            "DROP SCHEMA IF EXISTS \"{legacy_schema}\" CASCADE"
+        ))
+        .execute(&setup_pool)
+        .await;
+        let _ = sqlx::query(&format!(
+            "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
+        ))
+        .execute(&setup_pool)
+        .await;
+        setup_pool.close().await;
+
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Verifies the upgrade contract: a database with v1+v2 migrations (data TEXT)
