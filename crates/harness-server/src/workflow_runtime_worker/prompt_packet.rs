@@ -6,7 +6,7 @@ use harness_workflow::runtime::{
     PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
     PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
     QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
-    SERVER_PR_SNAPSHOT_ARTIFACT,
+    SCOPE_TOO_LARGE_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -426,11 +426,17 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("github_issue_pr", "implement_issue") => json!({
             "on_succeeded": {
-                "reducer_next_state": "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked",
-                "accepted_signals": [ISSUE_CLOSED_SIGNAL, ISSUE_ALREADY_RESOLVED_SIGNAL],
+                "reducer_next_state": "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_or_blocked_with_scope_too_large_signal_else_blocked",
+                "accepted_signals": [ISSUE_CLOSED_SIGNAL, ISSUE_ALREADY_RESOLVED_SIGNAL, SCOPE_TOO_LARGE_SIGNAL],
                 "accepted_artifacts": ["pull_request", ISSUE_STATE_ARTIFACT],
-                "success_requires": "A succeeded implement_issue result MUST include either a pull_request artifact with pr_number/pr_url, or structured closed-issue evidence with explicit closed/resolved state plus issue_number or issue_url. Empty success is blocked.",
-                "required_summary": "Include changed files, validation commands, and the PR URL or closed issue evidence."
+                "success_requires": "A succeeded implement_issue result MUST include either a pull_request artifact with pr_number/pr_url, structured closed-issue evidence with explicit closed/resolved state plus issue_number or issue_url, or SCOPE_TOO_LARGE with scope counts and a decomposition_skeleton. Empty success is blocked.",
+                "required_summary": "Include changed files, validation commands, and the PR URL, closed issue evidence, or SCOPE_TOO_LARGE decomposition evidence.",
+                "pr_scope_guard": {
+                    "when": "After edits and validation, before pushing or creating a PR.",
+                    "base_ref": "Use workflow_file.config.base remote/branch, for example origin/main.",
+                    "threshold_config": "workflow_file.config.pr_scope_guard; defaults are enabled=true, max_files_changed=30, max_lines_added=1500.",
+                    "on_exceeded": "Do not create a PR. Emit SCOPE_TOO_LARGE with files_changed, lines_added, max_files_changed, max_lines_added, base_ref, and decomposition_skeleton."
+                }
             },
             "follow_up_event": "PrDetected can still bind PR metadata, but a runtime result should emit pull_request directly when a PR exists."
         }),
@@ -501,7 +507,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             }
         }),
         ("github_issue_pr", "implement_issue") => json!({
-            "must_include": ["changed files", "validation commands", "PR URL, closed issue evidence, or blocker"],
+            "must_include": ["changed files", "validation commands", "PR URL, closed issue evidence, SCOPE_TOO_LARGE decomposition evidence, or blocker"],
             "must_not_include": ["workflow table mutations", "unverified merge claims"],
             "artifacts": {
                 "pull_request": {
@@ -515,7 +521,14 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             },
             "signals": {
                 "IssueClosed": "Use when the GitHub issue is confirmed closed and no implementation PR is needed. Include state=closed or state=resolved plus issue_number or issue_url.",
-                "IssueAlreadyResolved": "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
+                "IssueAlreadyResolved": "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url.",
+                "SCOPE_TOO_LARGE": "Use when pr_scope_guard is enabled and the diff exceeds configured max_files_changed or max_lines_added. Include base_ref, files_changed, lines_added, max_files_changed, max_lines_added, and decomposition_skeleton."
+            },
+            "pr_scope_guard": {
+                "required_when": "workflow_file.config.pr_scope_guard.enabled is true.",
+                "check_timing": "Run after edits and validation but before pushing or creating a PR.",
+                "counting": "Compare the implementation diff against workflow_file.config.base remote/branch and count files changed plus added lines.",
+                "exceeded_result": "Emit SCOPE_TOO_LARGE instead of pull_request when files_changed > max_files_changed or lines_added > max_lines_added."
             }
         }),
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({

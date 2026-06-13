@@ -76,6 +76,9 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.runtime_worker.lease_ttl_secs, 3900);
     assert!(cfg.runtime_retry_policy.is_empty());
     assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
+    assert!(cfg.pr_scope_guard.enabled);
+    assert_eq!(cfg.pr_scope_guard.max_files_changed, 30);
+    assert_eq!(cfg.pr_scope_guard.max_lines_added, 1500);
     assert_eq!(cfg.storage.schema_namespace, "workflow");
     assert!(!cfg.issue_workflow.require_human_gate_before_merge);
     assert!(cfg.activities.is_empty());
@@ -144,6 +147,10 @@ issue_workflow:
   force_execute_label: do-not-second-guess
   auto_replan_on_plan_issue: false
   require_human_gate_before_merge: true
+pr_scope_guard:
+  enabled: false
+  max_files_changed: 12
+  max_lines_added: 345
 pr_feedback:
   enabled: false
   sweep_interval_secs: 15
@@ -250,6 +257,9 @@ Body
     );
     assert!(!cfg.issue_workflow.auto_replan_on_plan_issue);
     assert!(cfg.issue_workflow.require_human_gate_before_merge);
+    assert!(!cfg.pr_scope_guard.enabled);
+    assert_eq!(cfg.pr_scope_guard.max_files_changed, 12);
+    assert_eq!(cfg.pr_scope_guard.max_lines_added, 345);
     assert!(!cfg.pr_feedback.enabled);
     assert_eq!(cfg.pr_feedback.sweep_interval_secs, 15);
     assert_eq!(cfg.pr_feedback.claim_stale_after_secs, 45);

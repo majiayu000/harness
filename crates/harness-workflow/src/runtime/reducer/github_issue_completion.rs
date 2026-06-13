@@ -1,7 +1,7 @@
 use super::support::{event_field_string, non_empty_json_string, runtime_completion_evidence};
 use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
-    ISSUE_STATE_ARTIFACT,
+    ISSUE_STATE_ARTIFACT, SCOPE_TOO_LARGE_SIGNAL,
 };
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
@@ -54,6 +54,58 @@ pub(super) fn issue_implementation_missing_result_decision(
                 "runtime_job_id": event_field_string(event, "runtime_job_id"),
             }),
         ))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
+}
+
+pub(super) fn scope_too_large_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "implementing",
+        "implement_issue",
+    ) {
+        return None;
+    }
+
+    let scope = scope_too_large_evidence_from_activity_result(result)?;
+    let scope_summary = scope.summary;
+    let scope_payload = scope.payload;
+    let reason = format!(
+        "implement_issue reported SCOPE_TOO_LARGE before PR creation: {}",
+        scope_summary
+    );
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "block_scope_too_large",
+            "blocked",
+            &reason,
+        )
+        .with_command(WorkflowCommand::mark_blocked(
+            reason.clone(),
+            format!("runtime-completion:{}:scope-too-large:block", event.id),
+        ))
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::RequestOperatorAttention,
+            format!("runtime-completion:{}:scope-too-large:operator", event.id),
+            json!({
+                "reason": reason,
+                "activity": result.activity,
+                "runtime_job_id": event_field_string(event, "runtime_job_id"),
+                "scope_guard": scope_payload,
+            }),
+        ))
+        .with_evidence(WorkflowEvidence::new("scope_too_large", scope_summary))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
@@ -145,6 +197,56 @@ pub(super) fn bind_pr_from_activity_result(
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
+}
+
+#[derive(Debug, Clone)]
+struct ScopeTooLargeEvidence {
+    summary: String,
+    payload: Value,
+}
+
+fn scope_too_large_evidence_from_activity_result(
+    result: &ActivityResult,
+) -> Option<ScopeTooLargeEvidence> {
+    result
+        .signals
+        .iter()
+        .filter(|signal| signal.signal_type == SCOPE_TOO_LARGE_SIGNAL)
+        .find_map(|signal| scope_too_large_evidence_from_value(&signal.signal))
+}
+
+fn scope_too_large_evidence_from_value(value: &Value) -> Option<ScopeTooLargeEvidence> {
+    let files_changed = value.get("files_changed").and_then(Value::as_u64)?;
+    let lines_added = value.get("lines_added").and_then(Value::as_u64)?;
+    let max_files_changed = value.get("max_files_changed").and_then(Value::as_u64)?;
+    let max_lines_added = value.get("max_lines_added").and_then(Value::as_u64)?;
+    let base_ref = value
+        .get("base_ref")
+        .and_then(non_empty_json_string)
+        .unwrap_or_else(|| "configured base".to_string());
+    value
+        .get("decomposition_skeleton")
+        .filter(|skeleton| decomposition_skeleton_is_non_empty(skeleton))?;
+
+    if files_changed <= max_files_changed && lines_added <= max_lines_added {
+        return None;
+    }
+
+    Some(ScopeTooLargeEvidence {
+        summary: format!(
+            "base_ref={base_ref}; files_changed={files_changed}/{max_files_changed}; lines_added={lines_added}/{max_lines_added}"
+        ),
+        payload: value.clone(),
+    })
+}
+
+fn decomposition_skeleton_is_non_empty(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        Value::String(text) => !text.trim().is_empty(),
+        _ => false,
+    }
 }
 
 fn pull_request_artifact(result: &ActivityResult) -> Option<(u64, String)> {
