@@ -1,8 +1,11 @@
 use anyhow::Context;
 use harness_core::db::{Migration, PgStoreContext};
+use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use harness_core::{types::Thread, types::ThreadId, types::ThreadStatus};
 use sqlx::postgres::PgPool;
 use std::path::Path;
+
+pub const THREAD_DB_SCHEMA: &str = "thread_db";
 
 static THREAD_MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
@@ -21,6 +24,7 @@ static THREAD_MIGRATIONS: &[Migration] = &[Migration {
 #[derive(Clone)]
 pub struct ThreadDb {
     pool: PgPool,
+    schema: String,
 }
 
 impl ThreadDb {
@@ -33,18 +37,31 @@ impl ThreadDb {
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
         let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let schema = context.schema().to_owned();
         let pool = context.open_migrated_pool(THREAD_MIGRATIONS).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, schema })
+    }
+
+    pub fn shared_schema_context(
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<PgStoreContext> {
+        PostgresBackend::new(configured_database_url.map(ToOwned::to_owned))
+            .store_context(&StoreLocation::SharedSchema(THREAD_DB_SCHEMA.to_string()))
     }
 
     pub async fn open_with_context(
         context: &PgStoreContext,
         setup_pool: &PgPool,
     ) -> anyhow::Result<Self> {
+        let schema = context.schema().to_owned();
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, THREAD_MIGRATIONS)
             .await?;
-        Ok(Self { pool })
+        Ok(Self { pool, schema })
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
     }
 
     pub async fn insert(&self, thread: &Thread) -> anyhow::Result<()> {
@@ -108,6 +125,50 @@ impl ThreadDb {
     }
 }
 
+pub async fn migrate_legacy_thread_db_if_needed(
+    legacy_path: &Path,
+    configured_database_url: Option<&str>,
+    target_db: &ThreadDb,
+) -> anyhow::Result<u64> {
+    let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
+    let legacy_schema = legacy_context.schema();
+    if legacy_schema == target_db.schema() {
+        return Ok(0);
+    }
+
+    let legacy_table: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(format!("\"{legacy_schema}\".threads"))
+        .fetch_one(&target_db.pool)
+        .await?;
+    if legacy_table.is_none() {
+        return Ok(0);
+    }
+
+    let copy_sql = format!(
+        "INSERT INTO threads (
+            id, cwd, status, turns, metadata, created_at, updated_at
+         )
+         SELECT id, cwd, status, turns, metadata, created_at, updated_at
+         FROM \"{legacy_schema}\".threads
+         ON CONFLICT (id) DO NOTHING"
+    );
+    let copied = sqlx::query(&copy_sql)
+        .execute(&target_db.pool)
+        .await?
+        .rows_affected();
+
+    if copied > 0 {
+        tracing::info!(
+            copied,
+            legacy_schema,
+            target_schema = target_db.schema(),
+            "thread db migration: backfilled legacy threads into shared schema"
+        );
+    }
+
+    Ok(copied)
+}
+
 #[derive(sqlx::FromRow)]
 struct ThreadRow {
     id: String,
@@ -141,8 +202,16 @@ impl ThreadRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::db::resolve_database_url;
+    use harness_core::db::{pg_open_pool, resolve_database_url};
     use std::path::PathBuf;
+
+    fn unique_test_schema(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_nanos();
+        format!("{prefix}_{nanos}")
+    }
 
     async fn open_test_db() -> anyhow::Result<Option<ThreadDb>> {
         if resolve_database_url(None).is_err() {
@@ -301,5 +370,75 @@ mod tests {
 
         assert!(db.get("missing-id").await?.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn shared_schema_context_uses_fixed_thread_db_schema() -> anyhow::Result<()> {
+        let context =
+            ThreadDb::shared_schema_context(Some("postgres://user:pass@localhost:5432/harness"))?;
+        assert_eq!(context.schema(), THREAD_DB_SCHEMA);
+        assert!(
+            context.ownership().is_none(),
+            "shared thread_db schema must not register path-derived ownership"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_thread_db_migration_backfills_shared_schema() -> anyhow::Result<()> {
+        let database_url = match resolve_database_url(None) {
+            Ok(url) => url,
+            Err(_) => return Ok(()),
+        };
+        let dir = tempfile::tempdir()?;
+        let legacy_path = dir.path().join("threads.db");
+        let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
+            .schema()
+            .to_owned();
+        let target_schema = unique_test_schema("thread_db_test");
+        let setup_pool = pg_open_pool(&database_url).await?;
+        let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+        let target_db = ThreadDb::open_with_context(&target_context, &setup_pool).await?;
+        let legacy_db = ThreadDb::open_with_database_url(&legacy_path, Some(&database_url)).await?;
+
+        let result = async {
+            let thread = Thread::new(PathBuf::from("/legacy/project"));
+            let thread_id = thread.id.clone();
+            legacy_db.insert(&thread).await?;
+
+            let copied =
+                migrate_legacy_thread_db_if_needed(&legacy_path, Some(&database_url), &target_db)
+                    .await?;
+            assert_eq!(copied, 1, "one legacy thread should be copied");
+
+            let copied_again =
+                migrate_legacy_thread_db_if_needed(&legacy_path, Some(&database_url), &target_db)
+                    .await?;
+            assert_eq!(copied_again, 0, "migration must be idempotent");
+
+            let loaded = target_db
+                .get(thread_id.as_str())
+                .await?
+                .expect("legacy thread should be present in the shared schema");
+            assert_eq!(loaded.project_root, PathBuf::from("/legacy/project"));
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        legacy_db.pool.close().await;
+        target_db.pool.close().await;
+        sqlx::query(&format!(
+            "DROP SCHEMA IF EXISTS \"{legacy_schema}\" CASCADE"
+        ))
+        .execute(&setup_pool)
+        .await?;
+        sqlx::query(&format!(
+            "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
+        ))
+        .execute(&setup_pool)
+        .await?;
+        setup_pool.close().await;
+
+        result
     }
 }

@@ -59,25 +59,25 @@ pub(crate) async fn build_registry(
     };
 
     // ── Thread DB ─────────────────────────────────────────────────────────────
-    // Constructed through the storage `Backend` seam (RFC Phase 2.2 sample). This
-    // is behavior-identical to the previous inline `PgStoreContext::new(url,
-    // pg_schema_for_path(path))`, but routes the schema strategy through
-    // `StoreLocation` so it lives in one place. `PathDerivedSchema` preserves the
-    // legacy per-path schema for now; switching this store to a shared schema is a
-    // later, deliberate (behavior-changing) step.
     let thread_db_path = harness_core::config::dirs::default_db_path(data_dir, "threads");
-    let thread_context =
-        harness_core::store_backend::PostgresBackend::new(Some(database_url.clone()))
-            .store_context(
-                &harness_core::store_backend::StoreLocation::PathDerivedSchema(thread_db_path),
-            )?;
+    let thread_context = crate::thread_db::ThreadDb::shared_schema_context(Some(&database_url))?;
     let thread_db = match super::forced_startup_error("thread_db") {
         Some(error) => {
             startup_results.push(StoreStartupResult::critical("thread_db").failed(error));
             None
         }
-        None => match crate::thread_db::ThreadDb::open_with_context(&thread_context, &setup_pool)
-            .await
+        None => match async {
+            let thread_db =
+                crate::thread_db::ThreadDb::open_with_context(&thread_context, &setup_pool).await?;
+            crate::thread_db::migrate_legacy_thread_db_if_needed(
+                &thread_db_path,
+                Some(&database_url),
+                &thread_db,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(thread_db)
+        }
+        .await
         {
             Ok(thread_db) => Some(thread_db),
             Err(error) => {
@@ -612,6 +612,7 @@ mod tests {
     use crate::{server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::registry::AgentRegistry;
     use harness_core::config::HarnessConfig;
+    use harness_core::db::resolve_database_url;
 
     async fn make_test_server_and_tasks(
         dir: &Path,
@@ -677,6 +678,23 @@ mod tests {
             bundle.plan_cache.contains_key(&plan_id),
             "plan should be hydrated into cache"
         );
+    }
+
+    #[tokio::test]
+    async fn build_registry_opens_thread_db_from_shared_schema() {
+        if resolve_database_url(None).is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+        let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
+            .await
+            .expect("build_registry should succeed");
+        let thread_db = bundle
+            .thread_db
+            .as_ref()
+            .unwrap_or_else(|| panic!("thread db should be ready: {:?}", bundle.startup_results));
+        assert_eq!(thread_db.schema(), crate::thread_db::THREAD_DB_SCHEMA);
     }
 
     #[tokio::test]
