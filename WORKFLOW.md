@@ -19,6 +19,10 @@ hooks:
 issue_workflow:
   force_execute_label: force-execute
   auto_replan_on_plan_issue: true
+pr_scope_guard:
+  enabled: true
+  max_files_changed: 30
+  max_lines_added: 1500
 pr_feedback:
   enabled: true
   sweep_interval_secs: 60
@@ -96,8 +100,10 @@ Issue implementation flow:
 2. Reproduce or confirm the issue signal before changing code.
 3. Make the smallest correct code change.
 4. Run the activity validation commands that apply to the touched scope.
-5. Commit, push, and open or update a PR targeting the configured base branch.
-6. Include the issue closing line in the PR body when working from an issue.
+5. Run `pr_scope_guard` against the configured base before pushing or creating a PR.
+6. If `pr_scope_guard` exceeds `max_files_changed` or `max_lines_added`, do not create a PR; emit `SCOPE_TOO_LARGE` with counts and a decomposition skeleton.
+7. Commit, push, and open or update a PR targeting the configured base branch.
+8. Include the issue closing line in the PR body when working from an issue.
 
 PR feedback flow:
 

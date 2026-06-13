@@ -11,6 +11,7 @@ use self::github_issue_completion::{
     bind_pr_from_activity_result, closed_issue_evidence_from_activity_result,
     closed_issue_evidence_from_activity_result_value, closed_issue_evidence_from_value,
     github_issue_closed_decision, issue_implementation_missing_result_decision,
+    scope_too_large_decision,
 };
 use self::plan_issue_completion::issue_plan_decision_from_activity_result;
 use self::pr_feedback_completion::{
@@ -55,6 +56,7 @@ pub const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
 pub const ISSUE_CLOSED_SIGNAL: &str = "IssueClosed";
 pub const ISSUE_ALREADY_RESOLVED_SIGNAL: &str = "IssueAlreadyResolved";
 pub const ISSUE_STATE_ARTIFACT: &str = "issue_state";
+pub const SCOPE_TOO_LARGE_SIGNAL: &str = "SCOPE_TOO_LARGE";
 
 pub fn activity_result_has_closed_issue_evidence(result: &ActivityResult) -> bool {
     closed_issue_evidence_from_activity_result(result).is_some()
@@ -84,6 +86,7 @@ pub fn reduce_runtime_job_completed(
     let decision = match result.status {
         ActivityStatus::Succeeded => reduce_success(instance, event, &result),
         ActivityStatus::Blocked => github_issue_closed_decision(instance, event, &result)
+            .or_else(|| scope_too_large_decision(instance, event, &result))
             .or_else(|| Some(runtime_blocked_decision(instance, event, &result))),
         ActivityStatus::Failed => Some(
             retry_failed_activity_decision(instance, event, &result)
@@ -104,6 +107,9 @@ fn reduce_success(
         return Some(decision);
     }
     if let Some(decision) = issue_plan_decision_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+    if let Some(decision) = scope_too_large_decision(instance, event, result) {
         return Some(decision);
     }
     if let Some(reason) =

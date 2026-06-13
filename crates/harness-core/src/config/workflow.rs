@@ -93,6 +93,16 @@ pub struct IssueWorkflowPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrScopeGuardPolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_pr_scope_guard_max_files_changed")]
+    pub max_files_changed: u32,
+    #[serde(default = "default_pr_scope_guard_max_lines_added")]
+    pub max_lines_added: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrFeedbackPolicy {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -235,6 +245,8 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub issue_workflow: IssueWorkflowPolicy,
     #[serde(default)]
+    pub pr_scope_guard: PrScopeGuardPolicy,
+    #[serde(default)]
     pub repo_backlog: RepoBacklogPolicy,
     #[serde(default)]
     pub pr_feedback: PrFeedbackPolicy,
@@ -270,6 +282,16 @@ impl Default for IssueWorkflowPolicy {
             force_execute_label: default_force_execute_label(),
             auto_replan_on_plan_issue: default_true(),
             require_human_gate_before_merge: false,
+        }
+    }
+}
+
+impl Default for PrScopeGuardPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_files_changed: default_pr_scope_guard_max_files_changed(),
+            max_lines_added: default_pr_scope_guard_max_lines_added(),
         }
     }
 }
@@ -455,6 +477,14 @@ fn default_hook_timeout_secs() -> u64 {
 
 fn default_force_execute_label() -> String {
     "force-execute".to_string()
+}
+
+fn default_pr_scope_guard_max_files_changed() -> u32 {
+    30
+}
+
+fn default_pr_scope_guard_max_lines_added() -> u32 {
+    1500
 }
 
 fn default_feedback_sweep_interval_secs() -> u64 {

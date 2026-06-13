@@ -124,12 +124,12 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["transition_contract"]
             ["on_succeeded"]["reducer_next_state"],
-        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
+        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_or_blocked_with_scope_too_large_signal_else_blocked"
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
             ["must_include"][2],
-        "PR URL, closed issue evidence, or blocker"
+        "PR URL, closed issue evidence, SCOPE_TOO_LARGE decomposition evidence, or blocker"
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]

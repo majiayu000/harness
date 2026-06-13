@@ -27,24 +27,36 @@ fn activity_result_schema_describes_issue_implementation_terminal_evidence_contr
 
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
-        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
+        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_or_blocked_with_scope_too_large_signal_else_blocked"
     );
     assert_eq!(
         schema["activity_contract"]["accepted_signals"][0],
         ISSUE_CLOSED_SIGNAL
     );
     assert_eq!(
+        schema["activity_contract"]["accepted_signals"][2],
+        SCOPE_TOO_LARGE_SIGNAL
+    );
+    assert_eq!(
         schema["activity_contract"]["success_requires"],
-        "pull_request_artifact_or_closed_issue_signal"
+        "pull_request_artifact_or_closed_issue_or_scope_too_large_signal"
     );
     assert_eq!(
         schema["agent_summary_contract"]["artifacts"]["issue_state"]["fields"][1],
         "state"
     );
     assert_eq!(
-            schema["agent_summary_contract"]["signals"]["IssueAlreadyResolved"],
-            "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
-        );
+        schema["agent_summary_contract"]["signals"]["IssueAlreadyResolved"],
+        "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
+    );
+    assert_eq!(
+        schema["transition_contract"]["on_succeeded"]["pr_scope_guard"]["threshold_config"],
+        "workflow_file.config.pr_scope_guard; defaults are enabled=true, max_files_changed=30, max_lines_added=1500."
+    );
+    assert_eq!(
+        schema["agent_summary_contract"]["signals"]["SCOPE_TOO_LARGE"],
+        "Use when pr_scope_guard is enabled and the diff exceeds configured max_files_changed or max_lines_added. Include base_ref, files_changed, lines_added, max_files_changed, max_lines_added, and decomposition_skeleton."
+    );
 }
 
 #[test]
