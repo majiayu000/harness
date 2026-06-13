@@ -30,12 +30,20 @@ static THREAD_MIGRATIONS: &[Migration] = &[
             backfilled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     },
+    Migration {
+        version: 3,
+        description: "scope threads within shared schema",
+        sql: "ALTER TABLE threads ADD COLUMN store_scope TEXT NOT NULL DEFAULT '';
+              CREATE INDEX IF NOT EXISTS idx_threads_store_scope_created_at
+              ON threads(store_scope, created_at DESC)",
+    },
 ];
 
 #[derive(Clone)]
 pub struct ThreadDb {
     pool: PgPool,
     schema: String,
+    store_scope: Option<String>,
 }
 
 impl ThreadDb {
@@ -50,7 +58,11 @@ impl ThreadDb {
         let context = PgStoreContext::from_path(path, configured_database_url)?;
         let schema = context.schema().to_owned();
         let pool = context.open_migrated_pool(THREAD_MIGRATIONS).await?;
-        Ok(Self { pool, schema })
+        Ok(Self {
+            pool,
+            schema,
+            store_scope: None,
+        })
     }
 
     pub fn shared_schema_context(
@@ -64,25 +76,61 @@ impl ThreadDb {
         context: &PgStoreContext,
         setup_pool: &PgPool,
     ) -> anyhow::Result<Self> {
+        Self::open_with_context_and_optional_scope(context, setup_pool, None).await
+    }
+
+    pub async fn open_with_context_and_scope(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        store_scope: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_context_and_optional_scope(context, setup_pool, Some(store_scope.into()))
+            .await
+    }
+
+    async fn open_with_context_and_optional_scope(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        store_scope: Option<String>,
+    ) -> anyhow::Result<Self> {
         let schema = context.schema().to_owned();
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, THREAD_MIGRATIONS)
             .await?;
-        Ok(Self { pool, schema })
+        Ok(Self {
+            pool,
+            schema,
+            store_scope,
+        })
     }
 
     pub fn schema(&self) -> &str {
         &self.schema
     }
 
+    pub fn scope_for_data_dir(data_dir: &Path) -> String {
+        data_dir
+            .canonicalize()
+            .unwrap_or_else(|_| data_dir.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn store_scope_value(&self) -> &str {
+        self.store_scope.as_deref().unwrap_or("")
+    }
+
     pub async fn insert(&self, thread: &Thread) -> anyhow::Result<()> {
         let turns_json = serde_json::to_string(&thread.turns)?;
         let metadata_json = serde_json::to_string(&thread.metadata)?;
         sqlx::query(
-            "INSERT INTO threads (id, cwd, status, turns, metadata, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO threads (
+                id, store_scope, cwd, status, turns, metadata, created_at, updated_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(thread.id.as_str())
+        .bind(self.store_scope_value())
         .bind(thread.project_root.to_string_lossy().as_ref())
         .bind(thread.status.as_ref())
         .bind(&turns_json)
@@ -97,41 +145,88 @@ impl ThreadDb {
     pub async fn update(&self, thread: &Thread) -> anyhow::Result<()> {
         let turns_json = serde_json::to_string(&thread.turns)?;
         let metadata_json = serde_json::to_string(&thread.metadata)?;
-        sqlx::query(
-            "UPDATE threads SET cwd = $1, status = $2, turns = $3, metadata = $4, updated_at = $5
-             WHERE id = $6",
-        )
-        .bind(thread.project_root.to_string_lossy().as_ref())
-        .bind(thread.status.as_ref())
-        .bind(&turns_json)
-        .bind(&metadata_json)
-        .bind(thread.updated_at)
-        .bind(thread.id.as_str())
-        .execute(&self.pool)
-        .await?;
+        if let Some(store_scope) = self.store_scope.as_deref() {
+            sqlx::query(
+                "UPDATE threads
+                 SET cwd = $1, status = $2, turns = $3, metadata = $4, updated_at = $5
+                 WHERE id = $6 AND store_scope = $7",
+            )
+            .bind(thread.project_root.to_string_lossy().as_ref())
+            .bind(thread.status.as_ref())
+            .bind(&turns_json)
+            .bind(&metadata_json)
+            .bind(thread.updated_at)
+            .bind(thread.id.as_str())
+            .bind(store_scope)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE threads
+                 SET cwd = $1, status = $2, turns = $3, metadata = $4, updated_at = $5
+                 WHERE id = $6",
+            )
+            .bind(thread.project_root.to_string_lossy().as_ref())
+            .bind(thread.status.as_ref())
+            .bind(&turns_json)
+            .bind(&metadata_json)
+            .bind(thread.updated_at)
+            .bind(thread.id.as_str())
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<Thread>> {
-        let row = sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads WHERE id = $1")
+        let row = if let Some(store_scope) = self.store_scope.as_deref() {
+            sqlx::query_as::<_, ThreadRow>(
+                "SELECT * FROM threads WHERE id = $1 AND store_scope = $2",
+            )
             .bind(id)
+            .bind(store_scope)
             .fetch_optional(&self.pool)
-            .await?;
+            .await?
+        } else {
+            sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+        };
         row.map(|r| r.into_thread()).transpose()
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<Thread>> {
-        let rows = sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads ORDER BY created_at DESC")
+        let rows = if let Some(store_scope) = self.store_scope.as_deref() {
+            sqlx::query_as::<_, ThreadRow>(
+                "SELECT * FROM threads
+                 WHERE store_scope = $1
+                 ORDER BY created_at DESC",
+            )
+            .bind(store_scope)
             .fetch_all(&self.pool)
-            .await?;
+            .await?
+        } else {
+            sqlx::query_as::<_, ThreadRow>("SELECT * FROM threads ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?
+        };
         rows.into_iter().map(|r| r.into_thread()).collect()
     }
 
     pub async fn delete(&self, id: &str) -> anyhow::Result<bool> {
-        let result = sqlx::query("DELETE FROM threads WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = if let Some(store_scope) = self.store_scope.as_deref() {
+            sqlx::query("DELETE FROM threads WHERE id = $1 AND store_scope = $2")
+                .bind(id)
+                .bind(store_scope)
+                .execute(&self.pool)
+                .await?
+        } else {
+            sqlx::query("DELETE FROM threads WHERE id = $1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+        };
         Ok(result.rows_affected() > 0)
     }
 }
@@ -171,13 +266,14 @@ pub async fn migrate_legacy_thread_db_if_needed(
 
     let copy_sql = format!(
         "INSERT INTO threads (
-            id, cwd, status, turns, metadata, created_at, updated_at
+            id, store_scope, cwd, status, turns, metadata, created_at, updated_at
          )
-         SELECT id, cwd, status, turns, metadata, created_at, updated_at
+         SELECT id, $1, cwd, status, turns, metadata, created_at, updated_at
          FROM \"{legacy_schema}\".threads
          ON CONFLICT (id) DO NOTHING"
     );
     let copied = sqlx::query(&copy_sql)
+        .bind(target_db.store_scope_value())
         .execute(&target_db.pool)
         .await?
         .rows_affected();
@@ -435,7 +531,12 @@ mod tests {
         let target_schema = unique_test_schema("thread_db_test");
         let setup_pool = pg_open_pool(&database_url).await?;
         let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
-        let target_db = ThreadDb::open_with_context(&target_context, &setup_pool).await?;
+        let target_db =
+            ThreadDb::open_with_context_and_scope(&target_context, &setup_pool, "data-dir-a")
+                .await?;
+        let other_scope_db =
+            ThreadDb::open_with_context_and_scope(&target_context, &setup_pool, "data-dir-b")
+                .await?;
         let legacy_db = ThreadDb::open_with_database_url(&legacy_path, Some(&database_url)).await?;
 
         let result = std::panic::AssertUnwindSafe(async {
@@ -458,6 +559,14 @@ mod tests {
                 .await?
                 .expect("legacy thread should be present in the shared schema");
             assert_eq!(loaded.project_root, PathBuf::from("/legacy/project"));
+            assert!(
+                other_scope_db.get(thread_id.as_str()).await?.is_none(),
+                "other data_dir scopes must not hydrate legacy threads"
+            );
+            assert!(
+                !other_scope_db.delete(thread_id.as_str()).await?,
+                "other data_dir scopes must not delete backfilled threads"
+            );
 
             assert!(target_db.delete(thread_id.as_str()).await?);
             let copied_after_delete =
@@ -478,6 +587,7 @@ mod tests {
 
         legacy_db.pool.close().await;
         target_db.pool.close().await;
+        other_scope_db.pool.close().await;
         let _ = sqlx::query(&format!(
             "DROP SCHEMA IF EXISTS \"{legacy_schema}\" CASCADE"
         ))

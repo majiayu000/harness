@@ -67,8 +67,12 @@ pub(crate) async fn build_registry(
             None
         }
         None => match async {
-            let thread_db =
-                crate::thread_db::ThreadDb::open_with_context(&thread_context, &setup_pool).await?;
+            let thread_db = crate::thread_db::ThreadDb::open_with_context_and_scope(
+                &thread_context,
+                &setup_pool,
+                crate::thread_db::ThreadDb::scope_for_data_dir(data_dir),
+            )
+            .await?;
             crate::thread_db::migrate_legacy_thread_db_if_needed(
                 &thread_db_path,
                 Some(&database_url),
@@ -612,7 +616,6 @@ mod tests {
     use crate::{server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::registry::AgentRegistry;
     use harness_core::config::HarnessConfig;
-    use harness_core::db::resolve_database_url;
 
     async fn make_test_server_and_tasks(
         dir: &Path,
@@ -682,9 +685,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_registry_opens_thread_db_from_shared_schema() {
-        if resolve_database_url(None).is_err() {
-            return;
-        }
         let dir = tempfile::tempdir().expect("tempdir");
         let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
         let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
@@ -693,7 +693,7 @@ mod tests {
         let thread_db = bundle
             .thread_db
             .as_ref()
-            .unwrap_or_else(|| panic!("thread db should be ready: {:?}", bundle.startup_results));
+            .expect("thread db should be ready");
         assert_eq!(thread_db.schema(), crate::thread_db::THREAD_DB_SCHEMA);
     }
 
