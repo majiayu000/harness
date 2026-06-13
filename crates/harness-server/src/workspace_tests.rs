@@ -353,7 +353,7 @@ async fn create_workspace_persists_owner_record_outside_checkout_root() {
 }
 
 #[tokio::test]
-async fn pool_slot_reuse_resets_existing_directory_for_new_task() {
+async fn pool_slot_reuse_preserves_existing_directory_for_same_workspace_identity() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
     let branch = current_branch(source.path());
@@ -398,10 +398,10 @@ async fn pool_slot_reuse_resets_existing_directory_for_new_task() {
         .expect("reuse deterministic workspace");
 
     assert_eq!(first.workspace_path, second.workspace_path);
-    assert_eq!(second.decision, WorkspaceAcquireDecision::RecreatedStale);
+    assert_eq!(second.decision, WorkspaceAcquireDecision::ReusedRecovered);
     assert!(
-        !second.workspace_path.join("handoff.txt").exists(),
-        "reused pool slot must be reset before the next task"
+        second.workspace_path.join("handoff.txt").exists(),
+        "same issue workspace identity should preserve non-terminal handoff state"
     );
     let owner = read_owner_record(&second.workspace_path).expect("owner record");
     assert_eq!(owner.task_id, "issue:42");
