@@ -100,11 +100,11 @@ pub(crate) async fn build_engines(
             match database_url {
                 Ok(database_url) => match harness_core::db::pg_open_pool(&database_url).await {
                     Ok(setup_pool) => {
-                        let event_context = harness_core::db::PgStoreContext::from_path(
-                            &data_dir.join("events.db"),
-                            Some(&database_url),
-                        )?;
-                        let store = harness_observe::event_store::EventStore::with_policies_and_otel_with_context(
+                        let event_context =
+                            harness_observe::event_store::EventStore::shared_schema_context(Some(
+                                &database_url,
+                            ))?;
+                        let store = harness_observe::event_store::EventStore::with_policies_and_otel_shared_with_context(
                             data_dir,
                             &event_context,
                             &setup_pool,
