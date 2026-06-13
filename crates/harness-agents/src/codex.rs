@@ -662,7 +662,12 @@ impl CodeAgent for CodexAgent {
             Err(harness_core::error::HarnessError::AgentExecution(message))
                 if message.contains("stream send failed")
         );
-        if stream_result.is_err() {
+        let stream_process_exited = matches!(
+            &stream_result,
+            Err(harness_core::error::HarnessError::AgentExecution(message))
+                if message.contains("codex exited with")
+        );
+        if stream_result.is_err() && !stream_process_exited {
             child.terminate_now();
         }
         if stream_send_failed {

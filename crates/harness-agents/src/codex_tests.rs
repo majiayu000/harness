@@ -433,6 +433,45 @@ async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
     );
 }
 
+#[tokio::test]
+async fn execute_kills_descendant_that_keeps_output_pipe_open_after_root_exit() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let descendant_marker = dir.path().join("execute-descendant-started.txt");
+    let marker = dir.path().join("execute-descendant-reached.txt");
+    let (script_dir, script) = write_executable_script(&format!(
+        r#"
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_0","type":"agent_message","text":"root done"}}}}'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":1,"output_tokens":1}}}}'
+( echo descendant > "{}"; sleep 1; echo reached > "{}" ) &
+"#,
+        descendant_marker.display(),
+        marker.display()
+    ));
+
+    let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+    let response = timeout(Duration::from_secs(5), agent.execute(request))
+        .await
+        .expect("execute should not hang on descendant-held stdout")
+        .expect("execute should parse root output");
+
+    assert_eq!(response.output, "root done");
+    assert!(
+        descendant_marker.exists(),
+        "descendant should start before process-group cleanup runs"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !marker.exists(),
+        "execute cleanup should kill descendants before they can mutate the workspace"
+    );
+    drop(script_dir);
+}
+
 #[test]
 fn local_mode_uses_read_only_approval_without_ephemeral() {
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::ReadOnly);
