@@ -195,6 +195,7 @@ impl CodeAgent for ClaudeCodeAgent {
         let child = cmd.spawn().map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
         })?;
+        let mut child = crate::ManagedChild::new(child, "claude execute");
 
         let output = child.wait_with_output().await.map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -297,7 +298,7 @@ impl CodeAgent for ClaudeCodeAgent {
         // ETXTBSY (error 26) occurs on Linux when a security scanner or indexer
         // briefly opens the executable for writing after it is written. Retry once.
         let spawn_result = cmd.spawn();
-        let mut child = match spawn_result {
+        let child = match spawn_result {
             Ok(child) => child,
             Err(ref e) if e.raw_os_error() == Some(26) => {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -313,10 +314,11 @@ impl CodeAgent for ClaudeCodeAgent {
                 )));
             }
         };
+        let mut child = crate::ManagedChild::new(child, "claude execute_stream");
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.inner_mut().stderr.take() {
             let agent = self.name().to_string();
             let captured = Arc::clone(&stderr_capture);
             stderr_task = Some(tokio::spawn(async move {
@@ -328,16 +330,33 @@ impl CodeAgent for ClaudeCodeAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        let stream_result = stream_claude_code_output(&mut child, &tx, idle_timeout).await;
+        let stream_result = stream_claude_code_output(child.inner_mut(), &tx, idle_timeout).await;
         let stream_send_failed = matches!(
             &stream_result,
             Err(harness_core::error::HarnessError::AgentExecution(message))
                 if message.contains("stream send failed")
         );
-        if stream_result.is_err() {
-            #[cfg(unix)]
-            crate::kill_process_group(&child);
-            let _ = child.start_kill();
+        let stream_process_exited = matches!(
+            &stream_result,
+            Err(harness_core::error::HarnessError::AgentExecution(message))
+                if message.contains("claude exited with")
+        );
+        if stream_result.is_err() && !stream_process_exited {
+            child.terminate_now();
+            child
+                .wait_and_cleanup_descendants()
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "failed waiting for claude process: {error}"
+                    ))
+                })?;
+        } else {
+            child.cleanup_after_child_exit().await.map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed cleaning up claude process: {error}"
+                ))
+            })?;
         }
         if stream_send_failed {
             return Err(stream_result.expect_err("stream send failures return an error"));

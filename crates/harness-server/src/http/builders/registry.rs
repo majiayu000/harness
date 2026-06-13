@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::registry_failures::failed_registry_bundle;
 use super::registry_migration::{
     migrate_issue_workflows_if_needed, migrate_project_workflows_if_needed,
     repair_corrupt_project_ids,
@@ -22,37 +23,6 @@ pub(crate) struct RegistryBundle {
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     pub workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     pub startup_results: Vec<StoreStartupResult>,
-}
-
-fn failed_registry_startup_results(error: &str) -> Vec<StoreStartupResult> {
-    vec![
-        StoreStartupResult::critical("thread_db").failed(error),
-        StoreStartupResult::critical("plan_db").failed(error),
-        StoreStartupResult::optional("issue_workflow_store").failed(error),
-        StoreStartupResult::optional("project_workflow_store").failed(error),
-        StoreStartupResult::optional("workflow_runtime_store").failed(error),
-        StoreStartupResult::critical("project_registry").failed(error),
-        StoreStartupResult::optional("workspace_manager").failed(error),
-        StoreStartupResult::optional("runtime_state_store").failed(error),
-    ]
-}
-
-fn failed_registry_bundle(
-    plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
-    error: &str,
-) -> RegistryBundle {
-    RegistryBundle {
-        thread_db: None,
-        plan_db: None,
-        plan_cache,
-        issue_workflow_store: None,
-        project_workflow_store: None,
-        workflow_runtime_store: None,
-        project_registry: None,
-        runtime_state_store: None,
-        workspace_mgr: None,
-        startup_results: failed_registry_startup_results(error),
-    }
 }
 
 /// Initialize thread DB, plan DB, plan cache, project registry, workspace
@@ -479,25 +449,65 @@ pub(crate) async fn build_registry(
     }
 
     // ── Workspace manager ─────────────────────────────────────────────────────
-    let workspace_mgr =
-        match crate::workspace::WorkspaceManager::new(server.config.workspace.clone()) {
-            Ok(mgr) => {
-                startup_results.push(StoreStartupResult::optional("workspace_manager"));
-                tracing::debug!(
-                    root = %server.config.workspace.root.display(),
-                    "workspace manager initialized"
-                );
-                Some(Arc::new(mgr))
+    let tasks_db_path = harness_core::config::dirs::default_db_path(data_dir, "tasks");
+    let task_context =
+        harness_core::db::PgStoreContext::from_path(&tasks_db_path, Some(&database_url))?;
+    let workspace_lease_store = match super::forced_startup_error("workspace_lease_store") {
+        Some(error) => {
+            startup_results
+                .push(StoreStartupResult::optional("workspace_lease_store").failed(error));
+            None
+        }
+        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_with_context(
+            &task_context,
+            &setup_pool,
+        )
+        .await
+        {
+            Ok(store) => {
+                startup_results.push(StoreStartupResult::optional("workspace_lease_store"));
+                Some(Arc::new(store))
             }
-            Err(e) => {
-                startup_results
-                    .push(StoreStartupResult::optional("workspace_manager").failed(e.to_string()));
+            Err(error) => {
+                startup_results.push(
+                    StoreStartupResult::optional("workspace_lease_store").failed(error.to_string()),
+                );
                 tracing::warn!(
-                "failed to initialize workspace manager: {e}; running without workspace isolation"
-            );
+                    path = %tasks_db_path.display(),
+                    "workspace lease store init failed; workspace leases will not persist: {error}"
+                );
                 None
             }
-        };
+        },
+    };
+
+    let workspace_pool_config = super::workspace_pool_config::build_workspace_pool_config(
+        server,
+        project_registry.as_ref(),
+    )
+    .await;
+    let workspace_mgr = match crate::workspace::WorkspaceManager::new_with_pool(
+        server.config.workspace.clone(),
+        workspace_pool_config,
+        workspace_lease_store,
+    ) {
+        Ok(mgr) => {
+            startup_results.push(StoreStartupResult::optional("workspace_manager"));
+            tracing::debug!(
+                root = %server.config.workspace.root.display(),
+                "workspace manager initialized"
+            );
+            Some(Arc::new(mgr))
+        }
+        Err(e) => {
+            startup_results
+                .push(StoreStartupResult::optional("workspace_manager").failed(e.to_string()));
+            tracing::warn!(
+                "failed to initialize workspace manager: {e}; running without workspace isolation"
+            );
+            None
+        }
+    };
 
     // Reconcile stale workspaces from any previous crash before new task admission.
     if let Some(ref wmgr) = workspace_mgr {
@@ -509,6 +519,7 @@ pub(crate) async fn build_registry(
                             removed = summary.removed,
                             preserved = summary.preserved,
                             migrated = summary.migrated,
+                            released_leases = summary.released_leases,
                             "workspace startup reconciliation complete"
                         );
                     }
@@ -733,7 +744,9 @@ mod tests {
 
     #[test]
     fn bootstrap_failure_records_workspace_manager_status() {
-        let statuses = failed_registry_startup_results("database unavailable");
+        let statuses = super::super::registry_failures::failed_registry_startup_results(
+            "database unavailable",
+        );
         let workspace_status = statuses
             .iter()
             .find(|status| status.name == "workspace_manager")

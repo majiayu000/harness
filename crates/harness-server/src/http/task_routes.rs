@@ -538,7 +538,9 @@ pub(super) async fn cancel_task(
         );
     }
 
-    // abort() is a no-op if the task already finished — safe to call unconditionally.
+    // abort() is a no-op if the task already finished. Workspace release is
+    // handled by the task watcher after it observes the aborted future, so the
+    // pool slot stays reserved while the child process is still being torn down.
     state.core.tasks.abort_task(&task_id);
 
     (StatusCode::OK, Json(json!({ "status": "cancelled" })))

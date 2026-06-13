@@ -1,4 +1,5 @@
 use super::*;
+use tokio::time::Duration;
 
 mod helpers;
 mod spawn_classify_tests;
@@ -187,6 +188,141 @@ fn abort_after_handle_registration_only_targets_live_terminal_tasks() {
         !should_abort_after_abort_handle_registration(&implementing, false),
         "non-terminal tasks must keep running"
     );
+}
+
+#[tokio::test]
+async fn cancelled_abort_releases_workspace_after_watcher_observes_join() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
+    let project_root = dir.path().join("project");
+    init_spawn_test_repo(&project_root)?;
+    let database_url = crate::test_helpers::test_database_url()?;
+    let store =
+        TaskStore::open_with_database_url(&dir.path().join("tasks.db"), Some(&database_url))
+            .await?;
+    let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
+    let events = Arc::new(
+        harness_observe::event_store::EventStore::new_with_database_url(
+            dir.path(),
+            Some(&database_url),
+        )
+        .await?,
+    );
+    let agent = helpers::BlockingAgent::new();
+    let mut workspace_config = harness_core::config::misc::WorkspaceConfig {
+        root: dir.path().join("workspaces"),
+        ..Default::default()
+    };
+    workspace_config.root_configured = true;
+    let workspace_mgr = Arc::new(crate::workspace::WorkspaceManager::new(workspace_config)?);
+    let req = CreateTaskRequest {
+        project: Some(project_root.clone()),
+        prompt: Some("block until cancelled".to_string()),
+        wait_secs: 0,
+        max_rounds: Some(1),
+        turn_timeout_secs: 3600,
+        ..Default::default()
+    };
+
+    let queue = crate::task_queue::TaskQueue::unbounded();
+    let permit = queue.acquire("test", 0).await?;
+    let task_id = spawn_task(
+        store.clone(),
+        agent.clone(),
+        None,
+        Default::default(),
+        skills,
+        events,
+        vec![],
+        req,
+        Some(workspace_mgr.clone()),
+        permit,
+        None,
+        None,
+        None,
+        vec![],
+    )
+    .await;
+
+    agent.wait_started(Duration::from_secs(15)).await?;
+    assert_eq!(workspace_mgr.live_count(), 1);
+    let workspace_path = store
+        .get(&task_id)
+        .and_then(|state| state.workspace_path)
+        .expect("workspace path should be persisted after admission");
+    assert!(
+        workspace_path.exists(),
+        "workspace should exist before cancellation"
+    );
+    mutate_and_persist(&store, &task_id, |s| {
+        s.status = TaskStatus::Cancelled;
+        s.scheduler.mark_terminal(&TaskStatus::Cancelled);
+    })
+    .await?;
+    assert_eq!(
+        workspace_mgr.live_count(),
+        1,
+        "cancelling the row must not release the workspace before abort is observed"
+    );
+
+    assert!(
+        store.abort_task(&task_id),
+        "running task should have an abort handle"
+    );
+    helpers::wait_until(Duration::from_secs(15), || workspace_mgr.live_count() == 0).await?;
+    assert!(
+        !workspace_path.exists(),
+        "cancelled prompt workspace should be removed after abort teardown"
+    );
+    assert_eq!(
+        store.get(&task_id).map(|state| state.status),
+        Some(TaskStatus::Cancelled)
+    );
+    Ok(())
+}
+
+fn init_spawn_test_repo(root: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)?;
+    run_spawn_test_git(root, &["init"])?;
+    run_spawn_test_git(root, &["config", "user.email", "test@harness.test"])?;
+    run_spawn_test_git(root, &["config", "user.name", "Harness Test"])?;
+    run_spawn_test_git(root, &["commit", "--allow-empty", "-m", "init"])?;
+    run_spawn_test_git(root, &["branch", "-M", "main"])?;
+    run_spawn_test_git(root, &["remote", "add", "origin", &root.to_string_lossy()])?;
+    Ok(())
+}
+
+fn run_spawn_test_git(root: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let git_bin = std::env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string());
+    let mut command = std::process::Command::new(git_bin);
+    for key in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command.arg("-C").arg(root).args(args).output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Verify that a local u32 counter correctly tracks waiting rounds without any store query.

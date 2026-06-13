@@ -530,6 +530,7 @@ impl CodeAgent for CodexAgent {
             );
             harness_core::error::HarnessError::AgentExecution(message)
         })?;
+        let mut child = crate::ManagedChild::new(child, "codex execute");
         let output = child.wait_with_output().await.map_err(|err| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for codex: {err}"
@@ -623,7 +624,7 @@ impl CodeAgent for CodexAgent {
             wrapped_command.engine,
             "execute_stream",
         );
-        let mut child = cmd.spawn().map_err(|error| {
+        let child = cmd.spawn().map_err(|error| {
             let message = codex_spawn_failure_message(
                 &error,
                 &wrapped_command.program,
@@ -639,10 +640,11 @@ impl CodeAgent for CodexAgent {
             );
             harness_core::error::HarnessError::AgentExecution(message)
         })?;
+        let mut child = crate::ManagedChild::new(child, "codex execute_stream");
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.inner_mut().stderr.take() {
             let agent = self.name().to_string();
             let captured = Arc::clone(&stderr_capture);
             stderr_task = Some(tokio::spawn(async move {
@@ -654,17 +656,28 @@ impl CodeAgent for CodexAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        let stream_result = stream_codex_exec_output(&mut child, &tx, idle_timeout).await;
+        let stream_result = stream_codex_exec_output(child.inner_mut(), &tx, idle_timeout).await;
         let stream_send_failed = matches!(
             &stream_result,
             Err(harness_core::error::HarnessError::AgentExecution(message))
                 if message.contains("stream send failed")
         );
-        if stream_result.is_err() {
-            #[cfg(unix)]
-            crate::kill_process_group(&child);
-            let _ = child.start_kill();
+        let stream_process_exited = matches!(
+            &stream_result,
+            Err(harness_core::error::HarnessError::AgentExecution(message))
+                if message.contains("codex exited with")
+        );
+        if stream_result.is_err() && !stream_process_exited {
+            child.terminate_now();
         }
+        let status = child
+            .wait_and_cleanup_descendants()
+            .await
+            .map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed waiting for codex process: {error}"
+                ))
+            })?;
         if stream_send_failed {
             return Err(stream_result.expect_err("stream send failures return an error"));
         }
@@ -690,11 +703,6 @@ impl CodeAgent for CodexAgent {
                 return Err(enrich_stream_exit_error(error, &stderr));
             }
         };
-        let status = child.wait().await.map_err(|error| {
-            harness_core::error::HarnessError::AgentExecution(format!(
-                "failed waiting for codex process: {error}"
-            ))
-        })?;
         if !status.success() {
             let stderr = captured_stderr_tail(&stderr_capture);
             return Err(codex_nonzero_exit_error(

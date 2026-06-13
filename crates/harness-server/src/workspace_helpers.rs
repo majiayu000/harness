@@ -27,7 +27,7 @@ pub(super) fn sanitize_task_id(id: &str) -> String {
 /// `my_org_repo`). The `/` org-repo separator maps to `_`. GitHub organisation
 /// names cannot contain underscores (only `[a-zA-Z0-9-]`), so the `owner_repo`
 /// output is unambiguous for valid GitHub slugs.
-pub(super) fn sanitize_repo_slug(s: &str) -> String {
+pub(crate) fn sanitize_repo_slug(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '.' || c == '_' {
@@ -43,7 +43,7 @@ pub(super) fn sanitize_repo_slug(s: &str) -> String {
 ///
 /// This is a deterministic, stable hash with no external dependencies, used to
 /// produce a unique project scope component in deterministic workspace keys.
-pub(super) fn fnv1a_8(s: &str) -> String {
+pub(crate) fn fnv1a_8(s: &str) -> String {
     let mut hash: u32 = 0x811c9dc5;
     for b in s.bytes() {
         hash ^= u32::from(b);
@@ -191,20 +191,6 @@ pub(super) fn task_summary_workspace_path(root: &Path, task: &TaskSummary) -> Pa
         .unwrap_or_else(|| root.join(sanitize_task_id(&task.id.0)))
 }
 
-pub(super) fn owner_record_matches_workspace(
-    record: &WorkspaceOwnerRecord,
-    task_id: &TaskId,
-    workspace_key: &str,
-    run_generation: u32,
-) -> bool {
-    let identity_matches = record
-        .workspace_key
-        .as_deref()
-        .map(|key| key == workspace_key)
-        .unwrap_or(record.task_id == task_id.0);
-    identity_matches && record.run_generation == run_generation
-}
-
 pub(super) fn write_owner_record(
     workspace_path: &Path,
     owner_record: &WorkspaceOwnerRecord,
@@ -347,6 +333,91 @@ pub(super) async fn is_registered_worktree(source_repo: &Path, workspace_path: &
             })
         })
         .unwrap_or(false)
+}
+
+pub(super) async fn reset_registered_worktree(
+    workspace_path: &Path,
+    branch: &str,
+    target_ref: &str,
+) -> anyhow::Result<()> {
+    let reset_pre = git_command()
+        .args(["-C", &workspace_path.to_string_lossy(), "reset", "--hard"])
+        .output()
+        .await?;
+    if !reset_pre.status.success() {
+        anyhow::bail!(
+            "git reset --hard failed before checkout: {}",
+            String::from_utf8_lossy(&reset_pre.stderr).trim()
+        );
+    }
+
+    let clean_pre = git_command()
+        .args(["-C", &workspace_path.to_string_lossy(), "clean", "-fdx"])
+        .output()
+        .await?;
+    if !clean_pre.status.success() {
+        anyhow::bail!(
+            "git clean -fdx failed before checkout: {}",
+            String::from_utf8_lossy(&clean_pre.stderr).trim()
+        );
+    }
+
+    let checkout = git_command()
+        .args([
+            "-C",
+            &workspace_path.to_string_lossy(),
+            "checkout",
+            "-B",
+            branch,
+            target_ref,
+        ])
+        .output()
+        .await?;
+    if !checkout.status.success() {
+        anyhow::bail!(
+            "git checkout -B failed: {}",
+            String::from_utf8_lossy(&checkout.stderr).trim()
+        );
+    }
+
+    let reset = git_command()
+        .args([
+            "-C",
+            &workspace_path.to_string_lossy(),
+            "reset",
+            "--hard",
+            target_ref,
+        ])
+        .output()
+        .await?;
+    if !reset.status.success() {
+        anyhow::bail!(
+            "git reset --hard failed: {}",
+            String::from_utf8_lossy(&reset.stderr).trim()
+        );
+    }
+
+    let clean = git_command()
+        .args(["-C", &workspace_path.to_string_lossy(), "clean", "-fdx"])
+        .output()
+        .await?;
+    if !clean.status.success() {
+        anyhow::bail!(
+            "git clean -fdx failed: {}",
+            String::from_utf8_lossy(&clean.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+pub(super) fn slot_index_from_workspace_path(
+    project_key: &str,
+    workspace_path: &Path,
+) -> Option<u32> {
+    let name = workspace_path.file_name()?.to_str()?;
+    let prefix = format!("{project_key}__slot_");
+    name.strip_prefix(&prefix)?.parse().ok()
 }
 
 pub(super) fn canonicalize_existing_or_parent(path: &Path) -> PathBuf {

@@ -483,10 +483,14 @@ mod tests {
                 source_repo: source_repo.clone(),
                 repo: Some("owner/repo".to_string()),
                 runtime_workflow_id: None,
+                workspace_key: "owner_repo__issue_882".to_string(),
+                project_key: "test-project".to_string(),
+                slot_index: 0,
                 branch: "harness/route-task-1".to_string(),
                 created_at,
                 owner_session: manager.owner_session.clone(),
                 run_generation: 1,
+                _pool_permit: None,
             },
         );
         manager.active_paths.insert(workspace_path, task_id.clone());
@@ -595,10 +599,14 @@ mod tests {
                 source_repo: source_repo.clone(),
                 repo: Some("owner/repo".to_string()),
                 runtime_workflow_id: None,
+                workspace_key: "owner_repo__runtime_workspace_1".to_string(),
+                project_key: "test-project".to_string(),
+                slot_index: 0,
                 branch: "harness/runtime-workspace-1".to_string(),
                 created_at,
                 owner_session: manager.owner_session.clone(),
                 run_generation: 1,
+                _pool_permit: None,
             },
         );
         workflow_runtime_store

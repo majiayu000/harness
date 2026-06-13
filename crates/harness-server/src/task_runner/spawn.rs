@@ -551,6 +551,7 @@ where
     let store_watcher = store.clone();
     let events_watcher = events.clone();
     let id_watcher = id.clone();
+    let workspace_mgr_watcher = workspace_mgr.clone();
     let interceptors = Arc::new(interceptors);
     let detect_worktree = Arc::new(detect_worktree);
     // Clones used to store the abort handle after the main future is spawned
@@ -797,6 +798,8 @@ where
                 workspace_path = %lease.workspace_path.display(),
                 workspace_owner = %lease.owner_session,
                 run_generation = lease.run_generation,
+                workspace_project_key = %lease.project_key,
+                workspace_slot_index = lease.slot_index,
                 workspace_decision = ?lease.decision,
                 "workspace admitted"
             );
@@ -950,7 +953,7 @@ where
                     tracing::warn!("workspace cleanup failed for {id:?}: {e}");
                 }
             } else {
-                wmgr.release_workspace(&id);
+                wmgr.release_workspace(&id).await;
             }
         }
 
@@ -992,6 +995,19 @@ where
                 // abort() was called by the cancel endpoint; status already set to
                 // Cancelled before abort() was called — do not overwrite with Failed.
                 tracing::info!("task {id_watcher:?} cancelled via abort");
+                if let Some(wmgr) = workspace_mgr_watcher.as_ref() {
+                    let final_state = store_watcher.get(&id_watcher);
+                    if should_remove_workspace_after_task(
+                        final_state.as_ref(),
+                        wmgr.config.auto_cleanup,
+                    ) {
+                        if let Err(e) = wmgr.remove_workspace_family(&id_watcher).await {
+                            tracing::warn!("workspace cleanup failed for {id_watcher:?}: {e}");
+                        }
+                    } else {
+                        wmgr.release_workspace_family(&id_watcher).await;
+                    }
+                }
             }
             Err(join_err) => {
                 tracing::error!("task {id_watcher:?} panicked: {join_err}");

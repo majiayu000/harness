@@ -24,7 +24,7 @@ impl Drop for AbortOnDrop {
 /// Maximum number of parallel subtasks — caps both chunk count in `decompose`
 /// and concurrent agent executions in `run_parallel_subtasks`.
 /// Wire up `--max-parallel` CLI flag to override this in a follow-up (see #638).
-const MAX_PARALLEL: usize = 8;
+pub(crate) const MAX_PARALLEL: usize = 8;
 
 /// Maximum number of sequential steps accepted from a numbered-list prompt.
 ///
@@ -39,6 +39,21 @@ const PARALLEL_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "cpp", "c", "h", "toml",
     "yaml", "yml", "json", "sh", "md",
 ];
+
+pub(crate) fn sequential_subtask_id(task_id: &TaskId) -> TaskId {
+    TaskId::from_str(&format!("{}-seq", task_id.as_str()))
+}
+
+pub(crate) fn parallel_subtask_id(task_id: &TaskId, index: usize) -> TaskId {
+    TaskId::from_str(&format!("{}-p{index}", task_id.as_str()))
+}
+
+pub(crate) fn synthetic_subtask_ids(task_id: &TaskId) -> Vec<TaskId> {
+    let mut ids = Vec::with_capacity(MAX_PARALLEL + 1);
+    ids.push(sequential_subtask_id(task_id));
+    ids.extend((0..MAX_PARALLEL).map(|index| parallel_subtask_id(task_id, index)));
+    ids
+}
 
 /// Build the `allowed_write_paths` list for a capability token.
 ///
@@ -321,7 +336,7 @@ async fn run_sequential_subtasks(
     let mut results = Vec::with_capacity(total);
 
     // One shared workspace for all sequential steps — step N sees step N-1 outputs.
-    let seq_id = harness_core::types::TaskId(format!("{}-seq", task_id.0));
+    let seq_id = sequential_subtask_id(task_id);
     // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
     let workspace = match workspace_mgr
         .create_workspace(&seq_id, source_repo, remote, base_branch, 1, None, None)
@@ -453,7 +468,6 @@ async fn run_concurrent_subtasks(
     let count = subtasks.len();
     let mut handles: Vec<tokio::task::JoinHandle<(usize, Result<AgentResponse, String>)>> =
         Vec::with_capacity(count);
-    let mut sub_ids: Vec<Option<TaskId>> = Vec::with_capacity(count);
     // RAII abort guards: when this Vec is dropped (including when the parent
     // future is cancelled via the cancel endpoint), every spawned task is
     // aborted.  Without these guards, dropping a JoinHandle merely detaches
@@ -463,63 +477,77 @@ async fn run_concurrent_subtasks(
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
 
     for (i, spec) in subtasks.into_iter().enumerate() {
-        let sub_id = harness_core::types::TaskId(format!("{}-p{i}", task_id.0));
-        // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
-        match workspace_mgr
-            .create_workspace(&sub_id, source_repo, remote, base_branch, 1, None, None)
-            .await
-        {
-            Ok(lease) => {
-                let workspace = lease.workspace_path;
-                sub_ids.push(Some(sub_id));
-                let agent = agent.clone();
-                let context = context.clone();
-                let token = CapabilityToken::new(
-                    i,
-                    token_write_paths(workspace.clone()),
-                    turn_timeout.saturating_add(Duration::from_secs(60)),
-                );
-                let req = AgentRequest {
-                    prompt: spec.prompt,
-                    project_root: workspace,
-                    context,
-                    capability_token: Some(token),
-                    ..Default::default()
-                };
-                let sem = Arc::clone(&sem);
-                let handle = tokio::spawn(async move {
-                    // Acquire semaphore first (unbounded wait), then apply timeout
-                    // only to the actual agent execution — subtasks beyond the first
-                    // MAX_PARALLEL do not time out while waiting in the queue.
-                    let _permit = match sem.acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => return (i, Err("semaphore closed unexpectedly".to_string())),
-                    };
-                    let result = match tokio::time::timeout(turn_timeout, agent.execute(req)).await
-                    {
-                        Ok(Ok(resp)) => Ok(resp),
-                        Ok(Err(e)) => Err(format!("agent error: {e}")),
-                        Err(_) => Err(format!(
-                            "subtask timed out after {}s",
-                            turn_timeout.as_secs()
-                        )),
-                    };
-                    (i, result)
-                });
-                abort_guards.push(AbortOnDrop(handle.abort_handle()));
-                handles.push(handle);
-            }
-            Err(e) => {
-                tracing::warn!("parallel_dispatch: workspace creation failed for subtask {i}: {e}");
-                sub_ids.push(None);
-                let handle =
-                    tokio::spawn(
-                        async move { (i, Err(format!("workspace creation failed: {e}"))) },
+        let sub_id = parallel_subtask_id(task_id, i);
+        let agent = agent.clone();
+        let context = context.clone();
+        let workspace_mgr = workspace_mgr.clone();
+        let source_repo = source_repo.to_path_buf();
+        let remote = remote.to_string();
+        let base_branch = base_branch.to_string();
+        let sem = Arc::clone(&sem);
+        let handle = tokio::spawn(async move {
+            // Acquire semaphore first (unbounded wait), then apply timeout only to
+            // the actual agent execution. Workspace acquisition is part of the
+            // subtask lifecycle so earlier completions can release pool slots
+            // before later subtasks acquire theirs.
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (i, Err("semaphore closed unexpectedly".to_string())),
+            };
+            // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
+            let workspace = match workspace_mgr
+                .create_workspace(&sub_id, &source_repo, &remote, &base_branch, 1, None, None)
+                .await
+            {
+                Ok(lease) => lease.workspace_path,
+                Err(e) => {
+                    tracing::warn!(
+                        "parallel_dispatch: workspace creation failed for subtask {i}: {e}"
                     );
-                abort_guards.push(AbortOnDrop(handle.abort_handle()));
-                handles.push(handle);
+                    return (i, Err(format!("workspace creation failed: {e}")));
+                }
+            };
+            let token = CapabilityToken::new(
+                i,
+                token_write_paths(workspace.clone()),
+                turn_timeout.saturating_add(Duration::from_secs(60)),
+            );
+            let req = AgentRequest {
+                prompt: spec.prompt,
+                project_root: workspace,
+                context,
+                capability_token: Some(token),
+                ..Default::default()
+            };
+            let agent_clone = agent.clone();
+            let mut agent_handle = tokio::spawn(async move { agent_clone.execute(req).await });
+            let _agent_abort_guard = AbortOnDrop(agent_handle.abort_handle());
+            let result = match tokio::time::timeout(turn_timeout, &mut agent_handle).await {
+                Ok(Ok(Ok(resp))) => Ok(resp),
+                Ok(Ok(Err(e))) => Err(format!("agent error: {e}")),
+                Ok(Err(join_err)) => Err(format!("subtask panicked: {join_err}")),
+                Err(_) => {
+                    agent_handle.abort();
+                    if let Err(e) = agent_handle.await {
+                        if !e.is_cancelled() {
+                            tracing::warn!(
+                                "parallel subtask {i} did not exit cleanly after abort: {e}"
+                            );
+                        }
+                    }
+                    Err(format!(
+                        "subtask timed out after {}s",
+                        turn_timeout.as_secs()
+                    ))
+                }
+            };
+            if let Err(e) = workspace_mgr.remove_workspace(&sub_id).await {
+                tracing::warn!("parallel_dispatch: workspace cleanup failed for {sub_id:?}: {e}");
             }
-        }
+            (i, result)
+        });
+        abort_guards.push(AbortOnDrop(handle.abort_handle()));
+        handles.push(handle);
     }
 
     let mut results = Vec::with_capacity(count);
@@ -546,13 +574,6 @@ async fn run_concurrent_subtasks(
                     error: Some(format!("subtask panicked: {join_err}")),
                 });
             }
-        }
-    }
-
-    // Clean up subtask workspaces after all executions complete.
-    for sub_id in sub_ids.into_iter().flatten() {
-        if let Err(e) = workspace_mgr.remove_workspace(&sub_id).await {
-            tracing::warn!("parallel_dispatch: workspace cleanup failed for {sub_id:?}: {e}");
         }
     }
 
