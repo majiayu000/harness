@@ -20,6 +20,7 @@ use harness_core::db::Migration;
 /// v23 – add indexes for server-side task list filters.
 /// v24 – add persisted workspace lease rows for the per-project worktree pool.
 /// v25 – add process start-time proof to persisted workspace leases.
+/// v26 – scope task-owned tables within a fixed shared schema using store_key.
 pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -187,6 +188,88 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         description: "add process start-time proof to workspace leases",
         sql: "ALTER TABLE workspace_leases ADD COLUMN process_started_at BIGINT NOT NULL DEFAULT 0",
     },
+    Migration {
+        version: 26,
+        description: "scope task db rows within shared schema",
+        sql: "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE tasks
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE tasks ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE tasks ALTER COLUMN store_key SET NOT NULL;
+              ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_pkey;
+              ALTER TABLE tasks ADD CONSTRAINT tasks_pkey PRIMARY KEY (store_key, id);
+              CREATE INDEX IF NOT EXISTS idx_tasks_store_created
+              ON tasks(store_key, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_tasks_store_status_updated
+              ON tasks(store_key, status, updated_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_tasks_store_project_status_updated
+              ON tasks(store_key, project, status, updated_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_tasks_store_repo_created
+              ON tasks(store_key, repo, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_tasks_store_source_created
+              ON tasks(store_key, source, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_tasks_store_kind_created
+              ON tasks(store_key, task_kind, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_tasks_store_scheduler_state_created
+              ON tasks(store_key, (scheduler_state::jsonb ->> 'authority_state'), created_at DESC);
+
+              ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE task_artifacts
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE task_artifacts ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE task_artifacts ALTER COLUMN store_key SET NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_task_artifacts_store_task_id
+              ON task_artifacts(store_key, task_id, turn, id);
+
+              ALTER TABLE task_checkpoints ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE task_checkpoints
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE task_checkpoints ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE task_checkpoints ALTER COLUMN store_key SET NOT NULL;
+              ALTER TABLE task_checkpoints DROP CONSTRAINT IF EXISTS task_checkpoints_pkey;
+              ALTER TABLE task_checkpoints
+              ADD CONSTRAINT task_checkpoints_pkey PRIMARY KEY (store_key, task_id);
+
+              ALTER TABLE task_prompts ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE task_prompts
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE task_prompts ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE task_prompts ALTER COLUMN store_key SET NOT NULL;
+              ALTER TABLE task_prompts
+              DROP CONSTRAINT IF EXISTS task_prompts_task_id_turn_phase_key;
+              CREATE UNIQUE INDEX IF NOT EXISTS idx_task_prompts_store_task_turn_phase
+              ON task_prompts(store_key, task_id, turn, phase);
+              CREATE INDEX IF NOT EXISTS idx_task_prompts_store_task_id
+              ON task_prompts(store_key, task_id, turn);
+
+              ALTER TABLE workspace_leases ADD COLUMN IF NOT EXISTS store_key TEXT;
+              UPDATE workspace_leases
+              SET store_key = COALESCE(NULLIF(store_key, ''), current_schema())
+              WHERE store_key IS NULL OR store_key = '';
+              ALTER TABLE workspace_leases ALTER COLUMN store_key SET DEFAULT current_schema();
+              ALTER TABLE workspace_leases ALTER COLUMN store_key SET NOT NULL;
+              ALTER TABLE workspace_leases DROP CONSTRAINT IF EXISTS workspace_leases_pkey;
+              ALTER TABLE workspace_leases
+              ADD CONSTRAINT workspace_leases_pkey PRIMARY KEY (store_key, project_key, slot_index);
+              CREATE INDEX IF NOT EXISTS idx_workspace_leases_store_task_state
+              ON workspace_leases(store_key, task_id, state);
+              CREATE INDEX IF NOT EXISTS idx_workspace_leases_store_workspace_key_state
+              ON workspace_leases(store_key, project_key, workspace_key, state);
+              CREATE INDEX IF NOT EXISTS idx_workspace_leases_store_state_owner
+              ON workspace_leases(store_key, state, owner_session);
+
+              CREATE TABLE IF NOT EXISTS task_db_legacy_backfills (
+                  store_key     TEXT NOT NULL DEFAULT current_schema(),
+                  legacy_schema TEXT NOT NULL,
+                  copied_rows   BIGINT NOT NULL DEFAULT 0,
+                  backfilled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY (store_key, legacy_schema)
+              )",
+    },
 ];
 
 #[cfg(test)]
@@ -226,6 +309,32 @@ mod tests {
             crate::workspace_lease_store::WORKSPACE_LEASES_TABLE_SQL
                 .contains("process_started_at  BIGINT NOT NULL DEFAULT 0"),
             "new workspace_leases tables should include process_started_at without v25"
+        );
+    }
+
+    #[test]
+    fn shared_schema_migration_scopes_task_owned_tables() {
+        let migration = TASK_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 26)
+            .expect("v26 migration should exist");
+
+        for table in [
+            "tasks",
+            "task_artifacts",
+            "task_checkpoints",
+            "task_prompts",
+            "workspace_leases",
+        ] {
+            let needle = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS store_key TEXT");
+            assert!(
+                migration.sql.contains(&needle),
+                "v26 should add store_key to {table}"
+            );
+        }
+        assert!(
+            migration.sql.contains("task_db_legacy_backfills"),
+            "v26 should create legacy backfill markers"
         );
     }
 }

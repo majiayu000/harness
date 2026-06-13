@@ -25,23 +25,35 @@ pub(crate) struct WorkspaceLeaseRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceLeaseStore {
     pool: PgPool,
+    store_key: String,
 }
 
 impl WorkspaceLeaseStore {
-    pub(crate) async fn open_with_context(
+    pub(crate) async fn open_shared_with_data_dir(
         context: &PgStoreContext,
         setup_pool: &PgPool,
+        data_dir: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        let store_key = crate::task_db::TaskDb::store_key_for_data_dir(data_dir)?;
+        Self::open_with_context_and_store_key(context, setup_pool, store_key).await
+    }
+
+    async fn open_with_context_and_store_key(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        store_key: String,
     ) -> anyhow::Result<Self> {
         let pool = context.open_pool_with_setup_pool(setup_pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, store_key })
     }
 
     #[cfg(test)]
     pub(crate) async fn open(path: &std::path::Path) -> anyhow::Result<Self> {
         let context = PgStoreContext::from_path(path, None)?;
+        let store_key = context.schema().to_owned();
         let pool = context.open_pool().await?;
         ensure_workspace_leases_table(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, store_key })
     }
 
     pub(crate) async fn try_acquire_lease(
@@ -50,12 +62,12 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "INSERT INTO workspace_leases (
-                project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                runtime_workflow_id, owner_session, run_generation, process_id, process_started_at,
-                state, acquired_at, released_at, last_used_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'leased',
+                store_key, project_key, slot_index, task_id, workspace_key, workspace_path,
+                source_repo, repo, runtime_workflow_id, owner_session, run_generation,
+                process_id, process_started_at, state, acquired_at, released_at, last_used_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'leased',
                        CURRENT_TIMESTAMP, NULL, CURRENT_TIMESTAMP)
-             ON CONFLICT(project_key, slot_index) DO UPDATE SET
+             ON CONFLICT(store_key, project_key, slot_index) DO UPDATE SET
                 task_id = EXCLUDED.task_id,
                 workspace_key = EXCLUDED.workspace_key,
                 workspace_path = EXCLUDED.workspace_path,
@@ -76,6 +88,7 @@ impl WorkspaceLeaseStore {
                     AND workspace_leases.owner_session = EXCLUDED.owner_session
                 )",
         )
+        .bind(&self.store_key)
         .bind(&record.project_key)
         .bind(record.slot_index as i64)
         .bind(record.task_id.as_str())
@@ -100,9 +113,11 @@ impl WorkspaceLeaseStore {
         let rows: Vec<(i64,)> = sqlx::query_as(
             "SELECT slot_index
              FROM workspace_leases
-             WHERE project_key = $1
+             WHERE store_key = $1
+               AND project_key = $2
                AND state = 'leased'",
         )
+        .bind(&self.store_key)
         .bind(project_key)
         .fetch_all(&self.pool)
         .await?;
@@ -122,11 +137,13 @@ impl WorkspaceLeaseStore {
              SET state = 'released',
                  released_at = CURRENT_TIMESTAMP,
                  last_used_at = CURRENT_TIMESTAMP
-             WHERE project_key = $1
-               AND slot_index = $2
-               AND task_id = $3
+             WHERE store_key = $1
+               AND project_key = $2
+               AND slot_index = $3
+               AND task_id = $4
                AND state = 'leased'",
         )
+        .bind(&self.store_key)
         .bind(project_key)
         .bind(slot_index as i64)
         .bind(task_id.as_str())
@@ -141,9 +158,11 @@ impl WorkspaceLeaseStore {
              SET state = 'released',
                  released_at = CURRENT_TIMESTAMP,
                  last_used_at = CURRENT_TIMESTAMP
-             WHERE task_id = $1
+             WHERE store_key = $1
+               AND task_id = $2
                AND state = 'leased'",
         )
+        .bind(&self.store_key)
         .bind(task_id.as_str())
         .execute(&self.pool)
         .await?;
@@ -159,9 +178,11 @@ impl WorkspaceLeaseStore {
                     runtime_workflow_id, owner_session, run_generation, process_id,
                     process_started_at
              FROM workspace_leases
-             WHERE state = 'leased'
-               AND owner_session <> $1",
+             WHERE store_key = $1
+               AND state = 'leased'
+               AND owner_session <> $2",
         )
+        .bind(&self.store_key)
         .bind(current_owner_session)
         .fetch_all(&self.pool)
         .await?;
@@ -188,14 +209,16 @@ impl WorkspaceLeaseStore {
              SET state = 'released',
                  released_at = CURRENT_TIMESTAMP,
                  last_used_at = CURRENT_TIMESTAMP
-             WHERE project_key = $1
-               AND slot_index = $2
-               AND task_id = $3
-               AND owner_session = $4
-               AND process_id = $5
-               AND process_started_at = $6
+             WHERE store_key = $1
+               AND project_key = $2
+               AND slot_index = $3
+               AND task_id = $4
+               AND owner_session = $5
+               AND process_id = $6
+               AND process_started_at = $7
                AND state = 'leased'",
         )
+        .bind(&self.store_key)
         .bind(&record.project_key)
         .bind(record.slot_index as i64)
         .bind(record.task_id.as_str())
@@ -214,10 +237,12 @@ impl WorkspaceLeaseStore {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT workspace_path
              FROM workspace_leases
-             WHERE task_id = $1
+             WHERE store_key = $1
+               AND task_id = $2
              ORDER BY last_used_at DESC
              LIMIT 1",
         )
+        .bind(&self.store_key)
         .bind(task_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
@@ -234,12 +259,14 @@ impl WorkspaceLeaseStore {
                     runtime_workflow_id, owner_session, run_generation, process_id,
                     process_started_at
              FROM workspace_leases
-             WHERE project_key = $1
-               AND workspace_key = $2
+             WHERE store_key = $1
+               AND project_key = $2
+               AND workspace_key = $3
                AND state = 'released'
              ORDER BY last_used_at DESC
              LIMIT 1",
         )
+        .bind(&self.store_key)
         .bind(project_key)
         .bind(workspace_key)
         .fetch_optional(&self.pool)
@@ -256,11 +283,13 @@ impl WorkspaceLeaseStore {
                     runtime_workflow_id, owner_session, run_generation, process_id,
                     process_started_at
              FROM workspace_leases
-             WHERE workspace_path = $1
+             WHERE store_key = $1
+               AND workspace_path = $2
                AND state = 'leased'
              ORDER BY last_used_at DESC
              LIMIT 1",
         )
+        .bind(&self.store_key)
         .bind(workspace_path.to_string_lossy().as_ref())
         .fetch_optional(&self.pool)
         .await?;
@@ -274,9 +303,11 @@ impl WorkspaceLeaseStore {
                     runtime_workflow_id, owner_session, run_generation, process_id,
                     process_started_at
              FROM workspace_leases
-             WHERE state = 'leased'
+             WHERE store_key = $1
+               AND state = 'leased'
              ORDER BY project_key, slot_index",
         )
+        .bind(&self.store_key)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
@@ -358,6 +389,7 @@ async fn ensure_workspace_leases_table(pool: &PgPool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub(crate) const WORKSPACE_LEASES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS workspace_leases (
+    store_key           TEXT NOT NULL DEFAULT current_schema(),
     project_key         TEXT NOT NULL,
     slot_index          BIGINT NOT NULL,
     task_id             TEXT NOT NULL,
@@ -374,14 +406,14 @@ pub(crate) const WORKSPACE_LEASES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS 
     acquired_at         TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     released_at         TIMESTAMPTZ,
     last_used_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(project_key, slot_index)
+    PRIMARY KEY(store_key, project_key, slot_index)
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_leases_task_state
-    ON workspace_leases(task_id, state);
+    ON workspace_leases(store_key, task_id, state);
 CREATE INDEX IF NOT EXISTS idx_workspace_leases_workspace_key_state
-    ON workspace_leases(project_key, workspace_key, state);
+    ON workspace_leases(store_key, project_key, workspace_key, state);
 CREATE INDEX IF NOT EXISTS idx_workspace_leases_state_owner
-    ON workspace_leases(state, owner_session)";
+    ON workspace_leases(store_key, state, owner_session)";
 
 pub(crate) const WORKSPACE_LEASES_TABLE_V24_SQL: &str =
     "CREATE TABLE IF NOT EXISTS workspace_leases (

@@ -473,18 +473,17 @@ pub(crate) async fn build_registry(
     }
 
     // ── Workspace manager ─────────────────────────────────────────────────────
-    let tasks_db_path = harness_core::config::dirs::default_db_path(data_dir, "tasks");
-    let task_context =
-        harness_core::db::PgStoreContext::from_path(&tasks_db_path, Some(&database_url))?;
+    let task_context = crate::task_db::TaskDb::shared_schema_context(Some(&database_url))?;
     let workspace_lease_store = match super::forced_startup_error("workspace_lease_store") {
         Some(error) => {
             startup_results
                 .push(StoreStartupResult::optional("workspace_lease_store").failed(error));
             None
         }
-        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_with_context(
+        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_shared_with_data_dir(
             &task_context,
             &setup_pool,
+            data_dir,
         )
         .await
         {
@@ -497,7 +496,7 @@ pub(crate) async fn build_registry(
                     StoreStartupResult::optional("workspace_lease_store").failed(error.to_string()),
                 );
                 tracing::warn!(
-                    path = %tasks_db_path.display(),
+                    schema = %crate::task_db::TASK_DB_SCHEMA,
                     "workspace lease store init failed; workspace leases will not persist: {error}"
                 );
                 None

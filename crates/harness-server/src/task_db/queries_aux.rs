@@ -16,15 +16,16 @@ impl TaskDb {
     ) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO task_checkpoints \
-                 (task_id, triage_output, plan_output, pr_url, last_phase, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) \
-             ON CONFLICT(task_id) DO UPDATE SET \
+                 (store_key, task_id, triage_output, plan_output, pr_url, last_phase, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP) \
+             ON CONFLICT(store_key, task_id) DO UPDATE SET \
                  triage_output = COALESCE(excluded.triage_output, task_checkpoints.triage_output), \
                  plan_output   = COALESCE(excluded.plan_output,   task_checkpoints.plan_output), \
                  pr_url        = COALESCE(excluded.pr_url,        task_checkpoints.pr_url), \
                  last_phase    = excluded.last_phase, \
                  updated_at    = excluded.updated_at",
         )
+        .bind(&self.store_key)
         .bind(task_id)
         .bind(triage_output)
         .bind(plan_output)
@@ -39,8 +40,9 @@ impl TaskDb {
         let row = sqlx::query_as::<_, TaskCheckpoint>(
             "SELECT task_id, triage_output, plan_output, pr_url, last_phase, \
                     TO_CHAR(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at \
-             FROM task_checkpoints WHERE task_id = $1",
+             FROM task_checkpoints WHERE store_key = $1 AND task_id = $2",
         )
+        .bind(&self.store_key)
         .bind(task_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -69,9 +71,10 @@ impl TaskDb {
         };
 
         sqlx::query(
-            "INSERT INTO task_artifacts (task_id, turn, artifact_type, content) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO task_artifacts (store_key, task_id, turn, artifact_type, content) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
+        .bind(&self.store_key)
         .bind(task_id)
         .bind(turn as i64)
         .bind(artifact_type)
@@ -85,8 +88,9 @@ impl TaskDb {
         let rows = sqlx::query_as::<_, TaskArtifact>(
             "SELECT task_id, turn, artifact_type, content, \
                     TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at \
-             FROM task_artifacts WHERE task_id = $1 ORDER BY id ASC",
+             FROM task_artifacts WHERE store_key = $1 AND task_id = $2 ORDER BY id ASC",
         )
+        .bind(&self.store_key)
         .bind(task_id)
         .fetch_all(&self.pool)
         .await?;
@@ -110,10 +114,11 @@ impl TaskDb {
             prompt.to_string()
         };
         sqlx::query(
-            "INSERT INTO task_prompts (task_id, turn, phase, prompt) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (task_id, turn, phase) DO UPDATE SET prompt = excluded.prompt",
+            "INSERT INTO task_prompts (store_key, task_id, turn, phase, prompt) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (store_key, task_id, turn, phase) DO UPDATE SET prompt = excluded.prompt",
         )
+        .bind(&self.store_key)
         .bind(task_id)
         .bind(turn as i64)
         .bind(phase)
@@ -127,8 +132,9 @@ impl TaskDb {
         let rows = sqlx::query_as::<_, TaskPrompt>(
             "SELECT task_id, turn, phase, prompt, \
                     TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at \
-             FROM task_prompts WHERE task_id = $1 ORDER BY turn ASC, id ASC",
+             FROM task_prompts WHERE store_key = $1 AND task_id = $2 ORDER BY turn ASC, id ASC",
         )
+        .bind(&self.store_key)
         .bind(task_id)
         .fetch_all(&self.pool)
         .await?;
@@ -147,11 +153,13 @@ impl TaskDb {
                     c.last_phase, \
                     TO_CHAR(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ck_updated_at \
              FROM tasks t \
-             JOIN task_checkpoints c ON c.task_id = t.id \
-             WHERE t.status = 'pending' \
+             JOIN task_checkpoints c ON c.store_key = t.store_key AND c.task_id = t.id \
+             WHERE t.store_key = $1 \
+               AND t.status = 'pending' \
                AND t.pr_url IS NULL \
                AND (c.plan_output IS NOT NULL OR c.triage_output IS NOT NULL)",
         )
+        .bind(&self.store_key)
         .fetch_all(&self.pool)
         .await?;
 

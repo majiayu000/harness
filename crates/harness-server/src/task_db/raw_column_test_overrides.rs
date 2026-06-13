@@ -12,8 +12,9 @@ impl TaskDb {
         task_id: &str,
         raw_scheduler_state: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE tasks SET scheduler_state = $1 WHERE id = $2")
+        sqlx::query("UPDATE tasks SET scheduler_state = $1 WHERE store_key = $2 AND id = $3")
             .bind(raw_scheduler_state)
+            .bind(&self.store_key)
             .bind(task_id)
             .execute(&self.pool)
             .await?;

@@ -20,11 +20,13 @@ impl TaskDb {
         terminal_status: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(status) = terminal_status {
-            let scheduler_state_row: Option<(String, i32)> =
-                sqlx::query_as("SELECT scheduler_state, version FROM tasks WHERE id = $1")
-                    .bind(task_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let scheduler_state_row: Option<(String, i32)> = sqlx::query_as(
+                "SELECT scheduler_state, version FROM tasks WHERE store_key = $1 AND id = $2",
+            )
+            .bind(&self.store_key)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
             let Some((scheduler_state, expected_version)) = scheduler_state_row else {
                 return Ok(());
             };
@@ -34,18 +36,19 @@ impl TaskDb {
             }
             let scheduler_json = serde_json::to_string(&scheduler)?;
             let resumable = TaskStatus::resumable_statuses();
-            let placeholders = Self::numbered_placeholders(6, resumable.len());
+            let placeholders = Self::numbered_placeholders(7, resumable.len());
             let sql = format!(
                 "UPDATE tasks SET status = $1, pr_url = COALESCE($2, pr_url), \
                  scheduler_state = $3, updated_at = CURRENT_TIMESTAMP, \
                  version = version + 1 \
-                 WHERE id = $4 AND version = $5 AND status IN ({})",
+                 WHERE store_key = $4 AND id = $5 AND version = $6 AND status IN ({})",
                 placeholders
             );
             let query = sqlx::query(&sql)
                 .bind(status)
                 .bind(pr_url)
                 .bind(&scheduler_json)
+                .bind(&self.store_key)
                 .bind(task_id)
                 .bind(expected_version);
             let query = resumable
@@ -53,19 +56,22 @@ impl TaskDb {
                 .fold(query, |q, resumable| q.bind(*resumable));
             query.execute(&self.pool).await?;
         } else if let Some(url) = pr_url {
-            let version_row: Option<(i32,)> =
-                sqlx::query_as("SELECT version FROM tasks WHERE id = $1 AND pr_url IS NULL")
-                    .bind(task_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let version_row: Option<(i32,)> = sqlx::query_as(
+                "SELECT version FROM tasks WHERE store_key = $1 AND id = $2 AND pr_url IS NULL",
+            )
+            .bind(&self.store_key)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
             let Some((expected_version,)) = version_row else {
                 return Ok(());
             };
             sqlx::query(
                 "UPDATE tasks SET pr_url = $1, version = version + 1 \
-                 WHERE id = $2 AND pr_url IS NULL AND version = $3",
+                 WHERE store_key = $2 AND id = $3 AND pr_url IS NULL AND version = $4",
             )
             .bind(url)
+            .bind(&self.store_key)
             .bind(task_id)
             .bind(expected_version)
             .execute(&self.pool)
@@ -78,20 +84,19 @@ impl TaskDb {
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
         let rows = {
             let resumable = TaskStatus::resumable_statuses();
-            let placeholders = Self::numbered_placeholders(1, resumable.len());
+            let placeholders = Self::numbered_placeholders(2, resumable.len());
             let sql = format!(
                 "SELECT t.id, t.status, t.turn, t.pr_url AS task_pr_url, t.scheduler_state, t.version, \
                         c.triage_output, c.plan_output, c.pr_url AS ck_pr_url \
                  FROM tasks t \
-                 LEFT JOIN task_checkpoints c ON t.id = c.task_id \
-                 WHERE t.status IN ({})",
+                 LEFT JOIN task_checkpoints c ON t.store_key = c.store_key AND t.id = c.task_id \
+                 WHERE t.store_key = $1 AND t.status IN ({})",
                 placeholders
             );
-            let query = resumable
-                .iter()
-                .fold(sqlx::query_as::<_, RecoveryRow>(&sql), |q, status| {
-                    q.bind(*status)
-                });
+            let query = resumable.iter().fold(
+                sqlx::query_as::<_, RecoveryRow>(&sql).bind(&self.store_key),
+                |q, status| q.bind(*status),
+            );
             query.fetch_all(&self.pool).await?
         };
 
@@ -142,10 +147,11 @@ impl TaskDb {
                     sqlx::query(
                         "UPDATE tasks SET status = 'pending', error = NULL, pr_url = $1, \
                          scheduler_state = $2, updated_at = CURRENT_TIMESTAMP, \
-                         version = version + 1 WHERE id = $3 AND version = $4",
+                         version = version + 1 WHERE store_key = $3 AND id = $4 AND version = $5",
                     )
                     .bind(effective_pr_url)
                     .bind(&scheduler_json)
+                    .bind(&self.store_key)
                     .bind(&row.id)
                     .bind(row.version)
                     .execute(&self.pool)
@@ -160,9 +166,10 @@ impl TaskDb {
                     sqlx::query(
                         "UPDATE tasks SET status = 'pending', error = NULL, \
                          scheduler_state = $1, updated_at = CURRENT_TIMESTAMP, \
-                         version = version + 1 WHERE id = $2 AND version = $3",
+                         version = version + 1 WHERE store_key = $2 AND id = $3 AND version = $4",
                     )
                     .bind(&scheduler_json)
+                    .bind(&self.store_key)
                     .bind(&row.id)
                     .bind(row.version)
                     .execute(&self.pool)
@@ -187,10 +194,11 @@ impl TaskDb {
                 sqlx::query(
                     "UPDATE tasks SET status = 'failed', error = $1, \
                      scheduler_state = $2, updated_at = CURRENT_TIMESTAMP, \
-                     version = version + 1 WHERE id = $3 AND version = $4",
+                     version = version + 1 WHERE store_key = $3 AND id = $4 AND version = $5",
                 )
                 .bind(&err)
                 .bind(&scheduler_json)
+                .bind(&self.store_key)
                 .bind(&row.id)
                 .bind(row.version)
                 .execute(&self.pool)
@@ -201,9 +209,11 @@ impl TaskDb {
 
         let transient_failed_rows: Vec<(String, Option<String>, String, i32)> = sqlx::query_as(
             "SELECT id, error, scheduler_state, version FROM tasks \
-             WHERE status = 'pending' \
+             WHERE store_key = $1 \
+               AND status = 'pending' \
                AND error LIKE 'retrying after transient failure%'",
         )
+        .bind(&self.store_key)
         .fetch_all(&self.pool)
         .await?;
         for (id, error, scheduler_state, expected_version) in &transient_failed_rows {
@@ -216,10 +226,12 @@ impl TaskDb {
             );
             sqlx::query(
                 "UPDATE tasks SET status = 'failed', error = $1, scheduler_state = $2, \
-                 updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE id = $3 AND version = $4",
+                 updated_at = CURRENT_TIMESTAMP, version = version + 1 \
+                 WHERE store_key = $3 AND id = $4 AND version = $5",
             )
             .bind(err)
             .bind(&scheduler_json)
+            .bind(&self.store_key)
             .bind(id)
             .bind(expected_version)
             .execute(&self.pool)
