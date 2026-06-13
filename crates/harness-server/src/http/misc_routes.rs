@@ -32,6 +32,12 @@ const WORKFLOW_RUNTIME_TREE_MAX_COMMAND_LIMIT: i64 = 50;
 const WORKFLOW_RUNTIME_TREE_DEFAULT_REJECTED_DECISION_LIMIT: i64 = 3;
 const WORKFLOW_RUNTIME_TREE_MAX_REJECTED_DECISION_LIMIT: i64 = 20;
 
+#[derive(Debug)]
+struct IntakeRecentDispatch {
+    sort_at: Option<chrono::DateTime<chrono::Utc>>,
+    payload: serde_json::Value,
+}
+
 fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
     let error = error?;
     let lower = error.to_ascii_lowercase();
@@ -1464,18 +1470,10 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
         "active": dashboard_active,
     });
 
-    let mut recent_dispatches: Vec<serde_json::Value> = all_tasks
+    let mut recent_dispatches: Vec<IntakeRecentDispatch> = all_tasks
         .iter()
         .filter(|t| t.source.is_some())
-        .map(|t| {
-            json!({
-                "source": t.source,
-                "external_id": t.external_id,
-                "task_id": t.id.0,
-                "status": serde_json::to_value(&t.status).unwrap_or(json!("unknown")),
-                "pr_url": t.pr_url,
-            })
-        })
+        .map(legacy_task_recent_dispatch)
         .collect();
     recent_dispatches.extend(
         runtime_issue_workflows
@@ -1483,7 +1481,12 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
             .filter(|workflow| runtime_workflow_intake_source(workflow).is_some())
             .filter_map(runtime_issue_recent_dispatch),
     );
-    recent_dispatches.truncate(10);
+    recent_dispatches.sort_by(|left, right| right.sort_at.cmp(&left.sort_at));
+    let recent_dispatches: Vec<serde_json::Value> = recent_dispatches
+        .into_iter()
+        .take(10)
+        .map(|dispatch| dispatch.payload)
+        .collect();
 
     let mut response = json!({
         "channels": [github_channel, feishu_channel, dashboard_channel],
@@ -1503,7 +1506,10 @@ async fn runtime_issue_workflows_for_intake_status(
     state: &AppState,
 ) -> (Vec<WorkflowInstance>, bool) {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (Vec::new(), false);
+        return (
+            Vec::new(),
+            workflow_runtime_submissions_expected_but_unavailable(state),
+        );
     };
     match store
         .list_instances_by_definition(
@@ -1521,19 +1527,51 @@ async fn runtime_issue_workflows_for_intake_status(
     }
 }
 
-fn runtime_issue_recent_dispatch(workflow: &WorkflowInstance) -> Option<serde_json::Value> {
+fn legacy_task_recent_dispatch(task: &task_runner::TaskState) -> IntakeRecentDispatch {
+    IntakeRecentDispatch {
+        sort_at: parse_rfc3339_utc(task.created_at.as_deref()),
+        payload: json!({
+            "source": task.source,
+            "external_id": task.external_id,
+            "task_id": task.id.0,
+            "status": serde_json::to_value(&task.status).unwrap_or(json!("unknown")),
+            "pr_url": task.pr_url,
+        }),
+    }
+}
+
+fn runtime_issue_recent_dispatch(workflow: &WorkflowInstance) -> Option<IntakeRecentDispatch> {
     let projection = RuntimeWorkflowProjection::from_workflow(workflow);
     let task_id = projection.submission_handle?;
     let source = runtime_workflow_intake_source(workflow)?;
-    Some(json!({
-        "source": source,
-        "external_id": runtime_workflow_external_id(workflow),
-        "tracker_source": runtime_workflow_tracker_source(workflow),
-        "tracker_external_id": runtime_workflow_tracker_external_id(workflow),
-        "task_id": task_id.0,
-        "status": serde_json::to_value(&projection.task_status).unwrap_or(json!("unknown")),
-        "pr_url": runtime_workflow_data_string(workflow, "pr_url"),
-    }))
+    Some(IntakeRecentDispatch {
+        sort_at: Some(workflow.created_at),
+        payload: json!({
+            "source": source,
+            "external_id": runtime_workflow_external_id(workflow),
+            "tracker_source": runtime_workflow_tracker_source(workflow),
+            "tracker_external_id": runtime_workflow_tracker_external_id(workflow),
+            "task_id": task_id.0,
+            "status": serde_json::to_value(&projection.task_status).unwrap_or(json!("unknown")),
+            "pr_url": runtime_workflow_data_string(workflow, "pr_url"),
+        }),
+    })
+}
+
+fn parse_rfc3339_utc(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn workflow_runtime_submissions_expected_but_unavailable(state: &AppState) -> bool {
+    state
+        .degraded_subsystems
+        .contains(&"workflow_runtime_store")
+        || state
+            .startup_statuses
+            .iter()
+            .any(|status| status.name == "workflow_runtime_store" && !status.ready)
 }
 
 fn runtime_workflow_has_tracker_source(workflow: &WorkflowInstance, source: &str) -> bool {

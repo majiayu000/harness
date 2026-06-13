@@ -204,6 +204,110 @@ async fn intake_status_includes_runtime_github_issue_dispatches() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn intake_status_merges_runtime_dispatches_by_recency_before_limit() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let old_created_at = Utc::now() - chrono::Duration::hours(2);
+    for index in 0..10 {
+        let mut task = task_runner::TaskState::new(task_runner::TaskId::from_str(&format!(
+            "legacy-github-intake-{index}"
+        )));
+        task.source = Some("github".to_string());
+        task.external_id = Some(format!("issue:{index}"));
+        task.created_at = Some((old_created_at - chrono::Duration::minutes(index)).to_rfc3339());
+        state.core.tasks.insert(&task).await;
+    }
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let task_id = task_runner::TaskId::from_str("runtime-newest-intake-status");
+    crate::workflow_runtime_submission::record_issue_submission(
+        store,
+        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 165,
+            task_id: &task_id,
+            labels: &[],
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("github"),
+            external_id: Some("issue:165"),
+        },
+    )
+    .await?;
+    let app = intake_app(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    let dispatches = json["recent_dispatches"]
+        .as_array()
+        .expect("recent dispatches should be an array");
+    assert_eq!(dispatches.len(), 10);
+    assert_eq!(dispatches[0]["task_id"], "runtime-newest-intake-status");
+    assert!(
+        dispatches
+            .iter()
+            .any(|dispatch| dispatch["task_id"] == "runtime-newest-intake-status"),
+        "newer runtime dispatch should not be truncated by older legacy rows"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_status_marks_runtime_submissions_degraded_when_store_unavailable(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = make_read_only_route_test_state(dir.path()).await?;
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("workflow_runtime_store")
+                .failed("failed to connect to Postgres"),
+        ];
+    state_mut.degraded_subsystems = vec!["workflow_runtime_store"];
+    let app = intake_app(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    assert_eq!(json["degraded"]["partial"], true);
+    assert_eq!(
+        json["degraded"]["missing"],
+        serde_json::json!(["workflow_runtime_submissions"])
+    );
+    assert_eq!(
+        json["degraded"]["reason"],
+        "runtime_submission_summaries_unavailable"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn intake_status_disables_feishu_when_verification_token_missing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state_with_feishu(dir.path(), None).await?;
