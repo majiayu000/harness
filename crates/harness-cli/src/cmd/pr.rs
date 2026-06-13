@@ -19,6 +19,11 @@ fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
         config.agents.sandbox_mode,
     )
     .with_no_session_persistence_probe()
+    .with_provider_backpressure_gate(
+        harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config(
+            &config.agents.claude.provider_backpressure,
+        ),
+    )
     .with_stream_timeout(config.agents.stream_timeout_secs)
 }
 

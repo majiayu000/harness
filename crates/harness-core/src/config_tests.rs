@@ -167,6 +167,77 @@ fn agents_config_includes_review() {
 }
 
 #[test]
+fn claude_provider_backpressure_deserializes_limits() {
+    let toml_str = r#"
+        default_agent = "claude"
+        [claude]
+        cli_path = "claude"
+        default_model = "sonnet"
+        [claude.provider_backpressure]
+        max_concurrent_sessions = 2
+        [claude.provider_backpressure.phase_limits]
+        triage = 1
+        planning = 1
+        execution = 2
+        simple_review = 1
+        [codex]
+        cli_path = "codex"
+        [anthropic_api]
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+    "#;
+    let config: AgentsConfig = toml::from_str(toml_str).unwrap();
+    let backpressure = &config.claude.provider_backpressure;
+    assert_eq!(
+        backpressure
+            .max_concurrent_sessions
+            .map(|limit| limit.get()),
+        Some(2)
+    );
+    assert_eq!(
+        backpressure.phase_limits.triage.map(|limit| limit.get()),
+        Some(1)
+    );
+    assert_eq!(
+        backpressure.phase_limits.planning.map(|limit| limit.get()),
+        Some(1)
+    );
+    assert_eq!(
+        backpressure.phase_limits.execution.map(|limit| limit.get()),
+        Some(2)
+    );
+    assert_eq!(
+        backpressure
+            .phase_limits
+            .simple_review
+            .map(|limit| limit.get()),
+        Some(1)
+    );
+}
+
+#[test]
+fn claude_provider_backpressure_rejects_zero_limit() {
+    let toml_str = r#"
+        default_agent = "claude"
+        [claude]
+        cli_path = "claude"
+        default_model = "sonnet"
+        [claude.provider_backpressure]
+        max_concurrent_sessions = 0
+        [codex]
+        cli_path = "codex"
+        [anthropic_api]
+        base_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-6"
+    "#;
+
+    assert!(
+        toml::from_str::<AgentsConfig>(toml_str).is_err(),
+        "zero-cap Claude provider limits should fail config parsing"
+    );
+}
+
+#[test]
 fn anthropic_api_config_deserializes_configured_max_tokens() {
     let toml_str = r#"
         base_url = "https://api.anthropic.com"

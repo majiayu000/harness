@@ -22,6 +22,9 @@ use super::data_helpers::{
 use super::pr_feedback_inspection::{
     execute_pr_feedback_inspection, is_server_owned_pr_feedback_inspection,
 };
+use super::prompt_input_telemetry::{
+    execution_phase_for_runtime_activity, record_runtime_prompt_input,
+};
 use super::prompt_packet::{
     build_runtime_job_prompt, build_runtime_prompt_packet, prompt_packet_digest,
 };
@@ -118,6 +121,18 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 .await?;
             let prompt =
                 build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
+            let activity = activity_name(&job);
+            let execution_phase = execution_phase_for_runtime_activity(&activity);
+            record_runtime_prompt_input(
+                self.state,
+                &job,
+                agent_name,
+                &project_root,
+                &activity,
+                execution_phase,
+                &prompt,
+            )
+            .await;
             let thread_id = self
                 .state
                 .core
@@ -143,6 +158,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 TurnLifecycleOptions {
                     model: runtime_profile.model.clone(),
                     reasoning_effort: runtime_profile.reasoning_effort.clone(),
+                    execution_phase,
                     sandbox_mode,
                     approval_policy,
                     timeout_secs: runtime_profile.timeout_secs,

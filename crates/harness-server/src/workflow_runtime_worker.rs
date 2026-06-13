@@ -6,6 +6,7 @@ mod child_workflow_replay;
 mod data_helpers;
 mod executor;
 mod pr_feedback_inspection;
+mod prompt_input_telemetry;
 mod prompt_packet;
 mod runtime_profile;
 mod workspace;

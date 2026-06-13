@@ -1,6 +1,7 @@
 use crate::claude_stream::{
     claude_stdout_tail, parse_claude_stream_output, stream_claude_code_output,
 };
+use crate::provider_backpressure::ProviderBackpressureGate;
 use crate::streaming::{
     captured_stderr_tail, enrich_stream_exit_error, filter_agent_stderr_with_capture,
     log_captured_stderr, send_stream_item,
@@ -28,6 +29,7 @@ pub struct ClaudeCodeAgent {
     /// Maximum seconds of idle silence on the output stream before the
     /// subprocess is declared a zombie and terminated. `None` = no timeout.
     pub stream_timeout_secs: Option<u64>,
+    pub provider_gate: ProviderBackpressureGate,
 }
 
 impl ClaudeCodeAgent {
@@ -38,6 +40,7 @@ impl ClaudeCodeAgent {
             sandbox_mode,
             reasoning_budget: None,
             stream_timeout_secs: Some(3600),
+            provider_gate: ProviderBackpressureGate::disabled(),
         }
     }
 
@@ -57,6 +60,11 @@ impl ClaudeCodeAgent {
     /// Set the per-line idle timeout for stream zombie detection.
     pub fn with_stream_timeout(mut self, secs: Option<u64>) -> Self {
         self.stream_timeout_secs = secs;
+        self
+    }
+
+    pub fn with_provider_backpressure_gate(mut self, gate: ProviderBackpressureGate) -> Self {
+        self.provider_gate = gate;
         self
     }
 
@@ -192,6 +200,15 @@ impl CodeAgent for ClaudeCodeAgent {
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
 
+        let _provider_permit = self
+            .provider_gate
+            .acquire(
+                req.execution_phase,
+                req.prompt.chars().count(),
+                req.prompt.len(),
+            )
+            .await?;
+
         let child = cmd.spawn().map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
         })?;
@@ -281,6 +298,20 @@ impl CodeAgent for ClaudeCodeAgent {
             prompt_len = req.prompt.len(),
             args = %args_debug.join(" | "),
             "claude execute_stream: full command args"
+        );
+
+        let provider_permit = self
+            .provider_gate
+            .acquire(
+                req.execution_phase,
+                req.prompt.chars().count(),
+                req.prompt.len(),
+            )
+            .await?;
+        tracing::debug!(
+            phase = provider_permit.phase().label(),
+            waited_ms = provider_permit.waited_ms(),
+            "claude execute_stream admitted by provider gate"
         );
 
         let mut cmd = Command::new(&wrapped_command.program);

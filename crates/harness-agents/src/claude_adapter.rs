@@ -1,3 +1,4 @@
+use crate::provider_backpressure::ProviderBackpressureGate;
 use async_trait::async_trait;
 use harness_core::{agent::AgentAdapter, agent::AgentEvent, agent::TurnRequest, types::TokenUsage};
 use harness_observe::usage::parse_result_usage_metrics;
@@ -17,6 +18,7 @@ pub struct ClaudeAdapter {
     cli_path: PathBuf,
     default_model: String,
     child: Arc<Mutex<Option<tokio::process::Child>>>,
+    provider_gate: ProviderBackpressureGate,
 }
 
 impl ClaudeAdapter {
@@ -25,7 +27,13 @@ impl ClaudeAdapter {
             cli_path,
             default_model,
             child: Arc::new(Mutex::new(None)),
+            provider_gate: ProviderBackpressureGate::disabled(),
         }
+    }
+
+    pub fn with_provider_backpressure_gate(mut self, gate: ProviderBackpressureGate) -> Self {
+        self.provider_gate = gate;
+        self
     }
 }
 
@@ -74,6 +82,20 @@ impl AgentAdapter for ClaudeAdapter {
         if !req.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));
         }
+
+        let provider_permit = self
+            .provider_gate
+            .acquire(
+                req.execution_phase,
+                req.prompt.chars().count(),
+                req.prompt.len(),
+            )
+            .await?;
+        tracing::debug!(
+            phase = provider_permit.phase().label(),
+            waited_ms = provider_permit.waited_ms(),
+            "claude adapter admitted by provider gate"
+        );
 
         let mut child = cmd.spawn().map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!(

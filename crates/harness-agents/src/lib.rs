@@ -5,6 +5,7 @@ mod claude_stream;
 mod cloud_setup;
 pub mod codex;
 pub mod codex_adapter;
+pub mod provider_backpressure;
 pub mod registry;
 mod streaming;
 

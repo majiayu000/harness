@@ -4,7 +4,7 @@ use super::helpers::{
 use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
 use harness_core::config::agents::SandboxMode;
 use harness_core::error::HarnessError;
-use harness_core::types::TurnId;
+use harness_core::types::{ExecutionPhase, TurnId};
 use harness_protocol::notifications::{Notification, RpcNotification};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -84,6 +84,7 @@ pub(crate) async fn run_turn_lifecycle(
 pub(crate) struct TurnLifecycleOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub execution_phase: Option<ExecutionPhase>,
     pub sandbox_mode: Option<SandboxMode>,
     pub approval_policy: Option<String>,
     pub timeout_secs: Option<u64>,
@@ -214,6 +215,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             project_root,
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
+            execution_phase: options.execution_phase,
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
             allowed_tools: vec![],
@@ -228,6 +230,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             project_root,
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
+            execution_phase: options.execution_phase,
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
             ..Default::default()
