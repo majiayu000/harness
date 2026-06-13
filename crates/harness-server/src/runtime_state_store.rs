@@ -284,6 +284,8 @@ pub async fn migrate_legacy_runtime_state_store_if_needed(
         return Ok(0);
     }
 
+    let mut tx = target_store.pool.begin().await?;
+
     let copy_sql = format!(
         "INSERT INTO runtime_state (store_key, id, data, created_at, updated_at)
          SELECT $1, id, data, created_at, updated_at
@@ -292,7 +294,7 @@ pub async fn migrate_legacy_runtime_state_store_if_needed(
     );
     let copied = sqlx::query(&copy_sql)
         .bind(target_store.store_key())
-        .execute(&target_store.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
 
@@ -304,8 +306,10 @@ pub async fn migrate_legacy_runtime_state_store_if_needed(
     .bind(target_store.store_key())
     .bind(legacy_schema)
     .bind(copied as i64)
-    .execute(&target_store.pool)
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     if copied > 0 {
         tracing::info!(
