@@ -418,6 +418,19 @@ fn failing_issue_fetcher<'a>(
     Box::pin(async { Err(anyhow::anyhow!("simulated GitHub failure")) })
 }
 
+fn failing_replan_issue_fetcher<'a>(
+    repo_slug: &'a str,
+    issue: u64,
+    github_token: Option<&'a str>,
+) -> IssueFetchFuture<'a> {
+    Box::pin(async move {
+        assert_eq!(repo_slug, "workflow/repo");
+        assert_eq!(issue, 988);
+        assert_eq!(github_token, None);
+        Err(anyhow::anyhow!("simulated GitHub failure"))
+    })
+}
+
 fn replan_issue_fetcher<'a>(
     repo_slug: &'a str,
     issue: u64,
@@ -513,6 +526,70 @@ async fn run_replan_for_issue_prompt_includes_issue_context_triage_plan_and_plan
     assert!(prompt.contains("previous implementation plan"));
     assert!(prompt.contains("Implementation concern raised by the executor"));
     assert!(prompt.contains("PLAN_ISSUE=agent wants to add auth"));
+
+    let state = store.get(&task_id).expect("task state");
+    assert_eq!(state.phase, TaskPhase::Implement);
+    assert_eq!(
+        state.plan_output.as_deref(),
+        Some("corrected plan\nPLAN=READY")
+    );
+    assert!(state
+        .rounds
+        .iter()
+        .any(|round| round.action == "replan" && round.result == "plan_ready"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_replan_for_issue_uses_saved_context_when_issue_fetch_is_unavailable(
+) -> anyhow::Result<()> {
+    let (dir, store, events, task_id, mut req, skills) = setup_issue_task_harness().await?;
+    req.repo = Some("workflow/repo".to_string());
+    mutate_and_persist(&store, &task_id, |state| {
+        state.repo = Some("task-state/repo".to_string());
+        state.triage_output =
+            Some("saved triage\nCOMPLEXITY=medium\nTRIAGE=PROCEED_WITH_PLAN".to_string());
+        state.plan_output = Some("saved fallback plan".to_string());
+    })
+    .await?;
+
+    let captured_prompt = Arc::new(Mutex::new(None));
+    let agent = CapturingReplanAgent::new(captured_prompt.clone());
+    let cargo_env = HashMap::new();
+    let plan = run_replan_for_issue_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        UNKNOWN_REPO_SLUG,
+        None,
+        None,
+        "PLAN_ISSUE=implementation needs a safer plan",
+        &cargo_env,
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        failing_replan_issue_fetcher,
+    )
+    .await?;
+
+    assert_eq!(plan, "corrected plan\nPLAN=READY");
+    let prompt = captured_prompt
+        .lock()
+        .expect("capture prompt lock")
+        .clone()
+        .expect("replan prompt should be captured");
+    assert!(prompt.contains("Original GitHub issue context"));
+    assert!(prompt.contains("Repository: workflow/repo"));
+    assert!(prompt.contains("Issue: #988"));
+    assert!(prompt.contains("Live GitHub issue context unavailable before replan."));
+    assert!(prompt.contains("simulated GitHub failure"));
+    assert!(prompt.contains("Previous triage output"));
+    assert!(prompt.contains("saved triage"));
+    assert!(prompt.contains("Previous implementation plan"));
+    assert!(prompt.contains("saved fallback plan"));
+    assert!(prompt.contains("PLAN_ISSUE=implementation needs a safer plan"));
 
     let state = store.get(&task_id).expect("task state");
     assert_eq!(state.phase, TaskPhase::Implement);
