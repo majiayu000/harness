@@ -605,6 +605,64 @@ async fn run_replan_for_issue_uses_saved_context_when_issue_fetch_is_unavailable
 }
 
 #[tokio::test]
+async fn run_replan_for_issue_uses_checkpoint_context_after_recovery_when_issue_fetch_fails(
+) -> anyhow::Result<()> {
+    let (dir, store, events, task_id, mut req, skills) = setup_issue_task_harness().await?;
+    req.repo = Some("workflow/repo".to_string());
+    mutate_and_persist(&store, &task_id, |state| {
+        state.repo = Some("task-state/repo".to_string());
+        state.triage_output = None;
+        state.plan_output = None;
+    })
+    .await?;
+    store
+        .write_checkpoint(
+            &task_id,
+            Some("checkpoint triage\nCOMPLEXITY=medium\nTRIAGE=PROCEED_WITH_PLAN"),
+            Some("checkpoint implementation plan"),
+            None,
+            "plan_done",
+        )
+        .await?;
+
+    let captured_prompt = Arc::new(Mutex::new(None));
+    let agent = CapturingReplanAgent::new(captured_prompt.clone());
+    let cargo_env = HashMap::new();
+    let plan = run_replan_for_issue_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        UNKNOWN_REPO_SLUG,
+        None,
+        None,
+        "PLAN_ISSUE=recovered task needs a safer plan",
+        &cargo_env,
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        failing_replan_issue_fetcher,
+    )
+    .await?;
+
+    assert_eq!(plan, "corrected plan\nPLAN=READY");
+    let prompt = captured_prompt
+        .lock()
+        .expect("capture prompt lock")
+        .clone()
+        .expect("replan prompt should be captured");
+    assert!(prompt.contains("Repository: workflow/repo"));
+    assert!(prompt.contains("Live GitHub issue context unavailable before replan."));
+    assert!(prompt.contains("Previous triage output"));
+    assert!(prompt.contains("checkpoint triage"));
+    assert!(prompt.contains("Previous implementation plan"));
+    assert!(prompt.contains("checkpoint implementation plan"));
+    assert!(prompt.contains("PLAN_ISSUE=recovered task needs a safer plan"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn actionable_review_issue_skip_is_promoted_to_plan() -> anyhow::Result<()> {
     let (dir, store, events, task_id, req, skills) = setup_issue_task_harness().await?;
     let agent = TriageStaticStreamAgent::new(

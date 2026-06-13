@@ -1112,14 +1112,35 @@ async fn run_replan_for_issue_with_issue_fetcher(
     .await?;
 
     let saved_task = store.get(task_id);
+    let checkpoint = match store.load_checkpoint(task_id).await {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task_id,
+                "failed to load replan checkpoint context; continuing from task state only: {error:#}"
+            );
+            None
+        }
+    };
     let saved_triage_output = saved_task
         .as_ref()
-        .and_then(|state| state.triage_output.as_deref());
-    let prior_plan = prior_plan.or_else(|| {
-        saved_task
-            .as_ref()
-            .and_then(|state| state.plan_output.as_deref())
-    });
+        .and_then(|state| state.triage_output.as_deref())
+        .or_else(|| {
+            checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.triage_output.as_deref())
+        });
+    let prior_plan = prior_plan
+        .or_else(|| {
+            saved_task
+                .as_ref()
+                .and_then(|state| state.plan_output.as_deref())
+        })
+        .or_else(|| {
+            checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.plan_output.as_deref())
+        });
     let replan_repo_slug = resolve_replan_repo_slug(
         repo_slug,
         req.repo.as_deref(),
