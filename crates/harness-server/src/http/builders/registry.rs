@@ -550,34 +550,30 @@ pub(crate) async fn build_registry(
                     .push(StoreStartupResult::optional("runtime_state_store").failed(error));
                 None
             }
-            None => match harness_core::db::PgStoreContext::from_path(
-                &runtime_state_db_path,
-                Some(&database_url),
-            ) {
-                Ok(context) => {
-                    match crate::runtime_state_store::RuntimeStateStore::open_with_context(
+            None => match async {
+                let context = crate::runtime_state_store::RuntimeStateStore::shared_schema_context(
+                    Some(&database_url),
+                )?;
+                let store =
+                    crate::runtime_state_store::RuntimeStateStore::open_shared_with_data_dir(
                         &context,
                         &setup_pool,
+                        data_dir,
                     )
-                    .await
-                    {
-                        Ok(store) => {
-                            startup_results
-                                .push(StoreStartupResult::optional("runtime_state_store"));
-                            Some(Arc::new(store))
-                        }
-                        Err(e) => {
-                            startup_results.push(
-                                StoreStartupResult::optional("runtime_state_store")
-                                    .failed(e.to_string()),
-                            );
-                            tracing::warn!(
-                                path = %runtime_state_db_path.display(),
-                                "runtime state store init failed, runtime host state will not persist: {e}"
-                            );
-                            None
-                        }
-                    }
+                    .await?;
+                crate::runtime_state_store::migrate_legacy_runtime_state_store_if_needed(
+                    &runtime_state_db_path,
+                    Some(&database_url),
+                    &store,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(store)
+            }
+            .await
+            {
+                Ok(store) => {
+                    startup_results.push(StoreStartupResult::optional("runtime_state_store"));
+                    Some(Arc::new(store))
                 }
                 Err(error) => {
                     startup_results.push(
@@ -586,7 +582,8 @@ pub(crate) async fn build_registry(
                     );
                     tracing::warn!(
                         path = %runtime_state_db_path.display(),
-                        "runtime state store context init failed, runtime host state will not persist: {error}"
+                        schema = crate::runtime_state_store::RUNTIME_STATE_STORE_SCHEMA,
+                        "runtime state store init failed, runtime host state will not persist: {error}"
                     );
                     None
                 }
