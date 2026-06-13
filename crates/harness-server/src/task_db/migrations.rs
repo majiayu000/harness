@@ -185,6 +185,6 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 25,
         description: "add process start-time proof to workspace leases",
-        sql: "ALTER TABLE workspace_leases ADD COLUMN process_started_at BIGINT NOT NULL DEFAULT 0",
+        sql: "ALTER TABLE workspace_leases ADD COLUMN IF NOT EXISTS process_started_at BIGINT NOT NULL DEFAULT 0",
     },
 ];
