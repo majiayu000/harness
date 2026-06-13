@@ -145,6 +145,19 @@ impl TaskStore {
         Self::from_task_db(db, db_path).await
     }
 
+    pub async fn open_shared_with_data_dir(
+        db_path: &std::path::Path,
+        context: &PgStoreContext,
+        setup_pool: &sqlx::postgres::PgPool,
+        data_dir: &std::path::Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_shared_with_data_dir(context, setup_pool, data_dir).await?;
+        crate::task_db::migrate_legacy_task_db_if_needed(db_path, configured_database_url, &db)
+            .await?;
+        Self::from_task_db(db, db_path).await
+    }
+
     async fn from_task_db(db: TaskDb, db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
         // 1. Event replay: runs BEFORE recover_in_progress so event-sourced
         //    data (pr_url, terminal status) wins over checkpoint data.
@@ -218,6 +231,16 @@ impl TaskStore {
             event_log,
         });
         Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_db_schema_for_test(&self) -> &str {
+        self.db.schema()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_db_store_key_for_test(&self) -> &str {
+        self.db.store_key()
     }
 
     pub fn get(&self, id: &TaskId) -> Option<TaskState> {

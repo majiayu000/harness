@@ -1,6 +1,16 @@
 use super::test_support::*;
 use super::*;
 
+fn unique_test_schema(prefix: &str) -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos();
+    format!("{prefix}_{nanos}_{count}")
+}
+
 #[tokio::test]
 async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
@@ -42,6 +52,74 @@ async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::R
     );
     assert!(store.list_leased().await?.is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_lease_store_shared_schema_keeps_data_dirs_isolated() -> anyhow::Result<()> {
+    let database_url = match harness_core::db::resolve_database_url(None) {
+        Ok(url) => url,
+        Err(_) => return Ok(()),
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let setup_pool = harness_core::db::pg_open_pool(&database_url).await?;
+    let shared_schema = unique_test_schema("workspace_lease_scope_test");
+    let shared_context =
+        harness_core::db::PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+    let store_a_dir = dir.path().join("store-a");
+    let store_b_dir = dir.path().join("store-b");
+    std::fs::create_dir_all(&store_a_dir)?;
+    std::fs::create_dir_all(&store_b_dir)?;
+    crate::task_db::TaskDb::open_shared_with_data_dir(&shared_context, &setup_pool, &store_a_dir)
+        .await?;
+    crate::task_db::TaskDb::open_shared_with_data_dir(&shared_context, &setup_pool, &store_b_dir)
+        .await?;
+    let store_a =
+        WorkspaceLeaseStore::open_shared_with_data_dir(&shared_context, &setup_pool, &store_a_dir)
+            .await?;
+    let store_b =
+        WorkspaceLeaseStore::open_shared_with_data_dir(&shared_context, &setup_pool, &store_b_dir)
+            .await?;
+    let process_started_at = WorkspaceLeaseStore::current_process_started_at()?;
+    let record_a = WorkspaceLeaseRecord {
+        project_key: "project-a".to_string(),
+        slot_index: 0,
+        task_id: harness_core::types::TaskId("store-a-task".to_string()),
+        workspace_key: "workspace-a".to_string(),
+        workspace_path: dir.path().join("workspaces/store-a"),
+        source_repo: dir.path().join("repo-a"),
+        repo: Some("owner/repo-a".to_string()),
+        runtime_workflow_id: Some("workflow-a".to_string()),
+        owner_session: "session-a".to_string(),
+        run_generation: 1,
+        process_id: std::process::id(),
+        process_started_at,
+    };
+    let record_b = WorkspaceLeaseRecord {
+        task_id: harness_core::types::TaskId("store-b-task".to_string()),
+        workspace_key: "workspace-b".to_string(),
+        workspace_path: dir.path().join("workspaces/store-b"),
+        source_repo: dir.path().join("repo-b"),
+        repo: Some("owner/repo-b".to_string()),
+        runtime_workflow_id: Some("workflow-b".to_string()),
+        owner_session: "session-b".to_string(),
+        ..record_a.clone()
+    };
+
+    assert!(store_a.try_acquire_lease(&record_a).await?);
+    assert!(
+        store_b.try_acquire_lease(&record_b).await?,
+        "same project slot should be isolated by store_key"
+    );
+
+    let leased_a = store_a.list_leased().await?;
+    let leased_b = store_b.list_leased().await?;
+    assert_eq!(leased_a.len(), 1);
+    assert_eq!(leased_b.len(), 1);
+    assert_eq!(leased_a[0].task_id, record_a.task_id);
+    assert_eq!(leased_b[0].task_id, record_b.task_id);
+
+    setup_pool.close().await;
     Ok(())
 }
 

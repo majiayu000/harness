@@ -86,10 +86,18 @@ pub(crate) async fn build_storage_with_database_url(
         }
     };
 
-    let task_context = harness_core::db::PgStoreContext::from_path(&db_path, Some(&database_url))?;
+    let task_context = crate::task_db::TaskDb::shared_schema_context(Some(&database_url))?;
     let (tasks, task_result) = match super::forced_startup_error("tasks") {
         Some(error) => (None, StoreStartupResult::critical("tasks").failed(error)),
-        None => match TaskStore::open_with_context(&db_path, &task_context, &setup_pool).await {
+        None => match TaskStore::open_shared_with_data_dir(
+            &db_path,
+            &task_context,
+            &setup_pool,
+            data_dir,
+            Some(&database_url),
+        )
+        .await
+        {
             Ok(store) => (Some(store), StoreStartupResult::critical("tasks")),
             Err(error) => (
                 None,
@@ -197,6 +205,28 @@ mod tests {
             bundle.startup_results
         );
         drop(bundle.q_values);
+    }
+
+    #[tokio::test]
+    async fn build_storage_opens_task_store_from_shared_schema() {
+        let database_url = match harness_core::db::resolve_database_url(None) {
+            Ok(url) => url,
+            Err(_) => return,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = build_storage_with_database_url(dir.path(), Some(&database_url))
+            .await
+            .expect("build_storage should succeed");
+        let tasks = bundle.tasks.expect("tasks store should be ready");
+
+        assert_eq!(
+            tasks.task_db_schema_for_test(),
+            crate::task_db::TASK_DB_SCHEMA
+        );
+        assert_eq!(
+            tasks.task_db_store_key_for_test(),
+            crate::task_db::TaskDb::store_key_for_data_dir(dir.path()).expect("store key")
+        );
     }
 
     #[tokio::test]

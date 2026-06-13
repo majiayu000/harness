@@ -1,11 +1,8 @@
 use crate::task_runner::{TaskState, TaskStatus, TaskSummaryFilter, TaskSummaryPageCursor};
 use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder};
-use std::collections::HashMap;
 
-use super::types::{
-    ExternalStatusRow, RecentFailureRow, TaskRow, TaskSummaryRow, TASK_ROW_COLUMNS,
-};
+use super::types::{ExternalStatusRow, TaskRow, TaskSummaryRow, TASK_ROW_COLUMNS};
 use super::TaskDb;
 
 impl TaskDb {
@@ -26,13 +23,14 @@ impl TaskDb {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
         sqlx::query(
-            "INSERT INTO tasks (id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, \
+            "INSERT INTO tasks (store_key, id, task_kind, status, failure_kind, turn, pr_url, rounds, error, source, \
              external_id, parent_id, created_at, repo, depends_on, project, workspace_path, \
              workspace_owner, run_generation, priority, phase, description, request_settings, scheduler_state) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                     COALESCE($12, CURRENT_TIMESTAMP), $13, $14, $15, $16, $17, $18, \
-                     $19, $20, $21, $22, $23)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                     COALESCE($13, CURRENT_TIMESTAMP), $14, $15, $16, $17, $18, $19, \
+                     $20, $21, $22, $23, $24)",
         )
+        .bind(&self.store_key)
         .bind(&state.id.0)
         .bind(task_kind)
         .bind(status)
@@ -88,7 +86,7 @@ impl TaskDb {
                     project = $12, workspace_path = $13, workspace_owner = $14, \
                     run_generation = $15, priority = $16, phase = $17, description = $18, \
                     request_settings = $19, scheduler_state = $20, updated_at = CURRENT_TIMESTAMP, \
-                    version = version + 1 WHERE id = $21 AND version = $22",
+                    version = version + 1 WHERE store_key = $21 AND id = $22 AND version = $23",
         )
         .bind(task_kind)
         .bind(status)
@@ -120,6 +118,7 @@ impl TaskDb {
         .bind(state.description.as_deref())
         .bind(settings_json.as_deref())
         .bind(&scheduler_json)
+        .bind(&self.store_key)
         .bind(&state.id.0)
         .bind(state.version)
         .execute(&self.pool)
@@ -135,8 +134,9 @@ impl TaskDb {
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
-        let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE id = $1");
+        let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE store_key = $1 AND id = $2");
         let row = sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(&self.store_key)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -144,8 +144,11 @@ impl TaskDb {
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
-        let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks ORDER BY created_at DESC");
+        let sql = format!(
+            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE store_key = $1 ORDER BY created_at DESC"
+        );
         let rows = sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(&self.store_key)
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
@@ -158,11 +161,11 @@ impl TaskDb {
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = Self::numbered_placeholders(1, statuses.len());
+        let placeholders = Self::numbered_placeholders(2, statuses.len());
         let sql = format!(
-            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at DESC"
+            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE store_key = $1 AND status IN ({placeholders}) ORDER BY created_at DESC"
         );
-        let mut q = sqlx::query_as::<_, TaskRow>(&sql);
+        let mut q = sqlx::query_as::<_, TaskRow>(&sql).bind(&self.store_key);
         for status in statuses {
             q = q.bind(*status);
         }
@@ -175,12 +178,17 @@ impl TaskDb {
         let sql = format!(
             "SELECT {TASK_ROW_COLUMNS} \
              FROM tasks t \
-             WHERE t.status = 'pending' \
+             WHERE t.store_key = $1 \
+               AND t.status = 'pending' \
                AND t.pr_url IS NULL \
-               AND NOT EXISTS (SELECT 1 FROM task_checkpoints c WHERE c.task_id = t.id) \
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_checkpoints c
+                   WHERE c.store_key = t.store_key AND c.task_id = t.id
+               ) \
              ORDER BY t.created_at DESC"
         );
         let rows = sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(&self.store_key)
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(TaskRow::try_into_task_state).collect()
@@ -197,10 +205,11 @@ impl TaskDb {
                  SELECT external_id, status, created_at, \
                         ROW_NUMBER() OVER (PARTITION BY external_id ORDER BY created_at DESC, id DESC) AS rn \
                  FROM tasks \
-                 WHERE project = $1 AND external_id IS NOT NULL";
+                 WHERE store_key = $1 AND project = $2 AND external_id IS NOT NULL";
         let rows: Vec<ExternalStatusRow> = if let Some(repo) = repo {
-            let sql = format!("{base_sql} AND repo = $2) latest WHERE rn = 1");
+            let sql = format!("{base_sql} AND repo = $3) latest WHERE rn = 1");
             sqlx::query_as::<_, ExternalStatusRow>(&sql)
+                .bind(&self.store_key)
                 .bind(project)
                 .bind(repo)
                 .fetch_all(&self.pool)
@@ -208,6 +217,7 @@ impl TaskDb {
         } else {
             let sql = format!("{base_sql} AND repo IS NULL) latest WHERE rn = 1");
             sqlx::query_as::<_, ExternalStatusRow>(&sql)
+                .bind(&self.store_key)
                 .bind(project)
                 .fetch_all(&self.pool)
                 .await?
@@ -235,12 +245,13 @@ impl TaskDb {
             .chain(std::iter::once(TaskStatus::AwaitingDeps.as_ref()))
             .chain(TaskStatus::resumable_statuses().iter().copied())
             .collect();
-        let placeholders = Self::numbered_placeholders(3, active_statuses.len());
+        let placeholders = Self::numbered_placeholders(4, active_statuses.len());
         let sql = format!(
-            "SELECT id FROM tasks WHERE project = $1 AND external_id = $2 \
+            "SELECT id FROM tasks WHERE store_key = $1 AND project = $2 AND external_id = $3 \
              AND status IN ({placeholders}) LIMIT 1"
         );
         let mut query = sqlx::query_as::<_, (String,)>(&sql)
+            .bind(&self.store_key)
             .bind(project)
             .bind(external_id);
         for status in active_statuses {
@@ -258,10 +269,11 @@ impl TaskDb {
     ) -> anyhow::Result<Option<(String, String)>> {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT id, pr_url FROM tasks \
-             WHERE project = $1 AND external_id = $2 \
+             WHERE store_key = $1 AND project = $2 AND external_id = $3 \
                AND status = 'done' AND pr_url IS NOT NULL \
              ORDER BY created_at DESC LIMIT 1",
         )
+        .bind(&self.store_key)
         .bind(project)
         .bind(external_id)
         .fetch_optional(&self.pool)
@@ -281,10 +293,11 @@ impl TaskDb {
     ) -> anyhow::Result<()> {
         let result = sqlx::query(
             "UPDATE tasks SET status = $1, scheduler_state = $2, version = version + 1 \
-             WHERE id = $3 AND version = $4",
+             WHERE store_key = $3 AND id = $4 AND version = $5",
         )
         .bind(status)
         .bind(scheduler_state)
+        .bind(&self.store_key)
         .bind(id)
         .bind(expected_version)
         .execute(&self.pool)
@@ -309,9 +322,10 @@ impl TaskDb {
         let result = sqlx::query(
             "UPDATE tasks SET external_id = $1, updated_at = CURRENT_TIMESTAMP, \
              version = version + 1 \
-             WHERE id = $2 AND external_id IS NULL AND version = $3",
+             WHERE store_key = $2 AND id = $3 AND external_id IS NULL AND version = $4",
         )
         .bind(external_id)
+        .bind(&self.store_key)
         .bind(id)
         .bind(expected_version)
         .execute(&self.pool)
@@ -336,9 +350,10 @@ impl TaskDb {
         let result = sqlx::query(
             "UPDATE tasks SET external_id = $1, updated_at = CURRENT_TIMESTAMP, \
              version = version + 1 \
-             WHERE id = $2 AND source = 'auto-fix' AND version = $3",
+             WHERE store_key = $2 AND id = $3 AND source = 'auto-fix' AND version = $4",
         )
         .bind(external_id)
+        .bind(&self.store_key)
         .bind(id)
         .bind(expected_version)
         .execute(&self.pool)
@@ -359,8 +374,9 @@ impl TaskDb {
             "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \
              run_generation, phase, description, scheduler_state \
-             FROM tasks ORDER BY created_at DESC",
+             FROM tasks WHERE store_key = $1 ORDER BY created_at DESC",
         )
+        .bind(&self.store_key)
         .fetch_all(&self.pool)
         .await?;
         Ok(decode_task_summary_rows(rows, "list_summaries"))
@@ -375,9 +391,11 @@ impl TaskDb {
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \
              run_generation, phase, description, scheduler_state \
              FROM tasks \
-             WHERE status NOT IN ('done', 'failed', 'cancelled') \
+             WHERE store_key = $1 \
+               AND status NOT IN ('done', 'failed', 'cancelled') \
              ORDER BY created_at DESC",
         )
+        .bind(&self.store_key)
         .fetch_all(&self.pool)
         .await?;
         Ok(decode_task_summary_rows(rows, "list_active_summaries"))
@@ -392,7 +410,8 @@ impl TaskDb {
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \
              run_generation, phase, description, scheduler_state FROM tasks",
         );
-        push_task_summary_filter(&mut query, filter);
+        let mut has_where = push_task_store_filter(&mut query, self.store_key.as_str());
+        push_task_summary_filter(&mut query, filter, &mut has_where);
         query.push(" ORDER BY created_at DESC, id DESC");
 
         let rows = query
@@ -426,7 +445,8 @@ impl TaskDb {
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \
              run_generation, phase, description, scheduler_state FROM tasks",
         );
-        let mut has_where = push_task_summary_filter(&mut query, filter);
+        let mut has_where = push_task_store_filter(&mut query, self.store_key.as_str());
+        push_task_summary_filter(&mut query, filter, &mut has_where);
         if let Some(cursor) = cursor {
             push_where_prefix(&mut query, &mut has_where);
             query.push("(created_at < ");
@@ -460,275 +480,6 @@ impl TaskDb {
         Ok(summaries)
     }
 
-    /// Return `(task_id, first_token_latency_ms)` pairs for the 500 most-recently
-    /// completed terminal tasks. Latency extracted via jsonb correlated subquery.
-    pub async fn list_terminal_first_token_latencies_ms(
-        &self,
-    ) -> anyhow::Result<Vec<(String, Option<i64>)>> {
-        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
-            "SELECT id, \
-             (SELECT (r.value ->> 'first_token_latency_ms')::BIGINT \
-              FROM jsonb_array_elements(rounds::jsonb) AS r(value) \
-              WHERE r.value ->> 'result' != 'resumed_checkpoint' \
-                AND r.value ->> 'first_token_latency_ms' IS NOT NULL \
-              LIMIT 1) AS first_token_latency_ms \
-             FROM tasks \
-             WHERE status IN ('done', 'failed') \
-             ORDER BY updated_at DESC \
-             LIMIT 500",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// Return `(task_id, turn)` pairs for the 500 most-recently-completed terminal tasks.
-    pub async fn list_terminal_turn_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT id, turn FROM tasks \
-             WHERE status IN ('done', 'failed') \
-             ORDER BY updated_at DESC LIMIT 500",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// Return `(id, status)` pairs for all tasks.
-    pub async fn list_id_status(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT id, status FROM tasks ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows)
-    }
-
-    /// Return only task IDs whose `status` matches any value in `statuses`.
-    pub async fn list_ids_by_status(&self, statuses: &[&str]) -> anyhow::Result<Vec<String>> {
-        if statuses.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = Self::numbered_placeholders(1, statuses.len());
-        let sql = format!("SELECT id FROM tasks WHERE status IN ({placeholders})");
-        let mut q = sqlx::query_as::<_, (String,)>(&sql);
-        for status in statuses {
-            q = q.bind(*status);
-        }
-        let rows = q.fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
-    }
-
-    /// Return the status of a single task, fetching only the `status` column.
-    pub async fn get_status_only(&self, id: &str) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM tasks WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|(s,)| s))
-    }
-
-    /// Return the current optimistic-locking version of a single task.
-    pub(crate) async fn get_version_only(&self, id: &str) -> anyhow::Result<Option<i32>> {
-        let row: Option<(i32,)> = sqlx::query_as("SELECT version FROM tasks WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|(version,)| version))
-    }
-
-    /// Return `true` if a task row with the given ID exists in the database.
-    pub async fn exists_by_id(&self, id: &str) -> anyhow::Result<bool> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT id FROM tasks WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.is_some())
-    }
-
-    /// Return the `pr_url` of the most recently completed Done task that has one.
-    pub async fn latest_done_pr_url(&self) -> anyhow::Result<Option<String>> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT pr_url FROM tasks WHERE status = 'done' AND pr_url IS NOT NULL \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.and_then(|(pr_url,)| pr_url))
-    }
-
-    /// Return the `pr_url` of the most recent Done task for the given project root path.
-    pub async fn latest_done_pr_url_by_project(
-        &self,
-        project: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT pr_url FROM tasks \
-             WHERE status = 'done' AND pr_url IS NOT NULL AND project = $1 \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(project)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.and_then(|(pr_url,)| pr_url))
-    }
-
-    /// Return the latest done PR URL for every project that has one, in a single query.
-    pub async fn latest_done_pr_urls_all_projects(
-        &self,
-    ) -> anyhow::Result<HashMap<String, String>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT project, pr_url FROM (\
-               SELECT project, pr_url, \
-                      ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC) AS rn \
-               FROM tasks \
-               WHERE status = 'done' AND pr_url IS NOT NULL AND project IS NOT NULL\
-             ) AS subq WHERE rn = 1",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().collect())
-    }
-
-    /// Count done/failed tasks globally and per project.
-    pub async fn count_done_failed_by_project(
-        &self,
-    ) -> anyhow::Result<(u64, u64, Vec<(String, u64, u64)>)> {
-        let outcome_statuses = [TaskStatus::Done.as_ref(), TaskStatus::Failed.as_ref()];
-        let global_sql = format!(
-            "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
-             FROM tasks WHERE status IN ({})",
-            Self::numbered_placeholders(1, outcome_statuses.len())
-        );
-        let global: (i64, i64) = outcome_statuses
-            .iter()
-            .fold(sqlx::query_as(&global_sql), |q, status| q.bind(*status))
-            .fetch_one(&self.pool)
-            .await?;
-        let rows_sql = format!(
-            "SELECT project, \
-                    COUNT(CASE WHEN status = 'done' THEN 1 END), \
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
-             FROM tasks \
-             WHERE status IN ({}) AND project IS NOT NULL \
-             GROUP BY project",
-            Self::numbered_placeholders(1, outcome_statuses.len())
-        );
-        let rows: Vec<(String, i64, i64)> = outcome_statuses
-            .iter()
-            .fold(sqlx::query_as(&rows_sql), |q, status| q.bind(*status))
-            .fetch_all(&self.pool)
-            .await?;
-        let by_project = rows
-            .into_iter()
-            .map(|(p, d, f)| (p, d as u64, f as u64))
-            .collect();
-        Ok((global.0 as u64, global.1 as u64, by_project))
-    }
-
-    /// Count tasks that reached `done` status with `updated_at >= since`.
-    pub async fn count_done_since(&self, since: DateTime<Utc>) -> anyhow::Result<u64> {
-        let row: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at >= $1")
-                .bind(since)
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(row.0 as u64)
-    }
-
-    /// Per-(project, hour-bucket) count of tasks that reached `done` after `since`.
-    pub async fn done_per_project_hour_since(
-        &self,
-        since: DateTime<Utc>,
-    ) -> anyhow::Result<Vec<(String, String, u64)>> {
-        let rows: Vec<(Option<String>, String, i64)> = sqlx::query_as(
-            "SELECT project, \
-                    TO_CHAR(date_trunc('hour', updated_at AT TIME ZONE 'UTC'), \
-                            'YYYY-MM-DD\"T\"HH24:00:00\"Z\"') AS hour, \
-                    COUNT(*) \
-             FROM tasks \
-             WHERE status = 'done' AND updated_at >= $1 \
-             GROUP BY project, date_trunc('hour', updated_at AT TIME ZONE 'UTC')",
-        )
-        .bind(since)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(p, h, c)| (p.unwrap_or_default(), h, c as u64))
-            .collect())
-    }
-
-    /// Return all tasks whose `parent_id` matches the given parent task ID.
-    pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
-        let sql = format!(
-            "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE parent_id = $1 ORDER BY created_at DESC"
-        );
-        let rows = sqlx::query_as::<_, TaskRow>(&sql)
-            .bind(parent_id)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(TaskRow::try_into_task_state).collect()
-    }
-
-    /// Return tasks that are active and have not been updated for at least `stale_threshold`.
-    pub async fn list_stalled_tasks(
-        &self,
-        stale_threshold: std::time::Duration,
-        project: Option<&str>,
-    ) -> anyhow::Result<Vec<TaskState>> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(stale_threshold)?;
-        let sql = if project.is_some() {
-            format!(
-                "SELECT {TASK_ROW_COLUMNS} FROM tasks \
-                 WHERE status IN ('triaging', 'planning', 'implementing', \
-                                  'review_generating', 'review_waiting', \
-                                  'planner_generating', 'planner_waiting', 'agent_review', \
-                                  'waiting', 'reviewing') \
-                 AND external_id IS NOT NULL \
-                 AND updated_at < $1 AND project = $2 \
-                 ORDER BY updated_at ASC LIMIT 100"
-            )
-        } else {
-            format!(
-                "SELECT {TASK_ROW_COLUMNS} FROM tasks \
-                 WHERE status IN ('triaging', 'planning', 'implementing', \
-                                  'review_generating', 'review_waiting', \
-                                  'planner_generating', 'planner_waiting', 'agent_review', \
-                                  'waiting', 'reviewing') \
-                 AND external_id IS NOT NULL \
-                 AND updated_at < $1 \
-                 ORDER BY updated_at ASC LIMIT 100"
-            )
-        };
-        let mut q = sqlx::query_as::<_, TaskRow>(&sql).bind(cutoff);
-        if let Some(proj) = project {
-            q = q.bind(proj);
-        }
-        let rows = q.fetch_all(&self.pool).await?;
-        rows.into_iter().map(TaskRow::try_into_task_state).collect()
-    }
-
-    /// Return the most recent `limit` failed tasks, newest first.
-    pub async fn list_recent_failed(
-        &self,
-        limit: i64,
-    ) -> anyhow::Result<Vec<crate::task_runner::RecentFailureTask>> {
-        let rows = sqlx::query_as::<_, RecentFailureRow>(
-            "SELECT id, failure_kind, external_id, project, workspace_path, workspace_owner, \
-             run_generation, error, updated_at FROM tasks \
-             WHERE status = 'failed' \
-             ORDER BY updated_at DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(RecentFailureRow::into_recent_failure)
-            .collect())
-    }
-
     /// Expose the raw pool for test-only SQL setup (e.g. back-dating `updated_at`).
     #[cfg(test)]
     pub(crate) fn pool_for_test(&self) -> &sqlx::PgPool {
@@ -746,8 +497,9 @@ impl TaskDb {
         task_id: &str,
         raw_rounds: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE tasks SET rounds = $1 WHERE id = $2")
+        sqlx::query("UPDATE tasks SET rounds = $1 WHERE store_key = $2 AND id = $3")
             .bind(raw_rounds)
+            .bind(&self.store_key)
             .bind(task_id)
             .execute(&self.pool)
             .await?;
@@ -775,11 +527,10 @@ fn decode_task_summary_rows(
 fn push_task_summary_filter<'a>(
     query: &mut QueryBuilder<'a, Postgres>,
     filter: &'a TaskSummaryFilter,
-) -> bool {
-    let mut has_where = false;
-
+    has_where: &mut bool,
+) {
     if !filter.statuses.is_empty() {
-        push_where_prefix(query, &mut has_where);
+        push_where_prefix(query, has_where);
         query.push("status IN (");
         let mut separated = query.separated(", ");
         for status in &filter.statuses {
@@ -789,7 +540,7 @@ fn push_task_summary_filter<'a>(
     }
 
     if filter.active {
-        push_where_prefix(query, &mut has_where);
+        push_where_prefix(query, has_where);
         query.push("status NOT IN (");
         let mut separated = query.separated(", ");
         for status in TaskStatus::terminal_statuses() {
@@ -799,7 +550,7 @@ fn push_task_summary_filter<'a>(
     }
 
     if !filter.scheduler_states.is_empty() {
-        push_where_prefix(query, &mut has_where);
+        push_where_prefix(query, has_where);
         query.push("(scheduler_state::jsonb ->> 'authority_state') IN (");
         let mut separated = query.separated(", ");
         for state in &filter.scheduler_states {
@@ -809,7 +560,7 @@ fn push_task_summary_filter<'a>(
     }
 
     if !filter.kinds.is_empty() {
-        push_where_prefix(query, &mut has_where);
+        push_where_prefix(query, has_where);
         query.push("task_kind IN (");
         let mut separated = query.separated(", ");
         for kind in &filter.kinds {
@@ -819,23 +570,29 @@ fn push_task_summary_filter<'a>(
     }
 
     if let Some(source) = filter.source.as_deref() {
-        push_where_prefix(query, &mut has_where);
+        push_where_prefix(query, has_where);
         query.push("source = ");
         query.push_bind(source.to_string());
     }
 
     if let Some(repo) = filter.repo.as_deref() {
-        push_where_prefix(query, &mut has_where);
+        push_where_prefix(query, has_where);
         query.push("repo = ");
         query.push_bind(repo.to_string());
     }
 
     if let Some(project) = filter.project.as_deref() {
-        push_where_prefix(query, &mut has_where);
+        push_where_prefix(query, has_where);
         query.push("project = ");
         query.push_bind(project.to_string());
     }
+}
 
+fn push_task_store_filter<'a>(query: &mut QueryBuilder<'a, Postgres>, store_key: &'a str) -> bool {
+    let mut has_where = false;
+    push_where_prefix(query, &mut has_where);
+    query.push("store_key = ");
+    query.push_bind(store_key);
     has_where
 }
 
