@@ -9,6 +9,7 @@ async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::R
     let dir = tempfile::tempdir().expect("tempdir");
     let store = WorkspaceLeaseStore::open(&dir.path().join("workspace-leases")).await?;
     let task_id = harness_core::types::TaskId("lease-store-task".to_string());
+    let process_started_at = WorkspaceLeaseStore::current_process_started_at()?;
     let record = WorkspaceLeaseRecord {
         project_key: "project-a".to_string(),
         slot_index: 0,
@@ -21,6 +22,7 @@ async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::R
         owner_session: "session-a".to_string(),
         run_generation: 1,
         process_id: std::process::id(),
+        process_started_at,
     };
 
     assert!(
@@ -52,6 +54,7 @@ async fn workspace_lease_store_does_not_steal_live_foreign_slot() -> anyhow::Res
     let store = WorkspaceLeaseStore::open(&dir.path().join("workspace-leases")).await?;
     let first_task = harness_core::types::TaskId("lease-store-first".to_string());
     let second_task = harness_core::types::TaskId("lease-store-second".to_string());
+    let process_started_at = WorkspaceLeaseStore::current_process_started_at()?;
     let first_record = WorkspaceLeaseRecord {
         project_key: "project-a".to_string(),
         slot_index: 0,
@@ -64,6 +67,7 @@ async fn workspace_lease_store_does_not_steal_live_foreign_slot() -> anyhow::Res
         owner_session: "session-a".to_string(),
         run_generation: 1,
         process_id: std::process::id(),
+        process_started_at,
     };
     let second_record = WorkspaceLeaseRecord {
         task_id: second_task,
@@ -106,6 +110,7 @@ async fn workspace_lease_store_releases_only_dead_foreign_processes() -> anyhow:
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let store = WorkspaceLeaseStore::open(&dir.path().join("workspace-leases")).await?;
+    let process_started_at = WorkspaceLeaseStore::current_process_started_at()?;
     let live_record = WorkspaceLeaseRecord {
         project_key: "project-a".to_string(),
         slot_index: 0,
@@ -118,6 +123,7 @@ async fn workspace_lease_store_releases_only_dead_foreign_processes() -> anyhow:
         owner_session: "session-live".to_string(),
         run_generation: 1,
         process_id: std::process::id(),
+        process_started_at,
     };
     let dead_record = WorkspaceLeaseRecord {
         slot_index: 1,
@@ -127,6 +133,7 @@ async fn workspace_lease_store_releases_only_dead_foreign_processes() -> anyhow:
         runtime_workflow_id: Some("workflow-dead".to_string()),
         owner_session: "session-dead".to_string(),
         process_id: u32::MAX,
+        process_started_at: 1,
         ..live_record.clone()
     };
 
@@ -140,6 +147,44 @@ async fn workspace_lease_store_releases_only_dead_foreign_processes() -> anyhow:
     let leased = store.list_leased().await?;
     assert_eq!(leased.len(), 1);
     assert_eq!(leased[0].task_id, live_record.task_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_lease_store_releases_pid_reuse_mismatch() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = WorkspaceLeaseStore::open(&dir.path().join("workspace-leases")).await?;
+    let current_started_at = WorkspaceLeaseStore::current_process_started_at()?;
+    let stale_started_at = current_started_at.saturating_add(1);
+    let record = WorkspaceLeaseRecord {
+        project_key: "project-a".to_string(),
+        slot_index: 0,
+        task_id: harness_core::types::TaskId("pid-reuse-task".to_string()),
+        workspace_key: "workspace-reused-pid".to_string(),
+        workspace_path: dir.path().join("workspaces/project-a-slot-0"),
+        source_repo: dir.path().join("repo"),
+        repo: Some("owner/repo".to_string()),
+        runtime_workflow_id: Some("workflow-reused-pid".to_string()),
+        owner_session: "session-stale".to_string(),
+        run_generation: 1,
+        process_id: std::process::id(),
+        process_started_at: stale_started_at,
+    };
+
+    assert!(store.try_acquire_lease(&record).await?);
+    let released = store
+        .release_foreign_orphaned_leases("current-session")
+        .await?;
+
+    assert_eq!(released, 1);
+    assert!(
+        store.list_leased().await?.is_empty(),
+        "same pid with different start time should be treated as stale"
+    );
 
     Ok(())
 }

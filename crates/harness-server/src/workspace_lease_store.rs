@@ -19,6 +19,7 @@ pub(crate) struct WorkspaceLeaseRecord {
     pub(crate) owner_session: String,
     pub(crate) run_generation: u32,
     pub(crate) process_id: u32,
+    pub(crate) process_started_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -50,9 +51,9 @@ impl WorkspaceLeaseStore {
         let result = sqlx::query(
             "INSERT INTO workspace_leases (
                 project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                runtime_workflow_id, owner_session, run_generation, process_id,
+                runtime_workflow_id, owner_session, run_generation, process_id, process_started_at,
                 state, acquired_at, released_at, last_used_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'leased',
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'leased',
                        CURRENT_TIMESTAMP, NULL, CURRENT_TIMESTAMP)
              ON CONFLICT(project_key, slot_index) DO UPDATE SET
                 task_id = EXCLUDED.task_id,
@@ -64,6 +65,7 @@ impl WorkspaceLeaseStore {
                 owner_session = EXCLUDED.owner_session,
                 run_generation = EXCLUDED.run_generation,
                 process_id = EXCLUDED.process_id,
+                process_started_at = EXCLUDED.process_started_at,
                 state = 'leased',
                 acquired_at = CURRENT_TIMESTAMP,
                 released_at = NULL,
@@ -85,6 +87,7 @@ impl WorkspaceLeaseStore {
         .bind(&record.owner_session)
         .bind(record.run_generation as i64)
         .bind(record.process_id as i64)
+        .bind(i64::try_from(record.process_started_at)?)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -153,7 +156,8 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<u64> {
         let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                    runtime_workflow_id, owner_session, run_generation, process_id
+                    runtime_workflow_id, owner_session, run_generation, process_id,
+                    process_started_at
              FROM workspace_leases
              WHERE state = 'leased'
                AND owner_session <> $1",
@@ -168,7 +172,7 @@ impl WorkspaceLeaseStore {
         let mut released = 0;
         for row in rows {
             let record = WorkspaceLeaseRecord::try_from(row)?;
-            if process_is_alive(&system, record.process_id) {
+            if process_matches_lease(&system, record.process_id, record.process_started_at) {
                 continue;
             }
             if self.release_exact_lease(&record).await? {
@@ -189,6 +193,7 @@ impl WorkspaceLeaseStore {
                AND task_id = $3
                AND owner_session = $4
                AND process_id = $5
+               AND process_started_at = $6
                AND state = 'leased'",
         )
         .bind(&record.project_key)
@@ -196,6 +201,7 @@ impl WorkspaceLeaseStore {
         .bind(record.task_id.as_str())
         .bind(&record.owner_session)
         .bind(record.process_id as i64)
+        .bind(i64::try_from(record.process_started_at)?)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -225,7 +231,8 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<Option<WorkspaceLeaseRecord>> {
         let row = sqlx::query_as::<_, WorkspaceLeaseRow>(
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                    runtime_workflow_id, owner_session, run_generation, process_id
+                    runtime_workflow_id, owner_session, run_generation, process_id,
+                    process_started_at
              FROM workspace_leases
              WHERE project_key = $1
                AND workspace_key = $2
@@ -246,7 +253,8 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<Option<WorkspaceLeaseRecord>> {
         let row = sqlx::query_as::<_, WorkspaceLeaseRow>(
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                    runtime_workflow_id, owner_session, run_generation, process_id
+                    runtime_workflow_id, owner_session, run_generation, process_id,
+                    process_started_at
              FROM workspace_leases
              WHERE workspace_path = $1
                AND state = 'leased'
@@ -263,7 +271,8 @@ impl WorkspaceLeaseStore {
     pub(crate) async fn list_leased(&self) -> anyhow::Result<Vec<WorkspaceLeaseRecord>> {
         let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                    runtime_workflow_id, owner_session, run_generation, process_id
+                    runtime_workflow_id, owner_session, run_generation, process_id,
+                    process_started_at
              FROM workspace_leases
              WHERE state = 'leased'
              ORDER BY project_key, slot_index",
@@ -272,10 +281,30 @@ impl WorkspaceLeaseStore {
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
     }
+    pub(crate) fn current_process_started_at() -> anyhow::Result<u64> {
+        let mut system = System::new();
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
+        process_start_time(&system, std::process::id()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to resolve current process start time for pid {}",
+                std::process::id()
+            )
+        })
+    }
 }
 
-fn process_is_alive(system: &System, process_id: u32) -> bool {
-    process_id != 0 && system.process(sysinfo::Pid::from_u32(process_id)).is_some()
+fn process_start_time(system: &System, process_id: u32) -> Option<u64> {
+    if process_id == 0 {
+        return None;
+    }
+    system
+        .process(sysinfo::Pid::from_u32(process_id))
+        .map(sysinfo::Process::start_time)
+}
+
+fn process_matches_lease(system: &System, process_id: u32, process_started_at: u64) -> bool {
+    process_started_at != 0
+        && process_started_at == process_start_time(system, process_id).unwrap_or_default()
 }
 
 #[derive(sqlx::FromRow)]
@@ -291,6 +320,7 @@ struct WorkspaceLeaseRow {
     owner_session: String,
     run_generation: i64,
     process_id: i64,
+    process_started_at: i64,
 }
 
 impl TryFrom<WorkspaceLeaseRow> for WorkspaceLeaseRecord {
@@ -309,6 +339,7 @@ impl TryFrom<WorkspaceLeaseRow> for WorkspaceLeaseRecord {
             owner_session: row.owner_session,
             run_generation: u32::try_from(row.run_generation)?,
             process_id: u32::try_from(row.process_id)?,
+            process_started_at: u64::try_from(row.process_started_at)?,
         })
     }
 }
@@ -337,6 +368,7 @@ pub(crate) const WORKSPACE_LEASES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS 
     owner_session       TEXT NOT NULL,
     run_generation      BIGINT NOT NULL,
     process_id          BIGINT NOT NULL,
+    process_started_at  BIGINT NOT NULL DEFAULT 0,
     state               TEXT NOT NULL DEFAULT 'leased',
     acquired_at         TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     released_at         TIMESTAMPTZ,

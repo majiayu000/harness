@@ -238,6 +238,7 @@ async fn reconcile_disk_releases_dead_persisted_lease_before_cleanup() -> anyhow
         owner_session: "dead-foreign-session".to_string(),
         run_generation: 1,
         process_id: u32::MAX,
+        process_started_at: 1,
     };
     assert!(store.try_acquire_lease(&stale_record).await?);
 

@@ -237,6 +237,17 @@ impl WorkspaceManager {
             let workspace_key = workspace_slot_key(&project_key, slot_index);
             let workspace_path = self.config.root.join(&workspace_key);
             let selected_released_task_slot = preferred_slot == Some(slot_index);
+            let process_started_at = if self.lease_store.is_some() {
+                WorkspaceLeaseStore::current_process_started_at().map_err(|err| {
+                    WorkspaceLifecycleError::CreateFailed {
+                        workspace_path: workspace_path.clone(),
+                        workspace_owner: Some(owner_session.clone()),
+                        message: format!("failed to identify workspace lease process: {err}"),
+                    }
+                })?
+            } else {
+                0
+            };
             let lease_record = WorkspaceLeaseRecord {
                 project_key: project_key.clone(),
                 slot_index,
@@ -249,6 +260,7 @@ impl WorkspaceManager {
                 owner_session: owner_session.clone(),
                 run_generation,
                 process_id: std::process::id(),
+                process_started_at,
             };
             let Some(store) = self.lease_store.as_ref() else {
                 break (

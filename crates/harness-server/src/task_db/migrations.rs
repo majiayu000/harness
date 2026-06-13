@@ -19,6 +19,7 @@ use harness_core::db::Migration;
 /// v22 – add scheduler_state column as the single authoritative ownership/recovery contract.
 /// v23 – add indexes for server-side task list filters.
 /// v24 – add persisted workspace lease rows for the per-project worktree pool.
+/// v25 – add process start-time proof to persisted workspace leases.
 pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -180,5 +181,10 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         version: 24,
         description: "create workspace leases table",
         sql: crate::workspace_lease_store::WORKSPACE_LEASES_TABLE_SQL,
+    },
+    Migration {
+        version: 25,
+        description: "add process start-time proof to workspace leases",
+        sql: "ALTER TABLE workspace_leases ADD COLUMN process_started_at BIGINT NOT NULL DEFAULT 0",
     },
 ];

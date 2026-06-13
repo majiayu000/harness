@@ -54,6 +54,14 @@ fn kill_process_group_id(pid: u32) {
     }
 }
 
+#[cfg(unix)]
+fn process_group_has_members(pid: u32) -> bool {
+    // kill(-pgid, 0) performs existence/permission checking without sending a
+    // signal. A non-zero result is treated as drained; in this use case Harness
+    // owns the child group, so EPERM should not hide live descendants.
+    (unsafe { nix_kill(-(pid as i32), 0) }) == 0
+}
+
 /// Raw kill(2) syscall without libc dependency.
 #[cfg(unix)]
 unsafe fn nix_kill(pid: i32, sig: i32) -> i32 {
@@ -156,33 +164,55 @@ impl Drop for ManagedChild {
             agent_process = self.label,
             "agent child dropped while still running; killing process group before workspace release"
         );
+        let process_group_id = self.child.id();
         self.terminate_now();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut child_reaped = false;
         loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    self.reaped = true;
-                    return;
+            if !child_reaped {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => {
+                        child_reaped = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            agent_process = self.label,
+                            "failed waiting for killed agent child to exit: {error}"
+                        );
+                        child_reaped = true;
+                    }
                 }
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Ok(None) => {
+            }
+
+            #[cfg(unix)]
+            let group_drained = process_group_id.is_none_or(|pid| !process_group_has_members(pid));
+            #[cfg(not(unix))]
+            let group_drained = true;
+
+            if child_reaped && group_drained {
+                self.reaped = true;
+                return;
+            }
+
+            if std::time::Instant::now() >= deadline {
+                if !child_reaped {
                     tracing::warn!(
                         agent_process = self.label,
                         "timed out waiting for killed agent child to exit"
                     );
-                    return;
                 }
-                Err(error) => {
+                if !group_drained {
                     tracing::warn!(
                         agent_process = self.label,
-                        "failed waiting for killed agent child to exit: {error}"
+                        "timed out waiting for killed agent process group to drain"
                     );
-                    return;
                 }
+                return;
             }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
