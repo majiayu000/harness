@@ -12,6 +12,7 @@ use super::state::{RoundResult, TaskState};
 use super::store::{mutate_and_persist, TaskStore};
 use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
 use super::CompletionCallback;
+use crate::task_executor::SharedTurnInterceptors;
 
 /// Patterns that indicate a transient (retryable) failure rather than a permanent one.
 const TRANSIENT_PATTERNS: &[&str] = &[
@@ -404,7 +405,7 @@ pub async fn spawn_task(
     server_config: std::sync::Arc<harness_core::config::HarnessConfig>,
     skills: Arc<RwLock<harness_skills::store::SkillStore>>,
     events: Arc<harness_observe::event_store::EventStore>,
-    interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    interceptors: impl Into<SharedTurnInterceptors>,
     req: CreateTaskRequest,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
@@ -472,7 +473,7 @@ pub async fn spawn_preregistered_task(
     server_config: std::sync::Arc<harness_core::config::HarnessConfig>,
     skills: Arc<RwLock<harness_skills::store::SkillStore>>,
     events: Arc<harness_observe::event_store::EventStore>,
-    interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    interceptors: impl Into<SharedTurnInterceptors>,
     req: CreateTaskRequest,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
     permit: crate::task_queue::TaskPermit,
@@ -511,7 +512,7 @@ pub(super) async fn spawn_task_with_worktree_detector<F>(
     server_config: std::sync::Arc<harness_core::config::HarnessConfig>,
     skills: Arc<RwLock<harness_skills::store::SkillStore>>,
     events: Arc<harness_observe::event_store::EventStore>,
-    interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
+    interceptors: impl Into<SharedTurnInterceptors>,
     mut req: CreateTaskRequest,
     detect_worktree: F,
     workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
@@ -526,6 +527,7 @@ pub(super) async fn spawn_task_with_worktree_detector<F>(
 where
     F: Fn() -> PathBuf + Send + Sync + 'static,
 {
+    let interceptors = interceptors.into();
     let task_id = if let Some(id) = preregistered_id {
         // Task was pre-registered (e.g. by register_pending_task for batch submission);
         // store.insert and register_task_stream were already called.
@@ -552,7 +554,6 @@ where
     let events_watcher = events.clone();
     let id_watcher = id.clone();
     let workspace_mgr_watcher = workspace_mgr.clone();
-    let interceptors = Arc::new(interceptors);
     let detect_worktree = Arc::new(detect_worktree);
     // Clones used to store the abort handle after the main future is spawned
     // (store and id are moved into the spawn closure).

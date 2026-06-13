@@ -5,13 +5,14 @@ use crate::{
     complexity_router,
     http::resolve_reviewer,
     project_registry::{check_allowed_roots, ProjectRegistry},
+    task_executor::SharedTurnInterceptors,
     task_queue::TaskQueue,
     task_runner::{self, CompletionCallback, CreateTaskRequest, TaskId, TaskStore},
     workspace::WorkspaceManager,
 };
 use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
-use harness_core::{agent::CodeAgent, config::HarnessConfig, interceptor::TurnInterceptor};
+use harness_core::{agent::CodeAgent, config::HarnessConfig};
 use harness_skills::store::SkillStore;
 use harness_workflow::issue_lifecycle::{
     is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
@@ -123,7 +124,7 @@ pub struct DefaultExecutionService {
     server_config: Arc<HarnessConfig>,
     skills: Arc<RwLock<SkillStore>>,
     events: Arc<harness_observe::event_store::EventStore>,
-    interceptors: Vec<Arc<dyn TurnInterceptor>>,
+    interceptors: SharedTurnInterceptors,
     workspace_mgr: Option<Arc<WorkspaceManager>>,
     task_queue: Arc<TaskQueue>,
     review_task_queue: Arc<TaskQueue>,
@@ -315,7 +316,7 @@ impl DefaultExecutionService {
         server_config: Arc<HarnessConfig>,
         skills: Arc<RwLock<SkillStore>>,
         events: Arc<harness_observe::event_store::EventStore>,
-        interceptors: Vec<Arc<dyn TurnInterceptor>>,
+        interceptors: impl Into<SharedTurnInterceptors>,
         workspace_mgr: Option<Arc<WorkspaceManager>>,
         task_queue: Arc<TaskQueue>,
         review_task_queue: Arc<TaskQueue>,
@@ -331,7 +332,7 @@ impl DefaultExecutionService {
             server_config,
             skills,
             events,
-            interceptors,
+            interceptors: interceptors.into(),
             workspace_mgr,
             task_queue,
             review_task_queue,

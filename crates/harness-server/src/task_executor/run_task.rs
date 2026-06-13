@@ -9,6 +9,7 @@ use super::{
     agent_review, agent_review_provider_gate, gates, implement_pipeline, non_implementation,
     review_loop, triage_pipeline,
 };
+use crate::task_executor::SharedTurnInterceptors;
 use crate::task_runner::{
     mutate_and_persist, CreateTaskRequest, TaskId, TaskKind, TaskStatus, TaskStore,
 };
@@ -98,7 +99,7 @@ pub(crate) async fn run_task(
     reviewer: Option<&dyn CodeAgent>,
     skills: Arc<RwLock<harness_skills::store::SkillStore>>,
     events: Arc<harness_observe::event_store::EventStore>,
-    interceptors: Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
+    interceptors: SharedTurnInterceptors,
     req: &CreateTaskRequest,
     project: PathBuf,
     // Canonical project root used for project_id derivation in issue workflow records.

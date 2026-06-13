@@ -155,7 +155,7 @@ pub(crate) async fn run_implement_phase(
     server_config: &harness_core::config::HarnessConfig,
     project_config: &harness_core::config::project::ProjectConfig,
     _review_config: &harness_core::config::agents::AgentReviewConfig,
-    interceptors: &Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
+    interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     events: &Arc<harness_observe::event_store::EventStore>,
     skills: &Arc<tokio::sync::RwLock<harness_skills::store::SkillStore>>,
     cargo_env: &HashMap<String, String>,

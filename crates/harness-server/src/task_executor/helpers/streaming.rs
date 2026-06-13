@@ -9,13 +9,15 @@ use harness_core::types::{
 };
 use harness_observe::event_store::EventStore;
 use harness_observe::usage::UsageMetrics;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 
 static USAGE_EVENT_STORE: OnceLock<RwLock<Option<Arc<EventStore>>>> = OnceLock::new();
+const USAGE_EVENT_LOG_TIMEOUT: Duration = Duration::from_secs(2);
 
 use super::{is_prompt_only_task, persist_artifact, TurnExecutionFailure, TurnExecutionSuccess};
 
@@ -142,6 +144,20 @@ mod tests {
         assert_eq!(execution_phase_label(None), "unknown");
     }
 
+    #[tokio::test]
+    async fn usage_event_logging_timeout_is_non_blocking() {
+        let status = log_usage_event_with_timeout(
+            &TaskId::new(),
+            "claude",
+            "llm_prompt_input",
+            Duration::from_millis(1),
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+
+        assert_eq!(status, UsageEventLogStatus::TimedOut);
+    }
+
     #[test]
     fn usage_project_label_prefers_canonical_task_root() {
         let canonical = Path::new("/repo/main");
@@ -176,6 +192,47 @@ fn current_usage_event_store() -> Option<Arc<EventStore>> {
     guard.clone()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageEventLogStatus {
+    Logged,
+    Failed,
+    TimedOut,
+}
+
+async fn log_usage_event_with_timeout<F>(
+    task_id: &TaskId,
+    agent: &str,
+    hook: &str,
+    timeout_duration: Duration,
+    log: F,
+) -> UsageEventLogStatus
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    match tokio::time::timeout(timeout_duration, log).await {
+        Ok(Ok(())) => UsageEventLogStatus::Logged,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                task_id = %task_id,
+                agent,
+                hook,
+                "failed to log usage event: {error}"
+            );
+            UsageEventLogStatus::Failed
+        }
+        Err(_) => {
+            tracing::warn!(
+                task_id = %task_id,
+                agent,
+                hook,
+                timeout_secs = timeout_duration.as_secs_f64(),
+                "timed out logging usage event"
+            );
+            UsageEventLogStatus::TimedOut
+        }
+    }
+}
+
 async fn log_llm_usage_event(
     events: &EventStore,
     task_id: &TaskId,
@@ -191,13 +248,14 @@ async fn log_llm_usage_event(
         return;
     };
 
-    if let Err(error) = events.log(&event).await {
-        tracing::warn!(
-            task_id = %task_id,
-            agent,
-            "failed to log llm_usage event: {error}"
-        );
-    }
+    log_usage_event_with_timeout(
+        task_id,
+        agent,
+        "llm_usage",
+        USAGE_EVENT_LOG_TIMEOUT,
+        async { events.log(&event).await.map(|_| ()) },
+    )
+    .await;
 }
 
 async fn log_prompt_input_event(
@@ -221,13 +279,14 @@ async fn log_prompt_input_event(
         prompt,
         context_items,
     );
-    if let Err(error) = events.log(&event).await {
-        tracing::warn!(
-            task_id = %task_id,
-            agent,
-            "failed to log llm_prompt_input event: {error}"
-        );
-    }
+    log_usage_event_with_timeout(
+        task_id,
+        agent,
+        "llm_prompt_input",
+        USAGE_EVENT_LOG_TIMEOUT,
+        async { events.log(&event).await.map(|_| ()) },
+    )
+    .await;
 }
 
 fn build_prompt_input_event(

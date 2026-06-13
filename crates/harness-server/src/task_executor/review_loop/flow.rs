@@ -33,7 +33,7 @@ pub(crate) async fn run_review_loop(
     project_root: &Path,
     req: &CreateTaskRequest,
     events: &Arc<harness_observe::event_store::EventStore>,
-    interceptors: &Arc<Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>>,
+    interceptors: &[Arc<dyn harness_core::interceptor::TurnInterceptor>],
     context_items: &[harness_core::types::ContextItem],
     project: &Path,
     cargo_env: &HashMap<String, String>,
