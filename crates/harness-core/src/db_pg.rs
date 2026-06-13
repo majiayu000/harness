@@ -1,5 +1,5 @@
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use sqlx::Acquire as _;
+use sqlx::{Acquire as _, Postgres, Transaction};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -583,6 +583,15 @@ impl<'a> PgMigrator<'a> {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(
+                hashtextextended('harness_schema_migrations:' || current_schema(), 0)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version     BIGINT PRIMARY KEY,
@@ -590,12 +599,12 @@ impl<'a> PgMigrator<'a> {
                 applied_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await?;
 
         let rows: Vec<(i64,)> =
             sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version ASC")
-                .fetch_all(self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
         let applied: HashSet<u32> = rows.into_iter().map(|(v,)| v as u32).collect();
 
@@ -607,15 +616,18 @@ impl<'a> PgMigrator<'a> {
         pending.sort_by_key(|m| m.version);
 
         for migration in pending {
-            self.apply(migration).await?;
+            Self::apply(&mut tx, migration).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn apply(&self, migration: &Migration) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+    async fn apply(
+        tx: &mut Transaction<'_, Postgres>,
+        migration: &Migration,
+    ) -> anyhow::Result<()> {
         for stmt in crate::db_pg_split::pg_split_statements(migration.sql) {
-            let mut statement_tx = (&mut tx).begin().await?;
+            let mut statement_tx = (&mut *tx).begin().await?;
             match sqlx::query(&stmt).execute(&mut *statement_tx).await {
                 Ok(_) => {
                     statement_tx.commit().await?;
@@ -639,9 +651,8 @@ impl<'a> PgMigrator<'a> {
         sqlx::query("INSERT INTO schema_migrations (version, description) VALUES ($1, $2)")
             .bind(migration.version as i64)
             .bind(migration.description)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-        tx.commit().await?;
         Ok(())
     }
 }
