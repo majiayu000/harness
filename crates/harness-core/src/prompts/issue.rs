@@ -89,8 +89,25 @@ pub fn plan_prompt(issue: u64, triage_assessment: &str) -> PromptParts {
 /// This is used when the current implementation plan proved incomplete or wrong
 /// during execution. The architect must produce a corrected plan rather than
 /// letting the executor silently diverge.
-pub fn replan_prompt(issue: u64, prior_plan: Option<&str>, plan_issue: &str) -> PromptParts {
+pub fn replan_prompt(
+    issue: u64,
+    issue_context: Option<&str>,
+    triage_output: Option<&str>,
+    prior_plan: Option<&str>,
+    plan_issue: &str,
+) -> PromptParts {
+    let issue_context_section = issue_context
+        .filter(|context| !context.trim().is_empty())
+        .map(wrap_external_data)
+        .map(|safe_context| format!("Original GitHub issue context:\n{safe_context}\n\n"))
+        .unwrap_or_default();
+    let triage_output_section = triage_output
+        .filter(|triage| !triage.trim().is_empty())
+        .map(wrap_external_data)
+        .map(|safe_triage| format!("Previous triage output:\n{safe_triage}\n\n"))
+        .unwrap_or_default();
     let prior_plan_section = prior_plan
+        .filter(|plan| !plan.trim().is_empty())
         .map(wrap_external_data)
         .map(|safe_plan| format!("Previous implementation plan:\n{safe_plan}\n\n"))
         .unwrap_or_default();
@@ -99,8 +116,11 @@ pub fn replan_prompt(issue: u64, prior_plan: Option<&str>, plan_issue: &str) -> 
         static_instructions: format!(
             "You are a Software Architect repairing the implementation plan for GitHub issue #{issue}.\n\n\
              A previous implementation attempt refused to proceed because the current plan was incomplete or wrong.\n\n\
+             The original GitHub issue contract is authoritative. Do not let the implementation concern redefine the issue requirements.\n\n\
+             {issue_context_section}\
+             {triage_output_section}\
              {prior_plan_section}\
-             Implementation concern raised by the executor:\n\
+             Implementation concern raised by the executor via PLAN_ISSUE:\n\
              {safe_plan_issue}\n\n\
              Produce a corrected implementation plan:\n\n\
              1. **Files to modify** — list each file with a one-line rationale\n\
@@ -272,9 +292,22 @@ mod tests {
 
     #[test]
     fn test_replan_prompt() {
-        let p = replan_prompt(42, Some("old plan"), "missed auth bypass").to_prompt_string();
+        let p = replan_prompt(
+            42,
+            Some("Title: original contract\nBody: keep route unauthenticated"),
+            Some("TRIAGE=PROCEED_WITH_PLAN"),
+            Some("old plan"),
+            "missed auth bypass",
+        )
+        .to_prompt_string();
         assert!(p.contains("repairing the implementation plan"));
+        assert!(p.contains("Original GitHub issue context"));
+        assert!(p.contains("keep route unauthenticated"));
+        assert!(p.contains("Previous triage output"));
+        assert!(p.contains("TRIAGE=PROCEED_WITH_PLAN"));
+        assert!(p.contains("old plan"));
         assert!(p.contains("missed auth bypass"));
+        assert!(p.contains("PLAN_ISSUE"));
         assert!(p.contains("PLAN=READY"));
     }
 

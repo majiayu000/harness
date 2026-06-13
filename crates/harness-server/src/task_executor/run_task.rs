@@ -472,6 +472,8 @@ pub(crate) async fn run_task(
                             store,
                             task_id,
                             issue,
+                            &repo_slug,
+                            server_config.server.github_token.as_deref(),
                             prior_plan.as_deref().or(current_plan_output.as_deref()),
                             &plan_issue,
                             &cargo_env,

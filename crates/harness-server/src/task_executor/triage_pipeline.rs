@@ -30,16 +30,25 @@ type IssueFetchFn = for<'a> fn(&'a str, u64, Option<&'a str>) -> IssueFetchFutur
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TypedIssueSnapshot {
+    title: String,
     body: String,
     labels: Vec<String>,
+    state: Option<String>,
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GitHubIssueSnapshotResponse {
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     body: Option<String>,
     #[serde(default)]
     labels: Vec<GitHubIssueLabel>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,12 +335,15 @@ async fn fetch_typed_issue_snapshot(
     }
     let snapshot: GitHubIssueSnapshotResponse = response.json().await?;
     Ok(TypedIssueSnapshot {
+        title: snapshot.title.unwrap_or_default(),
         body: snapshot.body.unwrap_or_default(),
         labels: snapshot
             .labels
             .into_iter()
             .map(|label| label.name)
             .collect(),
+        state: snapshot.state,
+        url: snapshot.html_url,
     })
 }
 
@@ -341,6 +353,75 @@ fn fetch_typed_issue_snapshot_boxed<'a>(
     github_token: Option<&'a str>,
 ) -> IssueFetchFuture<'a> {
     Box::pin(fetch_typed_issue_snapshot(repo_slug, issue, github_token))
+}
+
+fn usable_repo_slug(candidate: &str) -> Option<&str> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate == UNKNOWN_REPO_SLUG {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+fn resolve_replan_repo_slug(
+    detected_repo_slug: &str,
+    request_repo: Option<&str>,
+    task_repo: Option<&str>,
+) -> String {
+    usable_repo_slug(detected_repo_slug)
+        .or_else(|| request_repo.and_then(usable_repo_slug))
+        .or_else(|| task_repo.and_then(usable_repo_slug))
+        .unwrap_or(UNKNOWN_REPO_SLUG)
+        .to_string()
+}
+
+fn format_replan_issue_context(
+    repo_slug: &str,
+    issue: u64,
+    snapshot: &TypedIssueSnapshot,
+) -> String {
+    let mut context = vec![
+        format!("Repository: {repo_slug}"),
+        format!("Issue: #{issue}"),
+    ];
+    if !snapshot.title.trim().is_empty() {
+        context.push(format!("Title: {}", snapshot.title.trim()));
+    }
+    if let Some(state) = snapshot
+        .state
+        .as_deref()
+        .filter(|state| !state.trim().is_empty())
+    {
+        context.push(format!("State: {}", state.trim()));
+    }
+    if let Some(url) = snapshot.url.as_deref().filter(|url| !url.trim().is_empty()) {
+        context.push(format!("URL: {}", url.trim()));
+    }
+    if !snapshot.labels.is_empty() {
+        context.push(format!("Labels: {}", snapshot.labels.join(", ")));
+    }
+    if !snapshot.body.trim().is_empty() {
+        context.push("Body:".to_string());
+        context.push(snapshot.body.clone());
+    }
+    context.join("\n")
+}
+
+fn format_unavailable_replan_issue_context(
+    repo_slug: &str,
+    issue: u64,
+    fetch_error: &anyhow::Error,
+) -> String {
+    [
+        format!("Repository: {repo_slug}"),
+        format!("Issue: #{issue}"),
+        "Live GitHub issue context unavailable before replan.".to_string(),
+        format!("Issue fetch error: {fetch_error:#}"),
+        "Continue from the saved triage output, previous implementation plan, and PLAN_ISSUE concern."
+            .to_string(),
+    ]
+    .join("\n")
 }
 
 async fn record_phase_observability(
@@ -972,11 +1053,14 @@ async fn run_triage_plan_pipeline_with_issue_fetcher(
 ///
 /// Returns the corrected plan text and advances the task phase back to
 /// `Implement`. The caller decides whether to retry implementation or fail.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_replan_for_issue(
     agent: &dyn CodeAgent,
     store: &TaskStore,
     task_id: &TaskId,
     issue: u64,
+    repo_slug: &str,
+    github_token: Option<&str>,
     prior_plan: Option<&str>,
     plan_issue: &str,
     cargo_env: &HashMap<String, String>,
@@ -985,13 +1069,106 @@ pub(crate) async fn run_replan_for_issue(
     skills: &RwLock<harness_skills::store::SkillStore>,
     events: &EventStore,
 ) -> anyhow::Result<String> {
+    run_replan_for_issue_with_issue_fetcher(
+        agent,
+        store,
+        task_id,
+        issue,
+        repo_slug,
+        github_token,
+        prior_plan,
+        plan_issue,
+        cargo_env,
+        project,
+        req,
+        skills,
+        events,
+        fetch_typed_issue_snapshot_boxed,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_replan_for_issue_with_issue_fetcher(
+    agent: &dyn CodeAgent,
+    store: &TaskStore,
+    task_id: &TaskId,
+    issue: u64,
+    repo_slug: &str,
+    github_token: Option<&str>,
+    prior_plan: Option<&str>,
+    plan_issue: &str,
+    cargo_env: &HashMap<String, String>,
+    project: &Path,
+    req: &CreateTaskRequest,
+    skills: &RwLock<harness_skills::store::SkillStore>,
+    events: &EventStore,
+    issue_fetcher: IssueFetchFn,
+) -> anyhow::Result<String> {
     tracing::info!(task_id = %task_id, issue, "pipeline: starting replan phase");
     mutate_and_persist(store, task_id, |state| {
         state.phase = TaskPhase::Plan;
     })
     .await?;
 
-    let prompt = prompts::replan_prompt(issue, prior_plan, plan_issue).to_prompt_string();
+    let saved_task = store.get(task_id);
+    let checkpoint = match store.load_checkpoint(task_id).await {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task_id,
+                "failed to load replan checkpoint context; continuing from task state only: {error:#}"
+            );
+            None
+        }
+    };
+    let saved_triage_output = saved_task
+        .as_ref()
+        .and_then(|state| state.triage_output.as_deref())
+        .or_else(|| {
+            checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.triage_output.as_deref())
+        });
+    let prior_plan = prior_plan
+        .or_else(|| {
+            saved_task
+                .as_ref()
+                .and_then(|state| state.plan_output.as_deref())
+        })
+        .or_else(|| {
+            checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.plan_output.as_deref())
+        });
+    let replan_repo_slug = resolve_replan_repo_slug(
+        repo_slug,
+        req.repo.as_deref(),
+        saved_task.as_ref().and_then(|state| state.repo.as_deref()),
+    );
+    let issue_context = match issue_fetcher(&replan_repo_slug, issue, github_token).await {
+        Ok(issue_snapshot) => {
+            format_replan_issue_context(&replan_repo_slug, issue, &issue_snapshot)
+        }
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task_id,
+                issue,
+                repo = %replan_repo_slug,
+                "failed to fetch GitHub issue context before replan; continuing from saved task context: {error:#}"
+            );
+            format_unavailable_replan_issue_context(&replan_repo_slug, issue, &error)
+        }
+    };
+
+    let prompt = prompts::replan_prompt(
+        issue,
+        Some(&issue_context),
+        saved_triage_output,
+        prior_plan,
+        plan_issue,
+    )
+    .to_prompt_string();
     let prompt = augment_prompt_with_skills(skills, events, task_id, prompt).await;
     let plan_req = AgentRequest {
         prompt,

@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use harness_core::agent::{AgentResponse, StreamItem};
 use harness_core::error::HarnessError;
 use harness_core::types::{Capability, EventFilters, TokenUsage};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 struct PromptPlanningAgent;
 
@@ -13,11 +13,21 @@ struct TriageStaticStreamAgent {
     output: String,
 }
 
+struct CapturingReplanAgent {
+    prompt: Arc<Mutex<Option<String>>>,
+}
+
 impl TriageStaticStreamAgent {
     fn new(output: &str) -> Self {
         Self {
             output: output.to_string(),
         }
+    }
+}
+
+impl CapturingReplanAgent {
+    fn new(prompt: Arc<Mutex<Option<String>>>) -> Self {
+        Self { prompt }
     }
 }
 
@@ -119,6 +129,40 @@ impl CodeAgent for TriageStaticStreamAgent {
         })
         .await
         .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+        tx.send(StreamItem::Done)
+            .await
+            .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CodeAgent for CapturingReplanAgent {
+    fn name(&self) -> &str {
+        "capturing-replan-agent"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        *self.prompt.lock().expect("capture prompt lock") = Some(req.prompt);
+        Ok(AgentResponse {
+            output: "corrected plan\nPLAN=READY".to_string(),
+            stderr: String::new(),
+            items: vec![],
+            token_usage: TokenUsage::default(),
+            model: "mock".to_string(),
+            exit_code: Some(0),
+        })
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
         tx.send(StreamItem::Done)
             .await
             .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
@@ -333,6 +377,7 @@ fn actionable_review_issue_fetcher<'a>(
         Ok(TypedIssueSnapshot {
             body: actionable_issue_body(),
             labels: vec!["review".to_string(), "P1".to_string()],
+            ..TypedIssueSnapshot::default()
         })
     })
 }
@@ -346,6 +391,7 @@ fn actionable_no_label_issue_fetcher<'a>(
         Ok(TypedIssueSnapshot {
             body: actionable_issue_body(),
             labels: vec![],
+            ..TypedIssueSnapshot::default()
         })
     })
 }
@@ -359,6 +405,7 @@ fn abstract_review_issue_fetcher<'a>(
         Ok(TypedIssueSnapshot {
             body: abstract_issue_body(),
             labels: vec!["review".to_string()],
+            ..TypedIssueSnapshot::default()
         })
     })
 }
@@ -369,6 +416,38 @@ fn failing_issue_fetcher<'a>(
     _github_token: Option<&'a str>,
 ) -> IssueFetchFuture<'a> {
     Box::pin(async { Err(anyhow::anyhow!("simulated GitHub failure")) })
+}
+
+fn failing_replan_issue_fetcher<'a>(
+    repo_slug: &'a str,
+    issue: u64,
+    github_token: Option<&'a str>,
+) -> IssueFetchFuture<'a> {
+    Box::pin(async move {
+        assert_eq!(repo_slug, "workflow/repo");
+        assert_eq!(issue, 988);
+        assert_eq!(github_token, None);
+        Err(anyhow::anyhow!("simulated GitHub failure"))
+    })
+}
+
+fn replan_issue_fetcher<'a>(
+    repo_slug: &'a str,
+    issue: u64,
+    github_token: Option<&'a str>,
+) -> IssueFetchFuture<'a> {
+    Box::pin(async move {
+        assert_eq!(repo_slug, "owner/repo");
+        assert_eq!(issue, 988);
+        assert_eq!(github_token, Some("github-token"));
+        Ok(TypedIssueSnapshot {
+            title: "Keep public route contract".to_string(),
+            body: "The route must remain unauthenticated even if the agent disagrees.".to_string(),
+            labels: vec!["runtime".to_string(), "force-execute".to_string()],
+            state: Some("open".to_string()),
+            url: Some("https://github.com/owner/repo/issues/988".to_string()),
+        })
+    })
 }
 
 async fn setup_issue_task_harness() -> anyhow::Result<(
@@ -396,6 +475,191 @@ async fn setup_issue_task_harness() -> anyhow::Result<(
     };
     let skills = RwLock::new(harness_skills::store::SkillStore::new());
     Ok((dir, store, events, task_id, req, skills))
+}
+
+#[tokio::test]
+async fn run_replan_for_issue_prompt_includes_issue_context_triage_plan_and_plan_issue(
+) -> anyhow::Result<()> {
+    let (dir, store, events, task_id, req, skills) = setup_issue_task_harness().await?;
+    mutate_and_persist(&store, &task_id, |state| {
+        state.triage_output = Some(
+            "Complex enough for planning.\nCOMPLEXITY=medium\nTRIAGE=PROCEED_WITH_PLAN".to_string(),
+        );
+        state.plan_output = Some("persisted fallback plan".to_string());
+    })
+    .await?;
+
+    let captured_prompt = Arc::new(Mutex::new(None));
+    let agent = CapturingReplanAgent::new(captured_prompt.clone());
+    let cargo_env = HashMap::new();
+    let plan = run_replan_for_issue_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        "owner/repo",
+        Some("github-token"),
+        Some("previous implementation plan"),
+        "PLAN_ISSUE=agent wants to add auth despite the issue contract",
+        &cargo_env,
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        replan_issue_fetcher,
+    )
+    .await?;
+
+    assert_eq!(plan, "corrected plan\nPLAN=READY");
+    let prompt = captured_prompt
+        .lock()
+        .expect("capture prompt lock")
+        .clone()
+        .expect("replan prompt should be captured");
+    assert!(prompt.contains("Original GitHub issue context"));
+    assert!(prompt.contains("Keep public route contract"));
+    assert!(prompt.contains("https://github.com/owner/repo/issues/988"));
+    assert!(prompt.contains("The route must remain unauthenticated"));
+    assert!(prompt.contains("Previous triage output"));
+    assert!(prompt.contains("TRIAGE=PROCEED_WITH_PLAN"));
+    assert!(prompt.contains("Previous implementation plan"));
+    assert!(prompt.contains("previous implementation plan"));
+    assert!(prompt.contains("Implementation concern raised by the executor"));
+    assert!(prompt.contains("PLAN_ISSUE=agent wants to add auth"));
+
+    let state = store.get(&task_id).expect("task state");
+    assert_eq!(state.phase, TaskPhase::Implement);
+    assert_eq!(
+        state.plan_output.as_deref(),
+        Some("corrected plan\nPLAN=READY")
+    );
+    assert!(state
+        .rounds
+        .iter()
+        .any(|round| round.action == "replan" && round.result == "plan_ready"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_replan_for_issue_uses_saved_context_when_issue_fetch_is_unavailable(
+) -> anyhow::Result<()> {
+    let (dir, store, events, task_id, mut req, skills) = setup_issue_task_harness().await?;
+    req.repo = Some("workflow/repo".to_string());
+    mutate_and_persist(&store, &task_id, |state| {
+        state.repo = Some("task-state/repo".to_string());
+        state.triage_output =
+            Some("saved triage\nCOMPLEXITY=medium\nTRIAGE=PROCEED_WITH_PLAN".to_string());
+        state.plan_output = Some("saved fallback plan".to_string());
+    })
+    .await?;
+
+    let captured_prompt = Arc::new(Mutex::new(None));
+    let agent = CapturingReplanAgent::new(captured_prompt.clone());
+    let cargo_env = HashMap::new();
+    let plan = run_replan_for_issue_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        UNKNOWN_REPO_SLUG,
+        None,
+        None,
+        "PLAN_ISSUE=implementation needs a safer plan",
+        &cargo_env,
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        failing_replan_issue_fetcher,
+    )
+    .await?;
+
+    assert_eq!(plan, "corrected plan\nPLAN=READY");
+    let prompt = captured_prompt
+        .lock()
+        .expect("capture prompt lock")
+        .clone()
+        .expect("replan prompt should be captured");
+    assert!(prompt.contains("Original GitHub issue context"));
+    assert!(prompt.contains("Repository: workflow/repo"));
+    assert!(prompt.contains("Issue: #988"));
+    assert!(prompt.contains("Live GitHub issue context unavailable before replan."));
+    assert!(prompt.contains("simulated GitHub failure"));
+    assert!(prompt.contains("Previous triage output"));
+    assert!(prompt.contains("saved triage"));
+    assert!(prompt.contains("Previous implementation plan"));
+    assert!(prompt.contains("saved fallback plan"));
+    assert!(prompt.contains("PLAN_ISSUE=implementation needs a safer plan"));
+
+    let state = store.get(&task_id).expect("task state");
+    assert_eq!(state.phase, TaskPhase::Implement);
+    assert_eq!(
+        state.plan_output.as_deref(),
+        Some("corrected plan\nPLAN=READY")
+    );
+    assert!(state
+        .rounds
+        .iter()
+        .any(|round| round.action == "replan" && round.result == "plan_ready"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_replan_for_issue_uses_checkpoint_context_after_recovery_when_issue_fetch_fails(
+) -> anyhow::Result<()> {
+    let (dir, store, events, task_id, mut req, skills) = setup_issue_task_harness().await?;
+    req.repo = Some("workflow/repo".to_string());
+    mutate_and_persist(&store, &task_id, |state| {
+        state.repo = Some("task-state/repo".to_string());
+        state.triage_output = None;
+        state.plan_output = None;
+    })
+    .await?;
+    store
+        .write_checkpoint(
+            &task_id,
+            Some("checkpoint triage\nCOMPLEXITY=medium\nTRIAGE=PROCEED_WITH_PLAN"),
+            Some("checkpoint implementation plan"),
+            None,
+            "plan_done",
+        )
+        .await?;
+
+    let captured_prompt = Arc::new(Mutex::new(None));
+    let agent = CapturingReplanAgent::new(captured_prompt.clone());
+    let cargo_env = HashMap::new();
+    let plan = run_replan_for_issue_with_issue_fetcher(
+        &agent,
+        &store,
+        &task_id,
+        988,
+        UNKNOWN_REPO_SLUG,
+        None,
+        None,
+        "PLAN_ISSUE=recovered task needs a safer plan",
+        &cargo_env,
+        dir.path(),
+        &req,
+        &skills,
+        &events,
+        failing_replan_issue_fetcher,
+    )
+    .await?;
+
+    assert_eq!(plan, "corrected plan\nPLAN=READY");
+    let prompt = captured_prompt
+        .lock()
+        .expect("capture prompt lock")
+        .clone()
+        .expect("replan prompt should be captured");
+    assert!(prompt.contains("Repository: workflow/repo"));
+    assert!(prompt.contains("Live GitHub issue context unavailable before replan."));
+    assert!(prompt.contains("Previous triage output"));
+    assert!(prompt.contains("checkpoint triage"));
+    assert!(prompt.contains("Previous implementation plan"));
+    assert!(prompt.contains("checkpoint implementation plan"));
+    assert!(prompt.contains("PLAN_ISSUE=recovered task needs a safer plan"));
+    Ok(())
 }
 
 #[tokio::test]
@@ -610,6 +874,7 @@ fn resolve_triage_decision_promotes_only_actionable_skip() {
     let actionable = TypedIssueSnapshot {
         body: actionable_issue_body(),
         labels: vec!["review".to_string()],
+        ..TypedIssueSnapshot::default()
     };
     let resolved = resolve_triage_decision(
         prompts::TriageDecision::Skip,
@@ -622,6 +887,7 @@ fn resolve_triage_decision_promotes_only_actionable_skip() {
     let abstract_issue = TypedIssueSnapshot {
         body: abstract_issue_body(),
         labels: vec!["review".to_string()],
+        ..TypedIssueSnapshot::default()
     };
     let resolved = resolve_triage_decision(
         prompts::TriageDecision::Skip,
