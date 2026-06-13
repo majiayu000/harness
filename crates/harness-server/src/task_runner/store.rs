@@ -158,30 +158,60 @@ impl TaskStore {
         Self::from_task_db(db, db_path).await
     }
 
+    pub async fn open_shared_for_reconciliation_with_data_dir(
+        db_path: &std::path::Path,
+        context: &PgStoreContext,
+        setup_pool: &sqlx::postgres::PgPool,
+        data_dir: &std::path::Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_shared_with_data_dir(context, setup_pool, data_dir).await?;
+        crate::task_db::migrate_legacy_task_db_if_needed(db_path, configured_database_url, &db)
+            .await?;
+        Self::from_task_db_without_startup_recovery(db, db_path).await
+    }
+
     async fn from_task_db(db: TaskDb, db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
+        Self::from_task_db_with_startup_recovery(db, db_path, true).await
+    }
+
+    async fn from_task_db_without_startup_recovery(
+        db: TaskDb,
+        db_path: &std::path::Path,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::from_task_db_with_startup_recovery(db, db_path, false).await
+    }
+
+    async fn from_task_db_with_startup_recovery(
+        db: TaskDb,
+        db_path: &std::path::Path,
+        run_startup_recovery: bool,
+    ) -> anyhow::Result<Arc<Self>> {
         // 1. Event replay: runs BEFORE recover_in_progress so event-sourced
         //    data (pr_url, terminal status) wins over checkpoint data.
         let event_log_path = db_path
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .join("task-events.jsonl");
-        if let Err(e) = crate::event_replay::replay_and_recover(&db, &event_log_path).await {
-            tracing::warn!("startup: event replay failed (non-fatal): {e}");
-        }
+        if run_startup_recovery {
+            if let Err(e) = crate::event_replay::replay_and_recover(&db, &event_log_path).await {
+                tracing::warn!("startup: event replay failed (non-fatal): {e}");
+            }
 
-        // 2. Legacy checkpoint-based recovery as fallback.
-        let recovery = db.recover_in_progress().await?;
-        if recovery.resumed > 0 {
-            tracing::info!(
-                "startup recovery: resumed {} task(s) from checkpoint",
-                recovery.resumed
-            );
-        }
-        if recovery.failed > 0 {
-            tracing::warn!(
-                "startup recovery: marked {} interrupted task(s) as failed (no fresh checkpoint)",
-                recovery.failed
-            );
+            // 2. Legacy checkpoint-based recovery as fallback.
+            let recovery = db.recover_in_progress().await?;
+            if recovery.resumed > 0 {
+                tracing::info!(
+                    "startup recovery: resumed {} task(s) from checkpoint",
+                    recovery.resumed
+                );
+            }
+            if recovery.failed > 0 {
+                tracing::warn!(
+                    "startup recovery: marked {} interrupted task(s) as failed (no fresh checkpoint)",
+                    recovery.failed
+                );
+            }
         }
 
         // 3. Open the event log for appending during this server session.
