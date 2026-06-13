@@ -246,6 +246,14 @@ async fn cancelled_abort_releases_workspace_after_watcher_observes_join() -> any
 
     agent.wait_started(Duration::from_secs(15)).await?;
     assert_eq!(workspace_mgr.live_count(), 1);
+    let workspace_path = store
+        .get(&task_id)
+        .and_then(|state| state.workspace_path)
+        .expect("workspace path should be persisted after admission");
+    assert!(
+        workspace_path.exists(),
+        "workspace should exist before cancellation"
+    );
     mutate_and_persist(&store, &task_id, |s| {
         s.status = TaskStatus::Cancelled;
         s.scheduler.mark_terminal(&TaskStatus::Cancelled);
@@ -262,6 +270,10 @@ async fn cancelled_abort_releases_workspace_after_watcher_observes_join() -> any
         "running task should have an abort handle"
     );
     helpers::wait_until(Duration::from_secs(15), || workspace_mgr.live_count() == 0).await?;
+    assert!(
+        !workspace_path.exists(),
+        "cancelled prompt workspace should be removed after abort teardown"
+    );
     assert_eq!(
         store.get(&task_id).map(|state| state.status),
         Some(TaskStatus::Cancelled)

@@ -996,7 +996,17 @@ where
                 // Cancelled before abort() was called — do not overwrite with Failed.
                 tracing::info!("task {id_watcher:?} cancelled via abort");
                 if let Some(wmgr) = workspace_mgr_watcher.as_ref() {
-                    wmgr.release_workspace(&id_watcher).await;
+                    let final_state = store_watcher.get(&id_watcher);
+                    if should_remove_workspace_after_task(
+                        final_state.as_ref(),
+                        wmgr.config.auto_cleanup,
+                    ) {
+                        if let Err(e) = wmgr.remove_workspace(&id_watcher).await {
+                            tracing::warn!("workspace cleanup failed for {id_watcher:?}: {e}");
+                        }
+                    } else {
+                        wmgr.release_workspace(&id_watcher).await;
+                    }
                 }
             }
             Err(join_err) => {
