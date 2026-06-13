@@ -4,8 +4,11 @@ use harness_core::types::ExecutionPhase;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+pub const PROVIDER_WAIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub const PROVIDER_WAIT_INITIAL_HEARTBEAT_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderPhase {

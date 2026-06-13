@@ -1,4 +1,7 @@
-use crate::provider_backpressure::ProviderBackpressureGate;
+use crate::provider_backpressure::{
+    ProviderBackpressureGate, ProviderBackpressurePermit, ProviderPhase,
+    PROVIDER_WAIT_HEARTBEAT_INTERVAL, PROVIDER_WAIT_INITIAL_HEARTBEAT_DELAY,
+};
 use async_trait::async_trait;
 use harness_core::{agent::AgentAdapter, agent::AgentEvent, agent::TurnRequest, types::TokenUsage};
 use harness_observe::usage::parse_result_usage_metrics;
@@ -83,14 +86,8 @@ impl AgentAdapter for ClaudeAdapter {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));
         }
 
-        let provider_permit = self
-            .provider_gate
-            .acquire(
-                req.execution_phase,
-                req.prompt.chars().count(),
-                req.prompt.len(),
-            )
-            .await?;
+        let provider_permit =
+            acquire_provider_permit_with_event_heartbeat(&self.provider_gate, &req, &tx).await?;
         tracing::debug!(
             phase = provider_permit.phase().label(),
             waited_ms = provider_permit.waited_ms(),
@@ -269,6 +266,46 @@ impl AgentAdapter for ClaudeAdapter {
     }
 }
 
+async fn acquire_provider_permit_with_event_heartbeat(
+    gate: &ProviderBackpressureGate,
+    req: &TurnRequest,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> harness_core::error::Result<ProviderBackpressurePermit> {
+    let prompt_chars = req.prompt.chars().count();
+    let prompt_bytes = req.prompt.len();
+    if !gate.is_enabled() {
+        return gate
+            .acquire(req.execution_phase, prompt_chars, prompt_bytes)
+            .await;
+    }
+
+    let phase = ProviderPhase::from_execution_phase(req.execution_phase);
+    let mut acquire = Box::pin(gate.acquire(req.execution_phase, prompt_chars, prompt_bytes));
+    let mut heartbeat = Box::pin(tokio::time::sleep(PROVIDER_WAIT_INITIAL_HEARTBEAT_DELAY));
+    loop {
+        tokio::select! {
+            permit = &mut acquire => return permit,
+            _ = &mut heartbeat => {
+                if tx.send(AgentEvent::Warning {
+                    message: provider_wait_message(phase),
+                }).await.is_err() {
+                    return Err(harness_core::error::HarnessError::AgentExecution(
+                        "agent event channel closed while waiting for Claude provider capacity".into(),
+                    ));
+                }
+                heartbeat.as_mut().reset(tokio::time::Instant::now() + PROVIDER_WAIT_HEARTBEAT_INTERVAL);
+            }
+        }
+    }
+}
+
+fn provider_wait_message(phase: ProviderPhase) -> String {
+    format!(
+        "Waiting for Claude provider capacity for {} phase",
+        phase.label()
+    )
+}
+
 /// Parse a single line of Claude Code `--output-format stream-json` output.
 ///
 /// Returns `None` for unrecognized event types (forward compatibility).
@@ -343,6 +380,12 @@ pub fn parse_stream_json_usage(line: &str) -> Option<TokenUsage> {
 mod tests {
     use super::*;
     use harness_core::agent::ApprovalDecision;
+    use harness_core::config::agents::ClaudeProviderBackpressureConfig;
+    use harness_core::types::ExecutionPhase;
+    use std::fs;
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     #[test]
     fn parse_assistant_message() {
@@ -469,6 +512,113 @@ mod tests {
         let adapter = ClaudeAdapter::new(PathBuf::from("claude"), "test-model".into());
         // Should not error when no child process exists
         adapter.interrupt().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_turn_emits_provider_wait_warning_before_spawn() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let started = dir.path().join("started.txt");
+        let release = dir.path().join("release.txt");
+        let script = dir.path().join("mock-claude-adapter-provider-gate.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\nprompt=\"$2\"\necho \"$prompt\" >> \"{}\"\nif [ \"$prompt\" = first ]; then while [ ! -f \"{}\" ]; do sleep 0.02; done; fi\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":\"done\"}}'\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":\"done\"}}'\n",
+                started.display(),
+                release.display()
+            ),
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script)
+                .expect("script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).expect("set executable permissions");
+        }
+
+        let gate =
+            ProviderBackpressureGate::from_claude_config(&ClaudeProviderBackpressureConfig {
+                max_concurrent_sessions: Some(NonZeroUsize::new(1).expect("non-zero limit")),
+                ..ClaudeProviderBackpressureConfig::default()
+            });
+        let adapter = Arc::new(
+            ClaudeAdapter::new(script, "test-model".into()).with_provider_backpressure_gate(gate),
+        );
+
+        let first_adapter = adapter.clone();
+        let first_req = turn_request("first", dir.path().to_path_buf());
+        let first = tokio::spawn(async move {
+            let (tx, _rx) = mpsc::channel(8);
+            first_adapter.start_turn(first_req, tx).await
+        });
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let started_text = fs::read_to_string(&started).unwrap_or_default();
+                if started_text.contains("first") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first adapter process should start");
+
+        let second_adapter = adapter.clone();
+        let second_req = turn_request("second", dir.path().to_path_buf());
+        let (second_tx, mut second_rx) = mpsc::channel(8);
+        let second =
+            tokio::spawn(async move { second_adapter.start_turn(second_req, second_tx).await });
+
+        let wait_event = timeout(Duration::from_secs(2), second_rx.recv())
+            .await
+            .expect("queued Claude adapter should emit provider wait activity")
+            .expect("second adapter closed before provider wait activity");
+        match wait_event {
+            AgentEvent::Warning { message } => {
+                assert!(
+                    message.contains("Waiting for Claude provider capacity"),
+                    "unexpected provider wait message: {message}"
+                );
+            }
+            other => panic!("expected provider wait warning before spawn, got {other:?}"),
+        }
+
+        let started_before_release = fs::read_to_string(&started).unwrap_or_default();
+        assert!(
+            !started_before_release.contains("second"),
+            "second process must not spawn while provider capacity is saturated"
+        );
+
+        fs::write(&release, "release").expect("release first process");
+        timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first should finish")
+            .expect("first task should join")
+            .expect("first turn should succeed");
+        timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second should finish after first releases provider capacity")
+            .expect("second task should join")
+            .expect("second turn should succeed");
+    }
+
+    fn turn_request(prompt: &str, project_root: PathBuf) -> TurnRequest {
+        TurnRequest {
+            prompt: prompt.to_string(),
+            project_root,
+            model: None,
+            reasoning_effort: None,
+            execution_phase: Some(ExecutionPhase::Execution),
+            sandbox_mode: None,
+            approval_policy: None,
+            allowed_tools: vec![],
+            context: vec![],
+            timeout_secs: None,
+            capability_token: None,
+        }
     }
 
     #[tokio::test]

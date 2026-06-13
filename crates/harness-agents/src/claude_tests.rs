@@ -475,11 +475,23 @@ async fn execute_stream_waits_for_provider_capacity_before_spawn() {
         .env_vars
         .insert("RUN_ID".to_string(), "second".to_string());
     let second_agent = agent.clone();
-    let second = tokio::spawn(async move {
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        second_agent.execute_stream(second_req, tx).await
-    });
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(8);
+    let second =
+        tokio::spawn(async move { second_agent.execute_stream(second_req, second_tx).await });
 
+    let wait_event = timeout(Duration::from_secs(2), second_rx.recv())
+        .await
+        .expect("queued Claude stream should emit provider wait activity")
+        .expect("second stream closed before provider wait activity");
+    match wait_event {
+        StreamItem::Warning { message } => {
+            assert!(
+                message.contains("Waiting for Claude provider capacity"),
+                "unexpected provider wait message: {message}"
+            );
+        }
+        other => panic!("expected provider wait warning before spawn, got {other:?}"),
+    }
     tokio::time::sleep(Duration::from_millis(100)).await;
     let started_before_release = fs::read_to_string(&started).unwrap_or_default();
     assert!(

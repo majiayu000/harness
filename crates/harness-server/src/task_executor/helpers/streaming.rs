@@ -4,7 +4,8 @@ use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::types::{
-    Decision, Event, EventMetadata, Item, SessionId, TokenUsage, TurnFailure, TurnTelemetry,
+    Decision, Event, EventMetadata, ExecutionPhase, Item, SessionId, TokenUsage, TurnFailure,
+    TurnTelemetry,
 };
 use harness_observe::event_store::EventStore;
 use harness_observe::usage::UsageMetrics;
@@ -130,6 +131,15 @@ mod tests {
         assert_eq!(payload["context_items"], 2);
 
         Ok(())
+    }
+
+    #[test]
+    fn execution_phase_label_preserves_simple_review_snake_case() {
+        assert_eq!(
+            execution_phase_label(Some(ExecutionPhase::SimpleReview)),
+            "simple_review"
+        );
+        assert_eq!(execution_phase_label(None), "unknown");
     }
 
     #[test]
@@ -324,6 +334,10 @@ fn usage_project_label(task_project_root: Option<&Path>, request_project_root: &
         .into_owned()
 }
 
+fn execution_phase_label(phase: Option<ExecutionPhase>) -> String {
+    phase.map_or_else(|| "unknown".to_string(), |phase| phase.label().to_string())
+}
+
 /// Scan `output_slice` for a `CREATED_ISSUE=` sentinel and, when a new issue
 /// number is found, write it to the database.
 async fn backfill_issue_if_found(
@@ -395,10 +409,7 @@ pub(crate) async fn run_agent_streaming_with_options(
     let task_project_root = store.get(task_id).and_then(|state| state.project_root);
     let project = usage_project_label(task_project_root.as_deref(), &req.project_root);
     let is_prompt_only = is_prompt_only_task(store, task_id);
-    let phase_str = req
-        .execution_phase
-        .map(|p| format!("{p:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".into());
+    let phase_str = execution_phase_label(req.execution_phase);
     if !is_prompt_only {
         let redacted_prompt = crate::redact::redact_secrets(&req.prompt, &req.env_vars);
         if let Err(e) = store

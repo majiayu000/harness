@@ -1,7 +1,10 @@
 use crate::claude_stream::{
     claude_stdout_tail, parse_claude_stream_output, stream_claude_code_output,
 };
-use crate::provider_backpressure::ProviderBackpressureGate;
+use crate::provider_backpressure::{
+    ProviderBackpressureGate, ProviderBackpressurePermit, ProviderPhase,
+    PROVIDER_WAIT_HEARTBEAT_INTERVAL, PROVIDER_WAIT_INITIAL_HEARTBEAT_DELAY,
+};
 use crate::streaming::{
     captured_stderr_tail, enrich_stream_exit_error, filter_agent_stderr_with_capture,
     log_captured_stderr, send_stream_item,
@@ -18,6 +21,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 pub struct ClaudeCodeAgent {
     pub cli_path: PathBuf,
@@ -300,14 +304,8 @@ impl CodeAgent for ClaudeCodeAgent {
             "claude execute_stream: full command args"
         );
 
-        let provider_permit = self
-            .provider_gate
-            .acquire(
-                req.execution_phase,
-                req.prompt.chars().count(),
-                req.prompt.len(),
-            )
-            .await?;
+        let provider_permit =
+            acquire_provider_permit_with_stream_heartbeat(&self.provider_gate, &req, &tx).await?;
         tracing::debug!(
             phase = provider_permit.phase().label(),
             waited_ms = provider_permit.waited_ms(),
@@ -402,6 +400,48 @@ impl CodeAgent for ClaudeCodeAgent {
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }
+}
+
+async fn acquire_provider_permit_with_stream_heartbeat(
+    gate: &ProviderBackpressureGate,
+    req: &AgentRequest,
+    tx: &mpsc::Sender<StreamItem>,
+) -> harness_core::error::Result<ProviderBackpressurePermit> {
+    let prompt_chars = req.prompt.chars().count();
+    let prompt_bytes = req.prompt.len();
+    if !gate.is_enabled() {
+        return gate
+            .acquire(req.execution_phase, prompt_chars, prompt_bytes)
+            .await;
+    }
+
+    let phase = ProviderPhase::from_execution_phase(req.execution_phase);
+    let mut acquire = Box::pin(gate.acquire(req.execution_phase, prompt_chars, prompt_bytes));
+    let mut heartbeat = Box::pin(tokio::time::sleep(PROVIDER_WAIT_INITIAL_HEARTBEAT_DELAY));
+    loop {
+        tokio::select! {
+            permit = &mut acquire => return permit,
+            _ = &mut heartbeat => {
+                send_stream_item(
+                    tx,
+                    StreamItem::Warning {
+                        message: provider_wait_message(phase),
+                    },
+                    "claude",
+                    "provider capacity wait",
+                )
+                .await?;
+                heartbeat.as_mut().reset(tokio::time::Instant::now() + PROVIDER_WAIT_HEARTBEAT_INTERVAL);
+            }
+        }
+    }
+}
+
+fn provider_wait_message(phase: ProviderPhase) -> String {
+    format!(
+        "Waiting for Claude provider capacity for {} phase",
+        phase.label()
+    )
 }
 
 #[cfg(test)]
