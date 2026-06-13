@@ -113,6 +113,9 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     assert_eq!(runtime_task["workflow"]["definition_id"], "github_issue_pr");
     assert_eq!(runtime_task["workflow"]["state"], "planning");
     assert_eq!(runtime_task["workflow"]["issue_number"], 52);
+    assert!(runtime_task
+        .get("source")
+        .is_none_or(serde_json::Value::is_null));
 
     let planning_response = app
         .oneshot(
@@ -130,6 +133,67 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         planning_tasks.iter().any(|task| task["id"] == task_id),
         "status=planning should include runtime-backed planning workflows"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_runtime_issue_exposes_tracker_identity() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let task_id = harness_core::types::TaskId::from_str("runtime-github-issue-detail");
+
+    crate::workflow_runtime_submission::record_issue_submission(
+        store,
+        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 64,
+            task_id: &task_id,
+            labels: &[],
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("github"),
+            external_id: Some("issue:64"),
+        },
+    )
+    .await?;
+    let app = Router::new()
+        .route("/tasks/{id}", get(get_task))
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/runtime-github-issue-detail")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["source"], "github");
+    assert_eq!(body["external_id"], "issue:64");
+    assert_eq!(body["tracker_source"], "github");
+    assert_eq!(body["tracker_external_id"], "issue:64");
     Ok(())
 }
 

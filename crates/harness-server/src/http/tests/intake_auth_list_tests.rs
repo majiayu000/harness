@@ -128,6 +128,82 @@ async fn intake_status_recent_dispatches_empty_initially() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn intake_status_includes_runtime_github_issue_dispatches() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        repo: "owner/repo".to_string(),
+        ..Default::default()
+    });
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &project_root,
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let task_id = task_runner::TaskId::from_str("runtime-github-intake-status");
+    crate::workflow_runtime_submission::record_issue_submission(
+        store,
+        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 65,
+            task_id: &task_id,
+            labels: &[],
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("github"),
+            external_id: Some("issue:65"),
+        },
+    )
+    .await?;
+    let app = intake_app(state);
+
+    use http_body_util::BodyExt;
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await?.to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    let github = json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "github")
+        .expect("github channel present");
+    assert_eq!(github["active"], 1);
+    let dispatch = json["recent_dispatches"]
+        .as_array()
+        .expect("recent dispatches should be an array")
+        .iter()
+        .find(|dispatch| dispatch["task_id"] == "runtime-github-intake-status")
+        .expect("runtime GitHub issue dispatch should be listed");
+    assert_eq!(dispatch["source"], "github");
+    assert_eq!(dispatch["external_id"], "issue:65");
+    assert_eq!(dispatch["tracker_source"], "github");
+    assert_eq!(dispatch["tracker_external_id"], "issue:65");
+    Ok(())
+}
+
+#[tokio::test]
 async fn intake_status_disables_feishu_when_verification_token_missing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state_with_feishu(dir.path(), None).await?;

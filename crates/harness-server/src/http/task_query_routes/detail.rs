@@ -20,7 +20,13 @@ struct RuntimeTaskResponse {
     execution_path: &'static str,
     workflow_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker_external_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,7 +127,10 @@ async fn runtime_task_response_by_handle(
         status: workflow.state.clone(),
         execution_path: "workflow_runtime",
         workflow_id: workflow.id.clone(),
+        source: runtime_string_field(&workflow.data, "source"),
         external_id,
+        tracker_source: runtime_string_field(&workflow.data, "tracker_source"),
+        tracker_external_id: runtime_string_field(&workflow.data, "tracker_external_id"),
         repo: workflow
             .data
             .get("repo")

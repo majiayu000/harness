@@ -86,6 +86,8 @@ fn issue_task_request(issue_number: u64, repo: &str) -> CreateTaskRequest {
     let mut req = CreateTaskRequest::default();
     req.issue = Some(issue_number);
     req.repo = Some(repo.to_string());
+    req.source = Some("github".to_string());
+    req.external_id = Some(format!("issue:{issue_number}"));
     req
 }
 
