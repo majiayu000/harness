@@ -514,5 +514,25 @@ impl WorkspaceManager {
 mod entries_tests;
 
 #[cfg(test)]
+#[path = "workspace_test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "workspace_disk_reconcile_tests.rs"]
+mod disk_reconcile_tests;
+
+#[cfg(test)]
+#[path = "workspace_lease_store_tests.rs"]
+mod lease_store_tests;
+
+#[cfg(test)]
+#[path = "workspace_pool_tests.rs"]
+mod pool_tests;
+
+#[cfg(test)]
+#[path = "workspace_startup_reconcile_tests.rs"]
+mod startup_reconcile_tests;
+
+#[cfg(test)]
 #[path = "workspace_tests.rs"]
 mod tests;

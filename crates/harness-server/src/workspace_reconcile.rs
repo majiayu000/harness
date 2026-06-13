@@ -81,6 +81,29 @@ impl WorkspaceManager {
             if self.active.iter().any(|e| e.workspace_path == path) {
                 continue;
             }
+            if let Some(store) = self.lease_store.as_ref() {
+                match store.leased_workspace_path(&path).await {
+                    Ok(Some(record)) => {
+                        tracing::debug!(
+                            workspace_path = ?path,
+                            owner_session = %record.owner_session,
+                            task_id = %record.task_id.0,
+                            "reconcile_startup: preserving workspace with persisted live lease"
+                        );
+                        summary.preserved += 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            workspace_path = ?path,
+                            "reconcile_startup: failed to inspect persisted workspace lease: {error}"
+                        );
+                        summary.preserved += 1;
+                        continue;
+                    }
+                }
+            }
 
             let owner_record = read_owner_record(&path);
             let mut candidate_tasks = Vec::new();

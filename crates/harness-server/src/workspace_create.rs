@@ -491,13 +491,14 @@ impl WorkspaceManager {
                 if let Err(err) =
                     reset_registered_worktree(&workspace_path, &branch, target_ref).await
                 {
-                    self.release_workspace(task_id).await;
-                    if let Err(cleanup_err) = cleanup_workspace_path_with_registration(
-                        source_repo,
-                        &workspace_path,
-                        Some(true),
-                    )
-                    .await
+                    if let Err(cleanup_err) = self
+                        .cleanup_created_workspace_then_release(
+                            task_id,
+                            source_repo,
+                            &workspace_path,
+                            Some(true),
+                        )
+                        .await
                     {
                         tracing::warn!(
                             "failed to cleanup workspace after slot reset failure: {cleanup_err}"
@@ -581,7 +582,19 @@ impl WorkspaceManager {
         {
             Ok(output) => output,
             Err(e) => {
-                self.release_workspace(task_id).await;
+                if let Err(cleanup_err) = self
+                    .cleanup_created_workspace_then_release(
+                        task_id,
+                        source_repo,
+                        &workspace_path,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "failed to cleanup partial worktree after worktree-add spawn failure: {cleanup_err}"
+                    );
+                }
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     workspace_path: workspace_path.clone(),
                     workspace_owner: Some(owner_session.clone()),
@@ -592,15 +605,26 @@ impl WorkspaceManager {
 
         if !output.status.success() {
             if options.require_remote_head {
-                self.release_workspace(task_id).await;
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if let Err(cleanup_err) = self
+                    .cleanup_created_workspace_then_release(
+                        task_id,
+                        source_repo,
+                        &workspace_path,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "failed to cleanup partial worktree after worktree-add failure: {cleanup_err}"
+                    );
+                }
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     workspace_path: workspace_path.clone(),
                     workspace_owner: Some(owner_session.clone()),
                     message: format!(
                         "git worktree add from {remote_ref} failed for task {}: {}",
-                        task_id.0,
-                        stderr.trim()
+                        task_id.0, stderr
                     ),
                 });
             }
@@ -621,7 +645,19 @@ impl WorkspaceManager {
             {
                 Ok(output) => output,
                 Err(e) => {
-                    self.release_workspace(task_id).await;
+                    if let Err(cleanup_err) = self
+                        .cleanup_created_workspace_then_release(
+                            task_id,
+                            source_repo,
+                            &workspace_path,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "failed to cleanup partial worktree after fallback worktree-add spawn failure: {cleanup_err}"
+                        );
+                    }
                     return Err(WorkspaceLifecycleError::CreateFailed {
                         workspace_path: workspace_path.clone(),
                         workspace_owner: Some(owner_session.clone()),
@@ -634,16 +670,24 @@ impl WorkspaceManager {
             };
 
             if !fallback.status.success() {
-                self.release_workspace(task_id).await;
-                let stderr = String::from_utf8_lossy(&fallback.stderr);
+                let stderr = String::from_utf8_lossy(&fallback.stderr).trim().to_string();
+                if let Err(cleanup_err) = self
+                    .cleanup_created_workspace_then_release(
+                        task_id,
+                        source_repo,
+                        &workspace_path,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "failed to cleanup partial worktree after fallback worktree-add failure: {cleanup_err}"
+                    );
+                }
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     workspace_path: workspace_path.clone(),
                     workspace_owner: Some(owner_session.clone()),
-                    message: format!(
-                        "git worktree add failed for task {}: {}",
-                        task_id.0,
-                        stderr.trim()
-                    ),
+                    message: format!("git worktree add failed for task {}: {}", task_id.0, stderr),
                 });
             }
         }
@@ -655,8 +699,10 @@ impl WorkspaceManager {
             workspace_key: Some(owner_record_workspace_key),
         };
         if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
-            self.release_workspace(task_id).await;
-            if let Err(cleanup_err) = cleanup_workspace_path(source_repo, &workspace_path).await {
+            if let Err(cleanup_err) = self
+                .cleanup_created_workspace_then_release(task_id, source_repo, &workspace_path, None)
+                .await
+            {
                 tracing::warn!(
                     "failed to cleanup partial worktree after owner-record failure: {cleanup_err}"
                 );
@@ -716,86 +762,21 @@ impl WorkspaceManager {
             slot_index,
         })
     }
-}
 
-async fn reset_registered_worktree(
-    workspace_path: &Path,
-    branch: &str,
-    target_ref: &str,
-) -> anyhow::Result<()> {
-    let reset_pre = git_command()
-        .args(["-C", &workspace_path.to_string_lossy(), "reset", "--hard"])
-        .output()
-        .await?;
-    if !reset_pre.status.success() {
-        anyhow::bail!(
-            "git reset --hard failed before checkout: {}",
-            String::from_utf8_lossy(&reset_pre.stderr).trim()
-        );
+    async fn cleanup_created_workspace_then_release(
+        &self,
+        task_id: &TaskId,
+        source_repo: &Path,
+        workspace_path: &Path,
+        known_worktree_registered: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let cleanup_result = cleanup_workspace_path_with_registration(
+            source_repo,
+            workspace_path,
+            known_worktree_registered,
+        )
+        .await;
+        self.release_workspace(task_id).await;
+        cleanup_result
     }
-
-    let clean_pre = git_command()
-        .args(["-C", &workspace_path.to_string_lossy(), "clean", "-fdx"])
-        .output()
-        .await?;
-    if !clean_pre.status.success() {
-        anyhow::bail!(
-            "git clean -fdx failed before checkout: {}",
-            String::from_utf8_lossy(&clean_pre.stderr).trim()
-        );
-    }
-
-    let checkout = git_command()
-        .args([
-            "-C",
-            &workspace_path.to_string_lossy(),
-            "checkout",
-            "-B",
-            branch,
-            target_ref,
-        ])
-        .output()
-        .await?;
-    if !checkout.status.success() {
-        anyhow::bail!(
-            "git checkout -B failed: {}",
-            String::from_utf8_lossy(&checkout.stderr).trim()
-        );
-    }
-
-    let reset = git_command()
-        .args([
-            "-C",
-            &workspace_path.to_string_lossy(),
-            "reset",
-            "--hard",
-            target_ref,
-        ])
-        .output()
-        .await?;
-    if !reset.status.success() {
-        anyhow::bail!(
-            "git reset --hard failed: {}",
-            String::from_utf8_lossy(&reset.stderr).trim()
-        );
-    }
-
-    let clean = git_command()
-        .args(["-C", &workspace_path.to_string_lossy(), "clean", "-fdx"])
-        .output()
-        .await?;
-    if !clean.status.success() {
-        anyhow::bail!(
-            "git clean -fdx failed: {}",
-            String::from_utf8_lossy(&clean.stderr).trim()
-        );
-    }
-
-    Ok(())
-}
-
-fn slot_index_from_workspace_path(project_key: &str, workspace_path: &Path) -> Option<u32> {
-    let name = workspace_path.file_name()?.to_str()?;
-    let prefix = format!("{project_key}__slot_");
-    name.strip_prefix(&prefix)?.parse().ok()
 }

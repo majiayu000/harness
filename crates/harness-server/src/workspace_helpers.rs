@@ -335,6 +335,91 @@ pub(super) async fn is_registered_worktree(source_repo: &Path, workspace_path: &
         .unwrap_or(false)
 }
 
+pub(super) async fn reset_registered_worktree(
+    workspace_path: &Path,
+    branch: &str,
+    target_ref: &str,
+) -> anyhow::Result<()> {
+    let reset_pre = git_command()
+        .args(["-C", &workspace_path.to_string_lossy(), "reset", "--hard"])
+        .output()
+        .await?;
+    if !reset_pre.status.success() {
+        anyhow::bail!(
+            "git reset --hard failed before checkout: {}",
+            String::from_utf8_lossy(&reset_pre.stderr).trim()
+        );
+    }
+
+    let clean_pre = git_command()
+        .args(["-C", &workspace_path.to_string_lossy(), "clean", "-fdx"])
+        .output()
+        .await?;
+    if !clean_pre.status.success() {
+        anyhow::bail!(
+            "git clean -fdx failed before checkout: {}",
+            String::from_utf8_lossy(&clean_pre.stderr).trim()
+        );
+    }
+
+    let checkout = git_command()
+        .args([
+            "-C",
+            &workspace_path.to_string_lossy(),
+            "checkout",
+            "-B",
+            branch,
+            target_ref,
+        ])
+        .output()
+        .await?;
+    if !checkout.status.success() {
+        anyhow::bail!(
+            "git checkout -B failed: {}",
+            String::from_utf8_lossy(&checkout.stderr).trim()
+        );
+    }
+
+    let reset = git_command()
+        .args([
+            "-C",
+            &workspace_path.to_string_lossy(),
+            "reset",
+            "--hard",
+            target_ref,
+        ])
+        .output()
+        .await?;
+    if !reset.status.success() {
+        anyhow::bail!(
+            "git reset --hard failed: {}",
+            String::from_utf8_lossy(&reset.stderr).trim()
+        );
+    }
+
+    let clean = git_command()
+        .args(["-C", &workspace_path.to_string_lossy(), "clean", "-fdx"])
+        .output()
+        .await?;
+    if !clean.status.success() {
+        anyhow::bail!(
+            "git clean -fdx failed: {}",
+            String::from_utf8_lossy(&clean.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+pub(super) fn slot_index_from_workspace_path(
+    project_key: &str,
+    workspace_path: &Path,
+) -> Option<u32> {
+    let name = workspace_path.file_name()?.to_str()?;
+    let prefix = format!("{project_key}__slot_");
+    name.strip_prefix(&prefix)?.parse().ok()
+}
+
 pub(super) fn canonicalize_existing_or_parent(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
