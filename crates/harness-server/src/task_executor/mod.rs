@@ -23,7 +23,8 @@ pub(crate) mod turn_lifecycle;
 mod turn_lifecycle_terminal_error_tests;
 mod validation_gate;
 
-use harness_core::config::agents::CapabilityProfile;
+use harness_core::{config::agents::CapabilityProfile, interceptor::TurnInterceptor};
+use std::sync::Arc;
 
 #[cfg(test)]
 use crate::task_runner::{mutate_and_persist, CreateTaskRequest, TaskId, TaskStatus, TaskStore};
@@ -52,6 +53,9 @@ pub(crate) use run_task::run_task;
 // Re-export so existing call sites in handlers/ don't need updating.
 pub(crate) use turn_lifecycle::run_turn_lifecycle;
 pub(crate) use validation_gate::run_test_gate;
+
+pub(crate) type TurnInterceptorHandle = Arc<dyn TurnInterceptor>;
+pub(crate) type SharedTurnInterceptors = Arc<[TurnInterceptorHandle]>;
 
 /// Extract tool list from a capability profile, returning an error if the
 /// profile unexpectedly returns `None` (which means Full/unrestricted).
