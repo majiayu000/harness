@@ -253,6 +253,7 @@ mod tests {
         assert_eq!(
             q_values.store_key_for_test(),
             crate::q_value_store::QValueStore::store_key_for_data_dir(dir.path())
+                .expect("store key")
         );
     }
 

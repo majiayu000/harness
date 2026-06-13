@@ -155,7 +155,7 @@ impl QValueStore {
         setup_pool: &PgPool,
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
-        let store_key = Self::store_key_for_data_dir(data_dir);
+        let store_key = Self::store_key_for_data_dir(data_dir)?;
         Self::open_with_context_and_store_key(context, setup_pool, store_key).await
     }
 
@@ -179,17 +179,14 @@ impl QValueStore {
         &self.schema
     }
 
-    pub fn store_key_for_data_dir(data_dir: &Path) -> String {
-        let path = data_dir.canonicalize().unwrap_or_else(|_| {
-            if data_dir.is_absolute() {
-                data_dir.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .map(|current| current.join(data_dir))
-                    .unwrap_or_else(|_| data_dir.to_path_buf())
-            }
-        });
-        path.to_string_lossy().into_owned()
+    pub fn store_key_for_data_dir(data_dir: &Path) -> anyhow::Result<String> {
+        let canonical = data_dir.canonicalize().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to canonicalize q_value_store data_dir {}: {error}",
+                data_dir.display()
+            )
+        })?;
+        Ok(canonical.to_string_lossy().into_owned())
     }
 
     pub fn store_key(&self) -> &str {
@@ -351,6 +348,20 @@ pub async fn migrate_legacy_q_value_store_if_needed(
     let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
     let legacy_schema = legacy_context.schema();
     if legacy_schema == target_store.schema() {
+        return Ok(0);
+    }
+
+    let legacy_schema_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM pg_catalog.pg_namespace
+             WHERE nspname = $1
+         )",
+    )
+    .bind(legacy_schema)
+    .fetch_one(&target_store.pool)
+    .await?;
+    if !legacy_schema_exists {
         return Ok(0);
     }
 

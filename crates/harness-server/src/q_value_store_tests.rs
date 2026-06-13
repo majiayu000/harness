@@ -47,6 +47,8 @@ async fn shared_schema_q_value_store_keeps_store_rows_isolated() -> anyhow::Resu
     let shared_context = PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
     let store_a_dir = dir.path().join("store-a");
     let store_b_dir = dir.path().join("store-b");
+    std::fs::create_dir_all(&store_a_dir)?;
+    std::fs::create_dir_all(&store_b_dir)?;
     let store_a =
         QValueStore::open_shared_with_data_dir(&shared_context, &setup_pool, &store_a_dir).await?;
     let store_b =
@@ -125,6 +127,8 @@ async fn legacy_q_value_store_migration_backfills_once() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let target_data_dir = dir.path().join("target-data");
     let other_data_dir = dir.path().join("other-data");
+    std::fs::create_dir_all(&target_data_dir)?;
+    std::fs::create_dir_all(&other_data_dir)?;
     let legacy_path = target_data_dir.join("q_values.db");
     let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
         .schema()
@@ -203,6 +207,64 @@ async fn legacy_q_value_store_migration_backfills_once() -> anyhow::Result<()> {
     ))
     .execute(&setup_pool)
     .await;
+    let _ = sqlx::query(&format!(
+        "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
+    ))
+    .execute(&setup_pool)
+    .await;
+    setup_pool.close().await;
+
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[test]
+fn store_key_for_missing_data_dir_errors() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let missing = dir.path().join("missing-data-dir");
+    let err = QValueStore::store_key_for_data_dir(&missing)
+        .expect_err("missing data dir should not produce a fallback store key");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed to canonicalize q_value_store data_dir"),
+        "error should mention q_value_store data_dir canonicalization, got: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_q_value_store_migration_ignores_missing_legacy_schema() -> anyhow::Result<()> {
+    let database_url = match resolve_database_url(None) {
+        Ok(url) => url,
+        Err(_) => return Ok(()),
+    };
+    let dir = tempdir()?;
+    let target_data_dir = dir.path().join("target-data");
+    std::fs::create_dir_all(&target_data_dir)?;
+    let missing_legacy_path = dir.path().join("missing-legacy").join("q_values.db");
+    let target_schema = unique_test_schema("q_value_store_missing_legacy_test");
+    let setup_pool = pg_open_pool(&database_url).await?;
+    let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+    let target_store =
+        QValueStore::open_shared_with_data_dir(&target_context, &setup_pool, &target_data_dir)
+            .await?;
+
+    let result = std::panic::AssertUnwindSafe(async {
+        let copied = migrate_legacy_q_value_store_if_needed(
+            &missing_legacy_path,
+            Some(&database_url),
+            &target_store,
+        )
+        .await?;
+        assert_eq!(copied, 0, "missing legacy schema should be a no-op");
+        Ok::<(), anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+
+    target_store.pool.close().await;
     let _ = sqlx::query(&format!(
         "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
     ))
