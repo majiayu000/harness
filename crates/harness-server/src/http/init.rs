@@ -103,7 +103,18 @@ async fn build_review_store(
 
     let context = match crate::review_store::ReviewStore::shared_schema_context(Some(&database_url))
     {
-        Ok(context) => context,
+        Ok(context) => {
+            if let Err(error) =
+                builders::ensure_startup_context_not_path_derived("review_store", &context)
+            {
+                setup_pool.close().await;
+                return Ok((
+                    None,
+                    StoreStartupResult::optional("review_store").failed(error.to_string()),
+                ));
+            }
+            context
+        }
         Err(error) => {
             setup_pool.close().await;
             return Ok((
