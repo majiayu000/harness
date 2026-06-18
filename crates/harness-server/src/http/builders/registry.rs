@@ -309,11 +309,12 @@ pub(crate) async fn build_registry(
                 let context =
                     harness_core::db::PgStoreContext::new(database_url.clone(), schema.clone())?;
                 super::ensure_startup_context_not_path_derived("workflow_runtime_store", &context)?;
-                harness_workflow::runtime::WorkflowRuntimeStore::open_with_context(
+                let store = harness_workflow::runtime::WorkflowRuntimeStore::open_with_context(
                     &context,
                     &setup_pool,
                 )
-                .await
+                .await?;
+                Ok::<_, anyhow::Error>(store)
             }
             .await
             {
