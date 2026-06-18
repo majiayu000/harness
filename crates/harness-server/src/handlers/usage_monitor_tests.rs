@@ -96,6 +96,64 @@ fn runtime_attribution_tokens_include_runtime_job_and_command_ids() {
 }
 
 #[test]
+fn active_counts_skip_terminal_invocations() {
+    let invocations = [
+        test_invocation(
+            "owner/active",
+            "implement_issue",
+            "running",
+            "high",
+            Some("active_leased"),
+        ),
+        test_invocation(
+            "owner/active",
+            "implement_issue",
+            "pending",
+            "low",
+            Some("missing_lease"),
+        ),
+        test_invocation(
+            "owner/done",
+            "poll_repo_backlog",
+            "succeeded",
+            "high",
+            Some("active_leased"),
+        ),
+        test_invocation(
+            "owner/failed",
+            "review_pr",
+            "failed",
+            "high",
+            Some("expired_lease"),
+        ),
+        test_invocation("owner/cancelled", "plan_issue", "cancelled", "high", None),
+    ];
+
+    let active_by_repo = aggregate_active_counts(&invocations, |invocation| {
+        invocation
+            .repo
+            .clone()
+            .unwrap_or_else(|| "unassigned".to_string())
+    });
+    let active_by_activity =
+        aggregate_active_counts(&invocations, |invocation| invocation.activity.clone());
+
+    assert_eq!(active_by_repo.len(), 1);
+    assert_eq!(active_by_repo[0].name, "owner/active");
+    assert_eq!(active_by_repo[0].running, 1);
+    assert_eq!(active_by_repo[0].pending, 1);
+    assert_eq!(active_by_repo[0].active_leased, 1);
+    assert_eq!(active_by_repo[0].expired_or_missing_lease, 1);
+    assert_eq!(active_by_repo[0].high_burn, 1);
+
+    assert_eq!(active_by_activity.len(), 1);
+    assert_eq!(active_by_activity[0].name, "implement_issue");
+    assert_eq!(active_by_activity[0].running, 1);
+    assert_eq!(active_by_activity[0].pending, 1);
+    assert_eq!(active_by_activity[0].high_burn, 1);
+}
+
+#[test]
 fn agent_invocation_exposes_running_lease_state_and_observation() {
     let now = Utc::now();
     let workflow = WorkflowInstance::new(
@@ -180,4 +238,47 @@ fn agent_invocation_ends_in_flight_after_latest_turn_result() {
     let invocation = agent_invocation_from_row(&row, now);
 
     assert!(!invocation.in_flight_model_turn);
+}
+
+fn test_invocation(
+    repo: &str,
+    activity: &str,
+    status: &'static str,
+    burn_level: &'static str,
+    lease_state: Option<&'static str>,
+) -> AgentInvocation {
+    AgentInvocation {
+        agent_invocation_id: format!("{repo}-{activity}-{status}"),
+        source: "workflow_runtime",
+        runtime_job_id: format!("{repo}-{activity}-{status}"),
+        command_id: format!("command-{repo}-{activity}-{status}"),
+        workflow_id: format!("workflow-{repo}"),
+        workflow_definition: "github_issue_pr".to_string(),
+        workflow_state: "implementing".to_string(),
+        subject_type: "repo".to_string(),
+        subject_key: repo.to_string(),
+        repo: Some(repo.to_string()),
+        project: None,
+        issue_number: None,
+        pr_number: None,
+        task_id: None,
+        activity: activity.to_string(),
+        status,
+        command_status: "dispatched".to_string(),
+        agent_runtime: "codex_exec",
+        runtime_profile: "codex-default".to_string(),
+        model: None,
+        reasoning_effort: None,
+        lease_owner: None,
+        lease_expires_at: None,
+        lease_state,
+        in_flight_model_turn: false,
+        latest_runtime_event_type: None,
+        last_runtime_observation_at: None,
+        stale: false,
+        age_secs: 60,
+        updated_age_secs: 10,
+        burn_level,
+        cost_confidence: "estimated_runtime_burn",
+    }
 }

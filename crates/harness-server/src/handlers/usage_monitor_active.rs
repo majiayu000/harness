@@ -13,6 +13,10 @@ where
 {
     let mut counts: BTreeMap<String, ActiveCount> = BTreeMap::new();
     for invocation in invocations {
+        if !matches!(invocation.status, "running" | "pending") {
+            continue;
+        }
+
         let entry = counts
             .entry(key_fn(invocation))
             .or_insert_with_key(|name| ActiveCount {
