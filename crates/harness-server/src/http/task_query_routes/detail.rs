@@ -16,7 +16,12 @@ struct RuntimeTaskResponse {
     task_id: String,
     submission_id: String,
     task_kind: TaskKind,
-    status: String,
+    status: TaskStatus,
+    workflow_state: String,
+    failure_kind: Option<crate::task_runner::TaskFailureKind>,
+    phase: crate::task_runner::TaskPhase,
+    scheduler: crate::task_runner::TaskSchedulerState,
+    turn: u32,
     execution_path: &'static str,
     workflow_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +40,10 @@ struct RuntimeTaskResponse {
     issue: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    depends_on: Vec<TaskId>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    subtask_ids: Vec<TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow: Option<TaskWorkflowSummary>,
 }
@@ -115,8 +124,11 @@ async fn runtime_task_response_by_handle(
     }) else {
         return Ok(None);
     };
+    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
     let external_id = runtime_external_id(task_kind, &workflow.data, issue);
-    let submission_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
+    let submission_id = projection
+        .submission_handle
+        .clone()
         .unwrap_or_else(|| task_id.clone())
         .0;
     Ok(Some(RuntimeTaskResponse {
@@ -124,7 +136,12 @@ async fn runtime_task_response_by_handle(
         task_id: submission_id.clone(),
         submission_id,
         task_kind,
-        status: workflow.state.clone(),
+        status: projection.task_status,
+        workflow_state: workflow.state.clone(),
+        failure_kind: projection.failure_kind,
+        phase: projection.phase,
+        scheduler: projection.scheduler,
+        turn: 0,
         execution_path: "workflow_runtime",
         workflow_id: workflow.id.clone(),
         source: runtime_string_field(&workflow.data, "source"),
@@ -136,13 +153,11 @@ async fn runtime_task_response_by_handle(
             .get("repo")
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned),
-        project: workflow
-            .data
-            .get("project_id")
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned),
+        project: projection.project_id,
         issue,
         error: runtime_string_field(&workflow.data, "failure_reason"),
+        depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
+        subtask_ids: Vec::new(),
         workflow: Some(TaskWorkflowSummary::from_runtime(&workflow)),
     }))
 }
