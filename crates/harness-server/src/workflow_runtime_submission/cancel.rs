@@ -1,6 +1,6 @@
 use harness_workflow::runtime::{
-    WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowInstance, WorkflowRuntimeStore,
-    PROMPT_TASK_DEFINITION_ID,
+    WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision,
+    WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::fmt;
@@ -139,8 +139,10 @@ async fn cancel_submission_instance(
     let commands = store.commands_for(&cancelled.id).await?;
     for command in commands {
         if matches!(
-            command.status.as_str(),
-            "pending" | "dispatching" | "dispatched"
+            command.status,
+            WorkflowCommandStatus::Pending
+                | WorkflowCommandStatus::Dispatching
+                | WorkflowCommandStatus::Dispatched
         ) {
             store
                 .cancel_command_and_unfinished_runtime_jobs(

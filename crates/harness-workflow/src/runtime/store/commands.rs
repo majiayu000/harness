@@ -20,6 +20,7 @@ pub(super) async fn insert(
         .bind(&command.dedupe_key)
         .bind(status.as_str())
         .bind(&data)
+        .bind(WorkflowCommandStatus::Pending.as_str())
         .fetch_one(pool)
         .await?;
     Ok(id)
@@ -42,6 +43,7 @@ pub(super) async fn insert_tx(
         .bind(&command.dedupe_key)
         .bind(status.as_str())
         .bind(&data)
+        .bind(WorkflowCommandStatus::Pending.as_str())
         .fetch_one(&mut **tx)
         .await?;
     Ok(id)
@@ -53,23 +55,23 @@ fn insert_sql() -> &'static str {
      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
      ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
         decision_id = CASE
-            WHEN workflow_commands.status = 'pending' THEN EXCLUDED.decision_id
+            WHEN workflow_commands.status = $8 THEN EXCLUDED.decision_id
             ELSE workflow_commands.decision_id
         END,
         command_type = CASE
-            WHEN workflow_commands.status = 'pending' THEN EXCLUDED.command_type
+            WHEN workflow_commands.status = $8 THEN EXCLUDED.command_type
             ELSE workflow_commands.command_type
         END,
         data = CASE
-            WHEN workflow_commands.status = 'pending' THEN EXCLUDED.data
+            WHEN workflow_commands.status = $8 THEN EXCLUDED.data
             ELSE workflow_commands.data
         END,
         status = CASE
-            WHEN workflow_commands.status = 'pending' THEN EXCLUDED.status
+            WHEN workflow_commands.status = $8 THEN EXCLUDED.status
             ELSE workflow_commands.status
         END,
         updated_at = CASE
-            WHEN workflow_commands.status = 'pending'
+            WHEN workflow_commands.status = $8
                  AND (
                      workflow_commands.status <> EXCLUDED.status
                      OR workflow_commands.decision_id IS DISTINCT FROM EXCLUDED.decision_id
