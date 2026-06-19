@@ -39,8 +39,14 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
     let workflows = vec![
         workflow("implementing", json!({})),
         workflow("checking", json!({})),
+        workflow("dispatching", json!({})),
         workflow("inspecting", json!({})),
+        workflow("planning_batch", json!({})),
+        workflow("reconciling", json!({})),
+        workflow("scanning", json!({})),
         workflow("awaiting_feedback", json!({})),
+        workflow("feedback_found", json!({})),
+        workflow("no_actionable_feedback", json!({})),
         workflow("ready_to_merge", json!({})),
         workflow("awaiting_dependencies", json!({})),
         workflow("idle", json!({})),
@@ -50,7 +56,8 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
 
     let counts = runtime_workflow_counts(&workflows);
 
-    assert_eq!(counts.running, 3);
+    assert_eq!(counts.running, 7);
+    assert_eq!(counts.pending, 2);
     assert_eq!(counts.review, 1);
     assert_eq!(counts.ready_to_merge, 1);
     assert_eq!(counts.awaiting_dependencies, 1);
@@ -513,6 +520,8 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
             workflow("checking", json!({ "source": "github" })),
             workflow("inspecting", json!({ "source": "github" })),
             workflow("awaiting_feedback", json!({ "source": "github" })),
+            workflow("feedback_found", json!({ "source": "github" })),
+            workflow("no_actionable_feedback", json!({ "source": "github" })),
             workflow("scheduled", json!({ "source": "github" })),
         ],
         &[legacy_row, queued_row],
@@ -521,7 +530,7 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     assert_eq!(by_source.len(), 1);
     let source = by_source.pop().expect("source row");
     assert_eq!(source.source, "github");
-    assert_eq!(source.pending, 1);
+    assert_eq!(source.pending, 3);
     assert_eq!(source.ready_to_merge, 1);
     assert_eq!(source.review, 1);
     assert_eq!(source.running, 2);

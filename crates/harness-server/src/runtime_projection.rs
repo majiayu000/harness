@@ -15,6 +15,7 @@ pub(crate) struct RuntimeWorkflowProjection {
     pub(crate) failure_kind: Option<TaskFailureKind>,
     pub(crate) phase: TaskPhase,
     pub(crate) scheduler: TaskSchedulerState,
+    active_bucket: Option<RuntimeActiveBucket>,
     pub(crate) project_id: Option<String>,
     pub(crate) submission_handle: Option<TaskId>,
     pub(crate) legacy_dedupe_task_handle: Option<TaskId>,
@@ -25,11 +26,13 @@ impl RuntimeWorkflowProjection {
         let terminal_state = workflow.terminal_state();
         let task_status = workflow_state_to_task_status(workflow, terminal_state);
         let scheduler = workflow_scheduler_state(&workflow.state, &task_status, terminal_state);
+        let active_bucket = workflow_active_bucket(&workflow.state, &task_status, &scheduler);
         Self {
             failure_kind: task_status.is_failure().then_some(TaskFailureKind::Task),
             phase: workflow_state_to_task_phase(&workflow.state, terminal_state),
             task_status,
             scheduler,
+            active_bucket,
             project_id: runtime_string_field(&workflow.data, "project_id"),
             submission_handle: runtime_submission_handle(&workflow.data),
             legacy_dedupe_task_handle: legacy_dedupe_task_handle(&workflow.data),
@@ -37,15 +40,7 @@ impl RuntimeWorkflowProjection {
     }
 
     pub(crate) fn active_bucket(&self) -> Option<RuntimeActiveBucket> {
-        if self.task_status.is_terminal() {
-            return None;
-        }
-        match self.scheduler.authority_state {
-            SchedulerAuthorityState::Running
-            | SchedulerAuthorityState::Leased
-            | SchedulerAuthorityState::Recovering => Some(RuntimeActiveBucket::Running),
-            _ => Some(RuntimeActiveBucket::Queued),
-        }
+        self.active_bucket
     }
 }
 
@@ -69,8 +64,19 @@ pub(crate) fn workflow_state_to_task_status(
         "awaiting_dependencies" => TaskStatus::AwaitingDeps,
         "scheduled" | "discovered" => TaskStatus::Pending,
         "planning" => TaskStatus::Planning,
-        "implementing" | "replanning" | "addressing_feedback" => TaskStatus::Implementing,
-        "pr_open"
+        "checking"
+        | "dispatching"
+        | "implementing"
+        | "inspecting"
+        | "planning_batch"
+        | "reconciling"
+        | "replanning"
+        | "scanning"
+        | "addressing_feedback" => TaskStatus::Implementing,
+        "feedback_found"
+        | "idle"
+        | "no_actionable_feedback"
+        | "pr_open"
         | "local_review_gate"
         | "awaiting_feedback"
         | "quality_gate_pending"
@@ -111,7 +117,16 @@ fn workflow_scheduler_state(
     match state {
         "awaiting_dependencies" => TaskSchedulerState::awaiting_dependencies(),
         "scheduled" | "discovered" => TaskSchedulerState::queued(),
-        "planning" | "implementing" | "replanning" | "addressing_feedback" => TaskSchedulerState {
+        "checking"
+        | "dispatching"
+        | "implementing"
+        | "inspecting"
+        | "planning"
+        | "planning_batch"
+        | "reconciling"
+        | "replanning"
+        | "scanning"
+        | "addressing_feedback" => TaskSchedulerState {
             authority_state: SchedulerAuthorityState::Running,
             owner: None,
             run_generation: 0,
@@ -134,6 +149,22 @@ fn workflow_scheduler_state(
             }
             _ => TaskSchedulerState::queued(),
         },
+    }
+}
+
+fn workflow_active_bucket(
+    state: &str,
+    status: &TaskStatus,
+    scheduler: &TaskSchedulerState,
+) -> Option<RuntimeActiveBucket> {
+    if status.is_terminal() || state == "idle" {
+        return None;
+    }
+    match scheduler.authority_state {
+        SchedulerAuthorityState::Running
+        | SchedulerAuthorityState::Leased
+        | SchedulerAuthorityState::Recovering => Some(RuntimeActiveBucket::Running),
+        _ => Some(RuntimeActiveBucket::Queued),
     }
 }
 
@@ -335,5 +366,94 @@ mod tests {
         );
         assert_eq!(projection.phase, TaskPhase::Terminal);
         assert_eq!(projection.active_bucket(), None);
+    }
+
+    #[test]
+    fn projection_maps_runtime_execution_states_to_running() {
+        for state in [
+            "checking",
+            "dispatching",
+            "implementing",
+            "inspecting",
+            "planning_batch",
+            "reconciling",
+            "replanning",
+            "scanning",
+            "addressing_feedback",
+        ] {
+            let workflow = workflow(state, serde_json::json!({}));
+
+            let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+            assert_eq!(projection.task_status, TaskStatus::Implementing, "{state}");
+            assert_eq!(
+                projection.scheduler.authority_state,
+                SchedulerAuthorityState::Running,
+                "{state}"
+            );
+            assert_eq!(
+                projection.active_bucket(),
+                Some(RuntimeActiveBucket::Running),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_preserves_planning_status_but_marks_scheduler_running() {
+        let workflow = workflow("planning", serde_json::json!({}));
+
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+        assert_eq!(projection.task_status, TaskStatus::Planning);
+        assert_eq!(projection.phase, TaskPhase::Plan);
+        assert_eq!(
+            projection.scheduler.authority_state,
+            SchedulerAuthorityState::Running
+        );
+        assert_eq!(
+            projection.active_bucket(),
+            Some(RuntimeActiveBucket::Running)
+        );
+    }
+
+    #[test]
+    fn projection_excludes_idle_workflows_from_active_counts() {
+        let workflow = workflow_with_definition(
+            harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+            "idle",
+            serde_json::json!({}),
+        );
+
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+        assert_eq!(projection.task_status, TaskStatus::Waiting);
+        assert_eq!(
+            projection.scheduler.authority_state,
+            SchedulerAuthorityState::Queued
+        );
+        assert_eq!(projection.active_bucket(), None);
+    }
+
+    #[test]
+    fn projection_keeps_pr_feedback_outcomes_queued_without_review_phase() {
+        for state in ["feedback_found", "no_actionable_feedback"] {
+            let workflow = workflow(state, serde_json::json!({}));
+
+            let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+            assert_eq!(projection.task_status, TaskStatus::Waiting, "{state}");
+            assert_eq!(projection.phase, TaskPhase::Implement, "{state}");
+            assert_eq!(
+                projection.scheduler.authority_state,
+                SchedulerAuthorityState::Queued,
+                "{state}"
+            );
+            assert_eq!(
+                projection.active_bucket(),
+                Some(RuntimeActiveBucket::Queued),
+                "{state}"
+            );
+        }
     }
 }
