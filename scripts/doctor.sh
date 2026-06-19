@@ -167,6 +167,19 @@ config_intake_github_value() {
     config_value "intake.github" "$1"
 }
 
+github_intake_mode() {
+    local mode
+    mode="$(config_intake_github_value "mode" || true)"
+    printf '%s\n' "${mode:-poll}"
+}
+
+github_intake_poller_enabled() {
+    case "$1" in
+        poll | hybrid | both) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 status_ok() {
     printf 'OK: %s\n' "$1"
 }
@@ -329,9 +342,21 @@ bind_port() {
 
 is_local_bind_host() {
     case "$1" in
-        "" | "localhost" | "127."* | "::1") return 0 ;;
+        "127."* | "::1") return 0 ;;
         *) return 1 ;;
     esac
+}
+
+is_ip_literal_host() {
+    local host="$1"
+
+    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 0
+    fi
+    if [[ "$host" == *:* && "$host" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+        return 0
+    fi
+    return 1
 }
 
 config_has_non_empty_server_array() {
@@ -413,6 +438,11 @@ check_http_exposure() {
 
     resolve_http_addr
     host="$(bind_host "$HTTP_ADDR")"
+    if ! is_ip_literal_host "$host"; then
+        fail "HTTP bind address must use an IP literal SocketAddr host, not a hostname: $HTTP_ADDR"
+        return 0
+    fi
+
     if is_local_bind_host "$host"; then
         status_ok "HTTP bind address is local: $HTTP_ADDR"
         return 0
@@ -546,6 +576,7 @@ workflow_enabled_value() {
 check_workflow_runtime_flags() {
     local section
     local value
+    local mode
     local missing=0
 
     if [ ! -f "WORKFLOW.md" ]; then
@@ -553,7 +584,14 @@ check_workflow_runtime_flags() {
         return 0
     fi
 
+    mode="$(github_intake_mode)"
+
     for section in repo_backlog runtime_dispatch runtime_worker; do
+        if [ "$section" = "repo_backlog" ] && ! github_intake_poller_enabled "$mode"; then
+            status_ok "GitHub intake mode '$mode' does not require repo_backlog polling"
+            continue
+        fi
+
         value="$(workflow_enabled_value "$section" || true)"
         if [ "$value" = "true" ]; then
             status_ok "WORKFLOW.md enables $section"
