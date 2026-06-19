@@ -57,6 +57,7 @@ pub(crate) struct TaskResponseDetails {
     pub(crate) workflow_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskResponseStatusMode {
     RuntimeProjection,
     WorkflowState,
