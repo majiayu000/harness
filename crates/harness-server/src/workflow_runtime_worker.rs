@@ -12,6 +12,7 @@ mod runtime_profile;
 mod workspace;
 
 use crate::http::AppState;
+use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::task_runner::{TaskFailureKind, TaskKind, TaskState, TaskStatus};
 use chrono::Duration;
 use data_helpers::{optional_data_string, optional_data_u64};
@@ -132,7 +133,9 @@ fn runtime_submission_completion_task(
     instance: &WorkflowInstance,
     result: Option<&ActivityResult>,
 ) -> Option<TaskState> {
-    if !instance.is_terminal() {
+    let projection = RuntimeWorkflowProjection::from_workflow(instance);
+    let status = projection.task_status;
+    if !status.is_terminal() {
         return None;
     }
     let task_kind = match instance.definition_id.as_str() {
@@ -143,7 +146,6 @@ fn runtime_submission_completion_task(
     let source = optional_data_string(instance, "source")?;
     let external_id = optional_data_string(instance, "external_id")?;
     let task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(instance)?;
-    let status = task_status_for_runtime_state(&instance.state)?;
     let mut task = TaskState::new(task_id);
     task.task_kind = task_kind;
     task.status = status.clone();
@@ -166,15 +168,6 @@ fn runtime_submission_completion_task(
     };
     task.error = runtime_completion_error(&status, result);
     Some(task)
-}
-
-fn task_status_for_runtime_state(state: &str) -> Option<TaskStatus> {
-    match state {
-        "done" => Some(TaskStatus::Done),
-        "failed" => Some(TaskStatus::Failed),
-        "cancelled" => Some(TaskStatus::Cancelled),
-        _ => None,
-    }
 }
 
 fn runtime_job_activity_result(job: &RuntimeJob) -> Option<ActivityResult> {
@@ -216,4 +209,133 @@ fn runtime_completion_error(
                 .or_else(|| (!result.summary.trim().is_empty()).then_some(result.summary.trim()))
         })
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_workflow::runtime::WorkflowSubject;
+    use serde_json::json;
+
+    fn issue_instance(state: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            state,
+            WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_data(json!({
+            "task_id": "runtime-task-42",
+            "project_id": "/tmp/project",
+            "repo": "owner/repo",
+            "issue_number": 42,
+            "source": "github",
+            "external_id": "issue:42",
+            "last_pr_url": "https://github.com/owner/repo/pull/7",
+        }))
+    }
+
+    fn prompt_instance(state: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            state,
+            WorkflowSubject::new("prompt", "manual:prompt:42"),
+        )
+        .with_data(json!({
+            "task_id": "runtime-prompt-42",
+            "project_id": "/tmp/project",
+            "prompt_summary": "prompt task",
+            "source": "dashboard",
+            "external_id": "manual:prompt:42",
+        }))
+    }
+
+    #[test]
+    fn runtime_submission_completion_task_maps_passed_via_projection() {
+        let instance = issue_instance("passed");
+        let result = ActivityResult::succeeded("implement_issue", "Runtime job passed.");
+
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+            panic!("projected terminal runtime issue should map to an intake task");
+        };
+
+        assert_eq!(task.id.as_str(), "runtime-task-42");
+        assert_eq!(task.task_kind, TaskKind::Issue);
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.source.as_deref(), Some("github"));
+        assert_eq!(task.external_id.as_deref(), Some("issue:42"));
+        assert_eq!(task.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(task.issue, Some(42));
+        assert_eq!(
+            task.pr_url.as_deref(),
+            Some("https://github.com/owner/repo/pull/7")
+        );
+        assert_eq!(task.description.as_deref(), Some("issue #42"));
+    }
+
+    #[test]
+    fn runtime_submission_completion_task_preserves_issue_intake_identity() {
+        let instance = issue_instance("cancelled");
+        let result = ActivityResult::cancelled("implement_issue", "Runtime job was cancelled.");
+
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+            panic!("terminal runtime issue should map to an intake task");
+        };
+
+        assert_eq!(task.id.as_str(), "runtime-task-42");
+        assert_eq!(task.task_kind, TaskKind::Issue);
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.source.as_deref(), Some("github"));
+        assert_eq!(task.external_id.as_deref(), Some("issue:42"));
+        assert_eq!(task.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(task.issue, Some(42));
+    }
+
+    #[test]
+    fn runtime_submission_completion_task_preserves_prompt_intake_identity() {
+        let instance = prompt_instance("done");
+        let result = ActivityResult::succeeded("implement_prompt", "Prompt task completed.");
+
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+            panic!("terminal runtime prompt should map to an intake task");
+        };
+
+        assert_eq!(task.id.as_str(), "runtime-prompt-42");
+        assert_eq!(task.task_kind, TaskKind::Prompt);
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.source.as_deref(), Some("dashboard"));
+        assert_eq!(task.external_id.as_deref(), Some("manual:prompt:42"));
+        assert_eq!(task.issue, None);
+        assert_eq!(task.description.as_deref(), Some("prompt task"));
+    }
+
+    #[test]
+    fn runtime_submission_completion_task_marks_retryable_failures_as_transient() {
+        let instance = issue_instance("failed");
+        let result = ActivityResult::failed(
+            "implement_issue",
+            "Runtime dependency failed.",
+            "provider temporarily unavailable",
+        )
+        .with_error_kind(ActivityErrorKind::ExternalDependency);
+
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+            panic!("terminal runtime issue should map to an intake task");
+        };
+
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.failure_kind, Some(TaskFailureKind::WorkspaceLifecycle));
+        assert_eq!(
+            task.error.as_deref(),
+            Some("provider temporarily unavailable")
+        );
+    }
+
+    #[test]
+    fn runtime_submission_completion_task_ignores_nonterminal_projection_status() {
+        let instance = issue_instance("local_review_gate");
+
+        assert!(runtime_submission_completion_task(&instance, None).is_none());
+    }
 }
