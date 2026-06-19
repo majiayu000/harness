@@ -5,9 +5,12 @@
 //! questions across workflow runtime state, legacy task rows, failures, and
 //! worktrees.
 
+mod activity;
+
 use crate::http::AppState;
-use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
+use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary};
+use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, SourceActivity};
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
@@ -63,36 +66,12 @@ struct OperatorActivity {
 }
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
-struct RuntimeWorkflowCounts {
-    pending: u64,
-    running: u64,
-    review: u64,
-    awaiting_dependencies: u64,
-    ready_to_merge: u64,
-    blocked: u64,
-    failed: u64,
-    done: u64,
-    other: u64,
-}
-
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
 struct LegacyQueueCounts {
     queued: u64,
     running: u64,
     stalled: u64,
     failed: u64,
     done: u64,
-}
-
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
-struct SourceActivity {
-    source: String,
-    pending: u64,
-    running: u64,
-    review: u64,
-    blocked: u64,
-    failed: u64,
-    ready_to_merge: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -359,62 +338,6 @@ async fn list_recent_failed_workflows(
     Ok(workflows)
 }
 
-fn runtime_workflow_counts(workflows: &[WorkflowInstance]) -> RuntimeWorkflowCounts {
-    let mut counts = RuntimeWorkflowCounts::default();
-    for workflow in workflows {
-        match workflow_bucket(workflow) {
-            WorkflowBucket::Pending => counts.pending += 1,
-            WorkflowBucket::Running => counts.running += 1,
-            WorkflowBucket::Review => counts.review += 1,
-            WorkflowBucket::AwaitingDependencies => counts.awaiting_dependencies += 1,
-            WorkflowBucket::ReadyToMerge => counts.ready_to_merge += 1,
-            WorkflowBucket::Blocked => counts.blocked += 1,
-            WorkflowBucket::Failed => counts.failed += 1,
-            WorkflowBucket::Done => counts.done += 1,
-            WorkflowBucket::Other => counts.other += 1,
-        }
-    }
-    counts
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkflowBucket {
-    Pending,
-    Running,
-    Review,
-    AwaitingDependencies,
-    ReadyToMerge,
-    Blocked,
-    Failed,
-    Done,
-    Other,
-}
-
-fn workflow_bucket(workflow: &WorkflowInstance) -> WorkflowBucket {
-    match workflow.state.as_str() {
-        "scheduled" | "discovered" => WorkflowBucket::Pending,
-        "checking" | "dispatching" | "inspecting" | "planning_batch" | "reconciling"
-        | "scanning" => WorkflowBucket::Running,
-        "awaiting_dependencies" => WorkflowBucket::AwaitingDependencies,
-        "ready_to_merge" => WorkflowBucket::ReadyToMerge,
-        "blocked" => WorkflowBucket::Blocked,
-        "failed" => WorkflowBucket::Failed,
-        "done" | "passed" => WorkflowBucket::Done,
-        "idle" => WorkflowBucket::Other,
-        "pr_open" | "local_review_gate" | "awaiting_feedback" | "quality_gate_pending" => {
-            WorkflowBucket::Review
-        }
-        _ => {
-            let projection = RuntimeWorkflowProjection::from_workflow(workflow);
-            match projection.active_bucket() {
-                Some(RuntimeActiveBucket::Running) => WorkflowBucket::Running,
-                Some(RuntimeActiveBucket::Queued) => WorkflowBucket::Pending,
-                None => WorkflowBucket::Other,
-            }
-        }
-    }
-}
-
 fn legacy_queue_counts(
     active_tasks: &[TaskSummary],
     stalled: u64,
@@ -457,101 +380,6 @@ fn filter_workflow_backed_tasks(
         .into_iter()
         .filter(|task| !workflow_task_ids.contains(task.id.as_str()))
         .collect()
-}
-
-fn source_activity(
-    workflows: &[WorkflowInstance],
-    active_tasks: &[TaskSummary],
-) -> Vec<SourceActivity> {
-    let mut by_source: HashMap<String, SourceActivity> = HashMap::new();
-    let workflow_task_ids = workflow_legacy_task_ids(workflows);
-    for workflow in workflows {
-        add_workflow_source_activity(&mut by_source, workflow);
-    }
-    for task in active_tasks {
-        if task.workflow.is_some() || workflow_task_ids.contains(task.id.as_str()) {
-            continue;
-        }
-        add_legacy_source_activity(&mut by_source, task);
-    }
-    let mut rows: Vec<SourceActivity> = by_source.into_values().collect();
-    rows.sort_by(|a, b| {
-        source_total(b)
-            .cmp(&source_total(a))
-            .then_with(|| a.source.cmp(&b.source))
-    });
-    rows
-}
-
-fn add_workflow_source_activity(
-    by_source: &mut HashMap<String, SourceActivity>,
-    workflow: &WorkflowInstance,
-) {
-    let bucket = workflow_bucket(workflow);
-    if matches!(bucket, WorkflowBucket::Done | WorkflowBucket::Other) {
-        return;
-    }
-    let source = workflow_source(workflow);
-    let entry = by_source
-        .entry(source.clone())
-        .or_insert_with(|| SourceActivity {
-            source,
-            ..Default::default()
-        });
-    match bucket {
-        WorkflowBucket::Pending => entry.pending += 1,
-        WorkflowBucket::Running => entry.running += 1,
-        WorkflowBucket::Review => entry.review += 1,
-        WorkflowBucket::AwaitingDependencies | WorkflowBucket::Blocked => entry.blocked += 1,
-        WorkflowBucket::Failed => entry.failed += 1,
-        WorkflowBucket::ReadyToMerge => entry.ready_to_merge += 1,
-        _ => {}
-    }
-}
-
-fn add_legacy_source_activity(by_source: &mut HashMap<String, SourceActivity>, task: &TaskSummary) {
-    let update: fn(&mut SourceActivity) = if task.status.is_failure()
-        || task.scheduler.authority_state == SchedulerAuthorityState::Failed
-    {
-        |entry| entry.failed += 1
-    } else if matches!(
-        task.scheduler.authority_state,
-        SchedulerAuthorityState::Running
-            | SchedulerAuthorityState::Leased
-            | SchedulerAuthorityState::Recovering
-    ) {
-        |entry| entry.running += 1
-    } else if matches!(
-        task.scheduler.authority_state,
-        SchedulerAuthorityState::AwaitingDependencies | SchedulerAuthorityState::RetryBackoff
-    ) || matches!(task.status.as_ref(), "awaiting_deps" | "waiting")
-    {
-        |entry| entry.blocked += 1
-    } else {
-        return;
-    };
-    let source = task
-        .source
-        .as_deref()
-        .filter(|source| !source.trim().is_empty())
-        .unwrap_or("manual")
-        .to_string();
-    let entry = by_source
-        .entry(source.clone())
-        .or_insert_with(|| SourceActivity {
-            source,
-            ..Default::default()
-        });
-    update(entry);
-}
-
-fn source_total(source: &SourceActivity) -> u64 {
-    source.pending
-        + source.running
-        + source.review
-        + source.blocked
-        + source.failed
-        + source.ready_to_merge
 }
 
 fn operator_actions(
