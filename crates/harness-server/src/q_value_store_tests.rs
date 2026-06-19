@@ -130,7 +130,7 @@ async fn legacy_q_value_store_migration_backfills_once() -> anyhow::Result<()> {
     std::fs::create_dir_all(&target_data_dir)?;
     std::fs::create_dir_all(&other_data_dir)?;
     let legacy_path = target_data_dir.join("q_values.db");
-    let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
+    let legacy_schema = PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
     let target_schema = unique_test_schema("q_value_store_migration_test");

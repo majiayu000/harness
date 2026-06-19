@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn storage_path_schema_guard_rejects_path_derived_startup_context() -> anyhow::Result<()> {
-        let context = PgStoreContext::from_path(
+        let context = PgStoreContext::from_legacy_path_schema(
             Path::new("/tmp/harness/path-derived-startup.db"),
             Some(TEST_DATABASE_URL),
         )?;

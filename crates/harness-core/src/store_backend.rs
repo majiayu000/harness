@@ -110,7 +110,9 @@ impl PostgresBackend {
         let url = self.configured_database_url.as_deref();
         match loc {
             StoreLocation::SharedSchema(schema) => PgStoreContext::from_schema(schema, url),
-            StoreLocation::PathDerivedSchema(path) => PgStoreContext::from_path(path, url),
+            StoreLocation::PathDerivedSchema(path) => {
+                PgStoreContext::from_legacy_path_schema(path, url)
+            }
             StoreLocation::LocalFile(path) => Err(anyhow::anyhow!(
                 "PostgresBackend cannot open a LocalFile location ({}); use LocalFileBackend",
                 path.display()

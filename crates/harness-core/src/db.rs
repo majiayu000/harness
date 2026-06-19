@@ -17,13 +17,15 @@ pub use crate::db_pg_schema_registry::{
     PG_SCHEMA_REGISTRY_SCHEMA, PG_SCHEMA_REGISTRY_TABLE,
 };
 
-/// Create a Postgres connection pool for the logical store at `path`.
+/// Create a legacy path-derived Postgres connection pool for the logical store at `path`.
 ///
 /// Historical stores accepted SQLite file paths as their identity boundary.
 /// The Postgres backend preserves that boundary by hashing each path to a
 /// stable schema name.
-pub async fn open_pool(path: &Path) -> anyhow::Result<PgPool> {
-    PgStoreContext::from_path(path, None)?.open_pool().await
+pub async fn open_legacy_path_schema_pool(path: &Path) -> anyhow::Result<PgPool> {
+    PgStoreContext::from_legacy_path_schema(path, None)?
+        .open_pool()
+        .await
 }
 
 /// Marker trait for entities that can be stored as JSON blobs.
@@ -50,15 +52,15 @@ pub trait DbEntity: Serialize + for<'de> Deserialize<'de> + Send + Unpin + 'stat
 ///
 /// Use this when entities do not need queryable columns beyond `id`.
 /// For entities requiring SQL-level filtering, keep a specialised store and
-/// call [`open_pool`] for pool creation.
+/// call [`open_legacy_path_schema_pool`] only for legacy path-derived schemas.
 pub struct Db<T: DbEntity> {
     pub(crate) pool: PgPool,
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: DbEntity> Db<T> {
-    pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        let pool = open_pool(path).await?;
+    pub async fn open_legacy_path_schema(path: &Path) -> anyhow::Result<Self> {
+        let pool = open_legacy_path_schema_pool(path).await?;
         let db = Self {
             pool,
             _phantom: std::marker::PhantomData,

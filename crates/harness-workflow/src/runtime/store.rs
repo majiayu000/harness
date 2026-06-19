@@ -188,7 +188,7 @@ impl WorkflowRuntimeStore {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let context = PgStoreContext::from_legacy_path_schema(path, configured_database_url)?;
         let pool = context
             .open_migrated_pool(WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;

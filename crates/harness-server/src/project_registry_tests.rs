@@ -147,7 +147,7 @@ async fn legacy_project_registry_migration_backfills_once() -> anyhow::Result<()
     let target_data_dir = dir.path().join("target-data");
     let other_data_dir = dir.path().join("other-data");
     let legacy_path = target_data_dir.join("projects.db");
-    let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
+    let legacy_schema = PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
     let target_schema = unique_test_schema("project_registry_migration_test");

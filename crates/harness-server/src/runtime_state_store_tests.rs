@@ -68,7 +68,7 @@ async fn legacy_runtime_state_migration_backfills_once() -> anyhow::Result<()> {
     let target_data_dir = dir.path().join("target-data");
     let other_data_dir = dir.path().join("other-data");
     let legacy_path = target_data_dir.join("runtime_state.db");
-    let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
+    let legacy_schema = PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
     let target_schema = unique_test_schema("runtime_state_store_test");

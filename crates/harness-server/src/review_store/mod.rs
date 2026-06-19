@@ -110,7 +110,7 @@ impl ReviewStore {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let context = PgStoreContext::from_legacy_path_schema(path, configured_database_url)?;
         let pool = context.open_migrated_pool(REVIEW_MIGRATIONS).await?;
         Ok(Self { pool })
     }
@@ -559,7 +559,8 @@ pub async fn migrate_legacy_review_store_if_needed(
     configured_database_url: Option<&str>,
     target_store: &ReviewStore,
 ) -> anyhow::Result<u64> {
-    let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
+    let legacy_context =
+        PgStoreContext::from_legacy_path_schema(legacy_path, configured_database_url)?;
     let legacy_schema = legacy_context.schema();
     if legacy_schema == REVIEW_STORE_SCHEMA {
         return Ok(0);

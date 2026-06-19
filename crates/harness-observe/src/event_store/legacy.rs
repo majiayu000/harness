@@ -7,7 +7,8 @@ pub async fn migrate_legacy_event_store_if_needed(
     configured_database_url: Option<&str>,
     target_store: &EventStore,
 ) -> anyhow::Result<u64> {
-    let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
+    let legacy_context =
+        PgStoreContext::from_legacy_path_schema(legacy_path, configured_database_url)?;
     let legacy_schema = legacy_context.schema();
     if legacy_schema == target_store.schema() {
         return Ok(0);
