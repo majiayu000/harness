@@ -124,23 +124,29 @@ async fn runtime_task_response_by_handle(
     }) else {
         return Ok(None);
     };
-    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+    let RuntimeWorkflowProjection {
+        task_status,
+        failure_kind,
+        phase,
+        scheduler,
+        project_id,
+        submission_handle,
+        ..
+    } = RuntimeWorkflowProjection::from_workflow(&workflow);
     let external_id = runtime_external_id(task_kind, &workflow.data, issue);
-    let submission_id = projection
-        .submission_handle
-        .clone()
-        .unwrap_or_else(|| task_id.clone())
-        .0;
+    let submission_id = submission_handle
+        .map(|handle| handle.0)
+        .unwrap_or_else(|| task_id.0.clone());
     Ok(Some(RuntimeTaskResponse {
         id: submission_id.clone(),
         task_id: submission_id.clone(),
         submission_id,
         task_kind,
-        status: projection.task_status,
+        status: task_status,
         workflow_state: workflow.state.clone(),
-        failure_kind: projection.failure_kind,
-        phase: projection.phase,
-        scheduler: projection.scheduler,
+        failure_kind,
+        phase,
+        scheduler,
         turn: 0,
         execution_path: "workflow_runtime",
         workflow_id: workflow.id.clone(),
@@ -153,7 +159,7 @@ async fn runtime_task_response_by_handle(
             .get("repo")
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned),
-        project: projection.project_id,
+        project: project_id,
         issue,
         error: runtime_string_field(&workflow.data, "failure_reason"),
         depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
