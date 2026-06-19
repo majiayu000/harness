@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 
 CONFIG_PATH="${HARNESS_CONFIG:-}"
 CONFIG_ARGS=()
+HARNESS_BIN="${HARNESS_BIN:-./target/release/harness}"
 
 is_absolute_path() {
     case "$1" in
@@ -156,8 +157,7 @@ listener_pids() {
         [[ "$line" == COMMAND* ]] && continue
         [[ "$line" == *" TCP "* ]] || continue
         [[ "$line" == *"(LISTEN)"* ]] || continue
-        set -- $line
-        pid="${2:-}"
+        read -r _ pid _ <<< "$line"
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
         name="${line##* TCP }"
         name="${name% (LISTEN)}"
@@ -270,6 +270,44 @@ ensure_bind_port_available() {
 
 ensure_bind_port_available
 
+ensure_harness_binary() {
+    if [ -e "$HARNESS_BIN" ] && [ ! -x "$HARNESS_BIN" ]; then
+        echo "ERROR: Harness binary exists but is not executable: $HARNESS_BIN" >&2
+        echo "Remove it or rebuild with: cargo build --release -p harness-cli" >&2
+        exit 1
+    fi
+
+    if [ -x "$HARNESS_BIN" ]; then
+        return 0
+    fi
+
+    if [ "$HARNESS_BIN" != "./target/release/harness" ]; then
+        echo "ERROR: configured Harness binary not found or not executable: $HARNESS_BIN" >&2
+        echo "Set HARNESS_BIN to an executable harness binary or build the default release binary." >&2
+        exit 1
+    fi
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "ERROR: $HARNESS_BIN is missing and cargo is not available to build it." >&2
+        echo "Install Rust or build the release binary in another environment, then rerun ./start-server.sh." >&2
+        exit 1
+    fi
+
+    echo "Release Harness binary not found; building it with cargo build --release -p harness-cli..." >&2
+    if ! cargo build --release -p harness-cli; then
+        echo "ERROR: failed to build $HARNESS_BIN." >&2
+        echo "Install the build prerequisites, then rerun: cargo build --release -p harness-cli" >&2
+        exit 1
+    fi
+
+    if [ ! -x "$HARNESS_BIN" ]; then
+        echo "ERROR: cargo build completed but $HARNESS_BIN is still missing or not executable." >&2
+        exit 1
+    fi
+}
+
+ensure_harness_binary
+
 uses_local_postgres() {
     if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
         return 1
@@ -305,4 +343,4 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
     fi
 fi
 
-exec ./target/release/harness serve "${CONFIG_ARGS[@]}" --transport http --project-root "$(pwd)"
+exec "$HARNESS_BIN" "${CONFIG_ARGS[@]}" serve --transport http --project-root "$(pwd)"

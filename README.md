@@ -75,7 +75,11 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 - Rust 1.88+
 - Bun 1.1+ for release builds that embed the web dashboard. If `web/dist` is
   already built, release builds can reuse it.
-- At least one agent runtime:
+- Postgres 14+. For local development, `scripts/dev-db.sh` starts the bundled
+  Docker Compose Postgres service.
+- A GitHub token for issue/PR automation. Use `gh auth login`, `GITHUB_TOKEN`,
+  `GH_TOKEN`, or `server.github_token`.
+- At least one agent runtime for autonomous execution:
   - [`codex`](https://github.com/openai/codex) CLI
   - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI
   - Anthropic API key (for direct API adapter)
@@ -85,8 +89,12 @@ Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Code
 ```bash
 git clone https://github.com/majiayu000/harness.git
 cd harness
-cargo build
+cargo build --release -p harness-cli
 ```
+
+`./start-server.sh` also builds the release CLI automatically when
+`./target/release/harness` is missing, but running the build yourself keeps the
+startup prerequisite explicit.
 
 ### Rust API Facade
 
@@ -114,8 +122,11 @@ track internal crate layout changes.
 ### Database Setup
 
 Harness requires Postgres 14+ (SQLite was removed in v0.x). Configure
-`server.database_url` in your TOML config before starting the server —
-migrations run automatically on first connect.
+`server.database_url` in your TOML config or set `HARNESS_DATABASE_URL` before
+starting the server. When no config or environment database URL is present,
+`./start-server.sh` uses the local development default
+`postgres://harness:harness@localhost:5432/harness`. Migrations run
+automatically on first connect.
 
 **Option A — Docker Compose (recommended for local dev):**
 
@@ -178,9 +189,25 @@ coverage remains explicit and stable.
 **HTTP server:**
 
 ```bash
-cargo run -p harness-cli -- serve --transport http --port 9800
+bash scripts/doctor.sh
+./start-server.sh
 curl http://127.0.0.1:9800/health
 ```
+
+`scripts/doctor.sh` is non-mutating. It checks database URL resolution and
+Postgres reachability, the release binary/build prerequisite, GitHub token
+discovery, webhook secret readiness when webhook intake is enabled, local agent
+CLI availability, required `WORKFLOW.md` runtime flags, port occupancy, and
+unsafe non-local HTTP exposure before you start the server. Use
+`scripts/doctor.sh --dry-run` when you want a report without a failing exit
+code.
+
+`./start-server.sh` selects `HARNESS_CONFIG`, `config/default.toml`,
+`config/claude.toml`, a user config file, or built-in defaults in that order.
+It verifies the HTTP port, starts the local Docker Compose Postgres service when
+using the local fallback URL, loads `GITHUB_TOKEN` from `gh auth token` when
+available, and builds `./target/release/harness` with
+`cargo build --release -p harness-cli` if the release binary is missing.
 
 `harness serve` persists its runtime log under `server.data_dir/logs/` as
 `harness-serve-<startup-timestamp>-pid<PID>.log`. `/health` exposes a redacted
@@ -437,7 +464,7 @@ because the operator owns the process lifetime directly.
 
 ```bash
 # Single project (backward compatible)
-./target/release/harness serve --transport http --port 9800 --project-root /path/to/project
+./start-server.sh
 
 # Multi-project via config file (recommended)
 ./target/release/harness --config config/default.toml serve --transport http --port 9800
@@ -450,6 +477,11 @@ because the operator owns the process lifetime directly.
 # With GitHub token for auto-review
 GITHUB_TOKEN=ghp_xxx ./target/release/harness --config config/default.toml serve --transport http --port 9800
 ```
+
+Before using direct `./target/release/harness ... serve` commands, run
+`scripts/doctor.sh --config <path>` or confirm the same prerequisites manually.
+The direct binary commands do not start local Postgres or build the release
+binary for you.
 
 ## Task Execution Flow
 
