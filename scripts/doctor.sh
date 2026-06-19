@@ -380,9 +380,9 @@ PY
         return $?
     fi
 
-    if [[ "$host" == *:* && "$host" =~ ^[0-9A-Fa-f:.]+$ ]]; then
-        return 0
-    fi
+    # Without python3 there is no portable shell parser that reliably matches
+    # Rust SocketAddr IPv6 semantics, so fail closed instead of accepting a
+    # malformed IPv6 literal.
     return 1
 }
 
