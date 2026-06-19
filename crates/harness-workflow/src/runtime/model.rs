@@ -1,4 +1,5 @@
 use super::status::WorkflowCommandStatus;
+use super::terminal_state::{workflow_terminal_state, WorkflowTerminalState};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -113,10 +114,11 @@ impl WorkflowInstance {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.state.as_str(),
-            "done" | "passed" | "failed" | "cancelled"
-        )
+        self.terminal_state().is_some()
+    }
+
+    pub fn terminal_state(&self) -> Option<WorkflowTerminalState> {
+        workflow_terminal_state(&self.definition_id, &self.state)
     }
 
     pub fn with_id(mut self, id: impl Into<String>) -> Self {

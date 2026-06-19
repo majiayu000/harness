@@ -21,6 +21,7 @@ pub mod store;
 mod store_migrations;
 mod store_summary;
 pub mod submission;
+pub mod terminal_state;
 pub mod validator;
 pub mod worker;
 
@@ -88,6 +89,7 @@ pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,
     IssueSubmissionWorkflowAction,
 };
+pub use terminal_state::{workflow_terminal_state, WorkflowTerminalState};
 pub use validator::{
     DecisionValidator, TransitionAllowlist, TransitionRule, ValidationContext,
     WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
