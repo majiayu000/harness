@@ -391,6 +391,124 @@ async fn workflow_runtime_tree_endpoint_defaults_to_compact_polling_shape() -> a
 }
 
 #[tokio::test]
+async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+
+    for (id, state, issue_number, extra_data) in [
+        (
+            "issue-active",
+            "implementing",
+            1201,
+            serde_json::json!({
+                "submission_id": "submission-active",
+                "task_id": "legacy-active",
+            }),
+        ),
+        (
+            "issue-review-wait",
+            "awaiting_feedback",
+            1202,
+            serde_json::json!({}),
+        ),
+        ("issue-terminal", "failed", 1203, serde_json::json!({})),
+    ] {
+        let mut data = serde_json::json!({
+            "project_id": "/project-a",
+            "repo": "owner/repo",
+            "issue_number": issue_number,
+        });
+        data.as_object_mut()
+            .expect("test data should be an object")
+            .extend(
+                extra_data
+                    .as_object()
+                    .expect("extra data should be an object")
+                    .clone(),
+            );
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            state,
+            harness_workflow::runtime::WorkflowSubject::new(
+                "issue",
+                format!("issue:{issue_number}"),
+            ),
+        )
+        .with_id(id)
+        .with_data(data);
+        store.upsert_instance(&workflow).await?;
+    }
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-a&job_limit=0")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    let workflows = body["workflows"]
+        .as_array()
+        .expect("workflows should be an array");
+    let node = |id: &str| {
+        workflows
+            .iter()
+            .find(|node| node["workflow"]["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing workflow node {id}"))
+    };
+
+    let active = node("issue-active");
+    assert_eq!(active["projection"]["status"], "implementing");
+    assert_eq!(active["projection"]["phase"], "implement");
+    assert_eq!(
+        active["projection"]["scheduler"]["authority_state"],
+        "running"
+    );
+    assert_eq!(active["projection"]["active_bucket"], "running");
+    assert_eq!(active["projection"]["project_id"], "/project-a");
+    assert_eq!(
+        active["projection"]["submission_handle"],
+        "submission-active"
+    );
+    assert_eq!(
+        active["projection"]["legacy_dedupe_task_handle"],
+        "legacy-active"
+    );
+
+    let review_wait = node("issue-review-wait");
+    assert_eq!(review_wait["projection"]["status"], "waiting");
+    assert_eq!(review_wait["projection"]["phase"], "review");
+    assert_eq!(
+        review_wait["projection"]["scheduler"]["authority_state"],
+        "queued"
+    );
+    assert_eq!(review_wait["projection"]["active_bucket"], "queued");
+
+    let terminal = node("issue-terminal");
+    assert_eq!(terminal["projection"]["status"], "failed");
+    assert_eq!(terminal["projection"]["phase"], "terminal");
+    assert_eq!(
+        terminal["projection"]["scheduler"]["authority_state"],
+        "failed"
+    );
+    assert_eq!(terminal["projection"]["failure_kind"], "task");
+    assert!(terminal["projection"]["active_bucket"].is_null());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn workflow_runtime_tree_endpoint_returns_summary_only_shape() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
