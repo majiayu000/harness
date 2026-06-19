@@ -1,3 +1,5 @@
+import type { TaskSchedulerState } from "./task";
+
 export interface WorkflowRuntimeTreePayload {
   workflows: WorkflowRuntimeTreeNode[];
   total_workflows: number;
@@ -26,6 +28,7 @@ export interface WorkflowRuntimeTreePayload {
 
 export interface WorkflowRuntimeTreeNode {
   workflow: WorkflowRuntimeInstance;
+  projection: WorkflowRuntimeTreeProjection;
   runtime_job_count?: number;
   event_count?: number;
   decision_count?: number;
@@ -35,6 +38,17 @@ export interface WorkflowRuntimeTreeNode {
   decisions: WorkflowRuntimeDecisionRecord[];
   commands: WorkflowRuntimeCommandNode[];
   children: WorkflowRuntimeTreeNode[];
+}
+
+export interface WorkflowRuntimeTreeProjection {
+  status: string;
+  failure_kind?: string | null;
+  phase: string;
+  scheduler: TaskSchedulerState;
+  project_id?: string | null;
+  submission_handle?: string | null;
+  legacy_dedupe_task_handle?: string | null;
+  active_bucket?: "running" | "queued" | null;
 }
 
 export interface WorkflowRuntimeInstance {
