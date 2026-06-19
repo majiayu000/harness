@@ -8,6 +8,7 @@ pub const PG_SCHEMA_REGISTRY_TABLE: &str = "schema_ownership";
 
 const PATH_DERIVED_OWNER_KIND: &str = "path_derived_store";
 const PATH_DERIVED_DIRECTORY_OWNER_KIND: &str = "path_derived_directory_store";
+const LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND: &str = "path_derived_schema";
 const PATH_DERIVED_RETENTION_CLASS: &str = "path_derived";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -45,7 +46,9 @@ fn path_derived_owner_kind(path: &Path) -> &'static str {
 fn is_path_derived_owner_kind(owner_kind: &str) -> bool {
     matches!(
         owner_kind,
-        PATH_DERIVED_OWNER_KIND | PATH_DERIVED_DIRECTORY_OWNER_KIND
+        PATH_DERIVED_OWNER_KIND
+            | PATH_DERIVED_DIRECTORY_OWNER_KIND
+            | LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND
     )
 }
 
@@ -556,7 +559,8 @@ fn owner_path_is_orphaned_with_workspace_roots(
     workspace_roots: &[PathBuf],
 ) -> bool {
     let liveness_path = if owner_kind == PATH_DERIVED_DIRECTORY_OWNER_KIND
-        || (owner_kind == PATH_DERIVED_OWNER_KIND
+        || ((owner_kind == PATH_DERIVED_OWNER_KIND
+            || owner_kind == LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND)
             && is_legacy_workspace_directory_owner_path(owner_path, workspace_roots))
     {
         owner_path
@@ -573,24 +577,40 @@ fn owner_path_is_orphaned_with_workspace_roots(
 }
 
 fn orphaned_path_schema_names(
-    rows: Vec<(String, String, Option<String>)>,
+    rows: Vec<(String, String, Option<String>, Option<String>)>,
     workspace_roots: Vec<PathBuf>,
 ) -> Vec<String> {
     let mut orphans = Vec::new();
-    for (schema_name, owner_kind, owner_path) in rows {
+    for (schema_name, owner_kind, owner_key, owner_path) in rows {
         // No recorded path: cannot prove the schema is orphaned, so keep it.
-        let Some(owner_path) = owner_path else {
+        let Some(liveness_path) =
+            owner_liveness_path(&owner_kind, owner_key.as_deref(), owner_path.as_deref())
+        else {
             continue;
         };
         if owner_path_is_orphaned_with_workspace_roots(
             &owner_kind,
-            Path::new(&owner_path),
+            Path::new(liveness_path),
             &workspace_roots,
         ) {
             orphans.push(schema_name);
         }
     }
     orphans
+}
+
+fn owner_liveness_path<'a>(
+    owner_kind: &str,
+    owner_key: Option<&'a str>,
+    owner_path: Option<&'a str>,
+) -> Option<&'a str> {
+    owner_path.or_else(|| {
+        if owner_kind == LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND {
+            owner_key.filter(|key| Path::new(key).is_absolute())
+        } else {
+            None
+        }
+    })
 }
 
 /// Drop registered path-derived schemas whose owning workspace directory is gone.
@@ -616,13 +636,14 @@ pub async fn reap_orphaned_path_schemas_with_workspace_roots(
     workspace_roots: &[PathBuf],
 ) -> anyhow::Result<PgSchemaReapReport> {
     ensure_pg_schema_registry(pool).await?;
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT schema_name, owner_kind, owner_path
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT schema_name, owner_kind, owner_key, owner_path
          FROM \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\"
-         WHERE owner_kind IN ($1, $2)"
+         WHERE owner_kind IN ($1, $2, $3)"
     ))
     .bind(PATH_DERIVED_OWNER_KIND)
     .bind(PATH_DERIVED_DIRECTORY_OWNER_KIND)
+    .bind(LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND)
     .fetch_all(pool)
     .await?;
 
