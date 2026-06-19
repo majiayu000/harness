@@ -8,6 +8,8 @@ export interface Task {
   submission_id?: string | null;
   task_kind: string;
   status: string;
+  workflow_state?: string | null;
+  failure_kind?: string | null;
   execution_path?: string | null;
   workflow_id?: string | null;
   turn: number;

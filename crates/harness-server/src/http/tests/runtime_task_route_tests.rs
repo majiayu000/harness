@@ -198,6 +198,111 @@ async fn get_task_runtime_issue_exposes_tracker_identity() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let cases = [
+        (
+            "detail-active-workflow",
+            "detail-active-task",
+            "implementing",
+            "implementing",
+            "implement",
+            "running",
+            None,
+        ),
+        (
+            "detail-review-wait-workflow",
+            "detail-review-wait-task",
+            "awaiting_feedback",
+            "waiting",
+            "review",
+            "queued",
+            None,
+        ),
+        (
+            "detail-terminal-workflow",
+            "detail-terminal-task",
+            "failed",
+            "failed",
+            "terminal",
+            "failed",
+            Some("task"),
+        ),
+    ];
+
+    for &(workflow_id, task_id, workflow_state, _, _, _, _) in &cases {
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            workflow_state,
+            harness_workflow::runtime::WorkflowSubject::new("issue", workflow_id),
+        )
+        .with_id(workflow_id)
+        .with_data(serde_json::json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 70,
+            "submission_id": task_id,
+            "task_id": format!("{task_id}-legacy"),
+        }));
+        store.upsert_instance(&workflow).await?;
+    }
+
+    let app = Router::new()
+        .route("/tasks/{id}", get(get_task))
+        .with_state(state);
+
+    for &(_, task_id, workflow_state, status, phase, scheduler_state, failure_kind) in &cases {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/tasks/{task_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await?;
+        assert_eq!(body["id"], task_id);
+        assert_eq!(body["task_id"], task_id);
+        assert_eq!(body["submission_id"], task_id);
+        assert_eq!(body["workflow_state"], workflow_state);
+        assert_eq!(body["workflow"]["state"], workflow_state);
+        assert_eq!(body["status"], status);
+        assert_eq!(body["phase"], phase);
+        assert_eq!(body["scheduler"]["authority_state"], scheduler_state);
+        match failure_kind {
+            Some(kind) => assert_eq!(body["failure_kind"], *kind),
+            None => assert!(body
+                .get("failure_kind")
+                .is_none_or(serde_json::Value::is_null)),
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
