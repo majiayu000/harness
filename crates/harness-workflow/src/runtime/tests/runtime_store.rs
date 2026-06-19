@@ -1,6 +1,152 @@
 use super::*;
 
 #[tokio::test]
+async fn runtime_jobs_accept_typed_status_values() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let statuses = [
+        RuntimeJobStatus::Pending,
+        RuntimeJobStatus::Running,
+        RuntimeJobStatus::Succeeded,
+        RuntimeJobStatus::Failed,
+        RuntimeJobStatus::Cancelled,
+    ];
+
+    for (index, status) in statuses.iter().copied().enumerate() {
+        let status = runtime_job_status_str(status)?;
+        insert_runtime_job_with_status(&store, &format!("typed-status-{index}"), &status).await?;
+    }
+
+    let (persisted_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM runtime_jobs")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(persisted_count, statuses.len() as i64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_jobs_reject_legacy_invalid_status_values() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+
+    let error = insert_runtime_job_with_status(&store, "legacy-expired-status", "expired")
+        .await
+        .expect_err("expired runtime job status should be rejected");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("runtime_jobs_status_check"),
+        "unexpected persistence error: {error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_jobs_migration_rewrites_legacy_expired_statuses() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("workflow_runtime.db");
+    let store = WorkflowRuntimeStore::open(&db_path).await?;
+    let job = store
+        .enqueue_runtime_job(
+            "legacy-expired-command",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({"legacy": true}),
+        )
+        .await?;
+    sqlx::query("ALTER TABLE runtime_jobs DROP CONSTRAINT IF EXISTS runtime_jobs_status_check")
+        .execute(store.pool())
+        .await?;
+    sqlx::query(
+        "ALTER TABLE runtime_jobs
+            ADD CONSTRAINT runtime_jobs_status_check
+            CHECK (status IN (
+                'pending', 'running', 'succeeded',
+                'failed', 'cancelled', 'expired'
+            ))",
+    )
+    .execute(store.pool())
+    .await?;
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 13")
+        .execute(store.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE runtime_jobs
+         SET status = 'expired',
+             data = jsonb_set(data, '{status}', '\"expired\"'::jsonb, false)
+         WHERE id = $1",
+    )
+    .bind(&job.id)
+    .execute(store.pool())
+    .await?;
+    drop(store);
+
+    let store = WorkflowRuntimeStore::open(&db_path).await?;
+    let migrated_job = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("legacy expired job should remain readable after migration");
+    assert_eq!(migrated_job.status, RuntimeJobStatus::Failed);
+    let (rewritten_status, payload_status): (String, String) =
+        sqlx::query_as("SELECT status, data->>'status' FROM runtime_jobs WHERE id = $1")
+            .bind(&job.id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(rewritten_status, "failed");
+    assert_eq!(payload_status, "failed");
+
+    let error = insert_runtime_job_with_status(&store, "legacy-expired-after-migration", "expired")
+        .await
+        .expect_err("expired runtime job status should be rejected after migration");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("runtime_jobs_status_check"),
+        "unexpected persistence error: {error}"
+    );
+    Ok(())
+}
+
+fn runtime_job_status_str(status: RuntimeJobStatus) -> anyhow::Result<String> {
+    let value = serde_json::to_value(status)?;
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("runtime job status did not serialize to a string"))
+}
+
+async fn insert_runtime_job_with_status(
+    store: &WorkflowRuntimeStore,
+    id: &str,
+    status: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO runtime_jobs
+            (id, command_id, runtime_kind, runtime_profile, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind(id)
+    .bind(format!("command-{id}"))
+    .bind("codex_jsonrpc")
+    .bind("codex-default")
+    .bind(status)
+    .bind("{}")
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn dedupe_uses_runtime_job_timestamps_not_uuid_order() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

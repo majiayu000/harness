@@ -222,4 +222,21 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_submission_id
               ON workflow_instances ((data->'data'->>'submission_id'))",
     },
+    Migration {
+        version: 13,
+        description: "align runtime job status constraint with typed values",
+        sql: "ALTER TABLE runtime_jobs
+              DROP CONSTRAINT IF EXISTS runtime_jobs_status_check;
+              UPDATE runtime_jobs
+              SET status = 'failed',
+                  data = jsonb_set(data, '{status}', '\"failed\"'::jsonb, false)
+              WHERE status = 'expired'
+                 OR data->>'status' = 'expired';
+              ALTER TABLE runtime_jobs
+                ADD CONSTRAINT runtime_jobs_status_check
+                CHECK (status IN (
+                  'pending', 'running', 'succeeded',
+                  'failed', 'cancelled'
+                ))",
+    },
 ];
