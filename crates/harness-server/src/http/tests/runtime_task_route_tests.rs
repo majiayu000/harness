@@ -1001,7 +1001,8 @@ async fn create_task_with_blocked_issue_returns_runtime_state() -> anyhow::Resul
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let resp = response_json(response).await?;
     assert!(resp["task_id"].is_string());
-    assert_eq!(resp["status"], "awaiting_dependencies");
+    assert_eq!(resp["status"], "awaiting_deps");
+    assert_eq!(resp["workflow_state"], "awaiting_dependencies");
     assert_eq!(resp["execution_path"], "workflow_runtime");
 
     let store = state

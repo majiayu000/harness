@@ -608,6 +608,7 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
     let resp = response_json(response).await?;
     assert!(resp["task_id"].is_string());
     assert_eq!(resp["status"], "planning");
+    assert_eq!(resp["workflow_state"], "planning");
     assert_eq!(resp["execution_path"], "workflow_runtime");
     let task_id = task_runner::TaskId::from_str(resp["task_id"].as_str().unwrap());
     assert!(state

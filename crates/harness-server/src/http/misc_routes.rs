@@ -526,7 +526,14 @@ pub(crate) async fn github_webhook(
     let is_issue_submission = req.issue.is_some();
     match task_routes::enqueue_task(&state, req).await {
         Ok(task_id) => {
-            match task_routes::task_response_details(&state, &task_id, is_issue_submission).await {
+            match task_routes::task_response_details(
+                &state,
+                &task_id,
+                is_issue_submission,
+                task_routes::TaskResponseStatusMode::WorkflowState,
+            )
+            .await
+            {
                 Ok(details) => (
                     StatusCode::ACCEPTED,
                     Json(json!({
