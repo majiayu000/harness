@@ -126,24 +126,35 @@ config_value() {
 
     [ -n "$CONFIG_PATH" ] || return 1
 
-    awk -F= -v section="$section" -v key="$key" '
+    awk -v section="$section" -v key="$key" '
         /^[[:space:]]*\[/ {
             name = $0
             sub(/^[[:space:]]*\[/, "", name)
             sub(/\][[:space:]]*$/, "", name)
+            sub(/^[[:space:]]+/, "", name)
+            sub(/[[:space:]]+$/, "", name)
             in_section = (name == section)
             next
         }
-        in_section && $1 ~ "^[[:space:]]*" key "[[:space:]]*$" {
-            value = $2
-            sub(/^[[:space:]]*/, "", value)
-            sub(/[[:space:]]*#.*/, "", value)
-            sub(/[[:space:]]*$/, "", value)
-            if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
-                value = substr(value, 2, length(value) - 2)
+        in_section {
+            idx = index($0, "=")
+            if (idx == 0) {
+                next
             }
-            print value
-            exit
+            name = substr($0, 1, idx - 1)
+            sub(/^[[:space:]]+/, "", name)
+            sub(/[[:space:]]+$/, "", name)
+            if (name == key) {
+                value = substr($0, idx + 1)
+                sub(/^[[:space:]]*/, "", value)
+                sub(/[[:space:]]*#.*/, "", value)
+                sub(/[[:space:]]*$/, "", value)
+                if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
+                    value = substr(value, 2, length(value) - 2)
+                }
+                print value
+                exit
+            }
         }
     ' "$CONFIG_PATH"
 }
@@ -193,6 +204,7 @@ database_host_port() {
     esac
 
     authority="${rest%%/*}"
+    authority="${authority%%\?*}"
     authority="${authority##*@}"
     if [[ "$authority" == \[*\]* ]]; then
         host="${authority%%]*}"
@@ -324,9 +336,73 @@ is_local_bind_host() {
 
 config_has_non_empty_server_array() {
     local key="$1"
-    local value
-    value="$(config_server_value "$key" || true)"
-    [ -n "$value" ] && [ "$value" != "[]" ]
+
+    [ -n "$CONFIG_PATH" ] || return 1
+
+    awk -v key="$key" '
+        /^[[:space:]]*\[/ {
+            section = $0
+            sub(/^[[:space:]]*\[/, "", section)
+            sub(/\][[:space:]]*$/, "", section)
+            sub(/^[[:space:]]+/, "", section)
+            sub(/[[:space:]]+$/, "", section)
+            in_server = (section == "server")
+            in_array = 0
+            next
+        }
+        !in_server {
+            next
+        }
+        in_array {
+            value = $0
+            sub(/[[:space:]]*#.*/, "", value)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            if (value ~ /^\]/) {
+                exit 1
+            }
+            if (value != "") {
+                exit 0
+            }
+            next
+        }
+        {
+            idx = index($0, "=")
+            if (idx == 0) {
+                next
+            }
+            name = substr($0, 1, idx - 1)
+            sub(/^[[:space:]]+/, "", name)
+            sub(/[[:space:]]+$/, "", name)
+            if (name != key) {
+                next
+            }
+            value = substr($0, idx + 1)
+            sub(/[[:space:]]*#.*/, "", value)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            if (value == "" || value == "[]") {
+                exit 1
+            }
+            if (value == "[") {
+                in_array = 1
+                next
+            }
+            if (value ~ /^\[/) {
+                gsub(/[\[\]]/, "", value)
+                gsub(/,/, "", value)
+                sub(/^[[:space:]]+/, "", value)
+                sub(/[[:space:]]+$/, "", value)
+                exit(value == "" ? 1 : 0)
+            }
+            exit 0
+        }
+        END {
+            if (in_array) {
+                exit 1
+            }
+        }
+    ' "$CONFIG_PATH"
 }
 
 check_http_exposure() {
