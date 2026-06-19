@@ -1,7 +1,7 @@
 use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskId, TaskPhase, TaskSchedulerState, TaskStatus,
 };
-use harness_workflow::runtime::WorkflowInstance;
+use harness_workflow::runtime::{WorkflowInstance, WorkflowTerminalState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeActiveBucket {
@@ -22,11 +22,12 @@ pub(crate) struct RuntimeWorkflowProjection {
 
 impl RuntimeWorkflowProjection {
     pub(crate) fn from_workflow(workflow: &WorkflowInstance) -> Self {
-        let task_status = workflow_state_to_task_status(&workflow.state);
-        let scheduler = workflow_scheduler_state(&workflow.state, &task_status);
+        let terminal_state = workflow.terminal_state();
+        let task_status = workflow_state_to_task_status(workflow, terminal_state);
+        let scheduler = workflow_scheduler_state(&workflow.state, &task_status, terminal_state);
         Self {
             failure_kind: task_status.is_failure().then_some(TaskFailureKind::Task),
-            phase: workflow_state_to_task_phase(&workflow.state),
+            phase: workflow_state_to_task_phase(&workflow.state, terminal_state),
             task_status,
             scheduler,
             project_id: runtime_string_field(&workflow.data, "project_id"),
@@ -54,8 +55,17 @@ pub(crate) fn runtime_string_field(data: &serde_json::Value, field: &str) -> Opt
         .map(ToOwned::to_owned)
 }
 
-pub(crate) fn workflow_state_to_task_status(state: &str) -> TaskStatus {
-    match state {
+pub(crate) fn workflow_state_to_task_status(
+    workflow: &WorkflowInstance,
+    terminal_state: Option<WorkflowTerminalState>,
+) -> TaskStatus {
+    match terminal_state {
+        Some(WorkflowTerminalState::Succeeded) => return TaskStatus::Done,
+        Some(WorkflowTerminalState::Failed) => return TaskStatus::Failed,
+        Some(WorkflowTerminalState::Cancelled) => return TaskStatus::Cancelled,
+        None => {}
+    }
+    match workflow.state.as_str() {
         "awaiting_dependencies" => TaskStatus::AwaitingDeps,
         "scheduled" | "discovered" => TaskStatus::Pending,
         "planning" => TaskStatus::Planning,
@@ -66,16 +76,18 @@ pub(crate) fn workflow_state_to_task_status(state: &str) -> TaskStatus {
         | "quality_gate_pending"
         | "ready_to_merge"
         | "blocked" => TaskStatus::Waiting,
-        "done" | "passed" => TaskStatus::Done,
-        "failed" => TaskStatus::Failed,
-        "cancelled" => TaskStatus::Cancelled,
         _ => TaskStatus::Waiting,
     }
 }
 
-fn workflow_state_to_task_phase(state: &str) -> TaskPhase {
+fn workflow_state_to_task_phase(
+    state: &str,
+    terminal_state: Option<WorkflowTerminalState>,
+) -> TaskPhase {
+    if terminal_state.is_some() {
+        return TaskPhase::Terminal;
+    }
     match state {
-        "done" | "passed" | "failed" | "cancelled" => TaskPhase::Terminal,
         "pr_open"
         | "local_review_gate"
         | "awaiting_feedback"
@@ -86,7 +98,16 @@ fn workflow_state_to_task_phase(state: &str) -> TaskPhase {
     }
 }
 
-fn workflow_scheduler_state(state: &str, status: &TaskStatus) -> TaskSchedulerState {
+fn workflow_scheduler_state(
+    state: &str,
+    status: &TaskStatus,
+    terminal_state: Option<WorkflowTerminalState>,
+) -> TaskSchedulerState {
+    if terminal_state.is_some() {
+        let mut scheduler = TaskSchedulerState::queued();
+        scheduler.mark_terminal(status);
+        return scheduler;
+    }
     match state {
         "awaiting_dependencies" => TaskSchedulerState::awaiting_dependencies(),
         "scheduled" | "discovered" => TaskSchedulerState::queued(),
@@ -97,11 +118,6 @@ fn workflow_scheduler_state(state: &str, status: &TaskStatus) -> TaskSchedulerSt
             recovery_generation: 0,
             lease_expires_at: None,
         },
-        "done" | "passed" | "failed" | "cancelled" => {
-            let mut scheduler = TaskSchedulerState::queued();
-            scheduler.mark_terminal(status);
-            scheduler
-        }
         "pr_open"
         | "local_review_gate"
         | "awaiting_feedback"
@@ -162,11 +178,25 @@ fn trimmed_string(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_workflow::runtime::{WorkflowInstance, WorkflowSubject};
+    use harness_workflow::runtime::{
+        WorkflowInstance, WorkflowSubject, QUALITY_GATE_DEFINITION_ID,
+    };
 
     fn workflow(state: &str, data: serde_json::Value) -> WorkflowInstance {
-        WorkflowInstance::new(
+        workflow_with_definition(
             harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            state,
+            data,
+        )
+    }
+
+    fn workflow_with_definition(
+        definition_id: &str,
+        state: &str,
+        data: serde_json::Value,
+    ) -> WorkflowInstance {
+        WorkflowInstance::new(
+            definition_id,
             1,
             state,
             WorkflowSubject::new("issue", "issue:1"),
@@ -269,6 +299,39 @@ mod tests {
         assert_eq!(
             projection.scheduler.authority_state,
             SchedulerAuthorityState::Failed
+        );
+        assert_eq!(projection.phase, TaskPhase::Terminal);
+        assert_eq!(projection.active_bucket(), None);
+    }
+
+    #[test]
+    fn projection_uses_definition_specific_terminal_passed_state() {
+        let workflow =
+            workflow_with_definition(QUALITY_GATE_DEFINITION_ID, "passed", serde_json::json!({}));
+
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+        assert!(workflow.is_terminal());
+        assert_eq!(projection.task_status, TaskStatus::Done);
+        assert_eq!(
+            projection.scheduler.authority_state,
+            SchedulerAuthorityState::Done
+        );
+        assert_eq!(projection.phase, TaskPhase::Terminal);
+        assert_eq!(projection.active_bucket(), None);
+    }
+
+    #[test]
+    fn projection_preserves_passed_as_shared_success_terminal_state() {
+        let workflow = workflow("passed", serde_json::json!({}));
+
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+        assert!(workflow.is_terminal());
+        assert_eq!(projection.task_status, TaskStatus::Done);
+        assert_eq!(
+            projection.scheduler.authority_state,
+            SchedulerAuthorityState::Done
         );
         assert_eq!(projection.phase, TaskPhase::Terminal);
         assert_eq!(projection.active_bucket(), None);
