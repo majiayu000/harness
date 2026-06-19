@@ -1,6 +1,7 @@
 pub mod classify;
 pub mod cross_review;
 pub mod dashboard;
+mod dashboard_active_counts;
 pub mod error;
 pub mod evals;
 pub mod exec;
