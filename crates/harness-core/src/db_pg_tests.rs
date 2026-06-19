@@ -160,8 +160,9 @@ fn pg_schema_for_path_normalizes_absolute_aliases() {
 }
 
 #[test]
-fn pg_store_context_from_path_uses_configured_url_and_path_schema() -> anyhow::Result<()> {
-    let context = PgStoreContext::from_path(
+fn pg_store_context_from_legacy_path_schema_uses_configured_url_and_path_schema(
+) -> anyhow::Result<()> {
+    let context = PgStoreContext::from_legacy_path_schema(
         Path::new("/tmp/harness/tasks.db"),
         Some(" postgres://user:pass@localhost:5432/harness "),
     )
@@ -263,9 +264,11 @@ fn pg_store_context_can_reuse_shared_setup_pool() {
             Ok(pool) => pool,
             Err(_) => return,
         };
-        let context =
-            PgStoreContext::from_path(Path::new("/tmp/harness/shared.db"), Some(&database_url))
-                .expect("context should resolve");
+        let context = PgStoreContext::from_legacy_path_schema(
+            Path::new("/tmp/harness/shared.db"),
+            Some(&database_url),
+        )
+        .expect("context should resolve");
         let pool = context
             .open_pool_with_setup_pool(&setup_pool)
             .await
@@ -294,7 +297,7 @@ async fn pg_store_context_registers_path_schema_with_shared_setup_pool() -> anyh
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let context = PgStoreContext::from_path(&store_path, Some(&database_url))?;
+    let context = PgStoreContext::from_legacy_path_schema(&store_path, Some(&database_url))?;
     let schema = context.schema().to_string();
     let expected_owner_path = context
         .ownership()

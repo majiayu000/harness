@@ -104,7 +104,7 @@ static SIMPLE_MIGRATIONS: &[Migration] = &[
 ];
 
 db_test!(upsert_and_get_roundtrip, {
-    let db = Db::<Note>::open(&db_path("notes.db")?).await?;
+    let db = Db::<Note>::open_legacy_path_schema(&db_path("notes.db")?).await?;
 
     let note = Note::new("n1", "hello");
     db.upsert(&note).await?;
@@ -118,14 +118,14 @@ db_test!(upsert_and_get_roundtrip, {
 });
 
 db_test!(get_returns_none_for_missing, {
-    let db = Db::<Note>::open(&db_path("notes.db")?).await?;
+    let db = Db::<Note>::open_legacy_path_schema(&db_path("notes.db")?).await?;
 
     assert!(db.get("missing").await?.is_none());
     Ok(())
 });
 
 db_test!(upsert_overwrites_existing_and_list_does_not_duplicate, {
-    let db = Db::<Note>::open(&db_path("notes.db")?).await?;
+    let db = Db::<Note>::open_legacy_path_schema(&db_path("notes.db")?).await?;
 
     db.upsert(&Note::new("n1", "original")).await?;
     db.upsert(&Note::new("n1", "updated")).await?;
@@ -143,7 +143,7 @@ db_test!(upsert_overwrites_existing_and_list_does_not_duplicate, {
 });
 
 db_test!(list_returns_all_entities, {
-    let db = Db::<Note>::open(&db_path("notes.db")?).await?;
+    let db = Db::<Note>::open_legacy_path_schema(&db_path("notes.db")?).await?;
 
     db.upsert(&Note::new("n1", "a")).await?;
     db.upsert(&Note::new("n2", "b")).await?;
@@ -155,7 +155,7 @@ db_test!(list_returns_all_entities, {
 });
 
 db_test!(delete_roundtrip, {
-    let db = Db::<Note>::open(&db_path("notes.db")?).await?;
+    let db = Db::<Note>::open_legacy_path_schema(&db_path("notes.db")?).await?;
 
     db.upsert(&Note::new("n1", "bye")).await?;
     assert!(db.delete("n1").await?);
@@ -168,12 +168,12 @@ db_test!(survives_reopen_for_same_path, {
     let db_path = db_path("notes.db")?;
 
     {
-        let db = Db::<Note>::open(&db_path).await?;
+        let db = Db::<Note>::open_legacy_path_schema(&db_path).await?;
         db.upsert(&Note::new("n1", "persisted")).await?;
     }
 
     {
-        let db = Db::<Note>::open(&db_path).await?;
+        let db = Db::<Note>::open_legacy_path_schema(&db_path).await?;
         let loaded = db
             .get("n1")
             .await?
@@ -184,8 +184,8 @@ db_test!(survives_reopen_for_same_path, {
 });
 
 db_test!(different_paths_are_schema_isolated, {
-    let db_a = Db::<Note>::open(&db_path("notes-a.db")?).await?;
-    let db_b = Db::<Note>::open(&db_path("notes-b.db")?).await?;
+    let db_a = Db::<Note>::open_legacy_path_schema(&db_path("notes-a.db")?).await?;
+    let db_b = Db::<Note>::open_legacy_path_schema(&db_path("notes-b.db")?).await?;
 
     db_a.upsert(&Note::new("shared-id", "alpha")).await?;
     db_b.upsert(&Note::new("shared-id", "beta")).await?;
@@ -206,10 +206,10 @@ db_test!(different_paths_are_schema_isolated, {
     Ok(())
 });
 
-db_test!(db_open_uses_deterministic_schema_name, {
+db_test!(db_legacy_path_schema_open_uses_deterministic_schema_name, {
     let path = db_path("notes.db")?;
     let expected_schema = pg_schema_for_path(&path)?;
-    let db = Db::<Note>::open(&path).await?;
+    let db = Db::<Note>::open_legacy_path_schema(&path).await?;
 
     let (actual_schema,): (String,) = sqlx::query_as("SELECT current_schema()")
         .fetch_one(db.pool())
@@ -219,7 +219,7 @@ db_test!(db_open_uses_deterministic_schema_name, {
 });
 
 db_test!(migrator_applies_pending_migrations, {
-    let pool = open_pool(&db_path("mig.db")?).await?;
+    let pool = open_legacy_path_schema_pool(&db_path("mig.db")?).await?;
 
     Migrator::new(&pool, SIMPLE_MIGRATIONS).run().await?;
 
@@ -232,7 +232,7 @@ db_test!(migrator_applies_pending_migrations, {
 });
 
 db_test!(migrator_is_idempotent_on_rerun, {
-    let pool = open_pool(&db_path("mig.db")?).await?;
+    let pool = open_legacy_path_schema_pool(&db_path("mig.db")?).await?;
 
     Migrator::new(&pool, SIMPLE_MIGRATIONS).run().await?;
     Migrator::new(&pool, SIMPLE_MIGRATIONS).run().await?;
@@ -243,8 +243,8 @@ db_test!(migrator_is_idempotent_on_rerun, {
 
 db_test!(migrator_serializes_concurrent_runs_for_same_schema, {
     let path = db_path("mig-concurrent.db")?;
-    let pool_a = open_pool(&path).await?;
-    let pool_b = open_pool(&path).await?;
+    let pool_a = open_legacy_path_schema_pool(&path).await?;
+    let pool_b = open_legacy_path_schema_pool(&path).await?;
     let migrations = [
         Migration {
             version: 1,
@@ -279,7 +279,7 @@ db_test!(migrator_serializes_concurrent_runs_for_same_schema, {
 });
 
 db_test!(migrator_tolerates_duplicate_column_on_alter_table, {
-    let pool = open_pool(&db_path("mig.db")?).await?;
+    let pool = open_legacy_path_schema_pool(&db_path("mig.db")?).await?;
     sqlx::query("CREATE TABLE items (id TEXT PRIMARY KEY, value TEXT NOT NULL, tag TEXT)")
         .execute(&pool)
         .await?;
@@ -301,7 +301,7 @@ db_test!(migrator_tolerates_duplicate_column_on_alter_table, {
 });
 
 db_test!(failing_migration_is_not_recorded, {
-    let pool = open_pool(&db_path("mig.db")?).await?;
+    let pool = open_legacy_path_schema_pool(&db_path("mig.db")?).await?;
     let migrations = [Migration {
         version: 1,
         description: "bad migration",

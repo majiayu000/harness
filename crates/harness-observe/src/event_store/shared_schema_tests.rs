@@ -219,7 +219,8 @@ async fn shared_schema_backfills_legacy_path_schema_once() -> anyhow::Result<()>
     let legacy_data_dir = dir.path().join("legacy-data");
     std::fs::create_dir_all(&legacy_data_dir)?;
     let legacy_path = legacy_data_dir.join("events.db");
-    let legacy_context = PgStoreContext::from_path(&legacy_path, Some(&database_url))?;
+    let legacy_context =
+        PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?;
 
     let legacy_store =
         EventStore::new_with_context(&legacy_data_dir, &legacy_context, &setup_pool).await?;

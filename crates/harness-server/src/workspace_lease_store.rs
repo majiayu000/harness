@@ -49,7 +49,7 @@ impl WorkspaceLeaseStore {
 
     #[cfg(test)]
     pub(crate) async fn open(path: &std::path::Path) -> anyhow::Result<Self> {
-        let context = PgStoreContext::from_path(path, None)?;
+        let context = PgStoreContext::from_legacy_path_schema(path, None)?;
         let store_key = context.schema().to_owned();
         let pool = context.open_pool().await?;
         ensure_workspace_leases_table(&pool).await?;

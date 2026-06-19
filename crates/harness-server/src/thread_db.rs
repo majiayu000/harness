@@ -70,7 +70,7 @@ impl ThreadDb {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let context = PgStoreContext::from_legacy_path_schema(path, configured_database_url)?;
         let schema = context.schema().to_owned();
         let store_key = schema.clone();
         let pool = context.open_migrated_pool(THREAD_MIGRATIONS).await?;
@@ -214,7 +214,8 @@ pub async fn migrate_legacy_thread_db_if_needed(
     configured_database_url: Option<&str>,
     target_db: &ThreadDb,
 ) -> anyhow::Result<u64> {
-    let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
+    let legacy_context =
+        PgStoreContext::from_legacy_path_schema(legacy_path, configured_database_url)?;
     let legacy_schema = legacy_context.schema();
     if legacy_schema == target_db.schema() {
         return Ok(0);
@@ -593,9 +594,10 @@ mod tests {
         let target_data_dir = dir.path().join("target-data");
         let other_data_dir = dir.path().join("other-data");
         let legacy_path = target_data_dir.join("threads.db");
-        let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
-            .schema()
-            .to_owned();
+        let legacy_schema =
+            PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
+                .schema()
+                .to_owned();
         let target_schema = unique_test_schema("thread_db_test");
         let setup_pool = pg_open_pool(&database_url).await?;
         let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;

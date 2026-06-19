@@ -329,7 +329,15 @@ impl std::fmt::Debug for PgStoreContext {
 }
 
 impl PgStoreContext {
-    pub fn from_path(path: &Path, configured_database_url: Option<&str>) -> anyhow::Result<Self> {
+    /// Open the legacy schema derived from a store identity path.
+    ///
+    /// This preserves the historical `pg_schema_for_path` naming exactly for
+    /// migrations, backfills, compatibility paths, and tests that intentionally
+    /// read path-derived schemas.
+    pub fn from_legacy_path_schema(
+        path: &Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let database_url = resolve_database_url(configured_database_url)?;
         let hash_path = schema_hash_path(path)?;
         let schema = pg_schema_for_path(&hash_path)?;

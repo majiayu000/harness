@@ -44,7 +44,7 @@ async fn legacy_review_store_migration_backfills_shared_schema() -> anyhow::Resu
     };
     let dir = tempfile::tempdir()?;
     let legacy_path = dir.path().join("reviews.db");
-    let legacy_schema = PgStoreContext::from_path(&legacy_path, Some(&database_url))?
+    let legacy_schema = PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
     let target_schema = unique_test_schema("review_store_test");

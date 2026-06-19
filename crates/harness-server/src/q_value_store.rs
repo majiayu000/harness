@@ -123,7 +123,7 @@ impl QValueStore {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let context = PgStoreContext::from_path(path, configured_database_url)?;
+        let context = PgStoreContext::from_legacy_path_schema(path, configured_database_url)?;
         let schema = context.schema().to_owned();
         let store_key = schema.clone();
         let pool = context.open_migrated_pool(Q_VALUE_MIGRATIONS).await?;
@@ -345,7 +345,8 @@ pub async fn migrate_legacy_q_value_store_if_needed(
     configured_database_url: Option<&str>,
     target_store: &QValueStore,
 ) -> anyhow::Result<u64> {
-    let legacy_context = PgStoreContext::from_path(legacy_path, configured_database_url)?;
+    let legacy_context =
+        PgStoreContext::from_legacy_path_schema(legacy_path, configured_database_url)?;
     let legacy_schema = legacy_context.schema();
     if legacy_schema == target_store.schema() {
         return Ok(0);
