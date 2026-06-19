@@ -57,17 +57,10 @@ pub(crate) struct TaskResponseDetails {
     pub(crate) workflow_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TaskResponseStatusMode {
-    RuntimeProjection,
-    WorkflowState,
-}
-
 pub(crate) async fn task_response_details(
     state: &AppState,
     task_id: &task_runner::TaskId,
     is_issue_submission: bool,
-    status_mode: TaskResponseStatusMode,
 ) -> Result<TaskResponseDetails, EnqueueTaskError> {
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
         if let Some(workflow) = store
@@ -79,19 +72,10 @@ pub(crate) async fn task_response_details(
                 crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
                     .map(|task_id| task_id.0)
                     .unwrap_or_else(|| task_id.as_str().to_string());
-            let (status, workflow_state) = match status_mode {
-                TaskResponseStatusMode::RuntimeProjection => {
-                    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
-                    (
-                        projection.task_status.as_ref().to_string(),
-                        Some(workflow.state),
-                    )
-                }
-                TaskResponseStatusMode::WorkflowState => (workflow.state, None),
-            };
+            let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
             return Ok(TaskResponseDetails {
-                status,
-                workflow_state,
+                status: projection.task_status.as_ref().to_string(),
+                workflow_state: Some(workflow.state),
                 execution_path: "workflow_runtime",
                 submission_id: Some(submission_id),
                 workflow_id: Some(workflow.id),
@@ -359,14 +343,7 @@ pub(super) async fn create_tasks_batch(
                     conflict_group_tail[group_idx] = Some(task_id.clone());
                 }
                 all_maintenance_window = false;
-                match task_response_details(
-                    &state,
-                    &task_id,
-                    is_issue_submission,
-                    TaskResponseStatusMode::RuntimeProjection,
-                )
-                .await
-                {
+                match task_response_details(&state, &task_id, is_issue_submission).await {
                     Ok(details) => {
                         let mut response = task_submission_response(&task_id, details);
                         if is_serialized {
@@ -418,14 +395,7 @@ pub(super) async fn create_task(
 ) -> Response {
     let is_issue_submission = req.issue.is_some();
     match enqueue_task_background(state.clone(), req, None).await {
-        Ok(task_id) => match task_response_details(
-            &state,
-            &task_id,
-            is_issue_submission,
-            TaskResponseStatusMode::RuntimeProjection,
-        )
-        .await
-        {
+        Ok(task_id) => match task_response_details(&state, &task_id, is_issue_submission).await {
             Ok(details) => (
                 StatusCode::ACCEPTED,
                 Json(task_submission_response(&task_id, details)),
