@@ -74,6 +74,7 @@ fn runtime_task_submission_response_uses_submission_id_as_handle() {
         &task_runner::TaskId::from_str("legacy-task-id"),
         TaskResponseDetails {
             status: "implementing".to_string(),
+            workflow_state: Some("implementing".to_string()),
             execution_path: "workflow_runtime",
             submission_id: Some("runtime-submission-id".to_string()),
             workflow_id: Some("runtime-workflow-id".to_string()),
@@ -84,6 +85,7 @@ fn runtime_task_submission_response_uses_submission_id_as_handle() {
     assert_eq!(response["submission_id"], "runtime-submission-id");
     assert_eq!(response["workflow_id"], "runtime-workflow-id");
     assert_eq!(response["execution_path"], "workflow_runtime");
+    assert_eq!(response["workflow_state"], "implementing");
 }
 
 #[test]
@@ -92,6 +94,7 @@ fn legacy_task_submission_response_keeps_task_id_handle() {
         &task_runner::TaskId::from_str("legacy-task-id"),
         TaskResponseDetails {
             status: "queued".to_string(),
+            workflow_state: None,
             execution_path: "task_runner",
             submission_id: None,
             workflow_id: None,
@@ -100,6 +103,7 @@ fn legacy_task_submission_response_keeps_task_id_handle() {
 
     assert_eq!(response["task_id"], "legacy-task-id");
     assert!(response.get("submission_id").is_none());
+    assert!(response.get("workflow_state").is_none());
     assert_eq!(response["execution_path"], "task_runner");
 }
 
