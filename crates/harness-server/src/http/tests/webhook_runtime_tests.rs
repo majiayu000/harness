@@ -453,7 +453,8 @@ async fn webhook_pull_request_review_changes_requested_requests_local_review_gat
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "local_review_gate");
+    assert_eq!(json["status"], "waiting");
+    assert_eq!(json["workflow_state"], "local_review_gate");
     assert_eq!(json["execution_path"], "workflow_runtime");
     let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
     assert_eq!(state.core.tasks.count(), before_count);

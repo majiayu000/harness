@@ -526,17 +526,9 @@ pub(crate) async fn github_webhook(
     let is_issue_submission = req.issue.is_some();
     match task_routes::enqueue_task(&state, req).await {
         Ok(task_id) => {
-            match task_routes::task_response_details(
-                &state,
-                &task_id,
-                is_issue_submission,
-                task_routes::TaskResponseStatusMode::WorkflowState,
-            )
-            .await
-            {
-                Ok(details) => (
-                    StatusCode::ACCEPTED,
-                    Json(json!({
+            match task_routes::task_response_details(&state, &task_id, is_issue_submission).await {
+                Ok(details) => {
+                    let mut response = json!({
                         "status": if details.execution_path == "workflow_runtime" {
                             details.status
                         } else {
@@ -545,8 +537,12 @@ pub(crate) async fn github_webhook(
                         "reason": reason,
                         "task_id": task_id.0,
                         "execution_path": details.execution_path,
-                    })),
-                ),
+                    });
+                    if let Some(workflow_state) = details.workflow_state {
+                        response["workflow_state"] = json!(workflow_state);
+                    }
+                    (StatusCode::ACCEPTED, Json(response))
+                }
                 Err(crate::services::execution::EnqueueTaskError::BadRequest(error)) => {
                     (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
                 }

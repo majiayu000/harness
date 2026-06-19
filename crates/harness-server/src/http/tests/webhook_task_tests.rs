@@ -45,6 +45,7 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
     assert_eq!(json["status"], "planning");
+    assert_eq!(json["workflow_state"], "planning");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(state.core.tasks.count(), before_count);
     let task_id = json["task_id"]
@@ -140,7 +141,8 @@ async fn webhook_review_on_pr_requests_runtime_pr_feedback() -> anyhow::Result<(
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
-    assert_eq!(json["status"], "local_review_gate");
+    assert_eq!(json["status"], "waiting");
+    assert_eq!(json["workflow_state"], "local_review_gate");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(json["task_id"], runtime_task_id);
     assert_eq!(state.core.tasks.count(), before_count);
@@ -204,6 +206,7 @@ async fn webhook_fix_ci_on_pr_creates_runtime_prompt_submission() -> anyhow::Res
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = response_json(response).await?;
     assert_eq!(json["status"], "implementing");
+    assert_eq!(json["workflow_state"], "implementing");
     assert_eq!(json["execution_path"], "workflow_runtime");
     let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
     assert_eq!(state.core.tasks.count(), before_count);
