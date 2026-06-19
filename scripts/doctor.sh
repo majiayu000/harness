@@ -209,7 +209,7 @@ database_host_port() {
     if [[ "$authority" == \[*\]* ]]; then
         host="${authority%%]*}"
         host="${host#[}"
-        rest="${authority#]}"
+        rest="${authority#*]}"
         if [[ "$rest" == :* ]]; then
             port="${rest#:}"
         else
@@ -362,6 +362,8 @@ config_has_non_empty_server_array() {
                 exit 1
             }
             if (value != "") {
+                found_array_value = 1
+                in_array = 0
                 exit 0
             }
             next
@@ -398,7 +400,7 @@ config_has_non_empty_server_array() {
             exit 0
         }
         END {
-            if (in_array) {
+            if (in_array && !found_array_value) {
                 exit 1
             }
         }
