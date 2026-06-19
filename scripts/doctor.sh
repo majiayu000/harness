@@ -129,6 +129,7 @@ config_value() {
     awk -v section="$section" -v key="$key" '
         /^[[:space:]]*\[/ {
             name = $0
+            sub(/[[:space:]]*#.*/, "", name)
             sub(/^[[:space:]]*\[/, "", name)
             sub(/\][[:space:]]*$/, "", name)
             sub(/^[[:space:]]+/, "", name)
@@ -419,6 +420,7 @@ config_has_non_empty_server_array() {
     awk -v key="$key" '
         /^[[:space:]]*\[/ {
             section = $0
+            sub(/[[:space:]]*#.*/, "", section)
             sub(/^[[:space:]]*\[/, "", section)
             sub(/\][[:space:]]*$/, "", section)
             sub(/^[[:space:]]+/, "", section)
