@@ -1,10 +1,16 @@
 use super::*;
+use crate::db_pg::{pg_open_pool, resolve_database_url};
 use std::collections::HashSet;
 
 fn create_normalized_workspace_root(parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
     let raw_workspace_root = parent.join(name);
     std::fs::create_dir(&raw_workspace_root)?;
     Ok(normalize_path_for_comparison(&raw_workspace_root))
+}
+
+fn unique_legacy_schema_name() -> String {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    format!("h{}", &unique[..16])
 }
 
 #[test]
@@ -20,6 +26,23 @@ fn owner_path_is_orphaned_detects_missing_parent() -> anyhow::Result<()> {
     assert!(
         owner_path_is_orphaned(PATH_DERIVED_OWNER_KIND, &dead),
         "schema whose parent dir is gone must be reaped"
+    );
+    Ok(())
+}
+
+#[test]
+fn owner_path_is_orphaned_detects_legacy_schema_missing_parent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let live = dir.path().join("threads");
+    assert!(
+        !owner_path_is_orphaned(LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND, &live),
+        "legacy schema owner whose parent dir exists must be kept"
+    );
+
+    let dead = dir.path().join("removed-workspace/threads");
+    assert!(
+        owner_path_is_orphaned(LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND, &dead),
+        "legacy schema owner whose parent dir is gone must be reaped"
     );
     Ok(())
 }
@@ -66,6 +89,34 @@ fn owner_path_is_orphaned_detects_legacy_workspace_directory_owner() -> anyhow::
             &workspace_roots
         ),
         "deleted legacy workspace directory owner path must be reaped"
+    );
+    Ok(())
+}
+
+#[test]
+fn owner_path_is_orphaned_detects_legacy_schema_workspace_directory_owner() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let workspace_root = create_normalized_workspace_root(parent.path(), "workspaces")?;
+    let workspace = workspace_root.join("550e8400-e29b-41d4-a716-446655440000");
+    let workspace_roots = vec![normalize_path_for_comparison(&workspace_root)];
+    std::fs::create_dir(&workspace)?;
+    assert!(
+        !owner_path_is_orphaned_with_workspace_roots(
+            LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND,
+            &workspace,
+            &workspace_roots
+        ),
+        "live legacy schema workspace directory owner path must be kept"
+    );
+
+    std::fs::remove_dir(&workspace)?;
+    assert!(
+        owner_path_is_orphaned_with_workspace_roots(
+            LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND,
+            &workspace,
+            &workspace_roots
+        ),
+        "deleted legacy schema workspace directory owner path must be reaped"
     );
     Ok(())
 }
@@ -239,6 +290,124 @@ fn owner_path_is_orphaned_keeps_configured_root_fixed_store_path() -> anyhow::Re
 }
 
 #[test]
+fn orphaned_path_schema_names_includes_legacy_schema_owner_kind() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let live_parent = dir.path().join("live-workspace");
+    std::fs::create_dir(&live_parent)?;
+
+    let orphans = orphaned_path_schema_names(
+        vec![
+            (
+                "h1111111111111111".to_string(),
+                LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND.to_string(),
+                Some(
+                    dir.path()
+                        .join("missing-workspace/tasks-store")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                None,
+            ),
+            (
+                "h2222222222222222".to_string(),
+                LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND.to_string(),
+                Some(
+                    live_parent
+                        .join("tasks-store")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                None,
+            ),
+        ],
+        vec![],
+    );
+
+    assert_eq!(orphans, vec!["h1111111111111111"]);
+    Ok(())
+}
+
+#[test]
+fn orphaned_path_schema_names_ignores_opaque_legacy_schema_owner_key() {
+    let orphans = orphaned_path_schema_names(
+        vec![(
+            "h3333333333333333".to_string(),
+            LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND.to_string(),
+            Some("h3333333333333333".to_string()),
+            None,
+        )],
+        vec![],
+    );
+
+    assert!(orphans.is_empty());
+}
+
+#[tokio::test]
+async fn reaper_inventory_includes_legacy_path_derived_schema_owner_rows() -> anyhow::Result<()> {
+    let database_url = {
+        let _lock = crate::test_support::process_env_lock();
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        database_url
+    };
+    let pool = match pg_open_pool(&database_url).await {
+        Ok(pool) => pool,
+        Err(_) => return Ok(()),
+    };
+    ensure_pg_schema_registry(&pool).await?;
+
+    let dir = tempfile::tempdir()?;
+    let live_parent = dir.path().join("live-workspace");
+    std::fs::create_dir(&live_parent)?;
+    let missing_schema = unique_legacy_schema_name();
+    let live_schema = unique_legacy_schema_name();
+    let missing_owner_path = dir
+        .path()
+        .join("missing-workspace/tasks-store")
+        .to_string_lossy()
+        .to_string();
+    let live_owner_path = live_parent
+        .join("tasks-store")
+        .to_string_lossy()
+        .to_string();
+
+    for (schema, owner_key) in [
+        (&missing_schema, &missing_owner_path),
+        (&live_schema, &live_owner_path),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\"
+                (schema_name, owner_kind, owner_key, owner_path, retention_class)
+             VALUES ($1, $2, $3, NULL, $4)"
+        ))
+        .bind(schema)
+        .bind(LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND)
+        .bind(owner_key)
+        .bind(PATH_DERIVED_RETENTION_CLASS)
+        .execute(&pool)
+        .await?;
+    }
+
+    let report = reap_orphaned_path_schemas_with_workspace_roots(&pool, false, &[]).await?;
+
+    sqlx::query(&format!(
+        "DELETE FROM \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\"
+         WHERE schema_name = ANY($1)"
+    ))
+    .bind(vec![missing_schema.clone(), live_schema.clone()])
+    .execute(&pool)
+    .await?;
+    pool.close().await;
+
+    assert!(report.scanned >= 2);
+    assert!(report.orphans.contains(&missing_schema));
+    assert!(!report.orphans.contains(&live_schema));
+    assert!(!report.dropped);
+    Ok(())
+}
+
+#[test]
 fn normalize_path_lexically_preserves_root_and_leading_parent() {
     assert_eq!(
         normalize_path_lexically(Path::new("/../workspace")),
@@ -299,6 +468,28 @@ fn path_derived_ownership_records_directory_owner_kind() -> anyhow::Result<()> {
     );
     assert_eq!(ownership.retention_class, "path_derived");
     Ok(())
+}
+
+#[test]
+fn cleanup_keeps_legacy_path_derived_schema_in_manual_plan() {
+    let row = PgSchemaInventoryRow {
+        schema_name: "h6666666666666666".to_string(),
+        owner_kind: Some("path_derived_schema".to_string()),
+        owner_key: Some("/definitely/missing/harness/schema-owner".to_string()),
+        owner_path: Some("/definitely/missing/harness/schema-owner".to_string()),
+        retention_class: Some("path_derived".to_string()),
+        table_count: 1,
+        estimated_row_count: 0,
+    };
+
+    let candidate = classify_schema_cleanup_candidate(row);
+
+    assert!(candidate.registered);
+    assert_eq!(candidate.action, PgSchemaCleanupAction::Keep);
+    assert_eq!(
+        candidate.reason,
+        "registered path-derived schema; owner_path is an identity key, not a liveness check"
+    );
 }
 
 #[test]
