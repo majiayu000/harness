@@ -327,19 +327,6 @@ resolve_http_addr() {
     HTTP_ADDR="${configured:-127.0.0.1:9800}"
 }
 
-bind_host() {
-    local addr="$1"
-    local host="${addr%:*}"
-    host="${host#[}"
-    host="${host%]}"
-    printf '%s\n' "$host"
-}
-
-bind_port() {
-    local addr="$1"
-    printf '%s\n' "${addr##*:}"
-}
-
 is_local_bind_host() {
     case "$1" in
         "127."* | "::1") return 0 ;;
@@ -347,16 +334,81 @@ is_local_bind_host() {
     esac
 }
 
-is_ip_literal_host() {
+is_valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -le 65535 ]
+}
+
+is_valid_ipv4_literal() {
+    local host="$1"
+    local a
+    local b
+    local c
+    local d
+    local extra
+    local part
+
+    IFS=. read -r a b c d extra <<EOF
+$host
+EOF
+    [ -z "${extra:-}" ] || return 1
+    for part in "$a" "$b" "$c" "$d"; do
+        [[ "$part" =~ ^[0-9]+$ ]] || return 1
+        [ "$part" -le 255 ] || return 1
+    done
+}
+
+is_valid_ip_literal_host() {
     local host="$1"
 
-    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        return 0
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$host" <<'PY' >/dev/null 2>&1
+import ipaddress
+import sys
+
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+PY
+        return $?
     fi
+
+    if [[ "$host" == *.* ]]; then
+        is_valid_ipv4_literal "$host"
+        return $?
+    fi
+
     if [[ "$host" == *:* && "$host" =~ ^[0-9A-Fa-f:.]+$ ]]; then
         return 0
     fi
     return 1
+}
+
+http_addr_host_port() {
+    local addr="$1"
+    local host
+    local rest
+    local port
+
+    if [[ "$addr" == \[* ]]; then
+        [[ "$addr" == *\]* ]] || return 1
+        host="${addr%%]*}"
+        host="${host#[}"
+        rest="${addr#*]}"
+        [[ "$rest" == :* ]] || return 1
+        port="${rest#:}"
+        [[ "$host" == *:* ]] || return 1
+    else
+        [[ "$addr" == *:* ]] || return 1
+        [[ "$addr" != *:*:* ]] || return 1
+        host="${addr%:*}"
+        port="${addr##*:}"
+    fi
+
+    is_valid_port "$port" || return 1
+    is_valid_ip_literal_host "$host" || return 1
+    printf '%s %s\n' "$host" "$port"
 }
 
 config_has_non_empty_server_array() {
@@ -434,14 +486,15 @@ config_has_non_empty_server_array() {
 
 check_http_exposure() {
     local host
+    local host_port
     local api_token
 
     resolve_http_addr
-    host="$(bind_host "$HTTP_ADDR")"
-    if ! is_ip_literal_host "$host"; then
-        fail "HTTP bind address must use an IP literal SocketAddr host, not a hostname: $HTTP_ADDR"
+    if ! host_port="$(http_addr_host_port "$HTTP_ADDR")"; then
+        fail "HTTP bind address must be a valid IP literal SocketAddr, not a hostname or malformed address: $HTTP_ADDR"
         return 0
     fi
+    host="${host_port% *}"
 
     if is_local_bind_host "$host"; then
         status_ok "HTTP bind address is local: $HTTP_ADDR"
@@ -467,15 +520,16 @@ check_http_exposure() {
 }
 
 check_port() {
+    local host_port
     local port
     local pids
 
     resolve_http_addr
-    port="$(bind_port "$HTTP_ADDR")"
-    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        fail "HTTP address has an invalid port: $HTTP_ADDR"
+    if ! host_port="$(http_addr_host_port "$HTTP_ADDR")"; then
+        fail "HTTP address must be a valid IP literal SocketAddr: $HTTP_ADDR"
         return 0
     fi
+    port="${host_port#* }"
 
     if ! command -v lsof >/dev/null 2>&1; then
         warn "lsof is unavailable; port occupancy for $HTTP_ADDR could not be verified"
