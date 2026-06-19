@@ -1184,18 +1184,18 @@ impl WorkflowRuntimeStore {
             "WITH candidates AS (
                  SELECT id
                  FROM workflow_commands
-                 WHERE status = 'pending'
+                 WHERE status = $3
                     OR (
-                        status = 'dispatching'
+                        status = $4
                         AND COALESCE(dispatch_lease_expires_at, '-infinity'::timestamptz)
                             <= CURRENT_TIMESTAMP
                     )
                  ORDER BY created_at ASC
-                 LIMIT $3
+                 LIMIT $5
                  FOR UPDATE SKIP LOCKED
              )
              UPDATE workflow_commands AS command
-             SET status = 'dispatching',
+             SET status = $4,
                  dispatch_owner = $1,
                  dispatch_lease_expires_at = $2,
                  updated_at = CURRENT_TIMESTAMP
@@ -1207,6 +1207,8 @@ impl WorkflowRuntimeStore {
         )
         .bind(owner)
         .bind(expires_at)
+        .bind(WorkflowCommandStatus::Pending.as_str())
+        .bind(WorkflowCommandStatus::Dispatching.as_str())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -1249,10 +1251,11 @@ impl WorkflowRuntimeStore {
                  dispatch_owner = NULL,
                  dispatch_lease_expires_at = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = $2 AND status = 'pending'",
+             WHERE id = $2 AND status = $3",
         )
         .bind(status.as_str())
         .bind(command_id)
+        .bind(WorkflowCommandStatus::Pending.as_str())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -1392,13 +1395,14 @@ impl WorkflowRuntimeStore {
         if let Some(existing) = runtime_job_for_command_tx(&mut tx, command_id).await? {
             sqlx::query(
                 "UPDATE workflow_commands
-                 SET status = 'dispatched',
+                 SET status = $2,
                      dispatch_owner = NULL,
                      dispatch_lease_expires_at = NULL,
                      updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1",
             )
             .bind(command_id)
+            .bind(WorkflowCommandStatus::Dispatched.as_str())
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -1421,13 +1425,14 @@ impl WorkflowRuntimeStore {
         .await?;
         sqlx::query(
             "UPDATE workflow_commands
-             SET status = 'dispatched',
+             SET status = $2,
                  dispatch_owner = NULL,
                  dispatch_lease_expires_at = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $1",
         )
         .bind(command_id)
+        .bind(WorkflowCommandStatus::Dispatched.as_str())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1785,11 +1790,14 @@ impl WorkflowRuntimeStore {
                      WHERE workflow_id = $1
                        AND id <> $2
                        AND command_type = $3
-                       AND status IN ('pending', 'dispatching', 'dispatched')",
+                       AND status IN ($4, $5, $6)",
                 )
                 .bind(&command.workflow_id)
                 .bind(&command.id)
                 .bind(&command_type)
+                .bind(WorkflowCommandStatus::Pending.as_str())
+                .bind(WorkflowCommandStatus::Dispatching.as_str())
+                .bind(WorkflowCommandStatus::Dispatched.as_str())
                 .fetch_one(&mut *tx)
                 .await?;
                 count as usize
@@ -2049,14 +2057,18 @@ impl WorkflowRuntimeStore {
         }
         sqlx::query(
             "UPDATE workflow_commands
-             SET status = 'cancelled',
+             SET status = $2,
                  dispatch_owner = NULL,
                  dispatch_lease_expires_at = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $1
-               AND status IN ('pending', 'dispatching', 'dispatched')",
+               AND status IN ($3, $4, $5)",
         )
         .bind(command_id)
+        .bind(WorkflowCommandStatus::Cancelled.as_str())
+        .bind(WorkflowCommandStatus::Pending.as_str())
+        .bind(WorkflowCommandStatus::Dispatching.as_str())
+        .bind(WorkflowCommandStatus::Dispatched.as_str())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
