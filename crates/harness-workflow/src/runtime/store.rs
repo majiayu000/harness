@@ -7,11 +7,11 @@ use super::model::{
 use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
 use super::prompt_task::PROMPT_TASK_DEFINITION_ID;
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
-use super::reducer::{reduce_runtime_job_completed, GITHUB_ISSUE_PR_DEFINITION_ID};
+use super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
 use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
-use super::validator::{DecisionValidator, ValidationContext};
+use super::validator::DecisionValidator;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::db::PgStoreContext;
@@ -25,6 +25,8 @@ use std::path::Path;
 mod command_store;
 #[path = "store/instances.rs"]
 mod instances;
+#[path = "store/runtime_completion.rs"]
+mod runtime_completion;
 #[path = "store/submission_commit.rs"]
 mod submission_commit;
 pub use submission_commit::{
@@ -1378,73 +1380,13 @@ impl WorkflowRuntimeStore {
         .execute(&mut *tx)
         .await?;
 
-        let decision_record = match sqlx::query_as::<_, (String,)>(
-            "SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE",
+        let decision_record = runtime_completion::apply_runtime_completion_decision_tx(
+            &mut tx,
+            &command.workflow_id,
+            owner,
+            &event,
         )
-        .bind(&command.workflow_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            Some((instance_data,)) => {
-                let mut instance: WorkflowInstance = serde_json::from_str(&instance_data)?;
-                match reduce_runtime_job_completed(&instance, &event)? {
-                    Some(decision) => {
-                        let validator = validator_for_definition(&instance.definition_id);
-                        let record = match validator {
-                            Some(validator) => {
-                                match validator.validate(
-                                    &instance,
-                                    &decision,
-                                    &ValidationContext::new(owner, event.created_at),
-                                ) {
-                                    Ok(()) => WorkflowDecisionRecord::accepted(
-                                        decision.clone(),
-                                        Some(event.id.clone()),
-                                    ),
-                                    Err(error) => WorkflowDecisionRecord::rejected(
-                                        decision,
-                                        Some(event.id.clone()),
-                                        error.to_string(),
-                                    ),
-                                }
-                            }
-                            None => WorkflowDecisionRecord::rejected(
-                                decision,
-                                Some(event.id.clone()),
-                                "unknown workflow definition for runtime completion",
-                            ),
-                        };
-                        insert_decision_record_tx(&mut tx, &record).await?;
-                        if record.accepted {
-                            for followup in &record.decision.commands {
-                                let status = if followup.requires_runtime_job() {
-                                    WorkflowCommandStatus::Pending
-                                } else {
-                                    WorkflowCommandStatus::HandledInline
-                                };
-                                command_store::insert_tx(
-                                    &mut tx,
-                                    &instance.id,
-                                    Some(&record.id),
-                                    followup,
-                                    status,
-                                )
-                                .await?;
-                                if !followup.requires_runtime_job() {
-                                    apply_inline_command_side_effect(&mut instance, followup)?;
-                                }
-                            }
-                            instance.state = record.decision.next_state.clone();
-                            instance.version = instance.version.saturating_add(1);
-                            upsert_instance_tx(&mut tx, &instance).await?;
-                        }
-                        Some(record)
-                    }
-                    None => None,
-                }
-            }
-            None => None,
-        };
+        .await?;
 
         tx.commit().await?;
         Ok(Some(RuntimeActivityCompletion {
