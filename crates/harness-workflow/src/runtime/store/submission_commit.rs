@@ -73,15 +73,19 @@ impl WorkflowRuntimeStore {
                 );
             }
         }
+        if transition.rejection_reason.is_some()
+            && transition.create_if_missing.is_some()
+            && transition.final_instance.is_none()
+        {
+            anyhow::bail!(
+                "rejected new workflow submission `{}` requires a terminal final instance",
+                transition.workflow_id
+            );
+        }
 
         let mut tx = self.pool.begin().await?;
         lock_submission_tx(&mut tx, transition.workflow_id).await?;
-        let accepted = transition
-            .existing_record
-            .map(|record| record.accepted)
-            .unwrap_or_else(|| transition.rejection_reason.is_none());
-        let Some(current) = load_submission_instance_tx(&mut tx, &transition, accepted).await?
-        else {
+        let Some(current) = load_submission_instance_tx(&mut tx, &transition).await? else {
             return Ok(None);
         };
         if current.state != transition.expected_state
@@ -130,30 +134,35 @@ impl WorkflowRuntimeStore {
         insert_decision_record_tx(&mut tx, &record).await?;
 
         let mut command_ids = Vec::new();
-        if record.accepted {
-            let final_instance = transition.final_instance.ok_or_else(|| {
-                anyhow::anyhow!("accepted workflow submission requires a final instance")
-            })?;
-            if let Some(prompt_payload) = transition.prompt_payload {
-                upsert_prompt_payload_tx(&mut tx, prompt_payload.prompt_ref, prompt_payload.prompt)
+        if let Some(final_instance) = transition.final_instance {
+            if record.accepted {
+                if let Some(prompt_payload) = transition.prompt_payload {
+                    upsert_prompt_payload_tx(
+                        &mut tx,
+                        prompt_payload.prompt_ref,
+                        prompt_payload.prompt,
+                    )
                     .await?;
-                if let Some(previous_prompt_ref) = prompt_payload.previous_prompt_ref {
-                    delete_prompt_payload_tx(&mut tx, previous_prompt_ref).await?;
+                    if let Some(previous_prompt_ref) = prompt_payload.previous_prompt_ref {
+                        delete_prompt_payload_tx(&mut tx, previous_prompt_ref).await?;
+                    }
+                }
+                for command in &record.decision.commands {
+                    command_ids.push(
+                        command_store::insert_tx(
+                            &mut tx,
+                            transition.workflow_id,
+                            Some(&record.id),
+                            command,
+                            transition.command_status,
+                        )
+                        .await?,
+                    );
                 }
             }
-            for command in &record.decision.commands {
-                command_ids.push(
-                    command_store::insert_tx(
-                        &mut tx,
-                        transition.workflow_id,
-                        Some(&record.id),
-                        command,
-                        transition.command_status,
-                    )
-                    .await?,
-                );
-            }
             upsert_instance_tx(&mut tx, final_instance).await?;
+        } else if record.accepted {
+            anyhow::bail!("accepted workflow submission requires a final instance");
         }
 
         tx.commit().await?;
@@ -178,7 +187,6 @@ async fn lock_submission_tx(
 async fn load_submission_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     transition: &WorkflowSubmissionDecisionTransition<'_>,
-    accepted: bool,
 ) -> anyhow::Result<Option<WorkflowInstance>> {
     if let Some(current) = select_instance_for_update_tx(tx, transition.workflow_id).await? {
         return Ok(Some(current));
@@ -198,10 +206,6 @@ async fn load_submission_instance_tx(
     {
         return Ok(None);
     }
-    if !accepted {
-        return Ok(Some(initial.clone()));
-    }
-
     if insert_instance_if_absent_tx(tx, initial).await? {
         return Ok(Some(initial.clone()));
     }

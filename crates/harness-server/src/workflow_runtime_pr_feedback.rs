@@ -126,6 +126,48 @@ fn runtime_task_id_from_instance(instance: &WorkflowInstance) -> String {
         .unwrap_or_else(|| format!("runtime:{}", instance.id))
 }
 
+fn pr_lifecycle_failure_instance(
+    project_root: &Path,
+    repo: Option<&str>,
+    issue_number: Option<u64>,
+    task_id: &TaskId,
+    pr_number: u64,
+    pr_url: Option<&str>,
+) -> WorkflowInstance {
+    let project_id = project_root.to_string_lossy().into_owned();
+    let mut instance = if let Some(issue_number) = issue_number {
+        let workflow_id =
+            harness_workflow::issue_lifecycle::workflow_id(&project_id, repo, issue_number);
+        issue_instance(
+            workflow_id,
+            project_id,
+            repo.map(ToOwned::to_owned),
+            issue_number,
+            "failed",
+        )
+    } else {
+        pr_scoped_instance(
+            pr_workflow_id(&project_id, repo, pr_number),
+            project_id,
+            repo.map(ToOwned::to_owned),
+            task_id,
+            pr_number,
+            pr_url,
+            "failed",
+        )
+    };
+    if let Some(data) = instance.data.as_object_mut() {
+        data.insert("task_id".to_string(), json!(task_id.as_str()));
+        data.insert("pr_number".to_string(), json!(pr_number));
+        data.insert("pr_url".to_string(), json!(pr_url));
+        data.insert(
+            "failure_kind".to_string(),
+            json!("pr_lifecycle_persistence"),
+        );
+    }
+    instance
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeMergeApprovalOutcome {
     Approved {
@@ -185,12 +227,21 @@ pub(crate) async fn record_pr_detected(
         "pr_number": ctx.pr_number,
         "pr_url": ctx.pr_url,
     });
+    let failure_instance = pr_lifecycle_failure_instance(
+        ctx.project_root,
+        ctx.repo,
+        Some(ctx.issue_number),
+        ctx.task_id,
+        ctx.pr_number,
+        Some(ctx.pr_url),
+    );
     if let Err(error) = persist_pr_lifecycle_with_retry(
         store,
         &workflow_id,
         "record_pr_detected",
         ctx.task_id,
         ctx.pr_number,
+        failure_instance,
         failure_payload,
         || persist_pr_detected(store, &ctx),
     )
@@ -230,12 +281,21 @@ pub(crate) async fn record_pr_feedback(
         "outcome": outcome_label(ctx.outcome),
         "summary": ctx.summary,
     });
+    let failure_instance = pr_lifecycle_failure_instance(
+        ctx.project_root,
+        ctx.repo,
+        ctx.issue_number,
+        ctx.task_id,
+        ctx.pr_number,
+        ctx.pr_url,
+    );
     if let Err(error) = persist_pr_lifecycle_with_retry(
         store,
         &workflow_id,
         "record_pr_feedback",
         ctx.task_id,
         ctx.pr_number,
+        failure_instance,
         failure_payload,
         || persist_pr_feedback(store, &ctx),
     )
@@ -290,12 +350,21 @@ pub(crate) async fn record_pr_merged(
         "pr_url": ctx.pr_url,
         "summary": ctx.summary,
     });
+    let failure_instance = pr_lifecycle_failure_instance(
+        ctx.project_root,
+        ctx.repo,
+        ctx.issue_number,
+        ctx.task_id,
+        ctx.pr_number,
+        ctx.pr_url,
+    );
     if let Err(error) = persist_pr_lifecycle_with_retry(
         store,
         &workflow_id,
         "record_pr_merged",
         ctx.task_id,
         ctx.pr_number,
+        failure_instance,
         failure_payload,
         || persist_pr_merged(store, &ctx),
     )

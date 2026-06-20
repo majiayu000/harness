@@ -426,7 +426,8 @@ fn runtime_budget_blocked_result(
 mod tests {
     use super::*;
     use crate::runtime::{
-        RuntimeJobStatus, RuntimeKind, WorkflowCommandType, WorkflowRuntimeStore,
+        RuntimeJobStatus, RuntimeKind, WorkflowCommand, WorkflowCommandType, WorkflowInstance,
+        WorkflowRuntimeStore, WorkflowSubject,
     };
     use async_trait::async_trait;
     use harness_core::db::resolve_database_url;
@@ -453,6 +454,33 @@ mod tests {
         }
     }
 
+    async fn enqueue_test_runtime_job(
+        store: &WorkflowRuntimeStore,
+        key: &str,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: serde_json::Value,
+    ) -> anyhow::Result<RuntimeJob> {
+        let workflow = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", format!("issue:{key}")),
+        )
+        .with_id(format!("runtime-worker-test-{key}"));
+        store.upsert_instance(&workflow).await?;
+        let activity = input
+            .get("activity")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("test_activity");
+        let command =
+            WorkflowCommand::enqueue_activity(activity, format!("runtime-worker-test-{key}"));
+        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+        store
+            .enqueue_runtime_job(&command_id, runtime_kind, runtime_profile, input)
+            .await
+    }
+
     #[tokio::test]
     async fn preflight_result_completes_job_before_runtime_turn_starts() -> anyhow::Result<()> {
         if resolve_database_url(None).is_err() {
@@ -465,14 +493,14 @@ mod tests {
             "workflow_runtime",
         ))
         .await?;
-        let job = store
-            .enqueue_runtime_job(
-                "command-1",
-                RuntimeKind::CodexJsonrpc,
-                "codex-default",
-                json!({ "activity": "check" }),
-            )
-            .await?;
+        let job = enqueue_test_runtime_job(
+            &store,
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "check" }),
+        )
+        .await?;
         let executions = Arc::new(AtomicUsize::new(0));
         let executor = PreflightRuntimeExecutor {
             result: ActivityResult::cancelled("check", "Runtime worker disabled."),
@@ -507,22 +535,22 @@ mod tests {
             "workflow_runtime",
         ))
         .await?;
-        let remote_job = store
-            .enqueue_runtime_job(
-                "command-remote",
-                RuntimeKind::RemoteHost,
-                "remote-host-default",
-                json!({ "activity": "remote_check" }),
-            )
-            .await?;
-        let local_job = store
-            .enqueue_runtime_job(
-                "command-local",
-                RuntimeKind::CodexJsonrpc,
-                "codex-default",
-                json!({ "activity": "local_check" }),
-            )
-            .await?;
+        let remote_job = enqueue_test_runtime_job(
+            &store,
+            "command-remote",
+            RuntimeKind::RemoteHost,
+            "remote-host-default",
+            json!({ "activity": "remote_check" }),
+        )
+        .await?;
+        let local_job = enqueue_test_runtime_job(
+            &store,
+            "command-local",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "local_check" }),
+        )
+        .await?;
         let executions = Arc::new(AtomicUsize::new(0));
         let executor = PreflightRuntimeExecutor {
             result: ActivityResult::succeeded("local_check", "Local worker completed."),

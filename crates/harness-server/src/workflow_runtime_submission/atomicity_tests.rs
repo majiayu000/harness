@@ -53,7 +53,11 @@ async fn rejected_new_issue_submission_does_not_persist_live_instance_or_command
 
     assert!(!result.accepted);
     assert!(result.rejection_reason.is_some());
-    assert!(store.get_instance(&workflow_id).await?.is_none());
+    let persisted = store.get_instance(&workflow_id).await?.ok_or_else(|| {
+        anyhow::anyhow!("rejected new issue should persist a terminal workflow for audit rows")
+    })?;
+    assert_eq!(persisted.state, "failed");
+    assert!(persisted.is_terminal());
     assert!(store.commands_for(&workflow_id).await?.is_empty());
     let decisions = store.decisions_for(&workflow_id).await?;
     assert_eq!(decisions.len(), 1);

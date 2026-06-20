@@ -57,6 +57,8 @@ pub(super) async fn apply_decision(
             DecisionValidator::github_issue_pr().validate(&instance, &decision, &validation_context)
         {
             let reason = error.to_string();
+            let rejected_instance = new_instance
+                .then(|| rejected_submission_instance(instance.clone(), accepted_data, &reason));
             let outcome = store
                 .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
                     workflow_id: &instance.id,
@@ -71,7 +73,7 @@ pub(super) async fn apply_decision(
                     decision: &decision,
                     existing_record: None,
                     rejection_reason: Some(&reason),
-                    final_instance: None,
+                    final_instance: rejected_instance.as_ref(),
                     command_status: WorkflowCommandStatus::Pending,
                     prompt_payload: None,
                 })
@@ -166,6 +168,8 @@ pub(super) async fn apply_prompt_decision(
             DecisionValidator::prompt_task().validate(&instance, &decision, &validation_context)
         {
             let reason = error.to_string();
+            let rejected_instance = new_instance
+                .then(|| rejected_submission_instance(instance.clone(), accepted_data, &reason));
             let outcome = store
                 .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
                     workflow_id: &instance.id,
@@ -180,7 +184,7 @@ pub(super) async fn apply_prompt_decision(
                     decision: &decision,
                     existing_record: None,
                     rejection_reason: Some(&reason),
-                    final_instance: None,
+                    final_instance: rejected_instance.as_ref(),
                     command_status: WorkflowCommandStatus::Pending,
                     prompt_payload: None,
                 })
@@ -326,6 +330,24 @@ fn accepted_submission_instance(
     instance.state = decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
     instance.data = merge_last_decision(accepted_data, &decision.decision);
+    instance
+}
+
+fn rejected_submission_instance(
+    mut instance: WorkflowInstance,
+    mut rejected_data: serde_json::Value,
+    reason: &str,
+) -> WorkflowInstance {
+    instance.state = "failed".to_string();
+    instance.version = instance.version.saturating_add(1);
+    if let Some(data) = rejected_data.as_object_mut() {
+        data.insert("rejection_reason".to_string(), json!(reason));
+        data.insert(
+            "rejected_at".to_string(),
+            json!(chrono::Utc::now().to_rfc3339()),
+        );
+    }
+    instance.data = merge_last_decision(rejected_data, "submission_rejected");
     instance
 }
 

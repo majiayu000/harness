@@ -128,7 +128,13 @@ async fn persistent_pr_lifecycle_persist_failure_records_operator_event() -> any
         Some("owner/repo"),
         123,
     );
-    assert!(store.get_instance(&workflow_id).await?.is_none());
+    let instance = store.get_instance(&workflow_id).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "persistent failure should create a terminal workflow for operator-visible events"
+        )
+    })?;
+    assert_eq!(instance.state, "failed");
+    assert!(instance.is_terminal());
     let events = store.events_for(&workflow_id).await?;
     let failure_event = events
         .iter()
@@ -147,6 +153,70 @@ async fn persistent_pr_lifecycle_persist_failure_records_operator_event() -> any
     assert!(failure_event.event["error"]
         .as_str()
         .is_some_and(|error| error.contains("injected PR lifecycle persist failure")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_pr_lifecycle_persist_failure_preserves_existing_workflow() -> anyhow::Result<()>
+{
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("existing-pr-lifecycle-persist-failure");
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    let existing = issue_instance(
+        workflow_id.clone(),
+        project_root.to_string_lossy().into_owned(),
+        Some("owner/repo".to_string()),
+        123,
+        "awaiting_feedback",
+    )
+    .with_data(json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 123,
+        "marker": "real",
+    }));
+    store.upsert_instance(&existing).await?;
+    let _guard =
+        set_pr_lifecycle_persist_test_failures(task_id.as_str(), PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS);
+
+    record_pr_detected(
+        Some(&store),
+        PrDetectedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    )
+    .await;
+
+    let Some(instance) = store.get_instance(&workflow_id).await? else {
+        anyhow::bail!("existing workflow should still be present after failure recording");
+    };
+    assert_eq!(instance.state, "awaiting_feedback");
+    assert_eq!(instance.data["marker"], "real");
+    assert!(instance.data.get("failure_kind").is_none());
+
+    let events = store.events_for(&workflow_id).await?;
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "PrLifecyclePersistenceFailed"));
     Ok(())
 }
 

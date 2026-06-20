@@ -55,14 +55,16 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("done");
     store.upsert_instance(&instance).await?;
-    let job = store
-        .enqueue_runtime_job(
-            "command-terminal-done",
-            RuntimeKind::ClaudeCode,
-            "claude-default",
-            json!({ "activity": "implement_issue", "workflow_id": instance.id }),
-        )
-        .await?;
+    let job = enqueue_workflow_runtime_job(
+        &store,
+        &instance.id,
+        "command-terminal-done",
+        RuntimeKind::ClaudeCode,
+        "claude-default",
+        json!({ "activity": "implement_issue", "workflow_id": instance.id }),
+        None,
+    )
+    .await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let worker = RuntimeWorker::new(&store, "runtime-1");
     let executor = CountingRuntimeExecutor {
@@ -99,6 +101,18 @@ async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Res
         "implement_issue",
         "repo-backlog:owner/repo:issue:1200:start",
     );
+    let mut old_decision = WorkflowDecisionRecord::accepted(
+        WorkflowDecision::new(
+            instance.id.clone(),
+            "dispatching",
+            "enqueue_old_command",
+            "dispatching",
+            "Record the original pending command.",
+        ),
+        None,
+    );
+    old_decision.id = "decision-old".to_string();
+    store.record_decision(&old_decision).await?;
     let command_id = store
         .enqueue_command(&instance.id, Some("decision-old"), &first)
         .await?;
@@ -107,6 +121,18 @@ async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Res
         "issue:1200",
         "repo-backlog:owner/repo:issue:1200:start",
     );
+    let mut new_decision = WorkflowDecisionRecord::accepted(
+        WorkflowDecision::new(
+            instance.id.clone(),
+            "dispatching",
+            "refresh_command_payload",
+            "dispatching",
+            "Refresh the pending command payload.",
+        ),
+        None,
+    );
+    new_decision.id = "decision-new".to_string();
+    store.record_decision(&new_decision).await?;
     let duplicate_id = store
         .enqueue_command(&instance.id, Some("decision-new"), &updated)
         .await?;
@@ -135,14 +161,14 @@ async fn runtime_store_running_lease_match_accepts_renewed_generation() -> anyho
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    store
-        .enqueue_runtime_job(
-            "command-renewed-lease",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "start_child_workflow" }),
-        )
-        .await?;
+    enqueue_test_runtime_job(
+        &store,
+        "command-renewed-lease",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "start_child_workflow" }),
+    )
+    .await?;
     let initial_expires_at = Utc::now() - Duration::seconds(1);
     let claimed = store
         .claim_next_runtime_job("runtime-1", initial_expires_at)
@@ -178,14 +204,14 @@ async fn runtime_store_running_lease_match_rejects_expired_same_owner_reclaim() 
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    store
-        .enqueue_runtime_job(
-            "command-stale-lease",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "start_child_workflow" }),
-        )
-        .await?;
+    enqueue_test_runtime_job(
+        &store,
+        "command-stale-lease",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "start_child_workflow" }),
+    )
+    .await?;
     let expired_expires_at = Utc::now() - Duration::minutes(1);
     let stale_claim = store
         .claim_next_runtime_job("runtime-1", expired_expires_at)
