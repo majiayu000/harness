@@ -1,18 +1,13 @@
 use super::model::{
     ActivityResult, ActivityStatus, RuntimeJob, RuntimeKind, RuntimeProfile, WorkflowCommand,
-    WorkflowCommandRecord, WorkflowCommandType, WorkflowInstance,
+    WorkflowCommandRecord, WorkflowInstance,
 };
-use super::reducer::reduce_runtime_job_completed;
-use super::status::WorkflowCommandStatus;
 use super::store::WorkflowRuntimeStore;
-use super::validator::{DecisionValidator, ValidationContext};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde_json::{json, Value};
 use std::time::Duration as StdDuration;
-
-const COMMAND_STATUS_HANDLED_INLINE: WorkflowCommandStatus = WorkflowCommandStatus::HandledInline;
 
 #[async_trait]
 pub trait RuntimeJobExecutor: Send + Sync {
@@ -240,17 +235,14 @@ impl<'a> RuntimeWorker<'a> {
         let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {
             return Ok(());
         };
-        let parent_event = self
-            .store
-            .append_event(
+        self.store
+            .commit_parent_runtime_completion(
                 parent_workflow_id,
-                "RuntimeJobCompleted",
                 &self.owner,
                 merge_child_completion_payload(event, &child.id),
             )
             .await?;
-        self.apply_runtime_completion_reducer(parent_workflow_id, &parent_event)
-            .await
+        Ok(())
     }
 
     async fn propagate_quality_gate_child_completion(
@@ -273,81 +265,14 @@ impl<'a> RuntimeWorker<'a> {
         let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {
             return Ok(());
         };
-        let parent_event = self
-            .store
-            .append_event(
+        self.store
+            .commit_parent_runtime_completion(
                 parent_workflow_id,
-                "RuntimeJobCompleted",
                 &self.owner,
                 merge_child_completion_payload(event, &child.id),
             )
             .await?;
-        self.apply_runtime_completion_reducer(parent_workflow_id, &parent_event)
-            .await
-    }
-
-    async fn apply_runtime_completion_reducer(
-        &self,
-        workflow_id: &str,
-        event: &super::model::WorkflowEvent,
-    ) -> anyhow::Result<()> {
-        let Some(mut instance) = self.store.get_instance(workflow_id).await? else {
-            return Ok(());
-        };
-        let Some(decision) = reduce_runtime_job_completed(&instance, event)? else {
-            return Ok(());
-        };
-
-        let validator = match instance.definition_id.as_str() {
-            super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
-            super::quality_gate::QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
-            super::pr_feedback::PR_FEEDBACK_DEFINITION_ID => DecisionValidator::pr_feedback(),
-            super::prompt_task::PROMPT_TASK_DEFINITION_ID => DecisionValidator::prompt_task(),
-            super::repo_backlog::REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
-            _ => return Ok(()),
-        };
-        let validation = validator.validate(
-            &instance,
-            &decision,
-            &ValidationContext::new(&self.owner, event.created_at),
-        );
-        let record = match validation {
-            Ok(()) => super::model::WorkflowDecisionRecord::accepted(
-                decision.clone(),
-                Some(event.id.clone()),
-            ),
-            Err(error) => {
-                let record = super::model::WorkflowDecisionRecord::rejected(
-                    decision,
-                    Some(event.id.clone()),
-                    error.to_string(),
-                );
-                self.store.record_decision(&record).await?;
-                return Ok(());
-            }
-        };
-
-        self.store.record_decision(&record).await?;
-        for command in &decision.commands {
-            if command.requires_runtime_job() {
-                self.store
-                    .enqueue_command(&instance.id, Some(&record.id), command)
-                    .await?;
-            } else {
-                self.store
-                    .enqueue_command_with_status(
-                        &instance.id,
-                        Some(&record.id),
-                        command,
-                        COMMAND_STATUS_HANDLED_INLINE,
-                    )
-                    .await?;
-                apply_inline_command_side_effect(&mut instance, command)?;
-            }
-        }
-        instance.state = decision.next_state.clone();
-        instance.version = instance.version.saturating_add(1);
-        self.store.upsert_instance(&instance).await
+        Ok(())
     }
 
     async fn max_turns_budget_result(
@@ -437,20 +362,6 @@ fn merge_child_completion_payload(
     payload
 }
 
-fn apply_inline_command_side_effect(
-    instance: &mut WorkflowInstance,
-    command: &WorkflowCommand,
-) -> anyhow::Result<()> {
-    match command.command_type {
-        WorkflowCommandType::BindPr => apply_bind_pr_side_effect(instance, command),
-        WorkflowCommandType::MarkDone => apply_mark_done_side_effect(instance, command),
-        WorkflowCommandType::MarkFailed
-        | WorkflowCommandType::MarkBlocked
-        | WorkflowCommandType::MarkCancelled => apply_failure_reason_side_effect(instance, command),
-        _ => Ok(()),
-    }
-}
-
 /// Persist the terminal-failure `reason` into the instance `data` under
 /// `failure_reason` so task queries surface it as the task `error`. Without
 /// this the reason lives only in the command payload/event log and the task
@@ -476,51 +387,6 @@ pub(super) fn apply_failure_reason_side_effect(
         .as_object_mut()
         .context("workflow instance data is not an object")?;
     data.insert("failure_reason".to_string(), json!(reason));
-    Ok(())
-}
-
-fn apply_bind_pr_side_effect(
-    instance: &mut WorkflowInstance,
-    command: &WorkflowCommand,
-) -> anyhow::Result<()> {
-    let pr_number = command
-        .command
-        .get("pr_number")
-        .and_then(Value::as_u64)
-        .context("bind_pr command missing pr_number")?;
-    let pr_url = command
-        .command
-        .get("pr_url")
-        .and_then(Value::as_str)
-        .context("bind_pr command missing pr_url")?;
-
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
-    data.insert("pr_number".to_string(), json!(pr_number));
-    data.insert("pr_url".to_string(), json!(pr_url));
-    Ok(())
-}
-
-fn apply_mark_done_side_effect(
-    instance: &mut WorkflowInstance,
-    command: &WorkflowCommand,
-) -> anyhow::Result<()> {
-    let Some(closed_issue_evidence) = command.command.get("closed_issue_evidence").cloned() else {
-        return Ok(());
-    };
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
-    data.insert("closed_issue_evidence".to_string(), closed_issue_evidence);
     Ok(())
 }
 
@@ -559,7 +425,9 @@ fn runtime_budget_blocked_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{RuntimeJobStatus, RuntimeKind, WorkflowRuntimeStore};
+    use crate::runtime::{
+        RuntimeJobStatus, RuntimeKind, WorkflowCommandType, WorkflowRuntimeStore,
+    };
     use async_trait::async_trait;
     use harness_core::db::resolve_database_url;
     use serde_json::json;
@@ -694,7 +562,7 @@ mod tests {
             json!({ "reason": "Agent turn timed out after 900s" }),
         );
 
-        apply_inline_command_side_effect(&mut instance, &command).unwrap();
+        apply_failure_reason_side_effect(&mut instance, &command).unwrap();
 
         assert_eq!(
             instance.data.get("failure_reason").and_then(Value::as_str),
@@ -719,7 +587,7 @@ mod tests {
             json!({}),
         );
 
-        apply_inline_command_side_effect(&mut instance, &command).unwrap();
+        apply_failure_reason_side_effect(&mut instance, &command).unwrap();
 
         assert!(instance.data.get("failure_reason").is_none());
     }

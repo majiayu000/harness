@@ -5269,6 +5269,120 @@ async fn runtime_worker_propagates_pr_feedback_child_completion_to_parent() -> a
     Ok(())
 }
 
+#[tokio::test]
+async fn runtime_store_commits_parent_completion_event_decision_and_command() -> anyhow::Result<()>
+{
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let parent = issue_instance("awaiting_feedback")
+        .with_id("issue-parent-transaction")
+        .with_data(json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "runtime-task-77",
+        }));
+    store.upsert_instance(&parent).await?;
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime child workflow found actionable PR feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "FeedbackFound",
+        json!({ "pr_number": 77, "count": 1 }),
+    ));
+
+    let record = store
+        .commit_parent_runtime_completion(
+            &parent.id,
+            "runtime-1",
+            json!({
+                "command_id": "child-command-1",
+                "runtime_job_id": "child-job-1",
+                "child_workflow_id": "pr-feedback-child-transaction",
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("parent completion should produce a decision");
+
+    assert!(record.accepted);
+    assert_eq!(record.decision.decision, "address_pr_feedback");
+    let parent_after = store
+        .get_instance(&parent.id)
+        .await?
+        .expect("parent workflow should still exist");
+    assert_eq!(parent_after.state, "addressing_feedback");
+    let parent_events = store.events_for(&parent.id).await?;
+    assert!(parent_events.iter().any(|event| {
+        event.event_type == "RuntimeJobCompleted"
+            && event.event["child_workflow_id"] == "pr-feedback-child-transaction"
+    }));
+    let parent_decisions = store.decisions_for(&parent.id).await?;
+    assert_eq!(parent_decisions.len(), 1);
+    assert_eq!(parent_decisions[0].id, record.id);
+    let parent_commands = store.commands_for(&parent.id).await?;
+    assert_eq!(parent_commands.len(), 1);
+    assert_eq!(
+        parent_commands[0].command.activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert_eq!(
+        parent_commands[0].decision_id.as_deref(),
+        Some(record.id.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_store_rolls_back_parent_completion_when_reducer_fails() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let parent = issue_instance("awaiting_feedback")
+        .with_id("issue-parent-rollback")
+        .with_data(json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "runtime-task-77",
+        }));
+    store.upsert_instance(&parent).await?;
+
+    let error = store
+        .commit_parent_runtime_completion(
+            &parent.id,
+            "runtime-1",
+            json!({
+                "command_id": "child-command-rollback",
+                "runtime_job_id": "child-job-rollback",
+                "child_workflow_id": "pr-feedback-child-rollback",
+                "activity_result": "not an activity result",
+            }),
+        )
+        .await
+        .expect_err("malformed activity_result should fail the parent completion transaction");
+
+    assert!(
+        error.to_string().contains("invalid type"),
+        "unexpected error: {error:#}"
+    );
+    let parent_after = store
+        .get_instance(&parent.id)
+        .await?
+        .expect("parent workflow should still exist");
+    assert_eq!(parent_after.state, "awaiting_feedback");
+    assert!(store.events_for(&parent.id).await?.is_empty());
+    assert!(store.decisions_for(&parent.id).await?.is_empty());
+    assert!(store.commands_for(&parent.id).await?.is_empty());
+    Ok(())
+}
+
 async fn seed_quality_gate_child_job(
     store: &WorkflowRuntimeStore,
     parent_id: &str,
