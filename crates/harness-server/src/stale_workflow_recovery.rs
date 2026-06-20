@@ -27,8 +27,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use harness_workflow::runtime::{
-    RuntimeJobStatus, WorkflowCommand, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowEvent,
-    WorkflowInstance, WorkflowRuntimeStore, REPO_BACKLOG_POLL_ACTIVITY,
+    RuntimeJobStatus, WorkflowCommand, WorkflowCommandRecord, WorkflowCommandStatus,
+    WorkflowCommandType, WorkflowEvent, WorkflowInstance, WorkflowRuntimeStore,
+    REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -58,6 +59,9 @@ const STUCK_STATES: &[&str] = &[
 const RECOVERY_TARGET_STATE: &str = "idle";
 const RECOVERY_EVENT_TYPE: &str = "RecoveryDetected";
 const RECOVERY_EVENT_SOURCE: &str = "stale_workflow_recovery";
+const LEGACY_REPO_BACKLOG_SPRINT_PLAN_ACTIVITY: &str = "plan_repo_sprint_from_scan";
+const REPO_BACKLOG_MARK_BOUND_ISSUE_DONE_ACTIVITY: &str = "mark_bound_issue_done";
+const REPO_BACKLOG_RECOVER_ISSUE_WORKFLOW_ACTIVITY: &str = "recover_issue_workflow";
 
 /// Default seconds a workflow must sit in a stuck state before recovery kicks
 /// in. 30 minutes is well above the longest legitimate `poll_repo_backlog`
@@ -201,6 +205,10 @@ async fn record_recovery_detected_event_and_reset_inner(
     force_rollback_after_event_insert: bool,
 ) -> anyhow::Result<RecoveryCommitOutcome> {
     let mut tx = store.pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("workflow_events:{workflow_id}"))
+        .execute(&mut *tx)
+        .await?;
     let Some((current_data,)) = sqlx::query_as::<_, (String,)>(
         "SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE",
     )
@@ -237,18 +245,9 @@ async fn record_recovery_detected_event_and_reset_inner(
 
     instance.state = RECOVERY_TARGET_STATE.to_string();
     instance.version = instance.version.saturating_add(1);
-    // Bump the JSON-baked updated_at so subsequent recovery ticks see a fresh
-    // timestamp and do not re-reset this same instance on every tick. The
-    // Postgres column updated_at is independently bumped below via
-    // CURRENT_TIMESTAMP, but list_instances_by_state returns instances with
-    // updated_at taken from the DB column and the JSON copy is still used by
-    // downstream replay/projection code.
+    // Keep the JSON timestamp fresh for replay/projection paths.
     instance.updated_at = Utc::now();
 
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("workflow_events:{workflow_id}"))
-        .execute(&mut *tx)
-        .await?;
     let (next_sequence,): (i64,) = sqlx::query_as(
         "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
     )
@@ -327,7 +326,7 @@ async fn workflow_has_active_repo_backlog_work_tx(
     .await?;
     for (command_id, status, data) in command_rows.into_iter().rev() {
         let command: WorkflowCommand = serde_json::from_str(&data)?;
-        if command.activity_name() != Some(REPO_BACKLOG_POLL_ACTIVITY) {
+        if !is_repo_backlog_runtime_command(&command) {
             continue;
         }
         match WorkflowCommandStatus::try_from(status.as_str())? {
@@ -361,7 +360,11 @@ async fn workflow_has_active_repo_backlog_work(
     workflow_id: &str,
 ) -> anyhow::Result<bool> {
     let commands = store.commands_for(workflow_id).await?;
-    for command in commands.iter().rev().filter(is_repo_backlog_poll_command) {
+    for command in commands
+        .iter()
+        .rev()
+        .filter(is_repo_backlog_runtime_command_record)
+    {
         match command.status {
             WorkflowCommandStatus::Pending | WorkflowCommandStatus::Dispatching => return Ok(true),
             WorkflowCommandStatus::Dispatched => {
@@ -381,8 +384,25 @@ async fn workflow_has_active_repo_backlog_work(
     Ok(false)
 }
 
-fn is_repo_backlog_poll_command(command: &&WorkflowCommandRecord) -> bool {
-    command.command.activity_name() == Some(REPO_BACKLOG_POLL_ACTIVITY)
+fn is_repo_backlog_runtime_command_record(command: &&WorkflowCommandRecord) -> bool {
+    is_repo_backlog_runtime_command(&command.command)
+}
+
+fn is_repo_backlog_runtime_command(command: &WorkflowCommand) -> bool {
+    if command.command_type == WorkflowCommandType::StartChildWorkflow {
+        return true;
+    }
+    command.command_type == WorkflowCommandType::EnqueueActivity
+        && matches!(
+            command.activity_name(),
+            Some(
+                REPO_BACKLOG_POLL_ACTIVITY
+                    | REPO_BACKLOG_SPRINT_PLAN_ACTIVITY
+                    | LEGACY_REPO_BACKLOG_SPRINT_PLAN_ACTIVITY
+                    | REPO_BACKLOG_MARK_BOUND_ISSUE_DONE_ACTIVITY
+                    | REPO_BACKLOG_RECOVER_ISSUE_WORKFLOW_ACTIVITY
+            )
+        )
 }
 
 /// Spawn the periodic recovery loop. Idempotent across restarts because each
@@ -566,28 +586,14 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_tick_does_not_re_reset_workflow_on_subsequent_tick() {
-        // Regression: previously the tick used the JSON-baked updated_at on
-        // each iteration, which never advanced after upsert_instance because
-        // upsert_instance bumped the Postgres column via CURRENT_TIMESTAMP
-        // but did NOT mutate the deserialized struct's updated_at field.
-        // Result: the same workflow was reset on every 10-minute tick.
-        //
-        // The fix bumps `instance.updated_at = Utc::now()` before each upsert
-        // in the recovery path so the JSON timestamp stays in lock-step with
-        // the column. Verified here: with a 5-minute threshold, a workflow
-        // that was just recovered should not be re-recovered on an
-        // immediately-following tick.
         let Some(store) = open_recovery_test_store().await else {
             return;
         };
         let id = "test::stale-recovery::no-thrash";
         let mut seed = stuck_instance(id, "dispatching");
-        // Force the seed instance to look stale (JSON updated_at = 1h ago)
-        // so the first tick will resolve it.
         seed.updated_at = Utc::now() - chrono::Duration::hours(1);
         store.upsert_instance(&seed).await.unwrap();
 
-        // First tick with 5-min threshold: 1h-old instance is stale, must reset.
         let first = run_stale_workflow_recovery_tick(&store, 300).await.unwrap();
         assert!(
             first.recovered >= 1,
@@ -597,21 +603,11 @@ mod tests {
         let post_first = store.get_instance(id).await.unwrap().unwrap();
         assert_eq!(post_first.state, "idle");
 
-        // Simulate the workflow transitioning back to a stuck state via the
-        // reducer path that historically does NOT bump the JSON updated_at.
-        // The recovery fix means post_first.updated_at is now ~"first-tick
-        // now"; a reducer that copies that value forward writes a JSON
-        // timestamp that is well within the 5-minute window.
         let mut transitioned = post_first.clone();
         transitioned.state = "dispatching".to_string();
         transitioned.version = transitioned.version.saturating_add(1);
-        // Intentionally do NOT touch transitioned.updated_at — mimics the
-        // upstream reducer behavior we observed in production.
         store.upsert_instance(&transitioned).await.unwrap();
 
-        // Second tick with the same 5-min threshold MUST NOT reset, because
-        // the workflow's JSON updated_at is now "fresh" relative to the
-        // 5-minute cutoff.
         let second = run_stale_workflow_recovery_tick(&store, 300).await.unwrap();
         assert_eq!(
             second.recovered, 0,
@@ -721,50 +717,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_tick_skips_workflow_with_active_runtime_job() -> anyhow::Result<()> {
+    async fn recovery_tick_skips_workflow_with_active_repo_backlog_runtime_work(
+    ) -> anyhow::Result<()> {
         let Some(store) = open_recovery_test_store().await else {
             return Ok(());
         };
-        let id = "test::stale-recovery::active-runtime-job";
-        let mut instance = stuck_instance(id, "scanning");
-        instance.updated_at = Utc::now() - chrono::Duration::hours(1);
-        store.upsert_instance(&instance).await?;
-        let command =
-            WorkflowCommand::enqueue_activity(REPO_BACKLOG_POLL_ACTIVITY, "active-runtime-job");
-        let command_id = store.enqueue_command(id, None, &command).await?;
-        store
-            .enqueue_runtime_job(
-                &command_id,
-                RuntimeKind::CodexJsonrpc,
-                "codex-default",
-                json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
-            )
-            .await?;
-        store
-            .mark_command_status(&command_id, WorkflowCommandStatus::Dispatched)
-            .await?;
+        let cases = vec![
+            (
+                "scanning",
+                WorkflowCommand::enqueue_activity(REPO_BACKLOG_POLL_ACTIVITY, "active-scan"),
+            ),
+            (
+                "planning_batch",
+                WorkflowCommand::enqueue_activity(REPO_BACKLOG_SPRINT_PLAN_ACTIVITY, "active-plan"),
+            ),
+            (
+                "dispatching",
+                WorkflowCommand::start_child_workflow(
+                    "github_issue_pr",
+                    "issue:1",
+                    "active-dispatch",
+                ),
+            ),
+            (
+                "reconciling",
+                WorkflowCommand::enqueue_activity(
+                    REPO_BACKLOG_MARK_BOUND_ISSUE_DONE_ACTIVITY,
+                    "active-mark",
+                ),
+            ),
+            (
+                "reconciling",
+                WorkflowCommand::enqueue_activity(
+                    REPO_BACKLOG_RECOVER_ISSUE_WORKFLOW_ACTIVITY,
+                    "active-recover",
+                ),
+            ),
+        ];
+        for (index, (state, command)) in cases.into_iter().enumerate() {
+            let id = format!("test::stale-recovery::active-runtime-work::{index}");
+            let mut instance = stuck_instance(&id, state);
+            instance.updated_at = Utc::now() - chrono::Duration::hours(1);
+            store.upsert_instance(&instance).await?;
+            let activity = command.runtime_activity_key().to_string();
+            let command_id = store.enqueue_command(&id, None, &command).await?;
+            store
+                .enqueue_runtime_job(
+                    &command_id,
+                    RuntimeKind::CodexJsonrpc,
+                    "codex-default",
+                    json!({ "activity": activity }),
+                )
+                .await?;
+            store
+                .mark_command_status(&command_id, WorkflowCommandStatus::Dispatched)
+                .await?;
 
-        let tick = run_stale_workflow_recovery_tick(&store, 300).await?;
-
-        let after = store.get_instance(id).await?.ok_or_else(|| {
-            anyhow::anyhow!("active runtime workflow missing after recovery tick")
-        })?;
-        assert_eq!(
-            after.state, "scanning",
-            "active runtime work must protect the workflow from stale recovery"
-        );
-        assert_eq!(tick.recovered, 0);
-        assert!(
-            tick.skipped_active >= 1,
-            "active runtime job should be counted as an active skip"
-        );
-        let events = store.events_for(id).await?;
-        assert!(
-            events
+            let tick = run_stale_workflow_recovery_tick(&store, 300).await?;
+            let after = store
+                .get_instance(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("active workflow missing after recovery tick"))?;
+            assert_eq!(after.state, state);
+            assert_eq!(tick.recovered, 0);
+            assert!(tick.skipped_active >= 1);
+            let events = store.events_for(&id).await?;
+            assert!(events
                 .iter()
-                .all(|event| event.event_type != RECOVERY_EVENT_TYPE),
-            "active runtime work should not emit a recovery event"
-        );
+                .all(|event| event.event_type != RECOVERY_EVENT_TYPE));
+        }
         Ok(())
     }
 }
