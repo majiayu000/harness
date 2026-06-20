@@ -157,9 +157,7 @@ async fn ensure_pr_lifecycle_failure_workflow(
             workflow_id
         );
     }
-    if store.get_instance(workflow_id).await?.is_none() {
-        store.upsert_instance(failure_instance).await?;
-    }
+    store.insert_instance_if_absent(failure_instance).await?;
     Ok(())
 }
 

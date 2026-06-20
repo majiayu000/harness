@@ -215,6 +215,37 @@ async fn runtime_graph_rejects_orphan_references() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn insert_instance_if_absent_does_not_overwrite_existing_workflow() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow_id = "insert-if-absent-existing-workflow";
+    let existing = issue_instance("implementing")
+        .with_id(workflow_id)
+        .with_data(json!({"marker": "real"}));
+    store.upsert_instance(&existing).await?;
+
+    let fallback = issue_instance("failed")
+        .with_id(workflow_id)
+        .with_data(json!({"marker": "fallback"}));
+    let inserted = store.insert_instance_if_absent(&fallback).await?;
+
+    assert!(!inserted);
+    let Some(persisted) = store.get_instance(workflow_id).await? else {
+        anyhow::bail!("existing workflow should still be present");
+    };
+    assert_eq!(persisted.state, "implementing");
+    assert_eq!(persisted.data["marker"], "real");
+
+    let new_workflow = issue_instance("failed").with_id("insert-if-absent-new-workflow");
+    assert!(store.insert_instance_if_absent(&new_workflow).await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_graph_fk_migration_allows_existing_orphan_rows() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

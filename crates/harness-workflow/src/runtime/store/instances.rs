@@ -1,7 +1,8 @@
 use super::{
-    command_store, insert_decision_record_tx, insert_event_tx, load_or_insert_initial_instance_tx,
-    to_jsonb_string, workflow_instance_from_row, WorkflowDecisionTransition, WorkflowInstancePage,
-    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    command_store, insert_decision_record_tx, insert_event_tx, insert_instance_if_absent_tx,
+    load_or_insert_initial_instance_tx, to_jsonb_string, workflow_instance_from_row,
+    WorkflowDecisionTransition, WorkflowInstancePage, WorkflowRejectedDecisionTransition,
+    WorkflowRuntimeStore,
 };
 use crate::runtime::model::{WorkflowDecisionRecord, WorkflowInstance};
 use crate::runtime::state_registry::workflow_terminal_state_names_for_definition;
@@ -9,6 +10,16 @@ use crate::runtime::status::WorkflowCommandStatus;
 use chrono::{DateTime, Utc};
 
 impl WorkflowRuntimeStore {
+    pub async fn insert_instance_if_absent(
+        &self,
+        instance: &WorkflowInstance,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = insert_instance_if_absent_tx(&mut tx, instance).await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
     pub async fn upsert_instance(&self, instance: &WorkflowInstance) -> anyhow::Result<()> {
         let data = to_jsonb_string(instance)?;
         sqlx::query(
