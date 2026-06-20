@@ -269,6 +269,7 @@ impl TransitionAllowlist {
             )
             .allow("dispatching", "idle", [Wait])
             .allow("reconciling", "idle", [Wait])
+            .allow("blocked", "idle", [Wait])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("done", [MarkDone])
             .allow_from_any("failed", [MarkFailed])
