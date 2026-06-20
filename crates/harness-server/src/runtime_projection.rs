@@ -353,19 +353,22 @@ mod tests {
     }
 
     #[test]
-    fn projection_preserves_passed_as_shared_success_terminal_state() {
+    fn projection_does_not_treat_passed_as_github_issue_pr_terminal_state() {
         let workflow = workflow("passed", serde_json::json!({}));
 
         let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
 
-        assert!(workflow.is_terminal());
-        assert_eq!(projection.task_status, TaskStatus::Done);
+        assert!(!workflow.is_terminal());
+        assert_eq!(projection.task_status, TaskStatus::Waiting);
         assert_eq!(
             projection.scheduler.authority_state,
-            SchedulerAuthorityState::Done
+            SchedulerAuthorityState::Queued
         );
-        assert_eq!(projection.phase, TaskPhase::Terminal);
-        assert_eq!(projection.active_bucket(), None);
+        assert_eq!(projection.phase, TaskPhase::Implement);
+        assert_eq!(
+            projection.active_bucket(),
+            Some(RuntimeActiveBucket::Queued)
+        );
     }
 
     #[test]
