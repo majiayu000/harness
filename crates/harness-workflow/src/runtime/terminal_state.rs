@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+use super::{
+    pr_feedback::PR_FEEDBACK_DEFINITION_ID, prompt_task::PROMPT_TASK_DEFINITION_ID,
+    quality_gate::QUALITY_GATE_DEFINITION_ID, reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
+    repo_backlog::REPO_BACKLOG_DEFINITION_ID,
+};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowTerminalState {
@@ -9,10 +15,33 @@ pub enum WorkflowTerminalState {
 }
 
 pub fn workflow_terminal_state(definition_id: &str, state: &str) -> Option<WorkflowTerminalState> {
+    use WorkflowTerminalState::{Cancelled, Failed, Succeeded};
+
     match (definition_id, state) {
-        (_, "done" | "passed") => Some(WorkflowTerminalState::Succeeded),
-        (_, "failed") => Some(WorkflowTerminalState::Failed),
-        (_, "cancelled") => Some(WorkflowTerminalState::Cancelled),
+        (
+            GITHUB_ISSUE_PR_DEFINITION_ID
+            | PROMPT_TASK_DEFINITION_ID
+            | REPO_BACKLOG_DEFINITION_ID
+            | PR_FEEDBACK_DEFINITION_ID,
+            "done",
+        ) => Some(Succeeded),
+        (QUALITY_GATE_DEFINITION_ID, "passed") => Some(Succeeded),
+        (
+            GITHUB_ISSUE_PR_DEFINITION_ID
+            | PROMPT_TASK_DEFINITION_ID
+            | REPO_BACKLOG_DEFINITION_ID
+            | PR_FEEDBACK_DEFINITION_ID
+            | QUALITY_GATE_DEFINITION_ID,
+            "failed",
+        ) => Some(Failed),
+        (
+            GITHUB_ISSUE_PR_DEFINITION_ID
+            | PROMPT_TASK_DEFINITION_ID
+            | REPO_BACKLOG_DEFINITION_ID
+            | PR_FEEDBACK_DEFINITION_ID
+            | QUALITY_GATE_DEFINITION_ID,
+            "cancelled",
+        ) => Some(Cancelled),
         _ => None,
     }
 }
@@ -38,14 +67,19 @@ mod tests {
     }
 
     #[test]
-    fn terminal_state_preserves_passed_as_shared_success_terminal_state() {
+    fn terminal_state_scopes_success_states_to_workflow_definitions() {
         assert_eq!(
             workflow_terminal_state("quality_gate", "passed"),
             Some(WorkflowTerminalState::Succeeded)
         );
-        assert_eq!(
-            workflow_terminal_state("github_issue_pr", "passed"),
-            Some(WorkflowTerminalState::Succeeded)
-        );
+        assert_eq!(workflow_terminal_state("github_issue_pr", "passed"), None);
+        assert_eq!(workflow_terminal_state("quality_gate", "done"), None);
+    }
+
+    #[test]
+    fn terminal_state_rejects_terminal_looking_states_for_unknown_definitions() {
+        for state in ["done", "passed", "failed", "cancelled"] {
+            assert_eq!(workflow_terminal_state("unknown_workflow", state), None);
+        }
     }
 }

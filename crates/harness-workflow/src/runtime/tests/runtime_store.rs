@@ -117,6 +117,55 @@ async fn runtime_jobs_migration_rewrites_legacy_expired_statuses() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+async fn nonterminal_listing_uses_definition_specific_terminal_states() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let issue_passed = project_issue_instance("/project-a", 223, "passed");
+    let issue_done = project_issue_instance("/project-a", 224, "done");
+    let quality_checking = quality_gate_instance("checking")
+        .with_id("/project-a::quality:checking")
+        .with_data(json!({ "project_id": "/project-a" }));
+    let quality_passed = quality_gate_instance("passed")
+        .with_id("/project-a::quality:passed")
+        .with_data(json!({ "project_id": "/project-a" }));
+    store.upsert_instance(&issue_passed).await?;
+    store.upsert_instance(&issue_done).await?;
+    store.upsert_instance(&quality_checking).await?;
+    store.upsert_instance(&quality_passed).await?;
+
+    let issue_ids: std::collections::HashSet<_> = store
+        .list_nonterminal_instances_by_definition(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            Some("/project-a"),
+            None,
+        )
+        .await?
+        .into_iter()
+        .map(|instance| instance.id)
+        .collect();
+    assert!(issue_ids.contains(&issue_passed.id));
+    assert!(!issue_ids.contains(&issue_done.id));
+
+    let quality_ids: std::collections::HashSet<_> = store
+        .list_nonterminal_instances_by_definition(
+            QUALITY_GATE_DEFINITION_ID,
+            Some("/project-a"),
+            None,
+        )
+        .await?
+        .into_iter()
+        .map(|instance| instance.id)
+        .collect();
+    assert!(quality_ids.contains(&quality_checking.id));
+    assert!(!quality_ids.contains(&quality_passed.id));
+    Ok(())
+}
+
 fn runtime_job_status_str(status: RuntimeJobStatus) -> anyhow::Result<String> {
     let value = serde_json::to_value(status)?;
     value

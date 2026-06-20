@@ -252,8 +252,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_submission_completion_task_maps_passed_via_projection() {
-        let instance = issue_instance("passed");
+    fn runtime_submission_completion_task_maps_done_via_projection() {
+        let instance = issue_instance("done");
         let result = ActivityResult::succeeded("implement_issue", "Runtime job passed.");
 
         let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
