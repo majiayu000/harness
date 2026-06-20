@@ -94,6 +94,74 @@ fn project_issue_instance(project_id: &str, issue_number: u64, state: &str) -> W
     }))
 }
 
+async fn enqueue_test_runtime_job(
+    store: &WorkflowRuntimeStore,
+    command_key: &str,
+    runtime_kind: RuntimeKind,
+    runtime_profile: &str,
+    input: serde_json::Value,
+) -> anyhow::Result<RuntimeJob> {
+    enqueue_test_runtime_job_with_not_before(
+        store,
+        command_key,
+        runtime_kind,
+        runtime_profile,
+        input,
+        None,
+    )
+    .await
+}
+
+async fn enqueue_test_runtime_job_with_not_before(
+    store: &WorkflowRuntimeStore,
+    command_key: &str,
+    runtime_kind: RuntimeKind,
+    runtime_profile: &str,
+    input: serde_json::Value,
+    not_before: Option<DateTime<Utc>>,
+) -> anyhow::Result<RuntimeJob> {
+    let workflow = issue_instance("implementing").with_id(format!("test-workflow-{command_key}"));
+    store.upsert_instance(&workflow).await?;
+    enqueue_workflow_runtime_job(
+        store,
+        &workflow.id,
+        command_key,
+        runtime_kind,
+        runtime_profile,
+        input,
+        not_before,
+    )
+    .await
+}
+
+async fn enqueue_workflow_runtime_job(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    command_key: &str,
+    runtime_kind: RuntimeKind,
+    runtime_profile: &str,
+    input: serde_json::Value,
+    not_before: Option<DateTime<Utc>>,
+) -> anyhow::Result<RuntimeJob> {
+    let activity = input
+        .get("activity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("test_activity")
+        .to_string();
+    let command =
+        WorkflowCommand::enqueue_activity(activity, format!("test-command-{command_key}"));
+    let command_id = store.enqueue_command(workflow_id, None, &command).await?;
+    store
+        .enqueue_runtime_job_with_not_before(
+            &command_id,
+            runtime_kind,
+            runtime_profile,
+            input,
+            not_before,
+        )
+        .await
+}
+
 fn runtime_completion_event(
     instance: &WorkflowInstance,
     activity: &str,
@@ -4284,14 +4352,14 @@ async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Resu
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let job = store
-        .enqueue_runtime_job(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "check" }),
-        )
-        .await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
     let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
     let executor = StaticRuntimeExecutor {
         result: ActivityResult::succeeded("check", "Validation passed."),
@@ -4399,15 +4467,15 @@ async fn runtime_worker_skips_runtime_jobs_before_not_before() -> anyhow::Result
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let not_before = Utc::now() + Duration::minutes(5);
-    let job = store
-        .enqueue_runtime_job_with_not_before(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "check" }),
-            Some(not_before),
-        )
-        .await?;
+    let job = enqueue_test_runtime_job_with_not_before(
+        &store,
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+        Some(not_before),
+    )
+    .await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let executor = CountingRuntimeExecutor {
         result: ActivityResult::succeeded("check", "Validation passed."),
@@ -4440,14 +4508,14 @@ async fn runtime_store_reclaims_expired_running_job() -> anyhow::Result<()> {
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let job = store
-        .enqueue_runtime_job(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "check" }),
-        )
-        .await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
 
     let first_claim = store
         .claim_next_runtime_job("runtime-1", Utc::now() - Duration::minutes(1))
@@ -4533,32 +4601,32 @@ async fn runtime_store_prioritizes_ready_work_over_older_backlog_jobs() -> anyho
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let backlog = store
-        .enqueue_runtime_job(
-            "command-backlog",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
-        )
-        .await?;
+    let backlog = enqueue_test_runtime_job(
+        &store,
+        "command-backlog",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
+    )
+    .await?;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let sprint_plan = store
-        .enqueue_runtime_job(
-            "command-sprint-plan",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY }),
-        )
-        .await?;
+    let sprint_plan = enqueue_test_runtime_job(
+        &store,
+        "command-sprint-plan",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": REPO_BACKLOG_SPRINT_PLAN_ACTIVITY }),
+    )
+    .await?;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let implementation = store
-        .enqueue_runtime_job(
-            "command-implement",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "implement_issue" }),
-        )
-        .await?;
+    let implementation = enqueue_test_runtime_job(
+        &store,
+        "command-implement",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "implement_issue" }),
+    )
+    .await?;
 
     let first = store
         .claim_next_runtime_job("runtime-1", Utc::now() + Duration::minutes(5))
@@ -4592,14 +4660,14 @@ async fn runtime_store_does_not_reclaim_unexpired_running_job() -> anyhow::Resul
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let job = store
-        .enqueue_runtime_job(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "check" }),
-        )
-        .await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
 
     let first_claim = store
         .claim_next_runtime_job("runtime-1", Utc::now() + Duration::minutes(5))
@@ -4623,14 +4691,14 @@ async fn runtime_worker_renews_running_job_lease_until_completion() -> anyhow::R
     let dir = tempfile::tempdir()?;
     let store =
         Arc::new(WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?);
-    let job = store
-        .enqueue_runtime_job(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "check" }),
-        )
-        .await?;
+    let job = enqueue_test_runtime_job(
+        store.as_ref(),
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
     let blocking_calls = Arc::new(AtomicUsize::new(0));
@@ -5870,14 +5938,14 @@ async fn runtime_worker_records_failed_activity_result() -> anyhow::Result<()> {
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    store
-        .enqueue_runtime_job(
-            "command-2",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "implement" }),
-        )
-        .await?;
+    enqueue_test_runtime_job(
+        &store,
+        "command-2",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "implement" }),
+    )
+    .await?;
     let worker = RuntimeWorker::new(&store, "runtime-1");
     let executor = StaticRuntimeExecutor {
         result: ActivityResult::failed(
@@ -5911,14 +5979,14 @@ async fn runtime_worker_cancelled_result_releases_lease() -> anyhow::Result<()> 
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    store
-        .enqueue_runtime_job(
-            "command-3",
-            RuntimeKind::ClaudeCode,
-            "claude-default",
-            json!({ "activity": "review" }),
-        )
-        .await?;
+    enqueue_test_runtime_job(
+        &store,
+        "command-3",
+        RuntimeKind::ClaudeCode,
+        "claude-default",
+        json!({ "activity": "review" }),
+    )
+    .await?;
     let worker = RuntimeWorker::new(&store, "runtime-1");
     let executor = StaticRuntimeExecutor {
         result: ActivityResult::cancelled("review", "Runtime job was cancelled."),

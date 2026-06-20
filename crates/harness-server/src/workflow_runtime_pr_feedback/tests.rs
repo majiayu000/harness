@@ -128,7 +128,13 @@ async fn persistent_pr_lifecycle_persist_failure_records_operator_event() -> any
         Some("owner/repo"),
         123,
     );
-    assert!(store.get_instance(&workflow_id).await?.is_none());
+    let instance = store.get_instance(&workflow_id).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "persistent failure should create a terminal workflow for operator-visible events"
+        )
+    })?;
+    assert_eq!(instance.state, "failed");
+    assert!(instance.is_terminal());
     let events = store.events_for(&workflow_id).await?;
     let failure_event = events
         .iter()

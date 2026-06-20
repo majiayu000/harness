@@ -5,12 +5,14 @@ use axum::{
     routing::post,
     Router,
 };
-use harness_workflow::runtime::{
-    ActivityResult, RuntimeJobStatus, RuntimeKind, WorkflowRuntimeStore,
-};
 use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt;
+
+use harness_workflow::runtime::{
+    ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeKind, WorkflowCommand, WorkflowInstance,
+    WorkflowRuntimeStore, WorkflowSubject,
+};
 
 fn runtime_hosts_workflow_app(state: Arc<crate::http::AppState>) -> Router {
     Router::new()
@@ -64,6 +66,32 @@ async fn register_host(app: &Router, host_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn enqueue_runtime_host_test_job(
+    store: &WorkflowRuntimeStore,
+    key: &str,
+    runtime_kind: RuntimeKind,
+    runtime_profile: &str,
+    input: serde_json::Value,
+) -> anyhow::Result<RuntimeJob> {
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        WorkflowSubject::new("issue", format!("issue:{key}")),
+    )
+    .with_id(format!("runtime-host-test-{key}"));
+    store.upsert_instance(&workflow).await?;
+    let activity = input
+        .get("activity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("remote_check");
+    let command = WorkflowCommand::enqueue_activity(activity, format!("runtime-host-test-{key}"));
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    store
+        .enqueue_runtime_job(&command_id, runtime_kind, runtime_profile, input)
+        .await
+}
+
 async fn post_json(
     app: &Router,
     uri: String,
@@ -105,29 +133,29 @@ async fn runtime_job_claim_endpoint_claims_remote_host_jobs_only() -> anyhow::Re
     let app = runtime_hosts_workflow_app(state);
     register_host(&app, "host-a").await?;
 
-    let local_job = store
-        .enqueue_runtime_job(
-            "command-local",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({ "activity": "local_check" }),
-        )
-        .await?;
-    let remote_job = store
-        .enqueue_runtime_job(
-            "command-remote",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({
-                "activity": "remote_check",
-                "workflow_id": "wf-remote",
-                "runtime_profile": {
-                    "name": "remote-host-default",
-                    "kind": "remote_host"
-                }
-            }),
-        )
-        .await?;
+    let local_job = enqueue_runtime_host_test_job(
+        &store,
+        "command-local",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "local_check" }),
+    )
+    .await?;
+    let remote_job = enqueue_runtime_host_test_job(
+        &store,
+        "command-remote",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "remote_check",
+            "workflow_id": "wf-remote",
+            "runtime_profile": {
+                "name": "remote-host-default",
+                "kind": "remote_host"
+            }
+        }),
+    )
+    .await?;
 
     let json = post_json(
         &app,
@@ -162,14 +190,14 @@ async fn runtime_job_claim_endpoint_blocks_duplicate_claims() -> anyhow::Result<
     register_host(&app, "host-a").await?;
     register_host(&app, "host-b").await?;
 
-    let job = store
-        .enqueue_runtime_job(
-            "command-remote",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({ "activity": "remote_check" }),
-        )
-        .await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-remote",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "remote_check" }),
+    )
+    .await?;
     let first = post_json(
         &app,
         "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
@@ -198,14 +226,14 @@ async fn runtime_job_claim_endpoint_reclaims_expired_remote_job() -> anyhow::Res
     register_host(&app, "host-a").await?;
     register_host(&app, "host-b").await?;
 
-    let job = store
-        .enqueue_runtime_job(
-            "command-remote",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({ "activity": "remote_check" }),
-        )
-        .await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-remote",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "remote_check" }),
+    )
+    .await?;
     let first = post_json(
         &app,
         "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
@@ -246,14 +274,14 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
     let app = runtime_hosts_workflow_app(state);
     register_host(&app, "host-a").await?;
 
-    let job = store
-        .enqueue_runtime_job(
-            "command-remote",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({ "activity": "remote_check" }),
-        )
-        .await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-remote",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "remote_check" }),
+    )
+    .await?;
     let claimed = post_json(
         &app,
         "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),

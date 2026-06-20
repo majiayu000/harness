@@ -239,4 +239,127 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                   'failed', 'cancelled'
                 ))",
     },
+    Migration {
+        version: 14,
+        description: "guard workflow runtime graph references",
+        sql: "DO $$
+              BEGIN
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'workflow_events_workflow_id_fkey'
+                    AND conrelid = 'workflow_events'::regclass
+                ) THEN
+                  ALTER TABLE workflow_events
+                    ADD CONSTRAINT workflow_events_workflow_id_fkey
+                    FOREIGN KEY (workflow_id)
+                    REFERENCES workflow_instances(id)
+                    ON DELETE CASCADE
+                    NOT VALID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'workflow_decisions_workflow_id_fkey'
+                    AND conrelid = 'workflow_decisions'::regclass
+                ) THEN
+                  ALTER TABLE workflow_decisions
+                    ADD CONSTRAINT workflow_decisions_workflow_id_fkey
+                    FOREIGN KEY (workflow_id)
+                    REFERENCES workflow_instances(id)
+                    ON DELETE CASCADE
+                    NOT VALID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'workflow_decisions_event_id_fkey'
+                    AND conrelid = 'workflow_decisions'::regclass
+                ) THEN
+                  ALTER TABLE workflow_decisions
+                    ADD CONSTRAINT workflow_decisions_event_id_fkey
+                    FOREIGN KEY (event_id)
+                    REFERENCES workflow_events(id)
+                    ON DELETE SET NULL
+                    NOT VALID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'workflow_commands_workflow_id_fkey'
+                    AND conrelid = 'workflow_commands'::regclass
+                ) THEN
+                  ALTER TABLE workflow_commands
+                    ADD CONSTRAINT workflow_commands_workflow_id_fkey
+                    FOREIGN KEY (workflow_id)
+                    REFERENCES workflow_instances(id)
+                    ON DELETE CASCADE
+                    NOT VALID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'workflow_commands_decision_id_fkey'
+                    AND conrelid = 'workflow_commands'::regclass
+                ) THEN
+                  ALTER TABLE workflow_commands
+                    ADD CONSTRAINT workflow_commands_decision_id_fkey
+                    FOREIGN KEY (decision_id)
+                    REFERENCES workflow_decisions(id)
+                    ON DELETE SET NULL
+                    NOT VALID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'runtime_jobs_command_id_fkey'
+                    AND conrelid = 'runtime_jobs'::regclass
+                ) THEN
+                  ALTER TABLE runtime_jobs
+                    ADD CONSTRAINT runtime_jobs_command_id_fkey
+                    FOREIGN KEY (command_id)
+                    REFERENCES workflow_commands(id)
+                    ON DELETE CASCADE
+                    NOT VALID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'runtime_events_runtime_job_id_fkey'
+                    AND conrelid = 'runtime_events'::regclass
+                ) THEN
+                  ALTER TABLE runtime_events
+                    ADD CONSTRAINT runtime_events_runtime_job_id_fkey
+                    FOREIGN KEY (runtime_job_id)
+                    REFERENCES runtime_jobs(id)
+                    ON DELETE CASCADE
+                    NOT VALID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'workflow_artifacts_workflow_id_fkey'
+                    AND conrelid = 'workflow_artifacts'::regclass
+                ) THEN
+                  ALTER TABLE workflow_artifacts
+                    ADD CONSTRAINT workflow_artifacts_workflow_id_fkey
+                    FOREIGN KEY (workflow_id)
+                    REFERENCES workflow_instances(id)
+                    ON DELETE CASCADE
+                    NOT VALID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'workflow_artifacts_runtime_job_id_fkey'
+                    AND conrelid = 'workflow_artifacts'::regclass
+                ) THEN
+                  ALTER TABLE workflow_artifacts
+                    ADD CONSTRAINT workflow_artifacts_runtime_job_id_fkey
+                    FOREIGN KEY (runtime_job_id)
+                    REFERENCES runtime_jobs(id)
+                    ON DELETE SET NULL
+                    NOT VALID;
+                END IF;
+              END $$",
+    },
 ];

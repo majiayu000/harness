@@ -49,6 +49,214 @@ async fn runtime_jobs_reject_legacy_invalid_status_values() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn runtime_graph_rejects_orphan_references() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = issue_instance("implementing").with_id("fk-workflow");
+    store.upsert_instance(&workflow).await?;
+    let command = WorkflowCommand::enqueue_activity("fk_activity", "fk-command");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "fk_activity" }),
+        )
+        .await?;
+
+    let error = sqlx::query(
+        "INSERT INTO workflow_events (id, workflow_id, sequence, event_type, source, data)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind("orphan-event")
+    .bind("missing-workflow")
+    .bind(1_i64)
+    .bind("OrphanEvent")
+    .bind("test")
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("workflow event without a workflow should be rejected");
+    assert_constraint_error(error, "workflow_events_workflow_id_fkey");
+
+    let error = sqlx::query(
+        "INSERT INTO workflow_decisions (id, workflow_id, event_id, accepted, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("orphan-decision-workflow")
+    .bind("missing-workflow")
+    .bind(Option::<String>::None)
+    .bind(true)
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("workflow decision without a workflow should be rejected");
+    assert_constraint_error(error, "workflow_decisions_workflow_id_fkey");
+
+    let error = sqlx::query(
+        "INSERT INTO workflow_decisions (id, workflow_id, event_id, accepted, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("orphan-decision-event")
+    .bind(&workflow.id)
+    .bind("missing-event")
+    .bind(true)
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("workflow decision without an event should be rejected");
+    assert_constraint_error(error, "workflow_decisions_event_id_fkey");
+
+    let error = sqlx::query(
+        "INSERT INTO workflow_commands
+            (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+    )
+    .bind("orphan-command-workflow")
+    .bind("missing-workflow")
+    .bind(Option::<String>::None)
+    .bind("enqueue_activity")
+    .bind("orphan-command-workflow")
+    .bind("pending")
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("workflow command without a workflow should be rejected");
+    assert_constraint_error(error, "workflow_commands_workflow_id_fkey");
+
+    let error = sqlx::query(
+        "INSERT INTO workflow_commands
+            (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+    )
+    .bind("orphan-command-decision")
+    .bind(&workflow.id)
+    .bind("missing-decision")
+    .bind("enqueue_activity")
+    .bind("orphan-command-decision")
+    .bind("pending")
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("workflow command without a decision should be rejected");
+    assert_constraint_error(error, "workflow_commands_decision_id_fkey");
+
+    let error = sqlx::query(
+        "INSERT INTO runtime_jobs
+            (id, command_id, runtime_kind, runtime_profile, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind("orphan-runtime-job")
+    .bind("missing-command")
+    .bind("codex_jsonrpc")
+    .bind("codex-default")
+    .bind("pending")
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("runtime job without a command should be rejected");
+    assert_constraint_error(error, "runtime_jobs_command_id_fkey");
+
+    let error = sqlx::query(
+        "INSERT INTO runtime_events (id, runtime_job_id, sequence, event_type, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("orphan-runtime-event")
+    .bind("missing-runtime-job")
+    .bind(1_i64)
+    .bind("RuntimePromptPrepared")
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("runtime event without a runtime job should be rejected");
+    assert_constraint_error(error, "runtime_events_runtime_job_id_fkey");
+
+    let error = sqlx::query(
+        "INSERT INTO workflow_artifacts (id, workflow_id, runtime_job_id, artifact_type, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("orphan-artifact-workflow")
+    .bind("missing-workflow")
+    .bind(Option::<String>::None)
+    .bind("test")
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("workflow artifact without a workflow should be rejected");
+    assert_constraint_error(error, "workflow_artifacts_workflow_id_fkey");
+
+    let error = sqlx::query(
+        "INSERT INTO workflow_artifacts (id, workflow_id, runtime_job_id, artifact_type, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("orphan-artifact-runtime-job")
+    .bind(&workflow.id)
+    .bind("missing-runtime-job")
+    .bind("test")
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("workflow artifact without a runtime job should be rejected");
+    assert_constraint_error(error, "workflow_artifacts_runtime_job_id_fkey");
+
+    store
+        .record_runtime_event(
+            &runtime_job.id,
+            "RuntimePromptPrepared",
+            json!({ "ok": true }),
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_graph_fk_migration_allows_existing_orphan_rows() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("workflow_runtime.db");
+    let store = WorkflowRuntimeStore::open(&db_path).await?;
+    drop_runtime_graph_fk_constraints(&store).await?;
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 14")
+        .execute(store.pool())
+        .await?;
+    insert_legacy_orphan_runtime_graph_rows(&store).await?;
+    drop(store);
+
+    let store = WorkflowRuntimeStore::open(&db_path).await?;
+    let (orphan_event_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM workflow_events WHERE id = $1")
+            .bind("legacy-orphan-event")
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(orphan_event_count, 1);
+
+    let error = sqlx::query(
+        "INSERT INTO runtime_jobs
+            (id, command_id, runtime_kind, runtime_profile, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind("new-orphan-runtime-job-after-v14")
+    .bind("missing-command-after-v14")
+    .bind("codex_jsonrpc")
+    .bind("codex-default")
+    .bind("pending")
+    .bind("{}")
+    .execute(store.pool())
+    .await
+    .expect_err("v14 should reject new orphan runtime jobs after migration");
+    assert_constraint_error(error, "runtime_jobs_command_id_fkey");
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_jobs_migration_rewrites_legacy_expired_statuses() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -57,14 +265,14 @@ async fn runtime_jobs_migration_rewrites_legacy_expired_statuses() -> anyhow::Re
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("workflow_runtime.db");
     let store = WorkflowRuntimeStore::open(&db_path).await?;
-    let job = store
-        .enqueue_runtime_job(
-            "legacy-expired-command",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({"legacy": true}),
-        )
-        .await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "legacy-expired-command",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({"legacy": true}),
+    )
+    .await?;
     sqlx::query("ALTER TABLE runtime_jobs DROP CONSTRAINT IF EXISTS runtime_jobs_status_check")
         .execute(store.pool())
         .await?;
@@ -174,18 +382,127 @@ fn runtime_job_status_str(status: RuntimeJobStatus) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("runtime job status did not serialize to a string"))
 }
 
+fn assert_constraint_error(error: sqlx::Error, constraint_name: &str) {
+    let error = format!("{error:#}");
+    assert!(
+        error.contains(constraint_name),
+        "expected {constraint_name}, got: {error}"
+    );
+}
+
+async fn drop_runtime_graph_fk_constraints(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
+    for statement in [
+        "ALTER TABLE workflow_events DROP CONSTRAINT IF EXISTS workflow_events_workflow_id_fkey",
+        "ALTER TABLE workflow_decisions DROP CONSTRAINT IF EXISTS workflow_decisions_workflow_id_fkey",
+        "ALTER TABLE workflow_decisions DROP CONSTRAINT IF EXISTS workflow_decisions_event_id_fkey",
+        "ALTER TABLE workflow_commands DROP CONSTRAINT IF EXISTS workflow_commands_workflow_id_fkey",
+        "ALTER TABLE workflow_commands DROP CONSTRAINT IF EXISTS workflow_commands_decision_id_fkey",
+        "ALTER TABLE runtime_jobs DROP CONSTRAINT IF EXISTS runtime_jobs_command_id_fkey",
+        "ALTER TABLE runtime_events DROP CONSTRAINT IF EXISTS runtime_events_runtime_job_id_fkey",
+        "ALTER TABLE workflow_artifacts DROP CONSTRAINT IF EXISTS workflow_artifacts_workflow_id_fkey",
+        "ALTER TABLE workflow_artifacts DROP CONSTRAINT IF EXISTS workflow_artifacts_runtime_job_id_fkey",
+    ] {
+        sqlx::query(statement).execute(store.pool()).await?;
+    }
+    Ok(())
+}
+
+async fn insert_legacy_orphan_runtime_graph_rows(
+    store: &WorkflowRuntimeStore,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO workflow_events (id, workflow_id, sequence, event_type, source, data)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind("legacy-orphan-event")
+    .bind("missing-legacy-workflow")
+    .bind(1_i64)
+    .bind("LegacyOrphanEvent")
+    .bind("test")
+    .bind("{}")
+    .execute(store.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO workflow_decisions (id, workflow_id, event_id, accepted, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("legacy-orphan-decision")
+    .bind("missing-legacy-workflow")
+    .bind("missing-legacy-event")
+    .bind(true)
+    .bind("{}")
+    .execute(store.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO workflow_commands
+            (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+    )
+    .bind("legacy-orphan-command")
+    .bind("missing-legacy-workflow")
+    .bind("missing-legacy-decision")
+    .bind("enqueue_activity")
+    .bind("legacy-orphan-command")
+    .bind("pending")
+    .bind("{}")
+    .execute(store.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO runtime_jobs
+            (id, command_id, runtime_kind, runtime_profile, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind("legacy-orphan-runtime-job")
+    .bind("missing-legacy-command")
+    .bind("codex_jsonrpc")
+    .bind("codex-default")
+    .bind("pending")
+    .bind("{}")
+    .execute(store.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO runtime_events (id, runtime_job_id, sequence, event_type, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("legacy-orphan-runtime-event")
+    .bind("missing-legacy-runtime-job")
+    .bind(1_i64)
+    .bind("RuntimePromptPrepared")
+    .bind("{}")
+    .execute(store.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO workflow_artifacts (id, workflow_id, runtime_job_id, artifact_type, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("legacy-orphan-artifact")
+    .bind("missing-legacy-workflow")
+    .bind("missing-legacy-runtime-job")
+    .bind("test")
+    .bind("{}")
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
 async fn insert_runtime_job_with_status(
     store: &WorkflowRuntimeStore,
     id: &str,
     status: &str,
-) -> Result<(), sqlx::Error> {
+) -> anyhow::Result<()> {
+    let command_id = test_runtime_job_command_id(store, id).await?;
     sqlx::query(
         "INSERT INTO runtime_jobs
             (id, command_id, runtime_kind, runtime_profile, status, data)
          VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
     )
     .bind(id)
-    .bind(format!("command-{id}"))
+    .bind(command_id)
     .bind("codex_jsonrpc")
     .bind("codex-default")
     .bind(status)
@@ -193,6 +510,16 @@ async fn insert_runtime_job_with_status(
     .execute(store.pool())
     .await?;
     Ok(())
+}
+
+async fn test_runtime_job_command_id(
+    store: &WorkflowRuntimeStore,
+    id: &str,
+) -> anyhow::Result<String> {
+    let workflow = issue_instance("implementing").with_id(format!("status-test-workflow-{id}"));
+    store.upsert_instance(&workflow).await?;
+    let command = WorkflowCommand::enqueue_activity("status_test", format!("status-test-{id}"));
+    store.enqueue_command(&workflow.id, None, &command).await
 }
 
 #[tokio::test]

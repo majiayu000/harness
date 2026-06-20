@@ -1,6 +1,6 @@
 use super::pr_workflow_id;
 use crate::task_runner::TaskId;
-use harness_workflow::runtime::WorkflowRuntimeStore;
+use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
 use serde_json::json;
 use std::{future::Future, path::Path, time::Duration};
 
@@ -38,6 +38,7 @@ pub(super) async fn persist_pr_lifecycle_with_retry<F, Fut>(
     operation: &'static str,
     task_id: &TaskId,
     pr_number: u64,
+    failure_instance: WorkflowInstance,
     failure_payload: serde_json::Value,
     mut persist: F,
 ) -> anyhow::Result<()>
@@ -85,6 +86,7 @@ where
                     operation,
                     task_id,
                     pr_number,
+                    &failure_instance,
                     failure_payload,
                     &error,
                     attempt,
@@ -102,6 +104,7 @@ async fn record_pr_lifecycle_persist_failure(
     operation: &'static str,
     task_id: &TaskId,
     pr_number: u64,
+    failure_instance: &WorkflowInstance,
     mut payload: serde_json::Value,
     error: &anyhow::Error,
     attempts: usize,
@@ -110,6 +113,18 @@ async fn record_pr_lifecycle_persist_failure(
         object.insert("operation".to_string(), json!(operation));
         object.insert("attempts".to_string(), json!(attempts));
         object.insert("error".to_string(), json!(error.to_string()));
+    }
+    if let Err(instance_error) =
+        ensure_pr_lifecycle_failure_workflow(store, workflow_id, failure_instance).await
+    {
+        tracing::error!(
+            workflow_id,
+            operation,
+            pr = pr_number,
+            task_id = %task_id.0,
+            "workflow runtime PR lifecycle failure workflow write failed: {instance_error}"
+        );
+        return;
     }
     if let Err(event_error) = store
         .append_event(
@@ -128,6 +143,24 @@ async fn record_pr_lifecycle_persist_failure(
             "workflow runtime PR lifecycle failure event write failed: {event_error}"
         );
     }
+}
+
+async fn ensure_pr_lifecycle_failure_workflow(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    failure_instance: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    if failure_instance.id != workflow_id {
+        anyhow::bail!(
+            "PR lifecycle failure instance `{}` does not match workflow `{}`",
+            failure_instance.id,
+            workflow_id
+        );
+    }
+    if store.get_instance(workflow_id).await?.is_none() {
+        store.upsert_instance(failure_instance).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
