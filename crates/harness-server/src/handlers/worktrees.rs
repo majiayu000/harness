@@ -1,4 +1,5 @@
 use crate::http::state::AppState;
+use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus};
 use crate::workspace::WorkspaceEntry;
 use axum::{extract::State, http::StatusCode, Json};
@@ -84,10 +85,17 @@ pub(crate) async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<Workt
                     .get(entry.task_id.as_str())
                     .cloned()
             });
+        let runtime_projection =
+            runtime_projection_for_workflow_id(state, runtime_workflow_id.as_deref()).await?;
         let task = tasks_by_id.get(entry.task_id.as_str());
-        if let Some(response) =
-            response_from_entry(entry, task, runtime_workflow_id, default_max_turns, now)
-        {
+        if let Some(response) = response_from_entry(
+            entry,
+            task,
+            runtime_workflow_id,
+            runtime_projection.as_ref(),
+            default_max_turns,
+            now,
+        ) {
             responses.push(response);
         }
     }
@@ -133,6 +141,22 @@ async fn resolve_runtime_workflow_ids_by_task_id(
         by_task_id.entry(task_id).or_insert_with(|| instance.id);
     }
     Ok(by_task_id)
+}
+
+async fn runtime_projection_for_workflow_id(
+    state: &AppState,
+    workflow_id: Option<&str>,
+) -> anyhow::Result<Option<RuntimeWorkflowProjection>> {
+    let Some(workflow_id) = workflow_id else {
+        return Ok(None);
+    };
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(None);
+    };
+    let Some(instance) = store.get_instance(workflow_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(RuntimeWorkflowProjection::from_workflow(&instance)))
 }
 
 fn runtime_workflow_id_candidate(task: &TaskState) -> Option<String> {
@@ -184,17 +208,26 @@ fn response_from_entry(
     entry: WorkspaceEntry,
     task: Option<&TaskState>,
     runtime_workflow_id: Option<String>,
+    runtime_projection: Option<&RuntimeWorkflowProjection>,
     default_max_turns: Option<u32>,
     now: SystemTime,
 ) -> Option<WorktreeResponse> {
     match task {
-        Some(task) => response_from_task(entry, task, runtime_workflow_id, default_max_turns, now),
-        None => Some(response_from_workspace_entry(
+        Some(task) => response_from_task(
             entry,
+            task,
             runtime_workflow_id,
+            runtime_projection,
             default_max_turns,
             now,
-        )),
+        ),
+        None => response_from_workspace_entry(
+            entry,
+            runtime_workflow_id,
+            runtime_projection,
+            default_max_turns,
+            now,
+        ),
     }
 }
 
@@ -202,10 +235,14 @@ fn response_from_task(
     entry: WorkspaceEntry,
     task: &TaskState,
     runtime_workflow_id: Option<String>,
+    runtime_projection: Option<&RuntimeWorkflowProjection>,
     default_max_turns: Option<u32>,
     now: SystemTime,
 ) -> Option<WorktreeResponse> {
-    if task.status.is_terminal() {
+    let (status, phase) = runtime_projection
+        .map(|projection| (&projection.task_status, &projection.phase))
+        .unwrap_or((&task.status, &task.phase));
+    if status.is_terminal() {
         return None;
     }
 
@@ -228,8 +265,8 @@ fn response_from_task(
         source_repo: entry.source_repo.to_string_lossy().into_owned(),
         repo: task.repo.clone(),
         runtime_workflow_id,
-        status: task.status.as_ref().to_string(),
-        phase: phase_name(&task.phase).to_string(),
+        status: status.as_ref().to_string(),
+        phase: phase_name(phase).to_string(),
         description: task.description.clone(),
         turn: task.turn,
         max_turns,
@@ -246,9 +283,17 @@ fn response_from_task(
 fn response_from_workspace_entry(
     entry: WorkspaceEntry,
     runtime_workflow_id: Option<String>,
+    runtime_projection: Option<&RuntimeWorkflowProjection>,
     default_max_turns: Option<u32>,
     now: SystemTime,
-) -> WorktreeResponse {
+) -> Option<WorktreeResponse> {
+    let (status, phase) = runtime_projection
+        .map(|projection| (projection.task_status.clone(), projection.phase.clone()))
+        .unwrap_or((TaskStatus::Implementing, TaskPhase::Implement));
+    if status.is_terminal() {
+        return None;
+    }
+
     let created_at: DateTime<Utc> = entry.created_at.into();
     let duration_secs = now
         .duration_since(entry.created_at)
@@ -256,7 +301,7 @@ fn response_from_workspace_entry(
         .as_secs();
     let source_repo = entry.source_repo.to_string_lossy().into_owned();
 
-    WorktreeResponse {
+    Some(WorktreeResponse {
         task_id: entry.task_id.0,
         branch: entry.branch,
         workspace_path: entry.workspace_path.to_string_lossy().into_owned(),
@@ -264,8 +309,8 @@ fn response_from_workspace_entry(
         source_repo: source_repo.clone(),
         repo: entry.repo,
         runtime_workflow_id,
-        status: TaskStatus::Implementing.as_ref().to_string(),
-        phase: phase_name(&TaskPhase::Implement).to_string(),
+        status: status.as_ref().to_string(),
+        phase: phase_name(&phase).to_string(),
         description: None,
         turn: 0,
         max_turns: default_max_turns,
@@ -273,7 +318,7 @@ fn response_from_workspace_entry(
         duration_secs,
         pr_url: None,
         project: Some(source_repo),
-    }
+    })
 }
 
 fn path_short(path: &Path) -> String {
@@ -349,6 +394,7 @@ mod tests {
             entry("task-1"),
             &task,
             Some("workflow-1".to_string()),
+            None,
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
@@ -380,6 +426,7 @@ mod tests {
             entry("task-1"),
             &task,
             Some("workflow-1".to_string()),
+            None,
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
@@ -397,6 +444,7 @@ mod tests {
             workspace,
             &task,
             Some("resolved-workflow-1".to_string()),
+            None,
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
@@ -417,6 +465,7 @@ mod tests {
             entry("task-1"),
             &task,
             Some("workflow-1".to_string()),
+            None,
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
@@ -431,6 +480,7 @@ mod tests {
             entry("runtime-workspace-1"),
             None,
             Some("workflow-1".to_string()),
+            None,
             Some(20),
             UNIX_EPOCH + Duration::from_secs(850),
         )
@@ -446,6 +496,38 @@ mod tests {
         assert_eq!(response.project.as_deref(), Some("/Users/example/src/repo"));
         assert_eq!(response.description, None);
         assert_eq!(response.pr_url, None);
+    }
+
+    #[test]
+    fn response_from_task_uses_runtime_projection_status_and_phase() {
+        let mut task = TaskState::new(CoreTaskId("task-1".to_string()));
+        task.status = TaskStatus::Implementing;
+        task.phase = TaskPhase::Implement;
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "awaiting_feedback",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
+        );
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+        let response = response_from_task(
+            entry("task-1"),
+            &task,
+            Some("workflow-1".to_string()),
+            Some(&projection),
+            Some(20),
+            UNIX_EPOCH + Duration::from_secs(850),
+        );
+
+        assert_eq!(
+            response.as_ref().map(|response| response.status.as_str()),
+            Some("waiting")
+        );
+        assert_eq!(
+            response.as_ref().map(|response| response.phase.as_str()),
+            Some("review")
+        );
     }
 
     #[tokio::test]
@@ -512,7 +594,7 @@ mod tests {
                 &harness_workflow::runtime::WorkflowInstance::new(
                     harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
                     1,
-                    "implementing",
+                    "awaiting_feedback",
                     harness_workflow::runtime::WorkflowSubject::new("issue", "issue:882"),
                 )
                 .with_id(workflow_id.clone())
@@ -548,6 +630,8 @@ mod tests {
         assert_eq!(payload[0]["description"], "Render active worktrees");
         assert_eq!(payload[0]["repo"], "owner/repo");
         assert_eq!(payload[0]["runtime_workflow_id"], workflow_id);
+        assert_eq!(payload[0]["status"], "waiting");
+        assert_eq!(payload[0]["phase"], "review");
         assert_eq!(payload[0]["turn"], 2);
         assert_eq!(payload[0]["max_turns"], 8);
         Ok(())
@@ -614,7 +698,7 @@ mod tests {
                 &harness_workflow::runtime::WorkflowInstance::new(
                     harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
                     1,
-                    "implementing",
+                    "awaiting_feedback",
                     harness_workflow::runtime::WorkflowSubject::new("issue", "issue:884"),
                 )
                 .with_id("workflow-1".to_string())
@@ -642,8 +726,8 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let payload: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(payload[0]["task_id"], "runtime-workspace-1");
-        assert_eq!(payload[0]["status"], "implementing");
-        assert_eq!(payload[0]["phase"], "implement");
+        assert_eq!(payload[0]["status"], "waiting");
+        assert_eq!(payload[0]["phase"], "review");
         assert_eq!(payload[0]["repo"], "owner/repo");
         assert_eq!(payload[0]["runtime_workflow_id"], "workflow-1");
         assert_eq!(payload[0]["turn"], 0);
