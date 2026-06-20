@@ -197,6 +197,7 @@ pub(crate) async fn build_registry(
                     .await?;
                 if let Err(e) = migrate_issue_workflows_if_needed(
                     configured_database_url,
+                    &setup_pool,
                     &issue_workflows_db_path,
                     &schema,
                     &store,
@@ -262,6 +263,7 @@ pub(crate) async fn build_registry(
                     .await?;
                 if let Err(e) = migrate_project_workflows_if_needed(
                     configured_database_url,
+                    &setup_pool,
                     &project_workflows_db_path,
                     &schema,
                     &store,

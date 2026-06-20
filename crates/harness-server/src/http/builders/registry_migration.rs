@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use sqlx::postgres::PgPool;
+
 /// Walk all `issue_workflows` rows. For each row whose `project_id` contains
 /// `/workspaces/` (a corrupt worktree path), replace it with `canonical_root`.
 /// Returns `(rewritten, failed, skipped)` counts.
@@ -56,12 +58,16 @@ pub(super) async fn repair_corrupt_project_ids(
 
 pub(super) async fn migrate_issue_workflows_if_needed(
     configured_database_url: Option<&str>,
+    setup_pool: &PgPool,
     legacy_path: &Path,
     target_schema: &str,
     target_store: &harness_workflow::issue_lifecycle::IssueWorkflowStore,
 ) -> anyhow::Result<()> {
     let legacy_schema = harness_workflow::issue_lifecycle::legacy_schema_for_path(legacy_path)?;
     if legacy_schema == target_schema {
+        return Ok(());
+    }
+    if !legacy_table_exists(setup_pool, &legacy_schema, "issue_workflows").await? {
         return Ok(());
     }
 
@@ -97,12 +103,16 @@ pub(super) async fn migrate_issue_workflows_if_needed(
 
 pub(super) async fn migrate_project_workflows_if_needed(
     configured_database_url: Option<&str>,
+    setup_pool: &PgPool,
     legacy_path: &Path,
     target_schema: &str,
     target_store: &harness_workflow::project_lifecycle::ProjectWorkflowStore,
 ) -> anyhow::Result<()> {
     let legacy_schema = harness_workflow::project_lifecycle::legacy_schema_for_path(legacy_path)?;
     if legacy_schema == target_schema {
+        return Ok(());
+    }
+    if !legacy_table_exists(setup_pool, &legacy_schema, "project_workflows").await? {
         return Ok(());
     }
 
@@ -136,10 +146,44 @@ pub(super) async fn migrate_project_workflows_if_needed(
     Ok(())
 }
 
+async fn legacy_table_exists(pool: &PgPool, schema: &str, table: &str) -> anyhow::Result<bool> {
+    let table_name: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(format!(
+            "{}.{}",
+            quote_pg_ident(schema),
+            quote_pg_ident(table)
+        ))
+        .fetch_one(pool)
+        .await?;
+    Ok(table_name.is_some())
+}
+
+fn quote_pg_ident(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use harness_core::db::{pg_schema_for_path, resolve_database_url};
+
+    async fn configured_database_url_and_setup_pool() -> anyhow::Result<Option<(String, PgPool)>> {
+        let database_url = match resolve_database_url(None) {
+            Ok(url) => url,
+            Err(_) => return Ok(None),
+        };
+        let setup_pool = harness_core::db::pg_open_pool(&database_url).await?;
+        Ok(Some((database_url, setup_pool)))
+    }
+
+    async fn schema_exists(pool: &PgPool, schema: &str) -> anyhow::Result<bool> {
+        let found: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1")
+                .bind(schema)
+                .fetch_optional(pool)
+                .await?;
+        Ok(found.is_some())
+    }
 
     async fn open_test_issue_store(
     ) -> anyhow::Result<Option<harness_workflow::issue_lifecycle::IssueWorkflowStore>> {
@@ -257,9 +301,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_workflow_migration_backfills_partial_target() -> anyhow::Result<()> {
-        let configured_database_url = match resolve_database_url(None) {
-            Ok(url) => Some(url),
-            Err(_) => return Ok(()),
+        let Some((configured_database_url, setup_pool)) =
+            configured_database_url_and_setup_pool().await?
+        else {
+            return Ok(());
         };
         let dir = tempfile::tempdir()?;
         let legacy_path = dir.path().join("issue_workflows.db");
@@ -268,12 +313,12 @@ mod tests {
         let legacy_store =
             harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
                 &legacy_path,
-                configured_database_url.as_deref(),
+                Some(&configured_database_url),
             )
             .await?;
         let target_store =
             harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url_and_schema(
-                configured_database_url.as_deref(),
+                Some(&configured_database_url),
                 &target_schema,
             )
             .await?;
@@ -320,7 +365,8 @@ mod tests {
             .await?;
 
         migrate_issue_workflows_if_needed(
-            configured_database_url.as_deref(),
+            Some(&configured_database_url),
+            &setup_pool,
             &legacy_path,
             &target_schema,
             &target_store,
@@ -353,9 +399,10 @@ mod tests {
 
     #[tokio::test]
     async fn project_workflow_migration_backfills_partial_target() -> anyhow::Result<()> {
-        let configured_database_url = match resolve_database_url(None) {
-            Ok(url) => Some(url),
-            Err(_) => return Ok(()),
+        let Some((configured_database_url, setup_pool)) =
+            configured_database_url_and_setup_pool().await?
+        else {
+            return Ok(());
         };
         let dir = tempfile::tempdir()?;
         let legacy_path = dir.path().join("project_workflows.db");
@@ -364,11 +411,11 @@ mod tests {
         let legacy_store =
             harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url(
                 &legacy_path,
-                configured_database_url.as_deref(),
+                Some(&configured_database_url),
             )
             .await?;
         let target_store = harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url_and_schema(
-            configured_database_url.as_deref(),
+            Some(&configured_database_url),
             &target_schema,
         )
         .await?;
@@ -387,7 +434,8 @@ mod tests {
             .await?;
 
         migrate_project_workflows_if_needed(
-            configured_database_url.as_deref(),
+            Some(&configured_database_url),
+            &setup_pool,
             &legacy_path,
             &target_schema,
             &target_store,
@@ -417,6 +465,83 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn issue_workflow_migration_missing_legacy_store_does_not_create_schema(
+    ) -> anyhow::Result<()> {
+        let Some((configured_database_url, setup_pool)) =
+            configured_database_url_and_setup_pool().await?
+        else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let legacy_path = dir.path().join("missing_issue_workflows.db");
+        let legacy_schema =
+            harness_workflow::issue_lifecycle::legacy_schema_for_path(&legacy_path)?;
+        let target_schema = pg_schema_for_path(&dir.path().join("issue_workflows_target.db"))?;
+        let target_store =
+            harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url_and_schema(
+                Some(&configured_database_url),
+                &target_schema,
+            )
+            .await?;
+
+        assert!(
+            !schema_exists(&setup_pool, &legacy_schema).await?,
+            "legacy issue workflow schema should not exist before migration probe"
+        );
+        migrate_issue_workflows_if_needed(
+            Some(&configured_database_url),
+            &setup_pool,
+            &legacy_path,
+            &target_schema,
+            &target_store,
+        )
+        .await?;
+        assert!(
+            !schema_exists(&setup_pool, &legacy_schema).await?,
+            "migration probe should not create an empty legacy issue workflow schema"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_workflow_migration_missing_legacy_store_does_not_create_schema(
+    ) -> anyhow::Result<()> {
+        let Some((configured_database_url, setup_pool)) =
+            configured_database_url_and_setup_pool().await?
+        else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let legacy_path = dir.path().join("missing_project_workflows.db");
+        let legacy_schema =
+            harness_workflow::project_lifecycle::legacy_schema_for_path(&legacy_path)?;
+        let target_schema = pg_schema_for_path(&dir.path().join("project_workflows_target.db"))?;
+        let target_store = harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url_and_schema(
+            Some(&configured_database_url),
+            &target_schema,
+        )
+        .await?;
+
+        assert!(
+            !schema_exists(&setup_pool, &legacy_schema).await?,
+            "legacy project workflow schema should not exist before migration probe"
+        );
+        migrate_project_workflows_if_needed(
+            Some(&configured_database_url),
+            &setup_pool,
+            &legacy_path,
+            &target_schema,
+            &target_store,
+        )
+        .await?;
+        assert!(
+            !schema_exists(&setup_pool, &legacy_schema).await?,
+            "migration probe should not create an empty legacy project workflow schema"
+        );
+        Ok(())
+    }
+
     // Regression for #928: rows written to the legacy schema after the first
     // migration boot (e.g. by a still-old node during a rolling upgrade) must
     // be picked up on subsequent boots. A non-empty target schema is not
@@ -424,9 +549,10 @@ mod tests {
     #[tokio::test]
     async fn issue_workflow_migration_picks_up_late_legacy_rows_across_boots() -> anyhow::Result<()>
     {
-        let configured_database_url = match resolve_database_url(None) {
-            Ok(url) => Some(url),
-            Err(_) => return Ok(()),
+        let Some((configured_database_url, setup_pool)) =
+            configured_database_url_and_setup_pool().await?
+        else {
+            return Ok(());
         };
         let dir = tempfile::tempdir()?;
         let legacy_path = dir.path().join("issue_workflows.db");
@@ -435,12 +561,12 @@ mod tests {
         let legacy_store =
             harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
                 &legacy_path,
-                configured_database_url.as_deref(),
+                Some(&configured_database_url),
             )
             .await?;
         let target_store =
             harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url_and_schema(
-                configured_database_url.as_deref(),
+                Some(&configured_database_url),
                 &target_schema,
             )
             .await?;
@@ -457,7 +583,8 @@ mod tests {
             )
             .await?;
         migrate_issue_workflows_if_needed(
-            configured_database_url.as_deref(),
+            Some(&configured_database_url),
+            &setup_pool,
             &legacy_path,
             &target_schema,
             &target_store,
@@ -487,7 +614,8 @@ mod tests {
         // Boot 2: target already has rows; migration must still copy the
         // late-arriving legacy row instead of returning early.
         migrate_issue_workflows_if_needed(
-            configured_database_url.as_deref(),
+            Some(&configured_database_url),
+            &setup_pool,
             &legacy_path,
             &target_schema,
             &target_store,
@@ -514,9 +642,10 @@ mod tests {
     #[tokio::test]
     async fn project_workflow_migration_picks_up_late_legacy_rows_across_boots(
     ) -> anyhow::Result<()> {
-        let configured_database_url = match resolve_database_url(None) {
-            Ok(url) => Some(url),
-            Err(_) => return Ok(()),
+        let Some((configured_database_url, setup_pool)) =
+            configured_database_url_and_setup_pool().await?
+        else {
+            return Ok(());
         };
         let dir = tempfile::tempdir()?;
         let legacy_path = dir.path().join("project_workflows.db");
@@ -525,11 +654,11 @@ mod tests {
         let legacy_store =
             harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url(
                 &legacy_path,
-                configured_database_url.as_deref(),
+                Some(&configured_database_url),
             )
             .await?;
         let target_store = harness_workflow::project_lifecycle::ProjectWorkflowStore::open_with_database_url_and_schema(
-            configured_database_url.as_deref(),
+            Some(&configured_database_url),
             &target_schema,
         )
         .await?;
@@ -538,7 +667,8 @@ mod tests {
             .record_poll_started("/tmp/project", Some("owner/repo-a"))
             .await?;
         migrate_project_workflows_if_needed(
-            configured_database_url.as_deref(),
+            Some(&configured_database_url),
+            &setup_pool,
             &legacy_path,
             &target_schema,
             &target_store,
@@ -557,7 +687,8 @@ mod tests {
             .await?;
 
         migrate_project_workflows_if_needed(
-            configured_database_url.as_deref(),
+            Some(&configured_database_url),
+            &setup_pool,
             &legacy_path,
             &target_schema,
             &target_store,
