@@ -701,11 +701,13 @@ impl WorkflowRuntimeStore {
     pub async fn pending_commands(&self, limit: i64) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
         let limit = limit.clamp(1, 500);
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
-            "SELECT id, workflow_id, decision_id, status, dispatch_owner,
-                    dispatch_lease_expires_at, data::text, created_at, updated_at
-             FROM workflow_commands
-             WHERE status = 'pending'
-             ORDER BY created_at ASC
+            "SELECT command.id, command.workflow_id, command.decision_id, command.status,
+                    command.dispatch_owner, command.dispatch_lease_expires_at,
+                    command.data::text, command.created_at, command.updated_at
+             FROM workflow_commands AS command
+             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+             WHERE command.status = 'pending'
+             ORDER BY command.created_at ASC
              LIMIT $1",
         )
         .bind(limit)
@@ -725,17 +727,18 @@ impl WorkflowRuntimeStore {
         let limit = limit.clamp(1, 500);
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
             "WITH candidates AS (
-                 SELECT id
-                 FROM workflow_commands
-                 WHERE status = $3
+                 SELECT command.id
+                 FROM workflow_commands AS command
+                 JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+                 WHERE command.status = $3
                     OR (
-                        status = $4
-                        AND COALESCE(dispatch_lease_expires_at, '-infinity'::timestamptz)
+                        command.status = $4
+                        AND COALESCE(command.dispatch_lease_expires_at, '-infinity'::timestamptz)
                             <= CURRENT_TIMESTAMP
                     )
-                 ORDER BY created_at ASC
+                 ORDER BY command.created_at ASC
                  LIMIT $5
-                 FOR UPDATE SKIP LOCKED
+                 FOR UPDATE OF command SKIP LOCKED
              )
              UPDATE workflow_commands AS command
              SET status = $4,
@@ -989,30 +992,33 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Option<RuntimeJob>> {
         let mut tx = self.pool.begin().await?;
         let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT id, data::text FROM runtime_jobs
+            "SELECT job.id, job.data::text
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
              WHERE (
-                 status = 'pending'
-                 AND (not_before IS NULL OR not_before <= CURRENT_TIMESTAMP)
+                 job.status = 'pending'
+                 AND (job.not_before IS NULL OR job.not_before <= CURRENT_TIMESTAMP)
              ) OR (
-                 status = 'running'
-                 AND data ? 'lease'
-                 AND (data->'lease' ? 'expires_at')
-                 AND (data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
+                 job.status = 'running'
+                 AND job.data ? 'lease'
+                 AND (job.data->'lease' ? 'expires_at')
+                 AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
              )
              ORDER BY
                  CASE
-                     WHEN COALESCE(data #>> '{input,activity}', '') IN (
+                     WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
                          'implement_issue',
                          'implement_prompt',
                          'inspect_pr_feedback',
                          'address_pr_feedback'
                      ) THEN 0
-                     WHEN COALESCE(data #>> '{input,activity}', '') = 'poll_repo_backlog' THEN 2
+                     WHEN COALESCE(job.data #>> '{input,activity}', '') = 'poll_repo_backlog' THEN 2
                      ELSE 1
                  END ASC,
-                 created_at ASC
+                 job.created_at ASC
              LIMIT 1
-             FOR UPDATE SKIP LOCKED",
+             FOR UPDATE OF job SKIP LOCKED",
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -1324,6 +1330,21 @@ impl WorkflowRuntimeStore {
         command.status = command_status;
         command.dispatch_owner = None;
         command.dispatch_lease_expires_at = None;
+
+        let (workflow_exists,): (bool,) =
+            sqlx::query_as("SELECT EXISTS (SELECT 1 FROM workflow_instances WHERE id = $1)")
+                .bind(&command.workflow_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !workflow_exists {
+            tx.commit().await?;
+            return Ok(Some(RuntimeActivityCompletion {
+                runtime_job: job,
+                command: Some(command),
+                workflow_event: None,
+                decision: None,
+            }));
+        }
 
         let active_start_child_workflow_commands =
             if command.command.command_type == WorkflowCommandType::StartChildWorkflow {

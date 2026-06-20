@@ -246,6 +246,74 @@ async fn insert_instance_if_absent_does_not_overwrite_existing_workflow() -> any
 }
 
 #[tokio::test]
+async fn runtime_dispatch_skips_legacy_orphan_commands_and_jobs() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    drop_runtime_graph_fk_constraints(&store).await?;
+    let command_id = "legacy-orphan-dispatch-command";
+    let workflow_id = "missing-legacy-workflow";
+    let command = WorkflowCommand::enqueue_activity("orphan_activity", "legacy-orphan-dedupe");
+    insert_legacy_orphan_command(
+        &store,
+        command_id,
+        workflow_id,
+        &command,
+        WorkflowCommandStatus::Pending,
+    )
+    .await?;
+
+    assert!(store.pending_commands(10).await?.is_empty());
+    assert!(store
+        .claim_pending_commands(
+            "legacy-orphan-dispatcher",
+            Utc::now() + Duration::minutes(5),
+            10,
+        )
+        .await?
+        .is_empty());
+
+    sqlx::query("UPDATE workflow_commands SET status = $1 WHERE id = $2")
+        .bind(WorkflowCommandStatus::Dispatched.as_str())
+        .bind(command_id)
+        .execute(store.pool())
+        .await?;
+    let lease_expires_at = Utc::now() + Duration::minutes(5);
+    let mut job = RuntimeJob::pending(
+        command_id,
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({"activity": "orphan_activity"}),
+    );
+    insert_runtime_job_record(&store, &job).await?;
+
+    assert!(store
+        .claim_next_runtime_job("legacy-orphan-worker", lease_expires_at)
+        .await?
+        .is_none());
+
+    job.claim("legacy-orphan-worker", lease_expires_at);
+    update_runtime_job_record(&store, &job).await?;
+    let Some(completion) = store
+        .commit_runtime_activity_completion_if_owned(
+            &job.id,
+            "legacy-orphan-worker",
+            lease_expires_at,
+            &ActivityResult::succeeded("orphan_activity", "Legacy orphan completed."),
+        )
+        .await?
+    else {
+        anyhow::bail!("orphan runtime job completion should be acknowledged");
+    };
+    assert!(completion.workflow_event.is_none());
+    assert!(store.events_for(workflow_id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_graph_fk_migration_allows_existing_orphan_rows() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -411,6 +479,72 @@ fn runtime_job_status_str(status: RuntimeJobStatus) -> anyhow::Result<String> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("runtime job status did not serialize to a string"))
+}
+
+async fn insert_legacy_orphan_command(
+    store: &WorkflowRuntimeStore,
+    command_id: &str,
+    workflow_id: &str,
+    command: &WorkflowCommand,
+    status: WorkflowCommandStatus,
+) -> anyhow::Result<()> {
+    let data = serde_json::to_string(command)?;
+    sqlx::query(
+        "INSERT INTO workflow_commands
+            (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+    )
+    .bind(command_id)
+    .bind(workflow_id)
+    .bind(Option::<String>::None)
+    .bind("enqueue_activity")
+    .bind(&command.dedupe_key)
+    .bind(status.as_str())
+    .bind(&data)
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
+async fn insert_runtime_job_record(
+    store: &WorkflowRuntimeStore,
+    job: &RuntimeJob,
+) -> anyhow::Result<()> {
+    let data = serde_json::to_string(job)?;
+    sqlx::query(
+        "INSERT INTO runtime_jobs
+            (id, command_id, runtime_kind, runtime_profile, status, not_before, data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+    )
+    .bind(&job.id)
+    .bind(&job.command_id)
+    .bind("codex_jsonrpc")
+    .bind(&job.runtime_profile)
+    .bind(runtime_job_status_str(job.status)?)
+    .bind(job.not_before)
+    .bind(&data)
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
+async fn update_runtime_job_record(
+    store: &WorkflowRuntimeStore,
+    job: &RuntimeJob,
+) -> anyhow::Result<()> {
+    let data = serde_json::to_string(job)?;
+    sqlx::query(
+        "UPDATE runtime_jobs
+         SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $4",
+    )
+    .bind(runtime_job_status_str(job.status)?)
+    .bind(job.not_before)
+    .bind(&data)
+    .bind(&job.id)
+    .execute(store.pool())
+    .await?;
+    Ok(())
 }
 
 fn assert_constraint_error(error: sqlx::Error, constraint_name: &str) {
