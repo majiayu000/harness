@@ -203,14 +203,21 @@ async fn persist_replan_completed(
         Some(instance) => instance,
         None => {
             let instance = issue_instance(
-                workflow_id,
+                workflow_id.clone(),
                 project_id.clone(),
                 repo.map(ToOwned::to_owned),
                 issue_number,
                 "replanning",
             );
-            store.upsert_instance(&instance).await?;
-            instance
+            if store.insert_instance_if_absent(&instance).await? {
+                instance
+            } else {
+                store.get_instance(&workflow_id).await?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow `{workflow_id}` disappeared after replan fallback insert conflict"
+                    )
+                })?
+            }
         }
     };
     store
