@@ -13,6 +13,7 @@ from textwrap import dedent
 
 
 LEGACY_PATTERNS = (
+    "pg_schema_for_path(",
     "legacy_schema_for_path(",
     "open_legacy_path_schema_pool(",
     "open_legacy_path_schema(",
@@ -22,6 +23,7 @@ LEGACY_PATTERNS = (
 PG_CONTEXT_TYPES = {"PgStoreContext"}
 
 LEGACY_FUNCTION_NAMES = (
+    "pg_schema_for_path",
     "legacy_schema_for_path",
     "open_legacy_path_schema_pool",
     "open_legacy_path_schema",
@@ -55,7 +57,7 @@ PG_CONTEXT_LEGACY_RE = re.compile(
 
 GLOBAL_ALLOWED_LEGACY_FUNCTIONS = re.compile(
     r"^(from_legacy_path_schema|open_legacy_path_schema_pool|open_legacy_path_schema|"
-    r"legacy_schema_for_path|open_migrated|migrate_[A-Za-z0-9_]+_if_needed)$"
+    r"pg_schema_for_path|legacy_schema_for_path|open_migrated|migrate_[A-Za-z0-9_]+_if_needed)$"
 )
 
 FN_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\b")
@@ -442,6 +444,7 @@ def run_self_test() -> int:
             use harness_core::db::PgStoreContext as ContextAlias;
             use harness_core::db::{
                 PgStoreContext as GroupedContextAlias,
+                pg_schema_for_path as pg_schema_alias,
                 legacy_schema_for_path as schema_alias,
                 open_legacy_path_schema_pool as pool_alias,
             };
@@ -473,12 +476,20 @@ def run_self_test() -> int:
                 let _ = legacy_schema_for_path(path);
             }
 
+            pub fn disallowed_pg_schema(path: &std::path::Path) {
+                let _ = pg_schema_for_path(path);
+            }
+
             pub fn open(path: &std::path::Path) {
                 let _ = PgStoreContext::from_legacy_path_schema(path, None);
             }
 
             pub fn disallowed_schema_alias(path: &std::path::Path) {
                 let _ = schema_alias(path);
+            }
+
+            pub fn disallowed_pg_schema_alias(path: &std::path::Path) {
+                let _ = pg_schema_alias(path);
             }
 
             pub fn disallowed_pool_alias(path: &std::path::Path) {
@@ -525,6 +536,7 @@ def run_self_test() -> int:
                 let _ = PgStoreContext::from_legacy_path_schema(path, None);
                 let _ = WorkflowRuntimeStore::open_with_database_url(path, None).await;
                 let _ = WorkflowRuntimeStore::open(path).await;
+                let _ = pg_schema_for_path(path);
                 let _ = legacy_schema_for_path(path);
             }
 
@@ -533,6 +545,10 @@ def run_self_test() -> int:
             }
 
             pub fn legacy_schema_for_path(path: &std::path::Path) -> anyhow::Result<String> {
+                Ok(path.display().to_string())
+            }
+
+            pub fn pg_schema_for_path(path: &std::path::Path) -> anyhow::Result<String> {
                 Ok(path.display().to_string())
             }
             """,
@@ -596,9 +612,9 @@ def run_self_test() -> int:
         )
 
         violations = scan(root)
-        if len(violations) != 17:
+        if len(violations) != 19:
             sys.stderr.write(
-                f"self-test failed: expected 17 violations, found {len(violations)}\n"
+                f"self-test failed: expected 19 violations, found {len(violations)}\n"
             )
             for violation in violations:
                 sys.stderr.write(f"{violation.format(root)}\n")
@@ -609,6 +625,7 @@ def run_self_test() -> int:
         }
         expected_pattern_counts = {
             "PgStoreContext::from_legacy_path_schema": 8,
+            "pg_schema_for_path(": 2,
             "legacy_schema_for_path(": 2,
             "open_legacy_path_schema_pool(": 1,
             "known-store::open_with_database_url(": 4,
