@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::store::{WorkflowRuntimeStore, WorkflowRuntimeSummaryCounts};
+use super::store::{WorkflowRuntimeStateCount, WorkflowRuntimeStore, WorkflowRuntimeSummaryCounts};
 
 impl WorkflowRuntimeStore {
     pub async fn runtime_summary_counts_for_instances(
@@ -9,6 +9,7 @@ impl WorkflowRuntimeStore {
         activity_envelope_artifact_type: &str,
         activity_envelope_schema: &str,
     ) -> anyhow::Result<WorkflowRuntimeSummaryCounts> {
+        let workflow_states = workflow_states_for_instances(self, project_id).await?;
         let command_statuses = command_statuses_for_instances(self, project_id).await?;
         let total_commands = command_statuses.values().sum();
         let runtime_job_statuses = runtime_job_statuses_for_instances(self, project_id).await?;
@@ -24,6 +25,7 @@ impl WorkflowRuntimeStore {
         .await?;
 
         Ok(WorkflowRuntimeSummaryCounts {
+            workflow_states,
             total_commands,
             total_runtime_jobs,
             command_statuses,
@@ -33,6 +35,30 @@ impl WorkflowRuntimeStore {
             jobs_without_activity_envelope,
         })
     }
+}
+
+async fn workflow_states_for_instances(
+    store: &WorkflowRuntimeStore,
+    project_id: Option<&str>,
+) -> anyhow::Result<Vec<WorkflowRuntimeStateCount>> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT definition_id, state, COUNT(*)
+         FROM workflow_instances
+         WHERE ($1::text IS NULL OR data->'data'->>'project_id' = $1)
+         GROUP BY definition_id, state
+         ORDER BY definition_id ASC, state ASC",
+    )
+    .bind(project_id)
+    .fetch_all(store.pool())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(definition_id, state, count)| WorkflowRuntimeStateCount {
+            definition_id,
+            state,
+            count: count.max(0) as usize,
+        })
+        .collect())
 }
 
 async fn command_statuses_for_instances(
@@ -219,6 +245,14 @@ mod tests {
             .await?;
 
         assert_eq!(summary.total_runtime_jobs, 2);
+        assert_eq!(
+            summary.workflow_states,
+            vec![WorkflowRuntimeStateCount {
+                definition_id: "github_issue_pr".to_string(),
+                state: "implementing".to_string(),
+                count: 1,
+            }]
+        );
         assert_eq!(summary.runtime_job_statuses["running"], 2);
         assert_eq!(summary.running_job_lease_statuses["active_leased"], 1);
         assert_eq!(summary.running_job_lease_statuses["expired_lease"], 1);

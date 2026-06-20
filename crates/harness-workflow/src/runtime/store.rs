@@ -52,6 +52,7 @@ pub struct WorkflowRuntimeDetailCounts {
 }
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WorkflowRuntimeSummaryCounts {
+    pub workflow_states: Vec<WorkflowRuntimeStateCount>,
     pub total_commands: usize,
     pub total_runtime_jobs: usize,
     pub command_statuses: BTreeMap<String, usize>,
@@ -59,6 +60,12 @@ pub struct WorkflowRuntimeSummaryCounts {
     pub running_job_lease_statuses: BTreeMap<String, usize>,
     pub activity_outcomes: BTreeMap<String, usize>,
     pub jobs_without_activity_envelope: usize,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRuntimeStateCount {
+    pub definition_id: String,
+    pub state: String,
+    pub count: usize,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeJobCompactRecord {

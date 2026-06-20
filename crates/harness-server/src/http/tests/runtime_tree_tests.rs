@@ -563,6 +563,9 @@ async fn workflow_runtime_tree_endpoint_returns_summary_only_shape() -> anyhow::
     assert_eq!(body["pagination"]["next_offset"], serde_json::Value::Null);
     assert_eq!(body["pagination"]["summary_only"], true);
     assert_eq!(body["pagination"]["detail"], "compact");
+    assert_eq!(body["summary"]["workflow_statuses"]["implementing"], 1);
+    assert_eq!(body["summary"]["workflow_scheduler_states"]["running"], 1);
+    assert_eq!(body["summary"]["workflow_active_buckets"]["running"], 1);
     assert_eq!(body["summary"]["total_commands"], 1);
     assert_eq!(body["summary"]["total_runtime_jobs"], 1);
     assert_eq!(
@@ -624,6 +627,32 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
             )
             .await?;
     }
+    let quality_gate = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID,
+        1,
+        "passed",
+        harness_workflow::runtime::WorkflowSubject::new("quality_gate", "issue:101"),
+    )
+    .with_id("quality-gate-101")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 101,
+    }));
+    store.upsert_instance(&quality_gate).await?;
+    let non_terminal_passed_issue = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "passed",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:103"),
+    )
+    .with_id("issue-103")
+    .with_data(serde_json::json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 103,
+    }));
+    store.upsert_instance(&non_terminal_passed_issue).await?;
 
     let response = workflow_runtime_app(state)
         .oneshot(
@@ -634,9 +663,9 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await?;
-    assert_eq!(body["total_workflows"], 2);
+    assert_eq!(body["total_workflows"], 4);
     assert_eq!(body["pagination"]["returned"], 1);
-    assert_eq!(body["pagination"]["total"], 2);
+    assert_eq!(body["pagination"]["total"], 4);
     assert_eq!(body["pagination"]["has_more"], true);
     assert_eq!(
         body["workflows"]
@@ -645,6 +674,14 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
             .len(),
         1
     );
+    assert_eq!(body["summary"]["workflow_statuses"]["done"], 1);
+    assert_eq!(body["summary"]["workflow_statuses"]["implementing"], 2);
+    assert_eq!(body["summary"]["workflow_statuses"]["waiting"], 1);
+    assert_eq!(body["summary"]["workflow_scheduler_states"]["done"], 1);
+    assert_eq!(body["summary"]["workflow_scheduler_states"]["queued"], 1);
+    assert_eq!(body["summary"]["workflow_scheduler_states"]["running"], 2);
+    assert_eq!(body["summary"]["workflow_active_buckets"]["queued"], 1);
+    assert_eq!(body["summary"]["workflow_active_buckets"]["running"], 2);
     assert_eq!(body["summary"]["total_commands"], 2);
     assert_eq!(body["summary"]["total_runtime_jobs"], 2);
     assert_eq!(body["summary"]["command_statuses"]["pending"], 2);
