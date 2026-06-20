@@ -294,6 +294,22 @@ async fn runtime_dispatch_skips_legacy_orphan_commands_and_jobs() -> anyhow::Res
         .claim_next_runtime_job("legacy-orphan-worker", lease_expires_at)
         .await?
         .is_none());
+    assert!(store
+        .claim_next_runtime_job_for_runtime_kind(
+            RuntimeKind::CodexJsonrpc,
+            "legacy-orphan-remote-worker",
+            lease_expires_at,
+        )
+        .await?
+        .is_none());
+    assert!(store
+        .claim_next_runtime_job_excluding_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "legacy-orphan-local-worker",
+            lease_expires_at,
+        )
+        .await?
+        .is_none());
 
     job.claim("legacy-orphan-worker", lease_expires_at);
     update_runtime_job_record(&store, &job).await?;

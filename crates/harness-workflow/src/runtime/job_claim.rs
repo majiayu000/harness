@@ -38,34 +38,37 @@ impl WorkflowRuntimeStore {
             .transpose()?;
         let mut tx = self.pool.begin().await?;
         let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT id, data::text FROM runtime_jobs
+            "SELECT job.id, job.data::text
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
              WHERE (
                  (
-                     status = 'pending'
-                     AND (not_before IS NULL OR not_before <= CURRENT_TIMESTAMP)
+                     job.status = 'pending'
+                     AND (job.not_before IS NULL OR job.not_before <= CURRENT_TIMESTAMP)
                  ) OR (
-                     status = 'running'
-                     AND data ? 'lease'
-                     AND (data->'lease' ? 'expires_at')
-                     AND (data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
+                     job.status = 'running'
+                     AND job.data ? 'lease'
+                     AND (job.data->'lease' ? 'expires_at')
+                     AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
                  )
              )
-             AND ($1::text IS NULL OR runtime_kind = $1)
-             AND ($2::text IS NULL OR runtime_kind <> $2)
+             AND ($1::text IS NULL OR job.runtime_kind = $1)
+             AND ($2::text IS NULL OR job.runtime_kind <> $2)
              ORDER BY
                  CASE
-                     WHEN COALESCE(data #>> '{input,activity}', '') IN (
+                     WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
                          'implement_issue',
                          'implement_prompt',
                          'inspect_pr_feedback',
                          'address_pr_feedback'
                      ) THEN 0
-                     WHEN COALESCE(data #>> '{input,activity}', '') = 'poll_repo_backlog' THEN 2
+                     WHEN COALESCE(job.data #>> '{input,activity}', '') = 'poll_repo_backlog' THEN 2
                      ELSE 1
                  END ASC,
-                 created_at ASC
+                 job.created_at ASC
              LIMIT 1
-             FOR UPDATE SKIP LOCKED",
+             FOR UPDATE OF job SKIP LOCKED",
         )
         .bind(only_runtime_kind.as_deref())
         .bind(excluded_runtime_kind.as_deref())
