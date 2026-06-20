@@ -1,0 +1,748 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.6.34](https://github.com/majiayu000/harness/releases/tag/harness-server-v0.6.34) - 2026-06-20
+
+### Added
+
+- *(server)* tag runtime GitHub issue intake ([#1338](https://github.com/majiayu000/harness/pull/1338))
+- *(web)* add operator monitor cockpit ([#1328](https://github.com/majiayu000/harness/pull/1328))
+- *(usage)* add ccstats local cost summaries ([#1234](https://github.com/majiayu000/harness/pull/1234))
+- *(runtime)* gate PR readiness through quality gate
+- *(eval)* persist eval runs and quality snapshots ([#1245](https://github.com/majiayu000/harness/pull/1245))
+- *(usage)* add ccstats local summaries ([#1235](https://github.com/majiayu000/harness/pull/1235))
+- *(usage)* add agent usage monitor dashboard ([#1228](https://github.com/majiayu000/harness/pull/1228))
+- *(workflow)* central WORKFLOW.md config + drive Codex turns through codex exec ([#1222](https://github.com/majiayu000/harness/pull/1222))
+- *(intake)* selectable poll/webhook/hybrid intake mode ([#1221](https://github.com/majiayu000/harness/pull/1221))
+- *(store)* route thread_db builder through Backend seam (storage RFC Phase 2.2) ([#1209](https://github.com/majiayu000/harness/pull/1209))
+- *(web)* back worktrees page with API data ([#1155](https://github.com/majiayu000/harness/pull/1155))
+- *(observe)* wire token usage overview KPIs
+- *(tasks)* paginate task list queries
+- *(http/shutdown)* add staged shutdown deadlines
+- *(observe)* add proof-of-work summary endpoint
+- *(workflow-runtime)* defensive stale workflow recovery tick ([#1072](https://github.com/majiayu000/harness/pull/1072))
+- *(observe)* persist serve runtime logs by default ([#1045](https://github.com/majiayu000/harness/pull/1045))
+- add tiered review fallback for review loop ([#1042](https://github.com/majiayu000/harness/pull/1042))
+- *(workflow)* add Ready-for-Merge human gate ([#935](https://github.com/majiayu000/harness/pull/935)) ([#939](https://github.com/majiayu000/harness/pull/939))
+- *(workspace)* deterministic per-issue/PR workspace keys on write path ([#975](https://github.com/majiayu000/harness/pull/975))
+- *(skill-injection)* inject skills into triage, plan, and review agent prompts ([#979](https://github.com/majiayu000/harness/pull/979))
+- *(workspace)* GC trigger demotion + disk reconciliation + startup migration (slice 3/3 of #952) ([#980](https://github.com/majiayu000/harness/pull/980))
+- *(self-evolution)* emit drafts_pending/adopted/skills_invoked telemetry ([#972](https://github.com/majiayu000/harness/pull/972)) ([#976](https://github.com/majiayu000/harness/pull/976))
+- *(web)* proof-of-work card in TaskDetailSlideover for terminal tasks ([#974](https://github.com/majiayu000/harness/pull/974))
+- *(reconciliation)* periodic GitHub<->harness state reconciliation ([#951](https://github.com/majiayu000/harness/pull/951)) ([#958](https://github.com/majiayu000/harness/pull/958))
+- *(task-status)* surface Triaging and Planning status during agent execution ([#956](https://github.com/majiayu000/harness/pull/956))
+- *(web)* task detail slide-over for Dashboard kanban ([#934](https://github.com/majiayu000/harness/pull/934))
+- *(web)* dedicated /worktrees page with card grid and cancel action ([#853](https://github.com/majiayu000/harness/pull/853))
+- *(web)* project-scoped Dashboard routing (/?project=<id>) ([#854](https://github.com/majiayu000/harness/pull/854))
+- *(db)* migrate remaining SQLite stores to Postgres (closes #747) ([#831](https://github.com/majiayu000/harness/pull/831))
+- *(task-db)* migrate task_db from SQLite to Postgres (closes #750) ([#829](https://github.com/majiayu000/harness/pull/829))
+- *(web)* React + TypeScript rewrite of / and /overview ([#827](https://github.com/majiayu000/harness/pull/827))
+- *(security)* CapabilityToken for parallel_dispatch write isolation ([#826](https://github.com/majiayu000/harness/pull/826))
+- *(ui)* persist and surface agent prompts per turn ([#792](https://github.com/majiayu000/harness/pull/792)) ([#805](https://github.com/majiayu000/harness/pull/805))
+- *(server)* daily maintenance window for safe self-update ([#803](https://github.com/majiayu000/harness/pull/803)) ([#804](https://github.com/majiayu000/harness/pull/804))
+- *(scheduler)* periodic retry loop for stalled open issues ([#794](https://github.com/majiayu000/harness/pull/794)) ([#796](https://github.com/majiayu000/harness/pull/796))
+- *(server)* system overview page at /overview with live aggregated API ([#816](https://github.com/majiayu000/harness/pull/816))
+- *(conflict)* rebase-first strategy for conflicting PRs ([#755](https://github.com/majiayu000/harness/pull/755)) ([#779](https://github.com/majiayu000/harness/pull/779))
+- *(671)* model tiering, quota circuit-breaker, and release-plz CI ([#778](https://github.com/majiayu000/harness/pull/778))
+- *(observe)* add LLM-specific metrics (cost/turns/linter/latency) ([#738](https://github.com/majiayu000/harness/pull/738))
+- *(observe)* wire periodic purge timer for event store ([#719](https://github.com/majiayu000/harness/pull/719))
+- *(quality)* wire challenger-agent LLM judge into QualityTrigger ([#637](https://github.com/majiayu000/harness/pull/637)) ([#654](https://github.com/majiayu000/harness/pull/654))
+- extract harness-workflow crate with circuit_breaker, checkpoint, plan_db, task_queue ([#662](https://github.com/majiayu000/harness/pull/662))
+- *(task_queue)* priority scheduling for TaskQueue ([#630](https://github.com/majiayu000/harness/pull/630)) ([#650](https://github.com/majiayu000/harness/pull/650))
+- add Q-value utility tracking for rules (MemRL pattern) ([#619](https://github.com/majiayu000/harness/pull/619))
+- *(skills)* add freshness classifier and skill/stale endpoint ([#602](https://github.com/majiayu000/harness/pull/602))
+- memory-pressure-aware task admission ([#621](https://github.com/majiayu000/harness/pull/621))
+- add max_turns budget and Jaccard review-loop detection ([#623](https://github.com/majiayu000/harness/pull/623))
+- *(reviewer)* extend periodic review to all registered projects ([#617](https://github.com/majiayu000/harness/pull/617))
+- auto-spawn fix tasks for P1/P2 periodic review findings ([#605](https://github.com/majiayu000/harness/pull/605))
+- support github_token in server config with env var fallback
+- *(server)* add event sourcing for crash recovery ([#528](https://github.com/majiayu000/harness/pull/528))
+- *(server)* add runtime host control plane and persistence
+- resumable workflows with contract-driven evaluator loop ([#572](https://github.com/majiayu000/harness/pull/572))
+- add POST /tasks/{id}/cancel endpoint with dashboard Cancel button
+- add default_db_path() and migrate all DB path constructions
+- add LGTM test gate to prevent LLM gaming in review loop
+- restore hard tool enforcement via --allowedTools at CLI boundary
+- triage complexity tag drives dynamic max_rounds and skip_agent_review
+- persist and expose project field in task API
+- validate recovered pending tasks against GitHub PR state on startup ([#546](https://github.com/majiayu000/harness/pull/546))
+- impasse detection in agent review loop ([#530](https://github.com/majiayu000/harness/pull/530)) ([#547](https://github.com/majiayu000/harness/pull/547))
+- add circuit breaker to hook enforcer to prevent infinite loops
+- add task dependency scheduling for serial/parallel execution
+- add DAG validation and stranded-task detection for sprint scheduler
+- transient retry and PR-aware recovery on server restart
+- project-type-aware review prompts
+- redesign dashboard with search, detail panel, and card improvements
+- add external_id and repo fields to tasks for GitHub traceability
+- differentiate task recovery by status on server restart
+- sprint planner for intelligent issue dispatch ordering
+- make intake label filter optional
+- multi-repo GitHub intake polling
+- dual-model periodic review (Claude + Codex → synthesis)
+- add triage → plan → implement pipeline with role-based prompts
+- inject Golden Principles constitution into agent prompts
+- GC incremental scanning with checkpoint and configurable tool whitelist
+- improve server log signal-to-noise ratio with agent summaries and phase timing
+- wire HookEnforcer into interceptor chain and fix SessionId leak
+- config consistency fixes — deterministic ProjectId, configurable constants
+- add PromptParts struct, refactor implement_from_issue for cache-ready prompt structure
+- use ReadOnly/Standard capability profiles for review agents
+- wire SkillStore into prompt construction for agent skill visibility
+- periodic review system with structured output and GitHub issue creation
+- add full-repo review mode and multi-project support for periodic reviewer
+- decompose orchestration into ProjectService, TaskService, ExecutionService ([#336](https://github.com/majiayu000/harness/pull/336))
+- add TOCTOU fix and orphan worktree GC (closes #328)
+- recover in-progress tasks as failed on server restart (closes #328)
+- add comprehensive severity detection tests
+- add --project CLI flag for multi-project server startup
+- add POST /tasks/batch endpoint for batch task submission
+- true SSE streaming for task execution via GET /tasks/{id}/stream
+- add WebSocket heartbeat and graceful shutdown
+- migrate EventStore from JSONL to SQLite
+- add external signal ingestion for CI failures and review feedback
+- integrate ReasoningBudget per-phase model selection
+- auto-trigger GC based on QualityGrader score ([#245](https://github.com/majiayu000/harness/pull/245))
+- implement periodic review subsystem ([#244](https://github.com/majiayu000/harness/pull/244))
+- add stall detection to task executor ([#183](https://github.com/majiayu000/harness/pull/183))
+- add exponential backoff to validation retry loop
+- persist ExecPlan to exec_plans table with handler integration tests
+- split dashboard board into active and terminal rows
+- persist reviewer agent output in RoundResult.detail ([#188](https://github.com/majiayu000/harness/pull/188))
+- dashboard multi-channel view with /api/intake endpoint (Task 3.3)
+- handle pull_request_review events for rework dispatch
+- Feishu Bot intake pipeline (Task 2.3)
+- dashboard task submission form (Task 2.2)
+- GitHub Issues poller intake pipeline (Task 2.1)
+- implement ConcurrencyLimiter task queue (Task 1.2)
+- workspace manager — git worktree isolation per task (Task 1.1)
+- per-project config via .harness/config.toml
+- embed operations dashboard at GET /
+- post-execution validation pipeline with language detection
+- complete ExecPlan persistence read path with DB fallback ([#169](https://github.com/majiayu000/harness/pull/169))
+- wire multi-agent dispatch and register anthropic-api adapter ([#168](https://github.com/majiayu000/harness/pull/168))
+- *(harness-server)* wire turn/start to real agent lifecycle
+- *(rules)* auto-register builtin guard and warn on empty scans
+- secure GitHub webhook @harness mention automation ([#154](https://github.com/majiayu000/harness/pull/154))
+- multi-agent dispatch and agent/list RPC method ([#110](https://github.com/majiayu000/harness/pull/110))
+- persist ExecPlan to SQLite via PlanDb ([#95](https://github.com/majiayu000/harness/pull/95))
+- add MessageDelta notification and /ws route for streaming ([#104](https://github.com/majiayu000/harness/pull/104))
+- add AGENTS.md cascading discovery and context injection ([#107](https://github.com/majiayu000/harness/pull/107))
+- protocol compatibility — slash-style methods + initialize handshake ([#117](https://github.com/majiayu000/harness/pull/117))
+- detect existing PR before creating duplicate for same issue ([#53](https://github.com/majiayu000/harness/pull/53))
+- implement issue #41 step1 initialized handshake support ([#51](https://github.com/majiayu000/harness/pull/51))
+- add stdio server-push notifications pipeline (issue #41 step 2) ([#45](https://github.com/majiayu000/harness/pull/45))
+- add GET /health endpoint ([#48](https://github.com/majiayu000/harness/pull/48))
+- embed 10 built-in skills (Phase 3 VibeGuard absorption)
+- implement Phase 2 complexity routing and contract validation
+- Phase 8 periodic scheduler for VibeGuard absorption
+- Phase 6 health report and stats for VibeGuard absorption
+- Phase 5 learn feedback loop for VibeGuard absorption
+- implement Phase 1 TurnInterceptor framework for VibeGuard absorption
+- log PR review outcomes to EventStore (closes #22) ([#27](https://github.com/majiayu000/harness/pull/27))
+- GC adopt spawns task for automatic PR creation (issue #21) ([#26](https://github.com/majiayu000/harness/pull/26))
+- auto-inject skills into AgentRequest context (issue #20) ([#25](https://github.com/majiayu000/harness/pull/25))
+- persist SkillStore creates/deletes to disk (issue #19) ([#24](https://github.com/majiayu000/harness/pull/24))
+- wire thread persistence into router mutations (issue #18) ([#23](https://github.com/majiayu000/harness/pull/23))
+- review loop convergence + timeout + fallback
+- add SQLite persistence for task store
+- HTTP task API — POST /tasks, GET /tasks/:id, GET /tasks
+- initial Harness platform — 10 Rust crates implementing OpenAI Harness Engineering
+
+### Fixed
+
+- *(runtime)* record stale recovery evidence ([#1388](https://github.com/majiayu000/harness/pull/1388))
+- *(runtime)* project operator monitor buckets ([#1384](https://github.com/majiayu000/harness/pull/1384))
+- *(runtime)* centralize terminal state projection ([#1382](https://github.com/majiayu000/harness/pull/1382))
+- *(runtime)* project completion bridge status ([#1380](https://github.com/majiayu000/harness/pull/1380))
+- *(runtime)* project webhook status through projection ([#1378](https://github.com/majiayu000/harness/pull/1378))
+- *(runtime)* project dashboard active counts through projection ([#1372](https://github.com/majiayu000/harness/pull/1372))
+- *(runtime)* project runtime tree through shared status ([#1366](https://github.com/majiayu000/harness/pull/1366))
+- *(storage)* make path schema openings explicit ([#1364](https://github.com/majiayu000/harness/pull/1364))
+- *(runtime)* type workflow command status writes ([#1362](https://github.com/majiayu000/harness/pull/1362))
+- *(usage)* filter terminal active count rows ([#1359](https://github.com/majiayu000/harness/pull/1359))
+- *(storage)* scope task db in shared schema ([#1348](https://github.com/majiayu000/harness/pull/1348))
+- *(runtime)* allow blocked reconciliation completion ([#1330](https://github.com/majiayu000/harness/pull/1330))
+- *(runtime)* compact runtime tree polling ([#1327](https://github.com/majiayu000/harness/pull/1327))
+- *(store)* route review findings to shared schema ([#1324](https://github.com/majiayu000/harness/pull/1324))
+- *(runtime)* centralize workflow projection mapping ([#1323](https://github.com/majiayu000/harness/pull/1323))
+- *(runtime)* commit submissions atomically ([#1322](https://github.com/majiayu000/harness/pull/1322))
+- *(runtime)* make child workflow replay idempotent ([#1232](https://github.com/majiayu000/harness/pull/1232))
+- *(runtime)* expose running lease states ([#1313](https://github.com/majiayu000/harness/pull/1313))
+- bound hosted review wait loop ([#1311](https://github.com/majiayu000/harness/pull/1311))
+- release repo backlog issue dependencies ([#1309](https://github.com/majiayu000/harness/pull/1309))
+- *(task_db)* reject invalid scheduler state decode ([#1308](https://github.com/majiayu000/harness/pull/1308))
+- *(server)* retry PR lifecycle runtime persistence ([#1304](https://github.com/majiayu000/harness/pull/1304))
+- *(runtime)* address remaining review followups ([#1244](https://github.com/majiayu000/harness/pull/1244))
+- *(server)* pass workspace roots to schema reaper ([#1243](https://github.com/majiayu000/harness/pull/1243))
+- *(workflow)* report ignored legacy merge approvals ([#1302](https://github.com/majiayu000/harness/pull/1302))
+- *(server)* guard task status classifications ([#1300](https://github.com/majiayu000/harness/pull/1300))
+- *(runtime)* stop retrying Codex quota failures ([#1285](https://github.com/majiayu000/harness/pull/1285))
+- *(server)* start HTTP listener before background work ([#1283](https://github.com/majiayu000/harness/pull/1283))
+- *(eval)* tag collect-only repair snapshots ([#1271](https://github.com/majiayu000/harness/pull/1271))
+- *(eval)* require complete PR snapshot evidence
+- *(runtime)* require issue plans and PR repair evidence ([#1252](https://github.com/majiayu000/harness/pull/1252))
+- *(runtime)* require PR repair evidence snapshots ([#1250](https://github.com/majiayu000/harness/pull/1250))
+- *(runtime)* refresh PR feedback prompt checks ([#1249](https://github.com/majiayu000/harness/pull/1249))
+- *(runtime)* pass Codex approval policy via config ([#1230](https://github.com/majiayu000/harness/pull/1230))
+- bound Postgres schema growth (wire orphan reaper) + surface task failure reasons ([#1220](https://github.com/majiayu000/harness/pull/1220))
+- *(runtime-host)* claim workflow jobs through workflow runtime ([#1219](https://github.com/majiayu000/harness/pull/1219))
+- *(server)* surface runtime persistence degradation ([#1214](https://github.com/majiayu000/harness/pull/1214))
+- *(db)* register path-derived Postgres schemas ([#1213](https://github.com/majiayu000/harness/pull/1213))
+- *(agent)* fail turns on terminal adapter errors ([#1212](https://github.com/majiayu000/harness/pull/1212))
+- *(runtime)* extend repo backlog timeout ([#1169](https://github.com/majiayu000/harness/pull/1169))
+- *(runtime)* honor codex exec transport ([#1172](https://github.com/majiayu000/harness/pull/1172))
+- *(runtime)* honor fresh PR feedback activity ([#1194](https://github.com/majiayu000/harness/pull/1194))
+- *(runtime)* recover blocked repo backlog workflows ([#1193](https://github.com/majiayu000/harness/pull/1193))
+- *(runtime)* stop queued jobs when worker is disabled ([#1187](https://github.com/majiayu000/harness/pull/1187))
+- *(runtime)* require prompt task validation evidence ([#1186](https://github.com/majiayu000/harness/pull/1186))
+- *(runtime)* treat dispatching PR feedback commands as active ([#1185](https://github.com/majiayu000/harness/pull/1185))
+- *(runtime)* persist prompt payloads across restarts ([#1174](https://github.com/majiayu000/harness/pull/1174))
+- *(runtime)* show child workflow command shape
+- *(execution)* scope synthesized PR feedback task IDs by project ([#1149](https://github.com/majiayu000/harness/pull/1149))
+- *(runtime)* preserve PR-only feedback outcomes ([#1147](https://github.com/majiayu000/harness/pull/1147))
+- *(runtime)* enforce quality gate success contract ([#1135](https://github.com/majiayu000/harness/pull/1135))
+- *(runtime)* cancel dispatching commands ([#1143](https://github.com/majiayu000/harness/pull/1143))
+- *(runtime)* fail closed on workflow config errors ([#1142](https://github.com/majiayu000/harness/pull/1142))
+- *(store)* roll back cache after persist conflict ([#1141](https://github.com/majiayu000/harness/pull/1141))
+- *(server)* return proof for runtime tasks ([#1139](https://github.com/majiayu000/harness/pull/1139))
+- *(server)* cap LGTM test gate output ([#1138](https://github.com/majiayu000/harness/pull/1138))
+- *(runtime)* require final activity result fence ([#1136](https://github.com/majiayu000/harness/pull/1136))
+- *(runtime)* release closed blocked issue dependencies ([#1134](https://github.com/majiayu000/harness/pull/1134))
+- *(review)* make hosted bots advisory by default
+- *(workflow)* commit runtime completion atomically
+- *(workflow)* harden runtime state transitions
+- *(db)* enforce optimistic task locking
+- *(queue)* keep cancelled pending tasks terminal
+- *(stale-recovery)* bump JSON updated_at to prevent tick thrashing ([#1080](https://github.com/majiayu000/harness/pull/1080))
+- *(workflow-runtime)* make intake activity contracts observable and fail-fast ([#1071](https://github.com/majiayu000/harness/pull/1071))
+- recover orphan pending startup tasks ([#1040](https://github.com/majiayu000/harness/pull/1040))
+- *(codex)* consume structured Codex events ([#1038](https://github.com/majiayu000/harness/pull/1038))
+- *(workflow)* separate feedback claims from active PR tasks ([#1037](https://github.com/majiayu000/harness/pull/1037))
+- *(workflow)* skip terminal PR reuse for active issue workflows ([#1032](https://github.com/majiayu000/harness/pull/1032))
+- use task project root during reconciliation ([#1007](https://github.com/majiayu000/harness/pull/1007))
+- report awaiting dependency tasks in create_task ([#1005](https://github.com/majiayu000/harness/pull/1005))
+- *(review_loop)* harden Gemini quota graduation ([#1022](https://github.com/majiayu000/harness/pull/1022))
+- *(workflow)* sweeper uses repair_project_id to fix stale PK on path correction ([#961](https://github.com/majiayu000/harness/pull/961))
+- *(task)* recover PR URL when sentinel is missing from agent output ([#982](https://github.com/majiayu000/harness/pull/982)) ([#983](https://github.com/majiayu000/harness/pull/983))
+- *(workflow)* use canonical project root for IssueWorkflowInstance project_id ([#954](https://github.com/majiayu000/harness/pull/954))
+- *(workflow)* sweeper path recovery and warn deduplication ([#953](https://github.com/majiayu000/harness/pull/953))
+- *(review-loop)* short-circuit when PR is merged or closed externally ([#936](https://github.com/majiayu000/harness/pull/936))
+- *(task-runner)* make Scheduler-owner protection explicit in claim_for_runtime_host ([#940](https://github.com/majiayu000/harness/pull/940))
+- *(intake)* recover when sprint planner emits dependency outside sprint plan ([#908](https://github.com/majiayu000/harness/pull/908))
+- *(review)* defer startup periodic review until next interval ([#900](https://github.com/majiayu000/harness/pull/900))
+- *(db)* replace DefaultHasher with SHA-256 for stable Postgres schema names ([#869](https://github.com/majiayu000/harness/pull/869))
+- *(server)* include local WorkspaceManager in overview worktree KPI ([#866](https://github.com/majiayu000/harness/pull/866))
+- *(server)* prevent HTTP listener deadlock under queue saturation ([#863](https://github.com/majiayu000/harness/pull/863))
+- *(review_loop)* quota-heuristic graduation when Gemini quota exhausted ([#830](https://github.com/majiayu000/harness/pull/830))
+- *(health)* surface degraded persistence state in /health endpoint ([#824](https://github.com/majiayu000/harness/pull/824))
+- *(gc)* guard adopt() and auto_adopt_matching() against non-Pending drafts ([#821](https://github.com/majiayu000/harness/pull/821))
+- *(task_executor)* add three completion gates to prevent false Done records ([#817](https://github.com/majiayu000/harness/pull/817))
+- *(learn)* decouple grading window from gc_agent event list ([#810](https://github.com/majiayu000/harness/pull/810)) ([#813](https://github.com/majiayu000/harness/pull/813))
+- *(quality_trigger)* wrap gc_agent.run in tokio::time::timeout ([#806](https://github.com/majiayu000/harness/pull/806)) ([#811](https://github.com/majiayu000/harness/pull/811))
+- *(worktree)* prevent cross-task worktree pollution ([#799](https://github.com/majiayu000/harness/pull/799)) ([#800](https://github.com/majiayu000/harness/pull/800))
+- *(pr-detection)* only match PRs that claim to close the issue ([#799](https://github.com/majiayu000/harness/pull/799)) ([#801](https://github.com/majiayu000/harness/pull/801))
+- *(learn)* repair broken feedback loop across scheduler, grader, GC gates ([#802](https://github.com/majiayu000/harness/pull/802))
+- *(triage_pipeline)* use ExecutionPhase::Rebase in run_rebase_turn ([#789](https://github.com/majiayu000/harness/pull/789))
+- *(server)* only set last_backfilled_issue guard on successful DB write ([#783](https://github.com/majiayu000/harness/pull/783))
+- wire spawn_task_awaiting_deps and remove two dead public functions ([#717](https://github.com/majiayu000/harness/pull/717)) ([#780](https://github.com/majiayu000/harness/pull/780))
+- *(checkpoint)* write plan checkpoint in run_plan_for_prompt ([#776](https://github.com/majiayu000/harness/pull/776))
+- *(periodic_review)* add exponential backoff cooldown for failed auto-fix tasks ([#771](https://github.com/majiayu000/harness/pull/771))
+- *(triage)* reduce false skips and unparseable failures ([#774](https://github.com/majiayu000/harness/pull/774))
+- *(dedup)* back-fill external_id on auto-fix tasks that create GitHub issues ([#769](https://github.com/majiayu000/harness/pull/769))
+- *(server)* apply fail-fast error pattern to Source-A startup redispatch ([#765](https://github.com/majiayu000/harness/pull/765)) ([#767](https://github.com/majiayu000/harness/pull/767))
+- disable RuleEnforcer interceptor to unblock periodic_review ([#762](https://github.com/majiayu000/harness/pull/762))
+- *(redispatch)* re-dispatch plan/triage checkpoint tasks on startup ([#698](https://github.com/majiayu000/harness/pull/698)) ([#744](https://github.com/majiayu000/harness/pull/744))
+- *(security)* remove dashboard token injection and query-param auth ([#745](https://github.com/majiayu000/harness/pull/745))
+- *(task_db)* stop writing error field for resumed tasks on recovery ([#742](https://github.com/majiayu000/harness/pull/742))
+- *(batch)* treat issue-only tasks as independent in conflict groups
+- *(dedup)* prevent duplicate PRs with two-layer defense
+- *(runtime-state)* reject incompatible runtime snapshots on restore ([#700](https://github.com/majiayu000/harness/pull/700))
+- *(periodic_reviewer)* warn when review.enabled=false silently suppresses health checks ([#734](https://github.com/majiayu000/harness/pull/734))
+- *(dispatch)* wire project-level default_agent into task dispatch ([#727](https://github.com/majiayu000/harness/pull/727))
+- persist task phase and description to tasks DB ([#681](https://github.com/majiayu000/harness/pull/681)) ([#725](https://github.com/majiayu000/harness/pull/725))
+- centralize task status semantics ([#707](https://github.com/majiayu000/harness/pull/707))
+- *(task)* deduplicate issue/PR submissions to prevent duplicate PRs ([#713](https://github.com/majiayu000/harness/pull/713))
+- *(rules)* activate central guard enforcement for all managed projects ([#714](https://github.com/majiayu000/harness/pull/714))
+- preserve startup project metadata in registry ([#704](https://github.com/majiayu000/harness/pull/704))
+- fail closed Feishu webhook without token ([#703](https://github.com/majiayu000/harness/pull/703))
+- *(q-value)* gate REWARD_MERGED on pr_url presence for Done tasks ([#677](https://github.com/majiayu000/harness/pull/677))
+- *(q_value_store)* log parse errors in get_experiences_for_task instead of silently discarding ([#676](https://github.com/majiayu000/harness/pull/676))
+- *(task_db)* extract TASK_ROW_COLUMNS constant to prevent SELECT/struct drift
+- *(event-replay)* stream log with BufReader and compact on startup ([#659](https://github.com/majiayu000/harness/pull/659))
+- guard watermark advance behind confirmed non-None review output (U-23) ([#667](https://github.com/majiayu000/harness/pull/667))
+- *(security)* add prompt injection barrier and field truncation for auto-fix tasks ([#616](https://github.com/majiayu000/harness/pull/616))
+- *(reviewer)* retry confirm_task_spawned once to prevent stuck-pending findings ([#614](https://github.com/majiayu000/harness/pull/614))
+- *(parallel_dispatch)* scale chunk count dynamically, cap at 8 parallel ([#651](https://github.com/majiayu000/harness/pull/651))
+- *(task-store)* filter terminal tasks from startup cache to bound memory growth ([#645](https://github.com/majiayu000/harness/pull/645))
+- refine wait_for_rate_limit loop with let-else and explicit continue ([#658](https://github.com/majiayu000/harness/pull/658))
+- log checkpoint load errors to prevent silent duplicate-PR bypass ([#666](https://github.com/majiayu000/harness/pull/666))
+- replace read_to_string with BufReader streaming in event replay ([#657](https://github.com/majiayu000/harness/pull/657)) ([#661](https://github.com/majiayu000/harness/pull/661))
+- *(executor)* propagate complete_turn failure instead of silent warn ([#648](https://github.com/majiayu000/harness/pull/648))
+- *(periodic_reviewer)* use scan_ts watermark and advance only on successful parse
+- *(periodic_reviewer)* only advance watermark after review produces output
+- *(agents)* place prompt immediately after -p flag in Claude CLI invocation
+- *(task_db)* increment task_checkpoints migration version to v11 to avoid conflict with v9/v10
+- *(executor)* skip Jaccard abort when issue count is decreasing
+- *(executor)* three reviewer-found budget and loop-detection bugs
+- *(executor)* enforce max_turns in run_agent_review and skip Jaccard on LGTM
+- *(reviewer)* fix registry-upsert split-brain and watermark key collision
+- *(reviewer)* fix stale watermark, startup-sleep gap, and next_run anchoring
+- *(reviewer)* address P2 review comments on startup timing and config errors
+- *(reviewer)* deduplicate config projects by name/root and prune stale next_run_map entries
+- *(reviewer)* fix project discovery, name dedup, and dynamic registration in periodic_reviewer
+- *(reviewer)* fix scheduling cadence, deduplication, and CLI path override in periodic_reviewer
+- *(reviewer)* fix project routing, registry inclusion, and startup spike in periodic reviewer
+- *(security)* add MAX_FILE_LEN cap and truncate_to unit tests (SEC-03 review)
+- *(security)* address review feedback on auto-fix prompt construction
+- *(security)* close two prompt-injection gaps in auto-fix task prompt (SEC-03 round-2)
+- *(security)* mitigate indirect prompt injection in auto-fix task prompt (SEC-03)
+- replace cloned_ref_to_slice_refs in tests
+- prevent cross-finding task_id stamping and orphaned tasks on spawn race
+- make auto-fix dedup atomic by removing review_id from mark_task_spawned
+- cap consecutive WAITING rounds in review loop to prevent infinite spin
+- *(runtime-hosts)* honor claim project filter and serialize deregister
+- *(runtime)* revalidate live task claims and compact lease heap
+- *(runtime)* add dirty flag to converge persist state after failures
+- *(server)* canonicalize allowlist paths before prefix comparison
+- *(runtime)* guard lease ttl overflow in claim path
+- *(runtime)* serialize snapshot writes and guard cache sync
+- *(runtime)* keep successful claim response on persist failure
+- *(runtime)* harden claim path and lease input validation
+- *(clippy)* simplify project-root validation with question mark
+- align codex tool semantics and planning-gate exclusions
+- address three reviewer issues in planning gate and capability profiles
+- restrict planning phase to read-only tools in run_plan_for_prompt
+- planning gate must exclude sprint_planner tasks
+- write back effective_pr_url to tasks.pr_url when task_pr_url is invalid
+- fall back to ck_pr_url when task_pr_url is corrupted in recovery
+- validate pr_url parseability in checkpoint recovery
+- two startup-recovery correctness issues in http.rs
+- fail-close two silent-hang paths in startup recovery
+- resolve CI failures — fmt, import paths, and clippy lints
+- address round-3 review issues — planning gate, checkpoint durability, fenced-block parsing
+- address round-2 review issues in resumable-workflow recovery
+- mark unparseable PR URL checkpoint as Failed, extract test helper
+- implement checkpoint-based task recovery and address review feedback
+- resolve CI failures — register_pending_task type mismatch and dead code
+- address round-1 review issues in periodic reviewer guard scan
+- run guard scan on source repo in periodic reviewer ([#447](https://github.com/majiayu000/harness/pull/447))
+- release read lock before async scan in rule_check to prevent writer starvation
+- address round-2 review issues in LGTM test gate
+- address review round 1 issues in LGTM test gate
+- distinguish deny-all from full-access and add bypass-permissions for restricted mode
+- Low complexity preserves review gate; caller max_rounds takes priority over triage
+- address reviewer issues in triage complexity PR
+- remove unused test helper under -Dwarnings
+- remove dead fill_missing_repo_from_project function and its test
+- *(sec)* harden temp fallback dir against symlink hijacking and namespace collision
+- restore repo slug helper for task creation
+- *(rules)* validate file paths before snapshot to avoid redundant deep-clone
+- *(rules)* release read lock before async scan to prevent write starvation
+- remove duplicate test helper causing -Dwarnings failure
+- restore review_state watermark update after rebase
+- defer watermark advancement and tighten REVIEW_SKIPPED detection
+- exact-line REVIEW_SKIPPED match and defer secondary task enqueue
+- remove Command::new("git") from periodic_reviewer (REVIEW-01 / #452)
+- suppress too_many_arguments clippy lint on review_prompt; use is_some_and
+- repair test compilation errors after ReviewState mutex consolidation
+- treat PLAN_ISSUE output as task failure, not success ([#518](https://github.com/majiayu000/harness/pull/518))
+- elevate persist_findings failure from warn to error (U-29) ([#520](https://github.com/majiayu000/harness/pull/520))
+- escalate silent review cycle failures from warn to error (U-29) ([#517](https://github.com/majiayu000/harness/pull/517))
+- mark all interrupted tasks as failed on startup recovery ([#556](https://github.com/majiayu000/harness/pull/556))
+- WAITING responses no longer consume review rounds ([#559](https://github.com/majiayu000/harness/pull/559))
+- resolve 5 startup recovery bugs in PR re-dispatch
+- actually re-run tasks on transient retry and re-dispatch recovered pending tasks
+- apply per-project review_wait_secs and review_max_rounds in task executor
+- enforce strict GitHub PR URL validation to prevent command injection (SEC-03)
+- reject non-http(s) PR URLs to prevent javascript: URI injection (SEC-03)
+- skip external review bot wait when review_bot_auto_trigger is false
+- show all active columns including empty ones (e.g. pending)
+- correct phase badge check from "default" to "implement"
+- detect quota exhaustion and fail fast instead of looping
+- sprint_planner prompt pass-through (was wrapped by implement_from_prompt)
+- improve agent crash diagnostics with stdout capture and startup logging
+- remove dual-track prompt in intake dispatch, enable codex review
+- sprint_planner tasks skip review loop (same as periodic_review)
+- store agent output in implement round detail for planner retrieval
+- replace or_insert_with(VecDeque::new) with or_default()
+- *(auth)* fix rate limiter window type and bound map size
+- *(auth)* add rate limiting to password reset endpoint
+- resolve {owner}/{repo} placeholders and retry transient API errors
+- eliminate TOCTOU in HOME-based path validation ([#489](https://github.com/majiayu000/harness/pull/489)) ([#503](https://github.com/majiayu000/harness/pull/503))
+- use per-task CARGO_TARGET_DIR to eliminate parallel build contention ([#488](https://github.com/majiayu000/harness/pull/488)) ([#498](https://github.com/majiayu000/harness/pull/498))
+- restricted_tools returns Result to hard-fail on misconfigured profiles ([#494](https://github.com/majiayu000/harness/pull/494))
+- remove --allowedTools flag that crashes Claude CLI 2.1.70 ([#483](https://github.com/majiayu000/harness/pull/483)) ([#493](https://github.com/majiayu000/harness/pull/493))
+- *(periodic_reviewer)* prevent stale deduplication on EventStore write failure ([#484](https://github.com/majiayu000/harness/pull/484)) ([#492](https://github.com/majiayu000/harness/pull/492))
+- eliminate TOCTOU race in review_store check-then-insert ([#485](https://github.com/majiayu000/harness/pull/485)) ([#491](https://github.com/majiayu000/harness/pull/491))
+- *(sec)* deny access when allowed_project_root canonicalization fails ([#490](https://github.com/majiayu000/harness/pull/490))
+- add prompt diagnostics log before agent execution to debug empty-prompt failures
+- periodic review JSON parsing — use REVIEW_JSON_START/END markers and reorder prompt to create issues before outputting JSON
+- change periodic review JSON parse failure from warn to error
+- replace sleep with Notify in skills_are_injected_into_agent_context test
+- key periodic-review checkpoint by repo root, not project ID
+- scope task project and checkpoint hook in periodic reviewer
+- avoid unnecessary PathBuf clone in resolve_project
+- prevent agent process hangs by closing stdin and enabling kill_on_drop
+- dispatch tests use tempdir_in_home to pass validate_project_root
+- remove HOME_LOCK double-acquire deadlocks in tests
+- expand tilde in intake data_dir and extend HOME_LOCK to all tempdir_in_home tests
+- address reviewer issues in default.toml.example and HOME race
+- acquire HOME_LOCK in all tests that read or write HOME
+- resolve test race condition and SkillLocation assertion mismatch
+- resolve test isolation failures in rule_check and skill restart tests
+- resolve test races and stale assertion for issue #86
+- acquire HOME_LOCK in two unlocked tempdir_in_home callers
+- acquire HOME_LOCK in all tests that use tempdir_in_home as project root
+- resolve test failures from HOME race and stale SkillLocation assertion
+- wire GcConfig from server config in build_app_state and test helpers
+- restore User location for persist_dir skills to preserve shadowing behavior
+- resolve project registry ID in batch task submission path
+- auto-fix formatters in post_validator, gitignore config toml ([#322](https://github.com/majiayu000/harness/pull/322))
+- promote make_test_state helpers to shared test_helpers and bump to 0.6.3
+- align spawn_preregistered_task and enqueue_task_background with per-project concurrency API
+- validate duplicate/reserved --project names, empty paths, and load guards for startup projects
+- register --project entries in ProjectRegistry and validate --default-project name
+- non-blocking batch submission and description passthrough for issue tasks
+- replace map_or(false, ..) with is_some_and(..) to pass clippy
+- use two-step PR URL extraction pipeline to prevent markdown truncation
+- replace to_ascii_lowercase() with eq_ignore_ascii_case() for clippy compliance
+- enable SQLite WAL mode and busy_timeout for concurrent writes
+- increase DB connection pool to 8 with 10s acquire timeout
+- add graceful shutdown on Ctrl+C and SIGTERM
+- fetch latest remote before creating task worktree
+- handle backslash-escaped quotes in command safety scanner
+- make command safety check quote-aware and block newlines
+- add shell injection guard for validation commands
+- update test files to use new AppState structure
+- remove unused mut in post_validator run_command
+- add unmark_dispatched impl for FeishuIntake
+- escape all user-controlled fields in dashboard innerHTML
+- wire TaskQueue.acquire() into task spawn path for concurrency limiting
+- address intake memory leaks and error handling
+- add blank doc comment line to fix clippy doc_lazy_continuation
+- add Feishu webhook verification_token check
+- remove gh CLI calls from intake poller and fix enqueue race
+- case-insensitive review state matching and wrap external URLs in prompts
+- address medium-severity Gemini review comments on PR #176
+- add missing source/external_id fields to test helpers in task_db
+- resolve two high-severity Gemini review issues
+- revert SandboxMode default to WorkspaceWrite and fix clippy lints
+- replace splitn with split_once per clippy lint
+- remove non-functional priority selector from dashboard form
+- address Gemini review on GitHub Issues poller
+- address Gemini review comments on intake pipeline
+- validate base_branch in WorkspaceManager to prevent unexpected git behavior
+- remove verify_pr_exists that violated CLAUDE.md gh call prohibition
+- address PR #171 review findings
+- read max_retries from config, run pre_push commands, truncate error output
+- resolve common module conflict between PR #167 and #168
+- resolve common module conflict between PR #167 and #168
+- add MessageDelta match arm and apply cargo fmt
+- address OS sandbox rework feedback ([#156](https://github.com/majiayu000/harness/pull/156))
+- rework OpenTelemetry export with async-safe transport checks ([#149](https://github.com/majiayu000/harness/pull/149))
+- add semantic error codes instead of uniform INTERNAL_ERROR ([#91](https://github.com/majiayu000/harness/pull/91))
+- validate artifact target_path in GC adopt ([#92](https://github.com/majiayu000/harness/pull/92))
+- log anthropic stream errors + make review bot command configurable ([#123](https://github.com/majiayu000/harness/pull/123))
+- wire SignalThresholds from config instead of using default ([#101](https://github.com/majiayu000/harness/pull/101))
+- remove ThreadManager dead persistence code ([#100](https://github.com/majiayu000/harness/pull/100))
+- unify violation logging — replace persist_violations with persist_rule_scan ([#99](https://github.com/majiayu000/harness/pull/99))
+- pass project_root to gc_adopt_task_request instead of None ([#80](https://github.com/majiayu000/harness/pull/80))
+- *(test)* populate notification lag fields in scheduler app state
+- snapshot waiting_count update in task review loop ([#67](https://github.com/majiayu000/harness/pull/67))
+- *(task-db)* surface rounds deserialization errors ([#62](https://github.com/majiayu000/harness/pull/62))
+- *(scheduler)* use configured project root for health scans ([#73](https://github.com/majiayu000/harness/pull/73))
+- surface notify channel overflow drops ([#61](https://github.com/majiayu000/harness/pull/61))
+- *(server)* surface thread list serialization failures ([#70](https://github.com/majiayu000/harness/pull/70))
+- wire rule violations through observability pipeline ([#52](https://github.com/majiayu000/harness/pull/52))
+- register ContractValidator interceptor in AppState
+- address PR #34 review comments — security and correctness
+- address high and medium security issues in PR #36
+- address remaining high-severity prompt injection issues in PR #33
+- address critical and high security issues in PR #33
+- fail explicitly when HOME env var is not set in validate_project_root
+- address critical and high security issues in PR #33
+- scope waiting_count filter to current round only
+- always trigger /gemini review after pushing fixes ([#31](https://github.com/majiayu000/harness/pull/31))
+- always trigger /gemini review after pushing fixes ([#28](https://github.com/majiayu000/harness/pull/28))
+- propagate task panics to TaskStore via watcher spawn
+- use saturating_add for max_rounds to prevent overflow panic
+- prefer stronger agent for complex tasks, return TaskSummary from list endpoint
+- use full UUID for TaskId and move project root detection out of serde default
+- pass issue context to review_prompt and warn on fallback project root
+- address PR #11 review comments — task failure on max_rounds, fragment URL parsing, typed API, input validation
+- default project to main worktree, not server's worktree
+- address Gemini review — registry Arc, input validation, functional style
+- wire HTTP route handler to router::handle_request via axum State ([#6](https://github.com/majiayu000/harness/pull/6))
+
+### Other
+
+- Project task submission status through runtime projection ([#1370](https://github.com/majiayu000/harness/pull/1370))
+- Project task detail status through runtime projection ([#1368](https://github.com/majiayu000/harness/pull/1368))
+- Guard startup stores against path-derived schemas ([#1358](https://github.com/majiayu000/harness/pull/1358))
+- open reconcile task store from shared schema ([#1356](https://github.com/majiayu000/harness/pull/1356))
+- migrate eval store to shared schema ([#1354](https://github.com/majiayu000/harness/pull/1354))
+- migrate q_value_store to shared schema ([#1352](https://github.com/majiayu000/harness/pull/1352))
+- Migrate event store to shared schema ([#1350](https://github.com/majiayu000/harness/pull/1350))
+- Migrate project registry to shared schema ([#1346](https://github.com/majiayu000/harness/pull/1346))
+- migrate plan_db to shared schema ([#1344](https://github.com/majiayu000/harness/pull/1344))
+- migrate runtime state store to shared schema ([#1342](https://github.com/majiayu000/harness/pull/1342))
+- migrate thread_db to shared schema ([#1340](https://github.com/majiayu000/harness/pull/1340))
+- *(server)* share task interceptor stack ([#1337](https://github.com/majiayu000/harness/pull/1337))
+- Add Claude provider backpressure ([#1336](https://github.com/majiayu000/harness/pull/1336))
+- Fix PLAN_ISSUE replan prompt context ([#1335](https://github.com/majiayu000/harness/pull/1335))
+- Add workflow PR scope guard ([#1334](https://github.com/majiayu000/harness/pull/1334))
+- Fix dashboard submit alias for worktrees CTA ([#1333](https://github.com/majiayu000/harness/pull/1333))
+- Fix workspace pool leasing for concurrent tasks ([#1332](https://github.com/majiayu000/harness/pull/1332))
+- Fix runtime submission id task route lookup ([#1331](https://github.com/majiayu000/harness/pull/1331))
+- Stabilize parallel harness-server tests ([#1326](https://github.com/majiayu000/harness/pull/1326))
+- Add runtime PR hygiene sweep ([#1321](https://github.com/majiayu000/harness/pull/1321))
+- Implement local Codex CLI review provider ([#1320](https://github.com/majiayu000/harness/pull/1320))
+- Require complete review-thread snapshots for PR readiness ([#1318](https://github.com/majiayu000/harness/pull/1318))
+- Fix runtime workspace finalization failures ([#1317](https://github.com/majiayu000/harness/pull/1317))
+- cover runtime cancel compatibility handle ([#1319](https://github.com/majiayu000/harness/pull/1319))
+- Harden workflow command status boundaries ([#1314](https://github.com/majiayu000/harness/pull/1314))
+- *(workflow)* remove unreachable state variants ([#1312](https://github.com/majiayu000/harness/pull/1312))
+- Wire review provider policy into local review gate ([#1307](https://github.com/majiayu000/harness/pull/1307))
+- *(server)* refresh Codex startup guidance ([#1242](https://github.com/majiayu000/harness/pull/1242))
+- Fix empty subtask output aggregation ([#1305](https://github.com/majiayu000/harness/pull/1305))
+- Fix ready-to-merge reconciliation ([#1306](https://github.com/majiayu000/harness/pull/1306))
+- Fix runtime terminal workspace cleanup ([#1301](https://github.com/majiayu000/harness/pull/1301))
+- Fix runtime PR feedback with server-owned snapshots ([#1254](https://github.com/majiayu000/harness/pull/1254))
+- Fix runtime PR feedback local review gate ([#1224](https://github.com/majiayu000/harness/pull/1224))
+- *(release)* v0.6.34 ([#1196](https://github.com/majiayu000/harness/pull/1196))
+- *(server)* add lightweight HTTP route fixtures ([#1195](https://github.com/majiayu000/harness/pull/1195))
+- *(server)* narrow AppState DB setup lock lifetime
+- *(runtime)* persist submission handles ([#1159](https://github.com/majiayu000/harness/pull/1159))
+- *(execution)* split task driver ([#1158](https://github.com/majiayu000/harness/pull/1158))
+- [codex] Move task APIs to runtime submission handles ([#1157](https://github.com/majiayu000/harness/pull/1157))
+- *(runtime)* define submission identity contract
+- isolate spawn panic tempdir setup
+- Fix atomic PR feedback runtime transitions ([#1148](https://github.com/majiayu000/harness/pull/1148))
+- *(runtime)* paginate workflow runtime tree
+- Fix dashboard runtime metrics
+- Route open PR feedback through runtime prompts
+- Require PR head proof after local fixes
+- Fix runtime worker capacity under long turns
+- Harden Codex app-server turn adapters
+- Allow runtime backlog and feedback recovery
+- Harden workflow runtime contracts and status diagnostics ([#1115](https://github.com/majiayu000/harness/pull/1115))
+- *(validation)* introduce validation executor
+- *(workflow-runtime)* split runtime worker modules
+- *(spawn)* split spawn tests into focused modules
+- *(workspace)* synchronize CwdGuard with async lock
+- *(task_executor)* split gates and non-implementation path
+- *(workflow)* cover late legacy workflow migration rows
+- *(task-kind)* centralise per-kind metadata on TaskKind
+- *(prompts)* centralise inline prompts under harness-core
+- *(workflow)* add task and lifecycle state invariants
+- *(services/execution)* keep TempDir alive in make_event_store_noop
+- Repair workflow runtime PR recovery
+- Harden workflow runtime under Codex defaults
+- *(task_executor/pr_detection)* extract tests via #[path] ([#1095](https://github.com/majiayu000/harness/pull/1095))
+- *(task_runner/spawn)* extract tests via #[path] ([#1088](https://github.com/majiayu000/harness/pull/1088))
+- *(services/execution)* extract tests via #[path] ([#1086](https://github.com/majiayu000/harness/pull/1086))
+- *(workspace)* extract tests via #[path] ([#1084](https://github.com/majiayu000/harness/pull/1084))
+- *(workflow-runtime)* extract submission tests via #[path] ([#1083](https://github.com/majiayu000/harness/pull/1083))
+- *(workflow-runtime)* extract worker tests via #[path] ([#1082](https://github.com/majiayu000/harness/pull/1082))
+- Fix workflow runtime workspace and Codex recovery ([#1062](https://github.com/majiayu000/harness/pull/1062))
+- Decouple workflow runtime from legacy task fallbacks ([#1060](https://github.com/majiayu000/harness/pull/1060))
+- Route Worktrees runtime cancel through workflow API ([#1058](https://github.com/majiayu000/harness/pull/1058))
+- Expose runtime submission workflow handles ([#1057](https://github.com/majiayu000/harness/pull/1057))
+- Add runtime workflow cancellation from dashboard ([#1056](https://github.com/majiayu000/harness/pull/1056))
+- Route legacy feedback sweeps through workflow runtime ([#1055](https://github.com/majiayu000/harness/pull/1055))
+- Route dashboard merge approvals through workflow runtime ([#1054](https://github.com/majiayu000/harness/pull/1054))
+- Route prompt submissions through workflow runtime ([#1053](https://github.com/majiayu000/harness/pull/1053))
+- Route PR feedback through child workflow runtime ([#1052](https://github.com/majiayu000/harness/pull/1052))
+- Route repo sprint planning through workflow runtime ([#1051](https://github.com/majiayu000/harness/pull/1051))
+- Route repo backlog polling through workflow runtime ([#1050](https://github.com/majiayu000/harness/pull/1050))
+- Route PR feedback sweeps through workflow runtime ([#1049](https://github.com/majiayu000/harness/pull/1049))
+- Shadow issue submissions in workflow runtime
+- Add workflow runtime activity result contracts ([#1047](https://github.com/majiayu000/harness/pull/1047))
+- Make runtime-host claims reject scheduler-owned pending tasks ([#1033](https://github.com/majiayu000/harness/pull/1033))
+- Promote actionable triage skips into planned work ([#1041](https://github.com/majiayu000/harness/pull/1041))
+- Prepare pr:N branches with a review rebase stage ([#1039](https://github.com/majiayu000/harness/pull/1039))
+- Fail closed on resumed PR conflict gate ([#1035](https://github.com/majiayu000/harness/pull/1035))
+- Honor registry metadata for path-based project execution ([#1044](https://github.com/majiayu000/harness/pull/1044))
+- *(server)* cover task workflow enrichment ([#1036](https://github.com/majiayu000/harness/pull/1036))
+- Normalize Postgres schema path aliases ([#1031](https://github.com/majiayu000/harness/pull/1031))
+- Add structured turn telemetry to task and event surfaces ([#915](https://github.com/majiayu000/harness/pull/915))
+- Paginate existing PR lookup
+- Guard deterministic workspace cleanup ownership
+- Return queued task responses under saturation
+- Improve Postgres startup health reporting
+- Fix workflow migration backfill overwrite ([#1014](https://github.com/majiayu000/harness/pull/1014))
+- Fix linked worktree canonical root detection ([#1008](https://github.com/majiayu000/harness/pull/1008))
+- Inject project context into task prompts ([#1013](https://github.com/majiayu000/harness/pull/1013))
+- Fix GitHub issue intake PR filtering ([#1021](https://github.com/majiayu000/harness/pull/1021))
+- Clean runtime adapter strategy and docs links ([#1019](https://github.com/majiayu000/harness/pull/1019))
+- Fix task failure accounting and Postgres pool config ([#1018](https://github.com/majiayu000/harness/pull/1018))
+- Stabilize GitHub auth and workspace defaults ([#1010](https://github.com/majiayu000/harness/pull/1010))
+- Improve Codex runtime diagnostics and intake parsing ([#1004](https://github.com/majiayu000/harness/pull/1004))
+- Resolve database URL from Harness config ([#995](https://github.com/majiayu000/harness/pull/995))
+- Fix GitHub intake issue URL deserialization ([#1000](https://github.com/majiayu000/harness/pull/1000))
+- Remove hidden server-side PR URL recovery ([#994](https://github.com/majiayu000/harness/pull/994))
+- *(task_db)* surface RoundsDeserialize error and add regression test (FUT-28) ([#984](https://github.com/majiayu000/harness/pull/984))
+- *(reconciliation)* add mock-gh unit tests for fetch_pr_github_state ([#963](https://github.com/majiayu000/harness/pull/963))
+- Fix audit findings ([#981](https://github.com/majiayu000/harness/pull/981))
+- *(persistence)* audit all 4 UUID workspace path surfaces ([#968](https://github.com/majiayu000/harness/pull/968)) ([#977](https://github.com/majiayu000/harness/pull/977))
+- *(server)* eliminate N+1 DB queries in GET /tasks workflow enrichment ([#941](https://github.com/majiayu000/harness/pull/941))
+- Unify task ownership and recovery under a single scheduler authority ([#910](https://github.com/majiayu000/harness/pull/910))
+- Harden workspace lifecycle handling for task retries ([#919](https://github.com/majiayu000/harness/pull/919))
+- Move workflow coordination under database authority ([#925](https://github.com/majiayu000/harness/pull/925))
+- Give review and planner tasks a dedicated lifecycle ([#920](https://github.com/majiayu000/harness/pull/920))
+- Route webhook tasks to the configured repository checkout ([#916](https://github.com/majiayu000/harness/pull/916))
+- Preserve startup watermark delay for rescanned projects ([#918](https://github.com/majiayu000/harness/pull/918))
+- Stop stdio writers after undelivered flush failures ([#924](https://github.com/majiayu000/harness/pull/924))
+- Make issue workflows the orchestration authority ([#913](https://github.com/majiayu000/harness/pull/913))
+- Route webhook-triggered work into the correct project root
+- Keep startup recovery aligned with the stored PR URL contract
+- Expose live operator state needed to understand running task pressure
+- Prevent expired capability tokens from reaching Anthropic agent calls
+- Prevent false success semantics for password reset requests
+- Separate background review load from issue intake capacity
+- Respect server.database_url over DATABASE_URL fallback ([#903](https://github.com/majiayu000/harness/pull/903))
+- *(db)* validate schema name before SQL interpolation ([#862](https://github.com/majiayu000/harness/pull/862))
+- unify project identity via canonical path across registry, queue, and config ([#825](https://github.com/majiayu000/harness/pull/825))
+- split oversized files into modules (closes #625) ([#823](https://github.com/majiayu000/harness/pull/823))
+- *(learn)* per-agent scan watermark in QualityTrigger ([#822](https://github.com/majiayu000/harness/pull/822))
+- *(task_runner)* add coverage for rate-limit circuit-breaker ([#717](https://github.com/majiayu000/harness/pull/717)) ([#798](https://github.com/majiayu000/harness/pull/798))
+- split task_executor.rs into pipeline modules ([#772](https://github.com/majiayu000/harness/pull/772)) ([#787](https://github.com/majiayu000/harness/pull/787))
+- *(task_runner)* add coverage for dependency scheduling ([#634](https://github.com/majiayu000/harness/pull/634)) ([#785](https://github.com/majiayu000/harness/pull/785))
+- migrate handlers to service layer for project and task operations ([#737](https://github.com/majiayu000/harness/pull/737))
+- split build_app_state into domain-specific builders ([#685](https://github.com/majiayu000/harness/pull/685)) ([#746](https://github.com/majiayu000/harness/pull/746))
+- unify AgentRegistry and AdapterRegistry into descriptor registry ([#687](https://github.com/majiayu000/harness/pull/687)) ([#743](https://github.com/majiayu000/harness/pull/743))
+- Merge pull request #669 from majiayu000/feat/fix-watermark-on-agent-failure
+- Prevent hook-time worktree failures and codify repo checks
+- Merge pull request #663 from majiayu000/feat/621-memory-pressure-admission
+- Merge pull request #649 from majiayu000/feat/622-remove-expect-panic-task-runner
+- Merge pull request #647 from majiayu000/feat/632-atomic-checkpoint-write
+- Merge pull request #646 from majiayu000/feat/633-sse-heartbeat
+- Merge pull request #644 from majiayu000/feat/623-turn-limits-loop-detection
+- Merge pull request #610 from majiayu000/feat/issue-609-no-session-persistence
+- Merge pull request #608 from majiayu000/feat/auto-spawn-fix-tasks-605
+- Merge pull request #600 from majiayu000/feat/issue-591-claude-adapter-steer-approval
+- Merge pull request #599 from majiayu000/feat/dashboard-live-metrics-596
+- Merge pull request #598 from majiayu000/feat/skill-governance-view-endpoint
+- align runtime state dirty field formatting
+- *(runtime)* stabilize hook enforcer CI env handling
+- *(runtime)* optimize lease cleanup and deregister indexing
+- cargo fmt
+- Merge pull request #578 from majiayu000/feat/573-checkpoint-recovery-integration-tests
+- add integration tests for phase checkpoint recovery on restart ([#573](https://github.com/majiayu000/harness/pull/573))
+- checkpoint current harness workspace state
+- format task_executor after rebase
+- derive Default for ReviewState and use ::default() at init sites
+- merge dual mutexes into ReviewState to resolve RS-01 deadlock risk
+- Decouple agent routing and remove silent degradation ([#561](https://github.com/majiayu000/harness/pull/561))
+- Merge pull request #538 from majiayu000/fix/review-loop-no-review-detection
+- Merge pull request #539 from majiayu000/feat/project-type-aware-review
+- cargo fmt
+- Merge pull request #535 from majiayu000/feat/task-summary-fields
+- DAG-based slot-filling scheduler replaces round-based execution
+- per-repo sprint planners instead of single global planner
+- simplify periodic review to agent-driven exploration
+- Merge pull request #509 from majiayu000/feat/issue-348-password-reset-rate-limit
+- cargo fmt
+- clean up startup logs — demote verbose init messages to debug, add single-line ready summary
+- Merge pull request #464 from majiayu000/feat/cargo-target-dir-per-workspace
+- Merge pull request #466 from majiayu000/feat/file-overlap-detection-460
+- Merge pull request #465 from majiayu000/feat/issue-459-task-artifacts
+- Merge pull request #444 from majiayu000/feat/issue-429-toctou-dashmap-entry-api
+- Merge pull request #443 from majiayu000/feat/issue-207-intake-services
+- consolidate AppState test construction into shared helpers
+- group intake fields into IntakeServices domain struct
+- Merge pull request #416 from majiayu000/feat/issue-227-split-oversized-files
+- Merge pull request #412 from majiayu000/feat/post-validation-interceptor-helpers-tests
+- Merge pull request #411 from majiayu000/feat/post-execution-pr-verification
+- Merge pull request #410 from majiayu000/feat/issue-169-exec-plan-memory-cache
+- Merge pull request #408 from majiayu000/feat/notification-delivery-turn-lifecycle-tests
+- Merge pull request #403 from majiayu000/feat/issue-162-lifecycle-test-coverage
+- Merge pull request #402 from majiayu000/feat/sibling-task-awareness
+- Merge pull request #401 from majiayu000/feat/service-layer-336
+- *(webhook)* add missing coverage for issues event and HTTP integration ([#397](https://github.com/majiayu000/harness/pull/397))
+- Merge pull request #392 from majiayu000/fix/issue-364-batch-routing
+- Merge pull request #390 from majiayu000/feat/gc-adopt-project-root-prompt-test-78
+- add prompt-forwarding coverage for gc_adopt_task_request (closes #78)
+- Merge pull request #382 from majiayu000/feat/wire-agent-dispatch-issue-93
+- Merge pull request #381 from majiayu000/feat/path-validation-project-root-92
+- Merge pull request #383 from majiayu000/feat/issue-94-local-waiting-counter
+- Merge pull request #379 from majiayu000/feat/fix-detect-severity-false-positives-90
+- Merge pull request #362 from majiayu000/feat/thread-manager-test-coverage-issue-97
+- Merge pull request #361 from majiayu000/feat/fix-silent-error-discards
+- Merge pull request #359 from majiayu000/feat/exec-plan-sqlite-only
+- Merge pull request #358 from majiayu000/feat/local-waiting-counter
+- Merge pull request #354 from majiayu000/feat/issue-90-detect-severity-test-coverage
+- Merge pull request #352 from majiayu000/feat/issue-88-warn-missing-preflight-skill
+- Merge pull request #348 from majiayu000/feat/wire-signal-thresholds-from-config
+- Merge pull request #346 from majiayu000/feat/test-rule-scan-anchor-event-82
+- Merge pull request #345 from majiayu000/feat/plug-agent-review-security-gaps
+- Merge pull request #343 from majiayu000/feat/gc-adopt-project-root-integration-test-78
+- Merge pull request #341 from majiayu000/feat/persisted-skills-survive-restart
+- Merge pull request #340 from majiayu000/feat/thread-manager-in-memory-doc
+- Merge pull request #339 from majiayu000/feat/api-auth-security-fixes
+- Merge pull request #321 from majiayu000/feat/db-abstraction-layer
+- Merge pull request #319 from majiayu000/feat/reasoning-budget-phase-selection
+- run cargo fmt
+- Merge pull request #307 from majiayu000/feat/trusted-proxy-xff-validation
+- move use statements to top and simplify Default::default() in test_helpers
+- Merge pull request #315 from majiayu000/feat/cli-project-flag-306
+- Merge pull request #312 from majiayu000/fix/batch-blocking-and-description-311
+- Merge pull request #297 from majiayu000/feat/real-time-hook-enforcement-292
+- Merge pull request #296 from majiayu000/feat/plan-db-sqlite
+- Merge pull request #295 from majiayu000/feat/websocket-heartbeat-graceful-shutdown
+- Merge pull request #282 from majiayu000/feat/external-signal-ingestion
+- Merge pull request #258 from majiayu000/feat/periodic-review-244
+- Merge pull request #241 from majiayu000/feat/auto-trigger-gemini-review-185
+- Merge pull request #238 from majiayu000/feat/skill-persistence-trigger-injection
+- Merge pull request #237 from majiayu000/feat/exec-plan-sqlite-persistence
+- Merge pull request #239 from majiayu000/feat/gc-adopt-pipeline
+- Merge pull request #232 from majiayu000/feat/parallel-dispatch-224
+- Merge pull request #235 from majiayu000/feat/issue-219-route-missing-rpc-methods
+- strengthen event_id assertion in roundtrip test
+- add EventLog/EventQuery/MetricsCollect/MetricsQuery integration tests
+- Merge pull request #210 from majiayu000/feat/generic-db-abstraction
+- Merge pull request #209 from majiayu000/feat/prompt-builder-197
+- decompose AppState god object into domain services
+- Merge pull request #213 from majiayu000/feat/validate-root-macro
+- Merge pull request #212 from majiayu000/feat/remove-dead-code-task-db
+- Merge pull request #208 from majiayu000/feat/move-taskid-to-harness-core
+- Merge pull request #206 from majiayu000/feat/consolidate-error-types
+- Merge pull request #205 from majiayu000/feat/split-oversized-files
+- Merge pull request #204 from majiayu000/feat/extract-status-conversion-trait
+- Merge pull request #203 from majiayu000/feat/eliminate-duplicate-gcconfig
+- Merge pull request #182 from majiayu000/feat/wire-completion-callback
+- replace redundant closures with function references
+- apply cargo fmt
+- Revert "fix: resolve common module conflict between PR #167 and #168"
+- add notification delivery integration test ([#167](https://github.com/majiayu000/harness/pull/167))
+- *(server)* consolidate test home helpers, remove unsafe set_var ([#166](https://github.com/majiayu000/harness/pull/166))
+- add contract validator security tests (whitespace, punctuation, case, criteria)
+- add E2E task lifecycle tests (create, get, empty request, create-then-get)
+- add WebSocket origin validation tests (local, remote, missing, non-utf8)
+- add webhook edge case tests (ping, ignored actions, invalid payload, signature)
+- add ThreadDb tests (update, metadata, delete nonexistent, get missing)
+- add TaskDb CRUD tests (roundtrip, update, list, status variants, reopen)
+- Rework Starlark execpolicy engine (r3) ([#148](https://github.com/majiayu000/harness/pull/148))
+- Fix scan error swallowing in health observe scheduler ([#122](https://github.com/majiayu000/harness/pull/122))
+- use GcConfig for GC adopt scheduling ([#55](https://github.com/majiayu000/harness/pull/55))
+- Make notification broadcast channel tunable and observable ([#68](https://github.com/majiayu000/harness/pull/68))
+- Apply FUT-15 runtime config wiring on top of latest main ([#56](https://github.com/majiayu000/harness/pull/56))
+- [Critical] 合并 violation 持久化双通道并统一 rule_scan 锚点 ([#58](https://github.com/majiayu000/harness/pull/58))
+- Handle spawn_blocking panic observability ([#72](https://github.com/majiayu000/harness/pull/72))
+- Fix severity false positives in learn handler ([#63](https://github.com/majiayu000/harness/pull/63))
+- [Medium] websocket.rs:41 修复非 UTF-8 Origin header 处理 ([#64](https://github.com/majiayu000/harness/pull/64))
+- error on unknown persisted status ([#65](https://github.com/majiayu000/harness/pull/65))
+- Merge remote-tracking branch 'origin/main'
+- prune dead modules and tighten harness-server test sandboxes
+- add integration test for GET /health endpoint ([#49](https://github.com/majiayu000/harness/pull/49))
+- Merge branch 'feat/phase7-cross-review' into feat/vibeguard-integration
+- split router.rs and task_runner.rs into handler modules
+- simplify task API to single prompt field
+- extract shared prompts module to harness-core
+- add unit tests for 8 crates (56 tests total)
