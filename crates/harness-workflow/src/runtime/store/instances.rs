@@ -4,6 +4,7 @@ use super::{
     WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{WorkflowDecisionRecord, WorkflowInstance};
+use crate::runtime::state_registry::workflow_terminal_state_names_for_definition;
 use crate::runtime::status::WorkflowCommandStatus;
 use chrono::{DateTime, Utc};
 
@@ -458,25 +459,18 @@ impl WorkflowRuntimeStore {
         limit: Option<i64>,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
         let limit = limit.map(|value| value.clamp(1, 500));
+        let terminal_states = workflow_terminal_state_names_for_definition(definition_id);
         let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
             "SELECT data::text, updated_at FROM workflow_instances
              WHERE definition_id = $1
-               AND NOT (
-                   (
-                       definition_id IN ('github_issue_pr', 'prompt_task', 'repo_backlog', 'pr_feedback')
-                       AND state IN ('done', 'failed', 'cancelled')
-                   )
-                   OR (
-                       definition_id = 'quality_gate'
-                       AND state IN ('passed', 'failed', 'cancelled')
-                   )
-               )
+               AND NOT (state = ANY($3::text[]))
                AND ($2::text IS NULL OR data->'data'->>'project_id' = $2)
              ORDER BY updated_at DESC
-             LIMIT COALESCE($3, 2147483647)",
+             LIMIT COALESCE($4, 2147483647)",
         )
         .bind(definition_id)
         .bind(project_id)
+        .bind(&terminal_states)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

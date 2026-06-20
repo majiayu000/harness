@@ -87,6 +87,10 @@ impl TransitionAllowlist {
             .find(|rule| rule.matches(from_state, to_state))
     }
 
+    pub fn rules(&self) -> impl Iterator<Item = &TransitionRule> {
+        self.rules.iter()
+    }
+
     pub fn rules_from<'a>(
         &'a self,
         from_state: &'a str,

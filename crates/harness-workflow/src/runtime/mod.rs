@@ -16,6 +16,7 @@ pub mod prompt_task;
 pub mod quality_gate;
 pub mod reducer;
 pub mod repo_backlog;
+pub mod state_registry;
 pub mod status;
 pub mod store;
 mod store_migrations;
@@ -78,6 +79,11 @@ pub use repo_backlog::{
     RepoBacklogDecisionOutput, RepoBacklogPollDecisionInput, RepoBacklogWorkflowAction,
     StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
     REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+};
+pub use state_registry::{
+    known_workflow_definition_ids, workflow_state_definition, workflow_state_exists,
+    workflow_states_for_definition, workflow_terminal_state_names_for_definition,
+    WorkflowStateDefinition, WorkflowStateKey,
 };
 pub use status::WorkflowCommandStatus;
 pub use store::{
