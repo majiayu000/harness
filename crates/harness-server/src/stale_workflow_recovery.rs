@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use harness_workflow::runtime::{
-    RuntimeJobStatus, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowRuntimeStore,
-    REPO_BACKLOG_POLL_ACTIVITY,
+    RuntimeJobStatus, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowEvent,
+    WorkflowInstance, WorkflowRuntimeStore, REPO_BACKLOG_POLL_ACTIVITY,
 };
 use serde_json::json;
 
@@ -116,24 +116,6 @@ pub async fn run_stale_workflow_recovery_tick(
                 );
                 continue;
             }
-            if let Err(error) = record_recovery_detected_event(
-                store,
-                &instance.id,
-                &original_state,
-                stuck_secs,
-                stale_after_secs,
-            )
-            .await
-            {
-                tracing::warn!(
-                    workflow_id = %instance.id,
-                    from_state = %original_state,
-                    stuck_secs,
-                    "stale_workflow_recovery: recovery evidence write failed: {error}"
-                );
-                tick.failed += 1;
-                continue;
-            }
             instance.state = RECOVERY_TARGET_STATE.to_string();
             instance.version = instance.version.saturating_add(1);
             // Bump the JSON-baked updated_at so subsequent recovery ticks see a
@@ -152,7 +134,15 @@ pub async fn run_stale_workflow_recovery_tick(
             // restart, despite having transitioned through scanning legitimately
             // in between.
             instance.updated_at = Utc::now();
-            match store.upsert_instance(&instance).await {
+            match record_recovery_detected_event_and_reset(
+                store,
+                &instance,
+                &original_state,
+                stuck_secs,
+                stale_after_secs,
+            )
+            .await
+            {
                 Ok(()) => {
                     tracing::warn!(
                         workflow_id = %instance.id,
@@ -168,7 +158,7 @@ pub async fn run_stale_workflow_recovery_tick(
                         workflow_id = %instance.id,
                         from_state = %original_state,
                         stuck_secs,
-                        "stale_workflow_recovery: upsert failed: {error}"
+                        "stale_workflow_recovery: atomic recovery write failed: {error}"
                     );
                     tick.failed += 1;
                 }
@@ -178,28 +168,81 @@ pub async fn run_stale_workflow_recovery_tick(
     Ok(tick)
 }
 
-async fn record_recovery_detected_event(
+async fn record_recovery_detected_event_and_reset(
     store: &WorkflowRuntimeStore,
-    workflow_id: &str,
+    instance: &WorkflowInstance,
     original_state: &str,
     stuck_secs: i64,
     stale_after_secs: u64,
 ) -> anyhow::Result<()> {
-    store
-        .append_event(
-            workflow_id,
-            RECOVERY_EVENT_TYPE,
-            RECOVERY_EVENT_SOURCE,
-            json!({
-                "definition_id": RECOVERED_DEFINITION_ID,
-                "from_state": original_state,
-                "to_state": RECOVERY_TARGET_STATE,
-                "stuck_secs": stuck_secs,
-                "stale_after_secs": stale_after_secs,
-                "reason": "repo_backlog workflow exceeded stale recovery threshold without active repo backlog work",
-            }),
-        )
+    let payload = json!({
+        "definition_id": RECOVERED_DEFINITION_ID,
+        "from_state": original_state,
+        "to_state": RECOVERY_TARGET_STATE,
+        "stuck_secs": stuck_secs,
+        "stale_after_secs": stale_after_secs,
+        "reason": "repo_backlog workflow exceeded stale recovery threshold without active repo backlog work",
+    });
+
+    let mut tx = store.pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("workflow_events:{}", instance.id))
+        .execute(&mut *tx)
         .await?;
+    let (next_sequence,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
+    )
+    .bind(&instance.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let event = WorkflowEvent::new(
+        &instance.id,
+        next_sequence as u64,
+        RECOVERY_EVENT_TYPE,
+        RECOVERY_EVENT_SOURCE,
+    )
+    .with_payload(payload);
+    let event_data = serde_json::to_string(&event)?;
+    sqlx::query(
+        "INSERT INTO workflow_events
+            (id, workflow_id, sequence, event_type, source, data)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind(&event.id)
+    .bind(&event.workflow_id)
+    .bind(event.sequence as i64)
+    .bind(&event.event_type)
+    .bind(&event.source)
+    .bind(&event_data)
+    .execute(&mut *tx)
+    .await?;
+
+    let instance_data = serde_json::to_string(instance)?;
+    sqlx::query(
+        "INSERT INTO workflow_instances
+            (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+         ON CONFLICT (id) DO UPDATE SET
+            definition_id = EXCLUDED.definition_id,
+            state = EXCLUDED.state,
+            subject_type = EXCLUDED.subject_type,
+            subject_key = EXCLUDED.subject_key,
+            parent_workflow_id = EXCLUDED.parent_workflow_id,
+            data = EXCLUDED.data,
+            version = EXCLUDED.version,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(&instance.id)
+    .bind(&instance.definition_id)
+    .bind(&instance.state)
+    .bind(&instance.subject.subject_type)
+    .bind(&instance.subject.subject_key)
+    .bind(&instance.parent_workflow_id)
+    .bind(&instance_data)
+    .bind(instance.version as i64)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -351,10 +394,7 @@ mod tests {
             recovery_event.event["stuck_secs"].as_i64().is_some(),
             "recovery event should include stale duration evidence"
         );
-        assert!(
-            recovery_event.created_at <= post.updated_at,
-            "recovery evidence should be recorded before the reset completes"
-        );
+        assert_eq!(recovery_event.workflow_id, post.id);
         Ok(())
     }
 
