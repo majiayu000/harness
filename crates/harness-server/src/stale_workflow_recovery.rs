@@ -30,6 +30,7 @@ use harness_workflow::runtime::{
     RuntimeJobStatus, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowRuntimeStore,
     REPO_BACKLOG_POLL_ACTIVITY,
 };
+use serde_json::json;
 
 use crate::http::AppState;
 
@@ -54,6 +55,8 @@ const STUCK_STATES: &[&str] = &[
 /// (`idle | failed`), so the next poller tick will re-claim it and re-issue a
 /// fresh `poll_repo_backlog` activity.
 const RECOVERY_TARGET_STATE: &str = "idle";
+const RECOVERY_EVENT_TYPE: &str = "RecoveryDetected";
+const RECOVERY_EVENT_SOURCE: &str = "stale_workflow_recovery";
 
 /// Default seconds a workflow must sit in a stuck state before recovery kicks
 /// in. 30 minutes is well above the longest legitimate `poll_repo_backlog`
@@ -113,6 +116,24 @@ pub async fn run_stale_workflow_recovery_tick(
                 );
                 continue;
             }
+            if let Err(error) = record_recovery_detected_event(
+                store,
+                &instance.id,
+                &original_state,
+                stuck_secs,
+                stale_after_secs,
+            )
+            .await
+            {
+                tracing::warn!(
+                    workflow_id = %instance.id,
+                    from_state = %original_state,
+                    stuck_secs,
+                    "stale_workflow_recovery: recovery evidence write failed: {error}"
+                );
+                tick.failed += 1;
+                continue;
+            }
             instance.state = RECOVERY_TARGET_STATE.to_string();
             instance.version = instance.version.saturating_add(1);
             // Bump the JSON-baked updated_at so subsequent recovery ticks see a
@@ -155,6 +176,31 @@ pub async fn run_stale_workflow_recovery_tick(
         }
     }
     Ok(tick)
+}
+
+async fn record_recovery_detected_event(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    original_state: &str,
+    stuck_secs: i64,
+    stale_after_secs: u64,
+) -> anyhow::Result<()> {
+    store
+        .append_event(
+            workflow_id,
+            RECOVERY_EVENT_TYPE,
+            RECOVERY_EVENT_SOURCE,
+            json!({
+                "definition_id": RECOVERED_DEFINITION_ID,
+                "from_state": original_state,
+                "to_state": RECOVERY_TARGET_STATE,
+                "stuck_secs": stuck_secs,
+                "stale_after_secs": stale_after_secs,
+                "reason": "repo_backlog workflow exceeded stale recovery threshold without active repo backlog work",
+            }),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn workflow_has_active_repo_backlog_work(
@@ -256,32 +302,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_tick_resets_stuck_planning_batch_to_idle() {
+    async fn recovery_tick_resets_stuck_planning_batch_to_idle() -> anyhow::Result<()> {
         let Some(store) = open_recovery_test_store().await else {
-            return;
+            return Ok(());
         };
         let mut instance = stuck_instance("test::stale-recovery::planning::1", "planning_batch");
         // Backdate updated_at to 2h ago by serializing into the store. The
         // store's CURRENT_TIMESTAMP DEFAULT writes a fresh value, so we
         // immediately overwrite it via raw SQL.
-        store.upsert_instance(&instance).await.unwrap();
+        store.upsert_instance(&instance).await?;
         instance.state = "planning_batch".to_string();
         // Confirm pre-condition: instance.updated_at is now (within seconds).
-        let pre = store.get_instance(&instance.id).await.unwrap().unwrap();
+        let Some(pre) = store.get_instance(&instance.id).await? else {
+            anyhow::bail!("seeded planning workflow should exist before recovery");
+        };
         assert_eq!(pre.state, "planning_batch");
 
         // Stale_after = 0 means "anything not currently being modified counts as
         // stale" — gives the test a deterministic boundary without sleeping.
-        let tick = run_stale_workflow_recovery_tick(&store, 0).await.unwrap();
+        let tick = run_stale_workflow_recovery_tick(&store, 0).await?;
         assert!(
             tick.scanned >= 1,
             "should scan at least the seeded instance"
         );
         assert!(tick.recovered >= 1, "should recover at least one");
 
-        let post = store.get_instance(&instance.id).await.unwrap().unwrap();
+        let Some(post) = store.get_instance(&instance.id).await? else {
+            anyhow::bail!("seeded planning workflow should still exist after recovery");
+        };
         assert_eq!(post.state, "idle", "stuck workflow should be reset to idle");
         assert!(post.version > pre.version, "version should bump");
+        let events = store.events_for(&instance.id).await?;
+        let Some(recovery_event) = events
+            .iter()
+            .find(|event| event.event_type == RECOVERY_EVENT_TYPE)
+        else {
+            anyhow::bail!("stale recovery should record workflow evidence");
+        };
+        assert_eq!(recovery_event.source, RECOVERY_EVENT_SOURCE);
+        assert_eq!(
+            recovery_event.event["definition_id"],
+            RECOVERED_DEFINITION_ID
+        );
+        assert_eq!(recovery_event.event["from_state"], "planning_batch");
+        assert_eq!(recovery_event.event["to_state"], RECOVERY_TARGET_STATE);
+        assert_eq!(recovery_event.event["stale_after_secs"], 0);
+        assert!(
+            recovery_event.event["stuck_secs"].as_i64().is_some(),
+            "recovery event should include stale duration evidence"
+        );
+        assert!(
+            recovery_event.created_at <= post.updated_at,
+            "recovery evidence should be recorded before the reset completes"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -458,6 +532,13 @@ mod tests {
         assert!(
             tick.skipped_active >= 1,
             "active runtime job should be counted as an active skip"
+        );
+        let events = store.events_for(id).await?;
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != RECOVERY_EVENT_TYPE),
+            "active runtime work should not emit a recovery event"
         );
         Ok(())
     }
