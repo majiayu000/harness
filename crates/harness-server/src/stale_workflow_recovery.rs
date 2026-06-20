@@ -496,6 +496,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_tick_does_not_reset_when_recovery_event_write_fails() -> anyhow::Result<()> {
+        let Some(store) = open_recovery_test_store().await else {
+            return Ok(());
+        };
+        let id = "test::stale-recovery::evidence-write-fails";
+        let mut instance = stuck_instance(id, "dispatching");
+        instance.updated_at = Utc::now() - chrono::Duration::hours(1);
+        store.upsert_instance(&instance).await?;
+
+        sqlx::query("DROP TABLE workflow_events")
+            .execute(store.pool())
+            .await?;
+
+        let tick = run_stale_workflow_recovery_tick(&store, 300).await?;
+
+        let Some(after) = store.get_instance(id).await? else {
+            anyhow::bail!("seeded workflow should still exist after failed recovery");
+        };
+        assert_eq!(
+            after.state, "dispatching",
+            "failed evidence persistence must not reset workflow state"
+        );
+        assert_eq!(
+            after.version, instance.version,
+            "failed evidence persistence must not bump workflow version"
+        );
+        assert_eq!(tick.recovered, 0);
+        assert!(
+            tick.failed >= 1,
+            "failed evidence persistence should be counted as failed recovery"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn recovery_tick_skips_workflow_with_active_runtime_job() -> anyhow::Result<()> {
         let Some(store) = open_recovery_test_store().await else {
             return Ok(());
