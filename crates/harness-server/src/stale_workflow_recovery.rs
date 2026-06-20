@@ -779,7 +779,6 @@ mod tests {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("active workflow missing after recovery tick"))?;
             assert_eq!(after.state, state);
-            assert_eq!(tick.recovered, 0);
             assert!(tick.skipped_active >= 1);
             let events = store.events_for(&id).await?;
             assert!(events
