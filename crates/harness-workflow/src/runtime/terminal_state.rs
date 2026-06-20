@@ -1,49 +1,7 @@
-use serde::{Deserialize, Serialize};
-
-use super::{
-    pr_feedback::PR_FEEDBACK_DEFINITION_ID, prompt_task::PROMPT_TASK_DEFINITION_ID,
-    quality_gate::QUALITY_GATE_DEFINITION_ID, reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
-    repo_backlog::REPO_BACKLOG_DEFINITION_ID,
-};
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowTerminalState {
-    Succeeded,
-    Failed,
-    Cancelled,
-}
+pub use super::state_registry::WorkflowTerminalState;
 
 pub fn workflow_terminal_state(definition_id: &str, state: &str) -> Option<WorkflowTerminalState> {
-    use WorkflowTerminalState::{Cancelled, Failed, Succeeded};
-
-    match (definition_id, state) {
-        (
-            GITHUB_ISSUE_PR_DEFINITION_ID
-            | PROMPT_TASK_DEFINITION_ID
-            | REPO_BACKLOG_DEFINITION_ID
-            | PR_FEEDBACK_DEFINITION_ID,
-            "done",
-        ) => Some(Succeeded),
-        (QUALITY_GATE_DEFINITION_ID, "passed") => Some(Succeeded),
-        (
-            GITHUB_ISSUE_PR_DEFINITION_ID
-            | PROMPT_TASK_DEFINITION_ID
-            | REPO_BACKLOG_DEFINITION_ID
-            | PR_FEEDBACK_DEFINITION_ID
-            | QUALITY_GATE_DEFINITION_ID,
-            "failed",
-        ) => Some(Failed),
-        (
-            GITHUB_ISSUE_PR_DEFINITION_ID
-            | PROMPT_TASK_DEFINITION_ID
-            | REPO_BACKLOG_DEFINITION_ID
-            | PR_FEEDBACK_DEFINITION_ID
-            | QUALITY_GATE_DEFINITION_ID,
-            "cancelled",
-        ) => Some(Cancelled),
-        _ => None,
-    }
+    super::state_registry::workflow_state_terminal_state(definition_id, state)
 }
 
 #[cfg(test)]
