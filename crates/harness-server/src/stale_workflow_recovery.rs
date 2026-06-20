@@ -1,5 +1,5 @@
-//! Stale workflow recovery — periodic tick that resets workflows stuck in
-//! non-terminal, non-candidate states back to a state the poller can pick up.
+//! Stale workflow recovery — periodic tick that routes workflows stuck in
+//! non-terminal, non-candidate states through an explicit recovery decision.
 //!
 //! The `repo_backlog` workflow type has known dead-end states:
 //! `scanning`, `planning_batch`, `dispatching`, `reconciling`, `blocked`. The poller's
@@ -12,9 +12,9 @@
 //! This recovery tick is the operational backstop. It scans the runtime store
 //! every `interval_secs` (default 600 = 10 min), finds `repo_backlog`
 //! instances stuck in any of the dead-end states for longer than
-//! `stale_after_secs` (default 1800 = 30 min), and force-resets them to
-//! `idle` so the next poller tick will re-enqueue a fresh `poll_repo_backlog`
-//! activity.
+//! `stale_after_secs` (default 1800 = 30 min), records recovery evidence, and
+//! commits an accepted recovery decision to `idle` so the next poller tick will
+//! re-enqueue a fresh `poll_repo_backlog` activity.
 //!
 //! This is a defensive recovery layer, not a correctness fix. The right long-
 //! term answer is removing the `repo_backlog` state machine entirely (see
@@ -27,12 +27,13 @@ use std::time::Duration;
 
 use chrono::Utc;
 use harness_workflow::runtime::{
-    RuntimeJobStatus, WorkflowCommand, WorkflowCommandRecord, WorkflowCommandStatus,
-    WorkflowCommandType, WorkflowEvent, WorkflowInstance, WorkflowRuntimeStore,
+    DecisionValidator, RuntimeJobStatus, ValidationContext, WorkflowCommand, WorkflowCommandRecord,
+    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowEvent, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
     REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::http::AppState;
 
@@ -59,6 +60,8 @@ const STUCK_STATES: &[&str] = &[
 const RECOVERY_TARGET_STATE: &str = "idle";
 const RECOVERY_EVENT_TYPE: &str = "RecoveryDetected";
 const RECOVERY_EVENT_SOURCE: &str = "stale_workflow_recovery";
+const RECOVERY_DECISION_NAME: &str = "recover_stale_repo_backlog_workflow";
+const RECOVERY_REASON: &str = "stale repo_backlog recovery returned workflow to poller eligibility";
 const LEGACY_REPO_BACKLOG_SPRINT_PLAN_ACTIVITY: &str = "plan_repo_sprint_from_scan";
 const REPO_BACKLOG_MARK_BOUND_ISSUE_DONE_ACTIVITY: &str = "mark_bound_issue_done";
 const REPO_BACKLOG_RECOVER_ISSUE_WORKFLOW_ACTIVITY: &str = "recover_issue_workflow";
@@ -128,7 +131,7 @@ pub async fn run_stale_workflow_recovery_tick(
                 );
                 continue;
             }
-            match record_recovery_detected_event_and_reset(
+            match commit_stale_recovery_decision(
                 store,
                 &instance.id,
                 &original_state,
@@ -178,37 +181,35 @@ pub async fn run_stale_workflow_recovery_tick(
     Ok(tick)
 }
 
-async fn record_recovery_detected_event_and_reset(
+async fn commit_stale_recovery_decision(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
     original_state: &str,
     stale_after_secs: u64,
     cutoff: chrono::DateTime<Utc>,
 ) -> anyhow::Result<RecoveryCommitOutcome> {
-    record_recovery_detected_event_and_reset_inner(
+    commit_stale_recovery_decision_inner(
         store,
         workflow_id,
         original_state,
         stale_after_secs,
         cutoff,
         false,
+        false,
     )
     .await
 }
 
-async fn record_recovery_detected_event_and_reset_inner(
+async fn commit_stale_recovery_decision_inner(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
     original_state: &str,
     stale_after_secs: u64,
     cutoff: chrono::DateTime<Utc>,
     force_rollback_after_event_insert: bool,
+    force_rollback_after_decision_insert: bool,
 ) -> anyhow::Result<RecoveryCommitOutcome> {
     let mut tx = store.pool().begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("workflow_events:{workflow_id}"))
-        .execute(&mut *tx)
-        .await?;
     let Some((current_data,)) = sqlx::query_as::<_, (String,)>(
         "SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE",
     )
@@ -234,26 +235,25 @@ async fn record_recovery_detected_event_and_reset_inner(
         return Ok(RecoveryCommitOutcome::SkippedActive { stuck_secs });
     }
 
-    let payload = json!({
-        "definition_id": RECOVERED_DEFINITION_ID,
-        "from_state": original_state,
-        "to_state": RECOVERY_TARGET_STATE,
-        "stuck_secs": stuck_secs,
-        "stale_after_secs": stale_after_secs,
-        "reason": "repo_backlog workflow exceeded stale recovery threshold without active repo backlog work",
-    });
-
-    instance.state = RECOVERY_TARGET_STATE.to_string();
-    instance.version = instance.version.saturating_add(1);
-    // Keep the JSON timestamp fresh for replay/projection paths.
-    instance.updated_at = Utc::now();
-
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("workflow_events:{workflow_id}"))
+        .execute(&mut *tx)
+        .await?;
     let (next_sequence,): (i64,) = sqlx::query_as(
         "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
     )
     .bind(workflow_id)
     .fetch_one(&mut *tx)
     .await?;
+    let payload = json!({
+        "definition_id": RECOVERED_DEFINITION_ID,
+        "from_state": original_state,
+        "to_state": RECOVERY_TARGET_STATE,
+        "decision": RECOVERY_DECISION_NAME,
+        "stuck_secs": stuck_secs,
+        "stale_after_secs": stale_after_secs,
+        "reason": "repo_backlog workflow exceeded stale recovery threshold without active repo backlog work",
+    });
     let event = WorkflowEvent::new(
         &instance.id,
         next_sequence as u64,
@@ -261,6 +261,12 @@ async fn record_recovery_detected_event_and_reset_inner(
         RECOVERY_EVENT_SOURCE,
     )
     .with_payload(payload);
+    let decision = stale_repo_backlog_recovery_decision(&instance, stuck_secs, stale_after_secs);
+    DecisionValidator::repo_backlog().validate(
+        &instance,
+        &decision,
+        &ValidationContext::new(RECOVERY_EVENT_SOURCE, event.created_at),
+    )?;
     let event_data = to_jsonb_string(&event)?;
     sqlx::query(
         "INSERT INTO workflow_events
@@ -278,6 +284,25 @@ async fn record_recovery_detected_event_and_reset_inner(
     if force_rollback_after_event_insert {
         anyhow::bail!("forced stale recovery rollback after event insert");
     }
+
+    let record = WorkflowDecisionRecord::accepted(decision, Some(event.id.clone()));
+    insert_recovery_decision_tx(&mut tx, &record).await?;
+    if force_rollback_after_decision_insert {
+        anyhow::bail!("forced stale recovery rollback after decision insert");
+    }
+
+    merge_recovery_decision_data(
+        &mut instance,
+        &record,
+        &event,
+        original_state,
+        stuck_secs,
+        stale_after_secs,
+    );
+    instance.state = record.decision.next_state.clone();
+    instance.version = instance.version.saturating_add(1);
+    // Keep the JSON timestamp fresh for replay/projection paths.
+    instance.updated_at = Utc::now();
 
     let instance_data = to_jsonb_string(&instance)?;
     let rows_affected = sqlx::query(
@@ -310,6 +335,91 @@ async fn record_recovery_detected_event_and_reset_inner(
     }
     tx.commit().await?;
     Ok(RecoveryCommitOutcome::Recovered { stuck_secs })
+}
+
+fn stale_repo_backlog_recovery_decision(
+    instance: &WorkflowInstance,
+    stuck_secs: i64,
+    stale_after_secs: u64,
+) -> WorkflowDecision {
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        RECOVERY_DECISION_NAME,
+        RECOVERY_TARGET_STATE,
+        RECOVERY_REASON,
+    )
+    .with_evidence(WorkflowEvidence::new(
+        RECOVERY_EVENT_TYPE,
+        format!(
+            "repo_backlog workflow was stuck in `{}` for {stuck_secs}s with stale_after_secs={stale_after_secs}",
+            instance.state
+        ),
+    ))
+    .high_confidence()
+}
+
+async fn insert_recovery_decision_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record: &WorkflowDecisionRecord,
+) -> anyhow::Result<()> {
+    let data = to_jsonb_string(record)?;
+    sqlx::query(
+        "INSERT INTO workflow_decisions
+            (id, workflow_id, event_id, accepted, data, rejection_reason)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+         ON CONFLICT (id) DO UPDATE SET
+            accepted = EXCLUDED.accepted,
+            data = EXCLUDED.data,
+            rejection_reason = EXCLUDED.rejection_reason",
+    )
+    .bind(&record.id)
+    .bind(&record.workflow_id)
+    .bind(&record.event_id)
+    .bind(record.accepted)
+    .bind(&data)
+    .bind(&record.rejection_reason)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn merge_recovery_decision_data(
+    instance: &mut WorkflowInstance,
+    record: &WorkflowDecisionRecord,
+    event: &WorkflowEvent,
+    original_state: &str,
+    stuck_secs: i64,
+    stale_after_secs: u64,
+) {
+    let metadata = json!({
+        "event_id": event.id,
+        "decision_id": record.id,
+        "decision": record.decision.decision,
+        "from_state": original_state,
+        "to_state": record.decision.next_state,
+        "stuck_secs": stuck_secs,
+        "stale_after_secs": stale_after_secs,
+        "recovered_at": event.created_at,
+    });
+
+    match &mut instance.data {
+        Value::Object(map) => {
+            map.insert(
+                "last_decision".to_string(),
+                Value::String(record.decision.decision.clone()),
+            );
+            map.insert("last_recovery".to_string(), metadata);
+        }
+        data => {
+            let previous_data = std::mem::take(data);
+            *data = json!({
+                "previous_data": previous_data,
+                "last_decision": record.decision.decision,
+                "last_recovery": metadata,
+            });
+        }
+    }
 }
 
 async fn workflow_has_active_repo_backlog_work_tx(
@@ -446,345 +556,5 @@ pub fn spawn_stale_workflow_recovery(state: &Arc<AppState>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use harness_core::db::resolve_database_url;
-    use harness_workflow::runtime::{
-        RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowInstance, WorkflowSubject,
-    };
-    use serde_json::json;
-    use std::sync::Arc;
-
-    async fn open_recovery_test_store() -> Option<Arc<WorkflowRuntimeStore>> {
-        let database_url = resolve_database_url(None).ok()?;
-        let dir = tempfile::tempdir().ok()?;
-        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
-            .await
-            .ok()
-            .map(Arc::new)
-    }
-
-    fn stuck_instance(id: &str, state: &str) -> WorkflowInstance {
-        WorkflowInstance::new(
-            RECOVERED_DEFINITION_ID,
-            1,
-            state,
-            WorkflowSubject::new("repo", "owner/repo"),
-        )
-        .with_id(id)
-    }
-
-    #[tokio::test]
-    async fn recovery_tick_resets_stuck_planning_batch_to_idle() -> anyhow::Result<()> {
-        let Some(store) = open_recovery_test_store().await else {
-            return Ok(());
-        };
-        let mut instance = stuck_instance("test::stale-recovery::planning::1", "planning_batch");
-        // Backdate updated_at to 2h ago by serializing into the store. The
-        // store's CURRENT_TIMESTAMP DEFAULT writes a fresh value, so we
-        // immediately overwrite it via raw SQL.
-        store.upsert_instance(&instance).await?;
-        instance.state = "planning_batch".to_string();
-        // Confirm pre-condition: instance.updated_at is now (within seconds).
-        let Some(pre) = store.get_instance(&instance.id).await? else {
-            anyhow::bail!("seeded planning workflow should exist before recovery");
-        };
-        assert_eq!(pre.state, "planning_batch");
-
-        // Stale_after = 0 means "anything not currently being modified counts as
-        // stale" — gives the test a deterministic boundary without sleeping.
-        let tick = run_stale_workflow_recovery_tick(&store, 0).await?;
-        assert!(
-            tick.scanned >= 1,
-            "should scan at least the seeded instance"
-        );
-        assert!(tick.recovered >= 1, "should recover at least one");
-
-        let Some(post) = store.get_instance(&instance.id).await? else {
-            anyhow::bail!("seeded planning workflow should still exist after recovery");
-        };
-        assert_eq!(post.state, "idle", "stuck workflow should be reset to idle");
-        assert!(post.version > pre.version, "version should bump");
-        let events = store.events_for(&instance.id).await?;
-        let Some(recovery_event) = events
-            .iter()
-            .find(|event| event.event_type == RECOVERY_EVENT_TYPE)
-        else {
-            anyhow::bail!("stale recovery should record workflow evidence");
-        };
-        assert_eq!(recovery_event.source, RECOVERY_EVENT_SOURCE);
-        assert_eq!(
-            recovery_event.event["definition_id"],
-            RECOVERED_DEFINITION_ID
-        );
-        assert_eq!(recovery_event.event["from_state"], "planning_batch");
-        assert_eq!(recovery_event.event["to_state"], RECOVERY_TARGET_STATE);
-        assert_eq!(recovery_event.event["stale_after_secs"], 0);
-        assert!(
-            recovery_event.event["stuck_secs"].as_i64().is_some(),
-            "recovery event should include stale duration evidence"
-        );
-        assert_eq!(recovery_event.workflow_id, post.id);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn recovery_tick_resets_stuck_blocked_to_idle() -> anyhow::Result<()> {
-        let Some(store) = open_recovery_test_store().await else {
-            return Ok(());
-        };
-        let instance = stuck_instance("test::stale-recovery::blocked::1", "blocked");
-        store.upsert_instance(&instance).await?;
-
-        let Some(pre) = store.get_instance(&instance.id).await? else {
-            anyhow::bail!("seeded blocked workflow should exist before recovery");
-        };
-        assert_eq!(pre.state, "blocked");
-
-        let tick = run_stale_workflow_recovery_tick(&store, 0).await?;
-
-        assert!(
-            tick.scanned >= 1,
-            "should scan at least the blocked instance"
-        );
-        assert!(tick.recovered >= 1, "should recover blocked instance");
-
-        let Some(post) = store.get_instance(&instance.id).await? else {
-            anyhow::bail!("seeded blocked workflow should still exist after recovery");
-        };
-        assert_eq!(
-            post.state, "idle",
-            "blocked workflow should be reset to idle"
-        );
-        assert!(post.version > pre.version, "version should bump");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn recovery_tick_skips_workflows_in_terminal_or_candidate_state() {
-        let Some(store) = open_recovery_test_store().await else {
-            return;
-        };
-        for state in ["idle", "failed", "done", "cancelled"] {
-            let id = format!("test::stale-recovery::skip::{state}");
-            let instance = stuck_instance(&id, state);
-            store.upsert_instance(&instance).await.unwrap();
-        }
-        let tick = run_stale_workflow_recovery_tick(&store, 0).await.unwrap();
-        for state in ["idle", "failed", "done", "cancelled"] {
-            let id = format!("test::stale-recovery::skip::{state}");
-            let after = store.get_instance(&id).await.unwrap().unwrap();
-            assert_eq!(
-                after.state, state,
-                "instance in {state} should not be touched by recovery"
-            );
-        }
-        // The seeded states are not in STUCK_STATES, so none should have been
-        // scanned (the SQL filter excludes them). recovered MUST be 0.
-        assert_eq!(tick.recovered, 0);
-    }
-
-    #[tokio::test]
-    async fn recovery_tick_does_not_re_reset_workflow_on_subsequent_tick() {
-        let Some(store) = open_recovery_test_store().await else {
-            return;
-        };
-        let id = "test::stale-recovery::no-thrash";
-        let mut seed = stuck_instance(id, "dispatching");
-        seed.updated_at = Utc::now() - chrono::Duration::hours(1);
-        store.upsert_instance(&seed).await.unwrap();
-
-        let first = run_stale_workflow_recovery_tick(&store, 300).await.unwrap();
-        assert!(
-            first.recovered >= 1,
-            "first tick should reset stuck workflow"
-        );
-
-        let post_first = store.get_instance(id).await.unwrap().unwrap();
-        assert_eq!(post_first.state, "idle");
-
-        let mut transitioned = post_first.clone();
-        transitioned.state = "dispatching".to_string();
-        transitioned.version = transitioned.version.saturating_add(1);
-        store.upsert_instance(&transitioned).await.unwrap();
-
-        let second = run_stale_workflow_recovery_tick(&store, 300).await.unwrap();
-        assert_eq!(
-            second.recovered, 0,
-            "second tick must not re-reset a workflow whose JSON updated_at \
-             was just bumped by the first tick"
-        );
-
-        let post_second = store.get_instance(id).await.unwrap().unwrap();
-        assert_eq!(
-            post_second.state, "dispatching",
-            "transitioned-back state must be preserved by second tick"
-        );
-    }
-
-    #[tokio::test]
-    async fn recovery_tick_respects_stale_after_threshold() {
-        let Some(store) = open_recovery_test_store().await else {
-            return;
-        };
-        let instance = stuck_instance("test::stale-recovery::not-yet-stale", "dispatching");
-        store.upsert_instance(&instance).await.unwrap();
-        // Threshold of 3600s with a freshly-upserted row -> not stale yet.
-        let tick = run_stale_workflow_recovery_tick(&store, 3600)
-            .await
-            .unwrap();
-        let after = store.get_instance(&instance.id).await.unwrap().unwrap();
-        assert_eq!(
-            after.state, "dispatching",
-            "fresh stuck workflow should not be reset before threshold"
-        );
-        assert_eq!(tick.recovered, 0);
-    }
-
-    #[tokio::test]
-    async fn recovery_commit_skips_when_locked_workflow_changed() -> anyhow::Result<()> {
-        let Some(store) = open_recovery_test_store().await else {
-            return Ok(());
-        };
-        let id = "test::stale-recovery::changed-before-commit";
-        let mut instance = stuck_instance(id, "dispatching");
-        instance.updated_at = Utc::now() - chrono::Duration::hours(1);
-        store.upsert_instance(&instance).await?;
-        let mut changed = instance.clone();
-        changed.state = "idle".to_string();
-        changed.version = changed.version.saturating_add(1);
-        changed.updated_at = Utc::now();
-        store.upsert_instance(&changed).await?;
-
-        let outcome = record_recovery_detected_event_and_reset(
-            &store,
-            id,
-            "dispatching",
-            300,
-            Utc::now() - chrono::Duration::seconds(300),
-        )
-        .await?;
-
-        assert_eq!(outcome, RecoveryCommitOutcome::SkippedChanged);
-        let Some(after) = store.get_instance(id).await? else {
-            anyhow::bail!("seeded workflow should still exist after changed skip");
-        };
-        assert_eq!(after.state, "idle");
-        let events = store.events_for(id).await?;
-        assert!(
-            events
-                .iter()
-                .all(|event| event.event_type != RECOVERY_EVENT_TYPE),
-            "changed workflow should not receive recovery evidence"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn recovery_commit_rolls_back_event_after_event_insert_error() -> anyhow::Result<()> {
-        let Some(store) = open_recovery_test_store().await else {
-            return Ok(());
-        };
-        let id = "test::stale-recovery::forced-rollback";
-        let mut instance = stuck_instance(id, "dispatching");
-        instance.updated_at = Utc::now() - chrono::Duration::hours(1);
-        store.upsert_instance(&instance).await?;
-
-        let result = record_recovery_detected_event_and_reset_inner(
-            &store,
-            id,
-            "dispatching",
-            300,
-            Utc::now() - chrono::Duration::seconds(300),
-            true,
-        )
-        .await;
-
-        assert!(result.is_err(), "forced rollback should fail the commit");
-        let Some(after) = store.get_instance(id).await? else {
-            anyhow::bail!("seeded workflow should still exist after rollback");
-        };
-        assert_eq!(after.state, "dispatching");
-        assert_eq!(after.version, instance.version);
-        let events = store.events_for(id).await?;
-        assert!(
-            events
-                .iter()
-                .all(|event| event.event_type != RECOVERY_EVENT_TYPE),
-            "recovery event should roll back when the atomic commit fails"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn recovery_tick_skips_workflow_with_active_repo_backlog_runtime_work(
-    ) -> anyhow::Result<()> {
-        let Some(store) = open_recovery_test_store().await else {
-            return Ok(());
-        };
-        let cases = vec![
-            (
-                "scanning",
-                WorkflowCommand::enqueue_activity(REPO_BACKLOG_POLL_ACTIVITY, "active-scan"),
-            ),
-            (
-                "planning_batch",
-                WorkflowCommand::enqueue_activity(REPO_BACKLOG_SPRINT_PLAN_ACTIVITY, "active-plan"),
-            ),
-            (
-                "dispatching",
-                WorkflowCommand::start_child_workflow(
-                    "github_issue_pr",
-                    "issue:1",
-                    "active-dispatch",
-                ),
-            ),
-            (
-                "reconciling",
-                WorkflowCommand::enqueue_activity(
-                    REPO_BACKLOG_MARK_BOUND_ISSUE_DONE_ACTIVITY,
-                    "active-mark",
-                ),
-            ),
-            (
-                "reconciling",
-                WorkflowCommand::enqueue_activity(
-                    REPO_BACKLOG_RECOVER_ISSUE_WORKFLOW_ACTIVITY,
-                    "active-recover",
-                ),
-            ),
-        ];
-        for (index, (state, command)) in cases.into_iter().enumerate() {
-            let id = format!("test::stale-recovery::active-runtime-work::{index}");
-            let mut instance = stuck_instance(&id, state);
-            instance.updated_at = Utc::now() - chrono::Duration::hours(1);
-            store.upsert_instance(&instance).await?;
-            let activity = command.runtime_activity_key().to_string();
-            let command_id = store.enqueue_command(&id, None, &command).await?;
-            store
-                .enqueue_runtime_job(
-                    &command_id,
-                    RuntimeKind::CodexJsonrpc,
-                    "codex-default",
-                    json!({ "activity": activity }),
-                )
-                .await?;
-            store
-                .mark_command_status(&command_id, WorkflowCommandStatus::Dispatched)
-                .await?;
-
-            let tick = run_stale_workflow_recovery_tick(&store, 300).await?;
-            let after = store
-                .get_instance(&id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("active workflow missing after recovery tick"))?;
-            assert_eq!(after.state, state);
-            assert!(tick.skipped_active >= 1);
-            let events = store.events_for(&id).await?;
-            assert!(events
-                .iter()
-                .all(|event| event.event_type != RECOVERY_EVENT_TYPE));
-        }
-        Ok(())
-    }
-}
+#[path = "stale_workflow_recovery_tests.rs"]
+mod tests;
