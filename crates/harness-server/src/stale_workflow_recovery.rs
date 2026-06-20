@@ -27,9 +27,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use harness_workflow::runtime::{
-    RuntimeJobStatus, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowEvent,
+    RuntimeJobStatus, WorkflowCommand, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowEvent,
     WorkflowInstance, WorkflowRuntimeStore, REPO_BACKLOG_POLL_ACTIVITY,
 };
+use serde::Serialize;
 use serde_json::json;
 
 use crate::http::AppState;
@@ -87,6 +88,13 @@ impl StaleRecoveryTick {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryCommitOutcome {
+    Recovered { stuck_secs: i64 },
+    SkippedChanged,
+    SkippedActive { stuck_secs: i64 },
+}
+
 /// Run one recovery pass. Public for unit-testing.
 pub async fn run_stale_workflow_recovery_tick(
     store: &WorkflowRuntimeStore,
@@ -99,7 +107,7 @@ pub async fn run_stale_workflow_recovery_tick(
         let candidates = store
             .list_instances_by_state(RECOVERED_DEFINITION_ID, state, SCAN_LIMIT)
             .await?;
-        for mut instance in candidates {
+        for instance in candidates {
             if instance.updated_at >= cutoff {
                 continue;
             }
@@ -116,34 +124,16 @@ pub async fn run_stale_workflow_recovery_tick(
                 );
                 continue;
             }
-            instance.state = RECOVERY_TARGET_STATE.to_string();
-            instance.version = instance.version.saturating_add(1);
-            // Bump the JSON-baked updated_at so subsequent recovery ticks see a
-            // fresh timestamp and do not re-reset this same instance on every
-            // tick. The Postgres column updated_at is independently bumped by
-            // upsert_instance via CURRENT_TIMESTAMP, but list_instances_by_state
-            // returns instances deserialised from the data jsonb and the JSON
-            // copy of updated_at is what subsequent ticks compare against.
-            //
-            // Without this bump the recovery tick thrashes: after the first
-            // reset the column moves forward to NOW() but the data jsonb still
-            // carries a stale (often pre-reset) updated_at, so 10 minutes
-            // later the next tick re-reads the stale JSON timestamp, decides
-            // the workflow is still stale, and resets again. Observed in
-            // production: 8 workflows reset twice in 10 minutes after server
-            // restart, despite having transitioned through scanning legitimately
-            // in between.
-            instance.updated_at = Utc::now();
             match record_recovery_detected_event_and_reset(
                 store,
-                &instance,
+                &instance.id,
                 &original_state,
-                stuck_secs,
                 stale_after_secs,
+                cutoff,
             )
             .await
             {
-                Ok(()) => {
+                Ok(RecoveryCommitOutcome::Recovered { stuck_secs }) => {
                     tracing::warn!(
                         workflow_id = %instance.id,
                         from_state = %original_state,
@@ -152,6 +142,22 @@ pub async fn run_stale_workflow_recovery_tick(
                         "stale_workflow_recovery: reset workflow stuck in non-candidate state"
                     );
                     tick.recovered += 1;
+                }
+                Ok(RecoveryCommitOutcome::SkippedActive { stuck_secs }) => {
+                    tick.skipped_active += 1;
+                    tracing::debug!(
+                        workflow_id = %instance.id,
+                        state = %original_state,
+                        stuck_secs,
+                        "stale_workflow_recovery: skipped workflow with active repo backlog runtime work after lock"
+                    );
+                }
+                Ok(RecoveryCommitOutcome::SkippedChanged) => {
+                    tracing::debug!(
+                        workflow_id = %instance.id,
+                        from_state = %original_state,
+                        "stale_workflow_recovery: skipped workflow changed before recovery commit"
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -170,11 +176,56 @@ pub async fn run_stale_workflow_recovery_tick(
 
 async fn record_recovery_detected_event_and_reset(
     store: &WorkflowRuntimeStore,
-    instance: &WorkflowInstance,
+    workflow_id: &str,
     original_state: &str,
-    stuck_secs: i64,
     stale_after_secs: u64,
-) -> anyhow::Result<()> {
+    cutoff: chrono::DateTime<Utc>,
+) -> anyhow::Result<RecoveryCommitOutcome> {
+    record_recovery_detected_event_and_reset_inner(
+        store,
+        workflow_id,
+        original_state,
+        stale_after_secs,
+        cutoff,
+        false,
+    )
+    .await
+}
+
+async fn record_recovery_detected_event_and_reset_inner(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    original_state: &str,
+    stale_after_secs: u64,
+    cutoff: chrono::DateTime<Utc>,
+    force_rollback_after_event_insert: bool,
+) -> anyhow::Result<RecoveryCommitOutcome> {
+    let mut tx = store.pool().begin().await?;
+    let Some((current_data,)) = sqlx::query_as::<_, (String,)>(
+        "SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE",
+    )
+    .bind(workflow_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.commit().await?;
+        return Ok(RecoveryCommitOutcome::SkippedChanged);
+    };
+    let mut instance: WorkflowInstance = serde_json::from_str(&current_data)?;
+    if instance.definition_id != RECOVERED_DEFINITION_ID
+        || instance.state != original_state
+        || !STUCK_STATES.contains(&instance.state.as_str())
+        || instance.updated_at >= cutoff
+    {
+        tx.commit().await?;
+        return Ok(RecoveryCommitOutcome::SkippedChanged);
+    }
+    let stuck_secs = (Utc::now() - instance.updated_at).num_seconds();
+    if workflow_has_active_repo_backlog_work_tx(&mut tx, workflow_id).await? {
+        tx.commit().await?;
+        return Ok(RecoveryCommitOutcome::SkippedActive { stuck_secs });
+    }
+
     let payload = json!({
         "definition_id": RECOVERED_DEFINITION_ID,
         "from_state": original_state,
@@ -184,15 +235,24 @@ async fn record_recovery_detected_event_and_reset(
         "reason": "repo_backlog workflow exceeded stale recovery threshold without active repo backlog work",
     });
 
-    let mut tx = store.pool().begin().await?;
+    instance.state = RECOVERY_TARGET_STATE.to_string();
+    instance.version = instance.version.saturating_add(1);
+    // Bump the JSON-baked updated_at so subsequent recovery ticks see a fresh
+    // timestamp and do not re-reset this same instance on every tick. The
+    // Postgres column updated_at is independently bumped below via
+    // CURRENT_TIMESTAMP, but list_instances_by_state returns instances with
+    // updated_at taken from the DB column and the JSON copy is still used by
+    // downstream replay/projection code.
+    instance.updated_at = Utc::now();
+
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("workflow_events:{}", instance.id))
+        .bind(format!("workflow_events:{workflow_id}"))
         .execute(&mut *tx)
         .await?;
     let (next_sequence,): (i64,) = sqlx::query_as(
         "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
     )
-    .bind(&instance.id)
+    .bind(workflow_id)
     .fetch_one(&mut *tx)
     .await?;
     let event = WorkflowEvent::new(
@@ -202,7 +262,7 @@ async fn record_recovery_detected_event_and_reset(
         RECOVERY_EVENT_SOURCE,
     )
     .with_payload(payload);
-    let event_data = serde_json::to_string(&event)?;
+    let event_data = to_jsonb_string(&event)?;
     sqlx::query(
         "INSERT INTO workflow_events
             (id, workflow_id, sequence, event_type, source, data)
@@ -216,21 +276,22 @@ async fn record_recovery_detected_event_and_reset(
     .bind(&event_data)
     .execute(&mut *tx)
     .await?;
+    if force_rollback_after_event_insert {
+        anyhow::bail!("forced stale recovery rollback after event insert");
+    }
 
-    let instance_data = serde_json::to_string(instance)?;
-    sqlx::query(
-        "INSERT INTO workflow_instances
-            (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
-         ON CONFLICT (id) DO UPDATE SET
-            definition_id = EXCLUDED.definition_id,
-            state = EXCLUDED.state,
-            subject_type = EXCLUDED.subject_type,
-            subject_key = EXCLUDED.subject_key,
-            parent_workflow_id = EXCLUDED.parent_workflow_id,
-            data = EXCLUDED.data,
-            version = EXCLUDED.version,
-            updated_at = CURRENT_TIMESTAMP",
+    let instance_data = to_jsonb_string(&instance)?;
+    let rows_affected = sqlx::query(
+        "UPDATE workflow_instances
+         SET definition_id = $2,
+             state = $3,
+             subject_type = $4,
+             subject_key = $5,
+             parent_workflow_id = $6,
+             data = $7::jsonb,
+             version = $8,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1",
     )
     .bind(&instance.id)
     .bind(&instance.definition_id)
@@ -241,9 +302,58 @@ async fn record_recovery_detected_event_and_reset(
     .bind(&instance_data)
     .bind(instance.version as i64)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if rows_affected != 1 {
+        anyhow::bail!(
+            "stale recovery update affected {rows_affected} rows for workflow `{workflow_id}`"
+        );
+    }
     tx.commit().await?;
-    Ok(())
+    Ok(RecoveryCommitOutcome::Recovered { stuck_secs })
+}
+
+async fn workflow_has_active_repo_backlog_work_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    let command_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, status, data::text FROM workflow_commands
+         WHERE workflow_id = $1
+         ORDER BY created_at ASC",
+    )
+    .bind(workflow_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (command_id, status, data) in command_rows.into_iter().rev() {
+        let command: WorkflowCommand = serde_json::from_str(&data)?;
+        if command.activity_name() != Some(REPO_BACKLOG_POLL_ACTIVITY) {
+            continue;
+        }
+        match WorkflowCommandStatus::try_from(status.as_str())? {
+            WorkflowCommandStatus::Pending | WorkflowCommandStatus::Dispatching => return Ok(true),
+            WorkflowCommandStatus::Dispatched => {
+                let (has_active_job,): (bool,) = sqlx::query_as(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM runtime_jobs
+                        WHERE command_id = $1 AND status IN ('pending', 'running')
+                    )",
+                )
+                .bind(&command_id)
+                .fetch_one(&mut **tx)
+                .await?;
+                if has_active_job {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn to_jsonb_string(value: &impl Serialize) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(value)?.replace("\\u0000", ""))
 }
 
 async fn workflow_has_active_repo_backlog_work(
@@ -536,36 +646,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_tick_does_not_reset_when_recovery_event_write_fails() -> anyhow::Result<()> {
+    async fn recovery_commit_skips_when_locked_workflow_changed() -> anyhow::Result<()> {
         let Some(store) = open_recovery_test_store().await else {
             return Ok(());
         };
-        let id = "test::stale-recovery::evidence-write-fails";
+        let id = "test::stale-recovery::changed-before-commit";
+        let mut instance = stuck_instance(id, "dispatching");
+        instance.updated_at = Utc::now() - chrono::Duration::hours(1);
+        store.upsert_instance(&instance).await?;
+        let mut changed = instance.clone();
+        changed.state = "idle".to_string();
+        changed.version = changed.version.saturating_add(1);
+        changed.updated_at = Utc::now();
+        store.upsert_instance(&changed).await?;
+
+        let outcome = record_recovery_detected_event_and_reset(
+            &store,
+            id,
+            "dispatching",
+            300,
+            Utc::now() - chrono::Duration::seconds(300),
+        )
+        .await?;
+
+        assert_eq!(outcome, RecoveryCommitOutcome::SkippedChanged);
+        let Some(after) = store.get_instance(id).await? else {
+            anyhow::bail!("seeded workflow should still exist after changed skip");
+        };
+        assert_eq!(after.state, "idle");
+        let events = store.events_for(id).await?;
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != RECOVERY_EVENT_TYPE),
+            "changed workflow should not receive recovery evidence"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_commit_rolls_back_event_after_event_insert_error() -> anyhow::Result<()> {
+        let Some(store) = open_recovery_test_store().await else {
+            return Ok(());
+        };
+        let id = "test::stale-recovery::forced-rollback";
         let mut instance = stuck_instance(id, "dispatching");
         instance.updated_at = Utc::now() - chrono::Duration::hours(1);
         store.upsert_instance(&instance).await?;
 
-        sqlx::query("DROP TABLE workflow_events")
-            .execute(store.pool())
-            .await?;
+        let result = record_recovery_detected_event_and_reset_inner(
+            &store,
+            id,
+            "dispatching",
+            300,
+            Utc::now() - chrono::Duration::seconds(300),
+            true,
+        )
+        .await;
 
-        let tick = run_stale_workflow_recovery_tick(&store, 300).await?;
-
+        assert!(result.is_err(), "forced rollback should fail the commit");
         let Some(after) = store.get_instance(id).await? else {
-            anyhow::bail!("seeded workflow should still exist after failed recovery");
+            anyhow::bail!("seeded workflow should still exist after rollback");
         };
-        assert_eq!(
-            after.state, "dispatching",
-            "failed evidence persistence must not reset workflow state"
-        );
-        assert_eq!(
-            after.version, instance.version,
-            "failed evidence persistence must not bump workflow version"
-        );
-        assert_eq!(tick.recovered, 0);
+        assert_eq!(after.state, "dispatching");
+        assert_eq!(after.version, instance.version);
+        let events = store.events_for(id).await?;
         assert!(
-            tick.failed >= 1,
-            "failed evidence persistence should be counted as failed recovery"
+            events
+                .iter()
+                .all(|event| event.event_type != RECOVERY_EVENT_TYPE),
+            "recovery event should roll back when the atomic commit fails"
         );
         Ok(())
     }
