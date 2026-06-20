@@ -11,6 +11,9 @@ const REQUEST_TIMEOUT_SECS: u64 = 5;
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RuntimeTreeSummary {
     workflows: usize,
+    workflow_statuses: BTreeMap<String, usize>,
+    workflow_scheduler_states: BTreeMap<String, usize>,
+    workflow_active_buckets: BTreeMap<String, usize>,
     commands: usize,
     command_statuses: BTreeMap<String, usize>,
     jobs: usize,
@@ -214,6 +217,15 @@ fn print_summary(combined: &Value) {
         "Runtime workflows: {} workflows, {} commands, {} jobs",
         runtime_summary.workflows, runtime_summary.commands, runtime_summary.jobs
     );
+    print_count_map("Workflow statuses", &runtime_summary.workflow_statuses);
+    print_count_map(
+        "Workflow scheduler states",
+        &runtime_summary.workflow_scheduler_states,
+    );
+    print_count_map(
+        "Workflow active buckets",
+        &runtime_summary.workflow_active_buckets,
+    );
     print_count_map("Command statuses", &runtime_summary.command_statuses);
     print_count_map("Runtime job statuses", &runtime_summary.job_statuses);
     print_count_map(
@@ -239,6 +251,11 @@ fn summarize_runtime_tree(tree: &Value) -> RuntimeTreeSummary {
     };
     let has_server_summary = tree["summary"].is_object();
     if has_server_summary {
+        summary.workflow_statuses = count_map_from_value(&tree["summary"]["workflow_statuses"]);
+        summary.workflow_scheduler_states =
+            count_map_from_value(&tree["summary"]["workflow_scheduler_states"]);
+        summary.workflow_active_buckets =
+            count_map_from_value(&tree["summary"]["workflow_active_buckets"]);
         summary.commands = tree["summary"]["total_commands"].as_u64().unwrap_or(0) as usize;
         summary.jobs = tree["summary"]["total_runtime_jobs"].as_u64().unwrap_or(0) as usize;
         summary.command_statuses = count_map_from_value(&tree["summary"]["command_statuses"]);
@@ -259,6 +276,17 @@ fn summarize_runtime_tree(tree: &Value) -> RuntimeTreeSummary {
 }
 
 fn summarize_workflow_node(node: &Value, summary: &mut RuntimeTreeSummary, include_counts: bool) {
+    if include_counts {
+        if let Some(status) = node["projection"]["status"].as_str() {
+            increment(&mut summary.workflow_statuses, status);
+        }
+        if let Some(authority_state) = node["projection"]["scheduler"]["authority_state"].as_str() {
+            increment(&mut summary.workflow_scheduler_states, authority_state);
+        }
+        if let Some(active_bucket) = node["projection"]["active_bucket"].as_str() {
+            increment(&mut summary.workflow_active_buckets, active_bucket);
+        }
+    }
     if let Some(commands) = node["commands"].as_array() {
         for command in commands {
             if include_counts {
@@ -378,6 +406,13 @@ mod tests {
         let tree = json!({
             "total_workflows": 2,
             "workflows": [{
+                "projection": {
+                    "status": "implementing",
+                    "scheduler": {
+                        "authority_state": "running"
+                    },
+                    "active_bucket": "running"
+                },
                 "commands": [{
                     "status": "completed",
                         "runtime_jobs": [{
@@ -389,6 +424,13 @@ mod tests {
                     }]
                 }],
                 "children": [{
+                    "projection": {
+                        "status": "waiting",
+                        "scheduler": {
+                            "authority_state": "queued"
+                        },
+                        "active_bucket": "queued"
+                    },
                     "commands": [{
                         "status": "pending",
                         "runtime_jobs": [{
@@ -404,6 +446,12 @@ mod tests {
         let summary = summarize_runtime_tree(&tree);
 
         assert_eq!(summary.workflows, 2);
+        assert_eq!(summary.workflow_statuses["implementing"], 1);
+        assert_eq!(summary.workflow_statuses["waiting"], 1);
+        assert_eq!(summary.workflow_scheduler_states["queued"], 1);
+        assert_eq!(summary.workflow_scheduler_states["running"], 1);
+        assert_eq!(summary.workflow_active_buckets["queued"], 1);
+        assert_eq!(summary.workflow_active_buckets["running"], 1);
         assert_eq!(summary.commands, 2);
         assert_eq!(summary.jobs, 2);
         assert_eq!(summary.command_statuses["completed"], 1);
@@ -420,6 +468,18 @@ mod tests {
         let tree = json!({
             "total_workflows": 2,
             "summary": {
+                "workflow_statuses": {
+                    "implementing": 3,
+                    "waiting": 2
+                },
+                "workflow_scheduler_states": {
+                    "queued": 2,
+                    "running": 3
+                },
+                "workflow_active_buckets": {
+                    "queued": 2,
+                    "running": 3
+                },
                 "total_commands": 7,
                 "total_runtime_jobs": 42,
                 "command_statuses": {
@@ -457,6 +517,12 @@ mod tests {
         let summary = summarize_runtime_tree(&tree);
 
         assert_eq!(summary.workflows, 2);
+        assert_eq!(summary.workflow_statuses["implementing"], 3);
+        assert_eq!(summary.workflow_statuses["waiting"], 2);
+        assert_eq!(summary.workflow_scheduler_states["queued"], 2);
+        assert_eq!(summary.workflow_scheduler_states["running"], 3);
+        assert_eq!(summary.workflow_active_buckets["queued"], 2);
+        assert_eq!(summary.workflow_active_buckets["running"], 3);
         assert_eq!(summary.commands, 7);
         assert_eq!(summary.jobs, 42);
         assert_eq!(summary.command_statuses["completed"], 5);

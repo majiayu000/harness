@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::http::state::AppState;
+use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
 #[path = "misc_routes_runtime_tree_nodes.rs"]
 mod nodes;
 #[cfg(test)]
@@ -24,7 +25,7 @@ use nodes::{
 };
 
 use harness_workflow::runtime::store::RuntimeEventSummary;
-use harness_workflow::runtime::WorkflowInstance;
+use harness_workflow::runtime::{WorkflowInstance, WorkflowSubject};
 
 const WORKFLOW_RUNTIME_TREE_DEFAULT_LIMIT: i64 = 100;
 const WORKFLOW_RUNTIME_TREE_MAX_LIMIT: i64 = 500;
@@ -118,6 +119,9 @@ impl WorkflowRuntimeTreePagination {
 
 #[derive(Debug, Default, serde::Serialize)]
 struct WorkflowRuntimeTreeSummary {
+    pub workflow_statuses: BTreeMap<String, usize>,
+    pub workflow_scheduler_states: BTreeMap<String, usize>,
+    pub workflow_active_buckets: BTreeMap<String, usize>,
     pub total_commands: usize,
     pub total_runtime_jobs: usize,
     pub command_statuses: BTreeMap<String, usize>,
@@ -328,7 +332,12 @@ async fn workflow_runtime_tree_summary(
             ACTIVITY_RESULT_ENVELOPE_SCHEMA,
         )
         .await?;
+    let (workflow_statuses, workflow_scheduler_states, workflow_active_buckets) =
+        workflow_projection_summary_counts(&aggregate_summary.workflow_states);
     Ok(WorkflowRuntimeTreeSummary {
+        workflow_statuses,
+        workflow_scheduler_states,
+        workflow_active_buckets,
         total_commands: aggregate_summary.total_commands,
         total_runtime_jobs: aggregate_summary.total_runtime_jobs,
         command_statuses: aggregate_summary.command_statuses,
@@ -337,6 +346,68 @@ async fn workflow_runtime_tree_summary(
         activity_outcomes: aggregate_summary.activity_outcomes,
         jobs_without_activity_envelope: aggregate_summary.jobs_without_activity_envelope,
     })
+}
+
+fn workflow_projection_summary_counts(
+    workflow_states: &[harness_workflow::runtime::store::WorkflowRuntimeStateCount],
+) -> (
+    BTreeMap<String, usize>,
+    BTreeMap<String, usize>,
+    BTreeMap<String, usize>,
+) {
+    let mut workflow_statuses = BTreeMap::new();
+    let mut workflow_scheduler_states = BTreeMap::new();
+    let mut workflow_active_buckets = BTreeMap::new();
+
+    for state_count in workflow_states {
+        let workflow = WorkflowInstance::new(
+            &state_count.definition_id,
+            1,
+            &state_count.state,
+            WorkflowSubject::new(
+                "summary",
+                format!("{}:{}", state_count.definition_id, state_count.state),
+            ),
+        );
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+        add_summary_count(
+            &mut workflow_statuses,
+            projection.task_status.as_str(),
+            state_count.count,
+        );
+        add_summary_count(
+            &mut workflow_scheduler_states,
+            projection.scheduler.authority_state.as_str(),
+            state_count.count,
+        );
+        if let Some(active_bucket) = projection.active_bucket() {
+            add_summary_count(
+                &mut workflow_active_buckets,
+                runtime_active_bucket_label(active_bucket),
+                state_count.count,
+            );
+        }
+    }
+
+    (
+        workflow_statuses,
+        workflow_scheduler_states,
+        workflow_active_buckets,
+    )
+}
+
+fn add_summary_count(counts: &mut BTreeMap<String, usize>, key: &str, count: usize) {
+    counts
+        .entry(key.to_string())
+        .and_modify(|current| *current += count)
+        .or_insert(count);
+}
+
+fn runtime_active_bucket_label(bucket: RuntimeActiveBucket) -> &'static str {
+    match bucket {
+        RuntimeActiveBucket::Running => "running",
+        RuntimeActiveBucket::Queued => "queued",
+    }
 }
 
 async fn build_full_workflow_runtime_nodes(
