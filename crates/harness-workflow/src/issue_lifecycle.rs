@@ -14,6 +14,7 @@ pub const FEEDBACK_CLAIM_TASK_PREFIX: &str = "claim:";
 #[serde(rename_all = "snake_case")]
 pub enum IssueLifecycleState {
     Discovered,
+    AwaitingDependencies,
     Scheduled,
     Implementing,
     PrOpen,
@@ -21,7 +22,9 @@ pub enum IssueLifecycleState {
     FeedbackClaimed,
     AddressingFeedback,
     ReadyToMerge,
+    Merging,
     Done,
+    Blocked,
     Failed,
     Cancelled,
 }
@@ -29,6 +32,7 @@ pub enum IssueLifecycleState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueLifecycleEventKind {
+    DependenciesDetected,
     IssueScheduled,
     ImplementStarted,
     PlanIssueDetected,
@@ -38,11 +42,29 @@ pub enum IssueLifecycleEventKind {
     FeedbackFound,
     NoFeedbackFound,
     Mergeable,
+    MergeStarted,
     /// Human approved the merge after reviewing a `ReadyToMerge` workflow.
     HumanMergeApproved,
+    WorkflowBlocked,
     WorkflowFailed,
     WorkflowCancelled,
     WorkflowDone,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueMergePolicy {
+    Manual,
+    Auto,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueMergeMethod {
+    Squash,
+    Merge,
+    Rebase,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +107,10 @@ pub struct IssueLifecycleEvent {
     pub pr_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_head_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_fact_hash: Option<String>,
 }
 
 impl IssueLifecycleEvent {
@@ -96,6 +122,8 @@ impl IssueLifecycleEvent {
             detail: None,
             pr_number: None,
             pr_url: None,
+            pr_head_sha: None,
+            remote_fact_hash: None,
         }
     }
 
@@ -114,6 +142,16 @@ impl IssueLifecycleEvent {
         self.pr_url = Some(pr_url.into());
         self
     }
+
+    pub(crate) fn with_pr_head_sha(mut self, pr_head_sha: impl Into<String>) -> Self {
+        self.pr_head_sha = Some(pr_head_sha.into());
+        self
+    }
+
+    pub(crate) fn with_remote_fact_hash(mut self, fact_hash: impl Into<String>) -> Self {
+        self.remote_fact_hash = Some(fact_hash.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,6 +162,8 @@ pub struct IssueWorkflowInstance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     pub issue_number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_url: Option<String>,
     pub state: IssueLifecycleState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_task_id: Option<String>,
@@ -131,6 +171,16 @@ pub struct IssueWorkflowInstance {
     pub pr_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_head_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_remote_fact_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_policy: Option<IssueMergePolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_method: Option<IssueMergeMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_attempted_head_sha: Option<String>,
     #[serde(default)]
     pub labels_snapshot: Vec<String>,
     #[serde(default)]
@@ -158,10 +208,16 @@ impl IssueWorkflowInstance {
             project_id,
             repo,
             issue_number,
+            issue_url: None,
             state: IssueLifecycleState::Discovered,
             active_task_id: None,
             pr_number: None,
             pr_url: None,
+            pr_head_sha: None,
+            last_remote_fact_hash: None,
+            merge_policy: None,
+            merge_method: None,
+            merge_attempted_head_sha: None,
             labels_snapshot: Vec::new(),
             force_execute: false,
             plan_concern: None,
@@ -175,6 +231,11 @@ impl IssueWorkflowInstance {
 
     pub fn apply_event(&mut self, event: IssueLifecycleEvent) {
         match event.kind {
+            IssueLifecycleEventKind::DependenciesDetected => {
+                self.state = IssueLifecycleState::AwaitingDependencies;
+                self.active_task_id = None;
+                self.review_fallback = None;
+            }
             IssueLifecycleEventKind::IssueScheduled => {
                 self.state = IssueLifecycleState::Scheduled;
                 self.active_task_id = event.task_id.clone();
@@ -196,6 +257,9 @@ impl IssueWorkflowInstance {
                 self.active_task_id = event.task_id.clone();
                 self.pr_number = event.pr_number;
                 self.pr_url = event.pr_url.clone();
+                if event.pr_head_sha.is_some() {
+                    self.pr_head_sha = event.pr_head_sha.clone();
+                }
                 self.review_fallback = None;
             }
             IssueLifecycleEventKind::FeedbackFound => {
@@ -207,6 +271,9 @@ impl IssueWorkflowInstance {
                 }
                 if event.pr_url.is_some() {
                     self.pr_url = event.pr_url.clone();
+                }
+                if event.pr_head_sha.is_some() {
+                    self.pr_head_sha = event.pr_head_sha.clone();
                 }
             }
             IssueLifecycleEventKind::FeedbackTaskScheduled => {
@@ -231,6 +298,19 @@ impl IssueWorkflowInstance {
             IssueLifecycleEventKind::Mergeable => {
                 self.state = IssueLifecycleState::ReadyToMerge;
                 self.feedback_claimed_at = None;
+                self.active_task_id = None;
+                if event.pr_head_sha.is_some() {
+                    self.pr_head_sha = event.pr_head_sha.clone();
+                }
+            }
+            IssueLifecycleEventKind::MergeStarted => {
+                self.state = IssueLifecycleState::Merging;
+                self.active_task_id = event.task_id.clone();
+                self.feedback_claimed_at = None;
+                if event.pr_head_sha.is_some() {
+                    self.pr_head_sha = event.pr_head_sha.clone();
+                    self.merge_attempted_head_sha = event.pr_head_sha.clone();
+                }
             }
             IssueLifecycleEventKind::HumanMergeApproved => {
                 if self.state != IssueLifecycleState::ReadyToMerge {
@@ -242,6 +322,11 @@ impl IssueWorkflowInstance {
                     return;
                 }
                 self.state = IssueLifecycleState::Done;
+                self.feedback_claimed_at = None;
+            }
+            IssueLifecycleEventKind::WorkflowBlocked => {
+                self.state = IssueLifecycleState::Blocked;
+                self.active_task_id = None;
                 self.feedback_claimed_at = None;
             }
             IssueLifecycleEventKind::WorkflowFailed => {
@@ -261,7 +346,13 @@ impl IssueWorkflowInstance {
                 if event.pr_url.is_some() {
                     self.pr_url = event.pr_url.clone();
                 }
+                if event.pr_head_sha.is_some() {
+                    self.pr_head_sha = event.pr_head_sha.clone();
+                }
             }
+        }
+        if event.remote_fact_hash.is_some() {
+            self.last_remote_fact_hash = event.remote_fact_hash.clone();
         }
         self.last_event = Some(event);
         self.updated_at = Utc::now();
@@ -269,6 +360,31 @@ impl IssueWorkflowInstance {
 
     pub fn set_review_fallback(&mut self, fallback: Option<ReviewFallbackSnapshot>) {
         self.review_fallback = fallback;
+        self.updated_at = Utc::now();
+    }
+
+    pub fn set_issue_url(&mut self, issue_url: Option<String>) {
+        self.issue_url = issue_url;
+        self.updated_at = Utc::now();
+    }
+
+    pub fn set_remote_fact_hash(&mut self, fact_hash: Option<String>) {
+        self.last_remote_fact_hash = fact_hash;
+        self.updated_at = Utc::now();
+    }
+
+    pub fn set_pr_head_sha(&mut self, pr_head_sha: Option<String>) {
+        self.pr_head_sha = pr_head_sha;
+        self.updated_at = Utc::now();
+    }
+
+    pub fn set_merge_policy(
+        &mut self,
+        merge_policy: Option<IssueMergePolicy>,
+        merge_method: Option<IssueMergeMethod>,
+    ) {
+        self.merge_policy = merge_policy;
+        self.merge_method = merge_method;
         self.updated_at = Utc::now();
     }
 }

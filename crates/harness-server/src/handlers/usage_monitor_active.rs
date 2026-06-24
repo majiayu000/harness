@@ -52,7 +52,7 @@ where
 
 pub(super) fn burn_level(
     status: &str,
-    activity: &str,
+    _activity: &str,
     reasoning_effort: Option<&str>,
     age_secs: i64,
     stale: bool,
@@ -65,9 +65,6 @@ pub(super) fn burn_level(
     }
     if matches!(reasoning_effort, Some("xhigh" | "high")) || age_secs >= 1800 {
         return "high";
-    }
-    if activity == "poll_repo_backlog" && age_secs >= 300 {
-        return "medium";
     }
     if age_secs >= 900 {
         return "medium";

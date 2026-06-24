@@ -674,7 +674,7 @@ fn merge_runtime_reconciliation_data(
 }
 
 async fn record_runtime_issue_side_effects(
-    runtime_store: &WorkflowRuntimeStore,
+    _runtime_store: &WorkflowRuntimeStore,
     issue_workflows: Option<&IssueWorkflowStore>,
     candidate: &RuntimeWorkflowCandidate,
     target_state: &str,
@@ -684,19 +684,37 @@ async fn record_runtime_issue_side_effects(
         return;
     };
     if target_state == "done" {
-        crate::workflow_runtime_repo_backlog::record_merged_pr(
-            Some(runtime_store),
-            issue_workflows,
-            crate::workflow_runtime_repo_backlog::MergedPrRuntimeContext {
-                project_root,
-                repo: candidate.repo.as_deref(),
-                issue_number: candidate.issue_number,
-                pr_number: candidate.pr_number,
-                pr_url: candidate.pr_url.as_deref(),
-                detail: reason,
-            },
-        )
-        .await;
+        if let Some(issue_workflows) = issue_workflows {
+            let project_id = project_root.to_string_lossy();
+            let result = if let Some(issue_number) = candidate.issue_number {
+                issue_workflows
+                    .record_pr_merged_for_issue(
+                        &project_id,
+                        candidate.repo.as_deref(),
+                        issue_number,
+                        candidate.pr_number,
+                        candidate.pr_url.as_deref(),
+                        Some(reason),
+                    )
+                    .await
+            } else {
+                issue_workflows
+                    .record_pr_merged(
+                        &project_id,
+                        candidate.repo.as_deref(),
+                        candidate.pr_number,
+                        Some(reason),
+                    )
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    repo = candidate.repo.as_deref().unwrap_or("<unknown>"),
+                    pr_number = candidate.pr_number,
+                    "reconciliation: failed to record merged PR in issue workflow store: {error}"
+                );
+            }
+        }
         return;
     }
 

@@ -74,6 +74,7 @@ pub(crate) struct IssueSubmissionRuntimeContext<'a> {
     pub dependencies_blocked: bool,
     pub source: Option<&'a str>,
     pub external_id: Option<&'a str>,
+    pub remote_fact_hash: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +145,7 @@ async fn persist_issue_submission(
             additional_prompt: ctx.additional_prompt,
             depends_on: &depends_on_strings(ctx.depends_on),
             dependencies_blocked: ctx.dependencies_blocked,
+            remote_fact_hash: ctx.remote_fact_hash,
         },
     );
     apply_decision(
@@ -342,6 +344,10 @@ fn issue_submission_data(
     project_id: &str,
     existing_data: &serde_json::Value,
 ) -> serde_json::Value {
+    let last_remote_fact_hash = ctx
+        .remote_fact_hash
+        .map(ToOwned::to_owned)
+        .or_else(|| optional_string_field(existing_data, "last_remote_fact_hash"));
     crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
         json!({
@@ -358,6 +364,7 @@ fn issue_submission_data(
             "dependencies_blocked": ctx.dependencies_blocked,
             "source": ctx.source,
             "external_id": ctx.external_id,
+            "last_remote_fact_hash": last_remote_fact_hash,
             "tracker_source": issue_tracker_source(ctx),
             "tracker_external_id": issue_tracker_external_id(ctx),
         }),

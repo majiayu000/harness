@@ -362,4 +362,28 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                 END IF;
               END $$",
     },
+    Migration {
+        version: 15,
+        description: "create remote fact snapshots",
+        sql: "CREATE TABLE IF NOT EXISTS remote_fact_snapshots (
+            id              UUID PRIMARY KEY,
+            provider        TEXT NOT NULL,
+            repo            TEXT NOT NULL,
+            subject_type    TEXT NOT NULL,
+            subject_number  BIGINT NOT NULL,
+            subject_url     TEXT,
+            head_sha        TEXT,
+            state           TEXT NOT NULL,
+            fact_hash       TEXT NOT NULL,
+            facts           JSONB NOT NULL,
+            fetched_at      TIMESTAMPTZ NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (provider, repo, subject_type, subject_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_remote_fact_snapshots_repo_subject
+          ON remote_fact_snapshots (repo, subject_type, subject_number);
+        CREATE INDEX IF NOT EXISTS idx_remote_fact_snapshots_fact_hash
+          ON remote_fact_snapshots (fact_hash)",
+    },
 ];

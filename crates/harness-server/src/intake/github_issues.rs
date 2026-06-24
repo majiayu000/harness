@@ -1,13 +1,16 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use reqwest::header::{ACCEPT, LINK, USER_AGENT};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
 use crate::task_runner::TaskId;
+
+const GITHUB_ISSUES_MAX_PAGES: usize = 20;
 
 #[async_trait]
 pub(crate) trait DispatchedTaskChecker: Send + Sync {
@@ -212,6 +215,88 @@ impl GitHubIssuesPoller {
     pub async fn reconcile_dispatched_with_store(&self) -> anyhow::Result<usize> {
         self.prune_missing_task_entries().await
     }
+
+    async fn poll_from_api_base_url(
+        &self,
+        api_base_url: &str,
+    ) -> anyhow::Result<Vec<IncomingIssue>> {
+        let mut next_url = Some(github_issues_url(api_base_url, &self.repo, &self.label)?);
+        let mut seen_urls = HashSet::new();
+        let mut page_count = 0usize;
+        let mut complete_open_issue_set = true;
+        let mut new_issues = Vec::new();
+        let mut open_issue_ids = HashSet::new();
+
+        while let Some(url) = next_url {
+            if page_count >= GITHUB_ISSUES_MAX_PAGES {
+                tracing::warn!(
+                    repo = %self.repo,
+                    page_limit = GITHUB_ISSUES_MAX_PAGES,
+                    "GitHub issue polling stopped after reaching the pagination page limit"
+                );
+                complete_open_issue_set = false;
+                break;
+            }
+            page_count += 1;
+
+            if !seen_urls.insert(url.clone()) {
+                tracing::warn!(
+                    repo = %self.repo,
+                    url = %url,
+                    "GitHub issue polling stopped because pagination repeated a URL"
+                );
+                complete_open_issue_set = false;
+                break;
+            }
+
+            let page = fetch_github_issue_page(
+                &self.client,
+                &url,
+                &self.repo,
+                self.github_token.as_deref(),
+            )
+            .await?;
+            let parsed = parse_gh_output(
+                &page.body,
+                &self.repo,
+                &self.dispatched,
+                self.project_root.as_deref(),
+            )?;
+            new_issues.extend(parsed.new_issues);
+            open_issue_ids.extend(parsed.open_issue_ids);
+            next_url = page.next_url;
+        }
+
+        if complete_open_issue_set {
+            self.evict_closed_dispatched_entries(&open_issue_ids);
+        } else {
+            tracing::debug!(
+                repo = %self.repo,
+                "intake: skipped dispatched eviction because GitHub issue pagination was incomplete"
+            );
+        }
+
+        Ok(new_issues)
+    }
+
+    fn evict_closed_dispatched_entries(&self, open_issue_ids: &HashSet<String>) {
+        let stale: Vec<String> = self
+            .dispatched
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|id| !open_issue_ids.contains(&normalize_issue_external_id(id)))
+            .collect();
+        if !stale.is_empty() {
+            for id in &stale {
+                self.dispatched.remove(id);
+            }
+            tracing::debug!(
+                count = stale.len(),
+                "intake: evicted dispatched entries for closed issues"
+            );
+            self.persist_dispatched();
+        }
+    }
 }
 
 fn normalize_issue_external_id(external_id: &str) -> String {
@@ -253,7 +338,7 @@ struct ParsedGhOutput {
     /// New issues not yet dispatched.
     new_issues: Vec<IncomingIssue>,
     /// All open issue numbers from the API response (for eviction).
-    open_issue_ids: std::collections::HashSet<String>,
+    open_issue_ids: HashSet<String>,
 }
 
 /// Parse the JSON output of the GitHub issue list API
@@ -269,8 +354,7 @@ fn parse_gh_output(
         .into_iter()
         .filter(|issue| issue.pull_request.is_none())
         .collect();
-    let open_issue_ids: std::collections::HashSet<String> =
-        issues.iter().map(|i| i.number.to_string()).collect();
+    let open_issue_ids: HashSet<String> = issues.iter().map(|i| i.number.to_string()).collect();
     let new_issues = issues
         .into_iter()
         .filter(|issue| {
@@ -297,6 +381,86 @@ fn parse_gh_output(
     })
 }
 
+fn github_issues_url(api_base_url: &str, repo: &str, label: &str) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/repos/{repo}/issues",
+        api_base_url.trim_end_matches('/')
+    ))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("state", "open");
+        query.append_pair("per_page", "100");
+        if !label.is_empty() {
+            query.append_pair("labels", label);
+        }
+    }
+    Ok(url.to_string())
+}
+
+struct GitHubIssuePage {
+    body: Vec<u8>,
+    next_url: Option<String>,
+}
+
+async fn fetch_github_issue_page(
+    client: &reqwest::Client,
+    url: &str,
+    repo: &str,
+    github_token: Option<&str>,
+) -> anyhow::Result<GitHubIssuePage> {
+    let mut request = client
+        .get(url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, "harness-server");
+    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "GitHub issue list failed for {repo} at {url} with status {}",
+            response.status()
+        );
+    }
+    let next_url = next_link_from_headers(response.headers());
+    let body = response.bytes().await?.to_vec();
+    Ok(GitHubIssuePage { body, next_url })
+}
+
+fn next_link_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(LINK)?.to_str().ok()?;
+    parse_next_link(link)
+}
+
+fn parse_next_link(link: &str) -> Option<String> {
+    link.split(',').find_map(|part| {
+        let mut segments = part.split(';').map(str::trim);
+        let url_segment = segments.next()?;
+        if !url_segment.starts_with('<') || !url_segment.ends_with('>') {
+            return None;
+        }
+        if segments.any(link_segment_has_next_rel) {
+            Some(url_segment[1..url_segment.len() - 1].to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn link_segment_has_next_rel(segment: &str) -> bool {
+    let Some((key, value)) = segment.split_once('=') else {
+        return false;
+    };
+    if !key.trim().eq_ignore_ascii_case("rel") {
+        return false;
+    }
+    value
+        .trim()
+        .trim_matches('"')
+        .split_ascii_whitespace()
+        .any(|rel| rel.eq_ignore_ascii_case("next"))
+}
+
 #[async_trait]
 impl IntakeSource for GitHubIssuesPoller {
     fn name(&self) -> &str {
@@ -304,61 +468,7 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
-        let url = format!("https://api.github.com/repos/{}/issues", self.repo);
-        let mut request = self
-            .client
-            .get(url)
-            .query(&[("state", "open"), ("per_page", "100")])
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::USER_AGENT, "harness-server");
-        if !self.label.is_empty() {
-            request = request.query(&[("labels", self.label.as_str())]);
-        }
-        if let Some(token) = crate::github_auth::resolve_github_token(self.github_token.as_deref())
-        {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "GitHub issue list failed for {} with status {}",
-                self.repo,
-                response.status()
-            );
-        }
-        let body = response.bytes().await?;
-
-        let parsed = parse_gh_output(
-            &body,
-            &self.repo,
-            &self.dispatched,
-            self.project_root.as_deref(),
-        )?;
-
-        // Evict dispatched entries for issues no longer open (closed/deleted).
-        // This prevents unbounded growth of the dispatched map.
-        let stale: Vec<String> = self
-            .dispatched
-            .iter()
-            .map(|e| e.key().clone())
-            .filter(|id| {
-                !parsed
-                    .open_issue_ids
-                    .contains(&normalize_issue_external_id(id))
-            })
-            .collect();
-        if !stale.is_empty() {
-            for id in &stale {
-                self.dispatched.remove(id);
-            }
-            tracing::debug!(
-                count = stale.len(),
-                "intake: evicted dispatched entries for closed issues"
-            );
-            self.persist_dispatched();
-        }
-
-        Ok(parsed.new_issues)
+        self.poll_from_api_base_url("https://api.github.com").await
     }
 
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()> {
@@ -406,546 +516,5 @@ impl IntakeSource for GitHubIssuesPoller {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::task_runner::TaskStatus;
-    use std::collections::HashSet;
-    use tokio::sync::RwLock;
-
-    struct FakeTaskChecker {
-        existing: RwLock<HashSet<String>>,
-    }
-
-    #[async_trait]
-    impl DispatchedTaskChecker for FakeTaskChecker {
-        async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool> {
-            Ok(self.existing.read().await.contains(&task_id.0))
-        }
-    }
-
-    fn make_dispatched(ids: &[&str]) -> DashMap<String, TaskId> {
-        let map = DashMap::new();
-        for id in ids {
-            map.insert(
-                id.to_string(),
-                harness_core::types::TaskId(format!("task-{id}")),
-            );
-        }
-        map
-    }
-
-    #[test]
-    fn parse_gh_output_converts_issues_to_incoming() {
-        let json = br#"[
-            {
-                "number": 42,
-                "title": "Fix login bug",
-                "body": "Users cannot log in after password reset.",
-                "url": "https://github.com/owner/repo/issues/42",
-                "labels": [{"name": "harness"}, {"name": "bug"}],
-                "createdAt": "2026-03-01T10:00:00Z"
-            }
-        ]"#;
-
-        let dispatched = DashMap::new();
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
-
-        assert_eq!(parsed.new_issues.len(), 1);
-        assert_eq!(parsed.open_issue_ids.len(), 1);
-        assert!(parsed.open_issue_ids.contains("42"));
-        let issue = &parsed.new_issues[0];
-        assert_eq!(issue.source, "github");
-        assert_eq!(issue.external_id, "42");
-        assert_eq!(issue.identifier, "#42");
-        assert_eq!(issue.title, "Fix login bug");
-        assert_eq!(
-            issue.description.as_deref(),
-            Some("Users cannot log in after password reset.")
-        );
-        assert_eq!(issue.repo.as_deref(), Some("owner/repo"));
-        assert_eq!(
-            issue.url.as_deref(),
-            Some("https://github.com/owner/repo/issues/42")
-        );
-        assert_eq!(issue.labels, vec!["harness", "bug"]);
-    }
-
-    #[test]
-    fn parse_gh_output_accepts_api_url_and_html_url() {
-        let json = br#"[
-            {
-                "number": 42,
-                "title": "Fix login bug",
-                "body": null,
-                "url": "https://api.github.com/repos/owner/repo/issues/42",
-                "html_url": "https://github.com/owner/repo/issues/42",
-                "labels": []
-            }
-        ]"#;
-
-        let dispatched = DashMap::new();
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
-
-        assert_eq!(parsed.new_issues.len(), 1);
-        assert_eq!(
-            parsed.new_issues[0].url.as_deref(),
-            Some("https://github.com/owner/repo/issues/42")
-        );
-    }
-
-    #[test]
-    fn parse_gh_output_filters_dispatched_issues() {
-        let json = br#"[
-            {"number": 1, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
-            {"number": 2, "title": "B", "body": null, "url": "u2", "labels": [], "createdAt": null},
-            {"number": 3, "title": "C", "body": null, "url": "u3", "labels": [], "createdAt": null}
-        ]"#;
-
-        // Issues 1 and 2 already dispatched
-        let dispatched = make_dispatched(&["1", "2"]);
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
-
-        assert_eq!(parsed.new_issues.len(), 1);
-        assert_eq!(parsed.new_issues[0].external_id, "3");
-        assert_eq!(parsed.open_issue_ids.len(), 3);
-    }
-
-    #[test]
-    fn parse_gh_output_filters_pull_requests_from_issue_endpoint() {
-        let json = br#"[
-            {
-                "number": 10,
-                "title": "Actual issue",
-                "body": null,
-                "url": "https://api.github.com/repos/owner/repo/issues/10",
-                "html_url": "https://github.com/owner/repo/issues/10",
-                "labels": [],
-                "createdAt": null
-            },
-            {
-                "number": 11,
-                "title": "Open pull request",
-                "body": null,
-                "url": "https://api.github.com/repos/owner/repo/issues/11",
-                "html_url": "https://github.com/owner/repo/pull/11",
-                "pull_request": {
-                    "url": "https://api.github.com/repos/owner/repo/pulls/11",
-                    "html_url": "https://github.com/owner/repo/pull/11"
-                },
-                "labels": [],
-                "createdAt": null
-            }
-        ]"#;
-
-        let dispatched = DashMap::new();
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
-
-        assert_eq!(parsed.new_issues.len(), 1);
-        assert_eq!(parsed.new_issues[0].external_id, "10");
-        assert!(parsed.open_issue_ids.contains("10"));
-        assert!(!parsed.open_issue_ids.contains("11"));
-    }
-
-    #[test]
-    fn parse_gh_output_filters_canonical_dispatched_issue_keys() {
-        let json = br#"[
-            {"number": 1, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
-            {"number": 2, "title": "B", "body": null, "url": "u2", "labels": [], "createdAt": null},
-            {"number": 3, "title": "C", "body": null, "url": "u3", "labels": [], "createdAt": null}
-        ]"#;
-
-        let dispatched = make_dispatched(&["1"]);
-        dispatched.insert(
-            "issue:2".to_string(),
-            harness_core::types::TaskId("task-2".to_string()),
-        );
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
-
-        assert_eq!(parsed.new_issues.len(), 1);
-        assert_eq!(parsed.new_issues[0].external_id, "3");
-    }
-
-    #[test]
-    fn parse_gh_output_empty_array() {
-        let json = b"[]";
-        let dispatched = DashMap::new();
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
-        assert!(parsed.new_issues.is_empty());
-        assert!(parsed.open_issue_ids.is_empty());
-    }
-
-    #[test]
-    fn parse_gh_output_invalid_json_returns_error() {
-        let json = b"not valid json";
-        let dispatched = DashMap::new();
-        let result = parse_gh_output(json, "owner/repo", &dispatched, None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_gh_output_null_body_becomes_none_description() {
-        let json = br#"[
-            {"number": 5, "title": "No body", "body": null, "url": "u", "labels": [], "createdAt": null}
-        ]"#;
-        let dispatched = DashMap::new();
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
-        assert_eq!(parsed.new_issues[0].description, None);
-    }
-
-    #[test]
-    fn parse_gh_output_returns_open_issue_ids_for_eviction() {
-        let json = br#"[
-            {"number": 10, "title": "A", "body": null, "url": "u1", "labels": [], "createdAt": null},
-            {"number": 20, "title": "B", "body": null, "url": "u2", "labels": [], "createdAt": null}
-        ]"#;
-
-        // Issue 5 was dispatched but is no longer in the open list (closed).
-        let dispatched = make_dispatched(&["5", "10"]);
-        let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
-
-        // Only issue 20 is new (10 already dispatched).
-        assert_eq!(parsed.new_issues.len(), 1);
-        assert_eq!(parsed.new_issues[0].external_id, "20");
-        // open_issue_ids contains both open issues from the API.
-        assert!(parsed.open_issue_ids.contains("10"));
-        assert!(parsed.open_issue_ids.contains("20"));
-        // Issue 5 is NOT in open_issue_ids — caller can evict it.
-        assert!(!parsed.open_issue_ids.contains("5"));
-    }
-
-    #[test]
-    fn on_task_complete_removes_cancelled_issue_from_dispatched() {
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
-        let external_id = "42";
-        poller.dispatched.insert(
-            external_id.to_string(),
-            harness_core::types::TaskId("task-42".to_string()),
-        );
-
-        let result = TaskCompletionResult {
-            status: TaskStatus::Cancelled,
-            failure_kind: None,
-            pr_url: None,
-            error: Some("cancelled".to_string()),
-            summary: "cancelled".to_string(),
-        };
-
-        futures::executor::block_on(poller.on_task_complete(external_id, &result)).unwrap();
-
-        assert!(!poller.dispatched.contains_key(external_id));
-    }
-
-    #[test]
-    fn on_task_complete_manual_conflict_keeps_dispatched() {
-        // Gate B: failures requiring manual resolution must NOT unmark the issue so
-        // the poller cannot immediately re-discover the same conflict and hot-loop.
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
-        let external_id = "77";
-        poller.dispatched.insert(
-            external_id.to_string(),
-            harness_core::types::TaskId("task-77".to_string()),
-        );
-
-        let result = TaskCompletionResult {
-            status: TaskStatus::Failed,
-            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
-            pr_url: None,
-            error: Some(
-                "pr:77 is conflicting and rebase was not pushed; manual resolution required"
-                    .to_string(),
-            ),
-            summary: "conflict gate fired".to_string(),
-        };
-
-        futures::executor::block_on(poller.on_task_complete(external_id, &result)).unwrap();
-
-        assert!(
-            poller.dispatched.contains_key(external_id),
-            "issue must remain in dispatched after manual-resolution failure to prevent hot-loop"
-        );
-    }
-
-    #[test]
-    fn on_task_complete_transient_failure_removes_from_dispatched() {
-        // Transient failures (e.g. rate limit, empty output) should unmark for retry.
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
-        let external_id = "88";
-        poller.dispatched.insert(
-            external_id.to_string(),
-            harness_core::types::TaskId("task-88".to_string()),
-        );
-
-        let result = TaskCompletionResult {
-            status: TaskStatus::Failed,
-            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
-            pr_url: None,
-            error: Some("no PR number found in agent output; task requires PR_URL".to_string()),
-            summary: "transient failure".to_string(),
-        };
-
-        futures::executor::block_on(poller.on_task_complete(external_id, &result)).unwrap();
-
-        assert!(
-            !poller.dispatched.contains_key(external_id),
-            "issue must be removed from dispatched after transient failure so poller can retry"
-        );
-    }
-
-    #[test]
-    fn on_task_complete_transient_failure_removes_canonical_external_id_from_dispatched() {
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
-        poller.dispatched.insert(
-            "88".to_string(),
-            harness_core::types::TaskId("task-88".to_string()),
-        );
-
-        let result = TaskCompletionResult {
-            status: TaskStatus::Failed,
-            failure_kind: Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle),
-            pr_url: None,
-            error: Some("triage phase agent error".to_string()),
-            summary: "transient failure".to_string(),
-        };
-
-        futures::executor::block_on(poller.on_task_complete("issue:88", &result)).unwrap();
-
-        assert!(
-            !poller.dispatched.contains_key("88"),
-            "canonical external_id should remove the raw GitHub issue key"
-        );
-    }
-
-    #[test]
-    fn on_task_complete_task_failure_keeps_dispatched() {
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
-        poller.dispatched.insert(
-            "99".to_string(),
-            harness_core::types::TaskId("task-99".to_string()),
-        );
-
-        let result = TaskCompletionResult {
-            status: TaskStatus::Failed,
-            failure_kind: Some(crate::task_runner::TaskFailureKind::Task),
-            pr_url: None,
-            error: Some("implementation test failure".to_string()),
-            summary: "task failure".to_string(),
-        };
-
-        futures::executor::block_on(poller.on_task_complete("99", &result)).unwrap();
-
-        assert!(
-            poller.dispatched.contains_key("99"),
-            "non-lifecycle task failures should stay dispatched"
-        );
-    }
-
-    #[test]
-    fn github_issues_poller_name_is_github() {
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
-        assert_eq!(poller.name(), "github");
-    }
-
-    #[test]
-    fn github_issues_poller_accepts_configured_token() {
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller =
-            GitHubIssuesPoller::new_with_token(&repo_cfg, None, Some(" configured ".to_string()));
-
-        assert_eq!(
-            crate::github_auth::resolve_github_token_from_sources(
-                poller.github_token.as_deref(),
-                Some("env-github"),
-                Some("env-gh"),
-            )
-            .as_deref(),
-            Some("configured")
-        );
-    }
-
-    #[tokio::test]
-    async fn reconcile_prunes_missing_dispatched_tasks_but_keeps_skip_markers() {
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let checker = Arc::new(FakeTaskChecker {
-            existing: RwLock::new(
-                ["live-task".to_string()]
-                    .into_iter()
-                    .collect::<HashSet<String>>(),
-            ),
-        });
-        let poller = GitHubIssuesPoller::new(&repo_cfg, None).with_task_checker(checker);
-        poller.dispatched.insert(
-            "1".to_string(),
-            harness_core::types::TaskId("missing-task".to_string()),
-        );
-        poller.dispatched.insert(
-            "2".to_string(),
-            harness_core::types::TaskId("live-task".to_string()),
-        );
-        poller.dispatched.insert(
-            "3".to_string(),
-            harness_core::types::TaskId("skip-3".to_string()),
-        );
-
-        let pruned = poller
-            .reconcile_dispatched_with_store()
-            .await
-            .expect("reconcile should succeed");
-
-        assert_eq!(pruned, 1, "only the missing real task should be pruned");
-        assert!(!poller.dispatched.contains_key("1"));
-        assert!(poller.dispatched.contains_key("2"));
-        assert!(poller.dispatched.contains_key("3"));
-    }
-
-    #[tokio::test]
-    async fn reconcile_without_task_checker_is_noop() {
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller = GitHubIssuesPoller::new(&repo_cfg, None);
-        poller.dispatched.insert(
-            "1".to_string(),
-            harness_core::types::TaskId("missing-task".to_string()),
-        );
-
-        let pruned = poller
-            .reconcile_dispatched_with_store()
-            .await
-            .expect("reconcile should succeed");
-
-        assert_eq!(pruned, 0);
-        assert!(poller.dispatched.contains_key("1"));
-    }
-
-    #[tokio::test]
-    async fn runtime_aware_checker_preserves_runtime_issue_handles() -> anyhow::Result<()> {
-        if !crate::test_helpers::db_tests_enabled().await {
-            return Ok(());
-        }
-
-        let _db_state_guard = crate::test_helpers::acquire_db_state_guard().await;
-        let database_url = crate::test_helpers::test_database_url()?;
-        let dir = tempfile::tempdir()?;
-        let tasks = crate::task_runner::TaskStore::open_with_database_url(
-            &harness_core::config::dirs::default_db_path(dir.path(), "tasks"),
-            Some(&database_url),
-        )
-        .await?;
-        let runtime_store =
-            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
-                &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-                Some(&database_url),
-            )
-            .await?;
-        let project_root = dir.path().join("project");
-        std::fs::create_dir(&project_root)?;
-        let task_id = TaskId::from_str("runtime-issue-handle");
-        let labels = vec!["bug".to_string()];
-
-        crate::workflow_runtime_submission::record_issue_submission(
-            &runtime_store,
-            crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
-                project_root: &project_root,
-                repo: Some("owner/repo"),
-                issue_number: 42,
-                task_id: &task_id,
-                labels: &labels,
-                force_execute: false,
-                additional_prompt: None,
-                depends_on: &[],
-                dependencies_blocked: false,
-                source: None,
-                external_id: None,
-            },
-        )
-        .await?;
-
-        let checker = RuntimeAwareDispatchedTaskChecker::new(tasks, Some(Arc::new(runtime_store)));
-
-        assert!(checker.exists(&task_id).await?);
-        assert!(
-            !checker
-                .exists(&TaskId::from_str("missing-runtime-handle"))
-                .await?
-        );
-        Ok(())
-    }
-
-    // Surface 3 regression guard: the dispatched JSON file stores only
-    // {issue_id → task_id} pairs.  No workspace path must ever be written.
-    #[test]
-    fn surface3_dispatched_json_has_no_path_fields() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_cfg = harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: None,
-        };
-        let poller = GitHubIssuesPoller::new(&repo_cfg, Some(tmp.path()));
-        poller.dispatched.insert(
-            "42".to_string(),
-            harness_core::types::TaskId("task-abc123".to_string()),
-        );
-        poller.dispatched.insert(
-            "99".to_string(),
-            harness_core::types::TaskId("task-xyz456".to_string()),
-        );
-        poller.persist_dispatched();
-
-        let persist_path = tmp.path().join("github_dispatched_owner_repo.json");
-        let json = std::fs::read_to_string(&persist_path)
-            .expect("dispatched file should have been written");
-        assert!(
-            !json.contains("/workspaces/"),
-            "dispatched JSON must not contain workspace paths, got: {json}"
-        );
-        let map: HashMap<String, String> =
-            serde_json::from_str(&json).expect("dispatched JSON must parse");
-        assert_eq!(map.len(), 2, "both entries should be persisted");
-        assert!(
-            map.values()
-                .all(|v| !v.contains('/') || v.starts_with("skip-")),
-            "task IDs must not be filesystem paths"
-        );
-    }
-}
+#[path = "github_issues_tests.rs"]
+mod tests;

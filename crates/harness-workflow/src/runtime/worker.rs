@@ -579,10 +579,10 @@ mod tests {
         use crate::runtime::WorkflowSubject;
 
         let mut instance = WorkflowInstance::new(
-            "repo_backlog",
+            "prompt_task",
             1,
-            "running",
-            WorkflowSubject::new("issue", "1"),
+            "implementing",
+            WorkflowSubject::new("prompt", "1"),
         );
         let command = WorkflowCommand::new(
             WorkflowCommandType::MarkFailed,
@@ -604,10 +604,10 @@ mod tests {
         use crate::runtime::WorkflowSubject;
 
         let mut instance = WorkflowInstance::new(
-            "repo_backlog",
+            "prompt_task",
             1,
-            "running",
-            WorkflowSubject::new("issue", "1"),
+            "implementing",
+            WorkflowSubject::new("prompt", "1"),
         );
         let command = WorkflowCommand::new(
             WorkflowCommandType::MarkFailed,

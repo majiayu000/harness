@@ -424,12 +424,12 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
         .as_ref()
         .expect("workflow runtime store should be configured");
     let parent = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         1,
-        "dispatching",
-        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
-    .with_id("repo-backlog")
+    .with_id("prompt-task")
     .with_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
@@ -438,7 +438,7 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
     let command = harness_workflow::runtime::WorkflowCommand::start_child_workflow(
         "github_issue_pr",
         "issue:126",
-        "repo-backlog:owner/repo:issue:126:start",
+        "prompt-task:owner/repo:issue:126:start",
     );
     let command_id = store.enqueue_command(&parent.id, None, &command).await?;
     let activity = command.runtime_activity_key().to_string();
@@ -481,14 +481,14 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
         .await?
         .expect("child workflow should be created");
     assert_eq!(child.state, "discovered");
-    assert_eq!(child.parent_workflow_id.as_deref(), Some("repo-backlog"));
+    assert_eq!(child.parent_workflow_id.as_deref(), Some("prompt-task"));
     assert_eq!(child.data["issue_number"], 126);
     assert_eq!(child.data["started_by_runtime_job_id"], runtime_job.id);
     let parent_after = store
-        .get_instance("repo-backlog")
+        .get_instance("prompt-task")
         .await?
         .expect("parent workflow should still exist");
-    assert_eq!(parent_after.state, "idle");
+    assert_eq!(parent_after.state, "implementing");
     let completed = store
         .get_runtime_job(&runtime_job.id)
         .await?
@@ -530,12 +530,12 @@ async fn runtime_job_worker_starts_prompt_child_workflow_for_open_pr_feedback() 
         .as_ref()
         .expect("workflow runtime store should be configured");
     let parent = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         1,
-        "dispatching",
-        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
-    .with_id("repo-backlog-pr-feedback")
+    .with_id("prompt-task-pr-feedback")
     .with_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
@@ -543,7 +543,7 @@ async fn runtime_job_worker_starts_prompt_child_workflow_for_open_pr_feedback() 
     store.upsert_instance(&parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
-        "repo-backlog:owner/repo:pr:1120:feedback",
+        "prompt-task:owner/repo:pr:1120:feedback",
         serde_json::json!({
             "definition_id": "prompt_task",
             "subject_key": "pr:1120:feedback",
@@ -551,7 +551,7 @@ async fn runtime_job_worker_starts_prompt_child_workflow_for_open_pr_feedback() 
             "pr_number": 1120,
             "source": "github_pr_feedback",
             "external_id": "pr-feedback:owner/repo:1120",
-            "task_id": "repo-backlog:owner/repo:pr:1120:feedback",
+            "task_id": "prompt-task:owner/repo:pr:1120:feedback",
             "prompt": "Handle unresolved review feedback for PR https://github.com/owner/repo/pull/1120.",
         }),
     );
@@ -582,7 +582,7 @@ async fn runtime_job_worker_starts_prompt_child_workflow_for_open_pr_feedback() 
 
     assert_eq!(tick.succeeded, 1);
     assert_eq!(tick.failed, 0);
-    let task_id = harness_core::types::TaskId::from_str("repo-backlog:owner/repo:pr:1120:feedback");
+    let task_id = harness_core::types::TaskId::from_str("prompt-task:owner/repo:pr:1120:feedback");
     let child_id = crate::workflow_runtime_submission::prompt_workflow_id(
         &project_id,
         Some("pr-feedback:owner/repo:1120"),

@@ -306,11 +306,11 @@ describe("<Active>", () => {
         workflows: [
           {
             workflow: {
-              id: "repo-backlog",
-              definition_id: "repo_backlog",
+              id: "prompt-task",
+              definition_id: "prompt_task",
               definition_version: 1,
-              state: "dispatching",
-              subject: { subject_type: "repo", subject_key: "owner/repo" },
+              state: "implementing",
+              subject: { subject_type: "prompt", subject_key: "owner/repo" },
               data: {},
               version: 1,
               created_at: "2026-04-30T00:00:00Z",
@@ -327,7 +327,7 @@ describe("<Active>", () => {
                   definition_version: 1,
                   state: "replanning",
                   subject: { subject_type: "issue", subject_key: "issue:123" },
-                  parent_workflow_id: "repo-backlog",
+                  parent_workflow_id: "prompt-task",
                   data: {},
                   version: 2,
                   created_at: "2026-04-30T00:00:00Z",
@@ -427,7 +427,7 @@ describe("<Active>", () => {
     expect(screen.getByText("2/2 workflows")).toBeInTheDocument();
     expect(screen.getByText("2 active leases")).toBeInTheDocument();
     expect(screen.getByText("2 expired/missing")).toBeInTheDocument();
-    expect(screen.getByText("repo_backlog - owner/repo")).toBeInTheDocument();
+    expect(screen.getByText("prompt_task - owner/repo")).toBeInTheDocument();
     expect(screen.getByText("github_issue_pr - issue:123")).toBeInTheDocument();
     expect(screen.getByText("rejected 6")).toBeInTheDocument();
     expect(screen.getByText("activity: replan_issue")).toBeInTheDocument();

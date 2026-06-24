@@ -82,7 +82,7 @@ fn dependency_task_ids_from_command_maps_issue_numbers_to_repo_handles() {
         "depends_on": [42, "43", "explicit-task-id"]
     });
 
-    let dependencies = dependency_task_ids_from_command(&command, Some("owner/repo"));
+    let dependencies = dependency_task_ids_from_command(&command, Some("owner/repo"), None);
 
     assert_eq!(
         dependencies
@@ -90,8 +90,8 @@ fn dependency_task_ids_from_command_maps_issue_numbers_to_repo_handles() {
             .map(|task_id| task_id.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "repo-backlog:owner/repo:issue:42",
-            "repo-backlog:owner/repo:issue:43",
+            "github-issue:owner/repo:issue:42",
+            "github-issue:owner/repo:issue:43",
             "explicit-task-id"
         ]
     );
@@ -154,21 +154,26 @@ fn runtime_workspace_finish_action_preserves_reusable_issue_workspaces() {
 
 #[test]
 fn runtime_workspace_finish_action_removes_ephemeral_or_non_reused_workspaces() {
-    let backlog_job = RuntimeJob::pending(
+    let pr_feedback_job = RuntimeJob::pending(
         "command-1",
         RuntimeKind::CodexJsonrpc,
         "codex-default",
-        json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
+        json!({ "activity": PR_FEEDBACK_INSPECT_ACTIVITY }),
     );
-    let backlog = WorkflowInstance::new(
-        REPO_BACKLOG_DEFINITION_ID,
+    let pr_feedback = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
         1,
-        "scanning",
-        WorkflowSubject::new("repo", "owner/repo"),
+        "inspecting",
+        WorkflowSubject::new("pr", "pr:124"),
     )
-    .with_id("repo-backlog-owner-repo");
+    .with_id("pr-feedback-124");
     assert_eq!(
-        runtime_workspace_finish_action("on_terminal", true, &backlog_job, Some(&backlog)),
+        runtime_workspace_finish_action(
+            "on_terminal",
+            true,
+            &pr_feedback_job,
+            Some(&pr_feedback)
+        ),
         RuntimeWorkspaceFinishAction::Remove
     );
 
@@ -230,79 +235,6 @@ fn activity_result_schema_describes_quality_gate_contract() {
         .iter()
         .any(|transition| transition["next_state"] == "passed"));
 }
-
-#[test]
-fn activity_result_schema_describes_repo_backlog_poll_contract() {
-    let job = RuntimeJob::pending(
-        "command-1",
-        RuntimeKind::CodexJsonrpc,
-        "codex-default",
-        json!({
-            "activity": "poll_repo_backlog"
-        }),
-    );
-    let workflow = WorkflowInstance::new(
-        "repo_backlog",
-        1,
-        "scanning",
-        WorkflowSubject::new("repo", "owner/repo"),
-    )
-    .with_id("repo-backlog-1");
-
-    let schema = activity_result_schema(&job, Some(&workflow));
-
-    assert_eq!(schema["workflow_definition"], "repo_backlog");
-    assert_eq!(
-        schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
-        "IssueDiscovered"
-    );
-    assert_eq!(
-        schema["agent_summary_contract"]["signals"]["IssueDiscovered"],
-        "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available."
-    );
-    assert!(schema["workflow_decision_contract"]["allowed_transitions"]
-        .as_array()
-        .expect("allowed transitions should be an array")
-        .iter()
-        .any(|transition| transition["next_state"] == "planning_batch"));
-}
-
-#[test]
-fn activity_result_schema_describes_repo_sprint_plan_contract() {
-    let job = RuntimeJob::pending(
-        "command-1",
-        RuntimeKind::CodexJsonrpc,
-        "codex-default",
-        json!({
-            "activity": harness_workflow::runtime::REPO_BACKLOG_SPRINT_PLAN_ACTIVITY
-        }),
-    );
-    let workflow = WorkflowInstance::new(
-        "repo_backlog",
-        1,
-        "planning_batch",
-        WorkflowSubject::new("repo", "owner/repo"),
-    )
-    .with_id("repo-backlog-1");
-
-    let schema = activity_result_schema(&job, Some(&workflow));
-
-    assert_eq!(schema["workflow_definition"], "repo_backlog");
-    assert_eq!(
-        schema["transition_contract"]["on_succeeded"]["accepted_signals"][0],
-        "SprintTaskSelected"
-    );
-    assert_eq!(
-        schema["agent_summary_contract"]["signals"]["SprintTaskSelected"],
-        "Use once for each issue selected for execution. Include issue_number, issue_url, repo, labels, and depends_on as issue numbers."
-    );
-    assert!(schema["workflow_decision_contract"]["allowed_transitions"]
-        .as_array()
-        .expect("allowed transitions should be an array")
-        .iter()
-        .any(|transition| transition["next_state"] == "dispatching"));
-}
-
 #[test]
 fn activity_result_schema_describes_pr_feedback_child_contract() {
     let job = RuntimeJob::pending(
@@ -393,16 +325,13 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
 fn activity_result_from_turn_fails_when_no_fenced_block_present() {
     // P0-1: a completed agent turn that emits no `harness-activity-result`
     // fenced block must NOT be silently treated as success. Returning
-    // succeeded here historically caused state-machine no-progress loops
-    // for `repo_backlog` workflows (claude returns prose, reducer falls
-    // back to `finish_repo_backlog_scan`, state cycles back to idle, next
-    // tick re-dispatches, ad infinitum).
+    // succeeded here historically caused state-machine no-progress loops.
     let job = RuntimeJob::pending(
         "command-1",
         RuntimeKind::ClaudeCode,
         "claude-default",
         json!({
-            "activity": "poll_repo_backlog"
+            "activity": "implement_issue"
         }),
     );
     let items = vec![Item::AgentReasoning {
@@ -420,7 +349,7 @@ fn activity_result_from_turn_fails_when_no_fenced_block_present() {
         "digest-1",
     );
 
-    assert_eq!(result.activity, "poll_repo_backlog");
+    assert_eq!(result.activity, "implement_issue");
     assert_eq!(
         result.status,
         harness_workflow::runtime::ActivityStatus::Failed,

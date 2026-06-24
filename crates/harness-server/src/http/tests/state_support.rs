@@ -388,7 +388,9 @@ pub(super) async fn make_test_state_with_project_root(
         intake: crate::http::IntakeServices {
             feishu_intake,
             github_pollers: vec![],
+            github_poller_repos: vec![],
             completion_callback: None,
+            token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
         },
         project_svc,
         task_svc,
@@ -469,7 +471,9 @@ pub(super) async fn make_test_state_with_issue_workflows(
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],
+            github_poller_repos: vec![],
             completion_callback: None,
+            token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
         },
         project_svc: state.project_svc.clone(),
         task_svc: state.task_svc.clone(),
@@ -587,7 +591,9 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],
+            github_poller_repos: vec![],
             completion_callback: None,
+            token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
         },
         project_svc: state.project_svc.clone(),
         task_svc: state.task_svc.clone(),

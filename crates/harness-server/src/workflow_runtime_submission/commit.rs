@@ -299,6 +299,7 @@ fn issue_submission_event_payload(ctx: &IssueSubmissionRuntimeContext<'_>) -> se
         "dependencies_blocked": ctx.dependencies_blocked,
         "source": ctx.source,
         "external_id": ctx.external_id,
+        "remote_fact_hash": ctx.remote_fact_hash,
         "tracker_source": super::issue_tracker_source(ctx),
         "tracker_external_id": super::issue_tracker_external_id(ctx),
         "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,

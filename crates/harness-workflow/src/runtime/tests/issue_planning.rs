@@ -15,6 +15,7 @@ fn issue_submission_decision_force_execute_starts_implementation() {
             additional_prompt: Some("skip planning for this operator-requested run"),
             depends_on: &[],
             dependencies_blocked: false,
+            remote_fact_hash: None,
         },
     );
 
@@ -39,6 +40,39 @@ fn issue_submission_decision_force_execute_starts_implementation() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("force-execute issue submission should validate");
+}
+
+#[test]
+fn issue_submission_decision_uses_remote_fact_hash_for_implementation_dedupe() {
+    let labels = Vec::new();
+    let instance = issue_instance("discovered");
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-force",
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            labels: &labels,
+            force_execute: true,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            remote_fact_hash: Some("sha256:abc"),
+        },
+    );
+
+    assert_eq!(
+        output.decision.commands[0].dedupe_key,
+        "implement_issue:sha256:abc"
+    );
+    assert_eq!(
+        output.decision.commands[0].command["dispatch_gate"]["reason"],
+        "uncovered_issue_ready_for_implementation"
+    );
+    assert_eq!(
+        output.decision.commands[0].command["dispatch_gate"]["fact_hash"],
+        "sha256:abc"
+    );
 }
 
 #[test]

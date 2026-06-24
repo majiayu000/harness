@@ -42,13 +42,6 @@ pub(super) fn signal_count(result: &ActivityResult, signal_type: &str) -> usize 
         .count()
 }
 
-pub(super) fn has_any_signal(result: &ActivityResult, signal_types: &[&str]) -> bool {
-    result
-        .signals
-        .iter()
-        .any(|signal| signal_types.contains(&signal.signal_type.as_str()))
-}
-
 pub(super) fn has_signal(result: &ActivityResult, signal_type: &str) -> bool {
     result
         .signals
@@ -94,35 +87,6 @@ pub(super) fn non_empty_json_string(value: &Value) -> Option<String> {
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
-}
-
-pub(super) fn string_array_field(value: &Value, field: &str) -> Vec<String> {
-    value
-        .get(field)
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(non_empty_json_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-pub(super) fn u64_array_field(value: &Value, field: &str) -> Vec<u64> {
-    value
-        .get(field)
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(json_value_u64).collect::<Vec<_>>())
-        .unwrap_or_default()
-}
-
-pub(super) fn array_items<'a>(value: &'a Value, field: &str) -> Vec<&'a Value> {
-    value
-        .get(field)
-        .and_then(Value::as_array)
-        .map(|items| items.iter().collect())
-        .unwrap_or_default()
 }
 
 pub(super) fn event_field_string(event: &WorkflowEvent, field: &str) -> Option<String> {

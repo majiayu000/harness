@@ -170,6 +170,7 @@ async fn intake_status_includes_runtime_github_issue_dispatches() -> anyhow::Res
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:65"),
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -249,6 +250,7 @@ async fn intake_status_merges_runtime_dispatches_by_recency_before_limit() -> an
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:165"),
+            remote_fact_hash: None,
         },
     )
     .await?;

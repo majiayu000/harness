@@ -31,9 +31,6 @@ fn http_listener_starts_before_background_work() {
     let Some(feedback_sweeper_index) = source.find("spawn_runtime_pr_feedback_sweeper") else {
         panic!("serve should still start the PR feedback sweeper");
     };
-    let Some(backlog_poller_index) = source.find("spawn_runtime_repo_backlog_poller") else {
-        panic!("serve should still start the repo backlog poller");
-    };
     let Some(runtime_worker_index) = source.find("spawn_runtime_job_workers") else {
         panic!("serve should still start runtime workers");
     };
@@ -41,7 +38,6 @@ fn http_listener_starts_before_background_work() {
     for background_index in [
         reconciliation_index,
         feedback_sweeper_index,
-        backlog_poller_index,
         runtime_worker_index,
     ] {
         assert!(

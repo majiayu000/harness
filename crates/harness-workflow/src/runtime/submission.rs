@@ -1,5 +1,6 @@
 use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, WorkflowInstance};
 use super::plan_issue::ISSUE_PLAN_ACTIVITY;
+use super::remote_facts::remote_fact_command_dedupe_key;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueSubmissionWorkflowAction {
@@ -18,6 +19,7 @@ pub struct IssueSubmissionDecisionInput<'a> {
     pub additional_prompt: Option<&'a str>,
     pub depends_on: &'a [String],
     pub dependencies_blocked: bool,
+    pub remote_fact_hash: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,31 +61,51 @@ pub fn build_issue_submission_decision(
         reason,
     );
     if !input.dependencies_blocked && input.force_execute {
-        decision = decision.with_command(WorkflowCommand::new(
-            super::model::WorkflowCommandType::EnqueueActivity,
+        let dedupe_key = submission_command_dedupe_key(
+            "implement_issue",
+            input.remote_fact_hash,
             format!(
                 "issue-submit:{}:issue:{}:task:{}:implement",
                 repo_key(input.repo),
                 input.issue_number,
                 input.task_id
             ),
+        );
+        decision = decision.with_command(WorkflowCommand::new(
+            super::model::WorkflowCommandType::EnqueueActivity,
+            dedupe_key,
             serde_json::json!({
                 "activity": "implement_issue",
                 "additional_prompt": input.additional_prompt,
+                "dispatch_gate": {
+                    "reason": "uncovered_issue_ready_for_implementation",
+                    "fact_hash": input.remote_fact_hash,
+                },
+                "remote_fact_hash": input.remote_fact_hash,
             }),
         ));
     } else if !input.dependencies_blocked {
-        decision = decision.with_command(WorkflowCommand::new(
-            super::model::WorkflowCommandType::EnqueueActivity,
+        let dedupe_key = submission_command_dedupe_key(
+            ISSUE_PLAN_ACTIVITY,
+            input.remote_fact_hash,
             format!(
                 "issue-submit:{}:issue:{}:task:{}:plan",
                 repo_key(input.repo),
                 input.issue_number,
                 input.task_id
             ),
+        );
+        decision = decision.with_command(WorkflowCommand::new(
+            super::model::WorkflowCommandType::EnqueueActivity,
+            dedupe_key,
             serde_json::json!({
                 "activity": ISSUE_PLAN_ACTIVITY,
                 "additional_prompt": input.additional_prompt,
+                "dispatch_gate": {
+                    "reason": "dependency_analysis_required",
+                    "fact_hash": input.remote_fact_hash,
+                },
+                "remote_fact_hash": input.remote_fact_hash,
             }),
         ));
     }
@@ -122,4 +144,14 @@ fn depends_on_summary(depends_on: &[String]) -> String {
 
 fn repo_key(repo: Option<&str>) -> &str {
     repo.unwrap_or("<none>")
+}
+
+fn submission_command_dedupe_key(
+    activity: &str,
+    remote_fact_hash: Option<&str>,
+    fallback: String,
+) -> String {
+    remote_fact_hash
+        .map(|fact_hash| remote_fact_command_dedupe_key(activity, fact_hash))
+        .unwrap_or(fallback)
 }

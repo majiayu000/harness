@@ -4,8 +4,7 @@ use harness_workflow::runtime::{
     PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
     PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_REPAIR_SNAPSHOT_ARTIFACT,
     QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
-    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, REPO_BACKLOG_DEFINITION_ID,
-    REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY, SCOPE_TOO_LARGE_SIGNAL,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, SCOPE_TOO_LARGE_SIGNAL,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde::Serialize;
@@ -58,11 +57,6 @@ impl ActivityContract {
         self
     }
 
-    fn with_required_artifacts(mut self, artifacts: Vec<&'static str>) -> Self {
-        self.required_artifacts = artifacts;
-        self
-    }
-
     fn requires(mut self, requirement: &'static str) -> Self {
         self.empty_success_allowed = false;
         self.success_requires = Some(requirement);
@@ -81,30 +75,6 @@ impl ActivityContract {
 
 pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> ActivityContract {
     match (workflow_definition, activity) {
-        (REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY) => {
-            ActivityContract::new(workflow_definition, activity)
-                .with_accepted_signals(vec![
-                    "IssueDiscovered",
-                    "IssueSkipped",
-                    "NoOpenIssueFound",
-                    "OpenPrFeedbackDiscovered",
-                    "OpenPrFeedbackSkipped",
-                    "NoOpenPrFeedbackFound",
-                ])
-                .with_explicit_noop_signals(vec!["NoOpenIssueFound", "NoOpenPrFeedbackFound"])
-                .requires("at_least_one_accepted_signal")
-        }
-        (REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY) => {
-            ActivityContract::new(workflow_definition, activity)
-                .with_accepted_signals(vec![
-                    "SprintTaskSelected",
-                    "IssueSkipped",
-                    "NoSprintTaskSelected",
-                ])
-                .with_accepted_artifacts(vec!["sprint_plan"])
-                .with_explicit_noop_signals(vec!["NoSprintTaskSelected"])
-                .requires("at_least_one_accepted_signal_or_artifact")
-        }
         (PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY) => {
             pr_feedback_contract(workflow_definition, activity)
                 .with_child_outcome("pr_feedback_outcome")
@@ -171,17 +141,6 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
                 ])
                 .with_accepted_artifacts(vec!["validation_report"])
                 .requires("quality_gate_status_signal_and_validation_evidence")
-        }
-        (REPO_BACKLOG_DEFINITION_ID, "start_child_workflow") => {
-            ActivityContract::new(workflow_definition, activity)
-                .with_required_artifacts(vec!["child_workflow"])
-                .requires("child_workflow_artifact")
-        }
-        (REPO_BACKLOG_DEFINITION_ID, "mark_bound_issue_done")
-        | (REPO_BACKLOG_DEFINITION_ID, "recover_issue_workflow") => {
-            ActivityContract::new(workflow_definition, activity)
-                .with_required_artifacts(vec!["child_workflow"])
-                .requires("child_workflow_artifact")
         }
         _ => ActivityContract::new(workflow_definition, activity),
     }

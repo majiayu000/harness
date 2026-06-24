@@ -174,13 +174,6 @@ github_intake_mode() {
     printf '%s\n' "${mode:-poll}"
 }
 
-github_intake_poller_enabled() {
-    case "$1" in
-        poll | hybrid | both) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 status_ok() {
     printf 'OK: %s\n' "$1"
 }
@@ -632,22 +625,14 @@ workflow_enabled_value() {
 check_workflow_runtime_flags() {
     local section
     local value
-    local mode
     local missing=0
 
     if [ ! -f "WORKFLOW.md" ]; then
-        warn "WORKFLOW.md was not found; GitHub issue intake cannot prove runtime backlog ownership from this checkout"
+        warn "WORKFLOW.md was not found; GitHub issue intake cannot prove runtime dispatch ownership from this checkout"
         return 0
     fi
 
-    mode="$(github_intake_mode)"
-
-    for section in repo_backlog runtime_dispatch runtime_worker; do
-        if [ "$section" = "repo_backlog" ] && ! github_intake_poller_enabled "$mode"; then
-            status_ok "GitHub intake mode '$mode' does not require repo_backlog polling"
-            continue
-        fi
-
+    for section in runtime_dispatch runtime_worker; do
         value="$(workflow_enabled_value "$section" || true)"
         if [ "$value" = "true" ]; then
             status_ok "WORKFLOW.md enables $section"

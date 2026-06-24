@@ -242,7 +242,9 @@ async fn make_read_only_route_test_state_with_project_root(
         intake: IntakeServices {
             feishu_intake,
             github_pollers: vec![],
+            github_poller_repos: vec![],
             completion_callback: None,
+            token_dispatch_counters: IntakeServices::new_token_dispatch_counters(),
         },
         interceptors: vec![],
         startup_statuses: vec![],

@@ -2,8 +2,6 @@ mod github_issue_completion;
 mod plan_issue_completion;
 mod pr_feedback_completion;
 mod quality_gate_completion;
-mod repo_backlog_candidates;
-mod repo_backlog_completion;
 mod runtime_failure;
 mod support;
 
@@ -11,7 +9,7 @@ use self::github_issue_completion::{
     bind_pr_from_activity_result, closed_issue_evidence_from_activity_result,
     closed_issue_evidence_from_activity_result_value, closed_issue_evidence_from_value,
     github_issue_closed_decision, issue_implementation_missing_result_decision,
-    scope_too_large_decision,
+    merged_pr_from_activity_result, scope_too_large_decision,
 };
 use self::plan_issue_completion::issue_plan_decision_from_activity_result;
 use self::pr_feedback_completion::{
@@ -23,12 +21,6 @@ use self::pr_feedback_completion::{
 use self::quality_gate_completion::{
     parent_quality_gate_pass_decision, quality_gate_activity_matches,
     quality_gate_success_contract_error, quality_gate_success_decision,
-};
-use self::repo_backlog_completion::{
-    repo_backlog_child_dispatch_still_active, repo_backlog_invalid_success_decision,
-    repo_backlog_legacy_scan_dispatch_decision_from_activity_result,
-    repo_backlog_poll_decision_from_activity_result,
-    repo_backlog_sprint_plan_decision_from_activity_result,
 };
 use self::runtime_failure::{
     retry_failed_activity_decision, runtime_blocked_decision, runtime_cancelled_decision,
@@ -45,9 +37,6 @@ use super::model::{
 use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
 use super::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
-use super::repo_backlog::{
-    REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY, REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
-};
 use super::validator::{DecisionValidator, ValidationContext};
 use serde_json::{json, Value};
 
@@ -175,6 +164,10 @@ fn reduce_success(
         return Some(decision);
     }
 
+    if let Some(decision) = merged_pr_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+
     if let Some(decision) = pr_feedback_sweep_decision_from_activity_result(instance, event, result)
     {
         return Some(decision);
@@ -196,36 +189,6 @@ fn reduce_success(
     if let Some(decision) = pr_feedback_child_decision_from_activity_result(instance, event, result)
     {
         return Some(decision);
-    }
-
-    if let Some(decision) =
-        repo_backlog_invalid_success_decision(instance, event, result, structured_decision.as_ref())
-    {
-        return Some(decision);
-    }
-
-    if let Some(decision) = repo_backlog_poll_decision_from_activity_result(instance, event, result)
-    {
-        return Some(decision);
-    }
-
-    if let Some(decision) =
-        repo_backlog_sprint_plan_decision_from_activity_result(instance, event, result)
-    {
-        return Some(decision);
-    }
-
-    if let Some(decision) = repo_backlog_legacy_scan_dispatch_decision_from_activity_result(
-        instance,
-        event,
-        result,
-        structured_decision.as_ref(),
-    ) {
-        return Some(decision);
-    }
-
-    if repo_backlog_child_dispatch_still_active(instance, event) {
-        return None;
     }
 
     if stale_success_completion(instance, result) {
@@ -264,35 +227,6 @@ fn reduce_success(
             "local_review_gate",
             "run_local_review_after_rework",
             "PR feedback rework activity completed; run local review before remote feedback",
-        ),
-        (REPO_BACKLOG_DEFINITION_ID, "dispatching", _)
-            if event_command_type(event) == Some("start_child_workflow") =>
-        {
-            (
-                "idle",
-                "finish_issue_workflow_dispatch",
-                "repo backlog child workflow dispatch completed",
-            )
-        }
-        (REPO_BACKLOG_DEFINITION_ID, "reconciling", "mark_bound_issue_done") => (
-            "idle",
-            "finish_bound_issue_reconciliation",
-            "bound issue reconciliation activity completed",
-        ),
-        (REPO_BACKLOG_DEFINITION_ID, "reconciling", "recover_issue_workflow") => (
-            "idle",
-            "finish_issue_workflow_recovery",
-            "issue workflow recovery activity completed",
-        ),
-        (REPO_BACKLOG_DEFINITION_ID, "scanning", REPO_BACKLOG_POLL_ACTIVITY) => (
-            "idle",
-            "finish_repo_backlog_scan",
-            "repo backlog scan completed without new child workflow commands",
-        ),
-        (REPO_BACKLOG_DEFINITION_ID, "planning_batch", REPO_BACKLOG_SPRINT_PLAN_ACTIVITY) => (
-            "idle",
-            "finish_repo_sprint_plan",
-            "repo sprint planning completed without selected issue workflow commands",
         ),
         (QUALITY_GATE_DEFINITION_ID, "checking", super::quality_gate::QUALITY_GATE_ACTIVITY) => (
             "passed",
@@ -452,7 +386,6 @@ fn structured_decision_validates(
         QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
         PR_FEEDBACK_DEFINITION_ID => DecisionValidator::pr_feedback(),
         PROMPT_TASK_DEFINITION_ID => DecisionValidator::prompt_task(),
-        REPO_BACKLOG_DEFINITION_ID => DecisionValidator::repo_backlog(),
         _ => return true,
     };
     validator

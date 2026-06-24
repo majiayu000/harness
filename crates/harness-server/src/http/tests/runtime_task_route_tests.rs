@@ -173,6 +173,7 @@ async fn get_task_runtime_issue_exposes_tracker_identity() -> anyhow::Result<()>
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:64"),
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -331,6 +332,10 @@ async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()>
         "pr_number": 125,
         "pr_url": "https://github.com/owner/repo/pull/125",
         "task_id": "runtime-ready-task",
+        "merge_method": "rebase",
+        "merge_delete_branch": false,
+        "merge_require_review_threads_resolved": false,
+        "merge_require_clean_merge_state": true,
     }));
     store.upsert_instance(&workflow).await?;
     let app = Router::new()
@@ -354,9 +359,12 @@ async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()>
         .get_instance("runtime-ready-53")
         .await?
         .expect("workflow should still exist");
-    assert_eq!(updated.state, "done");
+    assert_eq!(updated.state, "merging");
     assert_eq!(updated.data["last_decision"], "approve_merge");
     assert_eq!(updated.data["merge_approved_task_id"], "runtime-ready-task");
+    assert_eq!(updated.data["merge_delete_branch"], false);
+    assert_eq!(updated.data["merge_require_review_threads_resolved"], false);
+    assert_eq!(updated.data["merge_require_clean_merge_state"], true);
     let events = store.events_for("runtime-ready-53").await?;
     assert!(events
         .iter()
@@ -369,7 +377,18 @@ async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()>
     assert_eq!(commands.len(), 1);
     assert_eq!(
         commands[0].command.command_type,
-        harness_workflow::runtime::WorkflowCommandType::MarkDone
+        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity
+    );
+    assert_eq!(commands[0].command.activity_name(), Some("merge_pr"));
+    assert_eq!(commands[0].command.command["merge_method"], "rebase");
+    assert_eq!(commands[0].command.command["delete_branch"], false);
+    assert_eq!(
+        commands[0].command.command["require_review_threads_resolved"],
+        false
+    );
+    assert_eq!(
+        commands[0].command.command["require_clean_merge_state"],
+        true
     );
     Ok(())
 }
@@ -561,7 +580,10 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
         .get_instance("runtime-ready-54")
         .await?
         .expect("workflow should still exist");
-    assert_eq!(updated.state, "done");
+    assert_eq!(updated.state, "merging");
+    let commands = store.commands_for("runtime-ready-54").await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.activity_name(), Some("merge_pr"));
     Ok(())
 }
 
@@ -595,6 +617,7 @@ async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Re
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -678,6 +701,7 @@ async fn cancel_task_accepts_runtime_submission_handle_without_task_row() -> any
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;

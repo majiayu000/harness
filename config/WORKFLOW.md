@@ -40,13 +40,6 @@ pr_feedback:
   dirty_age_to_comment_secs: 604800
   rebase_needed_label: rebase-needed
   hygiene_batch_limit: 25
-repo_backlog:
-  # Disabled by default: issues/PRs are picked up via webhook events only, so an
-  # idle system (no GitHub events) runs zero LLM turns. Set enabled: true in a
-  # repo's own WORKFLOW.md to opt that repo into autonomous LLM backlog polling.
-  enabled: false
-  poll_interval_secs: 60
-  batch_limit: 128
 runtime_dispatch:
   enabled: true
   interval_secs: 30
@@ -56,13 +49,6 @@ runtime_dispatch:
   activity_profiles:
     inspect_pr_feedback:
       timeout_secs: 3600
-    plan_repo_sprint:
-      reasoning_effort: xhigh
-    poll_repo_backlog:
-      runtime_kind: codex_exec
-      runtime_profile: codex-backlog-exec
-      reasoning_effort: xhigh
-      timeout_secs: 600
 runtime_worker:
   enabled: true
   interval_secs: 5

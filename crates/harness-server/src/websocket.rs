@@ -386,7 +386,9 @@ mod tests {
             intake: crate::http::IntakeServices {
                 feishu_intake: None,
                 github_pollers: vec![],
+                github_poller_repos: vec![],
                 completion_callback: None,
+                token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
             },
             project_svc,
             task_svc,

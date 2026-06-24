@@ -12,6 +12,56 @@ pub struct GitHubRepoConfig {
     pub label: String,
     /// Project root to associate with issues from this repo.
     pub project_root: Option<String>,
+    /// Explicit per-repo auto-merge opt-in. When omitted, the global
+    /// `[intake.github.auto_merge]` policy applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_merge: Option<bool>,
+    /// Optional per-repo merge method override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_method: Option<GitHubMergeMethod>,
+    /// Optional per-repo branch cleanup override after merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_branch: Option<bool>,
+    /// Optional per-repo review-thread readiness override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_review_threads_resolved: Option<bool>,
+    /// Optional per-repo mergeability readiness override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_clean_merge_state: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubMergeMethod {
+    #[default]
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl fmt::Display for GitHubMergeMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Squash => f.write_str("squash"),
+            Self::Merge => f.write_str("merge"),
+            Self::Rebase => f.write_str("rebase"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubAutoMergeConfig {
+    /// Explicitly enable automatic merge dispatch. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub method: GitHubMergeMethod,
+    #[serde(default = "default_true")]
+    pub delete_branch: bool,
+    #[serde(default = "default_true")]
+    pub require_review_threads_resolved: bool,
+    #[serde(default = "default_true")]
+    pub require_clean_merge_state: bool,
 }
 
 /// How GitHub issue intake is driven.
@@ -23,7 +73,7 @@ pub enum IntakeMode {
     Poll,
     /// Event-driven: the `/webhook` endpoint auto-enqueues `issues`
     /// opened/reopened events (no `@harness` mention required) and the
-    /// repo-backlog poller is skipped.
+    /// GitHub intake poller is skipped.
     Webhook,
     /// Both: webhook auto-enqueues for immediacy, poller runs as a backstop
     /// so events missed during downtime are still picked up.
@@ -36,7 +86,7 @@ impl IntakeMode {
         matches!(self, IntakeMode::Webhook | IntakeMode::Hybrid)
     }
 
-    /// Whether the repo-backlog poller should run.
+    /// Whether the GitHub intake poller should run.
     pub fn poller_enabled(self) -> bool {
         matches!(self, IntakeMode::Poll | IntakeMode::Hybrid)
     }
@@ -64,6 +114,10 @@ pub struct GitHubIntakeConfig {
     /// Multiple repos to poll.
     #[serde(default)]
     pub repos: Vec<GitHubRepoConfig>,
+    /// Global auto-merge policy. Disabled by default; repos can opt in with
+    /// `auto_merge = true`.
+    #[serde(default)]
+    pub auto_merge: GitHubAutoMergeConfig,
     /// Agent name for the sprint planner. None = use server default.
     #[serde(default)]
     pub planner_agent: Option<String>,
@@ -93,6 +147,11 @@ impl GitHubIntakeConfig {
                     repo: self.repo.clone(),
                     label: self.label.clone(),
                     project_root: None,
+                    auto_merge: None,
+                    merge_method: None,
+                    delete_branch: None,
+                    require_review_threads_resolved: None,
+                    require_clean_merge_state: None,
                 });
             }
         }
@@ -109,9 +168,45 @@ impl GitHubIntakeConfig {
                     repo: self.repo.clone(),
                     label: self.label.clone(),
                     project_root: None,
+                    auto_merge: None,
+                    merge_method: None,
+                    delete_branch: None,
+                    require_review_threads_resolved: None,
+                    require_clean_merge_state: None,
                 })
             })
     }
+
+    pub fn auto_merge_policy_for_repo(&self, repo: &str) -> ResolvedGitHubAutoMergePolicy {
+        let repo_cfg = self.find_repo_config(repo);
+        let repo_cfg = repo_cfg.as_ref();
+        ResolvedGitHubAutoMergePolicy {
+            enabled: repo_cfg
+                .and_then(|config| config.auto_merge)
+                .unwrap_or(self.auto_merge.enabled),
+            method: repo_cfg
+                .and_then(|config| config.merge_method)
+                .unwrap_or(self.auto_merge.method),
+            delete_branch: repo_cfg
+                .and_then(|config| config.delete_branch)
+                .unwrap_or(self.auto_merge.delete_branch),
+            require_review_threads_resolved: repo_cfg
+                .and_then(|config| config.require_review_threads_resolved)
+                .unwrap_or(self.auto_merge.require_review_threads_resolved),
+            require_clean_merge_state: repo_cfg
+                .and_then(|config| config.require_clean_merge_state)
+                .unwrap_or(self.auto_merge.require_clean_merge_state),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGitHubAutoMergePolicy {
+    pub enabled: bool,
+    pub method: GitHubMergeMethod,
+    pub delete_branch: bool,
+    pub require_review_threads_resolved: bool,
+    pub require_clean_merge_state: bool,
 }
 
 fn default_intake_label() -> String {
@@ -134,6 +229,22 @@ fn default_retry_backoff_max_secs() -> u64 {
     120
 }
 
+fn default_true() -> bool {
+    true
+}
+
+impl Default for GitHubAutoMergeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            method: GitHubMergeMethod::Squash,
+            delete_branch: true,
+            require_review_threads_resolved: true,
+            require_clean_merge_state: true,
+        }
+    }
+}
+
 impl Default for GitHubIntakeConfig {
     fn default() -> Self {
         Self {
@@ -143,6 +254,7 @@ impl Default for GitHubIntakeConfig {
             label: default_intake_label(),
             poll_interval_secs: default_poll_interval_secs(),
             repos: Vec::new(),
+            auto_merge: GitHubAutoMergeConfig::default(),
             planner_agent: None,
             sprint_timeout_secs: default_sprint_timeout_secs(),
             retry_backoff_base_secs: default_retry_backoff_base_secs(),
@@ -258,11 +370,21 @@ mod tests {
                     repo: "owner/default".to_string(),
                     label: "default".to_string(),
                     project_root: Some("/srv/default".to_string()),
+                    auto_merge: None,
+                    merge_method: None,
+                    delete_branch: None,
+                    require_review_threads_resolved: None,
+                    require_clean_merge_state: None,
                 },
                 GitHubRepoConfig {
                     repo: "owner/other".to_string(),
                     label: "other".to_string(),
                     project_root: Some("/srv/other".to_string()),
+                    auto_merge: None,
+                    merge_method: None,
+                    delete_branch: None,
+                    require_review_threads_resolved: None,
+                    require_clean_merge_state: None,
                 },
             ],
             ..GitHubIntakeConfig::default()
@@ -290,6 +412,50 @@ mod tests {
         assert_eq!(repo.repo, "owner/default");
         assert_eq!(repo.label, "triage");
         assert_eq!(repo.project_root, None);
+    }
+
+    #[test]
+    fn github_auto_merge_policy_requires_explicit_opt_in_and_allows_repo_override() {
+        let config: GitHubIntakeConfig = toml::from_str(
+            r#"
+enabled = true
+
+[auto_merge]
+enabled = false
+method = "squash"
+delete_branch = true
+require_review_threads_resolved = true
+require_clean_merge_state = true
+
+[[repos]]
+repo = "owner/auto"
+label = "harness"
+auto_merge = true
+merge_method = "rebase"
+delete_branch = false
+require_review_threads_resolved = false
+require_clean_merge_state = false
+
+[[repos]]
+repo = "owner/manual"
+label = "harness"
+"#,
+        )
+        .expect("config should parse");
+
+        let auto = config.auto_merge_policy_for_repo("owner/auto");
+        assert!(auto.enabled);
+        assert_eq!(auto.method, GitHubMergeMethod::Rebase);
+        assert!(!auto.delete_branch);
+        assert!(!auto.require_review_threads_resolved);
+        assert!(!auto.require_clean_merge_state);
+
+        let manual = config.auto_merge_policy_for_repo("owner/manual");
+        assert!(!manual.enabled);
+        assert_eq!(manual.method, GitHubMergeMethod::Squash);
+        assert!(manual.delete_branch);
+        assert!(manual.require_review_threads_resolved);
+        assert!(manual.require_clean_merge_state);
     }
 }
 

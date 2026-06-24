@@ -63,7 +63,6 @@ impl WorkflowRuntimeStore {
                          'inspect_pr_feedback',
                          'address_pr_feedback'
                      ) THEN 0
-                     WHEN COALESCE(job.data #>> '{input,activity}', '') = 'poll_repo_backlog' THEN 2
                      ELSE 1
                  END ASC,
                  job.created_at ASC

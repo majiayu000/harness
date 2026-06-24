@@ -40,6 +40,7 @@ async fn issue_submission_records_pending_runtime_implementation_command() -> an
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:42"),
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -298,6 +299,7 @@ async fn issue_submission_preserves_prior_task_handles_for_lookup() -> anyhow::R
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -315,6 +317,7 @@ async fn issue_submission_preserves_prior_task_handles_for_lookup() -> anyhow::R
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -376,6 +379,7 @@ async fn cancel_issue_submission_cancels_dispatched_runtime_jobs() -> anyhow::Re
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -449,6 +453,7 @@ async fn cancel_issue_submission_cancels_dispatching_runtime_command() -> anyhow
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -528,6 +533,7 @@ async fn cancel_issue_submission_by_workflow_id_uses_stable_runtime_handle() -> 
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -663,6 +669,7 @@ async fn rejected_issue_submission_keeps_existing_runtime_data() -> anyhow::Resu
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -730,6 +737,7 @@ async fn issue_submission_waits_for_dependencies_then_releases_runtime_command(
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;

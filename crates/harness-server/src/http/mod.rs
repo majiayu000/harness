@@ -17,6 +17,7 @@ use axum::{
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub(crate) mod auth;
+pub(crate) mod auto_merge;
 pub(crate) mod background;
 pub(crate) mod builders;
 pub(crate) mod http_router;
@@ -47,9 +48,9 @@ mod tests_password_reset;
 
 // Re-export all public symbols so callers using `crate::http::*` paths continue to work.
 pub use init::build_app_state;
-pub(crate) use init::build_completion_callback;
 pub use state::{
-    AppState, ConcurrencyServices, CoreServices, EngineServices, IntakeServices,
+    AppState, ConcurrencyServices, CoreServices, EngineServices,
+    GitHubTokenDispatchCounterSnapshot, GitHubTokenDispatchMetric, IntakeServices,
     NotificationServices, ObservabilityServices,
 };
 
@@ -245,21 +246,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // and route repair through workflow-owned PR feedback activities.
     pr_hygiene_background::spawn_runtime_pr_hygiene_sweeper(&state);
 
-    // Periodically ask repo backlog workflows to scan GitHub through runtime
-    // jobs so GitHub intake becomes workflow-owned when the runtime is enabled.
-    background::spawn_runtime_repo_backlog_poller(&state);
-
     // Periodically reap orphaned path-derived Postgres schemas whose owning
     // workspace directory has been removed, bounding catalog growth (storage RFC).
     orphan_reaper::spawn_orphan_schema_reaper(&state);
-
-    // Defensive recovery loop: reset repo_backlog workflows that have been
-    // sitting in non-candidate middle states (scanning / planning_batch /
-    // dispatching / reconciling) for longer than 30 minutes back to `idle`,
-    // so the poller above can re-claim them. Without this, a single dropped
-    // reducer transition (claude empty output, server restart mid-dispatch,
-    // wire-format drift) leaves a repo's intake stuck for hours.
-    crate::stale_workflow_recovery::spawn_stale_workflow_recovery(&state);
 
     // Convert workflow command outbox rows into runtime jobs when the workflow
     // policy keeps the dispatcher enabled.
@@ -295,7 +284,19 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Pass the pre-built GitHub pollers from AppState to the orchestrator so
     // both share the same Arc instances and on_task_complete operates on the
     // live poller's dispatched map.
-    let github_sources = state.intake.github_pollers.clone();
+    let github_sources = state
+        .intake
+        .github_pollers
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, source)| {
+            crate::intake::IntakeSourceRegistration::new(
+                source,
+                state.intake.github_poller_repos.get(index).cloned(),
+            )
+        })
+        .collect();
     crate::intake::build_orchestrator(
         &state.core.server.config.intake,
         state.intake.feishu_intake.clone(),

@@ -4,8 +4,7 @@ use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
     RuntimeJob, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowInstance,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY,
-    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
-    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -287,12 +286,7 @@ fn runtime_workspace_activity_is_ephemeral(
     };
     matches!(
         (workflow.definition_id.as_str(), activity),
-        (REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY)
-            | (
-                REPO_BACKLOG_DEFINITION_ID,
-                REPO_BACKLOG_SPRINT_PLAN_ACTIVITY
-            )
-            | (PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY)
+        (PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY)
             | (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY)
     )
 }
@@ -429,21 +423,26 @@ mod tests {
 
     #[test]
     fn runtime_workspace_finish_action_removes_ephemeral_or_non_reused_workspaces() {
-        let backlog_job = RuntimeJob::pending(
+        let pr_feedback_job = RuntimeJob::pending(
             "command-1",
             RuntimeKind::CodexJsonrpc,
             "codex-default",
-            json!({ "activity": REPO_BACKLOG_POLL_ACTIVITY }),
+            json!({ "activity": PR_FEEDBACK_INSPECT_ACTIVITY }),
         );
-        let backlog = WorkflowInstance::new(
-            REPO_BACKLOG_DEFINITION_ID,
+        let pr_feedback = WorkflowInstance::new(
+            PR_FEEDBACK_DEFINITION_ID,
             1,
-            "scanning",
-            WorkflowSubject::new("repo", "owner/repo"),
+            "inspecting",
+            WorkflowSubject::new("pr", "pr:124"),
         )
-        .with_id("repo-backlog-owner-repo");
+        .with_id("pr-feedback-124");
         assert_eq!(
-            runtime_workspace_finish_action("on_terminal", true, &backlog_job, Some(&backlog)),
+            runtime_workspace_finish_action(
+                "on_terminal",
+                true,
+                &pr_feedback_job,
+                Some(&pr_feedback)
+            ),
             RuntimeWorkspaceFinishAction::Remove
         );
 

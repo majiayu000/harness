@@ -42,12 +42,12 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
         .as_ref()
         .expect("workflow runtime store should be configured");
     let parent = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         1,
-        "dispatching",
-        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
-    .with_id("repo-backlog")
+    .with_id("prompt-task")
     .with_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
@@ -176,7 +176,7 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     assert_eq!(body["pagination"]["summary_only"], false);
     assert_eq!(body["summary"]["total_commands"], 1);
     assert_eq!(body["summary"]["total_runtime_jobs"], 1);
-    assert_eq!(body["workflows"][0]["workflow"]["id"], "repo-backlog");
+    assert_eq!(body["workflows"][0]["workflow"]["id"], "prompt-task");
     let child_node = &body["workflows"][0]["children"][0];
     assert_eq!(child_node["workflow"]["id"], "issue-123");
     assert_eq!(child_node["runtime_job_count"], 1);

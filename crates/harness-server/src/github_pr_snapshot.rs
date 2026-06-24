@@ -1,7 +1,7 @@
 use anyhow::Context;
 use chrono::{SecondsFormat, Utc};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, RemoteFactSnapshot,
     PR_FEEDBACK_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use reqwest::header::{ACCEPT, USER_AGENT};
@@ -18,6 +18,7 @@ pub(crate) const SERVER_PR_SNAPSHOT_ERROR_ARTIFACT: &str = "server_pr_snapshot_e
 pub(crate) struct GitHubPrSnapshotTarget {
     pub repo_slug: String,
     pub pr_number: u64,
+    pub expected_base_ref: Option<String>,
 }
 
 impl GitHubPrSnapshotTarget {
@@ -35,7 +36,17 @@ impl GitHubPrSnapshotTarget {
         Ok(Self {
             repo_slug,
             pr_number,
+            expected_base_ref: None,
         })
+    }
+
+    pub(crate) fn with_expected_base_ref(mut self, base_ref: impl Into<String>) -> Self {
+        let base_ref = base_ref.into();
+        let base_ref = base_ref.trim();
+        if !base_ref.is_empty() {
+            self.expected_base_ref = Some(base_ref.to_string());
+        }
+        self
     }
 }
 
@@ -63,6 +74,61 @@ impl GitHubPrSnapshotArtifacts {
                 self.raw_pr.clone(),
             ))
             .with_signal(signal)
+    }
+
+    pub(crate) fn remote_fact_snapshot(&self) -> anyhow::Result<RemoteFactSnapshot> {
+        let repo = value_string(self.normalized_snapshot.get("repo"))
+            .context("server PR snapshot missing repo")?;
+        let pr_number = value_u64(self.normalized_snapshot.get("pr_number"))
+            .context("server PR snapshot missing pr_number")?;
+        let state = value_string(self.normalized_snapshot.get("state")).unwrap_or_else(|| {
+            pr_readiness_for_snapshot(&self.normalized_snapshot)
+                .as_str()
+                .to_string()
+        });
+        let facts_for_hash = stable_pr_fact_hash_input(&self.normalized_snapshot);
+        let mut snapshot = RemoteFactSnapshot::new(
+            "github",
+            repo,
+            "pull_request",
+            i64::try_from(pr_number)?,
+            state,
+            facts_for_hash,
+            Utc::now(),
+        );
+        snapshot.facts = self.normalized_snapshot.clone();
+        if let Some(url) = value_string(self.normalized_snapshot.get("pr_url")) {
+            snapshot = snapshot.with_subject_url(url);
+        }
+        if let Some(head_sha) = value_string(self.normalized_snapshot.get("head_oid")) {
+            snapshot = snapshot.with_head_sha(head_sha);
+        }
+        Ok(snapshot)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrReadiness {
+    NeedsFeedbackRepair,
+    NeedsCiRepair,
+    WaitingForChecks,
+    WaitingForMergeability,
+    ReadyToMerge,
+    Merged,
+    ClosedUnmerged,
+}
+
+impl PrReadiness {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsFeedbackRepair => "needs_feedback_repair",
+            Self::NeedsCiRepair => "needs_ci_repair",
+            Self::WaitingForChecks => "waiting_for_checks",
+            Self::WaitingForMergeability => "waiting_for_mergeability",
+            Self::ReadyToMerge => "ready_to_merge",
+            Self::Merged => "merged",
+            Self::ClosedUnmerged => "closed_unmerged",
+        }
     }
 }
 
@@ -101,6 +167,7 @@ async fn fetch_github_pr_snapshot_value(
           repository(owner: $owner, name: $repo) {
             pullRequest(number: $pr) {
               number
+              state
               url
               title
               baseRefName
@@ -142,6 +209,12 @@ async fn fetch_github_pr_snapshot_value(
                   additions
                   deletions
                   changeType
+                }
+              }
+              closingIssuesReferences(first: 20) {
+                nodes {
+                  number
+                  url
                 }
               }
             }
@@ -200,8 +273,10 @@ fn normalize_github_pr_snapshot(
 ) -> anyhow::Result<Value> {
     let pr_number = value_u64(pr.get("number")).context("GitHub PR snapshot missing number")?;
     let pr_url = value_string(pr.get("url")).context("GitHub PR snapshot missing url")?;
+    let state = value_string(pr.get("state"));
     let title = value_string(pr.get("title"));
     let base_ref = value_string(pr.get("baseRefName"));
+    let expected_base_ref = target.expected_base_ref.clone();
     let head_ref = value_string(pr.get("headRefName"));
     let head_oid = value_string(pr.get("headRefOid"));
     let is_draft = pr.get("isDraft").and_then(Value::as_bool);
@@ -213,6 +288,7 @@ fn normalize_github_pr_snapshot(
         .and_then(|value| value_string(Some(value)));
     let active_threads = active_unresolved_review_threads(pr);
     let changed_files = changed_files(pr);
+    let closing_issues = closing_issues(pr);
     let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let review_threads_complete = !connection_has_next_page(pr, "reviewThreads");
     let changed_files_complete = !connection_has_next_page(pr, "files");
@@ -223,11 +299,13 @@ fn normalize_github_pr_snapshot(
         "observed_at": observed_at,
         "repo": target.repo_slug,
         "pr_number": pr_number,
+        "state": state,
         "pr_url": pr_url,
         "url": pr_url,
         "title": title,
         "base_ref": base_ref,
         "baseRefName": base_ref,
+        "expected_base_ref": expected_base_ref,
         "head_ref": head_ref,
         "headRefName": head_ref,
         "head_oid": head_oid,
@@ -246,6 +324,7 @@ fn normalize_github_pr_snapshot(
         "review_threads_complete": review_threads_complete,
         "changed_files": changed_files,
         "changed_files_complete": changed_files_complete,
+        "closing_issues": closing_issues,
     }))
 }
 
@@ -286,6 +365,17 @@ fn changed_files(pr: &Value) -> Vec<Value> {
                 "deletions": value_u64(file.get("deletions")),
                 "change_type": value_string(file.get("changeType")),
                 "changeType": value_string(file.get("changeType")),
+            })
+        })
+        .collect()
+}
+
+fn closing_issues(pr: &Value) -> Vec<Value> {
+    connection_nodes(pr, "closingIssuesReferences")
+        .map(|issue| {
+            json!({
+                "number": value_u64(issue.get("number")),
+                "url": value_string(issue.get("url")),
             })
         })
         .collect()
@@ -348,15 +438,60 @@ fn pr_feedback_signal_type(snapshot: &Value) -> &'static str {
     if snapshot_merge_state_requires_repair(snapshot) {
         return "FeedbackFound";
     }
+    if !snapshot_base_ref_matches_expected(snapshot) {
+        return "FeedbackFound";
+    }
     if snapshot_check_failed(snapshot) {
         return "ChecksFailed";
     }
     "NoFeedbackFound"
 }
 
+pub(crate) fn pr_readiness_for_snapshot(snapshot: &Value) -> PrReadiness {
+    if string_eq(snapshot, "state", "MERGED") {
+        return PrReadiness::Merged;
+    }
+    if string_eq(snapshot, "state", "CLOSED") {
+        return PrReadiness::ClosedUnmerged;
+    }
+    if snapshot_allows_ready(snapshot) {
+        return PrReadiness::ReadyToMerge;
+    }
+    if snapshot_check_failed(snapshot) {
+        return PrReadiness::NeedsCiRepair;
+    }
+    if !string_eq(snapshot, "status_check_rollup_state", "SUCCESS") {
+        return PrReadiness::WaitingForChecks;
+    }
+    if snapshot_review_threads_incomplete(snapshot)
+        || string_eq(snapshot, "review_decision", "CHANGES_REQUESTED")
+        || snapshot
+            .get("active_unresolved_review_threads_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        || snapshot_merge_state_requires_repair(snapshot)
+    {
+        return PrReadiness::NeedsFeedbackRepair;
+    }
+    if !string_eq(snapshot, "merge_state_status", "CLEAN") {
+        return PrReadiness::WaitingForMergeability;
+    }
+    PrReadiness::NeedsFeedbackRepair
+}
+
+fn stable_pr_fact_hash_input(snapshot: &Value) -> Value {
+    let mut stable = snapshot.clone();
+    if let Some(object) = stable.as_object_mut() {
+        object.remove("observed_at");
+    }
+    stable
+}
+
 fn snapshot_allows_ready(snapshot: &Value) -> bool {
     string_eq(snapshot, "status_check_rollup_state", "SUCCESS")
         && string_eq(snapshot, "merge_state_status", "CLEAN")
+        && snapshot_base_ref_matches_expected(snapshot)
         && string_eq(snapshot, "review_decision", "APPROVED")
         && snapshot.get("is_draft").and_then(Value::as_bool) == Some(false)
         && snapshot
@@ -364,6 +499,13 @@ fn snapshot_allows_ready(snapshot: &Value) -> bool {
             .and_then(Value::as_u64)
             == Some(0)
         && snapshot_review_threads_complete(snapshot)
+}
+
+fn snapshot_base_ref_matches_expected(snapshot: &Value) -> bool {
+    let Some(expected_base_ref) = value_string(snapshot.get("expected_base_ref")) else {
+        return true;
+    };
+    value_string(snapshot.get("base_ref")).is_some_and(|base_ref| base_ref == expected_base_ref)
 }
 
 fn snapshot_review_threads_incomplete(snapshot: &Value) -> bool {
@@ -421,6 +563,10 @@ fn pr_feedback_summary(signal_type: &str, snapshot: &Value) -> String {
                 format!(
                     "Server-owned PR snapshot found mergeability repair is needed on PR #{pr_number}."
                 )
+            } else if !snapshot_base_ref_matches_expected(snapshot) {
+                format!(
+                    "Server-owned PR snapshot found PR #{pr_number} targets the wrong base branch."
+                )
             } else {
                 format!("Server-owned PR snapshot found active review feedback on PR #{pr_number}.")
             }
@@ -471,156 +617,5 @@ pub(crate) fn github_pr_snapshot_failure_result(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ready_pr() -> Value {
-        json!({
-            "number": 77,
-            "url": "https://github.com/owner/repo/pull/77",
-            "title": "Ready PR",
-            "baseRefName": "main",
-            "headRefName": "feature",
-            "headRefOid": "abc123",
-            "isDraft": false,
-            "mergeStateStatus": "CLEAN",
-            "reviewDecision": "APPROVED",
-            "statusCheckRollup": {"state": "SUCCESS"},
-            "reviewThreads": {
-                "pageInfo": {"hasNextPage": false, "endCursor": null},
-                "nodes": [
-                    {"id": "resolved", "path": "src/lib.rs", "line": 1, "isResolved": true, "isOutdated": false}
-                ]
-            },
-            "files": {
-                "pageInfo": {"hasNextPage": false, "endCursor": null},
-                "nodes": [
-                    {"path": "src/lib.rs", "additions": 3, "deletions": 1, "changeType": "MODIFIED"}
-                ]
-            }
-        })
-    }
-
-    #[test]
-    fn maps_graphql_pr_to_runtime_snapshot_artifact() {
-        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
-        let snapshot = normalize_github_pr_snapshot(&target, &ready_pr()).unwrap();
-
-        assert_eq!(snapshot["schema"], SERVER_PR_SNAPSHOT_SCHEMA);
-        assert_eq!(snapshot["snapshot_source"], "server_github_graphql");
-        assert_eq!(snapshot["repo"], "owner/repo");
-        assert_eq!(snapshot["pr_number"], 77);
-        assert_eq!(snapshot["pr_url"], "https://github.com/owner/repo/pull/77");
-        assert_eq!(snapshot["head_oid"], "abc123");
-        assert_eq!(snapshot["status_check_rollup_state"], "SUCCESS");
-        assert_eq!(snapshot["merge_state_status"], "CLEAN");
-        assert_eq!(snapshot["review_decision"], "APPROVED");
-        assert_eq!(snapshot["is_draft"], false);
-        assert_eq!(snapshot["active_unresolved_review_threads_count"], 0);
-        assert_eq!(snapshot["changed_files"][0]["path"], "src/lib.rs");
-        assert_eq!(snapshot["review_threads_complete"], true);
-    }
-
-    #[test]
-    fn ready_pr_emits_pr_ready_to_merge_signal() {
-        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
-        let snapshot = normalize_github_pr_snapshot(&target, &ready_pr()).unwrap();
-        let artifacts = GitHubPrSnapshotArtifacts {
-            raw_pr: ready_pr(),
-            normalized_snapshot: snapshot,
-        };
-
-        let result = artifacts.activity_result("inspect_pr_feedback");
-
-        assert_eq!(
-            result.status,
-            harness_workflow::runtime::ActivityStatus::Succeeded
-        );
-        assert_eq!(result.signals[0].signal_type, "PrReadyToMerge");
-        assert!(result
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.artifact_type == SERVER_PR_SNAPSHOT_ARTIFACT));
-        assert!(result
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.artifact_type == PR_FEEDBACK_SNAPSHOT_ARTIFACT));
-    }
-
-    #[test]
-    fn unresolved_review_threads_emit_blocking_feedback() {
-        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
-        let mut pr = ready_pr();
-        pr["reviewThreads"]["nodes"] = json!([
-            {"id": "thread-1", "path": "src/lib.rs", "line": 10, "isResolved": false, "isOutdated": false}
-        ]);
-        let snapshot = normalize_github_pr_snapshot(&target, &pr).unwrap();
-
-        let signal = pr_feedback_signal_for_snapshot(&snapshot);
-
-        assert_eq!(snapshot["active_unresolved_review_threads_count"], 1);
-        assert_eq!(signal.signal_type, "FeedbackFound");
-    }
-
-    #[test]
-    fn incomplete_review_thread_page_emits_blocking_feedback() {
-        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
-        let mut pr = ready_pr();
-        pr["reviewThreads"]["pageInfo"]["hasNextPage"] = json!(true);
-        let snapshot = normalize_github_pr_snapshot(&target, &pr).unwrap();
-
-        let signal = pr_feedback_signal_for_snapshot(&snapshot);
-
-        assert_eq!(snapshot["review_threads_complete"], false);
-        assert_eq!(signal.signal_type, "FeedbackFound");
-    }
-
-    #[test]
-    fn missing_review_thread_completeness_emits_blocking_feedback() {
-        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
-        let mut snapshot = normalize_github_pr_snapshot(&target, &ready_pr()).unwrap();
-        let Some(snapshot_object) = snapshot.as_object_mut() else {
-            panic!("snapshot should be an object");
-        };
-        snapshot_object.remove("review_threads_complete");
-
-        let signal = pr_feedback_signal_for_snapshot(&snapshot);
-
-        assert_eq!(signal.signal_type, "FeedbackFound");
-    }
-
-    #[test]
-    fn dirty_merge_state_emits_blocking_feedback() {
-        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
-        let mut pr = ready_pr();
-        pr["mergeStateStatus"] = json!("DIRTY");
-        let snapshot = normalize_github_pr_snapshot(&target, &pr).unwrap();
-
-        let signal = pr_feedback_signal_for_snapshot(&snapshot);
-
-        assert_eq!(snapshot["merge_state_status"], "DIRTY");
-        assert_eq!(signal.signal_type, "FeedbackFound");
-    }
-
-    #[test]
-    fn github_graphql_error_is_failed_external_dependency() {
-        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
-        let error = anyhow::anyhow!("GitHub PR snapshot query returned errors");
-
-        let result =
-            github_pr_snapshot_failure_result("inspect_pr_feedback", Some(&target), &error);
-
-        assert_eq!(
-            result.status,
-            harness_workflow::runtime::ActivityStatus::Failed
-        );
-        assert_eq!(
-            result.error_kind,
-            Some(ActivityErrorKind::ExternalDependency)
-        );
-        assert_eq!(
-            result.artifacts[0].artifact_type,
-            SERVER_PR_SNAPSHOT_ERROR_ARTIFACT
-        );
-    }
-}
+#[path = "github_pr_snapshot_tests.rs"]
+mod tests;

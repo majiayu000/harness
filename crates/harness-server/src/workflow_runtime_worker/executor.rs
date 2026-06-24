@@ -12,9 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::activity_result::activity_result_from_turn;
-use super::child_workflow::{
-    execute_mark_bound_issue_done, execute_recover_issue_workflow, execute_start_child_workflow,
-};
+use super::child_workflow::execute_start_child_workflow;
 use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
     prompt_task_request_for_job, PromptTaskRequest,
@@ -36,7 +34,6 @@ use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 
 const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS: u64 = 3600;
-const DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS: u64 = 3600;
 const RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT: &str =
     "runtime_workspace_finalization_warning";
 
@@ -236,12 +233,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             "start_child_workflow" => Ok(Some(
                 execute_start_child_workflow(self.state, job, parent).await?,
             )),
-            "mark_bound_issue_done" => Ok(Some(
-                execute_mark_bound_issue_done(self.state, job, parent).await?,
-            )),
-            "recover_issue_workflow" => Ok(Some(
-                execute_recover_issue_workflow(self.state, job, parent).await?,
-            )),
             activity if activity == harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY => Ok(
                 Some(execute_pr_feedback_inspection(self.state, job, parent).await),
             ),
@@ -411,7 +402,6 @@ fn profile_timeout(profile: &RuntimeDispatchProfileOverride) -> Option<u64> {
 fn default_runtime_timeout(activity: &str) -> Option<u64> {
     Some(match activity {
         "inspect_pr_feedback" => DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS,
-        "poll_repo_backlog" => DEFAULT_REPO_BACKLOG_POLL_TIMEOUT_SECS,
         _ => DEFAULT_RUNTIME_TURN_TIMEOUT_SECS,
     })
 }
@@ -566,10 +556,6 @@ mod tests {
                 Some(&workflow("pr_feedback")),
                 &runtime_job("inspect_pr_feedback")
             ),
-            Some(3600)
-        );
-        assert_eq!(
-            runtime_timeout_fallback(&config, None, &runtime_job("poll_repo_backlog")),
             Some(3600)
         );
         assert_eq!(

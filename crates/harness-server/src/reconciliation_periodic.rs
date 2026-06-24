@@ -29,7 +29,7 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
             state.core.server.config.server.github_token.as_deref(),
         )
         .await;
-        record_repo_backlog_reconciliation_transitions(&state, &report).await;
+        record_issue_workflow_reconciliation_transitions(&state, &report).await;
 
         // Clean up workspaces for tasks that were just terminated by reconciliation.
         if let Some(ref wmgr) = state.concurrency.workspace_mgr {
@@ -58,7 +58,7 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
     }
 }
 
-async fn record_repo_backlog_reconciliation_transitions(
+async fn record_issue_workflow_reconciliation_transitions(
     state: &Arc<AppState>,
     report: &ReconciliationReport,
 ) {
@@ -86,18 +86,36 @@ async fn record_repo_backlog_reconciliation_transitions(
             .project_root
             .as_deref()
             .unwrap_or(&state.core.project_root);
-        crate::workflow_runtime_repo_backlog::record_merged_pr(
-            state.core.workflow_runtime_store.as_deref(),
-            state.core.issue_workflow_store.as_deref(),
-            crate::workflow_runtime_repo_backlog::MergedPrRuntimeContext {
-                project_root,
-                repo: task.repo.as_deref(),
-                issue_number,
-                pr_number,
-                pr_url: task.pr_url.as_deref(),
-                detail: &transition.reason,
-            },
-        )
-        .await;
+        if let Some(issue_workflows) = state.core.issue_workflow_store.as_deref() {
+            let project_id = project_root.to_string_lossy();
+            let result = if let Some(issue_number) = issue_number {
+                issue_workflows
+                    .record_pr_merged_for_issue(
+                        &project_id,
+                        task.repo.as_deref(),
+                        issue_number,
+                        pr_number,
+                        task.pr_url.as_deref(),
+                        Some(&transition.reason),
+                    )
+                    .await
+            } else {
+                issue_workflows
+                    .record_pr_merged(
+                        &project_id,
+                        task.repo.as_deref(),
+                        pr_number,
+                        Some(&transition.reason),
+                    )
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    task_id = %task.id,
+                    pr_number,
+                    "reconciliation: failed to record merged PR in issue workflow store: {error}"
+                );
+            }
+        }
     }
 }

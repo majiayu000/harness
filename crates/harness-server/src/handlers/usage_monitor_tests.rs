@@ -114,7 +114,7 @@ fn active_counts_skip_terminal_invocations() {
         ),
         test_invocation(
             "owner/done",
-            "poll_repo_backlog",
+            "quality_gate",
             "succeeded",
             "high",
             Some("active_leased"),

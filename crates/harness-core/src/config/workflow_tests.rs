@@ -33,9 +33,6 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.pr_feedback.dirty_age_to_comment_secs, 604800);
     assert_eq!(cfg.pr_feedback.rebase_needed_label, "rebase-needed");
     assert_eq!(cfg.pr_feedback.hygiene_batch_limit, 25);
-    assert!(cfg.repo_backlog.enabled);
-    assert_eq!(cfg.repo_backlog.poll_interval_secs, 60);
-    assert_eq!(cfg.repo_backlog.batch_limit, 128);
     assert!(cfg.runtime_dispatch.enabled);
     assert_eq!(cfg.runtime_dispatch.interval_secs, 30);
     assert_eq!(cfg.runtime_dispatch.batch_limit, 25);
@@ -48,27 +45,7 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.runtime_dispatch.max_turns, None);
     assert_eq!(cfg.runtime_dispatch.timeout_secs, None);
     assert!(cfg.runtime_dispatch.workflow_profiles.is_empty());
-    assert_eq!(
-        cfg.runtime_dispatch
-            .activity_profiles
-            .get("poll_repo_backlog")
-            .and_then(|profile| profile.runtime_kind.as_deref()),
-        Some("codex_exec")
-    );
-    assert_eq!(
-        cfg.runtime_dispatch
-            .activity_profiles
-            .get("poll_repo_backlog")
-            .and_then(|profile| profile.runtime_profile.as_deref()),
-        Some("codex-backlog-exec")
-    );
-    assert_eq!(
-        cfg.runtime_dispatch
-            .activity_profiles
-            .get("poll_repo_backlog")
-            .and_then(|profile| profile.timeout_secs),
-        Some(3600)
-    );
+    assert!(cfg.runtime_dispatch.activity_profiles.is_empty());
     assert!(cfg.runtime_dispatch.workflow_activity_profiles.is_empty());
     assert!(cfg.runtime_worker.enabled);
     assert_eq!(cfg.runtime_worker.interval_secs, 5);
@@ -161,10 +138,6 @@ pr_feedback:
   dirty_age_to_comment_secs: 1803
   rebase_needed_label: needs-rebase
   hygiene_batch_limit: 6
-repo_backlog:
-  enabled: false
-  poll_interval_secs: 20
-  batch_limit: 9
 runtime_dispatch:
   enabled: true
   interval_secs: 5
@@ -184,9 +157,6 @@ runtime_dispatch:
       model: gpt-5.4
       reasoning_effort: high
       max_turns: 8
-    repo_backlog:
-      runtime_profile: codex-backlog
-      timeout_secs: 120
   activity_profiles:
     replan_issue:
       runtime_profile: codex-replan
@@ -269,9 +239,6 @@ Body
     assert_eq!(cfg.pr_feedback.dirty_age_to_comment_secs, 1803);
     assert_eq!(cfg.pr_feedback.rebase_needed_label, "needs-rebase");
     assert_eq!(cfg.pr_feedback.hygiene_batch_limit, 6);
-    assert!(!cfg.repo_backlog.enabled);
-    assert_eq!(cfg.repo_backlog.poll_interval_secs, 20);
-    assert_eq!(cfg.repo_backlog.batch_limit, 9);
     assert!(cfg.runtime_dispatch.enabled);
     assert_eq!(cfg.runtime_dispatch.interval_secs, 5);
     assert_eq!(cfg.runtime_dispatch.batch_limit, 7);
@@ -308,17 +275,6 @@ Body
     assert_eq!(issue_profile.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(issue_profile.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(issue_profile.max_turns, Some(8));
-    let backlog_profile = cfg
-        .runtime_dispatch
-        .workflow_profiles
-        .get("repo_backlog")
-        .expect("repo backlog override should parse");
-    assert_eq!(backlog_profile.runtime_kind, None);
-    assert_eq!(
-        backlog_profile.runtime_profile.as_deref(),
-        Some("codex-backlog")
-    );
-    assert_eq!(backlog_profile.timeout_secs, Some(120));
     let replan_profile = cfg
         .runtime_dispatch
         .activity_profiles
@@ -330,27 +286,6 @@ Body
     );
     assert_eq!(replan_profile.model.as_deref(), Some("gpt-5.4-mini"));
     assert_eq!(replan_profile.timeout_secs, Some(180));
-    assert_eq!(
-        cfg.runtime_dispatch
-            .activity_profiles
-            .get("poll_repo_backlog")
-            .and_then(|profile| profile.runtime_kind.as_deref()),
-        Some("codex_exec")
-    );
-    assert_eq!(
-        cfg.runtime_dispatch
-            .activity_profiles
-            .get("poll_repo_backlog")
-            .and_then(|profile| profile.runtime_profile.as_deref()),
-        Some("codex-backlog-exec")
-    );
-    assert_eq!(
-        cfg.runtime_dispatch
-            .activity_profiles
-            .get("poll_repo_backlog")
-            .and_then(|profile| profile.timeout_secs),
-        Some(3600)
-    );
     let issue_replan_profile = cfg
         .runtime_dispatch
         .workflow_activity_profiles
@@ -423,18 +358,20 @@ fn load_workflow_document_reads_prompt_template_body() -> anyhow::Result<()> {
 }
 
 #[test]
-fn load_workflow_config_merges_poll_activity_profile_defaults() -> anyhow::Result<()> {
+fn load_workflow_config_reads_custom_activity_profile_overrides() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(
         dir.path().join("WORKFLOW.md"),
         r#"---
 runtime_dispatch:
   activity_profiles:
-    poll_repo_backlog:
+    inspect_pr:
+      runtime_kind: codex_exec
+      runtime_profile: codex-pr-inspector
       timeout_secs: 7200
   workflow_activity_profiles:
-    repo_backlog:
-      poll_repo_backlog:
+    github_issue_pr:
+      inspect_pr:
         timeout_secs: 5400
 ---
 Body
@@ -442,27 +379,24 @@ Body
     )?;
 
     let cfg = load_workflow_config(dir.path())?;
-    let poll_profile = cfg
-        .runtime_dispatch
-        .activity_profiles
-        .get("poll_repo_backlog");
+    let inspect_profile = cfg.runtime_dispatch.activity_profiles.get("inspect_pr");
     assert_eq!(
-        poll_profile.and_then(|profile| profile.runtime_kind.as_deref()),
+        inspect_profile.and_then(|profile| profile.runtime_kind.as_deref()),
         Some("codex_exec")
     );
     assert_eq!(
-        poll_profile.and_then(|profile| profile.runtime_profile.as_deref()),
-        Some("codex-backlog-exec")
+        inspect_profile.and_then(|profile| profile.runtime_profile.as_deref()),
+        Some("codex-pr-inspector")
     );
     assert_eq!(
-        poll_profile.and_then(|profile| profile.timeout_secs),
+        inspect_profile.and_then(|profile| profile.timeout_secs),
         Some(7200)
     );
     assert_eq!(
         cfg.runtime_dispatch
             .workflow_activity_profiles
-            .get("repo_backlog")
-            .and_then(|profiles| profiles.get("poll_repo_backlog"))
+            .get("github_issue_pr")
+            .and_then(|profiles| profiles.get("inspect_pr"))
             .and_then(|profile| profile.timeout_secs),
         Some(5400)
     );
@@ -525,11 +459,11 @@ fn load_workflow_config_reads_crlf_front_matter_delimiter_at_eof() -> anyhow::Re
 #[test]
 fn deep_merge_yaml_overrides_only_declared_fields() {
     let base: serde_yaml::Value = serde_yaml::from_str(
-        "runtime_retry_policy:\n  max_failed_activity_retries: 6\n  retry_delay_secs: 30\nrepo_backlog:\n  enabled: true\n  poll_interval_secs: 60\n",
+        "runtime_retry_policy:\n  max_failed_activity_retries: 6\n  retry_delay_secs: 30\nactivity_profiles:\n  implement_issue:\n    prompt: base\n",
     )
     .unwrap();
     let over: serde_yaml::Value = serde_yaml::from_str(
-        "runtime_retry_policy:\n  max_failed_activity_retries: 2\nrepo_backlog:\n  poll_interval_secs: 900\n",
+        "runtime_retry_policy:\n  max_failed_activity_retries: 2\nactivity_profiles:\n  implement_issue:\n    validation:\n      - cargo test\n",
     )
     .unwrap();
 
@@ -546,10 +480,13 @@ fn deep_merge_yaml_overrides_only_declared_fields() {
         Some(30)
     );
     assert_eq!(
-        merged["repo_backlog"]["poll_interval_secs"].as_u64(),
-        Some(900)
+        merged["activity_profiles"]["implement_issue"]["prompt"].as_str(),
+        Some("base")
     );
-    assert_eq!(merged["repo_backlog"]["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        merged["activity_profiles"]["implement_issue"]["validation"][0].as_str(),
+        Some("cargo test")
+    );
 }
 
 #[test]
@@ -566,21 +503,20 @@ fn load_workflow_document_merges_base_then_repo_override() -> anyhow::Result<()>
     let base_path = base_dir.path().join("WORKFLOW.md");
     std::fs::write(
         &base_path,
-        "---\nrepo_backlog:\n  enabled: true\n  poll_interval_secs: 60\nruntime_retry_policy:\n  max_failed_activity_retries: 6\n  retry_delay_secs: 30\n---\nbase body\n",
+        "---\nruntime_worker:\n  concurrency: 4\nruntime_retry_policy:\n  max_failed_activity_retries: 6\n  retry_delay_secs: 30\n---\nbase body\n",
     )?;
 
     let repo_dir = tempfile::tempdir()?;
     std::fs::write(
         repo_dir.path().join("WORKFLOW.md"),
-        "---\nrepo_backlog:\n  poll_interval_secs: 900\n---\nrepo body\n",
+        "---\nruntime_worker:\n  interval_secs: 9\n---\nrepo body\n",
     )?;
 
     let doc = load_workflow_document_with_base(repo_dir.path(), Some(&base_path))?;
 
-    // Repo overrides the field it declares.
-    assert_eq!(doc.config.repo_backlog.poll_interval_secs, 900);
-    // Base fields not declared by the repo survive.
-    assert!(doc.config.repo_backlog.enabled);
+    // Repo overrides the field it declares while base sibling fields survive.
+    assert_eq!(doc.config.runtime_worker.interval_secs, 9);
+    assert_eq!(doc.config.runtime_worker.concurrency, 4);
     assert_eq!(
         doc.config.runtime_retry_policy.max_failed_activity_retries,
         Some(6)
@@ -615,7 +551,7 @@ fn load_workflow_document_inherits_base_when_repo_absent() -> anyhow::Result<()>
 fn workflow_path_identity_treats_canonical_and_relative_same_file_as_equal() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let repo_path = dir.path().join(".").join("WORKFLOW.md");
-    std::fs::write(&repo_path, "---\nrepo_backlog:\n  enabled: false\n---\n")?;
+    std::fs::write(&repo_path, "---\nruntime_worker:\n  enabled: false\n---\n")?;
     let base_path = std::fs::canonicalize(dir.path().join("WORKFLOW.md"))?;
 
     assert!(!workflow_paths_are_distinct(&base_path, &repo_path));

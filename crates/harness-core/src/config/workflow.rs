@@ -125,16 +125,6 @@ pub struct PrFeedbackPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoBacklogPolicy {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_repo_backlog_poll_interval_secs")]
-    pub poll_interval_secs: u64,
-    #[serde(default = "default_repo_backlog_batch_limit")]
-    pub batch_limit: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeDispatchPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -247,8 +237,6 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub pr_scope_guard: PrScopeGuardPolicy,
     #[serde(default)]
-    pub repo_backlog: RepoBacklogPolicy,
-    #[serde(default)]
     pub pr_feedback: PrFeedbackPolicy,
     #[serde(default)]
     pub runtime_dispatch: RuntimeDispatchPolicy,
@@ -308,16 +296,6 @@ impl Default for PrFeedbackPolicy {
             dirty_age_to_comment_secs: default_pr_hygiene_dirty_age_to_comment_secs(),
             rebase_needed_label: default_pr_hygiene_rebase_needed_label(),
             hygiene_batch_limit: default_pr_hygiene_batch_limit(),
-        }
-    }
-}
-
-impl Default for RepoBacklogPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: default_true(),
-            poll_interval_secs: default_repo_backlog_poll_interval_secs(),
-            batch_limit: default_repo_backlog_batch_limit(),
         }
     }
 }
@@ -515,14 +493,6 @@ fn default_pr_hygiene_batch_limit() -> u32 {
     25
 }
 
-fn default_repo_backlog_poll_interval_secs() -> u64 {
-    60
-}
-
-fn default_repo_backlog_batch_limit() -> u32 {
-    128
-}
-
 fn default_runtime_dispatch_interval_secs() -> u64 {
     30
 }
@@ -533,15 +503,7 @@ fn default_runtime_dispatch_batch_limit() -> u32 {
 
 fn default_runtime_dispatch_activity_profiles() -> BTreeMap<String, RuntimeDispatchProfileOverride>
 {
-    BTreeMap::from([(
-        "poll_repo_backlog".to_string(),
-        RuntimeDispatchProfileOverride {
-            runtime_kind: Some("codex_exec".to_string()),
-            runtime_profile: Some("codex-backlog-exec".to_string()),
-            timeout_secs: Some(3600),
-            ..Default::default()
-        },
-    )])
+    BTreeMap::new()
 }
 
 fn default_runtime_worker_interval_secs() -> u64 {

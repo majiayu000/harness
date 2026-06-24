@@ -360,10 +360,19 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         interceptors: services.interceptors,
         startup_statuses,
         degraded_subsystems,
-        intake: IntakeServices {
-            feishu_intake: intake.feishu_intake,
-            github_pollers: intake.github_pollers.into_iter().map(|(_, p)| p).collect(),
-            completion_callback: intake.completion_callback,
+        intake: {
+            let github_poller_repos = intake
+                .github_pollers
+                .iter()
+                .filter_map(|(key, _)| key.strip_prefix("github:").map(ToOwned::to_owned))
+                .collect();
+            IntakeServices {
+                feishu_intake: intake.feishu_intake,
+                github_pollers: intake.github_pollers.into_iter().map(|(_, p)| p).collect(),
+                github_poller_repos,
+                completion_callback: intake.completion_callback,
+                token_dispatch_counters: IntakeServices::new_token_dispatch_counters(),
+            }
         },
         project_svc: services.project_svc,
         task_svc: services.task_svc,

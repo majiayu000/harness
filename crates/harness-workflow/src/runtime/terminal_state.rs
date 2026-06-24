@@ -19,7 +19,7 @@ mod tests {
             Some(WorkflowTerminalState::Failed)
         );
         assert_eq!(
-            workflow_terminal_state("repo_backlog", "cancelled"),
+            workflow_terminal_state("pr_feedback", "cancelled"),
             Some(WorkflowTerminalState::Cancelled)
         );
     }

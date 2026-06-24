@@ -89,8 +89,8 @@ fn runtime_prompt_input_event(
 
 pub(super) fn execution_phase_for_runtime_activity(activity: &str) -> Option<ExecutionPhase> {
     match activity {
-        "triage_issue" | "poll_repo_backlog" => Some(ExecutionPhase::Triage),
-        "plan_issue" | "replan_issue" | "plan_repo_sprint" => Some(ExecutionPhase::Planning),
+        "triage_issue" => Some(ExecutionPhase::Triage),
+        "plan_issue" | "replan_issue" => Some(ExecutionPhase::Planning),
         "implement_issue" | "implement_prompt" | "address_pr_feedback" => {
             Some(ExecutionPhase::Execution)
         }

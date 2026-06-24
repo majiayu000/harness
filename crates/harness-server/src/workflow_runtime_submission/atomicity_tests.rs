@@ -40,6 +40,7 @@ async fn rejected_new_issue_submission_does_not_persist_live_instance_or_command
         dependencies_blocked: false,
         source: Some("github"),
         external_id: Some("issue:409"),
+        remote_fact_hash: None,
     };
     let decision = WorkflowDecision::new(
         &workflow_id,
@@ -96,6 +97,7 @@ async fn accepted_issue_replay_repairs_pending_command_without_advancing_instanc
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:410"),
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -118,6 +120,7 @@ async fn accepted_issue_replay_repairs_pending_command_without_advancing_instanc
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:410"),
+            remote_fact_hash: None,
         },
     )
     .await?;

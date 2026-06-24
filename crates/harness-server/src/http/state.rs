@@ -1,6 +1,7 @@
 use crate::task_runner;
 use dashmap::DashMap;
 use harness_protocol::notifications::RpcNotification;
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -132,8 +133,118 @@ pub struct IntakeServices {
     /// `on_task_complete` (e.g. evicting a failed issue from `dispatched`)
     /// operates on the live poller rather than a detached clone.
     pub github_pollers: Vec<Arc<dyn crate::intake::IntakeSource>>,
+    /// Repository slug for each GitHub poller, aligned by index with
+    /// `github_pollers`.
+    pub github_poller_repos: Vec<String>,
     /// Completion callback invoked when a task reaches a terminal state.
     pub completion_callback: Option<task_runner::CompletionCallback>,
+    /// Per-repo intake and runtime-agent dispatch counters used by operator
+    /// monitoring to distinguish cheap server polling from token-consuming
+    /// agent work.
+    pub token_dispatch_counters: Arc<DashMap<String, Arc<GitHubTokenDispatchCounters>>>,
+}
+
+impl IntakeServices {
+    pub fn new_token_dispatch_counters() -> Arc<DashMap<String, Arc<GitHubTokenDispatchCounters>>> {
+        Arc::new(DashMap::new())
+    }
+
+    pub fn record_github_token_dispatch(&self, repo: &str, metric: GitHubTokenDispatchMetric) {
+        let repo = repo.trim();
+        if repo.is_empty() {
+            return;
+        }
+        let counters = self
+            .token_dispatch_counters
+            .entry(repo.to_string())
+            .or_insert_with(|| Arc::new(GitHubTokenDispatchCounters::default()))
+            .clone();
+        counters.record(metric);
+    }
+
+    pub fn github_token_dispatch_snapshot(&self) -> Vec<GitHubTokenDispatchCounterSnapshot> {
+        let mut snapshots = self
+            .token_dispatch_counters
+            .iter()
+            .map(|entry| entry.value().snapshot(entry.key()))
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.repo.cmp(&right.repo));
+        snapshots
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubTokenDispatchMetric {
+    ServerGithubPoll,
+    AgentImplementIssue,
+    AgentAddressFeedback,
+    AgentMergePr,
+    AgentDependencyAnalysis,
+    AgentSkippedCoveredIssue,
+    AgentSkippedSameFactHash,
+}
+
+#[derive(Debug, Default)]
+pub struct GitHubTokenDispatchCounters {
+    server_github_poll_count: AtomicU64,
+    agent_implement_issue_count: AtomicU64,
+    agent_address_feedback_count: AtomicU64,
+    agent_merge_pr_count: AtomicU64,
+    agent_dependency_analysis_count: AtomicU64,
+    agent_skipped_covered_issue_count: AtomicU64,
+    agent_skipped_same_fact_hash_count: AtomicU64,
+}
+
+impl GitHubTokenDispatchCounters {
+    fn record(&self, metric: GitHubTokenDispatchMetric) {
+        let counter = match metric {
+            GitHubTokenDispatchMetric::ServerGithubPoll => &self.server_github_poll_count,
+            GitHubTokenDispatchMetric::AgentImplementIssue => &self.agent_implement_issue_count,
+            GitHubTokenDispatchMetric::AgentAddressFeedback => &self.agent_address_feedback_count,
+            GitHubTokenDispatchMetric::AgentMergePr => &self.agent_merge_pr_count,
+            GitHubTokenDispatchMetric::AgentDependencyAnalysis => {
+                &self.agent_dependency_analysis_count
+            }
+            GitHubTokenDispatchMetric::AgentSkippedCoveredIssue => {
+                &self.agent_skipped_covered_issue_count
+            }
+            GitHubTokenDispatchMetric::AgentSkippedSameFactHash => {
+                &self.agent_skipped_same_fact_hash_count
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, repo: &str) -> GitHubTokenDispatchCounterSnapshot {
+        GitHubTokenDispatchCounterSnapshot {
+            repo: repo.to_string(),
+            server_github_poll_count: self.server_github_poll_count.load(Ordering::Relaxed),
+            agent_implement_issue_count: self.agent_implement_issue_count.load(Ordering::Relaxed),
+            agent_address_feedback_count: self.agent_address_feedback_count.load(Ordering::Relaxed),
+            agent_merge_pr_count: self.agent_merge_pr_count.load(Ordering::Relaxed),
+            agent_dependency_analysis_count: self
+                .agent_dependency_analysis_count
+                .load(Ordering::Relaxed),
+            agent_skipped_covered_issue_count: self
+                .agent_skipped_covered_issue_count
+                .load(Ordering::Relaxed),
+            agent_skipped_same_fact_hash_count: self
+                .agent_skipped_same_fact_hash_count
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GitHubTokenDispatchCounterSnapshot {
+    pub repo: String,
+    pub server_github_poll_count: u64,
+    pub agent_implement_issue_count: u64,
+    pub agent_address_feedback_count: u64,
+    pub agent_merge_pr_count: u64,
+    pub agent_dependency_analysis_count: u64,
+    pub agent_skipped_covered_issue_count: u64,
+    pub agent_skipped_same_fact_hash_count: u64,
 }
 
 pub struct AppState {

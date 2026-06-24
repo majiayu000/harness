@@ -94,19 +94,17 @@ async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Res
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = repo_backlog_instance("dispatching").with_id("repo-backlog-dedupe-refresh");
+    let instance = issue_instance("implementing").with_id("issue-dedupe-refresh");
     store.upsert_instance(&instance).await?;
 
-    let first = WorkflowCommand::enqueue_activity(
-        "implement_issue",
-        "repo-backlog:owner/repo:issue:1200:start",
-    );
+    let first =
+        WorkflowCommand::enqueue_activity("implement_issue", "issue:owner/repo:issue:1200:start");
     let mut old_decision = WorkflowDecisionRecord::accepted(
         WorkflowDecision::new(
             instance.id.clone(),
-            "dispatching",
+            "implementing",
             "enqueue_old_command",
-            "dispatching",
+            "implementing",
             "Record the original pending command.",
         ),
         None,
@@ -119,14 +117,14 @@ async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Res
     let updated = WorkflowCommand::start_child_workflow(
         "github_issue_pr",
         "issue:1200",
-        "repo-backlog:owner/repo:issue:1200:start",
+        "issue:owner/repo:issue:1200:start",
     );
     let mut new_decision = WorkflowDecisionRecord::accepted(
         WorkflowDecision::new(
             instance.id.clone(),
-            "dispatching",
+            "implementing",
             "refresh_command_payload",
-            "dispatching",
+            "implementing",
             "Refresh the pending command payload.",
         ),
         None,

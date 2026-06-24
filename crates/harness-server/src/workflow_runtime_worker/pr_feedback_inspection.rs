@@ -1,5 +1,6 @@
 use crate::github_pr_snapshot::{
-    fetch_github_pr_snapshot, github_pr_snapshot_failure_result, GitHubPrSnapshotTarget,
+    fetch_github_pr_snapshot, github_pr_snapshot_failure_result, pr_readiness_for_snapshot,
+    GitHubPrSnapshotArtifacts, GitHubPrSnapshotTarget,
 };
 use crate::http::AppState;
 use harness_workflow::runtime::{
@@ -39,9 +40,41 @@ pub(super) async fn execute_pr_feedback_inspection(
     )
     .await
     {
-        Ok(artifacts) => artifacts.activity_result(&activity),
+        Ok(artifacts) => {
+            match persist_pr_remote_fact_snapshot(state, &activity, &artifacts).await {
+                Ok(()) => {
+                    let readiness = pr_readiness_for_snapshot(&artifacts.normalized_snapshot);
+                    tracing::info!(
+                        repo = %target.repo_slug,
+                        pr = target.pr_number,
+                        readiness = readiness.as_str(),
+                        "server-owned PR feedback inspection collected remote facts"
+                    );
+                    artifacts.activity_result(&activity)
+                }
+                Err(error) => ActivityResult::failed(
+                    activity,
+                    "Server-owned PR snapshot persistence failed.",
+                    error.to_string(),
+                )
+                .with_error_kind(ActivityErrorKind::Fatal),
+            }
+        }
         Err(error) => github_pr_snapshot_failure_result(&activity, Some(&target), &error),
     }
+}
+
+async fn persist_pr_remote_fact_snapshot(
+    state: &Arc<AppState>,
+    activity: &str,
+    artifacts: &GitHubPrSnapshotArtifacts,
+) -> anyhow::Result<()> {
+    let store = state.core.workflow_runtime_store.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("{activity} requires workflow_runtime_store to persist PR remote facts")
+    })?;
+    let snapshot = artifacts.remote_fact_snapshot()?;
+    store.upsert_remote_fact_snapshot(&snapshot).await?;
+    Ok(())
 }
 
 fn pr_snapshot_target(
@@ -65,7 +98,21 @@ fn pr_snapshot_target(
 
     let repo = repo.ok_or_else(|| anyhow::anyhow!("GitHub repo slug is missing"))?;
     let pr_number = pr_number.ok_or_else(|| anyhow::anyhow!("PR number is missing"))?;
-    GitHubPrSnapshotTarget::new(repo, pr_number)
+    let mut target = GitHubPrSnapshotTarget::new(repo, pr_number)?;
+    if let Some(expected_base_ref) = expected_base_ref(job, workflow) {
+        target = target.with_expected_base_ref(expected_base_ref);
+    }
+    Ok(target)
+}
+
+fn expected_base_ref(job: &RuntimeJob, workflow: Option<&WorkflowInstance>) -> Option<String> {
+    workflow
+        .and_then(|workflow| optional_data_string(workflow, "expected_base_ref"))
+        .or_else(|| workflow.and_then(|workflow| optional_data_string(workflow, "target_base_ref")))
+        .or_else(|| workflow.and_then(|workflow| optional_data_string(workflow, "base_ref")))
+        .or_else(|| job_input_string(job, "expected_base_ref"))
+        .or_else(|| job_input_string(job, "target_base_ref"))
+        .or_else(|| job_input_string(job, "base_ref"))
 }
 
 fn job_input_string(job: &RuntimeJob, field: &str) -> Option<String> {
@@ -148,6 +195,7 @@ mod tests {
 
         assert_eq!(target.repo_slug, "owner/repo");
         assert_eq!(target.pr_number, 77);
+        assert_eq!(target.expected_base_ref, None);
     }
 
     #[test]
@@ -161,6 +209,21 @@ mod tests {
 
         assert_eq!(target.repo_slug, "owner/repo");
         assert_eq!(target.pr_number, 77);
+        assert_eq!(target.expected_base_ref, None);
+    }
+
+    #[test]
+    fn pr_snapshot_target_preserves_explicit_expected_base_ref() {
+        let job = pr_feedback_runtime_job(json!({
+            "activity": PR_FEEDBACK_INSPECT_ACTIVITY,
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "expected_base_ref": "release"
+        }));
+
+        let target = pr_snapshot_target(&job, None).unwrap();
+
+        assert_eq!(target.expected_base_ref.as_deref(), Some("release"));
     }
 
     #[test]
