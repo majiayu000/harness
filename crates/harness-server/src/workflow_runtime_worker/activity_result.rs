@@ -403,16 +403,15 @@ mod tests {
     fn activity_result_from_turn_fails_when_no_fenced_block_present() {
         // P0-1: a completed agent turn that emits no `harness-activity-result`
         // fenced block must NOT be silently treated as success. Returning
-        // succeeded here historically caused state-machine no-progress loops
-        // for `repo_backlog` workflows (claude returns prose, reducer falls
-        // back to `finish_repo_backlog_scan`, state cycles back to idle, next
-        // tick re-dispatches, ad infinitum).
+        // succeeded here historically caused state-machine no-progress loops:
+        // an agent could return prose, the reducer would observe no structured
+        // state transition, and the next tick would re-dispatch.
         let job = RuntimeJob::pending(
             "command-1",
             RuntimeKind::ClaudeCode,
             "claude-default",
             json!({
-                "activity": "poll_repo_backlog"
+                "activity": "implement_issue"
             }),
         );
         let items = vec![Item::AgentReasoning {
@@ -430,7 +429,7 @@ mod tests {
             "digest-1",
         );
 
-        assert_eq!(result.activity, "poll_repo_backlog");
+        assert_eq!(result.activity, "implement_issue");
         assert_eq!(
             result.status,
             ActivityStatus::Failed,

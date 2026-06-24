@@ -225,6 +225,7 @@ async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> a
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -250,6 +251,7 @@ async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> a
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -268,7 +270,7 @@ async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> a
 }
 
 #[tokio::test]
-async fn issue_submission_releases_dependency_by_repo_backlog_issue_handle_when_canonical_workflow_completed(
+async fn issue_submission_releases_dependency_by_github_issue_handle_when_canonical_workflow_completed(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -295,6 +297,7 @@ async fn issue_submission_releases_dependency_by_repo_backlog_issue_handle_when_
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -305,16 +308,16 @@ async fn issue_submission_releases_dependency_by_repo_backlog_issue_handle_when_
     dep_workflow.state = "done".to_string();
     store.upsert_instance(&dep_workflow).await?;
 
-    let repo_backlog_dep_id = TaskId::from_str("repo-backlog:owner/repo:issue:78");
+    let github_issue_dep_id = TaskId::from_str("github-issue:owner/repo:issue:78");
     assert!(
         store
-            .get_instance_by_task_id(repo_backlog_dep_id.as_str())
+            .get_instance_by_task_id(github_issue_dep_id.as_str())
             .await?
             .is_none(),
-        "planner dependency handle should not exist as a runtime task id"
+        "canonical GitHub issue dependency handle should not exist as a runtime task id"
     );
 
-    let task_id = TaskId::from_str("runtime-dependent-on-repo-backlog-handle");
+    let task_id = TaskId::from_str("runtime-dependent-on-github-issue-handle");
     let blocked = record_issue_submission(
         &store,
         IssueSubmissionRuntimeContext {
@@ -325,10 +328,11 @@ async fn issue_submission_releases_dependency_by_repo_backlog_issue_handle_when_
             labels: &labels,
             force_execute: false,
             additional_prompt: None,
-            depends_on: std::slice::from_ref(&repo_backlog_dep_id),
+            depends_on: std::slice::from_ref(&github_issue_dep_id),
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -376,6 +380,7 @@ async fn issue_submission_keeps_blocked_runtime_dependency_without_closed_eviden
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -401,6 +406,7 @@ async fn issue_submission_keeps_blocked_runtime_dependency_without_closed_eviden
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -440,6 +446,7 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_persisted_clo
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -472,6 +479,7 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_persisted_clo
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -519,6 +527,7 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_closed_issue_
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -573,6 +582,7 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_closed_issue_
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -623,6 +633,7 @@ async fn dependency_release_rotates_waiting_rows_to_prevent_starvation() -> anyh
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -648,6 +659,7 @@ async fn dependency_release_rotates_waiting_rows_to_prevent_starvation() -> anyh
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            remote_fact_hash: None,
         },
     )
     .await?;

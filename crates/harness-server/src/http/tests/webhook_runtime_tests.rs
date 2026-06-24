@@ -218,6 +218,11 @@ async fn webhook_routes_runtime_issue_to_repo_specific_project_root() -> anyhow:
             repo: "org/repo-b".to_string(),
             label: "harness".to_string(),
             project_root: Some(repo_b_dir.path().display().to_string()),
+            auto_merge: None,
+            merge_method: None,
+            delete_branch: None,
+            require_review_threads_resolved: None,
+            require_clean_merge_state: None,
         }],
         ..Default::default()
     });
@@ -287,6 +292,11 @@ async fn webhook_routes_runtime_prompt_to_repo_specific_project_root() -> anyhow
             repo: "org/repo-b".to_string(),
             label: "harness".to_string(),
             project_root: Some(repo_b_dir.path().display().to_string()),
+            auto_merge: None,
+            merge_method: None,
+            delete_branch: None,
+            require_review_threads_resolved: None,
+            require_clean_merge_state: None,
         }],
         ..Default::default()
     });
@@ -352,6 +362,11 @@ async fn webhook_ignores_issue_tasks_when_repo_is_unmapped() -> anyhow::Result<(
             repo: "org/repo-b".to_string(),
             label: "harness".to_string(),
             project_root: Some(repo_b_dir.path().display().to_string()),
+            auto_merge: None,
+            merge_method: None,
+            delete_branch: None,
+            require_review_threads_resolved: None,
+            require_clean_merge_state: None,
         }],
         ..Default::default()
     });

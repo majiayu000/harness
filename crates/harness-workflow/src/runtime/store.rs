@@ -8,7 +8,6 @@ use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
 use super::prompt_task::PROMPT_TASK_DEFINITION_ID;
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
-use super::repo_backlog::REPO_BACKLOG_DEFINITION_ID;
 use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
 use super::validator::DecisionValidator;
@@ -1013,7 +1012,6 @@ impl WorkflowRuntimeStore {
                          'inspect_pr_feedback',
                          'address_pr_feedback'
                      ) THEN 0
-                     WHEN COALESCE(job.data #>> '{input,activity}', '') = 'poll_repo_backlog' THEN 2
                      ELSE 1
                  END ASC,
                  job.created_at ASC
@@ -2080,7 +2078,6 @@ fn validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
         QUALITY_GATE_DEFINITION_ID => Some(DecisionValidator::quality_gate()),
         PR_FEEDBACK_DEFINITION_ID => Some(DecisionValidator::pr_feedback()),
         PROMPT_TASK_DEFINITION_ID => Some(DecisionValidator::prompt_task()),
-        REPO_BACKLOG_DEFINITION_ID => Some(DecisionValidator::repo_backlog()),
         _ => None,
     }
 }

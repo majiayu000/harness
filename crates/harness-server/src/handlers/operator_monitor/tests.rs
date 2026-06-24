@@ -71,7 +71,7 @@ fn workflow_sample_truncation_preserves_operator_action_and_failed_states() {
     let base = Utc::now();
     let mut workflows = (0..500)
         .map(|index| {
-            let mut workflow = workflow("checking", json!({ "source": "repo_backlog" }))
+            let mut workflow = workflow("checking", json!({ "source": "github" }))
                 .with_id(format!("checking-{index}"));
             workflow.updated_at = base + chrono::Duration::seconds(index);
             workflow
@@ -213,6 +213,51 @@ async fn endpoint_returns_monitor_payload_on_fresh_state() -> anyhow::Result<()>
         assert!(body.get(key).is_some(), "missing top-level key: {key}");
     }
     assert_eq!(body["worktrees"]["metrics_state"], "unavailable");
+    assert!(body["activity"]["token_dispatch_by_repo"].is_array());
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoint_includes_github_token_dispatch_counters() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-token-dispatch-")?;
+    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    state.intake.record_github_token_dispatch(
+        "owner/repo",
+        crate::http::GitHubTokenDispatchMetric::ServerGithubPoll,
+    );
+    state.intake.record_github_token_dispatch(
+        "owner/repo",
+        crate::http::GitHubTokenDispatchMetric::AgentImplementIssue,
+    );
+    state.intake.record_github_token_dispatch(
+        "owner/repo",
+        crate::http::GitHubTokenDispatchMetric::AgentSkippedCoveredIssue,
+    );
+
+    let app = Router::new()
+        .route("/api/operator-monitor", get(operator_monitor))
+        .with_state(state);
+
+    let req = axum::http::Request::builder()
+        .uri("/api/operator-monitor")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    let counters = body["activity"]["token_dispatch_by_repo"]
+        .as_array()
+        .expect("token_dispatch_by_repo should be an array");
+
+    assert_eq!(counters.len(), 1);
+    assert_eq!(counters[0]["repo"], "owner/repo");
+    assert_eq!(counters[0]["server_github_poll_count"], 1);
+    assert_eq!(counters[0]["agent_implement_issue_count"], 1);
+    assert_eq!(counters[0]["agent_skipped_covered_issue_count"], 1);
+    assert_eq!(counters[0]["agent_address_feedback_count"], 0);
+    assert_eq!(counters[0]["agent_merge_pr_count"], 0);
     Ok(())
 }
 
@@ -269,7 +314,7 @@ fn operator_actions_link_evidence_to_current_legacy_task_id() {
 
 #[test]
 fn idle_workflows_are_inactive_for_source_activity() {
-    let workflows = vec![workflow("idle", json!({ "source": "repo_backlog" }))];
+    let workflows = vec![workflow("idle", json!({ "source": "github" }))];
 
     let counts = runtime_workflow_counts(&workflows);
     let by_source = source_activity(&workflows, &[]);
@@ -449,7 +494,7 @@ async fn runtime_workflow_sampling_fetches_action_states_before_definition_cap(
     for index in 0..500 {
         workflow_runtime_store
             .upsert_instance(
-                &workflow("checking", json!({ "source": "repo_backlog" }))
+                &workflow("checking", json!({ "source": "github" }))
                     .with_id(format!("checking-{index}")),
             )
             .await?;

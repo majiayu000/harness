@@ -543,7 +543,7 @@ async fn enqueue_background_pr_feedback_creates_pr_scoped_runtime_workflow() -> 
 
     assert_eq!(
         task_id.as_str(),
-        format!("repo-backlog::{project_id}::repo:owner/repo::pr:77:feedback")
+        format!("github-pr-feedback::{project_id}::repo:owner/repo::pr:77:feedback")
     );
     assert!(
         task_store.get_with_db_fallback(&task_id).await?.is_none(),

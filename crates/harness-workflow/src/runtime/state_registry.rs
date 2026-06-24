@@ -1,7 +1,6 @@
 use super::{
     pr_feedback::PR_FEEDBACK_DEFINITION_ID, prompt_task::PROMPT_TASK_DEFINITION_ID,
     quality_gate::QUALITY_GATE_DEFINITION_ID, reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
-    repo_backlog::REPO_BACKLOG_DEFINITION_ID,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +55,6 @@ const WORKFLOW_DEFINITION_IDS: &[&str] = &[
     PROMPT_TASK_DEFINITION_ID,
     QUALITY_GATE_DEFINITION_ID,
     PR_FEEDBACK_DEFINITION_ID,
-    REPO_BACKLOG_DEFINITION_ID,
 ];
 
 const GITHUB_ISSUE_PR_STATES: &[WorkflowStateDefinition] = &[
@@ -72,6 +70,7 @@ const GITHUB_ISSUE_PR_STATES: &[WorkflowStateDefinition] = &[
     WorkflowStateDefinition::active(GITHUB_ISSUE_PR_DEFINITION_ID, "addressing_feedback"),
     WorkflowStateDefinition::active(GITHUB_ISSUE_PR_DEFINITION_ID, "quality_gate_pending"),
     WorkflowStateDefinition::active(GITHUB_ISSUE_PR_DEFINITION_ID, "ready_to_merge"),
+    WorkflowStateDefinition::active(GITHUB_ISSUE_PR_DEFINITION_ID, "merging"),
     WorkflowStateDefinition::active(GITHUB_ISSUE_PR_DEFINITION_ID, "blocked"),
     WorkflowStateDefinition::terminal(
         GITHUB_ISSUE_PR_DEFINITION_ID,
@@ -157,30 +156,6 @@ const PR_FEEDBACK_STATES: &[WorkflowStateDefinition] = &[
     ),
 ];
 
-const REPO_BACKLOG_STATES: &[WorkflowStateDefinition] = &[
-    WorkflowStateDefinition::active(REPO_BACKLOG_DEFINITION_ID, "idle"),
-    WorkflowStateDefinition::active(REPO_BACKLOG_DEFINITION_ID, "scanning"),
-    WorkflowStateDefinition::active(REPO_BACKLOG_DEFINITION_ID, "planning_batch"),
-    WorkflowStateDefinition::active(REPO_BACKLOG_DEFINITION_ID, "dispatching"),
-    WorkflowStateDefinition::active(REPO_BACKLOG_DEFINITION_ID, "reconciling"),
-    WorkflowStateDefinition::active(REPO_BACKLOG_DEFINITION_ID, "blocked"),
-    WorkflowStateDefinition::terminal(
-        REPO_BACKLOG_DEFINITION_ID,
-        "done",
-        WorkflowTerminalState::Succeeded,
-    ),
-    WorkflowStateDefinition::terminal(
-        REPO_BACKLOG_DEFINITION_ID,
-        "failed",
-        WorkflowTerminalState::Failed,
-    ),
-    WorkflowStateDefinition::terminal(
-        REPO_BACKLOG_DEFINITION_ID,
-        "cancelled",
-        WorkflowTerminalState::Cancelled,
-    ),
-];
-
 pub fn known_workflow_definition_ids() -> &'static [&'static str] {
     WORKFLOW_DEFINITION_IDS
 }
@@ -191,7 +166,6 @@ pub fn workflow_states_for_definition(definition_id: &str) -> &'static [Workflow
         PROMPT_TASK_DEFINITION_ID => PROMPT_TASK_STATES,
         QUALITY_GATE_DEFINITION_ID => QUALITY_GATE_STATES,
         PR_FEEDBACK_DEFINITION_ID => PR_FEEDBACK_STATES,
-        REPO_BACKLOG_DEFINITION_ID => REPO_BACKLOG_STATES,
         _ => &[],
     }
 }
@@ -289,10 +263,6 @@ mod tests {
             (
                 PR_FEEDBACK_DEFINITION_ID,
                 TransitionAllowlist::pr_feedback_defaults(),
-            ),
-            (
-                REPO_BACKLOG_DEFINITION_ID,
-                TransitionAllowlist::repo_backlog_defaults(),
             ),
         ];
 

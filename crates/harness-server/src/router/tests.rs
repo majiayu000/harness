@@ -127,7 +127,9 @@ async fn make_test_state_with_config_and_registry(
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],
+            github_poller_repos: vec![],
             completion_callback: None,
+            token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
         },
         project_svc,
         task_svc,
@@ -1470,7 +1472,9 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         intake: crate::http::IntakeServices {
             feishu_intake: None,
             github_pollers: vec![],
+            github_poller_repos: vec![],
             completion_callback: None,
+            token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
         },
         project_svc,
         task_svc,

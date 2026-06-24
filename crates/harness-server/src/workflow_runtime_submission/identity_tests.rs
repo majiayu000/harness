@@ -31,6 +31,7 @@ async fn issue_submission_records_explicit_submission_id() -> anyhow::Result<()>
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:1129"),
+            remote_fact_hash: None,
         },
     )
     .await?;

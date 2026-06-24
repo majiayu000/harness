@@ -15,7 +15,7 @@ pub mod pr_feedback;
 pub mod prompt_task;
 pub mod quality_gate;
 pub mod reducer;
-pub mod repo_backlog;
+pub mod remote_facts;
 pub mod state_registry;
 pub mod status;
 pub mod store;
@@ -72,13 +72,8 @@ pub use reducer::{
     ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT,
     RUNTIME_JOB_COMPLETED_EVENT, SCOPE_TOO_LARGE_SIGNAL,
 };
-pub use repo_backlog::{
-    build_merged_pr_decision, build_open_issue_without_workflow_decision,
-    build_repo_backlog_poll_decision, build_stale_active_workflow_decision,
-    repo_backlog_workflow_id, MergedPrDecisionInput, OpenIssueDecisionInput,
-    RepoBacklogDecisionOutput, RepoBacklogPollDecisionInput, RepoBacklogWorkflowAction,
-    StaleWorkflowDecisionInput, REPO_BACKLOG_DEFINITION_ID, REPO_BACKLOG_POLL_ACTIVITY,
-    REPO_BACKLOG_SPRINT_PLAN_ACTIVITY,
+pub use remote_facts::{
+    remote_fact_command_dedupe_key, stable_remote_fact_hash, RemoteFactSnapshot,
 };
 pub use state_registry::{
     known_workflow_definition_ids, workflow_state_definition, workflow_state_exists,

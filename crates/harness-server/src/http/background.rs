@@ -2,7 +2,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use super::auto_merge::{
+    expected_base_ref_from_workflow_data, prepare_auto_merge_workflow_from_snapshot,
+    AutoMergeSnapshotGate,
+};
 use super::{state::AppState, task_routes};
+use crate::github_pr_snapshot::{fetch_github_pr_snapshot, GitHubPrSnapshotTarget};
 use crate::task_runner;
 use anyhow::Context;
 use harness_workflow::issue_lifecycle::{
@@ -150,31 +155,6 @@ async fn fail_background_dispatch_task(
             cb(final_state).await;
         }
     }
-}
-
-async fn record_runtime_recovery_requested(
-    state: &Arc<AppState>,
-    project_root: &std::path::Path,
-    task: &task_runner::TaskState,
-    issue_number: Option<u64>,
-    recovery_kind: &'static str,
-) {
-    let Some(issue_number) = issue_number else {
-        return;
-    };
-    let reason = format!("startup {recovery_kind} recovery requested redispatch");
-    crate::workflow_runtime_repo_backlog::record_stale_active_workflow(
-        state.core.workflow_runtime_store.as_deref(),
-        crate::workflow_runtime_repo_backlog::StaleWorkflowRuntimeContext {
-            project_root,
-            repo: task.repo.as_deref(),
-            issue_number,
-            active_task_id: Some(task.id.as_str()),
-            observed_state: task.status.as_ref(),
-            reason: &reason,
-        },
-    )
-    .await;
 }
 
 fn task_has_restart_safe_prompt(task: &task_runner::TaskState) -> bool {
@@ -656,10 +636,94 @@ async fn dispatch_runtime_command_with_project_policy(
         }
     };
 
-    RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
+    let repo = command_repo_hint(store, &command).await?;
+    let activity = command.command.runtime_activity_key().to_string();
+    let dispatch_gate_fact_hash = command_dispatch_gate_fact_hash(&command);
+    let outcome = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
         .with_dispatcher_id(dispatch_owner)
         .dispatch_command(command)
-        .await
+        .await?;
+    record_runtime_agent_dispatch_counter(
+        state,
+        repo.as_deref(),
+        &activity,
+        &outcome,
+        dispatch_gate_fact_hash.as_deref(),
+    );
+    Ok(outcome)
+}
+
+async fn command_repo_hint(
+    store: &WorkflowRuntimeStore,
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<Option<String>> {
+    let instance_repo = store
+        .get_instance(&command.workflow_id)
+        .await?
+        .and_then(|instance| optional_json_string(&instance.data, "repo"));
+    Ok(instance_repo.or_else(|| optional_json_string(&command.command.command, "repo")))
+}
+
+fn optional_json_string(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn command_dispatch_gate_fact_hash(command: &WorkflowCommandRecord) -> Option<String> {
+    command
+        .command
+        .command
+        .get("dispatch_gate")
+        .and_then(|value| value.get("fact_hash"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn record_runtime_agent_dispatch_counter(
+    state: &AppState,
+    repo: Option<&str>,
+    activity: &str,
+    outcome: &CommandDispatchOutcome,
+    dispatch_gate_fact_hash: Option<&str>,
+) {
+    let Some(repo) = repo else {
+        return;
+    };
+    match outcome {
+        CommandDispatchOutcome::Enqueued { .. } => {
+            if let Some(metric) = token_dispatch_metric_for_activity(activity) {
+                state.intake.record_github_token_dispatch(repo, metric);
+            }
+        }
+        CommandDispatchOutcome::AlreadyDispatched { .. } if dispatch_gate_fact_hash.is_some() => {
+            state.intake.record_github_token_dispatch(
+                repo,
+                crate::http::GitHubTokenDispatchMetric::AgentSkippedSameFactHash,
+            );
+        }
+        CommandDispatchOutcome::AlreadyDispatched { .. }
+        | CommandDispatchOutcome::Skipped { .. } => {}
+    }
+}
+
+fn token_dispatch_metric_for_activity(
+    activity: &str,
+) -> Option<crate::http::GitHubTokenDispatchMetric> {
+    match activity {
+        "implement_issue" => Some(crate::http::GitHubTokenDispatchMetric::AgentImplementIssue),
+        "address_pr_feedback" => Some(crate::http::GitHubTokenDispatchMetric::AgentAddressFeedback),
+        "merge_pr" => Some(crate::http::GitHubTokenDispatchMetric::AgentMergePr),
+        "analyze_dependencies" => {
+            Some(crate::http::GitHubTokenDispatchMetric::AgentDependencyAnalysis)
+        }
+        _ => None,
+    }
 }
 
 async fn runtime_dispatch_profile_selector_for_command(
@@ -767,104 +831,7 @@ pub(super) fn load_runtime_workflow_config(
     })
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RuntimeRepoBacklogPollTick {
-    pub requested: usize,
-    pub active_command_exists: usize,
-    pub skipped: usize,
-    pub rejected: usize,
-}
-
-impl RuntimeRepoBacklogPollTick {
-    fn touched_anything(&self) -> bool {
-        self.requested > 0
-            || self.active_command_exists > 0
-            || self.skipped > 0
-            || self.rejected > 0
-    }
-}
-
-pub(super) async fn run_runtime_repo_backlog_poll_tick(
-    state: &Arc<AppState>,
-    limit: usize,
-) -> anyhow::Result<RuntimeRepoBacklogPollTick> {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return Ok(RuntimeRepoBacklogPollTick::default());
-    };
-    let Some(github_config) = state
-        .core
-        .server
-        .config
-        .intake
-        .github
-        .as_ref()
-        .filter(|config| config.enabled && config.mode.poller_enabled())
-    else {
-        return Ok(RuntimeRepoBacklogPollTick::default());
-    };
-
-    let mut tick = RuntimeRepoBacklogPollTick::default();
-    let mut considered_repos = 0usize;
-    for repo_config in github_config.effective_repos() {
-        if considered_repos >= limit.max(1) {
-            break;
-        }
-        let project_root = repo_backlog_project_root(&repo_config, &state.core.project_root).await;
-        if !project_root.exists() {
-            tracing::warn!(
-                repo = %repo_config.repo,
-                project_root = %project_root.display(),
-                "workflow runtime repo backlog poll skipped unresolvable project path"
-            );
-            tick.skipped += 1;
-            continue;
-        }
-        let workflow_cfg = match load_runtime_workflow_config(
-            &project_root,
-            "workflow runtime repo backlog poller",
-        ) {
-            Ok(config) => config,
-            Err(_) => {
-                tick.skipped += 1;
-                continue;
-            }
-        };
-        if !workflow_cfg.repo_backlog.enabled
-            || !workflow_cfg.runtime_dispatch.enabled
-            || !workflow_cfg.runtime_worker.enabled
-        {
-            tick.skipped += 1;
-            continue;
-        }
-        considered_repos += 1;
-        match crate::workflow_runtime_repo_backlog::request_repo_backlog_poll(
-            store,
-            crate::workflow_runtime_repo_backlog::RepoBacklogPollRuntimeContext {
-                project_root: &project_root,
-                repo: Some(repo_config.repo.as_str()),
-                label: Some(repo_config.label.as_str()),
-            },
-        )
-        .await?
-        {
-            crate::workflow_runtime_repo_backlog::RepoBacklogPollRequestOutcome::Requested {
-                ..
-            } => tick.requested += 1,
-            crate::workflow_runtime_repo_backlog::RepoBacklogPollRequestOutcome::ActiveCommandExists {
-                ..
-            } => tick.active_command_exists += 1,
-            crate::workflow_runtime_repo_backlog::RepoBacklogPollRequestOutcome::NotCandidate {
-                ..
-            } => tick.skipped += 1,
-            crate::workflow_runtime_repo_backlog::RepoBacklogPollRequestOutcome::Rejected {
-                ..
-            } => tick.rejected += 1,
-        }
-    }
-    Ok(tick)
-}
-
-pub(super) async fn repo_backlog_project_root(
+pub(super) async fn github_repo_project_root(
     repo_config: &harness_core::config::intake::GitHubRepoConfig,
     fallback: &Path,
 ) -> PathBuf {
@@ -880,7 +847,7 @@ pub(super) async fn repo_backlog_project_root(
             tracing::warn!(
                 repo = %repo_config.repo,
                 project_root = %configured.display(),
-                "workflow runtime repo backlog poller failed to canonicalize project root: {error}"
+                "github repo project root resolver failed to canonicalize project root: {error}"
             );
             configured
         }
@@ -901,58 +868,10 @@ fn expand_home_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-pub(super) fn spawn_runtime_repo_backlog_poller(state: &Arc<AppState>) {
-    if state.core.workflow_runtime_store.is_none() {
-        tracing::debug!("workflow runtime repo backlog poller disabled: store unavailable");
-        return;
-    }
-
-    let weak_state = Arc::downgrade(state);
-    tokio::spawn(async move {
-        loop {
-            let state = match weak_state.upgrade() {
-                Some(state) => state,
-                None => break,
-            };
-            let workflow_cfg = match load_runtime_workflow_config(
-                &state.core.project_root,
-                "workflow runtime repo backlog poller",
-            ) {
-                Ok(config) => config,
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
-                    ))
-                    .await;
-                    continue;
-                }
-            };
-            let interval =
-                std::time::Duration::from_secs(workflow_cfg.repo_backlog.poll_interval_secs.max(1));
-            let batch_limit = workflow_cfg.repo_backlog.batch_limit.max(1) as usize;
-            match run_runtime_repo_backlog_poll_tick(&state, batch_limit).await {
-                Ok(tick) if tick.touched_anything() => {
-                    tracing::info!(
-                        requested = tick.requested,
-                        active_command_exists = tick.active_command_exists,
-                        skipped = tick.skipped,
-                        rejected = tick.rejected,
-                        "workflow runtime repo backlog poller tick complete"
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!("workflow runtime repo backlog poller tick failed: {error}");
-                }
-            }
-            tokio::time::sleep(interval).await;
-        }
-    });
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RuntimePrFeedbackSweepTick {
     pub requested: usize,
+    pub auto_merge_requested: usize,
     pub active_command_exists: usize,
     pub skipped: usize,
     pub rejected: usize,
@@ -961,6 +880,7 @@ pub(super) struct RuntimePrFeedbackSweepTick {
 impl RuntimePrFeedbackSweepTick {
     fn touched_anything(&self) -> bool {
         self.requested > 0
+            || self.auto_merge_requested > 0
             || self.active_command_exists > 0
             || self.skipped > 0
             || self.rejected > 0
@@ -984,7 +904,10 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
     let mut tick = RuntimePrFeedbackSweepTick::default();
     let mut considered_candidates = 0usize;
     for mut workflow in workflows {
-        if !matches!(workflow.state.as_str(), "pr_open" | "awaiting_feedback") {
+        if !matches!(
+            workflow.state.as_str(),
+            "pr_open" | "awaiting_feedback" | "ready_to_merge"
+        ) {
             continue;
         }
         if workflow
@@ -1036,6 +959,16 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
         }
         considered_candidates += 1;
 
+        if workflow.state == "ready_to_merge" {
+            match request_auto_merge_if_enabled(state, store, &workflow).await? {
+                AutoMergeRequestOutcome::Requested => tick.auto_merge_requested += 1,
+                AutoMergeRequestOutcome::Disabled => tick.skipped += 1,
+                AutoMergeRequestOutcome::NotReady => tick.skipped += 1,
+                AutoMergeRequestOutcome::Rejected => tick.rejected += 1,
+            }
+            continue;
+        }
+
         let request_outcome = if workflow.state == "pr_open" {
             crate::workflow_runtime_pr_feedback::request_local_review(store, &workflow.id).await?
         } else {
@@ -1058,6 +991,79 @@ pub(super) async fn run_runtime_pr_feedback_sweep_tick(
         }
     }
     Ok(tick)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoMergeRequestOutcome {
+    Requested,
+    Disabled,
+    NotReady,
+    Rejected,
+}
+
+async fn request_auto_merge_if_enabled(
+    state: &Arc<AppState>,
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+) -> anyhow::Result<AutoMergeRequestOutcome> {
+    let repo = workflow
+        .data
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let Some(repo) = repo else {
+        return Ok(AutoMergeRequestOutcome::Disabled);
+    };
+    let Some(github_cfg) = state.core.server.config.intake.github.as_ref() else {
+        return Ok(AutoMergeRequestOutcome::Disabled);
+    };
+    let policy = github_cfg.auto_merge_policy_for_repo(repo);
+    if !policy.enabled {
+        return Ok(AutoMergeRequestOutcome::Disabled);
+    }
+
+    let pr_number = workflow
+        .data
+        .get("pr_number")
+        .and_then(serde_json::Value::as_u64);
+    let Some(pr_number) = pr_number else {
+        return Ok(AutoMergeRequestOutcome::NotReady);
+    };
+    let mut target = GitHubPrSnapshotTarget::new(repo, pr_number)?;
+    if let Some(expected_base_ref) = expected_base_ref_from_workflow_data(&workflow.data) {
+        target = target.with_expected_base_ref(expected_base_ref);
+    }
+    let snapshot = fetch_github_pr_snapshot(
+        &target,
+        state.core.server.config.server.github_token.as_deref(),
+    )
+    .await?;
+    let workflow = match prepare_auto_merge_workflow_from_snapshot(workflow, &snapshot, &policy)? {
+        AutoMergeSnapshotGate::Ready(workflow) => workflow,
+        AutoMergeSnapshotGate::NotReady => return Ok(AutoMergeRequestOutcome::NotReady),
+    };
+    store.upsert_instance(&workflow).await?;
+
+    match crate::workflow_runtime_pr_feedback::approve_runtime_merge_by_workflow_id(
+        store,
+        &workflow.id,
+    )
+    .await?
+    {
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::Approved { .. } => {
+            Ok(AutoMergeRequestOutcome::Requested)
+        }
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::NotReady { .. } => {
+            Ok(AutoMergeRequestOutcome::NotReady)
+        }
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::Rejected { .. } => {
+            Ok(AutoMergeRequestOutcome::Rejected)
+        }
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::NotFound
+        | crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::NotCandidate {
+            ..
+        } => Ok(AutoMergeRequestOutcome::Disabled),
+    }
 }
 
 async fn recover_runtime_pr_binding_from_bind_pr_command(
@@ -2449,14 +2455,6 @@ pub(super) async fn spawn_checkpoint_recovery(state: &Arc<AppState>) {
                     }
                 };
                 let project_id = canonical.to_string_lossy().into_owned();
-                record_runtime_recovery_requested(
-                    &state,
-                    &canonical,
-                    &task,
-                    issue_num,
-                    "checkpoint",
-                )
-                .await;
 
                 let permit = match state
                     .concurrency
@@ -2705,7 +2703,6 @@ pub(super) async fn spawn_orphan_pending_recovery(state: &Arc<AppState>) {
                 }
             };
             let project_id = canonical.to_string_lossy().into_owned();
-            record_runtime_recovery_requested(&state, &canonical, &task, issue, "orphan").await;
 
             let queue = match recovery_queue_domain(task.task_kind) {
                 task_routes::QueueDomain::Primary => state.concurrency.task_queue.clone(),
@@ -2937,10 +2934,10 @@ mod tests {
             },
         );
         policy.workflow_profiles.insert(
-            "repo_backlog".to_string(),
+            "prompt_task".to_string(),
             harness_core::config::workflow::RuntimeDispatchProfileOverride {
                 runtime_kind: None,
-                runtime_profile: Some("codex-backlog".to_string()),
+                runtime_profile: Some("codex-prompt-task".to_string()),
                 ..Default::default()
             },
         );
@@ -2978,16 +2975,19 @@ mod tests {
         assert_eq!(replan_profile.name, "codex-issue-replan");
         assert_eq!(replan_profile.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(replan_profile.timeout_secs, Some(900));
-        let global_replan_profile = selector.select(Some("repo_backlog"), Some("replan_issue"));
+        let global_replan_profile = selector.select(Some("prompt_task"), Some("replan_issue"));
         assert_eq!(global_replan_profile.kind, RuntimeKind::CodexJsonrpc);
         assert_eq!(global_replan_profile.name, "codex-replan");
         assert_eq!(global_replan_profile.model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(global_replan_profile.timeout_secs, Some(600));
-        let backlog_profile = selector.select_for_workflow(Some("repo_backlog"));
-        assert_eq!(backlog_profile.kind, RuntimeKind::ClaudeCode);
-        assert_eq!(backlog_profile.name, "codex-backlog");
-        assert_eq!(backlog_profile.model.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(backlog_profile.timeout_secs, Some(600));
+        let prompt_task_profile = selector.select_for_workflow(Some("prompt_task"));
+        assert_eq!(prompt_task_profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(prompt_task_profile.name, "codex-prompt-task");
+        assert_eq!(
+            prompt_task_profile.model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(prompt_task_profile.timeout_secs, Some(600));
         let default_profile = selector.select_for_workflow(Some("quality_gate"));
         assert_eq!(default_profile.kind, RuntimeKind::ClaudeCode);
         assert_eq!(default_profile.name, "claude-default");

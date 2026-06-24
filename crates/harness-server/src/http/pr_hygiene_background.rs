@@ -208,7 +208,7 @@ async fn runtime_pr_hygiene_repos(state: &Arc<AppState>) -> Vec<RuntimePrHygiene
     {
         for repo_config in github_config.effective_repos() {
             let project_root =
-                background::repo_backlog_project_root(&repo_config, &state.core.project_root).await;
+                background::github_repo_project_root(&repo_config, &state.core.project_root).await;
             push_pr_hygiene_repo(&mut repos, &mut seen, repo_config.repo, project_root);
         }
     }

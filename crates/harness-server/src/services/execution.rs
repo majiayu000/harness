@@ -696,6 +696,7 @@ impl DefaultExecutionService {
                 dependencies_blocked,
                 source: prepared.req.source.as_deref(),
                 external_id: prepared.req.external_id.as_deref(),
+                remote_fact_hash: None,
             },
         )
         .await

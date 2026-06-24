@@ -1,7 +1,9 @@
 use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskId, TaskPhase, TaskSchedulerState, TaskStatus,
 };
-use harness_workflow::runtime::{WorkflowInstance, WorkflowTerminalState};
+use harness_workflow::runtime::{
+    WorkflowInstance, WorkflowTerminalState, QUALITY_GATE_DEFINITION_ID,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeActiveBucket {
@@ -26,7 +28,12 @@ impl RuntimeWorkflowProjection {
         let terminal_state = workflow.terminal_state();
         let task_status = workflow_state_to_task_status(workflow, terminal_state);
         let scheduler = workflow_scheduler_state(&workflow.state, &task_status, terminal_state);
-        let active_bucket = workflow_active_bucket(&workflow.state, &task_status, &scheduler);
+        let active_bucket = workflow_active_bucket(
+            &workflow.definition_id,
+            &workflow.state,
+            &task_status,
+            &scheduler,
+        );
         Self {
             failure_kind: task_status.is_failure().then_some(TaskFailureKind::Task),
             phase: workflow_state_to_task_phase(&workflow.state, terminal_state),
@@ -153,11 +160,15 @@ fn workflow_scheduler_state(
 }
 
 fn workflow_active_bucket(
+    definition_id: &str,
     state: &str,
     status: &TaskStatus,
     scheduler: &TaskSchedulerState,
 ) -> Option<RuntimeActiveBucket> {
-    if status.is_terminal() || state == "idle" {
+    if status.is_terminal()
+        || state == "idle"
+        || (definition_id == QUALITY_GATE_DEFINITION_ID && state == "pending")
+    {
         return None;
     }
     match scheduler.authority_state {
@@ -423,8 +434,8 @@ mod tests {
     #[test]
     fn projection_excludes_idle_workflows_from_active_counts() {
         let workflow = workflow_with_definition(
-            harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
-            "idle",
+            harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID,
+            "pending",
             serde_json::json!({}),
         );
 

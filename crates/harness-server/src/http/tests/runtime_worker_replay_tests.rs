@@ -18,12 +18,12 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         .as_ref()
         .expect("workflow runtime store should be configured");
     let parent = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         1,
-        "dispatching",
-        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
-    .with_id("repo-backlog-auto-submit-replay")
+    .with_id("prompt-task-auto-submit-replay")
     .with_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
@@ -31,7 +31,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
     store.upsert_instance(&parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
-        "repo-backlog:owner/repo:issue:129:start",
+        "prompt-task:owner/repo:issue:129:start",
         serde_json::json!({
             "definition_id": "github_issue_pr",
             "subject_key": "issue:129",
@@ -96,7 +96,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
             }),
         )
         .await?;
-    let task_id = crate::task_runner::TaskId::from_str("repo-backlog:owner/repo:issue:129");
+    let task_id = crate::task_runner::TaskId::from_str("prompt-task:owner/repo:issue:129");
     let labels = vec!["harness".to_string()];
     crate::workflow_runtime_submission::record_issue_submission(
         store,
@@ -112,6 +112,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("129"),
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -164,10 +165,10 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
     let child_decisions = store.decisions_for(&child_id).await?;
     assert_eq!(child_decisions.len(), 1);
     let parent_after = store
-        .get_instance("repo-backlog-auto-submit-replay")
+        .get_instance("prompt-task-auto-submit-replay")
         .await?
         .expect("parent workflow should still exist");
-    assert_eq!(parent_after.state, "idle");
+    assert_eq!(parent_after.state, "implementing");
     Ok(())
 }
 
@@ -189,12 +190,12 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
         .as_ref()
         .expect("workflow runtime store should be configured");
     let parent = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         1,
-        "dispatching",
-        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
-    .with_id("repo-backlog-auto-submit-event-only")
+    .with_id("prompt-task-auto-submit-event-only")
     .with_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
@@ -202,7 +203,7 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
     store.upsert_instance(&parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
-        "repo-backlog:owner/repo:issue:130:start",
+        "prompt-task:owner/repo:issue:130:start",
         serde_json::json!({
             "definition_id": "github_issue_pr",
             "subject_key": "issue:130",
@@ -273,7 +274,7 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
             "IssueSubmitted",
             "workflow_runtime_submission",
             serde_json::json!({
-                "task_id": "repo-backlog:owner/repo:issue:130",
+                "task_id": "prompt-task:owner/repo:issue:130",
                 "repo": "owner/repo",
                 "issue_number": 130,
                 "labels": ["harness"],
@@ -305,7 +306,7 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
             .data
             .get("task_id")
             .and_then(serde_json::Value::as_str),
-        Some("repo-backlog:owner/repo:issue:130")
+        Some("prompt-task:owner/repo:issue:130")
     );
     let child_events = store.events_for(&child_id).await?;
     assert_eq!(
@@ -331,10 +332,10 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
         Some("plan_issue")
     );
     let parent_after = store
-        .get_instance("repo-backlog-auto-submit-event-only")
+        .get_instance("prompt-task-auto-submit-event-only")
         .await?
         .expect("parent workflow should still exist");
-    assert_eq!(parent_after.state, "idle");
+    assert_eq!(parent_after.state, "implementing");
     Ok(())
 }
 
@@ -356,12 +357,12 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
         .as_ref()
         .expect("workflow runtime store should be configured");
     let parent = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         1,
-        "dispatching",
-        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
-    .with_id("repo-backlog-auto-submit-reopen")
+    .with_id("prompt-task-auto-submit-reopen")
     .with_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
@@ -369,7 +370,7 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
     store.upsert_instance(&parent).await?;
     let first_command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
-        "repo-backlog:owner/repo:issue:131:start:first",
+        "prompt-task:owner/repo:issue:131:start:first",
         serde_json::json!({
             "definition_id": "github_issue_pr",
             "subject_key": "issue:131",
@@ -420,7 +421,7 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
             .data
             .get("task_id")
             .and_then(serde_json::Value::as_str),
-        Some("repo-backlog:owner/repo:issue:131")
+        Some("prompt-task:owner/repo:issue:131")
     );
     let first_child_commands = store.commands_for(&child_id).await?;
     assert_eq!(first_child_commands.len(), 1);
@@ -433,14 +434,14 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
     child.state = "failed".to_string();
     store.upsert_instance(&child).await?;
     let mut parent = store
-        .get_instance("repo-backlog-auto-submit-reopen")
+        .get_instance("prompt-task-auto-submit-reopen")
         .await?
         .expect("parent workflow should still exist");
-    parent.state = "dispatching".to_string();
+    parent.state = "implementing".to_string();
     store.upsert_instance(&parent).await?;
     let second_command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
-        "repo-backlog:owner/repo:issue:131:start:second",
+        "prompt-task:owner/repo:issue:131:start:second",
         serde_json::json!({
             "definition_id": "github_issue_pr",
             "subject_key": "issue:131",

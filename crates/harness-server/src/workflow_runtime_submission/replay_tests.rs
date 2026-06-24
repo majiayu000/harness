@@ -34,6 +34,7 @@ async fn issue_resubmission_after_completed_command_creates_fresh_attempt() -> a
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:501"),
+            remote_fact_hash: None,
         },
     )
     .await?;
@@ -63,6 +64,7 @@ async fn issue_resubmission_after_completed_command_creates_fresh_attempt() -> a
             dependencies_blocked: false,
             source: Some("github"),
             external_id: Some("issue:501"),
+            remote_fact_hash: None,
         },
     )
     .await?;

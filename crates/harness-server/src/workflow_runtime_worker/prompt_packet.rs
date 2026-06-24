@@ -216,39 +216,17 @@ pub(super) fn activity_result_schema(
     })
 }
 
-fn workflow_decision_command_examples(workflow_definition: &str, activity: &str) -> Value {
-    match (workflow_definition, activity) {
-        ("repo_backlog", "plan_repo_sprint") => json!([
-            {
-                "command_type": "start_child_workflow",
-                "dedupe_key": "repo-sprint-plan:owner/repo:issue:42:start",
-                "command": {
-                    "definition_id": "github_issue_pr",
-                    "subject_key": "issue:42",
-                    "repo": "owner/repo",
-                    "issue_number": 42,
-                    "issue_url": "https://github.com/owner/repo/issues/42",
-                    "title": "Example issue selected for the sprint",
-                    "labels": ["bug"],
-                    "depends_on": [],
-                    "source": "github",
-                    "external_id": "42",
-                    "auto_submit": true,
-                    "note": "All child-workflow payload goes INSIDE this nested `command` Value. Do not omit definition_id or subject_key."
-                }
+fn workflow_decision_command_examples(_workflow_definition: &str, _activity: &str) -> Value {
+    json!([
+        {
+            "command_type": "enqueue_activity",
+            "dedupe_key": "<unique stable string for this command>",
+            "command": {
+                "activity": "<next activity name>",
+                "note": "All activity-specific payload (repo, issue_number, signals, etc.) goes INSIDE this nested `command` Value. The outer object MUST have exactly the three fields: command_type, dedupe_key, command."
             }
-        ]),
-        _ => json!([
-            {
-                "command_type": "enqueue_activity",
-                "dedupe_key": "<unique stable string for this command>",
-                "command": {
-                    "activity": "<next activity name>",
-                    "note": "All activity-specific payload (repo, issue_number, signals, etc.) goes INSIDE this nested `command` Value. The outer object MUST have exactly the three fields: command_type, dedupe_key, command."
-                }
-            }
-        ]),
-    }
+        }
+    ])
 }
 
 fn workflow_decision_contract(workflow: Option<&WorkflowInstance>) -> Value {
@@ -297,7 +275,6 @@ fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionVali
         QUALITY_GATE_DEFINITION_ID => Some(DecisionValidator::quality_gate()),
         PR_FEEDBACK_DEFINITION_ID => Some(DecisionValidator::pr_feedback()),
         PROMPT_TASK_DEFINITION_ID => Some(DecisionValidator::prompt_task()),
-        "repo_backlog" => Some(DecisionValidator::repo_backlog()),
         _ => None,
     }
 }
@@ -389,41 +366,6 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "retry_policy": "runtime_retry_policy may retry this activity before failure."
             }
         }),
-        ("repo_backlog", "poll_repo_backlog") => json!({
-            "on_succeeded": {
-                "reducer_next_state": "planning_batch_when_IssueDiscovered_signals_exist; dispatching_when_only_OpenPrFeedbackDiscovered_signals_exist; otherwise idle",
-                "accepted_signals": ["IssueDiscovered", "IssueSkipped", "NoOpenIssueFound", "OpenPrFeedbackDiscovered", "OpenPrFeedbackSkipped", "NoOpenPrFeedbackFound"],
-                "success_requires": "At least one accepted signal. Empty signals are invalid even when status is succeeded.",
-                "empty_success_allowed": false,
-                "required_summary": "Describe the GitHub issue query, open PR feedback query, existing workflow checks, new issue workflow candidates, and standalone PR feedback candidates."
-            },
-            "structured_decision": {
-                "optional": true,
-                "description": "Prefer signals. Only emit workflow_decision when you can include every required command; a transition to planning_batch without an enqueue_activity command is invalid."
-            },
-            "on_failed": {
-                "reducer_next_state": "failed_or_retry",
-                "retry_policy": "runtime_retry_policy may retry this activity before failure."
-            }
-        }),
-        ("repo_backlog", "plan_repo_sprint") => json!({
-            "on_succeeded": {
-                "reducer_next_state": "dispatching_when_SprintTaskSelected_signals_exist_else_idle",
-                "accepted_signals": ["SprintTaskSelected", "IssueSkipped", "NoSprintTaskSelected"],
-                "accepted_artifacts": ["sprint_plan"],
-                "success_requires": "At least one accepted signal or a sprint_plan artifact. Empty signals and no sprint_plan artifact are invalid even when status is succeeded.",
-                "empty_success_allowed": false,
-                "required_summary": "Describe dependency planning, skipped issues, and selected issue workflow dispatch order."
-            },
-            "structured_decision": {
-                "optional": true,
-                "description": "Prefer signals. Only emit workflow_decision when you can include every required command; a transition to dispatching without start_child_workflow commands is invalid."
-            },
-            "on_failed": {
-                "reducer_next_state": "failed_or_retry",
-                "retry_policy": "runtime_retry_policy may retry this activity before failure."
-            }
-        }),
         ("github_issue_pr", "implement_issue") => json!({
             "on_succeeded": {
                 "reducer_next_state": "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_or_blocked_with_scope_too_large_signal_else_blocked",
@@ -451,20 +393,6 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "retry_policy": "runtime_retry_policy may retry this activity before failure."
             }
         }),
-        ("repo_backlog", "start_child_workflow") => json!({
-            "on_succeeded": {
-                "reducer_next_state": "idle",
-                "required_artifact": "child_workflow"
-            }
-        }),
-        ("repo_backlog", "mark_bound_issue_done") | ("repo_backlog", "recover_issue_workflow") => {
-            json!({
-                "on_succeeded": {
-                    "reducer_next_state": "idle",
-                    "required_artifact": "child_workflow"
-                }
-            })
-        }
         (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => json!({
             "on_succeeded": {
                 "reducer_next_state": "passed",
@@ -603,46 +531,6 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                     "PrReadyToMerge": "Use only with server_pr_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads for the final head."
             }
         }),
-        ("repo_backlog", "poll_repo_backlog") => json!({
-            "must_include": ["repo and label queried", "open issues inspected", "open PR feedback inspected", "existing workflow checks", "new issue workflow candidates", "open PR feedback candidates", "next workflow action"],
-            "must_not_include": ["repository code changes", "workflow table mutations", "server-side GitHub polling changes"],
-            "success_rule": "A succeeded result MUST emit at least one accepted issue or open PR feedback signal. Do not return succeeded with empty signals.",
-            "signals": {
-                "IssueDiscovered": "Use for each open GitHub issue that should be considered by the runtime sprint planner. Include issue_number, issue_url, repo, title, and labels when available.",
-                "IssueSkipped": "Use for open GitHub issues that already have a workflow, are PRs, or should not be started. Include issue_number and reason. When an issue already has a workflow, include workflow_state.",
-                "NoOpenIssueFound": "Use when the repo/label query found no candidate issues.",
-                "OpenPrFeedbackDiscovered": "Use for each open PR with unresolved actionable review feedback and no active bound workflow. Include pr_number, pr_url, repo, title, feedback_count, and summary.",
-                "OpenPrFeedbackSkipped": "Use for open PRs intentionally skipped because they are already covered, have no actionable feedback, are draft/closed, or are otherwise not candidates. Include pr_number and reason.",
-                "NoOpenPrFeedbackFound": "Use when the open PR review query found no standalone PR feedback candidates."
-            },
-            "artifacts": {
-                "workflow_decision": {
-                    "optional": true,
-                    "allowed_decisions": ["plan_repo_sprint_from_scan", "finish_repo_backlog_scan"]
-                }
-            }
-        }),
-        ("repo_backlog", "plan_repo_sprint") => json!({
-            "must_include": ["issues considered", "dependency reasoning", "selected tasks", "skipped issues", "next workflow action"],
-            "must_not_include": ["repository code changes", "workflow table mutations", "server-side task queue changes"],
-            "success_rule": "A succeeded result MUST emit SprintTaskSelected, IssueSkipped, NoSprintTaskSelected, or a sprint_plan artifact. Do not return succeeded with empty signals and no sprint_plan artifact.",
-            "signals": {
-                "SprintTaskSelected": "Use once for each issue selected for execution. Include issue_number, issue_url, repo, labels, and depends_on as issue numbers.",
-                "IssueSkipped": "Use for discovered issues intentionally skipped by planning. Include issue_number and reason.",
-                "NoSprintTaskSelected": "Use when no issue should be dispatched from this sprint plan."
-            },
-            "artifacts": {
-                "sprint_plan": {
-                    "optional": true,
-                    "fields": ["tasks", "skip"],
-                    "task_fields": ["issue", "depends_on"]
-                },
-                "workflow_decision": {
-                    "optional": true,
-                    "allowed_decisions": ["start_issue_workflows_from_sprint_plan", "finish_repo_sprint_plan"]
-                }
-            }
-        }),
         (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => json!({
             "must_include": ["validation commands", "pass/fail evidence", "remaining blockers"],
             "must_not_include": ["workflow table mutations", "unverified pass claims"],
@@ -650,6 +538,17 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 "validation_report": {
                     "required_when": "The activity records detailed validation results.",
                     "fields": ["commands", "passed", "failed", "blocked"]
+                }
+            }
+        }),
+        ("github_issue_pr", "merge_pr") => json!({
+            "must_include": ["fresh PR head SHA", "status checks", "review thread state", "mergeability", "delete branch policy", "merge result"],
+            "must_not_include": ["merge without matching expected_head_sha", "unverified merge claims", "workflow table mutations"],
+            "artifacts": {
+                "pull_request": {
+                    "required": true,
+                    "fields": ["pr_number", "pr_url", "state", "merged", "merge_commit_sha", "head_sha"],
+                    "success_requires": "state=merged or merged=true after re-reading GitHub immediately after merge"
                 }
             }
         }),

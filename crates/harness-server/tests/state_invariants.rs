@@ -123,6 +123,7 @@ fn scheduler_is_terminal(state: &SchedulerAuthorityState) -> bool {
 fn all_lifecycle_states() -> Vec<IssueLifecycleState> {
     vec![
         IssueLifecycleState::Discovered,
+        IssueLifecycleState::AwaitingDependencies,
         IssueLifecycleState::Scheduled,
         IssueLifecycleState::Implementing,
         IssueLifecycleState::PrOpen,
@@ -130,7 +131,9 @@ fn all_lifecycle_states() -> Vec<IssueLifecycleState> {
         IssueLifecycleState::FeedbackClaimed,
         IssueLifecycleState::AddressingFeedback,
         IssueLifecycleState::ReadyToMerge,
+        IssueLifecycleState::Merging,
         IssueLifecycleState::Done,
+        IssueLifecycleState::Blocked,
         IssueLifecycleState::Failed,
         IssueLifecycleState::Cancelled,
     ]
@@ -139,6 +142,7 @@ fn all_lifecycle_states() -> Vec<IssueLifecycleState> {
 fn lifecycle_tag(state: &IssueLifecycleState) -> &'static str {
     match state {
         IssueLifecycleState::Discovered => "discovered",
+        IssueLifecycleState::AwaitingDependencies => "awaiting_dependencies",
         IssueLifecycleState::Scheduled => "scheduled",
         IssueLifecycleState::Implementing => "implementing",
         IssueLifecycleState::PrOpen => "pr_open",
@@ -146,7 +150,9 @@ fn lifecycle_tag(state: &IssueLifecycleState) -> &'static str {
         IssueLifecycleState::FeedbackClaimed => "feedback_claimed",
         IssueLifecycleState::AddressingFeedback => "addressing_feedback",
         IssueLifecycleState::ReadyToMerge => "ready_to_merge",
+        IssueLifecycleState::Merging => "merging",
         IssueLifecycleState::Done => "done",
+        IssueLifecycleState::Blocked => "blocked",
         IssueLifecycleState::Failed => "failed",
         IssueLifecycleState::Cancelled => "cancelled",
     }
@@ -158,13 +164,16 @@ fn lifecycle_is_terminal(state: &IssueLifecycleState) -> bool {
         | IssueLifecycleState::Failed
         | IssueLifecycleState::Cancelled => true,
         IssueLifecycleState::Discovered
+        | IssueLifecycleState::AwaitingDependencies
         | IssueLifecycleState::Scheduled
         | IssueLifecycleState::Implementing
         | IssueLifecycleState::PrOpen
         | IssueLifecycleState::AwaitingFeedback
         | IssueLifecycleState::FeedbackClaimed
         | IssueLifecycleState::AddressingFeedback
-        | IssueLifecycleState::ReadyToMerge => false,
+        | IssueLifecycleState::ReadyToMerge
+        | IssueLifecycleState::Merging
+        | IssueLifecycleState::Blocked => false,
     }
 }
 

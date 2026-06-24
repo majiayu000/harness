@@ -29,10 +29,7 @@ pub(super) fn activity_name(job: &RuntimeJob) -> String {
 }
 
 pub(super) fn is_builtin_lifecycle_activity(job: &RuntimeJob) -> bool {
-    matches!(
-        activity_name(job).as_str(),
-        "start_child_workflow" | "mark_bound_issue_done" | "recover_issue_workflow"
-    )
+    activity_name(job) == "start_child_workflow"
 }
 
 pub(super) fn required_string<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str> {
@@ -66,27 +63,36 @@ pub(super) fn string_vec(value: &Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub(super) fn dependency_task_ids_from_command(command: &Value, repo: Option<&str>) -> Vec<TaskId> {
+pub(super) fn dependency_task_ids_from_command(
+    command: &Value,
+    repo: Option<&str>,
+    issue_task_prefix: Option<&str>,
+) -> Vec<TaskId> {
     command
         .get("depends_on")
         .and_then(Value::as_array)
         .map(|values| {
             values
                 .iter()
-                .filter_map(|value| dependency_task_id(value, repo))
+                .filter_map(|value| dependency_task_id(value, repo, issue_task_prefix))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn dependency_task_id(value: &Value, repo: Option<&str>) -> Option<TaskId> {
+fn dependency_task_id(
+    value: &Value,
+    repo: Option<&str>,
+    issue_task_prefix: Option<&str>,
+) -> Option<TaskId> {
     if let Some(issue_number) = value
         .as_u64()
         .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
     {
-        return Some(TaskId::from_str(&format!(
-            "repo-backlog:{}:issue:{issue_number}",
-            repo.unwrap_or("<none>")
+        return Some(TaskId::from_str(&issue_task_id_for_number(
+            issue_number,
+            repo,
+            issue_task_prefix,
         )));
     }
     value
@@ -95,24 +101,60 @@ fn dependency_task_id(value: &Value, repo: Option<&str>) -> Option<TaskId> {
         .map(TaskId::from_str)
 }
 
+pub(super) fn issue_task_id_for_number(
+    issue_number: u64,
+    repo: Option<&str>,
+    issue_task_prefix: Option<&str>,
+) -> String {
+    match issue_task_prefix {
+        Some(prefix) => format!("{prefix}:issue:{issue_number}"),
+        None => format!(
+            "github-issue:{}:issue:{issue_number}",
+            repo.unwrap_or("<none>")
+        ),
+    }
+}
+
+pub(super) fn issue_task_id_from_command(
+    command: &Value,
+    job: &RuntimeJob,
+    repo: Option<&str>,
+    issue_number: u64,
+) -> TaskId {
+    let task_id = optional_string(command, "task_id")
+        .or_else(|| {
+            job.input
+                .get("dedupe_key")
+                .and_then(Value::as_str)
+                .and_then(|dedupe_key| issue_task_id_from_dedupe_key(dedupe_key, issue_number))
+        })
+        .unwrap_or_else(|| issue_task_id_for_number(issue_number, repo, None));
+    TaskId::from_str(&task_id)
+}
+
+pub(super) fn issue_task_prefix_from_task_id(
+    task_id: &TaskId,
+    issue_number: u64,
+) -> Option<String> {
+    let marker = format!(":issue:{issue_number}");
+    let raw = task_id.as_str();
+    let marker_start = raw.find(&marker)?;
+    let prefix = &raw[..marker_start];
+    (!prefix.is_empty()).then(|| prefix.to_string())
+}
+
+fn issue_task_id_from_dedupe_key(dedupe_key: &str, issue_number: u64) -> Option<String> {
+    let marker = format!(":issue:{issue_number}");
+    let marker_end = dedupe_key.find(&marker)? + marker.len();
+    Some(dedupe_key[..marker_end].to_string()).filter(|task_id| !task_id.is_empty())
+}
+
 pub(super) fn force_execute_from_project_policy(project_id: &str, labels: &[String]) -> bool {
     let workflow_cfg = harness_core::config::workflow::load_workflow_config(Path::new(project_id))
         .unwrap_or_default();
     labels
         .iter()
         .any(|label| label == &workflow_cfg.issue_workflow.force_execute_label)
-}
-
-pub(super) fn required_data_string<'a>(
-    workflow: &'a WorkflowInstance,
-    field: &str,
-) -> anyhow::Result<&'a str> {
-    workflow
-        .data
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("workflow data `{field}` is missing"))
 }
 
 pub(super) fn optional_data_u64(workflow: &WorkflowInstance, field: &str) -> Option<u64> {
@@ -219,15 +261,6 @@ pub(super) fn merge_json_object(target: &mut Value, update: Value) {
     for (key, value) in update_object {
         target_object.insert(key.clone(), value.clone());
     }
-}
-
-pub(super) fn child_workflow_artifact(child: &WorkflowInstance) -> Value {
-    json!({
-        "workflow_id": child.id,
-        "definition_id": child.definition_id,
-        "state": child.state,
-        "subject_key": child.subject.subject_key,
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,7 +500,7 @@ mod tests {
             "depends_on": [42, "43", "explicit-task-id"]
         });
 
-        let dependencies = dependency_task_ids_from_command(&command, Some("owner/repo"));
+        let dependencies = dependency_task_ids_from_command(&command, Some("owner/repo"), None);
 
         assert_eq!(
             dependencies
@@ -475,10 +508,75 @@ mod tests {
                 .map(|task_id| task_id.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "repo-backlog:owner/repo:issue:42",
-                "repo-backlog:owner/repo:issue:43",
+                "github-issue:owner/repo:issue:42",
+                "github-issue:owner/repo:issue:43",
                 "explicit-task-id"
             ]
+        );
+    }
+
+    #[test]
+    fn dependency_task_ids_from_command_preserves_prompt_child_prefix() {
+        let command = json!({
+            "depends_on": [42, "43", "explicit-task-id"]
+        });
+
+        let dependencies = dependency_task_ids_from_command(
+            &command,
+            Some("owner/repo"),
+            Some("prompt-task:owner/repo"),
+        );
+
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|task_id| task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "prompt-task:owner/repo:issue:42",
+                "prompt-task:owner/repo:issue:43",
+                "explicit-task-id"
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_task_id_from_command_prefers_explicit_task_id() {
+        let command = json!({
+            "task_id": "explicit-task",
+        });
+        let job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "dedupe_key": "prompt-task:owner/repo:issue:42:start",
+            }),
+        );
+
+        let task_id = issue_task_id_from_command(&command, &job, Some("owner/repo"), 42);
+
+        assert_eq!(task_id.as_str(), "explicit-task");
+    }
+
+    #[test]
+    fn issue_task_id_from_command_preserves_dedupe_issue_namespace() {
+        let command = json!({});
+        let job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "dedupe_key": "prompt-task:owner/repo:issue:42:start:retry",
+            }),
+        );
+
+        let task_id = issue_task_id_from_command(&command, &job, Some("owner/repo"), 42);
+
+        assert_eq!(task_id.as_str(), "prompt-task:owner/repo:issue:42");
+        assert_eq!(
+            issue_task_prefix_from_task_id(&task_id, 42).as_deref(),
+            Some("prompt-task:owner/repo")
         );
     }
 }

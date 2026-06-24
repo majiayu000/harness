@@ -87,6 +87,7 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
         store.commands_for(&workflow.id).await?[0].status,
         "dispatched"
     );
+    assert!(state.intake.github_token_dispatch_snapshot().is_empty());
     Ok(())
 }
 
@@ -363,125 +364,6 @@ async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() ->
 }
 
 #[tokio::test]
-async fn runtime_repo_backlog_poll_tick_enqueues_runtime_command() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    let project_root = dir.path().join("project-backlog");
-    std::fs::create_dir(&project_root)?;
-    std::fs::write(
-        project_root.join("WORKFLOW.md"),
-        "---\nrepo_backlog:\n  enabled: true\n  batch_limit: 5\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
-    )?;
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
-        enabled: true,
-        repos: vec![harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: Some(project_root.to_string_lossy().into_owned()),
-        }],
-        ..Default::default()
-    });
-    let state = make_test_state_with_workflow_runtime_config_and_registry(
-        dir.path(),
-        &project_root,
-        config,
-        harness_agents::registry::AgentRegistry::new("test"),
-    )
-    .await?;
-    let store = state
-        .core
-        .workflow_runtime_store
-        .as_ref()
-        .expect("workflow runtime store should be configured");
-
-    let tick = super::background::run_runtime_repo_backlog_poll_tick(&state, 10).await?;
-
-    assert_eq!(tick.requested, 1);
-    assert_eq!(tick.active_command_exists, 0);
-    assert_eq!(tick.skipped, 0);
-    assert_eq!(tick.rejected, 0);
-    let instances = store
-        .list_instances_by_definition(
-            harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
-            None,
-            None,
-        )
-        .await?;
-    assert_eq!(instances.len(), 1);
-    let workflow_id = instances[0].id.clone();
-    let instance = store
-        .get_instance(&workflow_id)
-        .await?
-        .expect("repo backlog workflow should exist");
-    assert_eq!(instance.state, "scanning");
-    assert_eq!(instance.data["label"], "harness");
-    let commands = store.commands_for(&workflow_id).await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(
-        commands[0].command.activity_name(),
-        Some(harness_workflow::runtime::REPO_BACKLOG_POLL_ACTIVITY)
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn runtime_repo_backlog_poll_tick_skips_malformed_workflow_config() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    let project_root = dir.path().join("project-backlog-malformed");
-    std::fs::create_dir(&project_root)?;
-    std::fs::write(
-        project_root.join("WORKFLOW.md"),
-        "---\nrepo_backlog: [\n---\n",
-    )?;
-    let mut config = harness_core::config::HarnessConfig::default();
-    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
-        enabled: true,
-        repos: vec![harness_core::config::intake::GitHubRepoConfig {
-            repo: "owner/repo".to_string(),
-            label: "harness".to_string(),
-            project_root: Some(project_root.to_string_lossy().into_owned()),
-        }],
-        ..Default::default()
-    });
-    let state = make_test_state_with_workflow_runtime_config_and_registry(
-        dir.path(),
-        &project_root,
-        config,
-        harness_agents::registry::AgentRegistry::new("test"),
-    )
-    .await?;
-    let store = state
-        .core
-        .workflow_runtime_store
-        .as_ref()
-        .expect("workflow runtime store should be configured");
-
-    let tick = super::background::run_runtime_repo_backlog_poll_tick(&state, 10).await?;
-
-    assert_eq!(tick.requested, 0);
-    assert_eq!(tick.active_command_exists, 0);
-    assert_eq!(tick.skipped, 1);
-    assert_eq!(tick.rejected, 0);
-    let instances = store
-        .list_instances_by_definition(
-            harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
-            None,
-            None,
-        )
-        .await?;
-    assert!(instances.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
 async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -711,5 +593,259 @@ async fn runtime_command_dispatch_tick_skips_when_command_project_runtime_disabl
         .await?
         .is_empty());
     assert_eq!(store.commands_for(&workflow.id).await?[0].status, "skipped");
+    assert!(state.intake.github_token_dispatch_snapshot().is_empty());
+    Ok(())
+}
+
+fn ready_auto_merge_snapshot(
+    head_oid: &str,
+) -> crate::github_pr_snapshot::GitHubPrSnapshotArtifacts {
+    let normalized_snapshot = serde_json::json!({
+        "schema": "harness.github.pr_snapshot.v1",
+        "snapshot_source": "server_github_graphql",
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "state": "OPEN",
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "url": "https://github.com/owner/repo/pull/77",
+        "base_ref": "main",
+        "expected_base_ref": "main",
+        "head_oid": head_oid,
+        "is_draft": false,
+        "status_check_rollup_state": "SUCCESS",
+        "merge_state_status": "CLEAN",
+        "review_decision": "APPROVED",
+        "active_unresolved_review_threads_count": 0,
+        "review_threads_complete": true,
+    });
+    crate::github_pr_snapshot::GitHubPrSnapshotArtifacts {
+        raw_pr: normalized_snapshot.clone(),
+        normalized_snapshot,
+    }
+}
+
+fn auto_merge_policy(
+    require_review_threads_resolved: bool,
+    require_clean_merge_state: bool,
+) -> harness_core::config::intake::ResolvedGitHubAutoMergePolicy {
+    harness_core::config::intake::ResolvedGitHubAutoMergePolicy {
+        enabled: true,
+        method: harness_core::config::intake::GitHubMergeMethod::Squash,
+        delete_branch: false,
+        require_review_threads_resolved,
+        require_clean_merge_state,
+    }
+}
+
+#[test]
+fn auto_merge_snapshot_gate_accepts_ready_matching_head() -> anyhow::Result<()> {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:77"),
+    )
+    .with_id("issue-77")
+    .with_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 77,
+        "pr_number": 77,
+        "pr_head_sha": "abc123",
+    }));
+
+    let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+        &workflow,
+        &ready_auto_merge_snapshot("abc123"),
+        &auto_merge_policy(true, true),
+    )?;
+
+    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = outcome else {
+        panic!("matching ready snapshot should pass auto-merge gate");
+    };
+    assert_eq!(prepared.data["merge_policy"], "auto");
+    assert_eq!(prepared.data["merge_method"], "squash");
+    assert_eq!(prepared.data["merge_delete_branch"], false);
+    assert_eq!(prepared.data["merge_require_review_threads_resolved"], true);
+    assert_eq!(prepared.data["merge_require_clean_merge_state"], true);
+    assert_eq!(prepared.data["pr_head_sha"], "abc123");
+    assert_eq!(prepared.data["merge_attempted_head_sha"], "abc123");
+    assert!(prepared
+        .data
+        .get("last_remote_fact_hash")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.starts_with("sha256:")));
+    Ok(())
+}
+
+#[test]
+fn auto_merge_snapshot_gate_accepts_fresh_ready_head_when_stored_head_changed() -> anyhow::Result<()>
+{
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:78"),
+    )
+    .with_id("issue-78")
+    .with_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 78,
+        "pr_number": 78,
+        "pr_head_sha": "old-head",
+    }));
+
+    let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+        &workflow,
+        &ready_auto_merge_snapshot("new-head"),
+        &auto_merge_policy(true, true),
+    )?;
+
+    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = outcome else {
+        panic!("fresh ready snapshot should replace stale stored merge head");
+    };
+    assert_eq!(prepared.data["pr_head_sha"], "new-head");
+    assert_eq!(prepared.data["merge_attempted_head_sha"], "new-head");
+    Ok(())
+}
+
+#[test]
+fn auto_merge_snapshot_gate_persists_fresh_head_when_workflow_head_missing() -> anyhow::Result<()> {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:80"),
+    )
+    .with_id("issue-80")
+    .with_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 80,
+        "pr_number": 80,
+    }));
+
+    let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+        &workflow,
+        &ready_auto_merge_snapshot("fresh-head"),
+        &auto_merge_policy(true, true),
+    )?;
+
+    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = outcome else {
+        panic!("fresh ready snapshot should seed the expected merge head");
+    };
+    assert_eq!(prepared.data["pr_head_sha"], "fresh-head");
+    assert_eq!(prepared.data["merge_attempted_head_sha"], "fresh-head");
+    Ok(())
+}
+
+#[test]
+fn auto_merge_snapshot_gate_honors_relaxed_policy_fields() -> anyhow::Result<()> {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:79"),
+    )
+    .with_id("issue-79")
+    .with_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 79,
+        "pr_number": 79,
+        "pr_head_sha": "abc123",
+    }));
+    let mut snapshot = ready_auto_merge_snapshot("abc123");
+    snapshot.normalized_snapshot["merge_state_status"] = serde_json::json!("DIRTY");
+    snapshot.normalized_snapshot["active_unresolved_review_threads_count"] = serde_json::json!(2);
+    snapshot.normalized_snapshot["review_threads_complete"] = serde_json::json!(false);
+    snapshot.raw_pr = snapshot.normalized_snapshot.clone();
+
+    let strict = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+        &workflow,
+        &snapshot,
+        &auto_merge_policy(true, true),
+    )?;
+    assert!(matches!(
+        strict,
+        super::auto_merge::AutoMergeSnapshotGate::NotReady
+    ));
+
+    let relaxed = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+        &workflow,
+        &snapshot,
+        &auto_merge_policy(false, false),
+    )?;
+    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = relaxed else {
+        panic!("relaxed policy should pass matching approved snapshot");
+    };
+    assert_eq!(
+        prepared.data["merge_require_review_threads_resolved"],
+        false
+    );
+    assert_eq!(prepared.data["merge_require_clean_merge_state"], false);
+    Ok(())
+}
+
+#[test]
+fn auto_merge_snapshot_gate_rejects_wrong_base_ref() -> anyhow::Result<()> {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:81"),
+    )
+    .with_id("issue-81")
+    .with_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 81,
+        "pr_number": 81,
+        "pr_head_sha": "abc123",
+        "expected_base_ref": "main",
+    }));
+    let mut snapshot = ready_auto_merge_snapshot("abc123");
+    snapshot.normalized_snapshot["base_ref"] = serde_json::json!("release");
+    snapshot.raw_pr = snapshot.normalized_snapshot.clone();
+
+    let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+        &workflow,
+        &snapshot,
+        &auto_merge_policy(true, true),
+    )?;
+
+    assert!(matches!(
+        outcome,
+        super::auto_merge::AutoMergeSnapshotGate::NotReady
+    ));
+    Ok(())
+}
+
+#[test]
+fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()> {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:82"),
+    )
+    .with_id("issue-82")
+    .with_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 82,
+        "pr_number": 82,
+        "pr_head_sha": "abc123",
+    }));
+    let mut snapshot = ready_auto_merge_snapshot("abc123");
+    snapshot.normalized_snapshot["base_ref"] = serde_json::json!("release");
+    snapshot.normalized_snapshot["expected_base_ref"] = serde_json::Value::Null;
+    snapshot.raw_pr = snapshot.normalized_snapshot.clone();
+
+    let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+        &workflow,
+        &snapshot,
+        &auto_merge_policy(true, true),
+    )?;
+
+    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = outcome else {
+        panic!("unknown expected base should not block an otherwise ready snapshot");
+    };
+    assert!(prepared.data.get("expected_base_ref").is_none());
     Ok(())
 }

@@ -85,7 +85,7 @@ async fn resolve_issue_dependency_status_for_instance(
         return Ok(status);
     }
     let Some(instance) =
-        canonical_repo_backlog_issue_dependency_instance(store, waiting_instance, task_id).await?
+        canonical_github_issue_dependency_instance(store, waiting_instance, task_id).await?
     else {
         return Ok(RuntimeDependencyStatus::Waiting);
     };
@@ -141,13 +141,12 @@ fn runtime_event_has_closed_issue_evidence(event: &WorkflowEvent) -> bool {
         .is_some_and(activity_result_value_has_closed_issue_evidence)
 }
 
-async fn canonical_repo_backlog_issue_dependency_instance(
+async fn canonical_github_issue_dependency_instance(
     store: &WorkflowRuntimeStore,
     waiting_instance: &WorkflowInstance,
     task_id: &TaskId,
 ) -> anyhow::Result<Option<WorkflowInstance>> {
-    let Some((dependency_repo, issue_number)) =
-        parse_repo_backlog_issue_dependency(task_id.as_str())
+    let Some((dependency_repo, issue_number)) = parse_github_issue_dependency(task_id.as_str())
     else {
         return Ok(None);
     };
@@ -170,8 +169,8 @@ async fn canonical_repo_backlog_issue_dependency_instance(
     store.get_instance(&workflow_id).await
 }
 
-fn parse_repo_backlog_issue_dependency(task_id: &str) -> Option<(&str, u64)> {
-    let rest = task_id.strip_prefix("repo-backlog:")?;
+fn parse_github_issue_dependency(task_id: &str) -> Option<(&str, u64)> {
+    let rest = task_id.strip_prefix("github-issue:")?;
     let (repo_key, issue_number) = rest.rsplit_once(":issue:")?;
     if repo_key.is_empty() {
         return None;
@@ -341,6 +340,7 @@ async fn release_issue_after_dependencies(
             additional_prompt: fields.additional_prompt.as_deref(),
             depends_on: &depends_on_strings(depends_on),
             dependencies_blocked: false,
+            remote_fact_hash: None,
         },
     );
     let event = store

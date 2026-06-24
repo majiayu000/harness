@@ -45,7 +45,7 @@ pub(super) async fn execute_start_prompt_task_child_workflow(
     });
     let task_id = optional_string(command, "task_id").unwrap_or_else(|| {
         format!(
-            "repo-backlog:{}:{}",
+            "runtime-child:{}:{}",
             repo.unwrap_or("<none>"),
             subject_key.replace(':', "-")
         )

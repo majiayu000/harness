@@ -222,60 +222,10 @@ impl TransitionAllowlist {
             .allow("quality_gate_pending", "done", [MarkDone])
             .allow("quality_gate_pending", "quality_gate_pending", [Wait])
             .allow("ready_to_merge", "ready_to_merge", [Wait])
+            .allow("ready_to_merge", "merging", [EnqueueActivity])
+            .allow("merging", "done", [MarkDone])
             .allow("ready_to_merge", "done", [MarkDone])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
-            .allow_from_any("failed", [MarkFailed])
-            .allow_from_any("cancelled", [MarkCancelled])
-    }
-
-    pub fn repo_backlog_defaults() -> Self {
-        use WorkflowCommandType::{
-            EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
-            RequestOperatorAttention, StartChildWorkflow, Wait,
-        };
-
-        Self::default()
-            .allow(
-                "idle",
-                "dispatching",
-                [StartChildWorkflow, EnqueueActivity, Wait],
-            )
-            .allow("idle", "scanning", [EnqueueActivity, Wait])
-            .allow("failed", "scanning", [EnqueueActivity, Wait])
-            .allow("scanning", "scanning", [EnqueueActivity, Wait])
-            .allow("scanning", "planning_batch", [EnqueueActivity, Wait])
-            .allow("planning_batch", "planning_batch", [EnqueueActivity, Wait])
-            .allow(
-                "planning_batch",
-                "dispatching",
-                [StartChildWorkflow, EnqueueActivity, Wait],
-            )
-            .allow("planning_batch", "idle", [Wait])
-            .allow("idle", "reconciling", [EnqueueActivity, Wait])
-            .allow(
-                "scanning",
-                "dispatching",
-                [StartChildWorkflow, EnqueueActivity, Wait],
-            )
-            .allow("scanning", "reconciling", [EnqueueActivity, Wait])
-            .allow("scanning", "idle", [Wait])
-            .allow(
-                "dispatching",
-                "dispatching",
-                [StartChildWorkflow, EnqueueActivity, Wait],
-            )
-            .allow("dispatching", "reconciling", [EnqueueActivity, Wait])
-            .allow("reconciling", "reconciling", [EnqueueActivity, Wait])
-            .allow(
-                "reconciling",
-                "dispatching",
-                [StartChildWorkflow, EnqueueActivity, Wait],
-            )
-            .allow("dispatching", "idle", [Wait])
-            .allow("reconciling", "idle", [Wait])
-            .allow("blocked", "idle", [Wait])
-            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
-            .allow_from_any("done", [MarkDone])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
     }
@@ -464,10 +414,6 @@ impl DecisionValidator {
             allowlist: TransitionAllowlist::github_issue_pr_defaults(),
             kind: DecisionValidatorKind::GithubIssuePr,
         }
-    }
-
-    pub fn repo_backlog() -> Self {
-        Self::new(TransitionAllowlist::repo_backlog_defaults())
     }
 
     pub fn quality_gate() -> Self {

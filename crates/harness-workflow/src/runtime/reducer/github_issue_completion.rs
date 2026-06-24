@@ -199,6 +199,109 @@ pub(super) fn bind_pr_from_activity_result(
     )
 }
 
+pub(super) fn merged_pr_from_activity_result(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (GITHUB_ISSUE_PR_DEFINITION_ID, "merging", "merge_pr")
+    {
+        return None;
+    }
+    let merged = merged_pull_request_artifact(result)?;
+    let reason = "merge_pr returned structured evidence that the pull request was merged";
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "record_pr_merged",
+            "done",
+            reason,
+        )
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::MarkDone,
+            format!(
+                "runtime-completion:{}:merged-pr:{}:done",
+                event.id, merged.pr_number
+            ),
+            json!({
+                "reason": reason,
+                "activity": result.activity,
+                "runtime_job_id": event_field_string(event, "runtime_job_id"),
+                "pr_number": merged.pr_number,
+                "pr_url": merged.pr_url,
+                "merge_commit_sha": merged.merge_commit_sha,
+                "head_sha": merged.head_sha,
+                "pull_request_evidence": merged.payload,
+            }),
+        ))
+        .with_evidence(WorkflowEvidence::new(
+            "github_pr_merged",
+            format!("pr={} url={}", merged.pr_number, merged.pr_url),
+        ))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct MergedPullRequestEvidence {
+    pr_number: u64,
+    pr_url: String,
+    merge_commit_sha: Option<String>,
+    head_sha: Option<String>,
+    payload: Value,
+}
+
+fn merged_pull_request_artifact(result: &ActivityResult) -> Option<MergedPullRequestEvidence> {
+    result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "pull_request")
+        .find_map(|artifact| {
+            if !pull_request_artifact_is_merged(&artifact.artifact) {
+                return None;
+            }
+            let pr_number = artifact.artifact.get("pr_number")?.as_u64()?;
+            let pr_url = artifact
+                .artifact
+                .get("pr_url")
+                .or_else(|| artifact.artifact.get("url"))?
+                .as_str()
+                .filter(|value| !value.trim().is_empty())?
+                .to_string();
+            let merge_commit_sha = artifact
+                .artifact
+                .get("merge_commit_sha")
+                .or_else(|| artifact.artifact.get("mergeCommitOid"))
+                .and_then(non_empty_json_string);
+            let head_sha = artifact
+                .artifact
+                .get("head_sha")
+                .or_else(|| artifact.artifact.get("headRefOid"))
+                .and_then(non_empty_json_string);
+            Some(MergedPullRequestEvidence {
+                pr_number,
+                pr_url,
+                merge_commit_sha,
+                head_sha,
+                payload: artifact.artifact.clone(),
+            })
+        })
+}
+
+fn pull_request_artifact_is_merged(value: &Value) -> bool {
+    value.get("merged").and_then(Value::as_bool) == Some(true)
+        || value
+            .get("state")
+            .and_then(non_empty_json_string)
+            .is_some_and(|state| state.eq_ignore_ascii_case("merged"))
+}
+
 #[derive(Debug, Clone)]
 struct ScopeTooLargeEvidence {
     summary: String,

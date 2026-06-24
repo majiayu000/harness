@@ -18,12 +18,12 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         .as_ref()
         .expect("workflow runtime store should be configured");
     let parent = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         1,
-        "dispatching",
-        harness_workflow::runtime::WorkflowSubject::new("repo", "owner/repo"),
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
-    .with_id("repo-backlog-prompt-child-replay")
+    .with_id("prompt-task-prompt-child-replay")
     .with_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
@@ -31,14 +31,14 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
     store.upsert_instance(&parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
-        "repo-backlog:owner/repo:pr:1120:feedback",
+        "prompt-task:owner/repo:pr:1120:feedback",
         serde_json::json!({
             "definition_id": harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
             "subject_key": "pr:1120:feedback",
             "repo": "owner/repo",
             "source": "github_pr_feedback",
             "external_id": "pr-feedback:owner/repo:1120",
-            "task_id": "repo-backlog:owner/repo:pr:1120:feedback",
+            "task_id": "prompt-task:owner/repo:pr:1120:feedback",
             "prompt": "Handle unresolved review feedback for PR 1120.",
         }),
     );
@@ -64,7 +64,7 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         .expect("runtime job should be claimable for the simulated crashed worker");
     assert_eq!(claimed.id, runtime_job.id);
 
-    let task_id = crate::task_runner::TaskId::from_str("repo-backlog:owner/repo:pr:1120:feedback");
+    let task_id = crate::task_runner::TaskId::from_str("prompt-task:owner/repo:pr:1120:feedback");
     let submission = crate::workflow_runtime_submission::record_prompt_submission(
         store,
         crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {

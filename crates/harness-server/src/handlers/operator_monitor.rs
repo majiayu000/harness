@@ -32,7 +32,6 @@ const WORKFLOW_DEFINITION_IDS: &[&str] = &[
     harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
     harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
     harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
-    harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID,
     harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID,
 ];
 
@@ -63,6 +62,7 @@ struct OperatorActivity {
     runtime_workflows: RuntimeWorkflowCounts,
     legacy_queue: LegacyQueueCounts,
     by_source: Vec<SourceActivity>,
+    token_dispatch_by_repo: Vec<crate::http::GitHubTokenDispatchCounterSnapshot>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -217,6 +217,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
             runtime_workflows,
             legacy_queue,
             by_source,
+            token_dispatch_by_repo: state.intake.github_token_dispatch_snapshot(),
         },
         operator_actions,
         failures,
@@ -665,7 +666,6 @@ fn workflow_source(workflow: &WorkflowInstance) -> String {
                 "operator_pr_feedback".to_string()
             }
             harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID => "manual".to_string(),
-            harness_workflow::runtime::REPO_BACKLOG_DEFINITION_ID => "repo_backlog".to_string(),
             harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID => "quality_gate".to_string(),
             _ => "workflow_runtime".to_string(),
         })

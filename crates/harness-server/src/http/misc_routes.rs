@@ -324,11 +324,21 @@ mod tests {
                     repo: "org/repo-a".to_string(),
                     label: "harness".to_string(),
                     project_root: None,
+                    auto_merge: None,
+                    merge_method: None,
+                    delete_branch: None,
+                    require_review_threads_resolved: None,
+                    require_clean_merge_state: None,
                 },
                 GitHubRepoConfig {
                     repo: "org/repo-b".to_string(),
                     label: "harness".to_string(),
                     project_root: Some("/srv/repo-b".to_string()),
+                    auto_merge: None,
+                    merge_method: None,
+                    delete_branch: None,
+                    require_review_threads_resolved: None,
+                    require_clean_merge_state: None,
                 },
             ],
             ..Default::default()
@@ -349,6 +359,11 @@ mod tests {
                 repo: "org/repo-a".to_string(),
                 label: "harness".to_string(),
                 project_root: None,
+                auto_merge: None,
+                merge_method: None,
+                delete_branch: None,
+                require_review_threads_resolved: None,
+                require_clean_merge_state: None,
             }],
             ..Default::default()
         };
@@ -368,6 +383,11 @@ mod tests {
                 repo: "org/repo-a".to_string(),
                 label: "harness".to_string(),
                 project_root: None,
+                auto_merge: None,
+                merge_method: None,
+                delete_branch: None,
+                require_review_threads_resolved: None,
+                require_clean_merge_state: None,
             }],
             ..Default::default()
         };

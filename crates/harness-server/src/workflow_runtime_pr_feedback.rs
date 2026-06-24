@@ -608,7 +608,7 @@ pub(crate) fn synthesized_pr_feedback_task_id(
     pr_number: u64,
 ) -> TaskId {
     TaskId::from_str(&format!(
-        "repo-backlog::{project_id}::repo:{}::pr:{pr_number}:feedback",
+        "github-pr-feedback::{project_id}::repo:{}::pr:{pr_number}:feedback",
         repo.unwrap_or("<none>")
     ))
 }
@@ -1169,20 +1169,54 @@ async fn approve_runtime_merge(
 
     let workflow_id = instance.id.clone();
     let approval_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let pr_number = instance
+        .data
+        .get("pr_number")
+        .and_then(|value| value.as_u64());
+    let pr_url = optional_string_field(&instance.data, "pr_url");
+    let expected_head_sha = optional_string_field(&instance.data, "pr_head_sha")
+        .or_else(|| optional_string_field(&instance.data, "head_sha"));
+    let merge_method = optional_string_field(&instance.data, "merge_method")
+        .unwrap_or_else(|| "squash".to_string());
+    let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(true);
+    let require_review_threads_resolved =
+        optional_bool_field(&instance.data, "merge_require_review_threads_resolved")
+            .unwrap_or(true);
+    let require_clean_merge_state =
+        optional_bool_field(&instance.data, "merge_require_clean_merge_state").unwrap_or(true);
+    let last_remote_fact_hash = optional_string_field(&instance.data, "last_remote_fact_hash");
+    let merge_dedupe_key = last_remote_fact_hash
+        .as_deref()
+        .map(|fact_hash| {
+            harness_workflow::runtime::remote_fact_command_dedupe_key("merge_pr", fact_hash)
+        })
+        .unwrap_or_else(|| format!("merge-approved:{}:{approval_nonce}", instance.id));
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
         "approve_merge",
-        "done",
-        "operator approved the ready-to-merge workflow",
+        "merging",
+        "operator approved the ready-to-merge workflow for merge execution",
     )
     .with_command(harness_workflow::runtime::WorkflowCommand::new(
-        harness_workflow::runtime::WorkflowCommandType::MarkDone,
-        format!("merge-approved:{}:{approval_nonce}", instance.id),
+        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
+        merge_dedupe_key,
         json!({
             "workflow_id": instance.id,
             "task_id": task_id,
+            "activity": "merge_pr",
             "approved_by": "dashboard",
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "expected_head_sha": expected_head_sha,
+            "merge_method": merge_method,
+            "delete_branch": delete_branch,
+            "require_review_threads_resolved": require_review_threads_resolved,
+            "require_clean_merge_state": require_clean_merge_state,
+            "dispatch_gate": {
+                "reason": "auto_merge_gate_passed",
+                "fact_hash": last_remote_fact_hash,
+            },
         }),
     ))
     .with_evidence(WorkflowEvidence::new(
@@ -1190,14 +1224,25 @@ async fn approve_runtime_merge(
         "dashboard merge approval for ready-to-merge workflow",
     ))
     .high_confidence();
-    let accepted_data =
-        merge_runtime_merge_data(instance.data.clone(), &decision.decision, task_id);
+    let accepted_data = merge_runtime_merge_data(
+        instance.data.clone(),
+        &decision.decision,
+        task_id,
+        delete_branch,
+        require_review_threads_resolved,
+        require_clean_merge_state,
+    );
     let event_payload = json!({
         "task_id": task_id,
         "issue_number": instance.data.get("issue_number").and_then(|value| value.as_u64()),
         "repo": optional_string_field(&instance.data, "repo"),
-        "pr_number": instance.data.get("pr_number").and_then(|value| value.as_u64()),
-        "pr_url": optional_string_field(&instance.data, "pr_url"),
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "expected_head_sha": expected_head_sha,
+        "merge_method": merge_method,
+        "delete_branch": delete_branch,
+        "require_review_threads_resolved": require_review_threads_resolved,
+        "require_clean_merge_state": require_clean_merge_state,
     });
     match commit_runtime_decision(
         store,
@@ -1635,10 +1680,22 @@ fn merge_runtime_merge_data(
     mut data: serde_json::Value,
     decision: &str,
     task_id: Option<&str>,
+    delete_branch: bool,
+    require_review_threads_resolved: bool,
+    require_clean_merge_state: bool,
 ) -> serde_json::Value {
     if let Some(object) = data.as_object_mut() {
         object.insert("last_decision".to_string(), json!(decision));
         object.insert("merge_approved_at".to_string(), json!(chrono::Utc::now()));
+        object.insert("merge_delete_branch".to_string(), json!(delete_branch));
+        object.insert(
+            "merge_require_review_threads_resolved".to_string(),
+            json!(require_review_threads_resolved),
+        );
+        object.insert(
+            "merge_require_clean_merge_state".to_string(),
+            json!(require_clean_merge_state),
+        );
         if let Some(task_id) = task_id {
             object.insert("merge_approved_task_id".to_string(), json!(task_id));
         }
@@ -1651,6 +1708,10 @@ fn optional_string_field(data: &serde_json::Value, field: &str) -> Option<String
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn optional_bool_field(data: &serde_json::Value, field: &str) -> Option<bool> {
+    data.get(field).and_then(|value| value.as_bool())
 }
 
 fn required_u64_field(data: &serde_json::Value, field: &str) -> anyhow::Result<u64> {

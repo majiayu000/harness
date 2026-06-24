@@ -4,7 +4,7 @@ use super::support::{
 };
 use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
-    QUALITY_GATE_DEFINITION_ID, REPO_BACKLOG_DEFINITION_ID,
+    QUALITY_GATE_DEFINITION_ID,
 };
 use crate::runtime::model::{
     ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
@@ -309,9 +309,6 @@ fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool 
                 | "local_review_gate"
                 | "awaiting_feedback"
                 | "addressing_feedback"
-        ) | (
-            REPO_BACKLOG_DEFINITION_ID,
-            "scanning" | "dispatching" | "reconciling" | "planning_batch"
         ) | (PR_FEEDBACK_DEFINITION_ID, "inspecting")
             | (PROMPT_TASK_DEFINITION_ID, "implementing")
             | (QUALITY_GATE_DEFINITION_ID, "checking")
