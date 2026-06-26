@@ -52,6 +52,8 @@ query SpecRailReviewThreads($owner: String!, $name: String!, $number: Int!, $aft
 
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 STATUS_CONTEXT_STATES = {"SUCCESS", "FAILURE", "ERROR", "PENDING", "EXPECTED"}
+REVIEW_STATES_THAT_CLEAR_BLOCKING = {"APPROVED", "DISMISSED"}
+DECISIVE_REVIEW_STATES = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
 
 
 class EvidenceError(ValueError):
@@ -148,14 +150,19 @@ def collect_review_threads(owner: str, name: str, pr_number: int) -> dict[str, A
         if not isinstance(page_info_value, dict):
             if len(nodes) >= 100:
                 raise EvidenceError("reviewThreads pagination state is missing for a full page")
-            review_threads["nodes"] = all_nodes
-            review_threads["pageInfo"] = {"hasNextPage": False, "endCursor": None}
+            aggregate_threads = _review_threads_connection(first_page)
+            aggregate_threads["nodes"] = all_nodes
+            aggregate_threads["pageInfo"] = {"hasNextPage": False, "endCursor": None}
             return first_page
         page_info = _require_mapping(page_info_value, "reviewThreads.pageInfo")
         has_next_page = page_info.get("hasNextPage")
         if has_next_page is not True:
-            review_threads["nodes"] = all_nodes
-            review_threads["pageInfo"] = {"hasNextPage": False, "endCursor": page_info.get("endCursor")}
+            aggregate_threads = _review_threads_connection(first_page)
+            aggregate_threads["nodes"] = all_nodes
+            aggregate_threads["pageInfo"] = {
+                "hasNextPage": False,
+                "endCursor": page_info.get("endCursor"),
+            }
             return first_page
         end_cursor = page_info.get("endCursor")
         if not isinstance(end_cursor, str) or not end_cursor.strip():
@@ -296,6 +303,13 @@ def normalize_reviews(value: Any) -> list[dict[str, str]]:
         if not state:
             continue
         author = _author_login(item.get("author"), f"review #{index}")
+        previous = latest_by_author.get(author)
+        if previous:
+            previous_state = previous["state"]
+            if previous_state == "CHANGES_REQUESTED" and state not in REVIEW_STATES_THAT_CLEAR_BLOCKING:
+                continue
+            if state == "COMMENTED" and previous_state in DECISIVE_REVIEW_STATES:
+                continue
         if author not in latest_by_author:
             author_order.append(author)
         latest_by_author[author] = {"author": author, "state": state}

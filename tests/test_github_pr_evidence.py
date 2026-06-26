@@ -17,6 +17,7 @@ from github_pr_evidence import (  # noqa: E402
     EvidenceError,
     build_evidence,
     build_human_authorization,
+    collect_review_threads,
     normalize_review_threads,
     parse_github_repo,
 )
@@ -134,6 +135,34 @@ def test_build_evidence_matches_pr_gate_contract() -> None:
     assert evaluate_pr_gate(evidence)["decision"] == "allowed"
 
 
+def test_reviews_preserve_blocking_request_through_comment() -> None:
+    payload = pr_payload()
+    payload["reviews"] = [
+        {"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED"},
+        {"author": {"login": "reviewer"}, "state": "COMMENTED"},
+    ]
+
+    evidence = build_evidence(payload, threads_payload())
+
+    assert evidence["reviews"] == [{"author": "reviewer", "state": "CHANGES_REQUESTED"}]
+    result = evaluate_pr_gate(evidence)
+    assert result["decision"] == "blocked"
+    assert "changes requested by reviewer" in result["reasons"]
+
+
+def test_reviews_allow_approval_to_clear_blocking_request() -> None:
+    payload = pr_payload()
+    payload["reviews"] = [
+        {"author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED"},
+        {"author": {"login": "reviewer"}, "state": "APPROVED"},
+        {"author": {"login": "reviewer"}, "state": "COMMENTED"},
+    ]
+
+    evidence = build_evidence(payload, threads_payload())
+
+    assert evidence["reviews"] == [{"author": "reviewer", "state": "APPROVED"}]
+
+
 def test_build_evidence_without_authorization_needs_human() -> None:
     evidence = build_evidence(pr_payload(), threads_payload())
 
@@ -172,6 +201,47 @@ def test_review_threads_fail_closed_when_more_pages_remain() -> None:
 
     with pytest.raises(EvidenceError, match="truncated"):
         normalize_review_threads(payload)
+
+
+def test_collect_review_threads_returns_aggregated_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page_1 = threads_payload()
+    page_1_threads = page_1["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    page_1_threads["pageInfo"] = {"hasNextPage": True, "endCursor": "cursor-1"}
+    page_2 = threads_payload()
+    page_2_threads = page_2["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    page_2_threads["nodes"][0]["id"] = "PRRT_kwDOExamplePage2"
+    page_2_threads["pageInfo"] = {"hasNextPage": False, "endCursor": "cursor-2"}
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "from __future__ import annotations",
+                "import json",
+                "import sys",
+                f"page_1 = {json.dumps(page_1)!r}",
+                f"page_2 = {json.dumps(page_2)!r}",
+                "args = sys.argv[1:]",
+                "print(page_2 if 'after=cursor-1' in args else page_1)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    payload = collect_review_threads("majiayu000", "specrail", 10)
+    threads = normalize_review_threads(payload)
+
+    assert [thread["id"] for thread in threads] == [
+        "PRRT_kwDOExample",
+        "PRRT_kwDOExamplePage2",
+    ]
 
 
 def test_authorization_flags_must_include_actor_and_source() -> None:
