@@ -252,6 +252,7 @@ def test_route_gate_uses_evidence_pr_for_pr_review(tmp_path: Path) -> None:
     assert payload["pr"] == 123
     assert "linked_pr" not in payload["missing"]
     assert "artifacts/review/pr-123.json" in payload["required_artifacts"]
+    assert "force_push" in payload["blocked_actions"]
 
 
 def test_route_gate_requires_issue_for_triage_result() -> None:

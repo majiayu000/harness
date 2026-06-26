@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CHECKS))
 
 from check_workflow import validate_spec_packet, validate_task_plan  # noqa: E402
-from evaluate import evaluate_adoption_matrix, evaluate_rclean_smoke, evaluate_spec  # noqa: E402
+from evaluate import evaluate_adoption_matrix, evaluate_rclean_smoke, evaluate_spec, validate_tasks  # noqa: E402
 from specrail_lib import validate_json_schemas  # noqa: E402
 
 
@@ -49,6 +49,27 @@ def test_task_plan_requires_done_when_and_verify(tmp_path: Path) -> None:
 
     assert any("missing Done when:" in error for error in errors)
     assert any("missing Verify:" in error for error in errors)
+
+
+def test_task_plan_ignores_verification_checklist_items(tmp_path: Path) -> None:
+    task_path = tmp_path / "specs" / "GH5" / "tasks.md"
+    write_text(
+        task_path,
+        "\n".join(
+            [
+                "# Task Plan",
+                "",
+                "## Implementation Tasks",
+                "- [ ] `SP5-T001` Owner: `tests` | Done when: done | Verify: pytest",
+                "",
+                "## Verification",
+                "- [ ] Run the test suite",
+            ]
+        ),
+    )
+
+    assert validate_task_plan(task_path, "5") == []
+    assert validate_tasks(tmp_path, task_path, "5") == []
 
 
 def test_spec_packet_allows_missing_tasks_md(tmp_path: Path) -> None:

@@ -253,10 +253,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         if current_state and current_state in allowed_states:
             allowed_actions.append(action)
 
-    if route in {"review_pr", "draft_release_note"}:
-        blocked_actions.extend(["final_approval", "merge"])
-    else:
-        blocked_actions.extend(["final_approval", "merge", "force_push"])
+    blocked_actions.extend(["final_approval", "merge", "force_push"])
 
     if missing:
         if current_state is None or any(item.startswith("allowed_state:") for item in missing):

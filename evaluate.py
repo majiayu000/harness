@@ -146,7 +146,7 @@ def validate_tasks(repo: Path, task_path: Path, issue_number: str | None) -> lis
     text = read_text(task_path)
     prefix = f"SP{issue_number}-T" if issue_number else "SP"
     ids: list[str] = []
-    for line_number, line in enumerate(text.splitlines(), start=1):
+    for line_number, line in implementation_task_lines(text):
         if "- [" not in line:
             continue
         match = re.search(r"`([^`]+)`", line)
@@ -165,6 +165,21 @@ def validate_tasks(repo: Path, task_path: Path, issue_number: str | None) -> lis
     for task_id in sorted({task_id for task_id in ids if ids.count(task_id) > 1}):
         errors.append(f"{task_path.relative_to(repo)}: duplicate task ID {task_id}")
     return errors
+
+
+def implementation_task_lines(text: str) -> list[tuple[int, str]]:
+    lines = text.splitlines()
+    has_section = any(line.strip() == "## Implementation Tasks" for line in lines)
+    in_tasks = not has_section
+    task_lines: list[tuple[int, str]] = []
+    for line_number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if has_section and stripped.startswith("## "):
+            in_tasks = stripped == "## Implementation Tasks"
+            continue
+        if in_tasks:
+            task_lines.append((line_number, line))
+    return task_lines
 
 
 def evaluate_rclean_smoke(repo: Path) -> tuple[list[dict[str, str]], list[str], list[str]]:
