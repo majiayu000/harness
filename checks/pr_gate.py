@@ -28,7 +28,7 @@ def _non_empty_string(value: Any) -> bool:
 
 
 def _positive_int(value: Any) -> bool:
-    return isinstance(value, int) and value > 0
+    return type(value) is int and value > 0
 
 
 def _load_json(path: Path) -> dict[str, Any]:

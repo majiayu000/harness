@@ -52,6 +52,18 @@ def test_pr_gate_allows_clean_authorized_merge() -> None:
     assert result["reasons"] == []
 
 
+def test_pr_gate_rejects_boolean_ids() -> None:
+    evidence = clean_evidence()
+    evidence["pr"] = True
+    evidence["linked_issue"] = True
+
+    result = evaluate_pr_gate(evidence)
+
+    assert result["decision"] == "blocked"
+    assert "pr" in result["missing"]
+    assert "linked_issue" in result["missing"]
+
+
 def test_pr_gate_needs_human_without_authorization() -> None:
     evidence = clean_evidence()
     evidence.pop("human_authorization")
@@ -281,6 +293,42 @@ def test_route_gate_uses_evidence_pr_for_pr_review(tmp_path: Path) -> None:
     assert "linked_pr" not in payload["missing"]
     assert "artifacts/review/pr-123.json" in payload["required_artifacts"]
     assert "force_push" in payload["blocked_actions"]
+
+
+def test_route_gate_rejects_boolean_evidence_ids(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps({"linked_issue": True, "pr": True, "verification": "cargo test"}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "review_pr",
+            "--state",
+            "impl_pr_open",
+            "--evidence",
+            str(evidence_path),
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert "linked_issue" in payload["missing"]
+    assert "linked_pr" in payload["missing"]
 
 
 def test_route_gate_requires_issue_for_triage_result() -> None:
