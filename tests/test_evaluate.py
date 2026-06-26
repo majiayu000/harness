@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CHECKS))
 
 from check_workflow import validate_spec_packet, validate_task_plan  # noqa: E402
-from evaluate import evaluate_adoption_matrix, evaluate_rclean_smoke  # noqa: E402
+from evaluate import evaluate_adoption_matrix, evaluate_rclean_smoke, evaluate_spec  # noqa: E402
 from specrail_lib import validate_json_schemas  # noqa: E402
 
 
@@ -74,6 +74,18 @@ def test_spec_packet_validates_tasks_md_when_present(tmp_path: Path) -> None:
 
     assert any("missing Done when:" in error for error in errors)
     assert any("missing Verify:" in error for error in errors)
+
+
+def test_evaluate_spec_allows_missing_tasks_md(tmp_path: Path) -> None:
+    spec_dir = tmp_path / "specs" / "GH5"
+    write_text(spec_dir / "product.md", "GitHub issue: `#5`\n")
+    write_text(spec_dir / "tech.md", "GitHub issue: `#5`\n")
+
+    checks, errors = evaluate_spec(tmp_path, spec_dir)
+
+    assert errors == []
+    assert any(item["id"] == "spec.tasks_optional" and item["status"] == "pass" for item in checks)
+    assert not any(item["id"] == "spec.tasks_present" and item["status"] == "fail" for item in checks)
 
 
 def test_rclean_smoke_requires_all_scenarios(tmp_path: Path) -> None:

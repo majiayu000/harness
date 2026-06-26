@@ -79,6 +79,19 @@ def test_pr_gate_blocks_pending_ci() -> None:
     assert any("workflow-check is not completed" in reason for reason in result["reasons"])
 
 
+def test_pr_gate_accepts_skipped_and_neutral_checks() -> None:
+    evidence = clean_evidence()
+    evidence["checks"] = [
+        {"name": "docs-only", "status": "COMPLETED", "conclusion": "SKIPPED"},
+        {"name": "advisory", "status": "COMPLETED", "conclusion": "NEUTRAL"},
+    ]
+
+    result = evaluate_pr_gate(evidence)
+
+    assert result["decision"] == "allowed"
+    assert result["reasons"] == []
+
+
 def test_pr_gate_blocks_unresolved_thread() -> None:
     evidence = clean_evidence()
     evidence["review_threads"] = [

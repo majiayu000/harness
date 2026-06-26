@@ -89,7 +89,6 @@ def evaluate_spec(repo: Path, spec_dir: Path) -> tuple[list[dict[str, str]], lis
     for name, check_id in [
         ("product.md", "spec.product_present"),
         ("tech.md", "spec.tech_present"),
-        ("tasks.md", "spec.tasks_present"),
     ]:
         path = spec_dir / name
         rel = str(path.relative_to(repo))
@@ -98,6 +97,23 @@ def evaluate_spec(repo: Path, spec_dir: Path) -> tuple[list[dict[str, str]], lis
         else:
             checks.append(check("fail", check_id, rel, f"{name} is missing or empty"))
             errors.append(f"{rel} is missing or empty")
+
+    task_path = spec_dir / "tasks.md"
+    task_rel = str(task_path.relative_to(repo))
+    if task_path.is_file() and read_text(task_path).strip():
+        checks.append(check("pass", "spec.tasks_present", task_rel, "tasks.md exists and is non-empty"))
+    elif task_path.is_file():
+        checks.append(check("fail", "spec.tasks_present", task_rel, "tasks.md is empty"))
+        errors.append(f"{task_rel} is empty")
+    else:
+        checks.append(
+            check(
+                "pass",
+                "spec.tasks_optional",
+                task_rel,
+                "tasks.md may be created later by the implement route",
+            )
+        )
 
     for name in ["product.md", "tech.md"]:
         path = spec_dir / name
@@ -111,7 +127,6 @@ def evaluate_spec(repo: Path, spec_dir: Path) -> tuple[list[dict[str, str]], lis
             checks.append(check("fail", "spec.issue_anchor_present", rel, "issue anchor missing"))
             errors.append(f"{rel} is missing issue anchor")
 
-    task_path = spec_dir / "tasks.md"
     if task_path.is_file():
         task_errors = validate_tasks(repo, task_path, issue_number)
         if task_errors:
