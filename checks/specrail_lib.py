@@ -192,6 +192,12 @@ def render_artifact_path(
     template = artifact_templates(config).get(artifact)
     if not template:
         return None
+    if issue is None and (
+        "{issue_number}" in template or "{work_id}" in template
+    ):
+        return None
+    if pr is None and "{pr_number}" in template:
+        return None
     if issue is not None:
         template = template.replace("{issue_number}", str(issue)).replace(
             "{work_id}", work_id_for_issue(issue) or ""

@@ -12,4 +12,3 @@ Escalate to a maintainer when:
 
 Maintainers should record the decision in the issue or pull request so the
 workflow state remains auditable.
-

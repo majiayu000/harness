@@ -97,4 +97,3 @@ states:
   abandoned:
     owner: maintainer
     terminal: true
-

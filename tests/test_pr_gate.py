@@ -163,3 +163,29 @@ def test_route_gate_renders_pr_artifact_path(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert "artifacts/review/pr-123.json" in payload["required_artifacts"]
     assert "artifacts/review/pr-{pr_number}.json" not in payload["required_artifacts"]
+
+
+def test_route_gate_requires_issue_for_triage_result() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "triage_issue",
+            "--state",
+            "new_issue",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "warn"
+    assert "linked_issue" in payload["missing"]
+    assert "artifacts/triage/issue-{issue_number}.json" not in payload["required_artifacts"]

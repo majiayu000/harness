@@ -22,7 +22,7 @@ Describe inputs, outputs, persistence, and external calls.
 
 ## Alternatives Considered
 
-- 
+-
 
 ## Risks
 
@@ -40,4 +40,3 @@ Describe inputs, outputs, persistence, and external calls.
 ## Rollback Plan
 
 Describe how to revert or disable the change.
-

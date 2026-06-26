@@ -53,7 +53,8 @@ action_policy:
         - new_issue
         - needs_info
         - triaged
-      required_artifacts: []
+      required_artifacts:
+        - linked_issue
       creates_artifacts:
         - triage_result
       human_gates: []

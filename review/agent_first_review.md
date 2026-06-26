@@ -30,4 +30,3 @@ Return structured findings:
 ## Boundary
 
 Do not approve, merge, close issues, or mark security findings public.
-

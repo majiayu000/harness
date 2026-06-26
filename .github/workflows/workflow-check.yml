@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -31,5 +33,15 @@ jobs:
         run: python3 evaluate.py --repo . --spec-dir specs/GH13 --format json
       - name: Run tests
         run: python3 -m pytest -q
-      - name: Check whitespace
-        run: git diff --check
+      - name: Check committed whitespace
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+          elif git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+            git diff --check "${{ github.event.before }}" HEAD
+          elif git rev-parse HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git diff --check
+          fi

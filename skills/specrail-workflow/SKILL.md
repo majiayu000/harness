@@ -57,7 +57,7 @@ For feature work that needs a spec:
 
 1. Confirm or create a linked GitHub issue before creating a numbered spec.
 2. Use `specs/GH<issue-number>/product.md` and `specs/GH<issue-number>/tech.md`.
-3. Prefer templates in `templates/<locale>/`; fall back to root `templates/`.
+3. Use the root templates in `templates/`.
 4. Keep behavior in product spec and implementation plan in tech spec.
 5. Run:
 
@@ -99,7 +99,7 @@ skill for orchestration.
 
 Keep the boundary clear:
 
-- SpecRail owns policy, locale, required artifacts, human gates, and
+- SpecRail owns policy, required artifacts, human gates, and
   deterministic verification.
 - Threads owns lane maps, queue gates, remote truth refresh, review-thread
   handling, and closure audit.
@@ -126,7 +126,7 @@ When reporting completion, include:
 
 - issue or PR link, if created
 - spec paths
-- selected locale
-- stable IDs kept in English
+- English-only repository artifact policy
+- stable IDs kept unchanged
 - verification commands and results
 - PR gate decision when merge readiness was evaluated

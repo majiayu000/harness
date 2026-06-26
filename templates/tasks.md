@@ -11,8 +11,8 @@ GH-
 
 ## Implementation Tasks
 
-- [ ] 
-- [ ] 
+- [ ]
+- [ ]
 
 ## Parallelization
 
@@ -20,7 +20,7 @@ List tasks that can run in parallel and their disjoint file ownership.
 
 ## Verification
 
-- [ ] 
+- [ ]
 
 ## Handoff Notes
 

@@ -13,7 +13,7 @@ creating issues, specs, PRs, or reviews:
 2. `workflow.yaml`
 3. `states.yaml`
 4. `labels.yaml`
-5. the relevant template under `templates/` or `templates/<locale>/`
+5. the relevant template under `templates/`
 6. `skills/specrail-workflow/SKILL.md` when available
 
 The skill is an execution guide. The YAML files and templates are the workflow
@@ -84,17 +84,16 @@ packet. A missing issue number is not permission to skip spec creation.
 If the task is a GitHub issue or PR queue, needs disjoint parallel lanes, or
 requires review-thread, CI, merge-gate, or closure-audit handling, load
 `integrations/threads.md` after SpecRail preflight. SpecRail still owns policy,
-locale, required artifacts, and human gates. Threads owns lane orchestration,
-remote queue truth, and closure audit.
+required artifacts, human gates, and deterministic verification. Threads owns
+lane orchestration, remote queue truth, and closure audit.
 
 If no threads skill or native subagent capability is available, continue with
 the normal single-agent SpecRail flow and report that no native threads were
 launched.
 
-## Locale Behavior
+## Language Behavior
 
-Use human-facing text in the selected locale. If the user writes Chinese or the
-selected locale is `zh-CN`, write these in Chinese:
+Harness repository artifacts must be written in English. Use English for:
 
 - issue bodies
 - product specs
@@ -104,7 +103,7 @@ selected locale is `zh-CN`, write these in Chinese:
 - handoffs
 - error explanations
 
-Do not translate stable machine-facing identifiers:
+Keep stable machine-facing identifiers unchanged:
 
 - action IDs such as `write_spec`
 - state IDs such as `ready_to_spec`
@@ -114,21 +113,12 @@ Do not translate stable machine-facing identifiers:
 - commands and CLI flags
 - JSON keys and schema field names
 
-Use this locale selection order:
-
-1. explicit user request
-2. user's current language
-3. `presentation.default_locale` in `workflow.yaml`
-4. `presentation.fallback_locale`
-
 ## What Exists Today
 
 SpecRail currently provides:
 
 - state and label conventions
 - issue/spec/PR templates
-- `zh-CN` templates
-- localized message files
 - an optional threads integration design
 - a Codex-compatible `specrail-workflow` skill
 - a deterministic pack validator
@@ -148,6 +138,7 @@ SpecRail does not yet provide:
 - automatic issue label checks
 - automatic template rendering commands
 - automatic merge or final approval
+- localized repository artifact generation
 
 Until those exist, agents should treat `checks/route_gate.py` as a local gate and
 must report what they verified rather than claiming live GitHub workflow state

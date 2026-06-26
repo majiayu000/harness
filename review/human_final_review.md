@@ -22,4 +22,3 @@ Use one:
 - needs_info
 - close_not_planned
 - reserved_internal
-

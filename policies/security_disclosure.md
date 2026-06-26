@@ -15,4 +15,3 @@ threads unless a maintainer has explicitly decided disclosure is safe.
 
 Agents may identify possible security sensitivity and recommend escalation.
 Agents must not make the final disclosure decision.
-
