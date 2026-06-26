@@ -183,16 +183,22 @@ def work_id_for_issue(issue: int | None) -> str | None:
     return f"GH{issue}"
 
 
-def render_artifact_path(config: PackConfig, artifact: str, issue: int | None) -> str | None:
+def render_artifact_path(
+    config: PackConfig,
+    artifact: str,
+    issue: int | None,
+    pr: int | None = None,
+) -> str | None:
     template = artifact_templates(config).get(artifact)
     if not template:
         return None
-    if issue is None:
-        return template
-    return (
-        template.replace("{issue_number}", str(issue))
-        .replace("{work_id}", work_id_for_issue(issue) or "")
-    )
+    if issue is not None:
+        template = template.replace("{issue_number}", str(issue)).replace(
+            "{work_id}", work_id_for_issue(issue) or ""
+        )
+    if pr is not None:
+        template = template.replace("{pr_number}", str(pr))
+    return template
 
 
 def infer_state(config: PackConfig, state: str | None, labels: list[str]) -> tuple[str | None, list[str]]:
@@ -271,6 +277,8 @@ def validate_template_parity(repo: Path) -> list[str]:
     errors: list[str] = []
     root = repo / "templates"
     zh = root / "zh-CN"
+    if not zh.is_dir():
+        return errors
     base_files = sorted(path.name for path in root.glob("*.md"))
     zh_files = sorted(path.name for path in zh.glob("*.md")) if zh.is_dir() else []
     for name in base_files:
@@ -302,6 +310,9 @@ def validate_json_schemas(repo: Path) -> list[str]:
             data = json.loads(read_text(path))
         except json.JSONDecodeError as exc:
             errors.append(f"{path.relative_to(repo)}: invalid JSON: {exc.msg}")
+            continue
+        if not isinstance(data, dict):
+            errors.append(f"{path.relative_to(repo)}: JSON root must be an object")
             continue
         if "$schema" not in data:
             errors.append(f"{path.relative_to(repo)}: missing $schema")

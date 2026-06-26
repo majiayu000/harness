@@ -1,5 +1,0 @@
-messages:
-  missing_readiness_label: "缺少维护者确认的 readiness 标签，agent 不能继续实现。"
-  needs_human_gate: "此操作需要人工 gate 通过后才能继续。"
-  stable_ids_not_translated: "面向机器的 ID、路径、命令和 JSON key 在所有语言中都保持英文。"
-  spec_written_in_locale: "面向人的 SpecRail 文本应使用当前选择的语言。"

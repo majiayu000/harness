@@ -1,6 +1,6 @@
 ---
 name: specrail-workflow
-description: Use when working in a repository that adopts SpecRail for issue-first, spec-first, AI-assisted development. Handles triage, product specs, tech specs, PR bodies, review summaries, and handoffs with locale-aware human-facing text, including Chinese (`zh-CN`) when the user writes Chinese or the repository presentation config requests it.
+description: Use when working in this repository with SpecRail for issue-first, spec-first, AI-assisted development. Handles triage, product specs, tech specs, PR bodies, review summaries, and handoffs using English-only repository artifacts.
 ---
 
 # SpecRail Workflow
@@ -34,26 +34,14 @@ an existing issue first. If none exists and GitHub workflow is in scope, create
 or request a linked issue before writing `specs/GH<issue-number>/product.md` and
 `tech.md`. Do not treat a missing issue number as permission to skip the spec.
 
-## Locale
+## Language
 
-Choose the language for human-facing text in this order:
+Harness repository artifacts must be written in English. Use English for issue
+bodies, `product.md`, `tech.md`, PR bodies, review summaries, handoffs, error
+explanations, and generated templates even when chat with the user happens in
+another language.
 
-1. Explicit user request.
-2. User's current language.
-3. `presentation.default_locale` in `workflow.yaml`.
-4. `presentation.fallback_locale`.
-
-When the user writes Chinese or the selected locale is `zh-CN`, write human-facing artifacts in Chinese:
-
-- issue bodies
-- `product.md`
-- `tech.md`
-- PR bodies
-- review summaries
-- handoffs
-- error explanations
-
-Do not translate stable machine-facing identifiers:
+Keep stable machine-facing identifiers unchanged:
 
 - action IDs such as `write_spec`
 - state IDs such as `ready_to_spec`

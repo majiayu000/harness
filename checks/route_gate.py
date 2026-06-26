@@ -79,14 +79,19 @@ def artifact_exists(repo: Path, artifact_path: str | None) -> bool:
     return (repo / artifact_path).is_file()
 
 
-def required_artifact_path(config: Any, artifact: str, issue: int | None) -> str | None:
+def required_artifact_path(
+    config: Any,
+    artifact: str,
+    issue: int | None,
+    pr: int | None,
+) -> str | None:
     if artifact == "linked_issue":
         return None
     if artifact == "linked_pr":
         return None
     if artifact == "verification":
         return None
-    return render_artifact_path(config, artifact, issue)
+    return render_artifact_path(config, artifact, issue, pr)
 
 
 def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
@@ -176,7 +181,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         provided_artifacts[name] = value
 
     for artifact in required:
-        path = required_artifact_path(config, artifact, args.issue)
+        path = required_artifact_path(config, artifact, args.issue, args.pr)
         if artifact == "linked_issue":
             if args.issue is None:
                 missing.append("linked_issue")
@@ -232,7 +237,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         reasons.append(f"route {route} passed local SpecRail gates")
 
     for artifact in creates:
-        path = render_artifact_path(config, artifact, args.issue)
+        path = render_artifact_path(config, artifact, args.issue, args.pr)
         if path:
             required_artifacts.append(path)
 

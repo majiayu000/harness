@@ -120,5 +120,4 @@ presentation:
   default_locale: en-US
   supported_locales:
     - en-US
-    - zh-CN
   fallback_locale: en-US

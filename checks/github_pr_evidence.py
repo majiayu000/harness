@@ -23,10 +23,10 @@ PR_VIEW_FIELDS = [
 ]
 
 REVIEW_THREADS_QUERY = """
-query SpecRailReviewThreads($owner: String!, $name: String!, $number: Int!) {
+query SpecRailReviewThreads($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $after) {
         nodes {
           id
           isResolved
@@ -39,6 +39,10 @@ query SpecRailReviewThreads($owner: String!, $name: String!, $number: Int!) {
               }
             }
           }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
@@ -114,8 +118,12 @@ def collect_pr_view(github_repo: str, pr_number: int) -> dict[str, Any]:
 
 
 def collect_review_threads(owner: str, name: str, pr_number: int) -> dict[str, Any]:
-    return run_gh_json(
-        [
+    first_page: dict[str, Any] | None = None
+    all_nodes: list[Any] = []
+    after: str | None = None
+
+    for _ in range(100):
+        args = [
             "api",
             "graphql",
             "-F",
@@ -127,7 +135,34 @@ def collect_review_threads(owner: str, name: str, pr_number: int) -> dict[str, A
             "-f",
             f"query={REVIEW_THREADS_QUERY}",
         ]
-    )
+        if after:
+            args.extend(["-F", f"after={after}"])
+        page = run_gh_json(args)
+        if first_page is None:
+            first_page = page
+
+        review_threads = _review_threads_connection(page)
+        nodes = _require_list(review_threads.get("nodes"), "reviewThreads.nodes")
+        all_nodes.extend(nodes)
+        page_info_value = review_threads.get("pageInfo")
+        if not isinstance(page_info_value, dict):
+            if len(nodes) >= 100:
+                raise EvidenceError("reviewThreads pagination state is missing for a full page")
+            review_threads["nodes"] = all_nodes
+            review_threads["pageInfo"] = {"hasNextPage": False, "endCursor": None}
+            return first_page
+        page_info = _require_mapping(page_info_value, "reviewThreads.pageInfo")
+        has_next_page = page_info.get("hasNextPage")
+        if has_next_page is not True:
+            review_threads["nodes"] = all_nodes
+            review_threads["pageInfo"] = {"hasNextPage": False, "endCursor": page_info.get("endCursor")}
+            return first_page
+        end_cursor = page_info.get("endCursor")
+        if not isinstance(end_cursor, str) or not end_cursor.strip():
+            raise EvidenceError("reviewThreads pageInfo.endCursor is required when hasNextPage is true")
+        after = end_cursor.strip()
+
+    raise EvidenceError("reviewThreads pagination exceeded 100 pages")
 
 
 def _require_mapping(value: Any, field: str) -> dict[str, Any]:
@@ -161,6 +196,17 @@ def _require_bool(payload: dict[str, Any], field: str) -> bool:
     if not isinstance(value, bool):
         raise EvidenceError(f"{field} must be a boolean")
     return value
+
+
+def _review_threads_connection(graphql_payload: dict[str, Any]) -> dict[str, Any]:
+    data = _require_mapping(graphql_payload.get("data"), "data")
+    repository = _require_mapping(data.get("repository"), "data.repository")
+    pull_request = _require_mapping(
+        repository.get("pullRequest"), "data.repository.pullRequest"
+    )
+    return _require_mapping(
+        pull_request.get("reviewThreads"), "data.repository.pullRequest.reviewThreads"
+    )
 
 
 def _coerce_optional_positive_int(value: Any) -> int | None:
@@ -212,6 +258,8 @@ def _rollup_items(value: Any) -> list[Any]:
 
 
 def normalize_checks(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
     checks: list[dict[str, str]] = []
     for index, item in enumerate(_rollup_items(value), start=1):
         if not isinstance(item, dict):
@@ -236,6 +284,8 @@ def normalize_checks(value: Any) -> list[dict[str, str]]:
 
 
 def normalize_reviews(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
     reviews = _require_list(value, "reviews")
     latest_by_author: dict[str, dict[str, str]] = {}
     author_order: list[str] = []
@@ -253,17 +303,16 @@ def normalize_reviews(value: Any) -> list[dict[str, str]]:
 
 
 def normalize_review_threads(graphql_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    data = _require_mapping(graphql_payload.get("data"), "data")
-    repository = _require_mapping(data.get("repository"), "data.repository")
-    pull_request = _require_mapping(
-        repository.get("pullRequest"), "data.repository.pullRequest"
-    )
-    review_threads = _require_mapping(
-        pull_request.get("reviewThreads"), "data.repository.pullRequest.reviewThreads"
-    )
+    review_threads = _review_threads_connection(graphql_payload)
     nodes = _require_list(
         review_threads.get("nodes"), "data.repository.pullRequest.reviewThreads.nodes"
     )
+    page_info = review_threads.get("pageInfo")
+    if isinstance(page_info, dict):
+        if page_info.get("hasNextPage") is True:
+            raise EvidenceError("reviewThreads result is truncated; fetch all pages before gating")
+    elif len(nodes) >= 100:
+        raise EvidenceError("reviewThreads pagination state is missing for a full page")
 
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(nodes, start=1):
@@ -284,6 +333,8 @@ def normalize_review_threads(graphql_payload: dict[str, Any]) -> list[dict[str, 
 
 
 def normalize_linked_issue(value: Any) -> int | None:
+    if value is None:
+        return None
     if not isinstance(value, list):
         raise EvidenceError("closingIssuesReferences must be a list")
     for item in value:

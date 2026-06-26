@@ -129,3 +129,37 @@ def test_pr_gate_cli_json_contract(tmp_path: Path) -> None:
         "blocked_actions",
         "verification_commands",
     } <= set(payload)
+
+
+def test_route_gate_renders_pr_artifact_path(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps({"verification": "cargo test"}), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "review_pr",
+            "--issue",
+            "9",
+            "--pr",
+            "123",
+            "--state",
+            "impl_pr_open",
+            "--evidence",
+            str(evidence_path),
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "artifacts/review/pr-123.json" in payload["required_artifacts"]
+    assert "artifacts/review/pr-{pr_number}.json" not in payload["required_artifacts"]

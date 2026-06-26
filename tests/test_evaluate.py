@@ -13,6 +13,7 @@ sys.path.insert(0, str(CHECKS))
 
 from check_workflow import validate_spec_packet, validate_task_plan  # noqa: E402
 from evaluate import evaluate_adoption_matrix, evaluate_rclean_smoke  # noqa: E402
+from specrail_lib import validate_json_schemas  # noqa: E402
 
 
 def write_text(path: Path, text: str) -> None:
@@ -156,6 +157,25 @@ def test_adoption_matrix_requires_known_pilots(tmp_path: Path) -> None:
     assert any(check["id"] == "adoption_matrix.required_ids" for check in checks)
     assert any("litellm-rs" in error for error in errors)
     assert warnings == []
+
+
+def test_adoption_matrix_rejects_non_object_fixture_root(tmp_path: Path) -> None:
+    write_text(tmp_path / "docs" / "ADOPTION_MATRIX.md", "matrix\n")
+    write_text(tmp_path / "examples" / "adoptions" / "matrix.json", "[]")
+
+    checks, errors, warnings = evaluate_adoption_matrix(tmp_path)
+
+    assert any(check["id"] == "adoption_matrix.fixture_json" for check in checks)
+    assert any("JSON root must be an object" in error for error in errors)
+    assert warnings == []
+
+
+def test_json_schema_validator_rejects_non_object_root(tmp_path: Path) -> None:
+    write_text(tmp_path / "schemas" / "bad.schema.json", "[]")
+
+    errors = validate_json_schemas(tmp_path)
+
+    assert errors == ["schemas/bad.schema.json: JSON root must be an object"]
 
 
 def test_adoption_matrix_needs_human_status_affects_checks(tmp_path: Path) -> None:

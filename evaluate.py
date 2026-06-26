@@ -219,6 +219,11 @@ def evaluate_adoption_matrix(repo: Path) -> tuple[list[dict[str, str]], list[str
         errors.append(f"{ADOPTION_MATRIX_FIXTURE} invalid JSON: {exc.msg}")
         return checks, errors, warnings
 
+    if not isinstance(payload, dict):
+        checks.append(check("fail", "adoption_matrix.fixture_json", ADOPTION_MATRIX_FIXTURE, "JSON root must be an object"))
+        errors.append(f"{ADOPTION_MATRIX_FIXTURE} JSON root must be an object")
+        return checks, errors, warnings
+
     checks.append(check("pass", "adoption_matrix.fixture_present", ADOPTION_MATRIX_FIXTURE, "adoption matrix fixture exists"))
     adoptions = payload.get("adoptions")
     if not isinstance(adoptions, list):

@@ -17,6 +17,7 @@ from github_pr_evidence import (  # noqa: E402
     EvidenceError,
     build_evidence,
     build_human_authorization,
+    normalize_review_threads,
     parse_github_repo,
 )
 from pr_gate import evaluate_pr_gate  # noqa: E402
@@ -140,6 +141,37 @@ def test_build_evidence_without_authorization_needs_human() -> None:
     result = evaluate_pr_gate(evidence)
     assert result["decision"] == "needs_human"
     assert "human_authorization" in result["missing"]
+
+
+def test_build_evidence_accepts_absent_optional_github_fields() -> None:
+    payload = pr_payload()
+    payload["closingIssuesReferences"] = None
+    payload["statusCheckRollup"] = None
+    payload["reviews"] = None
+
+    evidence = build_evidence(payload, threads_payload())
+
+    assert evidence["linked_issue"] is None
+    assert evidence["checks"] == []
+    assert evidence["reviews"] == []
+
+
+def test_review_threads_fail_closed_on_truncated_page() -> None:
+    payload = threads_payload()
+    review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    review_threads["nodes"] = review_threads["nodes"] * 100
+
+    with pytest.raises(EvidenceError, match="pagination state"):
+        normalize_review_threads(payload)
+
+
+def test_review_threads_fail_closed_when_more_pages_remain() -> None:
+    payload = threads_payload()
+    review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    review_threads["pageInfo"] = {"hasNextPage": True, "endCursor": "cursor-1"}
+
+    with pytest.raises(EvidenceError, match="truncated"):
+        normalize_review_threads(payload)
 
 
 def test_authorization_flags_must_include_actor_and_source() -> None:
