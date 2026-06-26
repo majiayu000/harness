@@ -17,6 +17,7 @@ PR_VIEW_FIELDS = [
     "isDraft",
     "headRefOid",
     "mergeStateStatus",
+    "body",
     "closingIssuesReferences",
     "statusCheckRollup",
     "reviews",
@@ -51,6 +52,10 @@ query SpecRailReviewThreads($owner: String!, $name: String!, $number: Int!, $aft
 """.strip()
 
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+ISSUE_LINK_PATTERNS = [
+    re.compile(r"(?im)^\s*(?:linked\s+work|issues?|related)\s*:\s*.*?(?:#|/issues/)(\d+)\b"),
+    re.compile(r"(?im)\b(?:fixes|closes|resolves)\s+(?:#|[^\s]+/issues/)(\d+)\b"),
+]
 STATUS_CONTEXT_STATES = {"SUCCESS", "FAILURE", "ERROR", "PENDING", "EXPECTED"}
 REVIEW_STATES_THAT_CLEAR_BLOCKING = {"APPROVED", "DISMISSED"}
 DECISIVE_REVIEW_STATES = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
@@ -359,6 +364,21 @@ def normalize_linked_issue(value: Any) -> int | None:
     return None
 
 
+def linked_issue_from_body(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    for pattern in ISSUE_LINK_PATTERNS:
+        match = pattern.search(value)
+        if match:
+            try:
+                number = int(match.group(1))
+            except ValueError:
+                continue
+            if number > 0:
+                return number
+    return None
+
+
 def build_human_authorization(
     actor: str | None,
     source: str | None,
@@ -391,7 +411,8 @@ def build_evidence(
         "is_draft": _require_bool(pr_payload, "isDraft"),
         "head_sha": _require_string(pr_payload, "headRefOid"),
         "merge_state": _require_string(pr_payload, "mergeStateStatus").upper(),
-        "linked_issue": normalize_linked_issue(pr_payload.get("closingIssuesReferences")),
+        "linked_issue": normalize_linked_issue(pr_payload.get("closingIssuesReferences"))
+        or linked_issue_from_body(pr_payload.get("body")),
         "checks": normalize_checks(pr_payload.get("statusCheckRollup")),
         "reviews": normalize_reviews(pr_payload.get("reviews")),
         "review_threads": normalize_review_threads(threads_payload),

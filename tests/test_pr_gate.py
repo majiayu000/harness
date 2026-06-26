@@ -189,3 +189,35 @@ def test_route_gate_requires_issue_for_triage_result() -> None:
     assert payload["decision"] == "warn"
     assert "linked_issue" in payload["missing"]
     assert "artifacts/triage/issue-{issue_number}.json" not in payload["required_artifacts"]
+
+
+def test_route_gate_rejects_off_template_artifact_paths() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "implement",
+            "--issue",
+            "5",
+            "--state",
+            "ready_to_implement",
+            "--artifact",
+            "product_spec=/etc/passwd",
+            "--artifact",
+            "tech_spec=/etc/passwd",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "warn"
+    assert "product_spec:/etc/passwd" in payload["missing"]
+    assert "tech_spec:/etc/passwd" in payload["missing"]

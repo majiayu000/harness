@@ -79,6 +79,16 @@ def artifact_exists(repo: Path, artifact_path: str | None) -> bool:
     return (repo / artifact_path).is_file()
 
 
+def safe_relative_artifact_path(raw: object) -> str | None:
+    value = str(raw).strip()
+    if not value:
+        return None
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    return path.as_posix()
+
+
 def required_artifact_path(
     config: Any,
     artifact: str,
@@ -204,10 +214,15 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         required_artifacts.append(path or artifact)
         provided = provided_artifacts.get(artifact)
         if provided:
-            if artifact in ARTIFACT_FILES and not (repo / str(provided)).is_file():
+            provided_path = safe_relative_artifact_path(provided)
+            if provided_path is None:
                 missing.append(f"{artifact}:{provided}")
+            elif path and provided_path != path:
+                missing.append(f"{artifact}:{provided_path}:expected:{path}")
+            elif artifact in ARTIFACT_FILES and not (repo / provided_path).is_file():
+                missing.append(f"{artifact}:{provided_path}")
             else:
-                satisfied.append(f"{artifact}: {provided}")
+                satisfied.append(f"{artifact}: {provided_path}")
             continue
         if artifact in ARTIFACT_FILES:
             if artifact_exists(repo, path):

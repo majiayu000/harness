@@ -31,6 +31,7 @@ def pr_payload() -> dict[str, object]:
         "isDraft": False,
         "headRefOid": "e36d97517d8d0b27faca1abe5e5c63f9f88684d9",
         "mergeStateStatus": "CLEAN",
+        "body": "Linked Work: #9\n",
         "closingIssuesReferences": [{"number": 9}],
         "statusCheckRollup": [
             {
@@ -177,12 +178,23 @@ def test_build_evidence_accepts_absent_optional_github_fields() -> None:
     payload["closingIssuesReferences"] = None
     payload["statusCheckRollup"] = None
     payload["reviews"] = None
+    payload["body"] = ""
 
     evidence = build_evidence(payload, threads_payload())
 
     assert evidence["linked_issue"] is None
     assert evidence["checks"] == []
     assert evidence["reviews"] == []
+
+
+def test_build_evidence_parses_linked_issue_from_body_when_not_closing() -> None:
+    payload = pr_payload()
+    payload["closingIssuesReferences"] = []
+    payload["body"] = "## Linked Work\n\nIssue: #123\n"
+
+    evidence = build_evidence(payload, threads_payload())
+
+    assert evidence["linked_issue"] == 123
 
 
 def test_review_threads_fail_closed_on_truncated_page() -> None:
