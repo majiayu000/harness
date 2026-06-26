@@ -89,6 +89,10 @@ def safe_relative_artifact_path(raw: object) -> str | None:
     return path.as_posix()
 
 
+def positive_int(value: object) -> int | None:
+    return value if isinstance(value, int) and value > 0 else None
+
+
 def required_artifact_path(
     config: Any,
     artifact: str,
@@ -119,6 +123,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         config_errors.append(f"unknown route: {route}")
 
     evidence = load_evidence(Path(args.evidence) if args.evidence else None)
+    effective_issue = args.issue or positive_int(evidence.get("linked_issue"))
     labels = list(args.label or [])
     labels.extend(str(label) for label in evidence.get("labels", []) if str(label).strip())
     explicit_state = args.state or evidence.get("state")
@@ -191,12 +196,12 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         provided_artifacts[name] = value
 
     for artifact in required:
-        path = required_artifact_path(config, artifact, args.issue, args.pr)
+        path = required_artifact_path(config, artifact, effective_issue, args.pr)
         if artifact == "linked_issue":
-            if args.issue is None:
+            if effective_issue is None:
                 missing.append("linked_issue")
             else:
-                satisfied.append(f"linked_issue: GH-{args.issue}")
+                satisfied.append(f"linked_issue: GH-{effective_issue}")
             continue
         if artifact == "linked_pr":
             if args.pr is None:
@@ -252,7 +257,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         reasons.append(f"route {route} passed local SpecRail gates")
 
     for artifact in creates:
-        path = render_artifact_path(config, artifact, args.issue, args.pr)
+        path = render_artifact_path(config, artifact, effective_issue, args.pr)
         if path:
             required_artifacts.append(path)
 
@@ -261,7 +266,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         "route": route,
         "mode": args.mode,
         "current_state": current_state,
-        "issue": args.issue,
+        "issue": effective_issue,
         "pr": args.pr,
         "reasons": reasons,
         "satisfied": sorted(set(satisfied)),
@@ -273,8 +278,8 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         "verification_commands": [
             "python3 checks/check_workflow.py --repo .",
             *(
-                [f"python3 checks/check_workflow.py --repo . --spec-dir specs/GH{args.issue}"]
-                if args.issue
+                [f"python3 checks/check_workflow.py --repo . --spec-dir specs/GH{effective_issue}"]
+                if effective_issue
                 else []
             ),
         ],

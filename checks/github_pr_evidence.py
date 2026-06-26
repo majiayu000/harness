@@ -53,7 +53,7 @@ query SpecRailReviewThreads($owner: String!, $name: String!, $number: Int!, $aft
 
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 ISSUE_LINK_PATTERNS = [
-    re.compile(r"(?im)^\s*(?:linked\s+work|issues?|related)\s*:\s*.*?(?:#|/issues/)(\d+)\b"),
+    re.compile(r"(?im)^\s*(?:[-*]\s*)?(?:linked\s+work|issues?|related)\s*:\s*.*?(?:#|/issues/)(\d+)\b"),
     re.compile(r"(?im)\b(?:fixes|closes|resolves)\s+(?:#|[^\s]+/issues/)(\d+)\b"),
 ]
 STATUS_CONTEXT_STATES = {"SUCCESS", "FAILURE", "ERROR", "PENDING", "EXPECTED"}

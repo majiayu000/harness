@@ -197,6 +197,16 @@ def test_build_evidence_parses_linked_issue_from_body_when_not_closing() -> None
     assert evidence["linked_issue"] == 123
 
 
+def test_build_evidence_parses_linked_issue_from_template_bullet() -> None:
+    payload = pr_payload()
+    payload["closingIssuesReferences"] = []
+    payload["body"] = "## Linked Work\n\n- Issue: #123\n"
+
+    evidence = build_evidence(payload, threads_payload())
+
+    assert evidence["linked_issue"] == 123
+
+
 def test_review_threads_fail_closed_on_truncated_page() -> None:
     payload = threads_payload()
     review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
