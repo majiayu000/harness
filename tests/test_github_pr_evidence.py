@@ -187,6 +187,28 @@ def test_build_evidence_accepts_absent_optional_github_fields() -> None:
     assert evidence["reviews"] == []
 
 
+def test_build_evidence_fails_closed_on_capped_check_rollup() -> None:
+    payload = pr_payload()
+    payload["statusCheckRollup"] = [
+        {"name": f"check-{index}", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        for index in range(100)
+    ]
+
+    with pytest.raises(EvidenceError, match="statusCheckRollup may be truncated"):
+        build_evidence(payload, threads_payload())
+
+
+def test_build_evidence_fails_closed_on_capped_reviews() -> None:
+    payload = pr_payload()
+    payload["reviews"] = [
+        {"author": {"login": f"reviewer-{index}"}, "state": "COMMENTED"}
+        for index in range(100)
+    ]
+
+    with pytest.raises(EvidenceError, match="reviews may be truncated"):
+        build_evidence(payload, threads_payload())
+
+
 def test_build_evidence_parses_linked_issue_from_body_when_not_closing() -> None:
     payload = pr_payload()
     payload["closingIssuesReferences"] = []

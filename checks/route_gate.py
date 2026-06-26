@@ -59,6 +59,16 @@ def parse_artifact_value(raw: str) -> tuple[str, str]:
     return name.strip(), value.strip()
 
 
+def parse_positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return value
+
+
 def load_evidence(path: Path | None) -> dict[str, Any]:
     if path is None:
         return {}
@@ -343,8 +353,8 @@ def main() -> int:
     )
     parser.add_argument("--repo", default=".", help="SpecRail pack or adopted repo root")
     parser.add_argument("--route", "--action", required=True, help="Route/action to evaluate")
-    parser.add_argument("--issue", type=int, help="Linked GitHub issue number")
-    parser.add_argument("--pr", type=int, help="Linked pull request number")
+    parser.add_argument("--issue", type=parse_positive_int, help="Linked GitHub issue number")
+    parser.add_argument("--pr", type=parse_positive_int, help="Linked pull request number")
     parser.add_argument("--state", help="Canonical SpecRail state")
     parser.add_argument("--label", action="append", default=[], help="Issue/PR label evidence")
     parser.add_argument(

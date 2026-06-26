@@ -259,3 +259,30 @@ def test_route_gate_rejects_off_template_artifact_paths() -> None:
     assert payload["decision"] == "warn"
     assert "product_spec:/etc/passwd" in payload["missing"]
     assert "tech_spec:/etc/passwd" in payload["missing"]
+
+
+def test_route_gate_rejects_non_positive_issue_and_pr() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "review_pr",
+            "--issue",
+            "-1",
+            "--pr",
+            "-1",
+            "--state",
+            "impl_pr_open",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "positive integer" in result.stderr

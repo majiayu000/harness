@@ -272,8 +272,11 @@ def _rollup_items(value: Any) -> list[Any]:
 def normalize_checks(value: Any) -> list[dict[str, str]]:
     if value is None:
         return []
+    items = _rollup_items(value)
+    if len(items) >= 100:
+        raise EvidenceError("statusCheckRollup may be truncated at 100 items")
     checks: list[dict[str, str]] = []
-    for index, item in enumerate(_rollup_items(value), start=1):
+    for index, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             raise EvidenceError(f"statusCheckRollup item #{index} must be an object")
         name = str(item.get("name") or item.get("context") or item.get("workflowName") or f"check #{index}")
@@ -299,6 +302,8 @@ def normalize_reviews(value: Any) -> list[dict[str, str]]:
     if value is None:
         return []
     reviews = _require_list(value, "reviews")
+    if len(reviews) >= 100:
+        raise EvidenceError("reviews may be truncated at 100 items")
     latest_by_author: dict[str, dict[str, str]] = {}
     author_order: list[str] = []
     for index, item in enumerate(reviews, start=1):
