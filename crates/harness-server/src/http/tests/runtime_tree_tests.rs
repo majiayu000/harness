@@ -579,6 +579,75 @@ async fn workflow_runtime_tree_endpoint_returns_summary_only_shape() -> anyhow::
 }
 
 #[tokio::test]
+async fn workflow_runtime_tree_summary_only_counts_all_project_workflows_with_tiny_limit(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    for (id, project_id, issue_number) in [
+        ("issue-1201", "/project-a", 1201),
+        ("issue-1202", "/project-a", 1202),
+        ("issue-2201", "/project-b", 2201),
+    ] {
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "implementing",
+            harness_workflow::runtime::WorkflowSubject::new(
+                "issue",
+                format!("issue:{issue_number}"),
+            ),
+        )
+        .with_id(id)
+        .with_data(serde_json::json!({
+            "project_id": project_id,
+            "repo": "owner/repo",
+            "issue_number": issue_number,
+        }));
+        store.upsert_instance(&workflow).await?;
+    }
+
+    let response = workflow_runtime_app(state)
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/api/workflows/runtime/tree?project_id=%2Fproject-a&summary_only=true&limit=1",
+                )
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["total_workflows"], 2);
+    assert_eq!(body["pagination"]["limit"], 1);
+    assert_eq!(body["pagination"]["returned"], 0);
+    assert_eq!(body["pagination"]["total"], 2);
+    assert_eq!(body["pagination"]["has_more"], false);
+    assert_eq!(body["pagination"]["summary_only"], true);
+    assert_eq!(body["summary"]["workflow_statuses"]["implementing"], 2);
+    assert_eq!(body["summary"]["workflow_scheduler_states"]["running"], 2);
+    assert_eq!(body["summary"]["workflow_active_buckets"]["running"], 2);
+    assert_eq!(body["summary"]["total_commands"], 0);
+    assert_eq!(body["summary"]["total_runtime_jobs"], 0);
+    assert_eq!(
+        body["workflows"]
+            .as_array()
+            .expect("workflows should be an array")
+            .len(),
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_paginated(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {

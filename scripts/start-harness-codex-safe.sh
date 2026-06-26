@@ -12,6 +12,7 @@ Options:
   --config PATH         Optional Harness config file
   --bin PATH            Harness binary. Default: ./target/release/harness, then ./target/debug/harness
   --log-dir PATH        Log/PID directory. Default: .harness/local
+  --wait-secs N         Seconds to wait for /health in background mode. Default: 60
   --foreground          Run in the foreground instead of backgrounding
   --stop                Stop the PID recorded for this port
   --status              Print recorded PID and health status
@@ -40,6 +41,9 @@ PROJECT_ROOT_EXPLICIT=0
 CONFIG=""
 BIN="${HARNESS_BIN:-}"
 LOG_DIR=".harness/local"
+WAIT_SECS="${HARNESS_STARTER_WAIT_SECS:-60}"
+HEALTH_CURL_TIMEOUT_SECS="${HARNESS_STARTER_HEALTH_TIMEOUT_SECS:-2}"
+POLL_INTERVAL_SECS="${HARNESS_STARTER_POLL_INTERVAL_SECS:-1}"
 FOREGROUND=0
 STOP=0
 STATUS=0
@@ -72,6 +76,11 @@ while [[ $# -gt 0 ]]; do
       LOG_DIR="$2"
       shift 2
       ;;
+    --wait-secs)
+      require_value "$1" "${2:-}"
+      WAIT_SECS="$2"
+      shift 2
+      ;;
     --foreground)
       FOREGROUND=1
       shift
@@ -100,11 +109,76 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
   echo "--port must be a number" >&2
   exit 2
 fi
+if ! [[ "$WAIT_SECS" =~ ^[0-9]+$ ]] || [[ "$WAIT_SECS" -lt 1 ]]; then
+  echo "--wait-secs must be a positive number" >&2
+  exit 2
+fi
+if ! [[ "$HEALTH_CURL_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || [[ "$HEALTH_CURL_TIMEOUT_SECS" -lt 1 ]]; then
+  echo "HARNESS_STARTER_HEALTH_TIMEOUT_SECS must be a positive number" >&2
+  exit 2
+fi
+if ! [[ "$POLL_INTERVAL_SECS" =~ ^[0-9]+$ ]] || [[ "$POLL_INTERVAL_SECS" -lt 1 ]]; then
+  echo "HARNESS_STARTER_POLL_INTERVAL_SECS must be a positive number" >&2
+  exit 2
+fi
 
 mkdir -p "$LOG_DIR"
 PID_FILE="$LOG_DIR/harness-${PORT}.pid"
 LOG_FILE="$LOG_DIR/harness-${PORT}.log"
+STATUS_FILE="$LOG_DIR/harness-${PORT}.status"
+HEALTH_FILE="$LOG_DIR/harness-${PORT}.health.json"
+HEALTH_ERROR_FILE="$LOG_DIR/harness-${PORT}.health.err"
 TMUX_SESSION="harness-${PORT}"
+
+now_utc() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+record_start_status() {
+  local state_name="$1"
+  shift || true
+  local message="${*:-}"
+  {
+    printf 'updated_at=%s\n' "$(now_utc)"
+    printf 'state=%s\n' "$state_name"
+    printf 'port=%s\n' "$PORT"
+    printf 'health_url=%s\n' "$health_url"
+    printf 'pid_file=%s\n' "$PID_FILE"
+    printf 'log_file=%s\n' "$LOG_FILE"
+    printf 'health_file=%s\n' "$HEALTH_FILE"
+    printf 'tmux_session=%s\n' "$TMUX_SESSION"
+    printf 'wait_secs=%s\n' "$WAIT_SECS"
+    if [[ -n "$message" ]]; then
+      printf 'message=%s\n' "$message"
+    fi
+  } > "$STATUS_FILE"
+}
+
+check_health() {
+  curl -fsS --max-time "$HEALTH_CURL_TIMEOUT_SECS" "$health_url" \
+    > "$HEALTH_FILE" 2> "$HEALTH_ERROR_FILE"
+}
+
+print_health_error() {
+  if [[ -s "$HEALTH_ERROR_FILE" ]]; then
+    echo "last health check error:" >&2
+    sed -n '1,20p' "$HEALTH_ERROR_FILE" >&2 || true
+  fi
+}
+
+print_startup_diagnostics() {
+  echo "status: $STATUS_FILE" >&2
+  echo "health: $HEALTH_FILE" >&2
+  print_health_error
+  if [[ -f "$LOG_FILE" ]]; then
+    echo "last log lines:" >&2
+    tail -n 120 "$LOG_FILE" >&2 || true
+  fi
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo "tmux pane tail:" >&2
+    tmux capture-pane -pt "$TMUX_SESSION" -S -80 2>/dev/null >&2 || true
+  fi
+}
 
 pid_alive() {
   local pid="$1"
@@ -154,11 +228,16 @@ if [[ "$STOP" -eq 1 ]]; then
     echo "stopped tmux session $TMUX_SESSION"
   fi
   rm -f "$PID_FILE"
+  record_start_status "stopped" "stop requested"
   exit 0
 fi
 
 if [[ "$STATUS" -eq 1 ]]; then
   pid="$(recorded_pid)"
+  if [[ -f "$STATUS_FILE" ]]; then
+    echo "recorded_status=$STATUS_FILE"
+    sed -n '1,40p' "$STATUS_FILE"
+  fi
   if pid_alive "$pid"; then
     echo "$pid" > "$PID_FILE"
     echo "pid=$pid status=running log=$LOG_FILE"
@@ -175,7 +254,12 @@ if [[ "$STATUS" -eq 1 ]]; then
     fi
   fi
   if command -v curl >/dev/null 2>&1; then
-    curl -sS --max-time 2 "$health_url" || true
+    if check_health; then
+      cat "$HEALTH_FILE"
+    else
+      echo "health=unavailable url=$health_url"
+      print_health_error
+    fi
     echo
   fi
   if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -241,7 +325,10 @@ fi
 
 echo "starting harness server on $health_url"
 echo "log: $LOG_FILE"
+echo "status: $STATUS_FILE"
+echo "health wait: ${WAIT_SECS}s (curl timeout ${HEALTH_CURL_TIMEOUT_SECS}s)"
 echo "sanitized vars: ${unset_args[*]:-none}"
+record_start_status "starting" "launching server"
 
 if [[ "$FOREGROUND" -eq 1 ]]; then
   exec env "${unset_args[@]}" "${cmd[@]}"
@@ -270,14 +357,23 @@ if command -v tmux >/dev/null 2>&1 && [[ -z "${HARNESS_STARTER_NO_TMUX:-}" ]]; t
       tmux_command+=("--bin" "$BIN")
     fi
     printf -v quoted_pwd "%q" "$PWD"
+    printf -v quoted_log_file "%q" "$LOG_FILE"
     printf -v tmux_command_args "%q " "${tmux_command[@]}"
-    tmux_command_string="cd ${quoted_pwd} && ${tmux_command_args}"
+    tmux_command_string="cd ${quoted_pwd} && ${tmux_command_args} >> ${quoted_log_file} 2>&1"
     tmux new-session -d -s "$TMUX_SESSION" "$tmux_command_string"
     echo "started tmux session $TMUX_SESSION"
   fi
 
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if command -v curl >/dev/null 2>&1 && curl -sS --max-time 2 "$health_url" >/tmp/harness-health-"$PORT".json 2>/dev/null; then
+  start_seconds="$SECONDS"
+  next_progress=5
+  while [[ $((SECONDS - start_seconds)) -lt "$WAIT_SECS" ]]; do
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+      record_start_status "failed" "tmux session exited before health became ready"
+      echo "tmux session $TMUX_SESSION exited before /health became ready" >&2
+      print_startup_diagnostics
+      exit 4
+    fi
+    if check_health; then
       listener_pid="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
       if [[ -n "$listener_pid" ]]; then
         echo "$listener_pid" > "$PID_FILE"
@@ -285,16 +381,25 @@ if command -v tmux >/dev/null 2>&1 && [[ -z "${HARNESS_STARTER_NO_TMUX:-}" ]]; t
       else
         echo "harness server health is ready tmux_session=$TMUX_SESSION"
       fi
-      cat /tmp/harness-health-"$PORT".json
+      record_start_status "healthy" "health check succeeded"
+      cat "$HEALTH_FILE"
       echo
       exit 0
     fi
-    sleep 1
+    elapsed=$((SECONDS - start_seconds))
+    if [[ "$elapsed" -ge "$next_progress" ]]; then
+      echo "waiting for harness health (${elapsed}/${WAIT_SECS}s) url=$health_url"
+      record_start_status "starting" "waiting for health elapsed=${elapsed}s"
+      next_progress=$((next_progress + 5))
+    fi
+    sleep "$POLL_INTERVAL_SECS"
   done
 
-  echo "tmux session $TMUX_SESSION did not become healthy within 10s" >&2
+  record_start_status "timeout" "tmux session did not become healthy within ${WAIT_SECS}s"
+  echo "tmux session $TMUX_SESSION did not become healthy within ${WAIT_SECS}s" >&2
   echo "check: scripts/start-harness-codex-safe.sh --status --port $PORT" >&2
-  echo "inspect: tmux capture-pane -pt $TMUX_SESSION -S -120" >&2
+  echo "inspect: tail -n 120 $LOG_FILE" >&2
+  print_startup_diagnostics
   exit 4
 fi
 
@@ -302,23 +407,35 @@ nohup env "${unset_args[@]}" "${cmd[@]}" > "$LOG_FILE" 2>&1 &
 server_pid="$!"
 echo "$server_pid" > "$PID_FILE"
 
-for _ in 1 2 3 4 5; do
+start_seconds="$SECONDS"
+next_progress=5
+while [[ $((SECONDS - start_seconds)) -lt "$WAIT_SECS" ]]; do
   if ! pid_alive "$server_pid"; then
+    record_start_status "failed" "process exited during startup"
     echo "harness server exited during startup; last log lines:" >&2
     tail -n 80 "$LOG_FILE" >&2 || true
     rm -f "$PID_FILE"
     exit 4
   fi
-  if command -v curl >/dev/null 2>&1 && curl -sS --max-time 2 "$health_url" >/tmp/harness-health-"$PORT".json 2>/dev/null; then
+  if check_health; then
     echo "harness server started pid=$server_pid"
-    cat /tmp/harness-health-"$PORT".json
+    record_start_status "healthy" "health check succeeded"
+    cat "$HEALTH_FILE"
     echo
     exit 0
   fi
-  sleep 1
+  elapsed=$((SECONDS - start_seconds))
+  if [[ "$elapsed" -ge "$next_progress" ]]; then
+    echo "waiting for harness health (${elapsed}/${WAIT_SECS}s) pid=$server_pid url=$health_url"
+    record_start_status "starting" "waiting for health elapsed=${elapsed}s pid=${server_pid}"
+    next_progress=$((next_progress + 5))
+  fi
+  sleep "$POLL_INTERVAL_SECS"
 done
 
-echo "harness server pid=$server_pid did not become healthy within 5s" >&2
+record_start_status "timeout" "pid=${server_pid} did not become healthy within ${WAIT_SECS}s"
+echo "harness server pid=$server_pid did not become healthy within ${WAIT_SECS}s" >&2
 echo "check: scripts/start-harness-codex-safe.sh --status --port $PORT" >&2
 echo "inspect: tail -n 120 $LOG_FILE" >&2
+print_startup_diagnostics
 exit 4

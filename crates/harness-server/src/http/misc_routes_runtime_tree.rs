@@ -201,6 +201,26 @@ pub(crate) async fn get_workflow_runtime_tree(
             WorkflowRuntimeTreeDetail::Full => WorkflowRuntimeTreeMode::Full,
         }
     };
+    if mode.summary_only() {
+        return match build_workflow_runtime_tree_summary_only(
+            store,
+            query.project_id.as_deref(),
+            limit,
+            offset,
+            job_limit as usize,
+            mode,
+        )
+        .await
+        {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        };
+    }
+
     match store
         .list_instances_page(query.project_id.as_deref(), limit, offset)
         .await
@@ -229,6 +249,32 @@ pub(crate) async fn get_workflow_runtime_tree(
     }
 }
 
+async fn build_workflow_runtime_tree_summary_only(
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    project_id: Option<&str>,
+    limit: i64,
+    offset: i64,
+    job_limit: usize,
+    mode: WorkflowRuntimeTreeMode,
+) -> anyhow::Result<WorkflowRuntimeTreeResponse> {
+    let (summary, total_workflows) = workflow_runtime_tree_summary(store, project_id).await?;
+    Ok(WorkflowRuntimeTreeResponse {
+        total_workflows,
+        pagination: WorkflowRuntimeTreePagination::new(
+            limit,
+            offset,
+            0,
+            total_workflows as i64,
+            job_limit,
+            mode.command_limit(),
+            mode.detail(),
+            true,
+        ),
+        summary,
+        workflows: Vec::new(),
+    })
+}
+
 async fn build_workflow_runtime_tree(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     page: harness_workflow::runtime::store::WorkflowInstancePage,
@@ -241,24 +287,7 @@ async fn build_workflow_runtime_tree(
         .iter()
         .map(|instance| instance.id.clone())
         .collect();
-    let summary = workflow_runtime_tree_summary(store, project_id).await?;
-    if mode.summary_only() {
-        return Ok(WorkflowRuntimeTreeResponse {
-            total_workflows: page.total.max(0) as usize,
-            pagination: WorkflowRuntimeTreePagination::new(
-                page.limit,
-                page.offset,
-                0,
-                page.total,
-                job_limit,
-                mode.command_limit(),
-                mode.detail(),
-                true,
-            ),
-            summary,
-            workflows: Vec::new(),
-        });
-    }
+    let (summary, _) = workflow_runtime_tree_summary(store, project_id).await?;
 
     let (mut by_id, children_by_parent) = match mode {
         WorkflowRuntimeTreeMode::Full => {
@@ -324,7 +353,7 @@ async fn build_workflow_runtime_tree(
 async fn workflow_runtime_tree_summary(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     project_id: Option<&str>,
-) -> anyhow::Result<WorkflowRuntimeTreeSummary> {
+) -> anyhow::Result<(WorkflowRuntimeTreeSummary, usize)> {
     let aggregate_summary = store
         .runtime_summary_counts_for_instances(
             project_id,
@@ -332,20 +361,28 @@ async fn workflow_runtime_tree_summary(
             ACTIVITY_RESULT_ENVELOPE_SCHEMA,
         )
         .await?;
+    let total_workflows = aggregate_summary
+        .workflow_states
+        .iter()
+        .map(|state| state.count)
+        .sum();
     let (workflow_statuses, workflow_scheduler_states, workflow_active_buckets) =
         workflow_projection_summary_counts(&aggregate_summary.workflow_states);
-    Ok(WorkflowRuntimeTreeSummary {
-        workflow_statuses,
-        workflow_scheduler_states,
-        workflow_active_buckets,
-        total_commands: aggregate_summary.total_commands,
-        total_runtime_jobs: aggregate_summary.total_runtime_jobs,
-        command_statuses: aggregate_summary.command_statuses,
-        runtime_job_statuses: aggregate_summary.runtime_job_statuses,
-        running_job_lease_statuses: aggregate_summary.running_job_lease_statuses,
-        activity_outcomes: aggregate_summary.activity_outcomes,
-        jobs_without_activity_envelope: aggregate_summary.jobs_without_activity_envelope,
-    })
+    Ok((
+        WorkflowRuntimeTreeSummary {
+            workflow_statuses,
+            workflow_scheduler_states,
+            workflow_active_buckets,
+            total_commands: aggregate_summary.total_commands,
+            total_runtime_jobs: aggregate_summary.total_runtime_jobs,
+            command_statuses: aggregate_summary.command_statuses,
+            runtime_job_statuses: aggregate_summary.runtime_job_statuses,
+            running_job_lease_statuses: aggregate_summary.running_job_lease_statuses,
+            activity_outcomes: aggregate_summary.activity_outcomes,
+            jobs_without_activity_envelope: aggregate_summary.jobs_without_activity_envelope,
+        },
+        total_workflows,
+    ))
 }
 
 fn workflow_projection_summary_counts(
