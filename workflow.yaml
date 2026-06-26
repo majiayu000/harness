@@ -44,6 +44,7 @@ artifacts:
   tech_spec: specs/GH{issue_number}/tech.md
   task_plan: specs/GH{issue_number}/tasks.md
   agent_review: artifacts/review/pr-{pr_number}.json
+  verification: artifacts/verification/pr-{pr_number}.json
   triage_result: artifacts/triage/issue-{issue_number}.json
 
 action_policy:

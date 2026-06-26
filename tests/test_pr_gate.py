@@ -178,6 +178,34 @@ def test_route_gate_renders_pr_artifact_path(tmp_path: Path) -> None:
     assert "artifacts/review/pr-{pr_number}.json" not in payload["required_artifacts"]
 
 
+def test_route_gate_renders_fix_ci_verification_artifact_path() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "fix_ci",
+            "--pr",
+            "123",
+            "--state",
+            "human_review",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert "artifacts/verification/pr-123.json" in payload["required_artifacts"]
+    assert "artifacts/verification/pr-{pr_number}.json" not in payload["required_artifacts"]
+
+
 def test_route_gate_uses_evidence_linked_issue_for_pr_review(tmp_path: Path) -> None:
     evidence_path = tmp_path / "evidence.json"
     evidence_path.write_text(
