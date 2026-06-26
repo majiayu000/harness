@@ -22,5 +22,9 @@ sdk/typescript/node_modules/
 sdk/typescript/dist/
 sdk/typescript/bun.lock
 
+# Python workflow check artifacts
+__pycache__/
+*.py[cod]
+
 # macOS finder metadata
 .DS_Store

@@ -1,0 +1,35 @@
+name: workflow-check
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install test dependencies
+        run: python3 -m pip install pytest
+      - name: Check workflow pack and spec packets
+        run: |
+          python3 checks/check_workflow.py --repo . \
+            --spec-dir specs/GH5 \
+            --spec-dir specs/GH7 \
+            --spec-dir specs/GH9 \
+            --spec-dir specs/GH13
+      - name: Evaluate adoption matrix
+        run: python3 evaluate.py --repo . --spec-dir specs/GH13 --format json
+      - name: Run tests
+        run: python3 -m pytest -q
+      - name: Check whitespace
+        run: git diff --check

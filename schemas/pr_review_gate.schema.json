@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://specrail.local/schemas/pr_review_gate.schema.json",
+  "title": "Pull Request Review Gate",
+  "type": "object",
+  "required": [
+    "pr",
+    "linked_issue",
+    "head_sha",
+    "readiness_label",
+    "agent_review",
+    "human_review",
+    "merge_state",
+    "checks",
+    "review_threads",
+    "human_authorization",
+    "verification"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "pr": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "linked_issue": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "head_sha": {
+      "type": "string",
+      "minLength": 7
+    },
+    "readiness_label": {
+      "type": "string",
+      "minLength": 1
+    },
+    "spec_packet": {
+      "type": ["string", "null"]
+    },
+    "agent_review": {
+      "enum": ["passed", "findings", "skipped"]
+    },
+    "human_review": {
+      "enum": ["pending", "approved", "changes_requested"]
+    },
+    "merge_state": {
+      "type": "string",
+      "minLength": 1
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status", "conclusion"],
+        "additionalProperties": true,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "minLength": 1
+          },
+          "conclusion": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "review_threads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["is_resolved", "is_outdated"],
+        "additionalProperties": true,
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "is_resolved": {
+            "type": "boolean"
+          },
+          "is_outdated": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "human_authorization": {
+      "type": ["object", "null"],
+      "required": ["actor", "source"],
+      "additionalProperties": true,
+      "properties": {
+        "actor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "required": ["commands", "result"],
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "result": {
+          "enum": ["pending", "passed", "failed"]
+        }
+      }
+    }
+  }
+}

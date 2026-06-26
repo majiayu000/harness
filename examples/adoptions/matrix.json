@@ -1,0 +1,120 @@
+{
+  "schema_version": "1.0",
+  "levels": [
+    "referenced",
+    "smoke",
+    "spec_packet",
+    "pr_gate",
+    "repo_integrated",
+    "automation_ready"
+  ],
+  "adoptions": [
+    {
+      "id": "rclean",
+      "name": "rclean",
+      "repo": "majiayu000/rclean",
+      "local_path_hint": "AI/tool/rclean checkout on the maintainer workstation",
+      "current_level": "smoke",
+      "status": "needs_human",
+      "evidence": [
+        {
+          "kind": "specrail_artifact",
+          "path": "examples/rclean-smoke.md"
+        },
+        {
+          "kind": "specrail_artifact",
+          "path": "specs/GH5/product.md"
+        },
+        {
+          "kind": "specrail_artifact",
+          "path": "specs/GH5/tech.md"
+        },
+        {
+          "kind": "specrail_artifact",
+          "path": "specs/GH5/tasks.md"
+        }
+      ],
+      "verified_behaviors": [
+        "spec-first routing",
+        "human gate for risky/destructive work",
+        "doc-only direct path",
+        "CI command mapping",
+        "issue dedupe warning"
+      ],
+      "next_gap": "Promote the read-only smoke into a target-repo integration plan before writing SpecRail files into rclean."
+    },
+    {
+      "id": "litellm-rs",
+      "name": "litellm-rs",
+      "repo": "majiayu000/litellm-rs",
+      "local_path_hint": "AI/tools/litellm-rs checkout on the maintainer workstation",
+      "current_level": "pr_gate",
+      "status": "active",
+      "evidence": [
+        {
+          "kind": "specrail_artifact",
+          "path": "specs/GH7/product.md"
+        },
+        {
+          "kind": "specrail_artifact",
+          "path": "specs/GH7/tech.md"
+        },
+        {
+          "kind": "specrail_artifact",
+          "path": "tests/test_pr_gate.py"
+        },
+        {
+          "kind": "github_pr",
+          "repo": "majiayu000/litellm-rs",
+          "number": 718,
+          "url": "https://github.com/majiayu000/litellm-rs/pull/718"
+        }
+      ],
+      "verified_behaviors": [
+        "PR evidence gate",
+        "review-thread evidence fixture",
+        "CI rollup evidence",
+        "human authorization separation"
+      ],
+      "next_gap": "Add reusable PR evidence fixtures for more review-thread and CI states."
+    },
+    {
+      "id": "claude-code-monitor",
+      "name": "Claude-Code-Monitor / claude-hub",
+      "repo": "majiayu000/claude-hub",
+      "local_path_hint": "AI/agent/Claude-Code-Monitor checkout on the maintainer workstation",
+      "current_level": "spec_packet",
+      "status": "active",
+      "evidence": [
+        {
+          "kind": "external_artifact",
+          "repo": "majiayu000/claude-hub",
+          "path": "specs/GH44/product.md"
+        },
+        {
+          "kind": "external_artifact",
+          "repo": "majiayu000/claude-hub",
+          "path": "specs/GH44/tech.md"
+        },
+        {
+          "kind": "github_issue",
+          "repo": "majiayu000/claude-hub",
+          "number": 44,
+          "url": "https://github.com/majiayu000/claude-hub/issues/44"
+        },
+        {
+          "kind": "github_pr",
+          "repo": "majiayu000/claude-hub",
+          "number": 45,
+          "url": "https://github.com/majiayu000/claude-hub/pull/45"
+        }
+      ],
+      "verified_behaviors": [
+        "issue-first workflow",
+        "product and tech spec packet",
+        "PR-linked implementation handoff"
+      ],
+      "next_gap": "Decide whether the target repo should carry a copied SpecRail pack or stay as an external pilot."
+    }
+  ]
+}

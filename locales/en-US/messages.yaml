@@ -1,0 +1,5 @@
+messages:
+  missing_readiness_label: "A maintainer readiness label is missing; the agent must not continue to implementation."
+  needs_human_gate: "A human gate is required before this action can continue."
+  stable_ids_not_translated: "Machine-facing IDs, paths, commands, and JSON keys stay in English across locales."
+  spec_written_in_locale: "Human-facing SpecRail text should be written in the selected locale."
