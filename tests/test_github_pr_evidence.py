@@ -244,6 +244,30 @@ def test_collect_review_threads_returns_aggregated_pages(
     ]
 
 
+def test_pr_review_gate_schema_matches_collected_evidence_contract() -> None:
+    schema = json.loads((ROOT / "schemas" / "pr_review_gate.schema.json").read_text())
+    required = set(schema["required"])
+    properties = set(schema["properties"])
+
+    assert {
+        "pr",
+        "state",
+        "is_draft",
+        "linked_issue",
+        "head_sha",
+        "merge_state",
+        "checks",
+        "reviews",
+        "review_threads",
+    } <= required
+    assert {"readiness_label", "agent_review", "human_review", "verification"} - properties == {
+        "readiness_label",
+        "agent_review",
+        "human_review",
+        "verification",
+    }
+
+
 def test_authorization_flags_must_include_actor_and_source() -> None:
     assert build_human_authorization(None, None, None) is None
     assert build_human_authorization("user", "chat", "approved") == {
