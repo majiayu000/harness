@@ -149,9 +149,7 @@ def validate_spec_packet(spec_dir: Path) -> list[str]:
             errors.append(f"{path}: missing linked issue token {' or '.join(issue_tokens)}")
 
     task_path = spec_dir / "tasks.md"
-    if not task_path.is_file():
-        errors.append(f"{spec_dir}: missing tasks.md")
-    else:
+    if task_path.is_file():
         errors.extend(validate_task_plan(task_path, issue_number))
     return errors
 

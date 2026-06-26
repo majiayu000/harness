@@ -203,6 +203,44 @@ def test_route_gate_uses_evidence_linked_issue_for_pr_review(tmp_path: Path) -> 
     assert "linked_issue" not in payload["missing"]
 
 
+def test_route_gate_uses_evidence_pr_for_pr_review(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps({"linked_issue": 9, "pr": 123, "verification": "cargo test"}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "review_pr",
+            "--state",
+            "impl_pr_open",
+            "--evidence",
+            str(evidence_path),
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert payload["issue"] == 9
+    assert payload["pr"] == 123
+    assert "linked_pr" not in payload["missing"]
+    assert "artifacts/review/pr-123.json" in payload["required_artifacts"]
+
+
 def test_route_gate_requires_issue_for_triage_result() -> None:
     result = subprocess.run(
         [

@@ -134,6 +134,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
 
     evidence = load_evidence(Path(args.evidence) if args.evidence else None)
     effective_issue = args.issue or positive_int(evidence.get("linked_issue"))
+    effective_pr = args.pr or positive_int(evidence.get("pr"))
     labels = list(args.label or [])
     labels.extend(str(label) for label in evidence.get("labels", []) if str(label).strip())
     explicit_state = args.state or evidence.get("state")
@@ -206,7 +207,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         provided_artifacts[name] = value
 
     for artifact in required:
-        path = required_artifact_path(config, artifact, effective_issue, args.pr)
+        path = required_artifact_path(config, artifact, effective_issue, effective_pr)
         if artifact == "linked_issue":
             if effective_issue is None:
                 missing.append("linked_issue")
@@ -214,10 +215,10 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
                 satisfied.append(f"linked_issue: GH-{effective_issue}")
             continue
         if artifact == "linked_pr":
-            if args.pr is None:
+            if effective_pr is None:
                 missing.append("linked_pr")
             else:
-                satisfied.append(f"linked_pr: PR-{args.pr}")
+                satisfied.append(f"linked_pr: PR-{effective_pr}")
             continue
         if artifact == "verification":
             verification = evidence.get("verification") or provided_artifacts.get("verification")
@@ -267,7 +268,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         reasons.append(f"route {route} passed local SpecRail gates")
 
     for artifact in creates:
-        path = render_artifact_path(config, artifact, effective_issue, args.pr)
+        path = render_artifact_path(config, artifact, effective_issue, effective_pr)
         if path:
             required_artifacts.append(path)
 
@@ -277,7 +278,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         "mode": args.mode,
         "current_state": current_state,
         "issue": effective_issue,
-        "pr": args.pr,
+        "pr": effective_pr,
         "reasons": reasons,
         "satisfied": sorted(set(satisfied)),
         "missing": sorted(set(missing)),

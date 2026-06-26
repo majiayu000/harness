@@ -51,14 +51,29 @@ def test_task_plan_requires_done_when_and_verify(tmp_path: Path) -> None:
     assert any("missing Verify:" in error for error in errors)
 
 
-def test_spec_packet_requires_tasks_md(tmp_path: Path) -> None:
+def test_spec_packet_allows_missing_tasks_md(tmp_path: Path) -> None:
     spec_dir = tmp_path / "specs" / "GH5"
     write_text(spec_dir / "product.md", "GitHub issue: `#5`\n")
     write_text(spec_dir / "tech.md", "GitHub issue: `#5`\n")
 
     errors = validate_spec_packet(spec_dir)
 
-    assert any("missing tasks.md" in error for error in errors)
+    assert errors == []
+
+
+def test_spec_packet_validates_tasks_md_when_present(tmp_path: Path) -> None:
+    spec_dir = tmp_path / "specs" / "GH5"
+    write_text(spec_dir / "product.md", "GitHub issue: `#5`\n")
+    write_text(spec_dir / "tech.md", "GitHub issue: `#5`\n")
+    write_text(
+        spec_dir / "tasks.md",
+        "- [ ] `SP5-T001` Owner: `tests` | Details: malformed task",
+    )
+
+    errors = validate_spec_packet(spec_dir)
+
+    assert any("missing Done when:" in error for error in errors)
+    assert any("missing Verify:" in error for error in errors)
 
 
 def test_rclean_smoke_requires_all_scenarios(tmp_path: Path) -> None:

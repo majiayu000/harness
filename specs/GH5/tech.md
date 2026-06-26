@@ -217,7 +217,8 @@ Unit tests:
 - `tasks.ids_unique` fails on duplicate IDs.
 - `tasks.done_when_present` fails when `Done when:` is missing.
 - `tasks.verification_present` fails when `Verify:` is missing.
-- `spec.tasks_present` fails when `specs/GH5/tasks.md` is missing.
+- `spec.tasks_optional` allows early spec packets before `tasks.md` exists.
+- `spec.tasks_valid_when_present` fails malformed `specs/GH5/tasks.md`.
 - `rclean_smoke.scenarios_present` fails when one required scenario ID is absent.
 - `evaluate.py --format json` returns valid JSON with required top-level keys.
 

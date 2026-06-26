@@ -127,7 +127,8 @@ read-only and must not modify the `rclean` repository.
 ### `tasks_artifact`
 
 1. Each SpecRail issue spec directory may include `tasks.md`.
-2. For issue `#5`, `specs/GH5/tasks.md` is a required artifact.
+2. For issue `#5`, `specs/GH5/tasks.md` is included as the implementation task
+   plan; new spec packets may add it after `product.md` and `tech.md`.
 3. Each task has a stable ID, owner scope, done-when criteria, and verification
    command or review proof.
 4. Task status uses Markdown checkboxes for human and simple-parser access.
@@ -154,8 +155,8 @@ read-only and must not modify the `rclean` repository.
 - `examples/rclean-smoke.md` exists and marks the `rclean` pilot read-only.
 - `evaluate.py` JSON output is stable, parseable, and points failures to
   concrete missing or invalid paths.
-- `check_workflow.py` fails for missing `tasks.md`, duplicate task IDs, empty
-  `product.md`, or empty `tech.md`.
+- `check_workflow.py` fails for duplicate task IDs when `tasks.md` exists,
+  empty `product.md`, or empty `tech.md`.
 - The evaluator does not execute destructive commands, write to the evaluated
   repository, or auto-submit issues/PRs.
 - The `rclean` smoke can complete without modifying
