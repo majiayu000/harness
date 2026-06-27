@@ -362,7 +362,15 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
             required_artifacts.append(path or artifact)
             verification = evidence.get("verification") or provided_artifacts.get("verification")
             if verification:
-                satisfied.append("verification evidence provided")
+                provided_path = safe_relative_artifact_path(verification)
+                if provided_path is None:
+                    missing.append(f"verification:{verification}")
+                elif path and not artifact_path_matches(path, provided_path):
+                    missing.append(f"verification:{provided_path}:expected:{path}")
+                elif not provided_artifact_exists(repo, provided_path, path):
+                    missing.append(f"verification:{provided_path}")
+                else:
+                    satisfied.append(f"verification: {provided_path}")
             elif artifact_exists(repo, path):
                 satisfied.append(f"verification: {path}")
             elif path:

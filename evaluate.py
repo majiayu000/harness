@@ -144,7 +144,7 @@ def configured_issue_number(repo: Path, spec_dir: Path, config: PackConfig | Non
         work_id = match.groupdict().get("work_id")
         if work_id:
             return work_id.removeprefix("GH")
-    return spec_issue_number(spec_dir)
+    return None
 
 
 def issue_tokens(issue_number: str | None) -> list[str]:
@@ -161,6 +161,17 @@ def evaluate_spec(
     checks: list[dict[str, str]] = []
     errors: list[str] = []
     issue_number = configured_issue_number(repo, spec_dir, config)
+    if config is not None and issue_number is None:
+        rel = str(spec_dir.relative_to(repo))
+        checks.append(
+            check(
+                "fail",
+                "spec.layout_configured",
+                rel,
+                "spec-dir does not match configured spec packet layout",
+            )
+        )
+        errors.append(f"{rel}: does not match configured spec packet layout")
 
     spec_files = [
         ("product_spec", "product.md", "spec.product_present"),
