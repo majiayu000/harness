@@ -250,6 +250,75 @@ def test_route_gate_renders_pr_artifact_path(tmp_path: Path) -> None:
     assert "artifacts/review/pr-{pr_number}.json" not in payload["required_artifacts"]
 
 
+def test_route_gate_blocks_missing_configured_required_artifact(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "\n".join(
+                [
+                    "    review_pr:",
+                    "      allowed_from:",
+                    "        - impl_pr_open",
+                    "        - agent_review",
+                    "        - human_review",
+                    "      required_artifacts:",
+                    "        - linked_issue",
+                    "        - linked_pr",
+                    "      creates_artifacts:",
+                    "        - agent_review",
+                ]
+            ),
+            "\n".join(
+                [
+                    "    review_pr:",
+                    "      allowed_from:",
+                    "        - impl_pr_open",
+                    "        - agent_review",
+                    "        - human_review",
+                    "      required_artifacts:",
+                    "        - linked_issue",
+                    "        - linked_pr",
+                    "        - agent_review",
+                    "      creates_artifacts:",
+                    "        - agent_review",
+                ]
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "review_pr",
+            "--issue",
+            "9",
+            "--pr",
+            "123",
+            "--state",
+            "impl_pr_open",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert "agent_review:artifacts/review/pr-123.json" in payload["missing"]
+    assert "artifacts/review/pr-123.json" in payload["required_artifacts"]
+
+
 def test_route_gate_allows_first_pr_review_without_verification_artifact() -> None:
     result = subprocess.run(
         [

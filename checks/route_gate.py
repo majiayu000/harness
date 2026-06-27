@@ -91,7 +91,10 @@ def load_evidence(path: Path | None) -> dict[str, Any]:
 def artifact_exists(repo: Path, artifact_path: str | None) -> bool:
     if not artifact_path:
         return False
-    return (repo / artifact_path).is_file()
+    target = repo / artifact_path
+    if artifact_path.endswith("/"):
+        return target.is_dir()
+    return target.is_file()
 
 
 def safe_relative_artifact_path(raw: object) -> str | None:
@@ -340,20 +343,17 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
                 missing.append(f"{artifact}:{provided}")
             elif path and provided_path != path:
                 missing.append(f"{artifact}:{provided_path}:expected:{path}")
-            elif artifact in ARTIFACT_FILES and not (repo / provided_path).is_file():
+            elif not artifact_exists(repo, provided_path):
                 missing.append(f"{artifact}:{provided_path}")
             else:
                 satisfied.append(f"{artifact}: {provided_path}")
             continue
-        if artifact in ARTIFACT_FILES:
-            if artifact_exists(repo, path):
-                satisfied.append(f"{artifact}: {path}")
-            else:
-                missing.append(f"{artifact}:{path}")
-        elif path:
-            required_artifacts.append(path)
-        else:
+        if not path:
             missing.append(f"{artifact}:missing_template")
+        elif artifact_exists(repo, path):
+            satisfied.append(f"{artifact}: {path}")
+        else:
+            missing.append(f"{artifact}:{path}")
 
     for action, action_body in policies.items():
         allowed_states = [str(state) for state in action_body.get("allowed_from", [])]

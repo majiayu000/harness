@@ -195,6 +195,23 @@ def test_automation_policy_rejects_unknown_default_mode(tmp_path: Path) -> None:
     assert any("automation_policy.default_mode" in error for error in errors)
 
 
+def test_evaluate_rejects_invalid_automation_policy(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "default_mode: dry_run",
+            "default_mode: production",
+        ),
+        encoding="utf-8",
+    )
+
+    result = evaluate(tmp_path, tmp_path / "specs" / "GH5")
+
+    assert result["status"] == "fail"
+    assert any("automation_policy.default_mode" in error for error in result["errors"])
+
+
 def test_automation_policy_rejects_scalar_forbidden_actions(tmp_path: Path) -> None:
     copy_workflow_config(tmp_path)
     workflow_path = tmp_path / "workflow.yaml"

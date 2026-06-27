@@ -21,6 +21,7 @@ from specrail_lib import (  # noqa: E402
     read_text,
     render_artifact_path,
     validate_action_policy,
+    validate_automation_policy,
     validate_labels,
     validate_state_graph,
 )
@@ -479,6 +480,7 @@ def evaluate(repo: Path, spec_dir: Path) -> dict[str, object]:
         config_errors: list[str] = []
         config_errors.extend(validate_state_graph(config))
         config_errors.extend(validate_labels(config))
+        config_errors.extend(validate_automation_policy(config))
         config_errors.extend(validate_action_policy(config))
         if config_errors:
             for error in config_errors:
