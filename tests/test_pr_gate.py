@@ -317,6 +317,62 @@ def test_route_gate_returns_configured_forbidden_agent_actions() -> None:
     } <= set(payload["blocked_actions"])
 
 
+def test_route_gate_preserves_universal_forbidden_actions_when_overlay_omits_them(
+    tmp_path: Path,
+) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "\n".join(
+                [
+                    "  forbidden_agent_actions:",
+                    "    - final_approval",
+                    "    - merge",
+                    "    - force_push",
+                    "    - close_disputed_issue",
+                    "    - public_security_disclosure",
+                    "    - permission_change",
+                ]
+            ),
+            "  forbidden_agent_actions: []",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "write_spec",
+            "--issue",
+            "5",
+            "--state",
+            "triaged",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert {
+        "close_disputed_issue",
+        "final_approval",
+        "force_push",
+        "merge",
+        "permission_change",
+        "public_security_disclosure",
+    } <= set(payload["blocked_actions"])
+
+
 def test_route_gate_infers_agent_review_state_from_review_label() -> None:
     result = subprocess.run(
         [

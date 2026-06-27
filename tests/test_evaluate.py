@@ -123,6 +123,35 @@ def test_spec_packet_validates_tasks_md_when_present(tmp_path: Path) -> None:
     assert any("missing Verify:" in error for error in errors)
 
 
+def test_spec_packet_honors_configured_layout(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8")
+        .replace(
+            "specs/GH{issue_number}/product.md",
+            "docs/specs/{issue_number}/PRODUCT.md",
+        )
+        .replace(
+            "specs/GH{issue_number}/tech.md",
+            "docs/specs/{issue_number}/TECH.md",
+        )
+        .replace(
+            "specs/GH{issue_number}/tasks.md",
+            "docs/specs/{issue_number}/TASKS.md",
+        )
+        .replace("specs/GH{issue_number}/", "docs/specs/{issue_number}/"),
+        encoding="utf-8",
+    )
+    spec_dir = tmp_path / "docs" / "specs" / "5"
+    write_text(spec_dir / "PRODUCT.md", "GitHub issue: `#5`\n")
+    write_text(spec_dir / "TECH.md", "GitHub issue: `#5`\n")
+
+    errors = validate_spec_packet(spec_dir, load_pack(tmp_path))
+
+    assert errors == []
+
+
 def test_evaluate_spec_allows_missing_tasks_md(tmp_path: Path) -> None:
     spec_dir = tmp_path / "specs" / "GH5"
     write_text(spec_dir / "product.md", "GitHub issue: `#5`\n")

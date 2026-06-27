@@ -14,6 +14,16 @@ from typing import Any
 
 
 DECISIONS = {"allowed", "warn", "needs_human", "blocked"}
+UNIVERSAL_FORBIDDEN_AGENT_ACTIONS = {
+    "final_approval",
+    "merge",
+    "force_push",
+    "close_disputed_issue",
+    "public_security_disclosure",
+    "permission_change",
+}
+
+
 class SpecRailError(ValueError):
     """Raised when SpecRail configuration or evidence is malformed."""
 
@@ -205,7 +215,8 @@ def forbidden_agent_actions(config: PackConfig) -> list[str]:
     actions = policy.get("forbidden_agent_actions", [])
     if not isinstance(actions, list):
         raise SpecRailError("workflow.yaml automation_policy.forbidden_agent_actions must be a list")
-    return [str(action) for action in actions if str(action).strip()]
+    configured_actions = {str(action) for action in actions if str(action).strip()}
+    return sorted(UNIVERSAL_FORBIDDEN_AGENT_ACTIONS | configured_actions)
 
 
 def artifact_templates(config: PackConfig) -> dict[str, str]:
