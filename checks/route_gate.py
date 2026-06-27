@@ -103,6 +103,15 @@ def positive_int(value: object) -> int | None:
     return value if type(value) is int and value > 0 else None
 
 
+def evidence_labels(evidence: dict[str, Any]) -> list[str]:
+    labels = evidence.get("labels", [])
+    if labels is None:
+        return []
+    if not isinstance(labels, list):
+        raise SpecRailError("evidence labels must be a list when provided")
+    return [str(label) for label in labels if str(label).strip()]
+
+
 def required_artifact_path(
     config: Any,
     artifact: str,
@@ -136,7 +145,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     effective_issue = args.issue or positive_int(evidence.get("linked_issue"))
     effective_pr = args.pr or positive_int(evidence.get("pr"))
     labels = list(args.label or [])
-    labels.extend(str(label) for label in evidence.get("labels", []) if str(label).strip())
+    labels.extend(evidence_labels(evidence))
     explicit_state = args.state or evidence.get("state")
 
     reasons: list[str] = []
