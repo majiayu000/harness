@@ -245,6 +245,40 @@ def test_route_gate_allows_first_pr_review_without_verification_artifact() -> No
     assert "verification" not in payload["missing"]
 
 
+def test_route_gate_returns_configured_forbidden_agent_actions() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "write_spec",
+            "--issue",
+            "5",
+            "--state",
+            "triaged",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert {
+        "close_disputed_issue",
+        "final_approval",
+        "force_push",
+        "merge",
+        "permission_change",
+        "public_security_disclosure",
+    } <= set(payload["blocked_actions"])
+
+
 def test_route_gate_accepts_configured_label_alias_for_state(tmp_path: Path) -> None:
     copy_workflow_pack(tmp_path)
     labels_path = tmp_path / "labels.yaml"

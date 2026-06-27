@@ -191,6 +191,16 @@ def action_policy(config: PackConfig) -> dict[str, Any]:
     return actions
 
 
+def forbidden_agent_actions(config: PackConfig) -> list[str]:
+    policy = config.workflow.get("automation_policy", {})
+    if not isinstance(policy, dict):
+        raise SpecRailError("workflow.yaml automation_policy must be a mapping")
+    actions = policy.get("forbidden_agent_actions", [])
+    if not isinstance(actions, list):
+        raise SpecRailError("workflow.yaml automation_policy.forbidden_agent_actions must be a list")
+    return [str(action) for action in actions if str(action).strip()]
+
+
 def artifact_templates(config: PackConfig) -> dict[str, str]:
     artifacts = config.workflow.get("artifacts", {})
     if not isinstance(artifacts, dict):

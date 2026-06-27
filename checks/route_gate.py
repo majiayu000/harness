@@ -13,6 +13,7 @@ from specrail_lib import (
     TERMINAL_BLOCKING_STATES,
     SpecRailError,
     action_policy,
+    forbidden_agent_actions,
     infer_state,
     load_pack,
     render_artifact_path,
@@ -276,7 +277,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         if current_state and current_state in allowed_states:
             allowed_actions.append(action)
 
-    blocked_actions.extend(["final_approval", "merge", "force_push"])
+    blocked_actions.extend(forbidden_agent_actions(config))
 
     if missing:
         if current_state is None or any(item.startswith("allowed_state:") for item in missing):
