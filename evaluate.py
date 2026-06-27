@@ -8,6 +8,7 @@ import json
 import re
 import sys
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 
 CHECKS_DIR = Path(__file__).resolve().parent / "checks"
@@ -494,17 +495,11 @@ def validate_adoption_evidence(
             repo_slug = item.get("repo")
             number = item.get("number")
             url = item.get("url")
-            if (
-                isinstance(repo_slug, str)
-                and repo_slug
-                and type(number) is int
-                and number > 0
-                and isinstance(url, str)
-                and url
-            ):
+            remote_error = remote_github_evidence_error(kind, repo_slug, number, url)
+            if remote_error is None:
                 checks.append(check("pass", "adoption_matrix.remote_evidence", evidence_path, f"{kind} pointer recorded"))
             else:
-                checks.append(check("fail", "adoption_matrix.remote_evidence", evidence_path, f"{kind} pointer incomplete"))
+                checks.append(check("fail", "adoption_matrix.remote_evidence", evidence_path, f"{kind} pointer invalid: {remote_error}"))
                 errors.append(f"{adoption_id} {kind} evidence item {index} incomplete")
             continue
         if kind in {"external_artifact", "external_local_path"}:
@@ -518,6 +513,31 @@ def validate_adoption_evidence(
         checks.append(check("fail", "adoption_matrix.evidence_kind", evidence_path, f"unsupported evidence kind {kind}"))
         errors.append(f"{adoption_id} evidence item {index} has unsupported kind {kind}")
     return errors
+
+
+def remote_github_evidence_error(kind: str, repo_slug: object, number: object, url: object) -> str | None:
+    if not isinstance(repo_slug, str) or not repo_slug.strip():
+        return "repo missing"
+    repo_parts = repo_slug.strip().split("/")
+    if len(repo_parts) != 2 or not all(part.strip() for part in repo_parts):
+        return "repo must be owner/name"
+    if type(number) is not int or number <= 0:
+        return "number must be a positive integer"
+    if not isinstance(url, str) or not url.strip():
+        return "url missing"
+
+    parsed = urlparse(url.strip())
+    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        return "url must be a GitHub HTTPS URL"
+    path_parts = [part for part in parsed.path.split("/") if part]
+    expected_kind = "pull" if kind == "github_pr" else "issues"
+    if len(path_parts) < 4:
+        return f"url must include /{repo_parts[0]}/{repo_parts[1]}/{expected_kind}/{number}"
+    actual_repo = "/".join(path_parts[:2]).lower()
+    expected_repo = "/".join(repo_parts).lower()
+    if actual_repo != expected_repo or path_parts[2] != expected_kind or path_parts[3] != str(number):
+        return f"url must match {repo_slug} {expected_kind} {number}"
+    return None
 
 
 def evaluate(repo: Path, spec_dir: Path) -> dict[str, object]:

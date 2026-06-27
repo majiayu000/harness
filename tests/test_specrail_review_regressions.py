@@ -241,3 +241,42 @@ def test_route_gate_advisory_warns_on_configured_gate_miss() -> None:
     payload = json.loads(result.stdout)
     assert payload["decision"] == "warn"
     assert "allowed_state:human_review|ci_green" in payload["missing"]
+
+
+def test_route_gate_quotes_spec_dir_verification_command(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "spec_packet: specs/GH{issue_number}/",
+            "spec_packet: specs/GH{issue_number};echo INJECTED/",
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "write_spec",
+            "--issue",
+            "5",
+            "--state",
+            "triaged",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["verification_commands"] == [
+        "python3 checks/check_workflow.py --repo .",
+        "python3 checks/check_workflow.py --repo . --spec-dir 'specs/GH5;echo INJECTED/'",
+    ]

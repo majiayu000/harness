@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -194,8 +195,9 @@ def spec_packet_verification_commands(
     if not (SPEC_PACKET_ARTIFACTS & {*required, *creates}):
         return []
     spec_dir = render_artifact_path(config, "spec_packet", issue)
+    spec_dir_arg = shlex.quote(spec_dir or f"specs/GH{issue}")
     return [
-        f"python3 checks/check_workflow.py --repo . --spec-dir {spec_dir or f'specs/GH{issue}'}"
+        f"python3 checks/check_workflow.py --repo . --spec-dir {spec_dir_arg}"
     ]
 
 

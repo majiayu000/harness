@@ -512,7 +512,14 @@ def test_adoption_matrix_needs_human_status_affects_checks(tmp_path: Path) -> No
                         "repo": "majiayu000/litellm-rs",
                         "current_level": "pr_gate",
                         "status": "active",
-                        "evidence": [{"kind": "github_pr", "repo": "majiayu000/litellm-rs", "number": 718, "url": "https://example.test/pr"}],
+                        "evidence": [
+                            {
+                                "kind": "github_pr",
+                                "repo": "majiayu000/litellm-rs",
+                                "number": 718,
+                                "url": "https://github.com/majiayu000/litellm-rs/pull/718",
+                            }
+                        ],
                         "verified_behaviors": ["pr gate"],
                         "next_gap": "add fixtures",
                     },
@@ -594,7 +601,14 @@ def test_adoption_matrix_validates_extra_adoption_records(tmp_path: Path) -> Non
                         "repo": "majiayu000/litellm-rs",
                         "current_level": "pr_gate",
                         "status": "active",
-                        "evidence": [{"kind": "github_pr", "repo": "majiayu000/litellm-rs", "number": 718, "url": "https://example.test/pr"}],
+                        "evidence": [
+                            {
+                                "kind": "github_pr",
+                                "repo": "majiayu000/litellm-rs",
+                                "number": 718,
+                                "url": "https://github.com/majiayu000/litellm-rs/pull/718",
+                            }
+                        ],
                         "verified_behaviors": ["pr gate"],
                         "next_gap": "add fixtures",
                     },
@@ -798,13 +812,45 @@ def test_adoption_matrix_rejects_invalid_github_evidence_numbers(tmp_path: Path)
                     "kind": "github_pr",
                     "repo": "majiayu000/litellm-rs",
                     "number": number,
-                    "url": "https://example.test/pr",
+                    "url": "https://github.com/majiayu000/litellm-rs/pull/718",
                 }
             ],
             checks,
         )
 
         assert any(check["id"] == "adoption_matrix.remote_evidence" and check["status"] == "fail" for check in checks)
+        assert any("github_pr evidence item 0 incomplete" in error for error in errors)
+
+
+def test_adoption_matrix_rejects_invalid_github_evidence_urls(tmp_path: Path) -> None:
+    invalid_urls = [
+        "not-a-url",
+        "https://example.test/majiayu000/litellm-rs/pull/718",
+        "https://github.com/majiayu000/litellm-rs/issues/718",
+        "https://github.com/majiayu000/other/pull/718",
+        "https://github.com/majiayu000/litellm-rs/pull/719",
+    ]
+
+    for url in invalid_urls:
+        checks: list[dict[str, str]] = []
+        errors = validate_adoption_evidence(
+            tmp_path,
+            "litellm-rs",
+            [
+                {
+                    "kind": "github_pr",
+                    "repo": "majiayu000/litellm-rs",
+                    "number": 718,
+                    "url": url,
+                }
+            ],
+            checks,
+        )
+
+        assert any(
+            check["id"] == "adoption_matrix.remote_evidence" and check["status"] == "fail"
+            for check in checks
+        )
         assert any("github_pr evidence item 0 incomplete" in error for error in errors)
 
 
