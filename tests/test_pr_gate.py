@@ -398,6 +398,71 @@ def test_route_gate_blocks_non_list_evidence_labels(tmp_path: Path) -> None:
     assert payload["reasons"] == ["evidence labels must be a list when provided"]
 
 
+def test_route_gate_ignores_github_pr_state_when_label_supplies_specrail_state(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps({"linked_issue": 9, "pr": 123, "state": "OPEN", "verification": "cargo test"}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "review_pr",
+            "--label",
+            "impl_pr_open",
+            "--evidence",
+            str(evidence_path),
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert payload["current_state"] == "impl_pr_open"
+
+
+def test_route_gate_blocks_requested_route_when_required_artifacts_are_missing() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "implement",
+            "--issue",
+            "999",
+            "--state",
+            "ready_to_implement",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert "implement" in payload["blocked_actions"]
+    assert "implement" not in payload["allowed_actions"]
+
+
 def test_route_gate_requires_issue_for_triage_result() -> None:
     result = subprocess.run(
         [

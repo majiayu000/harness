@@ -112,6 +112,14 @@ def evidence_labels(evidence: dict[str, Any]) -> list[str]:
     return [str(label) for label in labels if str(label).strip()]
 
 
+def evidence_route_state(evidence: dict[str, Any], states: dict[str, Any]) -> str | None:
+    for key in ["specrail_state", "route_state", "current_state", "state"]:
+        value = evidence.get(key)
+        if isinstance(value, str) and value in states:
+            return value
+    return None
+
+
 def required_artifact_path(
     config: Any,
     artifact: str,
@@ -146,7 +154,8 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     effective_pr = args.pr or positive_int(evidence.get("pr"))
     labels = list(args.label or [])
     labels.extend(evidence_labels(evidence))
-    explicit_state = args.state or evidence.get("state")
+    states = state_map(config)
+    explicit_state = args.state or evidence_route_state(evidence, states)
 
     reasons: list[str] = []
     satisfied: list[str] = []
@@ -176,7 +185,6 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     current_state, state_evidence = infer_state(config, explicit_state, labels)
     satisfied.extend(state_evidence)
 
-    states = state_map(config)
     if current_state and current_state not in states:
         return blocked_result(
             route,
@@ -272,6 +280,10 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     else:
         decision = "allowed"
         reasons.append(f"route {route} passed local SpecRail gates")
+
+    if decision in {"blocked", "needs_human"}:
+        blocked_actions.append(route)
+        allowed_actions = [action for action in allowed_actions if action != route]
 
     for artifact in creates:
         path = render_artifact_path(config, artifact, effective_issue, effective_pr)
