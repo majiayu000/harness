@@ -76,9 +76,11 @@ def _review_items(evidence: dict[str, Any]) -> tuple[list[str], list[str], list[
     missing: list[str] = []
     reasons: list[str] = []
 
-    reviews = evidence.get("reviews", [])
+    reviews = evidence.get("reviews")
     if reviews is None:
-        reviews = []
+        missing.append("reviews")
+        reasons.append("review evidence is missing")
+        return satisfied, missing, reasons
     if not isinstance(reviews, list):
         reasons.append("reviews must be a list")
         return satisfied, missing, reasons
@@ -202,8 +204,8 @@ def evaluate_pr_gate(evidence: dict[str, Any]) -> dict[str, Any]:
     blocked_actions = []
     if decision in {"blocked", "needs_human"}:
         blocked_actions.append("merge")
-    if decision == "blocked":
         blocked_actions.append("final_approval")
+    blocked_actions = sorted(set(blocked_actions))
 
     return {
         "decision": decision,

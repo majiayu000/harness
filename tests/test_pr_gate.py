@@ -78,7 +78,31 @@ def test_pr_gate_needs_human_without_authorization() -> None:
 
     assert result["decision"] == "needs_human"
     assert "human_authorization" in result["missing"]
-    assert result["blocked_actions"] == ["merge"]
+    assert result["blocked_actions"] == ["final_approval", "merge"]
+
+
+def test_pr_gate_blocks_missing_review_evidence() -> None:
+    evidence = clean_evidence()
+    evidence.pop("reviews")
+
+    result = evaluate_pr_gate(evidence)
+
+    assert result["decision"] == "blocked"
+    assert "reviews" in result["missing"]
+    assert "review evidence is missing" in result["reasons"]
+    assert "final_approval" in result["blocked_actions"]
+
+
+def test_pr_gate_blocks_null_review_evidence() -> None:
+    evidence = clean_evidence()
+    evidence["reviews"] = None
+
+    result = evaluate_pr_gate(evidence)
+
+    assert result["decision"] == "blocked"
+    assert "reviews" in result["missing"]
+    assert "review evidence is missing" in result["reasons"]
+    assert "merge" in result["blocked_actions"]
 
 
 def test_pr_gate_blocks_pending_ci() -> None:
