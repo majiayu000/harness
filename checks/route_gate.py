@@ -433,7 +433,9 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     blocked_actions.extend(forbidden_actions)
 
     if missing:
-        if current_state is None or any(item.startswith("allowed_state:") for item in missing):
+        if args.mode in {"dry_run", "advisory"} and not human_gates:
+            decision = "warn"
+        elif current_state is None or any(item.startswith("allowed_state:") for item in missing):
             decision = "needs_human" if human_gates else "blocked"
         else:
             decision = "warn" if args.mode in {"dry_run", "advisory"} else "blocked"

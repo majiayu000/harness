@@ -202,3 +202,42 @@ def test_spec_packet_schema_allows_configured_markdown_paths() -> None:
     assert task_pattern.search("docs/specs/5/TASKS.md")
     assert not product_pattern.search("/tmp/product.md")
     assert not tech_pattern.search("../TECH.md")
+
+
+def test_task_plan_schema_allows_configured_spec_packet_directory() -> None:
+    schema = json.loads((ROOT / "schemas" / "task_plan.schema.json").read_text(encoding="utf-8"))
+    spec_packet_pattern = re.compile(schema["properties"]["spec_packet"]["pattern"])
+
+    assert spec_packet_pattern.search("docs/specs/5/")
+    assert spec_packet_pattern.search("specs/GH5/")
+    assert not spec_packet_pattern.search("/tmp/specs/5/")
+    assert not spec_packet_pattern.search("../specs/5/")
+
+
+def test_route_gate_advisory_warns_on_configured_gate_miss() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "fix_ci",
+            "--pr",
+            "123",
+            "--state",
+            "new_issue",
+            "--mode",
+            "advisory",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "warn"
+    assert "allowed_state:human_review|ci_green" in payload["missing"]
