@@ -17,6 +17,7 @@ PR_VIEW_FIELDS = [
     "isDraft",
     "headRefOid",
     "mergeStateStatus",
+    "reviewDecision",
     "body",
     "closingIssuesReferences",
     "statusCheckRollup",
@@ -153,12 +154,7 @@ def collect_review_threads(owner: str, name: str, pr_number: int) -> dict[str, A
         all_nodes.extend(nodes)
         page_info_value = review_threads.get("pageInfo")
         if not isinstance(page_info_value, dict):
-            if len(nodes) >= 100:
-                raise EvidenceError("reviewThreads pagination state is missing for a full page")
-            aggregate_threads = _review_threads_connection(first_page)
-            aggregate_threads["nodes"] = all_nodes
-            aggregate_threads["pageInfo"] = {"hasNextPage": False, "endCursor": None}
-            return first_page
+            raise EvidenceError("reviewThreads pagination state is missing")
         page_info = _require_mapping(page_info_value, "reviewThreads.pageInfo")
         has_next_page = page_info.get("hasNextPage")
         if has_next_page is not True:
@@ -326,6 +322,15 @@ def normalize_reviews(value: Any) -> list[dict[str, str]]:
     return [latest_by_author[author] for author in author_order]
 
 
+def normalize_review_decision(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise EvidenceError("reviewDecision must be a string when present")
+    decision = value.strip().upper()
+    return decision or None
+
+
 def normalize_review_threads(graphql_payload: dict[str, Any]) -> list[dict[str, Any]]:
     review_threads = _review_threads_connection(graphql_payload)
     nodes = _require_list(
@@ -335,8 +340,8 @@ def normalize_review_threads(graphql_payload: dict[str, Any]) -> list[dict[str, 
     if isinstance(page_info, dict):
         if page_info.get("hasNextPage") is True:
             raise EvidenceError("reviewThreads result is truncated; fetch all pages before gating")
-    elif len(nodes) >= 100:
-        raise EvidenceError("reviewThreads pagination state is missing for a full page")
+    else:
+        raise EvidenceError("reviewThreads pagination state is missing")
 
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(nodes, start=1):
@@ -422,6 +427,9 @@ def build_evidence(
         "reviews": normalize_reviews(pr_payload.get("reviews")),
         "review_threads": normalize_review_threads(threads_payload),
     }
+    review_decision = normalize_review_decision(pr_payload.get("reviewDecision"))
+    if review_decision is not None:
+        evidence["review_decision"] = review_decision
     if authorization is not None:
         evidence["human_authorization"] = authorization
     return evidence

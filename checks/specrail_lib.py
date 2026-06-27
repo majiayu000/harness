@@ -14,6 +14,7 @@ from typing import Any
 
 
 DECISIONS = {"allowed", "warn", "needs_human", "blocked"}
+AUTOMATION_MODES = {"dry_run", "advisory", "required"}
 UNIVERSAL_FORBIDDEN_AGENT_ACTIONS = {
     "final_approval",
     "merge",
@@ -217,6 +218,24 @@ def forbidden_agent_actions(config: PackConfig) -> list[str]:
         raise SpecRailError("workflow.yaml automation_policy.forbidden_agent_actions must be a list")
     configured_actions = {str(action) for action in actions if str(action).strip()}
     return sorted(UNIVERSAL_FORBIDDEN_AGENT_ACTIONS | configured_actions)
+
+
+def validate_automation_policy(config: PackConfig) -> list[str]:
+    errors: list[str] = []
+    policy = config.workflow.get("automation_policy", {})
+    if not isinstance(policy, dict):
+        return ["workflow.yaml automation_policy must be a mapping"]
+    mode = policy.get("default_mode", "dry_run")
+    if not isinstance(mode, str) or mode not in AUTOMATION_MODES:
+        errors.append(
+            "workflow.yaml automation_policy.default_mode must be one of "
+            "advisory, dry_run, required"
+        )
+    try:
+        forbidden_agent_actions(config)
+    except SpecRailError as exc:
+        errors.append(str(exc))
+    return errors
 
 
 def artifact_templates(config: PackConfig) -> dict[str, str]:

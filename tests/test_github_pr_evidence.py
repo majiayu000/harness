@@ -15,6 +15,7 @@ sys.path.insert(0, str(CHECKS))
 
 from github_pr_evidence import (  # noqa: E402
     EvidenceError,
+    PR_VIEW_FIELDS,
     build_evidence,
     build_human_authorization,
     collect_review_threads,
@@ -31,6 +32,7 @@ def pr_payload() -> dict[str, object]:
         "isDraft": False,
         "headRefOid": "e36d97517d8d0b27faca1abe5e5c63f9f88684d9",
         "mergeStateStatus": "CLEAN",
+        "reviewDecision": "APPROVED",
         "body": "Linked Work: #9\n",
         "closingIssuesReferences": [{"number": 9}],
         "statusCheckRollup": [
@@ -76,7 +78,8 @@ def threads_payload() -> dict[str, object]:
                                     ]
                                 },
                             }
-                        ]
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
                     }
                 }
             }
@@ -125,6 +128,7 @@ def test_build_evidence_matches_pr_gate_contract() -> None:
         {"author": "reviewer", "state": "APPROVED"},
         {"author": "bot", "state": "COMMENTED"},
     ]
+    assert evidence["review_decision"] == "APPROVED"
     assert evidence["review_threads"] == [
         {
             "id": "PRRT_kwDOExample",
@@ -134,6 +138,29 @@ def test_build_evidence_matches_pr_gate_contract() -> None:
         }
     ]
     assert evaluate_pr_gate(evidence)["decision"] == "allowed"
+
+
+def test_pr_view_collects_review_decision() -> None:
+    assert "reviewDecision" in PR_VIEW_FIELDS
+
+
+def test_review_decision_blocks_when_required() -> None:
+    payload = pr_payload()
+    payload["reviewDecision"] = "REVIEW_REQUIRED"
+
+    evidence = build_evidence(
+        payload,
+        threads_payload(),
+        {
+            "actor": "user",
+            "source": "chat",
+            "summary": "merge approved",
+        },
+    )
+    result = evaluate_pr_gate(evidence)
+
+    assert result["decision"] == "blocked"
+    assert "reviewDecision blocks merge: REVIEW_REQUIRED" in result["reasons"]
 
 
 def test_reviews_preserve_blocking_request_through_comment() -> None:
@@ -232,7 +259,17 @@ def test_build_evidence_parses_linked_issue_from_template_bullet() -> None:
 def test_review_threads_fail_closed_on_truncated_page() -> None:
     payload = threads_payload()
     review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    del review_threads["pageInfo"]
     review_threads["nodes"] = review_threads["nodes"] * 100
+
+    with pytest.raises(EvidenceError, match="pagination state"):
+        normalize_review_threads(payload)
+
+
+def test_review_threads_fail_closed_when_page_info_is_absent() -> None:
+    payload = threads_payload()
+    review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    del review_threads["pageInfo"]
 
     with pytest.raises(EvidenceError, match="pagination state"):
         normalize_review_threads(payload)
@@ -288,6 +325,35 @@ def test_collect_review_threads_returns_aggregated_pages(
     ]
 
 
+def test_collect_review_threads_fails_when_page_info_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = threads_payload()
+    review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    del review_threads["pageInfo"]
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "from __future__ import annotations",
+                "import json",
+                f"payload = {json.dumps(payload)!r}",
+                "print(payload)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    with pytest.raises(EvidenceError, match="pagination state"):
+        collect_review_threads("majiayu000", "specrail", 10)
+
+
 def test_pr_review_gate_schema_matches_collected_evidence_contract() -> None:
     schema = json.loads((ROOT / "schemas" / "pr_review_gate.schema.json").read_text())
     required = set(schema["required"])
@@ -304,6 +370,7 @@ def test_pr_review_gate_schema_matches_collected_evidence_contract() -> None:
         "reviews",
         "review_threads",
     } <= required
+    assert "review_decision" in properties
     assert {"readiness_label", "agent_review", "human_review", "verification"} - properties == {
         "readiness_label",
         "agent_review",

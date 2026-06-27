@@ -16,6 +16,7 @@ from specrail_lib import (
     read_text,
     render_artifact_path,
     validate_action_policy,
+    validate_automation_policy,
     validate_json_schemas,
     validate_labels,
     validate_state_graph,
@@ -288,6 +289,7 @@ def main() -> int:
         errors.extend(validate_json_schemas(repo))
         errors.extend(validate_state_graph(config))
         errors.extend(validate_labels(config))
+        errors.extend(validate_automation_policy(config))
         errors.extend(validate_action_policy(config))
         errors.extend(validate_template_parity(repo))
         for raw_spec_dir in args.spec_dir:

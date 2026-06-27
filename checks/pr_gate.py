@@ -17,6 +17,8 @@ from typing import Any
 CHECK_PASS_CONCLUSIONS = {"NEUTRAL", "SKIPPED", "SUCCESS"}
 CLEAN_MERGE_STATES = {"CLEAN"}
 ACTIVE_CHANGE_REQUESTS = {"CHANGES_REQUESTED"}
+BLOCKING_REVIEW_DECISIONS = {"CHANGES_REQUESTED", "REVIEW_REQUIRED"}
+PASSING_REVIEW_DECISIONS = {"APPROVED"}
 
 
 def _as_bool(value: Any) -> bool:
@@ -96,6 +98,20 @@ def _review_items(evidence: dict[str, Any]) -> tuple[list[str], list[str], list[
     if not any(reason.startswith("changes requested") for reason in reasons):
         satisfied.append("no active changes-requested review evidence")
     return satisfied, missing, reasons
+
+
+def _review_decision_item(evidence: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    value = evidence.get("review_decision")
+    if value is None:
+        return [], [], []
+    if not isinstance(value, str) or not value.strip():
+        return [], [], ["review_decision must be a non-empty string when present"]
+    decision = value.strip().upper()
+    if decision in PASSING_REVIEW_DECISIONS:
+        return [f"reviewDecision: {decision}"], [], []
+    if decision in BLOCKING_REVIEW_DECISIONS:
+        return [], [], [f"reviewDecision blocks merge: {decision}"]
+    return [], [], [f"reviewDecision is unrecognized: {decision}"]
 
 
 def _thread_items(evidence: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
@@ -183,7 +199,7 @@ def evaluate_pr_gate(evidence: dict[str, Any]) -> dict[str, Any]:
     else:
         missing.append("merge_state")
 
-    for checker in [_check_items, _review_items, _thread_items]:
+    for checker in [_check_items, _review_items, _review_decision_item, _thread_items]:
         checker_satisfied, checker_missing, checker_reasons = checker(evidence)
         satisfied.extend(checker_satisfied)
         missing.extend(checker_missing)

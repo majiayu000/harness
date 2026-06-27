@@ -20,7 +20,12 @@ from evaluate import (  # noqa: E402
     validate_adoption_evidence,
     validate_tasks,
 )
-from specrail_lib import load_pack, validate_json_schemas, validate_labels  # noqa: E402
+from specrail_lib import (  # noqa: E402
+    load_pack,
+    validate_automation_policy,
+    validate_json_schemas,
+    validate_labels,
+)
 
 
 def write_text(path: Path, text: str) -> None:
@@ -171,6 +176,49 @@ def test_workflow_token_check_allows_configured_default_mode(tmp_path: Path) -> 
     )
 
     assert validate_tokens(tmp_path) == []
+
+
+def test_automation_policy_rejects_unknown_default_mode(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "default_mode: dry_run",
+            "default_mode: production",
+        ),
+        encoding="utf-8",
+    )
+
+    errors = validate_automation_policy(load_pack(tmp_path))
+
+    assert any("automation_policy.default_mode" in error for error in errors)
+
+
+def test_automation_policy_rejects_scalar_forbidden_actions(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "\n".join(
+                [
+                    "  forbidden_agent_actions:",
+                    "    - final_approval",
+                    "    - merge",
+                    "    - force_push",
+                    "    - close_disputed_issue",
+                    "    - public_security_disclosure",
+                    "    - permission_change",
+                ]
+            ),
+            "  forbidden_agent_actions: merge",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    errors = validate_automation_policy(load_pack(tmp_path))
+
+    assert any("forbidden_agent_actions must be a list" in error for error in errors)
 
 
 def test_evaluate_spec_allows_missing_tasks_md(tmp_path: Path) -> None:

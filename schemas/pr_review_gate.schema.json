@@ -39,6 +39,10 @@
       "type": "string",
       "minLength": 1
     },
+    "review_decision": {
+      "type": "string",
+      "minLength": 1
+    },
     "checks": {
       "type": "array",
       "items": {
