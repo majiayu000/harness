@@ -314,7 +314,7 @@ def validate_labels(config: PackConfig) -> list[str]:
 def validate_action_policy(config: PackConfig) -> list[str]:
     errors: list[str] = []
     states = set(state_map(config))
-    artifacts = set(artifact_templates(config)) | {"linked_issue", "linked_pr"}
+    artifacts = set(artifact_templates(config)) | {"linked_issue", "linked_pr", "ci_evidence"}
     configured_human_gates: set[str] = set()
     raw_human_gates = config.workflow.get("required_human_gates", [])
     if not isinstance(raw_human_gates, list):

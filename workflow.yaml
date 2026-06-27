@@ -104,6 +104,7 @@ action_policy:
         - ci_green
       required_artifacts:
         - linked_pr
+        - ci_evidence
       creates_artifacts:
         - verification
       human_gates: []

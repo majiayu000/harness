@@ -659,7 +659,7 @@ def test_route_gate_blocks_unknown_human_gate(tmp_path: Path) -> None:
     )
 
 
-def test_route_gate_renders_fix_ci_verification_artifact_path() -> None:
+def test_route_gate_blocks_fix_ci_without_ci_evidence() -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -672,6 +672,49 @@ def test_route_gate_renders_fix_ci_verification_artifact_path() -> None:
             "123",
             "--state",
             "human_review",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert "ci_evidence" in payload["missing"]
+    assert "fix_ci" in payload["blocked_actions"]
+
+
+def test_route_gate_renders_fix_ci_verification_artifact_path(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "pr": 123,
+                "checks": [{"name": "CI", "status": "COMPLETED", "conclusion": "FAILURE"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "fix_ci",
+            "--pr",
+            "123",
+            "--state",
+            "human_review",
+            "--evidence",
+            str(evidence_path),
             "--json",
         ],
         cwd=ROOT,
@@ -685,6 +728,43 @@ def test_route_gate_renders_fix_ci_verification_artifact_path() -> None:
     assert payload["decision"] == "allowed"
     assert "artifacts/verification/pr-123.json" in payload["required_artifacts"]
     assert "artifacts/verification/pr-{pr_number}.json" not in payload["required_artifacts"]
+
+
+def test_route_gate_allows_fix_ci_with_verification_substitute(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps({"pr": 123, "verification": "cargo test"}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "fix_ci",
+            "--pr",
+            "123",
+            "--state",
+            "human_review",
+            "--evidence",
+            str(evidence_path),
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert "ci_evidence" not in payload["missing"]
 
 
 def test_route_gate_uses_evidence_linked_issue_for_pr_review(tmp_path: Path) -> None:
@@ -939,6 +1019,45 @@ def test_route_gate_blocks_requested_route_when_required_artifacts_are_missing()
     assert payload["decision"] == "blocked"
     assert "implement" in payload["blocked_actions"]
     assert "implement" not in payload["allowed_actions"]
+
+
+def test_route_gate_honors_configured_required_default_mode(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "  default_mode: dry_run\n",
+            "  default_mode: required\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "implement",
+            "--issue",
+            "999",
+            "--state",
+            "ready_to_implement",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert payload["mode"] == "required"
+    assert "implement" in payload["blocked_actions"]
 
 
 def test_route_gate_requires_issue_for_triage_result() -> None:

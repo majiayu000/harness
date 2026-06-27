@@ -47,6 +47,8 @@ ARTIFACT_FILES = {
     "task_plan",
     "verification",
 }
+VALID_MODES = {"dry_run", "advisory", "required"}
+PASSING_CHECK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
 
 
 def normalize_route(raw: str) -> str:
@@ -114,6 +116,19 @@ def evidence_positive_int(evidence: dict[str, Any], field: str) -> tuple[int | N
     return None, f"evidence {field} must be a positive integer"
 
 
+def configured_default_mode(config: Any) -> str:
+    policy = config.workflow.get("automation_policy", {})
+    if not isinstance(policy, dict):
+        raise SpecRailError("workflow.yaml automation_policy must be a mapping")
+    mode = policy.get("default_mode", "dry_run")
+    if not isinstance(mode, str) or mode not in VALID_MODES:
+        raise SpecRailError(
+            "workflow.yaml automation_policy.default_mode must be one of "
+            "advisory, dry_run, required"
+        )
+    return mode
+
+
 def evidence_labels(evidence: dict[str, Any]) -> list[str]:
     labels = evidence.get("labels", [])
     if labels is None:
@@ -144,6 +159,23 @@ def required_artifact_path(
     return render_artifact_path(config, artifact, issue, pr)
 
 
+def ci_fix_evidence_present(evidence: dict[str, Any], provided_artifacts: dict[str, str]) -> bool:
+    checks = evidence.get("checks")
+    if checks is not None and not isinstance(checks, list):
+        raise SpecRailError("evidence checks must be a list when provided")
+    if isinstance(checks, list):
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            status = str(check.get("status") or "").upper()
+            conclusion = str(check.get("conclusion") or "").upper()
+            if status and status != "COMPLETED":
+                return True
+            if conclusion and conclusion not in PASSING_CHECK_CONCLUSIONS:
+                return True
+    return bool(evidence.get("verification") or provided_artifacts.get("verification"))
+
+
 def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     repo = Path(args.repo).resolve()
     config = load_pack(repo)
@@ -151,6 +183,11 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     config_errors.extend(validate_state_graph(config))
     config_errors.extend(validate_labels(config))
     config_errors.extend(validate_action_policy(config))
+    try:
+        args.mode = args.mode or configured_default_mode(config)
+    except SpecRailError as exc:
+        args.mode = args.mode or "dry_run"
+        config_errors.append(str(exc))
 
     route = normalize_route(args.route)
     policies = action_policy(config)
@@ -259,6 +296,12 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
                 missing.append("linked_pr")
             else:
                 satisfied.append(f"linked_pr: PR-{effective_pr}")
+            continue
+        if artifact == "ci_evidence":
+            if ci_fix_evidence_present(evidence, provided_artifacts):
+                satisfied.append("ci_evidence provided")
+            else:
+                missing.append("ci_evidence")
             continue
         if artifact == "verification":
             required_artifacts.append(path or artifact)
@@ -428,9 +471,9 @@ def main() -> int:
     parser.add_argument("--evidence", help="Optional JSON evidence file")
     parser.add_argument(
         "--mode",
-        default="dry_run",
+        default=None,
         choices=["dry_run", "advisory", "required"],
-        help="Evaluation enforcement mode",
+        help="Evaluation enforcement mode; defaults to workflow.yaml automation_policy.default_mode",
     )
     parser.add_argument("--json", action="store_true", help="Print JSON output")
     args = parser.parse_args()
@@ -441,7 +484,7 @@ def main() -> int:
         result = {
             "decision": "blocked",
             "route": normalize_route(args.route),
-            "mode": args.mode,
+            "mode": args.mode or "dry_run",
             "current_state": args.state,
             "issue": args.issue,
             "pr": args.pr,
