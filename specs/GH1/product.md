@@ -87,7 +87,7 @@ SpecRail already defines a portable workflow pack with states, labels, schemas, 
 
 11. When the requested action is `implement`, the evaluator verifies that the issue is ready for implementation or that the configured workflow permits implementation after approved specs. If the issue still needs a spec or human readiness gate, the decision is `needs_human` or `blocked`.
 
-12. When the requested action is `review_pr`, the evaluator verifies that the PR is linked to acceptable durable work, required artifacts are present, verification evidence is available, and the agent review is advisory rather than final.
+12. When the requested action is `review_pr`, the evaluator verifies that the PR is linked to acceptable durable work and that the agent review is advisory rather than final. Verification evidence belongs to CI diagnosis and merge-readiness gates, not the first-pass agent review.
 
 13. When the requested action is `fix_ci`, the evaluator allows diagnostic and fix work when CI evidence exists or when the repository configuration permits local verification as a substitute. It must not claim CI is green from stale or unavailable evidence.
 

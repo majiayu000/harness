@@ -212,41 +212,36 @@ def test_route_gate_renders_pr_artifact_path(tmp_path: Path) -> None:
     assert "artifacts/review/pr-{pr_number}.json" not in payload["required_artifacts"]
 
 
-def test_route_gate_uses_configured_verification_artifact_for_pr_review() -> None:
-    verification_path = ROOT / "artifacts/verification/pr-123.json"
-    verification_path.parent.mkdir(parents=True, exist_ok=True)
-    verification_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
-    try:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "checks/route_gate.py",
-                "--repo",
-                ".",
-                "--route",
-                "review_pr",
-                "--issue",
-                "9",
-                "--pr",
-                "123",
-                "--state",
-                "impl_pr_open",
-                "--mode",
-                "required",
-                "--json",
-            ],
-            cwd=ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    finally:
-        verification_path.unlink(missing_ok=True)
+def test_route_gate_allows_first_pr_review_without_verification_artifact() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "review_pr",
+            "--issue",
+            "9",
+            "--pr",
+            "123",
+            "--state",
+            "impl_pr_open",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["decision"] == "allowed"
-    assert "artifacts/verification/pr-123.json" in payload["required_artifacts"]
+    assert "artifacts/review/pr-123.json" in payload["required_artifacts"]
+    assert "artifacts/verification/pr-123.json" not in payload["required_artifacts"]
     assert "verification" not in payload["missing"]
 
 

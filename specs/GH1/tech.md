@@ -75,7 +75,7 @@ actions:
       - agent_review
     required_artifacts:
       - linked_issue
-      - verification
+      - linked_pr
     human_gates:
       - final_pr_review
     agent:

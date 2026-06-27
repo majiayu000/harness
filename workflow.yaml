@@ -93,7 +93,6 @@ action_policy:
       required_artifacts:
         - linked_issue
         - linked_pr
-        - verification
       creates_artifacts:
         - agent_review
       human_gates:
