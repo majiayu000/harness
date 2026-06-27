@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from specrail_lib import (
-    TERMINAL_BLOCKING_STATES,
     SpecRailError,
     action_policy,
     forbidden_agent_actions,
@@ -18,6 +17,7 @@ from specrail_lib import (
     load_pack,
     render_artifact_path,
     state_map,
+    terminal_states,
     validate_action_policy,
     validate_labels,
     validate_state_graph,
@@ -150,8 +150,16 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         config_errors.append(f"unknown route: {route}")
 
     evidence = load_evidence(Path(args.evidence) if args.evidence else None)
-    effective_issue = args.issue or positive_int(evidence.get("linked_issue"))
-    effective_pr = args.pr or positive_int(evidence.get("pr"))
+    evidence_issue = positive_int(evidence.get("linked_issue"))
+    evidence_pr = positive_int(evidence.get("pr"))
+    if args.issue is not None and evidence_issue is not None and args.issue != evidence_issue:
+        config_errors.append(
+            f"conflicting linked_issue: --issue {args.issue} does not match evidence linked_issue {evidence_issue}"
+        )
+    if args.pr is not None and evidence_pr is not None and args.pr != evidence_pr:
+        config_errors.append(f"conflicting pr: --pr {args.pr} does not match evidence pr {evidence_pr}")
+    effective_issue = args.issue or evidence_issue
+    effective_pr = args.pr or evidence_pr
     labels = list(args.label or [])
     labels.extend(evidence_labels(evidence))
     states = state_map(config)
@@ -179,7 +187,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
             "required_artifacts": [],
             "human_gates": [],
             "allowed_actions": [],
-            "blocked_actions": [route],
+            "blocked_actions": sorted(set([*forbidden_actions, route])),
             "verification_commands": ["python3 checks/check_workflow.py --repo ."],
         }
 
@@ -195,7 +203,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
             forbidden_actions,
         )
 
-    if current_state in TERMINAL_BLOCKING_STATES:
+    if current_state in terminal_states(config):
         return blocked_result(
             route,
             current_state,

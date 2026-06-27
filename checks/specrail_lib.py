@@ -14,14 +14,6 @@ from typing import Any
 
 
 DECISIONS = {"allowed", "warn", "needs_human", "blocked"}
-TERMINAL_BLOCKING_STATES = {
-    "abandoned",
-    "duplicate",
-    "reserved_internal",
-    "security_private",
-}
-
-
 class SpecRailError(ValueError):
     """Raised when SpecRail configuration or evidence is malformed."""
 
@@ -150,6 +142,15 @@ def state_map(config: PackConfig) -> dict[str, Any]:
     if not isinstance(states, dict):
         raise SpecRailError("states.yaml must contain a states mapping")
     return states
+
+
+def terminal_states(config: PackConfig) -> set[str]:
+    states = state_map(config)
+    return {
+        str(name)
+        for name, body in states.items()
+        if isinstance(body, dict) and body.get("terminal") is True
+    }
 
 
 def label_groups(config: PackConfig) -> dict[str, list[str]]:

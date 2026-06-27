@@ -311,6 +311,44 @@ def test_route_gate_infers_agent_review_state_from_review_label() -> None:
     assert "current_state" not in payload["missing"]
 
 
+def test_route_gate_rejects_conflicting_cli_and_evidence_ids(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps({"linked_issue": 10, "pr": 124}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "review_pr",
+            "--issue",
+            "9",
+            "--pr",
+            "123",
+            "--state",
+            "impl_pr_open",
+            "--evidence",
+            str(evidence_path),
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert any("conflicting linked_issue" in reason for reason in payload["reasons"])
+    assert any("conflicting pr" in reason for reason in payload["reasons"])
+
+
 def test_route_gate_blocked_result_includes_configured_forbidden_actions() -> None:
     result = subprocess.run(
         [
@@ -344,6 +382,34 @@ def test_route_gate_blocked_result_includes_configured_forbidden_actions() -> No
         "public_security_disclosure",
         "write_spec",
     } <= set(payload["blocked_actions"])
+
+
+def test_route_gate_blocks_terminal_states_from_config() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "write_spec",
+            "--issue",
+            "5",
+            "--state",
+            "release_note_drafted",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert payload["reasons"] == ["state release_note_drafted is terminal or maintainer-reserved"]
+    assert "write_spec" in payload["blocked_actions"]
 
 
 def test_route_gate_accepts_configured_label_alias_for_state(tmp_path: Path) -> None:
