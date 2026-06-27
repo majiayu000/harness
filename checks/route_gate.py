@@ -160,6 +160,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     reasons: list[str] = []
     satisfied: list[str] = []
     missing: list[str] = []
+    forbidden_actions = forbidden_agent_actions(config)
     blocked_actions: list[str] = []
     allowed_actions: list[str] = []
     required_artifacts: list[str] = []
@@ -191,6 +192,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
             current_state,
             args,
             [f"unknown current state: {current_state}"],
+            forbidden_actions,
         )
 
     if current_state in TERMINAL_BLOCKING_STATES:
@@ -199,6 +201,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
             current_state,
             args,
             [f"state {current_state} is terminal or maintainer-reserved"],
+            forbidden_actions,
         )
 
     assert policy is not None
@@ -277,7 +280,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         if current_state and current_state in allowed_states:
             allowed_actions.append(action)
 
-    blocked_actions.extend(forbidden_agent_actions(config))
+    blocked_actions.extend(forbidden_actions)
 
     if missing:
         if current_state is None or any(item.startswith("allowed_state:") for item in missing):
@@ -327,7 +330,9 @@ def blocked_result(
     current_state: str | None,
     args: argparse.Namespace,
     reasons: list[str],
+    forbidden_actions: list[str] | None = None,
 ) -> dict[str, Any]:
+    blocked_actions = [*(forbidden_actions or []), route]
     return {
         "decision": "blocked",
         "route": route,
@@ -341,7 +346,7 @@ def blocked_result(
         "required_artifacts": [],
         "human_gates": [],
         "allowed_actions": [],
-        "blocked_actions": [route],
+        "blocked_actions": sorted(set(blocked_actions)),
         "verification_commands": ["python3 checks/check_workflow.py --repo ."],
     }
 
