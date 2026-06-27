@@ -484,6 +484,7 @@ def evaluate(repo: Path, spec_dir: Path) -> dict[str, object]:
             for error in config_errors:
                 checks.append(check("fail", "workflow.config_valid", ".", error))
             errors.extend(config_errors)
+            config = None
         else:
             checks.append(check("pass", "workflow.config_valid", ".", "workflow config is semantically valid"))
     except SpecRailError as exc:

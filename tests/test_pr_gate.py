@@ -1140,6 +1140,101 @@ def test_route_gate_requires_issue_for_triage_result() -> None:
     assert payload["decision"] == "warn"
     assert "linked_issue" in payload["missing"]
     assert "artifacts/triage/issue-{issue_number}.json" not in payload["required_artifacts"]
+    assert payload["verification_commands"] == ["python3 checks/check_workflow.py --repo ."]
+
+
+def test_route_gate_skips_spec_verification_for_triage_with_issue() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "triage_issue",
+            "--issue",
+            "999",
+            "--state",
+            "new_issue",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert payload["verification_commands"] == ["python3 checks/check_workflow.py --repo ."]
+
+
+def test_route_gate_includes_spec_verification_for_spec_routes() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "write_spec",
+            "--issue",
+            "999",
+            "--state",
+            "triaged",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["verification_commands"] == [
+        "python3 checks/check_workflow.py --repo .",
+        "python3 checks/check_workflow.py --repo . --spec-dir specs/GH999/",
+    ]
+
+
+def test_route_gate_rejects_unsafe_configured_artifact_template(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "specs/GH{issue_number}/product.md",
+            "/tmp/product.md",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "implement",
+            "--issue",
+            "5",
+            "--state",
+            "ready_to_implement",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert any("artifacts.product_spec must be repo-relative" in reason for reason in payload["reasons"])
 
 
 def test_route_gate_rejects_off_template_artifact_paths() -> None:

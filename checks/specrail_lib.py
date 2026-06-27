@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -238,11 +238,39 @@ def validate_automation_policy(config: PackConfig) -> list[str]:
     return errors
 
 
+def _validate_artifact_template_value(artifact: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise SpecRailError(f"workflow.yaml artifacts.{artifact} must be a string")
+    template = value.strip()
+    if not template:
+        raise SpecRailError(f"workflow.yaml artifacts.{artifact} must not be empty")
+    path = PurePosixPath(template)
+    if path.is_absolute():
+        raise SpecRailError(f"workflow.yaml artifacts.{artifact} must be repo-relative")
+    if ".." in path.parts:
+        raise SpecRailError(f"workflow.yaml artifacts.{artifact} must not contain '..'")
+    return template
+
+
 def artifact_templates(config: PackConfig) -> dict[str, str]:
     artifacts = config.workflow.get("artifacts", {})
     if not isinstance(artifacts, dict):
         raise SpecRailError("workflow.yaml artifacts must be a mapping")
-    return {str(key): str(value) for key, value in artifacts.items()}
+    templates: dict[str, str] = {}
+    for key, value in artifacts.items():
+        artifact = str(key).strip()
+        if not artifact:
+            raise SpecRailError("workflow.yaml artifacts keys must not be empty")
+        templates[artifact] = _validate_artifact_template_value(artifact, value)
+    return templates
+
+
+def validate_artifact_templates(config: PackConfig) -> list[str]:
+    try:
+        artifact_templates(config)
+    except SpecRailError as exc:
+        return [str(exc)]
+    return []
 
 
 def work_id_for_issue(issue: int | None) -> str | None:
@@ -344,6 +372,9 @@ def validate_labels(config: PackConfig) -> list[str]:
 def validate_action_policy(config: PackConfig) -> list[str]:
     errors: list[str] = []
     states = set(state_map(config))
+    artifact_errors = validate_artifact_templates(config)
+    if artifact_errors:
+        return artifact_errors
     artifacts = set(artifact_templates(config)) | {"linked_issue", "linked_pr", "ci_evidence"}
     configured_human_gates: set[str] = set()
     raw_human_gates = config.workflow.get("required_human_gates", [])

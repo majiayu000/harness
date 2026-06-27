@@ -157,7 +157,9 @@ def collect_review_threads(owner: str, name: str, pr_number: int) -> dict[str, A
             raise EvidenceError("reviewThreads pagination state is missing")
         page_info = _require_mapping(page_info_value, "reviewThreads.pageInfo")
         has_next_page = page_info.get("hasNextPage")
-        if has_next_page is not True:
+        if not isinstance(has_next_page, bool):
+            raise EvidenceError("reviewThreads.pageInfo.hasNextPage must be a boolean")
+        if not has_next_page:
             aggregate_threads = _review_threads_connection(first_page)
             aggregate_threads["nodes"] = all_nodes
             aggregate_threads["pageInfo"] = {
@@ -338,7 +340,12 @@ def normalize_review_threads(graphql_payload: dict[str, Any]) -> list[dict[str, 
     )
     page_info = review_threads.get("pageInfo")
     if isinstance(page_info, dict):
-        if page_info.get("hasNextPage") is True:
+        has_next_page = page_info.get("hasNextPage")
+        if not isinstance(has_next_page, bool):
+            raise EvidenceError(
+                "data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage must be a boolean"
+            )
+        if has_next_page:
             raise EvidenceError("reviewThreads result is truncated; fetch all pages before gating")
     else:
         raise EvidenceError("reviewThreads pagination state is missing")

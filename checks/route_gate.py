@@ -49,6 +49,7 @@ ARTIFACT_FILES = {
 }
 VALID_MODES = {"dry_run", "advisory", "required"}
 PASSING_CHECK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+SPEC_PACKET_ARTIFACTS = {"spec_packet", "product_spec", "tech_spec", "task_plan"}
 
 
 def normalize_route(raw: str) -> str:
@@ -157,6 +158,22 @@ def required_artifact_path(
     if artifact == "linked_pr":
         return None
     return render_artifact_path(config, artifact, issue, pr)
+
+
+def spec_packet_verification_commands(
+    config: Any,
+    issue: int | None,
+    required: list[str],
+    creates: list[str],
+) -> list[str]:
+    if issue is None:
+        return []
+    if not (SPEC_PACKET_ARTIFACTS & {*required, *creates}):
+        return []
+    spec_dir = render_artifact_path(config, "spec_packet", issue)
+    return [
+        f"python3 checks/check_workflow.py --repo . --spec-dir {spec_dir or f'specs/GH{issue}'}"
+    ]
 
 
 def ci_fix_evidence_present(evidence: dict[str, Any], provided_artifacts: dict[str, str]) -> bool:
@@ -379,11 +396,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         "blocked_actions": sorted(set(blocked_actions)),
         "verification_commands": [
             "python3 checks/check_workflow.py --repo .",
-            *(
-                [f"python3 checks/check_workflow.py --repo . --spec-dir specs/GH{effective_issue}"]
-                if effective_issue
-                else []
-            ),
+            *spec_packet_verification_commands(config, effective_issue, required, creates),
         ],
     }
 

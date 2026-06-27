@@ -22,6 +22,7 @@ from evaluate import (  # noqa: E402
 )
 from specrail_lib import (  # noqa: E402
     load_pack,
+    validate_artifact_templates,
     validate_automation_policy,
     validate_json_schemas,
     validate_labels,
@@ -219,6 +220,58 @@ def test_automation_policy_rejects_scalar_forbidden_actions(tmp_path: Path) -> N
     errors = validate_automation_policy(load_pack(tmp_path))
 
     assert any("forbidden_agent_actions must be a list" in error for error in errors)
+
+
+def test_artifact_templates_reject_paths_outside_repo(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "specs/GH{issue_number}/product.md",
+            "../outside/product.md",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    errors = validate_artifact_templates(load_pack(tmp_path))
+
+    assert any("artifacts.product_spec must not contain '..'" in error for error in errors)
+
+
+def test_artifact_templates_reject_absolute_paths(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "specs/GH{issue_number}/tech.md",
+            "/tmp/tech.md",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    errors = validate_artifact_templates(load_pack(tmp_path))
+
+    assert any("artifacts.tech_spec must be repo-relative" in error for error in errors)
+
+
+def test_evaluate_fails_closed_on_unsafe_artifact_template(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "specs/GH{issue_number}/product.md",
+            "/tmp/product.md",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = evaluate(tmp_path, tmp_path / "specs" / "GH5")
+
+    assert result["status"] == "fail"
+    assert any("artifacts.product_spec must be repo-relative" in error for error in result["errors"])
 
 
 def test_evaluate_spec_allows_missing_tasks_md(tmp_path: Path) -> None:

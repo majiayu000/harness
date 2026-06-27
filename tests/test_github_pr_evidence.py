@@ -284,6 +284,24 @@ def test_review_threads_fail_closed_when_more_pages_remain() -> None:
         normalize_review_threads(payload)
 
 
+def test_review_threads_fail_closed_when_has_next_page_is_missing() -> None:
+    payload = threads_payload()
+    review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    review_threads["pageInfo"] = {"endCursor": None}
+
+    with pytest.raises(EvidenceError, match="hasNextPage must be a boolean"):
+        normalize_review_threads(payload)
+
+
+def test_review_threads_fail_closed_when_has_next_page_is_null() -> None:
+    payload = threads_payload()
+    review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    review_threads["pageInfo"] = {"hasNextPage": None, "endCursor": None}
+
+    with pytest.raises(EvidenceError, match="hasNextPage must be a boolean"):
+        normalize_review_threads(payload)
+
+
 def test_collect_review_threads_returns_aggregated_pages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -351,6 +369,35 @@ def test_collect_review_threads_fails_when_page_info_is_absent(
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
 
     with pytest.raises(EvidenceError, match="pagination state"):
+        collect_review_threads("majiayu000", "specrail", 10)
+
+
+def test_collect_review_threads_fails_when_has_next_page_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = threads_payload()
+    review_threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]  # type: ignore[index]
+    review_threads["pageInfo"] = {"endCursor": None}
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "from __future__ import annotations",
+                "import json",
+                f"payload = {json.dumps(payload)!r}",
+                "print(payload)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    with pytest.raises(EvidenceError, match="hasNextPage must be a boolean"):
         collect_review_threads("majiayu000", "specrail", 10)
 
 
