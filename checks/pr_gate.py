@@ -113,8 +113,7 @@ def _thread_items(evidence: dict[str, Any]) -> tuple[list[str], list[str], list[
             unresolved.append(f"thread #{index}")
             continue
         is_resolved = _as_bool(thread.get("is_resolved"))
-        is_outdated = _as_bool(thread.get("is_outdated"))
-        if not is_resolved and not is_outdated:
+        if not is_resolved:
             unresolved.append(str(thread.get("url") or thread.get("id") or f"thread #{index}"))
 
     if unresolved:

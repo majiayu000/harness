@@ -120,6 +120,22 @@ def test_pr_gate_blocks_unresolved_thread() -> None:
     assert any("unresolved review threads" in reason for reason in result["reasons"])
 
 
+def test_pr_gate_blocks_unresolved_outdated_thread() -> None:
+    evidence = clean_evidence()
+    evidence["review_threads"] = [
+        {
+            "url": "https://example.invalid/outdated-thread",
+            "is_resolved": False,
+            "is_outdated": True,
+        }
+    ]
+
+    result = evaluate_pr_gate(evidence)
+
+    assert result["decision"] == "blocked"
+    assert any("unresolved review threads" in reason for reason in result["reasons"])
+
+
 def test_pr_gate_cli_json_contract(tmp_path: Path) -> None:
     evidence_path = tmp_path / "evidence.json"
     evidence_path.write_text(json.dumps(clean_evidence()), encoding="utf-8")
@@ -188,6 +204,44 @@ def test_route_gate_renders_pr_artifact_path(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert "artifacts/review/pr-123.json" in payload["required_artifacts"]
     assert "artifacts/review/pr-{pr_number}.json" not in payload["required_artifacts"]
+
+
+def test_route_gate_uses_configured_verification_artifact_for_pr_review() -> None:
+    verification_path = ROOT / "artifacts/verification/pr-123.json"
+    verification_path.parent.mkdir(parents=True, exist_ok=True)
+    verification_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "checks/route_gate.py",
+                "--repo",
+                ".",
+                "--route",
+                "review_pr",
+                "--issue",
+                "9",
+                "--pr",
+                "123",
+                "--state",
+                "impl_pr_open",
+                "--mode",
+                "required",
+                "--json",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        verification_path.unlink(missing_ok=True)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert "artifacts/verification/pr-123.json" in payload["required_artifacts"]
+    assert "verification" not in payload["missing"]
 
 
 def test_route_gate_renders_fix_ci_verification_artifact_path() -> None:

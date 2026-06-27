@@ -44,6 +44,7 @@ ARTIFACT_FILES = {
     "product_spec",
     "tech_spec",
     "task_plan",
+    "verification",
 }
 
 
@@ -129,8 +130,6 @@ def required_artifact_path(
     if artifact == "linked_issue":
         return None
     if artifact == "linked_pr":
-        return None
-    if artifact == "verification":
         return None
     return render_artifact_path(config, artifact, issue, pr)
 
@@ -238,9 +237,14 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
                 satisfied.append(f"linked_pr: PR-{effective_pr}")
             continue
         if artifact == "verification":
+            required_artifacts.append(path or artifact)
             verification = evidence.get("verification") or provided_artifacts.get("verification")
             if verification:
                 satisfied.append("verification evidence provided")
+            elif artifact_exists(repo, path):
+                satisfied.append(f"verification: {path}")
+            elif path:
+                missing.append(f"verification:{path}")
             else:
                 missing.append("verification")
             continue
