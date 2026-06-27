@@ -1,0 +1,66 @@
+labels:
+  readiness:
+    - needs_info
+    - triaged
+    - ready_to_spec
+    - ready_to_implement
+    - reserved_internal
+
+  outcome:
+    - duplicate
+    - abandoned
+    - security_private
+    - merged
+
+  review:
+    - agent_reviewed
+    - human_review_required
+    - owner_approval_required
+    - changes_requested
+
+  area:
+    - area_docs
+    - area_ci
+    - area_runtime
+    - area_ui
+    - area_security
+
+  source:
+    - agent_generated
+    - human_authored
+
+state_labels:
+  needs_info:
+    - needs_info
+    - needs-info
+    - Needs Info
+  triaged:
+    - triaged
+    - Triaged
+  ready_to_spec:
+    - ready_to_spec
+    - ready-to-spec
+    - ready_for_spec
+    - Ready for Spec
+  ready_to_implement:
+    - ready_to_implement
+    - ready-to-implement
+    - ready_for_implementation
+    - Ready for Implementation
+  impl_pr_open:
+    - impl_pr_open
+    - implementation-pr-open
+  agent_review:
+    - agent_review
+    - agent-reviewed
+    - agent_reviewed
+  human_review:
+    - human_review
+    - human-review
+    - human_review_required
+  ci_green:
+    - ci_green
+    - ci-green
+  merge_ready:
+    - merge_ready
+    - merge-ready

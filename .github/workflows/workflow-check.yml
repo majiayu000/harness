@@ -1,0 +1,52 @@
+name: workflow-check
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install test dependencies
+        run: python3 -m pip install pytest
+      - name: Check workflow pack and spec packets
+        run: |
+          python3 checks/check_workflow.py --repo . \
+            --spec-dir specs/GH5 \
+            --spec-dir specs/GH7 \
+            --spec-dir specs/GH9 \
+            --spec-dir specs/GH13
+      - name: Evaluate adoption matrix
+        run: python3 evaluate.py --repo . --spec-dir specs/GH13 --format json
+      - name: Run SpecRail tests
+        run: |
+          python3 -m pytest -q \
+            tests/test_evaluate.py \
+            tests/test_github_pr_evidence.py \
+            tests/test_pr_gate.py \
+            tests/test_specrail_review_regressions.py
+      - name: Check committed whitespace
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+          elif git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+            git diff --check "${{ github.event.before }}" HEAD
+          elif git rev-parse HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git diff --check
+          fi

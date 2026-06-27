@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CHECKS = ROOT / "checks"
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(CHECKS))
+
+from evaluate import evaluate  # noqa: E402
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def copy_workflow_pack(target: Path) -> None:
+    for name in ["workflow.yaml", "states.yaml", "labels.yaml"]:
+        shutil.copy(ROOT / name, target / name)
+
+
+def require_review_pr_verification(workflow_path: Path) -> None:
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "\n".join(
+                [
+                    "    review_pr:",
+                    "      allowed_from:",
+                    "        - impl_pr_open",
+                    "        - agent_review",
+                    "        - human_review",
+                    "      required_artifacts:",
+                    "        - linked_issue",
+                    "        - linked_pr",
+                    "      creates_artifacts:",
+                    "        - agent_review",
+                ]
+            ),
+            "\n".join(
+                [
+                    "    review_pr:",
+                    "      allowed_from:",
+                    "        - impl_pr_open",
+                    "        - agent_review",
+                    "        - human_review",
+                    "      required_artifacts:",
+                    "        - linked_issue",
+                    "        - linked_pr",
+                    "        - verification",
+                    "      creates_artifacts:",
+                    "        - agent_review",
+                ]
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_evaluate_rejects_spec_dir_outside_configured_layout(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    write_text(tmp_path / "specs" / "GH13" / "product.md", "GitHub issue: `#13`\n")
+    write_text(tmp_path / "specs" / "GH13" / "tech.md", "GitHub issue: `#13`\n")
+
+    result = evaluate(tmp_path, tmp_path / "bogus" / "GH13")
+
+    assert result["status"] == "fail"
+    assert "bogus/GH13: does not match configured spec packet layout" in result["errors"]
+
+
+def test_route_gate_blocks_missing_required_verification_artifact(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    require_review_pr_verification(tmp_path / "workflow.yaml")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "review_pr",
+            "--issue",
+            "9",
+            "--pr",
+            "123",
+            "--state",
+            "impl_pr_open",
+            "--artifact",
+            "verification=does/not/exist",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert "verification:does/not/exist:expected:artifacts/verification/pr-123.json" in payload["missing"]
+
+
+def test_route_gate_rejects_malformed_ci_check_status(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps({"pr": 123, "checks": [{"name": "CI", "status": "BOGUS", "conclusion": ""}]}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "fix_ci",
+            "--pr",
+            "123",
+            "--state",
+            "human_review",
+            "--evidence",
+            str(evidence_path),
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert any("evidence checks[0].status must be one of" in reason for reason in payload["reasons"])
+
+
+def test_route_gate_validates_automation_policy_before_mode_override(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "  default_mode: dry_run\n",
+            "  default_mode: production\n",
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "triage_issue",
+            "--issue",
+            "9",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert any("automation_policy.default_mode must be one of" in reason for reason in payload["reasons"])
+
+
+def test_workflow_check_runs_specrail_regression_tests() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "workflow-check.yml").read_text(encoding="utf-8")
+
+    assert "tests/test_specrail_review_regressions.py" in workflow
+
+
+def test_spec_packet_schema_allows_configured_markdown_paths() -> None:
+    schema = json.loads((ROOT / "schemas" / "spec_packet.schema.json").read_text(encoding="utf-8"))
+    product_pattern = re.compile(schema["properties"]["product_spec"]["pattern"])
+    tech_pattern = re.compile(schema["properties"]["tech_spec"]["pattern"])
+    task_pattern = re.compile(schema["properties"]["task_plan"]["pattern"])
+
+    assert product_pattern.search("docs/specs/5/PRODUCT.md")
+    assert tech_pattern.search("docs/specs/5/TECH.md")
+    assert task_pattern.search("docs/specs/5/TASKS.md")
+    assert not product_pattern.search("/tmp/product.md")
+    assert not tech_pattern.search("../TECH.md")
+
+
+def test_task_plan_schema_allows_configured_spec_packet_directory() -> None:
+    schema = json.loads((ROOT / "schemas" / "task_plan.schema.json").read_text(encoding="utf-8"))
+    spec_packet_pattern = re.compile(schema["properties"]["spec_packet"]["pattern"])
+
+    assert spec_packet_pattern.search("docs/specs/5/")
+    assert spec_packet_pattern.search("specs/GH5/")
+    assert not spec_packet_pattern.search("/tmp/specs/5/")
+    assert not spec_packet_pattern.search("../specs/5/")
+
+
+def test_route_gate_advisory_warns_on_configured_gate_miss() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "fix_ci",
+            "--pr",
+            "123",
+            "--state",
+            "new_issue",
+            "--mode",
+            "advisory",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "warn"
+    assert "allowed_state:human_review|ci_green" in payload["missing"]
+
+
+def test_route_gate_quotes_spec_dir_verification_command(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "spec_packet: specs/GH{issue_number}/",
+            "spec_packet: specs/GH{issue_number};echo INJECTED/",
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "write_spec",
+            "--issue",
+            "5",
+            "--state",
+            "triaged",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["verification_commands"] == [
+        "python3 checks/check_workflow.py --repo .",
+        "python3 checks/check_workflow.py --repo . --spec-dir 'specs/GH5;echo INJECTED/'",
+    ]
