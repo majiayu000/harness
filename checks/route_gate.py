@@ -105,6 +105,15 @@ def positive_int(value: object) -> int | None:
     return value if type(value) is int and value > 0 else None
 
 
+def evidence_positive_int(evidence: dict[str, Any], field: str) -> tuple[int | None, str | None]:
+    if field not in evidence or evidence[field] is None:
+        return None, None
+    value = evidence[field]
+    if type(value) is int and value > 0:
+        return value, None
+    return None, f"evidence {field} must be a positive integer"
+
+
 def evidence_labels(evidence: dict[str, Any]) -> list[str]:
     labels = evidence.get("labels", [])
     if labels is None:
@@ -150,8 +159,11 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
         config_errors.append(f"unknown route: {route}")
 
     evidence = load_evidence(Path(args.evidence) if args.evidence else None)
-    evidence_issue = positive_int(evidence.get("linked_issue"))
-    evidence_pr = positive_int(evidence.get("pr"))
+    evidence_issue, evidence_issue_error = evidence_positive_int(evidence, "linked_issue")
+    evidence_pr, evidence_pr_error = evidence_positive_int(evidence, "pr")
+    config_errors.extend(
+        error for error in [evidence_issue_error, evidence_pr_error] if error is not None
+    )
     if args.issue is not None and evidence_issue is not None and args.issue != evidence_issue:
         config_errors.append(
             f"conflicting linked_issue: --issue {args.issue} does not match evidence linked_issue {evidence_issue}"

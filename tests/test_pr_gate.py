@@ -387,6 +387,47 @@ def test_route_gate_rejects_conflicting_cli_and_evidence_ids(tmp_path: Path) -> 
     assert any("conflicting pr" in reason for reason in payload["reasons"])
 
 
+def test_route_gate_rejects_malformed_evidence_ids_before_cli_fallback(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps({"linked_issue": "10", "pr": "124", "verification": "cargo test"}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "review_pr",
+            "--issue",
+            "9",
+            "--pr",
+            "123",
+            "--state",
+            "impl_pr_open",
+            "--evidence",
+            str(evidence_path),
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert "evidence linked_issue must be a positive integer" in payload["reasons"]
+    assert "evidence pr must be a positive integer" in payload["reasons"]
+    assert "artifacts/review/pr-123.json" not in payload["required_artifacts"]
+
+
 def test_route_gate_blocked_result_includes_configured_forbidden_actions() -> None:
     result = subprocess.run(
         [
@@ -668,8 +709,8 @@ def test_route_gate_rejects_boolean_evidence_ids(tmp_path: Path) -> None:
     assert result.returncode == 1
     payload = json.loads(result.stdout)
     assert payload["decision"] == "blocked"
-    assert "linked_issue" in payload["missing"]
-    assert "linked_pr" in payload["missing"]
+    assert "evidence linked_issue must be a positive integer" in payload["reasons"]
+    assert "evidence pr must be a positive integer" in payload["reasons"]
 
 
 def test_route_gate_allows_null_evidence_labels(tmp_path: Path) -> None:
