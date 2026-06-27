@@ -568,6 +568,66 @@ def test_adoption_matrix_rejects_unsafe_specrail_artifact_paths(tmp_path: Path) 
     assert any("must not contain '..'" in error for error in errors)
 
 
+def test_adoption_matrix_validates_extra_adoption_records(tmp_path: Path) -> None:
+    write_text(tmp_path / "docs" / "ADOPTION_MATRIX.md", "matrix\n")
+    write_text(tmp_path / "examples" / "rclean-smoke.md", "smoke\n")
+    write_text(
+        tmp_path / "examples" / "adoptions" / "matrix.json",
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "levels": ["smoke", "pr_gate", "spec_packet"],
+                "adoptions": [
+                    {
+                        "id": "rclean",
+                        "name": "rclean",
+                        "repo": "majiayu000/rclean",
+                        "current_level": "smoke",
+                        "status": "active",
+                        "evidence": [{"kind": "specrail_artifact", "path": "examples/rclean-smoke.md"}],
+                        "verified_behaviors": ["smoke"],
+                        "next_gap": "add more evidence",
+                    },
+                    {
+                        "id": "litellm-rs",
+                        "name": "litellm-rs",
+                        "repo": "majiayu000/litellm-rs",
+                        "current_level": "pr_gate",
+                        "status": "active",
+                        "evidence": [{"kind": "github_pr", "repo": "majiayu000/litellm-rs", "number": 718, "url": "https://example.test/pr"}],
+                        "verified_behaviors": ["pr gate"],
+                        "next_gap": "add fixtures",
+                    },
+                    {
+                        "id": "claude-code-monitor",
+                        "name": "Claude-Code-Monitor",
+                        "repo": "majiayu000/claude-hub",
+                        "current_level": "spec_packet",
+                        "status": "active",
+                        "evidence": [{"kind": "external_artifact", "path": "specs/GH44/product.md"}],
+                        "verified_behaviors": ["spec packet"],
+                        "next_gap": "decide integration",
+                    },
+                    {
+                        "id": "new-pilot",
+                        "name": "New Pilot",
+                        "repo": "majiayu000/new-pilot",
+                        "current_level": "unknown",
+                        "status": "active",
+                        "evidence": [{"kind": "external_artifact", "path": "specs/GH1/product.md"}],
+                        "verified_behaviors": ["pilot"],
+                        "next_gap": "fix level",
+                    },
+                ],
+            }
+        ),
+    )
+
+    _checks, errors, _warnings = evaluate_adoption_matrix(tmp_path)
+
+    assert any("new-pilot has invalid adoption level" in error for error in errors)
+
+
 def test_adoption_matrix_rejects_invalid_github_evidence_numbers(tmp_path: Path) -> None:
     for number in ["718", -1, True]:
         checks: list[dict[str, str]] = []
@@ -587,3 +647,19 @@ def test_adoption_matrix_rejects_invalid_github_evidence_numbers(tmp_path: Path)
 
         assert any(check["id"] == "adoption_matrix.remote_evidence" and check["status"] == "fail" for check in checks)
         assert any("github_pr evidence item 0 incomplete" in error for error in errors)
+
+
+def test_adoption_matrix_rejects_non_string_external_paths(tmp_path: Path) -> None:
+    checks: list[dict[str, str]] = []
+    errors = validate_adoption_evidence(
+        tmp_path,
+        "claude-code-monitor",
+        [{"kind": "external_artifact", "path": 123}],
+        checks,
+    )
+
+    assert any(
+        check["id"] == "adoption_matrix.external_path_evidence" and check["status"] == "fail"
+        for check in checks
+    )
+    assert any("external artifact evidence item 0 missing path" in error for error in errors)

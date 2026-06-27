@@ -347,10 +347,19 @@ def evaluate_adoption_matrix(repo: Path) -> tuple[list[dict[str, str]], list[str
     else:
         checks.append(check("pass", "adoption_matrix.required_ids", ADOPTION_MATRIX_FIXTURE, "all required adoption IDs present"))
 
-    for adoption_id in REQUIRED_ADOPTION_IDS:
-        entry = by_id.get(adoption_id)
+    for index, entry in enumerate(adoptions):
         if not isinstance(entry, dict):
+            entry_path = f"{ADOPTION_MATRIX_FIXTURE}.adoptions[{index}]"
+            checks.append(check("fail", "adoption_matrix.record_shape", entry_path, "adoption record must be an object"))
+            errors.append(f"adoption matrix record {index} must be an object")
             continue
+        adoption_id = entry.get("id")
+        if not isinstance(adoption_id, str) or not adoption_id.strip():
+            entry_path = f"{ADOPTION_MATRIX_FIXTURE}.adoptions[{index}]"
+            checks.append(check("fail", "adoption_matrix.record_shape", entry_path, "adoption id missing"))
+            errors.append(f"adoption matrix record {index} missing id")
+            continue
+        adoption_id = adoption_id.strip()
         entry_path = f"{ADOPTION_MATRIX_FIXTURE}#{adoption_id}"
         level = entry.get("current_level")
         status = entry.get("status")
@@ -455,7 +464,8 @@ def validate_adoption_evidence(
                 errors.append(f"{adoption_id} {kind} evidence item {index} incomplete")
             continue
         if kind in {"external_artifact", "external_local_path"}:
-            if item.get("path"):
+            external_path = item.get("path")
+            if isinstance(external_path, str) and external_path.strip():
                 checks.append(check("pass", "adoption_matrix.external_path_evidence", evidence_path, "external artifact pointer recorded"))
             else:
                 checks.append(check("fail", "adoption_matrix.external_path_evidence", evidence_path, "external artifact pointer missing"))
