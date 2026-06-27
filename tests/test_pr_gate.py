@@ -1372,6 +1372,37 @@ def test_route_gate_rejects_off_template_artifact_paths() -> None:
     assert "tech_spec:/etc/passwd" in payload["missing"]
 
 
+def test_route_gate_accepts_directory_artifact_evidence_without_trailing_slash() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "write_spec",
+            "--issue",
+            "5",
+            "--state",
+            "ready_to_spec",
+            "--artifact",
+            "spec_packet=specs/GH5",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert "spec_packet:specs/GH5:expected:specs/GH5/" not in payload["missing"]
+
+
 def test_route_gate_rejects_non_positive_issue_and_pr() -> None:
     result = subprocess.run(
         [

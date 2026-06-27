@@ -361,6 +361,13 @@ def evaluate_adoption_matrix(repo: Path) -> tuple[list[dict[str, str]], list[str
             continue
         adoption_id = adoption_id.strip()
         entry_path = f"{ADOPTION_MATRIX_FIXTURE}#{adoption_id}"
+        for field in ["name", "repo"]:
+            value = entry.get(field)
+            if isinstance(value, str) and value.strip():
+                checks.append(check("pass", "adoption_matrix.identity_present", entry_path, f"{adoption_id} {field} recorded"))
+            else:
+                checks.append(check("fail", "adoption_matrix.identity_present", entry_path, f"{adoption_id} {field} missing"))
+                errors.append(f"{adoption_id} missing adoption {field}")
         level = entry.get("current_level")
         status = entry.get("status")
         evidence = entry.get("evidence")

@@ -97,6 +97,16 @@ def artifact_exists(repo: Path, artifact_path: str | None) -> bool:
     return target.is_file()
 
 
+def artifact_path_matches(expected: str, provided: str) -> bool:
+    return expected.rstrip("/") == provided.rstrip("/")
+
+
+def provided_artifact_exists(repo: Path, provided_path: str, expected_path: str | None) -> bool:
+    if expected_path and expected_path.endswith("/"):
+        return (repo / provided_path.rstrip("/")).is_dir()
+    return artifact_exists(repo, provided_path)
+
+
 def safe_relative_artifact_path(raw: object) -> str | None:
     value = str(raw).strip()
     if not value:
@@ -341,9 +351,9 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
             provided_path = safe_relative_artifact_path(provided)
             if provided_path is None:
                 missing.append(f"{artifact}:{provided}")
-            elif path and provided_path != path:
+            elif path and not artifact_path_matches(path, provided_path):
                 missing.append(f"{artifact}:{provided_path}:expected:{path}")
-            elif not artifact_exists(repo, provided_path):
+            elif not provided_artifact_exists(repo, provided_path, path):
                 missing.append(f"{artifact}:{provided_path}")
             else:
                 satisfied.append(f"{artifact}: {provided_path}")
