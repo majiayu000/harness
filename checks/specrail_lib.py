@@ -180,6 +180,12 @@ def state_label_map(config: PackConfig) -> dict[str, str]:
         for label in labels:
             label_name = str(label).strip()
             if label_name:
+                existing_state = mapping.get(label_name)
+                if existing_state is not None and existing_state != state_name:
+                    raise SpecRailError(
+                        "labels.yaml: state label "
+                        f"{label_name} maps to both {existing_state} and {state_name}"
+                    )
                 mapping[label_name] = state_name
     return mapping
 

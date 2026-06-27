@@ -12,13 +12,25 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CHECKS))
 
 from check_workflow import validate_spec_packet, validate_task_plan  # noqa: E402
-from evaluate import evaluate_adoption_matrix, evaluate_rclean_smoke, evaluate_spec, validate_adoption_evidence, validate_tasks  # noqa: E402
-from specrail_lib import validate_json_schemas  # noqa: E402
+from evaluate import (  # noqa: E402
+    evaluate,
+    evaluate_adoption_matrix,
+    evaluate_rclean_smoke,
+    evaluate_spec,
+    validate_adoption_evidence,
+    validate_tasks,
+)
+from specrail_lib import load_pack, validate_json_schemas, validate_labels  # noqa: E402
 
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def copy_workflow_config(target: Path) -> None:
+    for name in ["workflow.yaml", "states.yaml", "labels.yaml"]:
+        write_text(target / name, (ROOT / name).read_text(encoding="utf-8"))
 
 
 def test_task_plan_rejects_duplicate_ids(tmp_path: Path) -> None:
@@ -187,6 +199,48 @@ def test_evaluate_json_contract_for_gh5() -> None:
     assert payload["errors"] == []
     assert payload["artifacts"]["adoption_matrix"] == "docs/ADOPTION_MATRIX.md"
     assert payload["artifacts"]["adoption_fixture"] == "examples/adoptions/matrix.json"
+
+
+def test_evaluate_reports_semantic_workflow_config_errors(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "ready_to_spec",
+            "missing_state",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = evaluate(tmp_path, tmp_path / "specs" / "GH5")
+
+    assert result["status"] == "fail"
+    assert any("references unknown state missing_state" in error for error in result["errors"])
+    assert any(
+        check["id"] == "workflow.config_valid" and check["status"] == "fail"
+        for check in result["checks"]
+    )
+
+
+def test_validate_labels_rejects_duplicate_state_label_alias(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    labels_path = tmp_path / "labels.yaml"
+    labels_path.write_text(
+        labels_path.read_text(encoding="utf-8").replace(
+            "  triaged:\n    - triaged\n",
+            "  triaged:\n    - triaged\n    - ready_to_spec\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    errors = validate_labels(load_pack(tmp_path))
+
+    assert any(
+        "state label ready_to_spec maps to both ready_to_spec and triaged" in error
+        for error in errors
+    )
 
 
 def test_adoption_matrix_requires_known_pilots(tmp_path: Path) -> None:

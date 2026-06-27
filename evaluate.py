@@ -13,7 +13,14 @@ from pathlib import Path
 CHECKS_DIR = Path(__file__).resolve().parent / "checks"
 sys.path.insert(0, str(CHECKS_DIR))
 
-from specrail_lib import SpecRailError, load_pack, read_text  # noqa: E402
+from specrail_lib import (  # noqa: E402
+    SpecRailError,
+    load_pack,
+    read_text,
+    validate_action_policy,
+    validate_labels,
+    validate_state_graph,
+)
 
 
 REQUIRED_SMOKE_IDS = [
@@ -399,10 +406,20 @@ def evaluate(repo: Path, spec_dir: Path) -> dict[str, object]:
     warnings: list[str] = []
 
     try:
-        load_pack(repo)
+        config = load_pack(repo)
         checks.append(check("pass", "workflow.config_present", "workflow.yaml", "workflow config loaded"))
         checks.append(check("pass", "workflow.states_present", "states.yaml", "state config loaded"))
         checks.append(check("pass", "workflow.labels_present", "labels.yaml", "label config loaded"))
+        config_errors: list[str] = []
+        config_errors.extend(validate_state_graph(config))
+        config_errors.extend(validate_labels(config))
+        config_errors.extend(validate_action_policy(config))
+        if config_errors:
+            for error in config_errors:
+                checks.append(check("fail", "workflow.config_valid", ".", error))
+            errors.extend(config_errors)
+        else:
+            checks.append(check("pass", "workflow.config_valid", ".", "workflow config is semantically valid"))
     except SpecRailError as exc:
         checks.append(check("fail", "workflow.config_present", ".", str(exc)))
         errors.append(str(exc))
