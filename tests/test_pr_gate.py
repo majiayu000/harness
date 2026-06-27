@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECKS = ROOT / "checks"
 sys.path.insert(0, str(CHECKS))
 
+from check_workflow import REQUIRED_FILES, validate_required_files  # noqa: E402
 from pr_gate import evaluate_pr_gate  # noqa: E402
 
 
@@ -200,6 +201,19 @@ def test_pr_gate_cli_json_contract(tmp_path: Path) -> None:
         "blocked_actions",
         "verification_commands",
     } <= set(payload)
+
+
+def test_workflow_pack_requires_route_gate(tmp_path: Path) -> None:
+    for rel in REQUIRED_FILES:
+        if rel == "checks/route_gate.py":
+            continue
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("placeholder\n", encoding="utf-8")
+
+    errors = validate_required_files(tmp_path)
+
+    assert "missing required file: checks/route_gate.py" in errors
 
 
 def test_route_gate_renders_pr_artifact_path(tmp_path: Path) -> None:
@@ -723,6 +737,15 @@ def test_route_gate_blocks_non_list_evidence_labels(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["decision"] == "blocked"
     assert payload["reasons"] == ["evidence labels must be a list when provided"]
+    assert {
+        "close_disputed_issue",
+        "final_approval",
+        "force_push",
+        "merge",
+        "permission_change",
+        "public_security_disclosure",
+        "implement",
+    } <= set(payload["blocked_actions"])
 
 
 def test_route_gate_ignores_github_pr_state_when_label_supplies_specrail_state(tmp_path: Path) -> None:

@@ -32,6 +32,7 @@ REQUIRED_FILES = [
     "examples/adoptions/matrix.json",
     "checks/github_pr_evidence.py",
     "checks/pr_gate.py",
+    "checks/route_gate.py",
     "templates/issue_bug.md",
     "templates/issue_feature.md",
     "templates/product_spec.md",

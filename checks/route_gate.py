@@ -359,6 +359,17 @@ def blocked_result(
     }
 
 
+def fallback_blocked_actions(args: argparse.Namespace) -> list[str]:
+    route = normalize_route(args.route)
+    blocked_actions = [route]
+    try:
+        config = load_pack(Path(args.repo).resolve())
+        blocked_actions.extend(forbidden_agent_actions(config))
+    except SpecRailError:
+        return sorted(set(blocked_actions))
+    return sorted(set(blocked_actions))
+
+
 def print_human(result: dict[str, Any]) -> None:
     print(f"decision: {result['decision']}")
     print(f"route: {result['route']}")
@@ -428,7 +439,7 @@ def main() -> int:
             "required_artifacts": [],
             "human_gates": [],
             "allowed_actions": [],
-            "blocked_actions": [normalize_route(args.route)],
+            "blocked_actions": fallback_blocked_actions(args),
             "verification_commands": ["python3 checks/check_workflow.py --repo ."],
         }
 
