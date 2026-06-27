@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CHECKS))
 
 from check_workflow import validate_spec_packet, validate_task_plan  # noqa: E402
-from evaluate import evaluate_adoption_matrix, evaluate_rclean_smoke, evaluate_spec, validate_tasks  # noqa: E402
+from evaluate import evaluate_adoption_matrix, evaluate_rclean_smoke, evaluate_spec, validate_adoption_evidence, validate_tasks  # noqa: E402
 from specrail_lib import validate_json_schemas  # noqa: E402
 
 
@@ -49,6 +49,20 @@ def test_task_plan_requires_done_when_and_verify(tmp_path: Path) -> None:
 
     assert any("missing Done when:" in error for error in errors)
     assert any("missing Verify:" in error for error in errors)
+
+
+def test_task_plan_rejects_non_numeric_task_id_suffix(tmp_path: Path) -> None:
+    task_path = tmp_path / "specs" / "GH5" / "tasks.md"
+    write_text(
+        task_path,
+        "- [ ] `SP5-TABC` Owner: `tests` | Done when: done | Verify: pytest",
+    )
+
+    workflow_errors = validate_task_plan(task_path, "5")
+    evaluate_errors = validate_tasks(tmp_path, task_path, "5")
+
+    assert any("must match SP5-T[0-9]+" in error for error in workflow_errors)
+    assert any("must match SP5-T[0-9]+" in error for error in evaluate_errors)
 
 
 def test_task_plan_ignores_verification_checklist_items(tmp_path: Path) -> None:
@@ -306,3 +320,24 @@ def test_adoption_matrix_rejects_unsafe_specrail_artifact_paths(tmp_path: Path) 
 
     assert any(check["id"] == "adoption_matrix.local_evidence" for check in checks)
     assert any("must not contain '..'" in error for error in errors)
+
+
+def test_adoption_matrix_rejects_invalid_github_evidence_numbers(tmp_path: Path) -> None:
+    for number in ["718", -1, True]:
+        checks: list[dict[str, str]] = []
+        errors = validate_adoption_evidence(
+            tmp_path,
+            "litellm-rs",
+            [
+                {
+                    "kind": "github_pr",
+                    "repo": "majiayu000/litellm-rs",
+                    "number": number,
+                    "url": "https://example.test/pr",
+                }
+            ],
+            checks,
+        )
+
+        assert any(check["id"] == "adoption_matrix.remote_evidence" and check["status"] == "fail" for check in checks)
+        assert any("github_pr evidence item 0 incomplete" in error for error in errors)

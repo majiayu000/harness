@@ -159,7 +159,12 @@ def validate_task_plan(path: Path, issue_number: str | None) -> list[str]:
     text = read_text(path)
     if not text.strip():
         return [f"{path}: must not be empty"]
-    prefix = f"SP{issue_number}-T" if issue_number else "SP"
+    task_id_pattern = (
+        re.compile(rf"SP{re.escape(issue_number)}-T[0-9]+")
+        if issue_number
+        else re.compile(r"SP[0-9]+-T[0-9]+")
+    )
+    expected_task_id = f"SP{issue_number}-T[0-9]+" if issue_number else "SP<number>-T[0-9]+"
     ids: list[str] = []
     for line_number, line in implementation_task_lines(text):
         if "- [" not in line:
@@ -170,8 +175,8 @@ def validate_task_plan(path: Path, issue_number: str | None) -> list[str]:
             continue
         task_id = match.group(1)
         ids.append(task_id)
-        if issue_number and not task_id.startswith(prefix):
-            errors.append(f"{path}:{line_number}: task ID {task_id} must start with {prefix}")
+        if not task_id_pattern.fullmatch(task_id):
+            errors.append(f"{path}:{line_number}: task ID {task_id} must match {expected_task_id}")
         for token in ["Owner:", "Done when:", "Verify:"]:
             if token not in line:
                 errors.append(f"{path}:{line_number}: task {task_id} missing {token}")

@@ -144,7 +144,12 @@ def evaluate_spec(repo: Path, spec_dir: Path) -> tuple[list[dict[str, str]], lis
 def validate_tasks(repo: Path, task_path: Path, issue_number: str | None) -> list[str]:
     errors: list[str] = []
     text = read_text(task_path)
-    prefix = f"SP{issue_number}-T" if issue_number else "SP"
+    task_id_pattern = (
+        re.compile(rf"SP{re.escape(issue_number)}-T[0-9]+")
+        if issue_number
+        else re.compile(r"SP[0-9]+-T[0-9]+")
+    )
+    expected_task_id = f"SP{issue_number}-T[0-9]+" if issue_number else "SP<number>-T[0-9]+"
     ids: list[str] = []
     for line_number, line in implementation_task_lines(text):
         if "- [" not in line:
@@ -155,8 +160,8 @@ def validate_tasks(repo: Path, task_path: Path, issue_number: str | None) -> lis
             continue
         task_id = match.group(1)
         ids.append(task_id)
-        if issue_number and not task_id.startswith(prefix):
-            errors.append(f"{task_path.relative_to(repo)}:{line_number}: {task_id} must start with {prefix}")
+        if not task_id_pattern.fullmatch(task_id):
+            errors.append(f"{task_path.relative_to(repo)}:{line_number}: {task_id} must match {expected_task_id}")
         for token in ["Owner:", "Done when:", "Verify:"]:
             if token not in line:
                 errors.append(f"{task_path.relative_to(repo)}:{line_number}: {task_id} missing {token}")
@@ -360,7 +365,17 @@ def validate_adoption_evidence(
                 errors.append(f"{adoption_id} SpecRail evidence path missing: {rel_path}")
             continue
         if kind in {"github_issue", "github_pr"}:
-            if item.get("repo") and item.get("number") and item.get("url"):
+            repo_slug = item.get("repo")
+            number = item.get("number")
+            url = item.get("url")
+            if (
+                isinstance(repo_slug, str)
+                and repo_slug
+                and type(number) is int
+                and number > 0
+                and isinstance(url, str)
+                and url
+            ):
                 checks.append(check("pass", "adoption_matrix.remote_evidence", evidence_path, f"{kind} pointer recorded"))
             else:
                 checks.append(check("fail", "adoption_matrix.remote_evidence", evidence_path, f"{kind} pointer incomplete"))
