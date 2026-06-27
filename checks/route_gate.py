@@ -189,7 +189,32 @@ def spec_packet_verification_commands(
     ]
 
 
-def ci_fix_evidence_present(evidence: dict[str, Any], provided_artifacts: dict[str, str]) -> bool:
+def local_verification_artifact_present(
+    repo: Path,
+    config: Any,
+    evidence: dict[str, Any],
+    provided_artifacts: dict[str, str],
+    pr: int | None,
+) -> bool:
+    raw = provided_artifacts.get("verification") or evidence.get("verification")
+    if not raw:
+        return False
+    provided_path = safe_relative_artifact_path(raw)
+    if provided_path is None:
+        return False
+    expected_path = render_artifact_path(config, "verification", None, pr)
+    if expected_path and not artifact_path_matches(expected_path, provided_path):
+        return False
+    return provided_artifact_exists(repo, provided_path, expected_path)
+
+
+def ci_fix_evidence_present(
+    repo: Path,
+    config: Any,
+    evidence: dict[str, Any],
+    provided_artifacts: dict[str, str],
+    pr: int | None,
+) -> bool:
     checks = evidence.get("checks")
     if checks is not None and not isinstance(checks, list):
         raise SpecRailError("evidence checks must be a list when provided")
@@ -203,7 +228,7 @@ def ci_fix_evidence_present(evidence: dict[str, Any], provided_artifacts: dict[s
                 return True
             if conclusion and conclusion not in PASSING_CHECK_CONCLUSIONS:
                 return True
-    return bool(evidence.get("verification") or provided_artifacts.get("verification"))
+    return local_verification_artifact_present(repo, config, evidence, provided_artifacts, pr)
 
 
 def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
@@ -328,7 +353,7 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
                 satisfied.append(f"linked_pr: PR-{effective_pr}")
             continue
         if artifact == "ci_evidence":
-            if ci_fix_evidence_present(evidence, provided_artifacts):
+            if ci_fix_evidence_present(repo, config, evidence, provided_artifacts, effective_pr):
                 satisfied.append("ci_evidence provided")
             else:
                 missing.append("ci_evidence")

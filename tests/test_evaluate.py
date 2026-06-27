@@ -681,6 +681,59 @@ def test_adoption_matrix_requires_name_and_repo(tmp_path: Path) -> None:
     assert "rclean missing adoption repo" in errors
 
 
+def test_adoption_matrix_requires_schema_version_and_levels(tmp_path: Path) -> None:
+    write_text(tmp_path / "docs" / "ADOPTION_MATRIX.md", "matrix\n")
+    write_text(tmp_path / "examples" / "rclean-smoke.md", "smoke\n")
+    write_text(
+        tmp_path / "examples" / "adoptions" / "matrix.json",
+        json.dumps(
+            {
+                "adoptions": [
+                    {
+                        "id": "rclean",
+                        "name": "rclean",
+                        "repo": "majiayu000/rclean",
+                        "current_level": "smoke",
+                        "status": "active",
+                        "evidence": [{"kind": "specrail_artifact", "path": "examples/rclean-smoke.md"}],
+                        "verified_behaviors": ["smoke"],
+                        "next_gap": "add more evidence",
+                    },
+                    {
+                        "id": "litellm-rs",
+                        "name": "litellm-rs",
+                        "repo": "majiayu000/litellm-rs",
+                        "current_level": "smoke",
+                        "status": "active",
+                        "evidence": [{"kind": "external_artifact", "path": "specs/GH1/product.md"}],
+                        "verified_behaviors": ["smoke"],
+                        "next_gap": "add more evidence",
+                    },
+                    {
+                        "id": "claude-code-monitor",
+                        "name": "Claude-Code-Monitor",
+                        "repo": "majiayu000/claude-hub",
+                        "current_level": "smoke",
+                        "status": "active",
+                        "evidence": [{"kind": "external_artifact", "path": "specs/GH1/product.md"}],
+                        "verified_behaviors": ["smoke"],
+                        "next_gap": "add more evidence",
+                    },
+                ],
+            }
+        ),
+    )
+
+    checks, errors, _warnings = evaluate_adoption_matrix(tmp_path)
+
+    assert any(
+        check["id"] == "adoption_matrix.header_shape" and check["status"] == "fail"
+        for check in checks
+    )
+    assert "adoption matrix schema_version missing" in errors
+    assert "adoption matrix levels must be a non-empty list" in errors
+
+
 def test_adoption_matrix_rejects_invalid_github_evidence_numbers(tmp_path: Path) -> None:
     for number in ["718", -1, True]:
         checks: list[dict[str, str]] = []

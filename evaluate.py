@@ -333,6 +333,20 @@ def evaluate_adoption_matrix(repo: Path) -> tuple[list[dict[str, str]], list[str
         return checks, errors, warnings
 
     checks.append(check("pass", "adoption_matrix.fixture_present", ADOPTION_MATRIX_FIXTURE, "adoption matrix fixture exists"))
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, str) and schema_version.strip():
+        checks.append(check("pass", "adoption_matrix.header_shape", ADOPTION_MATRIX_FIXTURE, "schema_version recorded"))
+    else:
+        checks.append(check("fail", "adoption_matrix.header_shape", ADOPTION_MATRIX_FIXTURE, "schema_version missing"))
+        errors.append("adoption matrix schema_version missing")
+
+    levels = payload.get("levels")
+    if isinstance(levels, list) and levels and all(isinstance(level, str) and level.strip() for level in levels):
+        checks.append(check("pass", "adoption_matrix.header_shape", ADOPTION_MATRIX_FIXTURE, "levels recorded"))
+    else:
+        checks.append(check("fail", "adoption_matrix.header_shape", ADOPTION_MATRIX_FIXTURE, "levels must be a non-empty string list"))
+        errors.append("adoption matrix levels must be a non-empty list")
+
     adoptions = payload.get("adoptions")
     if not isinstance(adoptions, list):
         checks.append(check("fail", "adoption_matrix.records_shape", ADOPTION_MATRIX_FIXTURE, "adoptions must be a list"))

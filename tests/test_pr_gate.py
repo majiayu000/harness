@@ -890,9 +890,13 @@ def test_route_gate_renders_fix_ci_verification_artifact_path(tmp_path: Path) ->
 
 
 def test_route_gate_allows_fix_ci_with_verification_substitute(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    verification_path = tmp_path / "artifacts" / "verification" / "pr-123.json"
+    verification_path.parent.mkdir(parents=True)
+    verification_path.write_text('{"verified": true}\n', encoding="utf-8")
     evidence_path = tmp_path / "evidence.json"
     evidence_path.write_text(
-        json.dumps({"pr": 123, "verification": "cargo test"}),
+        json.dumps({"pr": 123, "verification": "artifacts/verification/pr-123.json"}),
         encoding="utf-8",
     )
 
@@ -901,7 +905,7 @@ def test_route_gate_allows_fix_ci_with_verification_substitute(tmp_path: Path) -
             sys.executable,
             "checks/route_gate.py",
             "--repo",
-            ".",
+            str(tmp_path),
             "--route",
             "fix_ci",
             "--pr",
@@ -924,6 +928,37 @@ def test_route_gate_allows_fix_ci_with_verification_substitute(tmp_path: Path) -
     payload = json.loads(result.stdout)
     assert payload["decision"] == "allowed"
     assert "ci_evidence" not in payload["missing"]
+
+
+def test_route_gate_blocks_fix_ci_with_missing_verification_substitute() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "fix_ci",
+            "--pr",
+            "123",
+            "--state",
+            "human_review",
+            "--artifact",
+            "verification=does/not/exist",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert "ci_evidence" in payload["missing"]
 
 
 def test_route_gate_uses_evidence_linked_issue_for_pr_review(tmp_path: Path) -> None:
