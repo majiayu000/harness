@@ -51,6 +51,11 @@ REQUIRED_ADOPTION_IDS = [
     "litellm-rs",
     "claude-code-monitor",
 ]
+REQUIRED_ADOPTION_LEVELS = {
+    "rclean": "smoke",
+    "litellm-rs": "pr_gate",
+    "claude-code-monitor": "spec_packet",
+}
 ADOPTION_LEVELS = {
     "referenced",
     "smoke",
@@ -393,6 +398,13 @@ def evaluate_adoption_matrix(repo: Path) -> tuple[list[dict[str, str]], list[str
         else:
             checks.append(check("fail", "adoption_matrix.level_valid", entry_path, f"{adoption_id} has invalid level {level!r}"))
             errors.append(f"{adoption_id} has invalid adoption level")
+        expected_level = REQUIRED_ADOPTION_LEVELS.get(adoption_id)
+        if expected_level is not None:
+            if level == expected_level:
+                checks.append(check("pass", "adoption_matrix.required_level", entry_path, f"{adoption_id} required level is {expected_level}"))
+            else:
+                checks.append(check("fail", "adoption_matrix.required_level", entry_path, f"{adoption_id} expected level {expected_level}"))
+                errors.append(f"{adoption_id} expected adoption level {expected_level}")
 
         if status in ADOPTION_STATUSES:
             checks.append(check("pass", "adoption_matrix.status_valid", entry_path, f"{adoption_id} status is {status}"))

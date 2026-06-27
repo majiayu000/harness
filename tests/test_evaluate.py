@@ -734,6 +734,59 @@ def test_adoption_matrix_requires_schema_version_and_levels(tmp_path: Path) -> N
     assert "adoption matrix levels must be a non-empty list" in errors
 
 
+def test_adoption_matrix_enforces_required_pilot_levels(tmp_path: Path) -> None:
+    write_text(tmp_path / "docs" / "ADOPTION_MATRIX.md", "matrix\n")
+    write_text(
+        tmp_path / "examples" / "adoptions" / "matrix.json",
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "levels": ["smoke", "pr_gate", "spec_packet"],
+                "adoptions": [
+                    {
+                        "id": "rclean",
+                        "name": "rclean",
+                        "repo": "majiayu000/rclean",
+                        "current_level": "smoke",
+                        "status": "active",
+                        "evidence": [{"kind": "external_artifact", "path": "specs/GH1/product.md"}],
+                        "verified_behaviors": ["smoke"],
+                        "next_gap": "add more evidence",
+                    },
+                    {
+                        "id": "litellm-rs",
+                        "name": "litellm-rs",
+                        "repo": "majiayu000/litellm-rs",
+                        "current_level": "smoke",
+                        "status": "active",
+                        "evidence": [{"kind": "external_artifact", "path": "specs/GH1/product.md"}],
+                        "verified_behaviors": ["smoke"],
+                        "next_gap": "restore pr gate level",
+                    },
+                    {
+                        "id": "claude-code-monitor",
+                        "name": "Claude-Code-Monitor",
+                        "repo": "majiayu000/claude-hub",
+                        "current_level": "spec_packet",
+                        "status": "active",
+                        "evidence": [{"kind": "external_artifact", "path": "specs/GH1/product.md"}],
+                        "verified_behaviors": ["spec packet"],
+                        "next_gap": "add more evidence",
+                    },
+                ],
+            }
+        ),
+    )
+
+    checks, errors, _warnings = evaluate_adoption_matrix(tmp_path)
+
+    assert any(
+        check["id"] == "adoption_matrix.required_level" and check["status"] == "fail"
+        for check in checks
+    )
+    assert "litellm-rs expected adoption level pr_gate" in errors
+
+
 def test_adoption_matrix_rejects_invalid_github_evidence_numbers(tmp_path: Path) -> None:
     for number in ["718", -1, True]:
         checks: list[dict[str, str]] = []
