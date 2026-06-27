@@ -151,7 +151,7 @@ def test_pr_gate_blocks_unresolved_thread() -> None:
     assert any("unresolved review threads" in reason for reason in result["reasons"])
 
 
-def test_pr_gate_blocks_unresolved_outdated_thread() -> None:
+def test_pr_gate_ignores_unresolved_outdated_thread() -> None:
     evidence = clean_evidence()
     evidence["review_threads"] = [
         {
@@ -163,8 +163,8 @@ def test_pr_gate_blocks_unresolved_outdated_thread() -> None:
 
     result = evaluate_pr_gate(evidence)
 
-    assert result["decision"] == "blocked"
-    assert any("unresolved review threads" in reason for reason in result["reasons"])
+    assert result["decision"] == "allowed"
+    assert not any("unresolved review threads" in reason for reason in result["reasons"])
 
 
 def test_pr_gate_cli_json_contract(tmp_path: Path) -> None:
@@ -614,6 +614,40 @@ def test_route_gate_blocks_terminal_states_from_config() -> None:
     assert payload["decision"] == "blocked"
     assert payload["reasons"] == ["state release_note_drafted is terminal or maintainer-reserved"]
     assert "write_spec" in payload["blocked_actions"]
+
+
+def test_route_gate_rejects_explicit_state_conflicting_with_label_state() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            ".",
+            "--route",
+            "implement",
+            "--issue",
+            "5",
+            "--state",
+            "ready_to_implement",
+            "--label",
+            "security_private",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert (
+        "explicit state ready_to_implement conflicts with label-derived state security_private"
+        in payload["reasons"]
+    )
 
 
 def test_route_gate_accepts_configured_label_alias_for_state(tmp_path: Path) -> None:

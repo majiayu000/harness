@@ -304,12 +304,22 @@ def render_artifact_path(
 
 
 def infer_state(config: PackConfig, state: str | None, labels: list[str]) -> tuple[str | None, list[str]]:
-    if state:
-        return state, [f"state provided explicitly: {state}"]
-
     label_to_state = state_label_map(config)
     label_set = {label.strip() for label in labels if label.strip()}
     matches = sorted({label_to_state[label] for label in label_set if label in label_to_state})
+    if state:
+        evidence = [f"state provided explicitly: {state}"]
+        if len(matches) == 1:
+            label_state = matches[0]
+            if label_state != state:
+                raise SpecRailError(
+                    f"explicit state {state} conflicts with label-derived state {label_state}"
+                )
+            evidence.append(f"state label confirms: {label_state}")
+        elif len(matches) > 1:
+            raise SpecRailError(f"conflicting state labels: {', '.join(matches)}")
+        return state, evidence
+
     if len(matches) == 1:
         return matches[0], [f"state inferred from label: {matches[0]}"]
     if len(matches) > 1:
