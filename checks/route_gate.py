@@ -268,6 +268,8 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
                 missing.append(f"{artifact}:{path}")
         elif path:
             required_artifacts.append(path)
+        else:
+            missing.append(f"{artifact}:missing_template")
 
     for action, action_body in policies.items():
         allowed_states = [str(state) for state in action_body.get("allowed_from", [])]

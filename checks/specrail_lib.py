@@ -162,6 +162,27 @@ def label_groups(config: PackConfig) -> dict[str, list[str]]:
     return groups
 
 
+def state_label_map(config: PackConfig) -> dict[str, str]:
+    states = state_map(config)
+    mapping = {state: state for state in states}
+    raw = config.labels.get("state_labels", {})
+    if raw is None:
+        return mapping
+    if not isinstance(raw, dict):
+        raise SpecRailError("labels.yaml state_labels must be a mapping")
+    for state, labels in raw.items():
+        state_name = str(state)
+        if state_name not in states:
+            continue
+        if not isinstance(labels, list):
+            continue
+        for label in labels:
+            label_name = str(label).strip()
+            if label_name:
+                mapping[label_name] = state_name
+    return mapping
+
+
 def action_policy(config: PackConfig) -> dict[str, Any]:
     policy = config.workflow.get("action_policy", {})
     actions = policy.get("actions", {}) if isinstance(policy, dict) else {}
@@ -211,9 +232,9 @@ def infer_state(config: PackConfig, state: str | None, labels: list[str]) -> tup
     if state:
         return state, [f"state provided explicitly: {state}"]
 
-    known_states = set(state_map(config))
+    label_to_state = state_label_map(config)
     label_set = {label.strip() for label in labels if label.strip()}
-    matches = sorted(label_set & known_states)
+    matches = sorted({label_to_state[label] for label in label_set if label in label_to_state})
     if len(matches) == 1:
         return matches[0], [f"state inferred from label: {matches[0]}"]
     if len(matches) > 1:
@@ -246,14 +267,29 @@ def validate_labels(config: PackConfig) -> list[str]:
     errors: list[str] = []
     states = set(state_map(config))
     groups = label_groups(config)
+    try:
+        label_to_state = state_label_map(config)
+    except SpecRailError as exc:
+        errors.append(str(exc))
+        label_to_state = {state: state for state in states}
     for required_group in ["readiness", "outcome", "review"]:
         if required_group not in groups:
             errors.append(f"labels.yaml: missing label group {required_group}")
+    raw_state_labels = config.labels.get("state_labels", {})
+    if raw_state_labels is not None and isinstance(raw_state_labels, dict):
+        for state, labels in raw_state_labels.items():
+            state_name = str(state)
+            if state_name not in states:
+                errors.append(f"labels.yaml: state_labels references unknown state {state_name}")
+            if not isinstance(labels, list):
+                errors.append(f"labels.yaml: state_labels.{state_name} must be a list")
+    readiness_states = {label_to_state.get(label, label) for label in groups.get("readiness", [])}
     for state in ["needs_info", "triaged", "ready_to_spec", "ready_to_implement"]:
-        if state not in groups.get("readiness", []):
+        if state not in readiness_states:
             errors.append(f"labels.yaml: readiness labels missing {state}")
     for label in groups.get("readiness", []) + groups.get("outcome", []):
-        if label not in states and label not in {"merged"}:
+        mapped = label_to_state.get(label, label)
+        if mapped not in states and mapped not in {"merged"}:
             errors.append(f"labels.yaml: label {label} is not a known state or allowed outcome")
     return errors
 
@@ -261,6 +297,7 @@ def validate_labels(config: PackConfig) -> list[str]:
 def validate_action_policy(config: PackConfig) -> list[str]:
     errors: list[str] = []
     states = set(state_map(config))
+    artifacts = set(artifact_templates(config)) | {"linked_issue", "linked_pr"}
     actions = action_policy(config)
     for route in ["triage_issue", "write_spec", "implement", "review_pr", "fix_ci", "draft_release_note"]:
         if route not in actions:
@@ -276,6 +313,17 @@ def validate_action_policy(config: PackConfig) -> list[str]:
         for state in allowed_from:
             if str(state) not in states:
                 errors.append(f"workflow.yaml: action {route} references unknown state {state}")
+        for field in ["required_artifacts", "creates_artifacts"]:
+            artifact_names = body.get(field, [])
+            if not isinstance(artifact_names, list):
+                errors.append(f"workflow.yaml: action {route} {field} must be a list")
+                continue
+            for artifact in artifact_names:
+                artifact_name = str(artifact)
+                if artifact_name not in artifacts:
+                    errors.append(
+                        f"workflow.yaml: action {route} references unknown artifact {artifact_name}"
+                    )
     return errors
 
 

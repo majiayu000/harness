@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,11 @@ def clean_evidence() -> dict[str, object]:
             "summary": "merge approved",
         },
     }
+
+
+def copy_workflow_pack(target: Path) -> None:
+    for name in ["workflow.yaml", "states.yaml", "labels.yaml"]:
+        shutil.copy(ROOT / name, target / name)
 
 
 def test_pr_gate_allows_clean_authorized_merge() -> None:
@@ -242,6 +248,87 @@ def test_route_gate_uses_configured_verification_artifact_for_pr_review() -> Non
     assert payload["decision"] == "allowed"
     assert "artifacts/verification/pr-123.json" in payload["required_artifacts"]
     assert "verification" not in payload["missing"]
+
+
+def test_route_gate_accepts_configured_label_alias_for_state(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    labels_path = tmp_path / "labels.yaml"
+    labels_path.write_text(
+        labels_path.read_text(encoding="utf-8").replace(
+            "    - ready_to_spec\n", "    - ready-to-spec\n", 1
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "write_spec",
+            "--issue",
+            "9",
+            "--label",
+            "ready-to-spec",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "allowed"
+    assert payload["current_state"] == "ready_to_spec"
+
+
+def test_route_gate_blocks_unknown_required_artifact(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "        - linked_issue\n        - product_spec\n        - tech_spec\n",
+            "        - linked_issue\n        - product_specs\n        - tech_spec\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "implement",
+            "--issue",
+            "9",
+            "--state",
+            "ready_to_implement",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert (
+        "workflow.yaml: action implement references unknown artifact product_specs"
+        in payload["reasons"]
+    )
 
 
 def test_route_gate_renders_fix_ci_verification_artifact_path() -> None:
