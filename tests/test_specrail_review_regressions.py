@@ -107,3 +107,78 @@ def test_route_gate_blocks_missing_required_verification_artifact(tmp_path: Path
     payload = json.loads(result.stdout)
     assert payload["decision"] == "blocked"
     assert "verification:does/not/exist:expected:artifacts/verification/pr-123.json" in payload["missing"]
+
+
+def test_route_gate_rejects_malformed_ci_check_status(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps({"pr": 123, "checks": [{"name": "CI", "status": "BOGUS", "conclusion": ""}]}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "fix_ci",
+            "--pr",
+            "123",
+            "--state",
+            "human_review",
+            "--evidence",
+            str(evidence_path),
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert any("evidence checks[0].status must be one of" in reason for reason in payload["reasons"])
+
+
+def test_route_gate_validates_automation_policy_before_mode_override(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "  default_mode: dry_run\n",
+            "  default_mode: production\n",
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "triage_issue",
+            "--issue",
+            "9",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert any("automation_policy.default_mode must be one of" in reason for reason in payload["reasons"])

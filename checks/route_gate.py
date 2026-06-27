@@ -19,6 +19,7 @@ from specrail_lib import (
     state_map,
     terminal_states,
     validate_action_policy,
+    validate_automation_policy,
     validate_labels,
     validate_state_graph,
 )
@@ -48,7 +49,16 @@ ARTIFACT_FILES = {
     "verification",
 }
 VALID_MODES = {"dry_run", "advisory", "required"}
+VALID_CHECK_STATUSES = {"COMPLETED", "IN_PROGRESS", "PENDING", "QUEUED", "REQUESTED", "WAITING"}
 PASSING_CHECK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+VALID_CHECK_CONCLUSIONS = PASSING_CHECK_CONCLUSIONS | {
+    "ACTION_REQUIRED",
+    "CANCELLED",
+    "FAILURE",
+    "STALE",
+    "STARTUP_FAILURE",
+    "TIMED_OUT",
+}
 SPEC_PACKET_ARTIFACTS = {"spec_packet", "product_spec", "tech_spec", "task_plan"}
 
 
@@ -219,11 +229,25 @@ def ci_fix_evidence_present(
     if checks is not None and not isinstance(checks, list):
         raise SpecRailError("evidence checks must be a list when provided")
     if isinstance(checks, list):
-        for check in checks:
+        for index, check in enumerate(checks):
             if not isinstance(check, dict):
                 continue
             status = str(check.get("status") or "").upper()
             conclusion = str(check.get("conclusion") or "").upper()
+            if status and status not in VALID_CHECK_STATUSES:
+                raise SpecRailError(
+                    f"evidence checks[{index}].status must be one of "
+                    f"{', '.join(sorted(VALID_CHECK_STATUSES))}"
+                )
+            if conclusion and conclusion not in VALID_CHECK_CONCLUSIONS:
+                raise SpecRailError(
+                    f"evidence checks[{index}].conclusion must be one of "
+                    f"{', '.join(sorted(VALID_CHECK_CONCLUSIONS))}"
+                )
+            if status == "COMPLETED" and not conclusion:
+                raise SpecRailError(
+                    f"evidence checks[{index}].conclusion is required when status is COMPLETED"
+                )
             if status and status != "COMPLETED":
                 return True
             if conclusion and conclusion not in PASSING_CHECK_CONCLUSIONS:
@@ -238,11 +262,14 @@ def evaluate_route(args: argparse.Namespace) -> dict[str, Any]:
     config_errors.extend(validate_state_graph(config))
     config_errors.extend(validate_labels(config))
     config_errors.extend(validate_action_policy(config))
+    config_errors.extend(validate_automation_policy(config))
     try:
-        args.mode = args.mode or configured_default_mode(config)
+        default_mode = configured_default_mode(config)
     except SpecRailError as exc:
-        args.mode = args.mode or "dry_run"
-        config_errors.append(str(exc))
+        default_mode = "dry_run"
+        if str(exc) not in config_errors:
+            config_errors.append(str(exc))
+    args.mode = args.mode or default_mode
 
     route = normalize_route(args.route)
     policies = action_policy(config)
