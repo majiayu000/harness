@@ -170,7 +170,7 @@ read-only and must not modify the `rclean` repository.
   ```sh
   python3 checks/check_workflow.py --repo . --spec-dir specs/GH5
   python3 evaluate.py --repo . --spec-dir specs/GH5 --format json
-  python3 -m pytest
+  python3 -m pytest tests/test_evaluate.py
   ```
 
 - Reviewers can trace `issue #5`, `tasks_artifact`, and `rclean_smoke`

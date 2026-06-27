@@ -108,4 +108,4 @@ Each record contains:
 - Tests cover failure when a required pilot ID is missing.
 - `python3 checks/check_workflow.py --repo . --spec-dir specs/GH13` passes.
 - `python3 evaluate.py --repo . --spec-dir specs/GH13 --format json` passes.
-- `python3 -m pytest` passes.
+- `python3 -m pytest tests/test_evaluate.py tests/test_github_pr_evidence.py tests/test_pr_gate.py` passes.

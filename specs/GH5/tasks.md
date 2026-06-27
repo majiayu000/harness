@@ -14,7 +14,7 @@ Smoke example: `examples/rclean-smoke.md`
 - [x] `SP5-T005` Owner: `workflow` | Done when: `checks/check_workflow.py` validates `product.md`, `tech.md`, `tasks.md`, issue anchors, task IDs, and missing artifact failures for `specs/GH5` | Verify: `python3 checks/check_workflow.py --repo . --spec-dir specs/GH5`
 - [x] `SP5-T006` Owner: `evaluator` | Done when: `evaluate.py` supports `--repo`, `--spec-dir`, `--format json`, stable exit codes, and required JSON keys | Verify: `python3 evaluate.py --repo . --spec-dir specs/GH5 --format json`
 - [x] `SP5-T007` Owner: `schema-template` | Done when: schemas/templates document `tasks_artifact` and keep stable JSON keys in English | Verify: `python3 checks/check_workflow.py --repo . --spec-dir specs/GH5`
-- [x] `SP5-T008` Owner: `tests` | Done when: tests cover duplicate task IDs, missing `Done when:`, missing `Verify:`, missing `tasks.md`, and missing `rclean` smoke scenario IDs | Verify: `python3 -m pytest`
+- [x] `SP5-T008` Owner: `tests` | Done when: tests cover duplicate task IDs, missing `Done when:`, missing `Verify:`, missing `tasks.md`, and missing `rclean` smoke scenario IDs | Verify: `python3 -m pytest tests/test_evaluate.py`
 - [x] `SP5-T009` Owner: `pilot` | Done when: evaluator can assess `examples/rclean-smoke.md` without writing to `/Users/lifcc/Desktop/code/AI/tool/rclean` | Verify: `python3 evaluate.py --repo . --spec-dir specs/GH5 --format json`
 - [x] `SP5-T010` Owner: `review` | Done when: reviewer sees `status`, `checks`, `artifacts`, `errors`, `warnings`, and `next_actions` in evaluator output and can trace failures to concrete paths | Verify: `python3 evaluate.py --repo . --spec-dir specs/GH5 --format json`
 

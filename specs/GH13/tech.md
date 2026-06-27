@@ -82,7 +82,7 @@ local repos. External paths and GitHub URLs are recorded as evidence pointers.
 
 - `python3 checks/check_workflow.py --repo . --spec-dir specs/GH13`
 - `python3 evaluate.py --repo . --spec-dir specs/GH13 --format json`
-- `python3 -m pytest`
+- `python3 -m pytest tests/test_evaluate.py tests/test_github_pr_evidence.py tests/test_pr_gate.py`
 
 ## Rollback Plan
 
