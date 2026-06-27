@@ -7,16 +7,19 @@ import argparse
 import json
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 CHECKS_DIR = Path(__file__).resolve().parent / "checks"
 sys.path.insert(0, str(CHECKS_DIR))
 
 from specrail_lib import (  # noqa: E402
+    PackConfig,
     SpecRailError,
+    artifact_templates,
     load_pack,
     read_text,
+    render_artifact_path,
     validate_action_policy,
     validate_labels,
     validate_state_graph,
@@ -82,22 +85,84 @@ def spec_issue_number(spec_dir: Path) -> str | None:
     return match.group(1) if match else None
 
 
+def template_dir(template: str, is_directory: bool) -> str:
+    cleaned = template.rstrip("/")
+    if is_directory:
+        return PurePosixPath(cleaned).as_posix()
+    return PurePosixPath(cleaned).parent.as_posix()
+
+
+def template_issue_regex(template: str) -> re.Pattern[str]:
+    pattern = re.escape(template.rstrip("/"))
+    pattern = pattern.replace(r"\{issue_number\}", r"(?P<issue_number>[0-9]+)")
+    pattern = pattern.replace(r"\{work_id\}", r"(?P<work_id>GH[0-9]+)")
+    return re.compile(f"^{pattern}$")
+
+
+def configured_artifact_path(
+    repo: Path,
+    spec_dir: Path,
+    config: PackConfig | None,
+    artifact: str,
+    fallback_name: str,
+    issue_number: str | None,
+) -> Path:
+    if config is not None and issue_number is not None:
+        rendered = render_artifact_path(config, artifact, int(issue_number))
+        if rendered:
+            return repo / rendered
+    return spec_dir / fallback_name
+
+
+def configured_issue_number(repo: Path, spec_dir: Path, config: PackConfig | None) -> str | None:
+    if config is None:
+        return spec_issue_number(spec_dir)
+    try:
+        relative_dir = spec_dir.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return None
+
+    templates = artifact_templates(config)
+    for artifact in ["spec_packet", "product_spec", "tech_spec", "task_plan"]:
+        template = templates.get(artifact)
+        if not template:
+            continue
+        match = template_issue_regex(
+            template_dir(template, artifact == "spec_packet")
+        ).fullmatch(relative_dir)
+        if match is None:
+            continue
+        issue_number = match.groupdict().get("issue_number")
+        if issue_number:
+            return issue_number
+        work_id = match.groupdict().get("work_id")
+        if work_id:
+            return work_id.removeprefix("GH")
+    return spec_issue_number(spec_dir)
+
+
 def issue_tokens(issue_number: str | None) -> list[str]:
     if not issue_number:
         return []
     return [f"GH-{issue_number}", f"GH{issue_number}", f"#{issue_number}"]
 
 
-def evaluate_spec(repo: Path, spec_dir: Path) -> tuple[list[dict[str, str]], list[str]]:
+def evaluate_spec(
+    repo: Path,
+    spec_dir: Path,
+    config: PackConfig | None = None,
+) -> tuple[list[dict[str, str]], list[str]]:
     checks: list[dict[str, str]] = []
     errors: list[str] = []
-    issue_number = spec_issue_number(spec_dir)
+    issue_number = configured_issue_number(repo, spec_dir, config)
 
-    for name, check_id in [
-        ("product.md", "spec.product_present"),
-        ("tech.md", "spec.tech_present"),
-    ]:
-        path = spec_dir / name
+    spec_files = [
+        ("product_spec", "product.md", "spec.product_present"),
+        ("tech_spec", "tech.md", "spec.tech_present"),
+    ]
+    for artifact, fallback_name, check_id in spec_files:
+        path = configured_artifact_path(repo, spec_dir, config, artifact, fallback_name, issue_number)
+        name = path.name
         rel = str(path.relative_to(repo))
         if path.is_file() and read_text(path).strip():
             checks.append(check("pass", check_id, rel, f"{name} exists and is non-empty"))
@@ -105,12 +170,12 @@ def evaluate_spec(repo: Path, spec_dir: Path) -> tuple[list[dict[str, str]], lis
             checks.append(check("fail", check_id, rel, f"{name} is missing or empty"))
             errors.append(f"{rel} is missing or empty")
 
-    task_path = spec_dir / "tasks.md"
+    task_path = configured_artifact_path(repo, spec_dir, config, "task_plan", "tasks.md", issue_number)
     task_rel = str(task_path.relative_to(repo))
     if task_path.is_file() and read_text(task_path).strip():
-        checks.append(check("pass", "spec.tasks_present", task_rel, "tasks.md exists and is non-empty"))
+        checks.append(check("pass", "spec.tasks_present", task_rel, f"{task_path.name} exists and is non-empty"))
     elif task_path.is_file():
-        checks.append(check("fail", "spec.tasks_present", task_rel, "tasks.md is empty"))
+        checks.append(check("fail", "spec.tasks_present", task_rel, f"{task_path.name} is empty"))
         errors.append(f"{task_rel} is empty")
     else:
         checks.append(
@@ -118,12 +183,12 @@ def evaluate_spec(repo: Path, spec_dir: Path) -> tuple[list[dict[str, str]], lis
                 "pass",
                 "spec.tasks_optional",
                 task_rel,
-                "tasks.md may be created later by the implement route",
+                f"{task_path.name} may be created later by the implement route",
             )
         )
 
-    for name in ["product.md", "tech.md"]:
-        path = spec_dir / name
+    for artifact, fallback_name, _check_id in spec_files:
+        path = configured_artifact_path(repo, spec_dir, config, artifact, fallback_name, issue_number)
         rel = str(path.relative_to(repo))
         if not path.is_file():
             continue
@@ -404,6 +469,7 @@ def evaluate(repo: Path, spec_dir: Path) -> dict[str, object]:
     checks: list[dict[str, str]] = []
     errors: list[str] = []
     warnings: list[str] = []
+    config: PackConfig | None = None
 
     try:
         config = load_pack(repo)
@@ -424,7 +490,7 @@ def evaluate(repo: Path, spec_dir: Path) -> dict[str, object]:
         checks.append(check("fail", "workflow.config_present", ".", str(exc)))
         errors.append(str(exc))
 
-    spec_checks, spec_errors = evaluate_spec(repo, spec_dir)
+    spec_checks, spec_errors = evaluate_spec(repo, spec_dir, config)
     checks.extend(spec_checks)
     errors.extend(spec_errors)
     smoke_checks, smoke_errors, smoke_warnings = evaluate_rclean_smoke(repo)
@@ -436,10 +502,23 @@ def evaluate(repo: Path, spec_dir: Path) -> dict[str, object]:
     errors.extend(adoption_errors)
     warnings.extend(adoption_warnings)
 
+    issue_number = configured_issue_number(repo, spec_dir, config)
     artifacts = {
-        "product_spec": str((spec_dir / "product.md").relative_to(repo)),
-        "tech_spec": str((spec_dir / "tech.md").relative_to(repo)),
-        "tasks_artifact": str((spec_dir / "tasks.md").relative_to(repo)),
+        "product_spec": str(
+            configured_artifact_path(
+                repo, spec_dir, config, "product_spec", "product.md", issue_number
+            ).relative_to(repo)
+        ),
+        "tech_spec": str(
+            configured_artifact_path(
+                repo, spec_dir, config, "tech_spec", "tech.md", issue_number
+            ).relative_to(repo)
+        ),
+        "tasks_artifact": str(
+            configured_artifact_path(
+                repo, spec_dir, config, "task_plan", "tasks.md", issue_number
+            ).relative_to(repo)
+        ),
         "smoke_example": "examples/rclean-smoke.md",
         "adoption_matrix": ADOPTION_MATRIX_DOC,
         "adoption_fixture": ADOPTION_MATRIX_FIXTURE,

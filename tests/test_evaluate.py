@@ -11,7 +11,7 @@ CHECKS = ROOT / "checks"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CHECKS))
 
-from check_workflow import validate_spec_packet, validate_task_plan  # noqa: E402
+from check_workflow import validate_spec_packet, validate_task_plan, validate_tokens  # noqa: E402
 from evaluate import (  # noqa: E402
     evaluate,
     evaluate_adoption_matrix,
@@ -31,6 +31,27 @@ def write_text(path: Path, text: str) -> None:
 def copy_workflow_config(target: Path) -> None:
     for name in ["workflow.yaml", "states.yaml", "labels.yaml"]:
         write_text(target / name, (ROOT / name).read_text(encoding="utf-8"))
+
+
+def configure_custom_spec_layout(target: Path) -> None:
+    workflow_path = target / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8")
+        .replace(
+            "specs/GH{issue_number}/product.md",
+            "docs/specs/{issue_number}/PRODUCT.md",
+        )
+        .replace(
+            "specs/GH{issue_number}/tech.md",
+            "docs/specs/{issue_number}/TECH.md",
+        )
+        .replace(
+            "specs/GH{issue_number}/tasks.md",
+            "docs/specs/{issue_number}/TASKS.md",
+        )
+        .replace("specs/GH{issue_number}/", "docs/specs/{issue_number}/"),
+        encoding="utf-8",
+    )
 
 
 def test_task_plan_rejects_duplicate_ids(tmp_path: Path) -> None:
@@ -125,24 +146,7 @@ def test_spec_packet_validates_tasks_md_when_present(tmp_path: Path) -> None:
 
 def test_spec_packet_honors_configured_layout(tmp_path: Path) -> None:
     copy_workflow_config(tmp_path)
-    workflow_path = tmp_path / "workflow.yaml"
-    workflow_path.write_text(
-        workflow_path.read_text(encoding="utf-8")
-        .replace(
-            "specs/GH{issue_number}/product.md",
-            "docs/specs/{issue_number}/PRODUCT.md",
-        )
-        .replace(
-            "specs/GH{issue_number}/tech.md",
-            "docs/specs/{issue_number}/TECH.md",
-        )
-        .replace(
-            "specs/GH{issue_number}/tasks.md",
-            "docs/specs/{issue_number}/TASKS.md",
-        )
-        .replace("specs/GH{issue_number}/", "docs/specs/{issue_number}/"),
-        encoding="utf-8",
-    )
+    configure_custom_spec_layout(tmp_path)
     spec_dir = tmp_path / "docs" / "specs" / "5"
     write_text(spec_dir / "PRODUCT.md", "GitHub issue: `#5`\n")
     write_text(spec_dir / "TECH.md", "GitHub issue: `#5`\n")
@@ -150,6 +154,23 @@ def test_spec_packet_honors_configured_layout(tmp_path: Path) -> None:
     errors = validate_spec_packet(spec_dir, load_pack(tmp_path))
 
     assert errors == []
+
+
+def test_workflow_token_check_allows_configured_default_mode(tmp_path: Path) -> None:
+    write_text(
+        tmp_path / "workflow.yaml",
+        "\n".join(
+            [
+                "automation_policy:",
+                "  default_mode: required",
+                "  forbidden_agent_actions: []",
+                "required_human_gates: []",
+                "action_policy: {}",
+            ]
+        ),
+    )
+
+    assert validate_tokens(tmp_path) == []
 
 
 def test_evaluate_spec_allows_missing_tasks_md(tmp_path: Path) -> None:
@@ -162,6 +183,30 @@ def test_evaluate_spec_allows_missing_tasks_md(tmp_path: Path) -> None:
     assert errors == []
     assert any(item["id"] == "spec.tasks_optional" and item["status"] == "pass" for item in checks)
     assert not any(item["id"] == "spec.tasks_present" and item["status"] == "fail" for item in checks)
+
+
+def test_evaluate_spec_honors_configured_layout(tmp_path: Path) -> None:
+    copy_workflow_config(tmp_path)
+    configure_custom_spec_layout(tmp_path)
+    spec_dir = tmp_path / "docs" / "specs" / "5"
+    write_text(spec_dir / "PRODUCT.md", "GitHub issue: `#5`\n")
+    write_text(spec_dir / "TECH.md", "GitHub issue: `#5`\n")
+
+    checks, errors = evaluate_spec(tmp_path, spec_dir, load_pack(tmp_path))
+
+    assert errors == []
+    assert any(
+        item["id"] == "spec.product_present"
+        and item["path"] == "docs/specs/5/PRODUCT.md"
+        and item["status"] == "pass"
+        for item in checks
+    )
+    assert any(
+        item["id"] == "spec.tasks_optional"
+        and item["path"] == "docs/specs/5/TASKS.md"
+        and item["status"] == "pass"
+        for item in checks
+    )
 
 
 def test_rclean_smoke_requires_all_scenarios(tmp_path: Path) -> None:

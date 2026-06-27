@@ -58,7 +58,7 @@ REQUIRED_FILES = [
 
 REQUIRED_TOKENS = {
     "workflow.yaml": [
-        "default_mode: dry_run",
+        "default_mode:",
         "forbidden_agent_actions:",
         "required_human_gates:",
         "action_policy:",
