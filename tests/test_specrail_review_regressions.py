@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -182,3 +183,22 @@ def test_route_gate_validates_automation_policy_before_mode_override(tmp_path: P
     payload = json.loads(result.stdout)
     assert payload["decision"] == "blocked"
     assert any("automation_policy.default_mode must be one of" in reason for reason in payload["reasons"])
+
+
+def test_workflow_check_runs_specrail_regression_tests() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "workflow-check.yml").read_text(encoding="utf-8")
+
+    assert "tests/test_specrail_review_regressions.py" in workflow
+
+
+def test_spec_packet_schema_allows_configured_markdown_paths() -> None:
+    schema = json.loads((ROOT / "schemas" / "spec_packet.schema.json").read_text(encoding="utf-8"))
+    product_pattern = re.compile(schema["properties"]["product_spec"]["pattern"])
+    tech_pattern = re.compile(schema["properties"]["tech_spec"]["pattern"])
+    task_pattern = re.compile(schema["properties"]["task_plan"]["pattern"])
+
+    assert product_pattern.search("docs/specs/5/PRODUCT.md")
+    assert tech_pattern.search("docs/specs/5/TECH.md")
+    assert task_pattern.search("docs/specs/5/TASKS.md")
+    assert not product_pattern.search("/tmp/product.md")
+    assert not tech_pattern.search("../TECH.md")

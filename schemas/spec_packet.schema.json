@@ -12,15 +12,15 @@
     },
     "product_spec": {
       "type": "string",
-      "pattern": "^specs/GH[0-9]+/product\\.md$"
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+\\.md$"
     },
     "tech_spec": {
       "type": "string",
-      "pattern": "^specs/GH[0-9]+/tech\\.md$"
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+\\.md$"
     },
     "task_plan": {
       "type": ["string", "null"],
-      "pattern": "^specs/GH[0-9]+/tasks\\.md$"
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+\\.md$"
     },
     "acceptance_criteria": {
       "type": "array",
