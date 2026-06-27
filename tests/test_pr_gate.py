@@ -572,6 +572,93 @@ def test_route_gate_blocks_unknown_required_artifact(tmp_path: Path) -> None:
     )
 
 
+def test_route_gate_blocks_non_list_human_gates(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "      human_gates:\n        - final_pr_review\n",
+            "      human_gates: final_pr_review\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "review_pr",
+            "--issue",
+            "9",
+            "--pr",
+            "123",
+            "--state",
+            "impl_pr_open",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert "workflow.yaml: action review_pr human_gates must be a list" in payload["reasons"]
+
+
+def test_route_gate_blocks_unknown_human_gate(tmp_path: Path) -> None:
+    copy_workflow_pack(tmp_path)
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "        - final_pr_review\n",
+            "        - manager_approval\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "checks/route_gate.py",
+            "--repo",
+            str(tmp_path),
+            "--route",
+            "review_pr",
+            "--issue",
+            "9",
+            "--pr",
+            "123",
+            "--state",
+            "impl_pr_open",
+            "--mode",
+            "required",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "blocked"
+    assert (
+        "workflow.yaml: action review_pr references unknown human gate manager_approval"
+        in payload["reasons"]
+    )
+
+
 def test_route_gate_renders_fix_ci_verification_artifact_path() -> None:
     result = subprocess.run(
         [

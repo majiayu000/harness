@@ -315,6 +315,12 @@ def validate_action_policy(config: PackConfig) -> list[str]:
     errors: list[str] = []
     states = set(state_map(config))
     artifacts = set(artifact_templates(config)) | {"linked_issue", "linked_pr"}
+    configured_human_gates: set[str] = set()
+    raw_human_gates = config.workflow.get("required_human_gates", [])
+    if not isinstance(raw_human_gates, list):
+        errors.append("workflow.yaml: required_human_gates must be a list")
+    else:
+        configured_human_gates = {str(gate) for gate in raw_human_gates}
     actions = action_policy(config)
     for route in ["triage_issue", "write_spec", "implement", "review_pr", "fix_ci", "draft_release_note"]:
         if route not in actions:
@@ -341,6 +347,16 @@ def validate_action_policy(config: PackConfig) -> list[str]:
                     errors.append(
                         f"workflow.yaml: action {route} references unknown artifact {artifact_name}"
                     )
+        human_gates = body.get("human_gates", [])
+        if not isinstance(human_gates, list):
+            errors.append(f"workflow.yaml: action {route} human_gates must be a list")
+            continue
+        for gate in human_gates:
+            gate_name = str(gate)
+            if gate_name not in configured_human_gates:
+                errors.append(
+                    f"workflow.yaml: action {route} references unknown human gate {gate_name}"
+                )
     return errors
 
 
