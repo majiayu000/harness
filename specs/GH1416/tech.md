@@ -17,7 +17,7 @@ See `specs/GH1416/product.md`.
 ## Proposed Design
 
 1. Add `allow_unauthenticated: bool` (default `false`) to the server HTTP config alongside `api_token`.
-2. Move the decision to startup, not per-request: during server construction (config validation in `http/mod.rs` startup path), evaluate:
+2. Move the decision to startup, not per-request: during application state initialization in `crates/harness-server/src/http/init.rs` (`build_app_state`) or earlier `ServerConfig` loading in `harness-core`, evaluate:
    - token present (non-empty after trim) -> `AuthMode::Enforced`
    - no token + `allow_unauthenticated = true` -> `AuthMode::Open` + `warn!` (single prominent startup log)
    - no token + no opt-in -> return a startup error (server refuses to bind) with the actionable message.
@@ -28,7 +28,7 @@ See `specs/GH1416/product.md`.
 ## Data Flow
 
 - Inputs: server config file + `HARNESS_API_TOKEN` env at startup.
-- Outputs: resolved `AuthMode` stored in `AppState`/router layer state; startup log line stating the mode; startup error on misconfiguration.
+- Outputs: resolved `AuthMode` stored in `AppState`/router layer state during initialization; startup log line stating the mode; startup error on misconfiguration.
 - No persistence changes, no external calls.
 
 ## Alternatives Considered

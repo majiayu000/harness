@@ -46,4 +46,4 @@ Two long-horizon operational gaps compound each other:
 
 ## Rollout Notes
 
-Off-by-default sweeper flags mean zero behavior change on upgrade. Recommended enable order: watchdog first (read-only reporting), retention second once the stuck list is clean. Postgres and SQLite must both be covered or the limitation stated explicitly in config docs.
+Off-by-default sweeper flags mean zero behavior change on upgrade. Recommended enable order: watchdog first (read-only reporting), retention second once the stuck list is clean. The workflow runtime store is Postgres-only, so config docs must state that these sweepers operate on the Postgres runtime store.

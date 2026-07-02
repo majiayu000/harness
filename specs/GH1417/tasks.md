@@ -6,7 +6,7 @@ Tech spec: `specs/GH1417/tech.md`
 
 ## Status
 
-- [ ] `SP1417-T001` Owner: `storage` | Done when: a forward-only migration adds the `(state, updated_at)` index needed by the aged-instance query, on both Postgres and SQLite paths | Verify: `cargo test --package harness-workflow`
+- [ ] `SP1417-T001` Owner: `storage` | Done when: a forward-only migration adds the `(state, updated_at)` index needed by the aged-instance query on the Postgres workflow runtime store | Verify: `cargo test --package harness-workflow`
 - [ ] `SP1417-T002` Owner: `storage` | Done when: `list_aged_wait_instances(states, older_than, limit)` returns only non-terminal wait-state instances older than the threshold, with boundary tests | Verify: `cargo test --package harness-workflow`
 - [ ] `SP1417-T003` Owner: `server-sweeper` | Done when: a watchdog sweeper module is spawned from server startup, logs aged `blocked`/`awaiting_feedback` instances at error level with id, definition, state, age, and bound repo/issue, and is config-gated off by default | Verify: `cargo test --package harness-server`
 - [ ] `SP1417-T004` Owner: `operator-api` | Done when: the operator-monitor payload includes a `stuck_workflows` section fed by the watchdog snapshot and the web `operator_snapshot` types render it in the cockpit | Verify: `cargo test --package harness-server && (cd web && bun run test)`

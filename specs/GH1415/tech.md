@@ -28,7 +28,7 @@ Phase 1 — verify-on-completion (mode `agent`, new default behavior):
 
 Phase 2 — server-executed merge (mode `server`, opt-in):
 
-1. Add `merge_pull_request` to a small REST client module next to `github_pr_snapshot.rs` (e.g. `github_pr_merge.rs`): `PUT https://api.github.com/repos/{owner}/{repo}/pulls/{number}/merge` with `merge_method` resolved from repository settings (squash for this project), using the same reqwest client pattern and `resolve_github_token`.
+1. Add `merge_pull_request` to a small REST client module next to `github_pr_snapshot.rs` (e.g. `github_pr_merge.rs`): `PUT https://api.github.com/repos/{owner}/{repo}/pulls/{number}/merge` with `merge_method` resolved from repository settings (squash for this project), reusing a shared `reqwest::Client` from `AppState` or a shared GitHub client manager plus `resolve_github_token`.
 2. In the dispatcher, when mode is `server`, route the `merge_pr` command to a builtin lifecycle activity (same mechanism as `mark_bound_issue_done`) instead of an agent prompt packet. The builtin: optional freshness re-check of the gate snapshot -> merge call -> confirmation read via `fetch_github_pr_snapshot` -> structured activity result.
 3. "Already merged" (HTTP 405/409 with merged state, or snapshot shows merged) is success. Other 4xx/5xx map to the existing retryable/non-retryable error classification (`reducer/runtime_failure.rs`).
 
@@ -52,7 +52,7 @@ Config: `merge_execution: "agent" | "server"` under the existing auto-merge/inta
 - Security: server mode requires a token with `contents: write` / merge permission; documented, and mode is opt-in. Verify-only mode needs no new permissions.
 - Compatibility: agents that previously "completed" merges dishonestly will now fail validation; this is the intended behavior change and is confined to the merge activity.
 - Performance: one extra GraphQL read per merge completion; negligible against agent runtime.
-- Maintenance: one new small REST module; reuses existing token, client, and error-classification machinery.
+- Maintenance: one new small REST module; reuses existing token, shared HTTP client, and error-classification machinery.
 
 ## Test Plan
 

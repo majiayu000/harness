@@ -30,7 +30,7 @@ Watchdog sweeper (`spawn_workflow_watchdog` in harness-server, following the orp
 
 Retention sweeper (`spawn_runtime_retention`):
 
-1. New store mutation `prune_terminal_runtime_history(terminal_before, batch_limit)` deleting from `runtime_jobs`, `runtime_events`, `workflow_events` for instances whose terminal transition is older than the window — guarded by a family check (parent and all children terminal) implemented as a single SQL predicate over the parent/child linkage.
+1. New store mutation `prune_terminal_runtime_history(terminal_before, batch_limit)` deleting eligible rows from `workflow_instances` whose terminal transition is older than the window. Migration 14 already defines `ON DELETE CASCADE` from `workflow_instances` to dependent runtime/workflow tables, so one parent delete prunes associated events, decisions, commands, jobs, runtime events, and artifacts. The mutation is guarded by a family check (parent and all children terminal) implemented as a single SQL predicate over the parent/child linkage.
 2. Batched deletes (`LIMIT` per tick) inside one transaction per batch; returns deleted counts which the sweeper logs per tick.
 3. Config validation: `retention_days` must be >= reconciliation/summary lookback windows or startup emits a warning naming both values.
 
@@ -40,12 +40,12 @@ Config (new `[runtime.sweepers]` section or alongside existing storage config): 
 
 - Inputs: workflow instance/event/job tables; config thresholds.
 - Outputs: error-level logs, operator-monitor JSON section, decision records (recovery hook only), batched DELETEs.
-- External calls: none. Both Postgres and SQLite paths must implement the queries (same sqlx surface as existing store code).
+- External calls: none. The workflow runtime store is Postgres-only, so the Postgres path implements the queries through the same sqlx surface as existing runtime store code.
 
 ## Alternatives Considered
 
 - Extend `periodic_retry.rs` to also cover workflow instances: rejected — that module is legacy-task-scoped and already 2.4k+ lines-adjacent territory; runtime concerns belong in runtime-owned sweepers.
-- Event-table partitioning (Postgres native partitions) instead of delete-based retention: better at very large scale but heavier migration and no SQLite story; revisit if delete batches prove insufficient.
+- Event-table partitioning (Postgres native partitions) instead of delete-based retention: better at very large scale but heavier migration; revisit if delete batches prove insufficient.
 - Watchdog auto-transitions stuck instances (e.g. force `blocked -> failed`): rejected — mutating state outside the validator/decision path breaks the event-sourced audit trail; the decision-routed recovery hook is the only mutation channel.
 
 ## Risks
@@ -58,7 +58,7 @@ Config (new `[runtime.sweepers]` section or alongside existing storage config): 
 ## Test Plan
 
 - [ ] Unit tests: aged-instance query boundary conditions (threshold, terminal exclusion); family-terminal predicate (active child blocks pruning); batch-limit behavior.
-- [ ] Integration tests: watchdog tick surfaces a seeded aged `blocked` instance into the operator snapshot and error log; retention tick prunes a terminal family and leaves an active one intact (both Postgres via test harness and SQLite).
+- [ ] Integration tests: watchdog tick surfaces a seeded aged `blocked` instance into the operator snapshot and error log; retention tick prunes a terminal family and leaves an active one intact on the Postgres workflow runtime store.
 - [ ] Manual verification: enable both sweepers on a dev deployment seeded with aged instances; capture row counts before/after and the operator-monitor payload.
 
 ## Rollback Plan
