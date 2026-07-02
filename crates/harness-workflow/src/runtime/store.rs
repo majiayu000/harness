@@ -66,6 +66,28 @@ pub struct WorkflowRuntimeStateCount {
     pub state: String,
     pub count: usize,
 }
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RuntimeHistoryPruneSummary {
+    pub workflow_instances_deleted: usize,
+    pub workflow_events_deleted: usize,
+    pub workflow_decisions_deleted: usize,
+    pub workflow_commands_deleted: usize,
+    pub runtime_jobs_deleted: usize,
+    pub runtime_events_deleted: usize,
+    pub workflow_artifacts_deleted: usize,
+}
+
+impl RuntimeHistoryPruneSummary {
+    pub fn is_empty(&self) -> bool {
+        self.workflow_instances_deleted == 0
+            && self.workflow_events_deleted == 0
+            && self.workflow_decisions_deleted == 0
+            && self.workflow_commands_deleted == 0
+            && self.runtime_jobs_deleted == 0
+            && self.runtime_events_deleted == 0
+            && self.workflow_artifacts_deleted == 0
+    }
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeJobCompactRecord {
     pub id: String,

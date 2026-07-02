@@ -386,4 +386,10 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_remote_fact_snapshots_fact_hash
           ON remote_fact_snapshots (fact_hash)",
     },
+    Migration {
+        version: 16,
+        description: "index aged workflow wait-state scans",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_state_updated_at
+              ON workflow_instances (state, updated_at)",
+    },
 ];

@@ -262,6 +262,34 @@ pub struct WorkflowStoragePolicy {
     /// Interval, in seconds, between background orphan-schema reap passes.
     #[serde(default = "default_orphan_reaper_interval_secs")]
     pub orphan_reaper_interval_secs: u64,
+    /// Enable workflow-runtime stuck-instance reporting. Off by default so
+    /// existing deployments keep their current background behavior on upgrade.
+    #[serde(default)]
+    pub workflow_watchdog_enabled: bool,
+    /// Minimum age, in minutes, before blocked/awaiting-feedback workflows are
+    /// reported as stuck.
+    #[serde(default = "default_workflow_watchdog_age_minutes")]
+    pub workflow_watchdog_age_minutes: u64,
+    /// Interval, in seconds, between workflow watchdog scans.
+    #[serde(default = "default_workflow_watchdog_interval_secs")]
+    pub workflow_watchdog_interval_secs: u64,
+    /// Maximum stuck workflow rows scanned/logged per watchdog tick.
+    #[serde(default = "default_workflow_watchdog_batch_size")]
+    pub workflow_watchdog_batch_size: u32,
+    /// Enable pruning of terminal workflow-runtime history. Off by default
+    /// because deleted runtime history is not recoverable.
+    #[serde(default)]
+    pub runtime_retention_enabled: bool,
+    /// Terminal workflow families older than this many days are eligible for
+    /// retention pruning.
+    #[serde(default = "default_runtime_retention_days")]
+    pub runtime_retention_days: u64,
+    /// Maximum terminal root families pruned per retention tick.
+    #[serde(default = "default_runtime_retention_batch_size")]
+    pub runtime_retention_batch_size: u32,
+    /// Interval, in seconds, between retention prune passes.
+    #[serde(default = "default_runtime_retention_interval_secs")]
+    pub runtime_retention_interval_secs: u64,
 }
 
 impl Default for IssueWorkflowPolicy {
@@ -378,6 +406,14 @@ impl Default for WorkflowStoragePolicy {
             schema_namespace: default_workflow_schema_namespace(),
             orphan_reaper_enabled: true,
             orphan_reaper_interval_secs: default_orphan_reaper_interval_secs(),
+            workflow_watchdog_enabled: false,
+            workflow_watchdog_age_minutes: default_workflow_watchdog_age_minutes(),
+            workflow_watchdog_interval_secs: default_workflow_watchdog_interval_secs(),
+            workflow_watchdog_batch_size: default_workflow_watchdog_batch_size(),
+            runtime_retention_enabled: false,
+            runtime_retention_days: default_runtime_retention_days(),
+            runtime_retention_batch_size: default_runtime_retention_batch_size(),
+            runtime_retention_interval_secs: default_runtime_retention_interval_secs(),
         }
     }
 }
@@ -524,6 +560,30 @@ fn default_workflow_schema_namespace() -> String {
 
 fn default_orphan_reaper_interval_secs() -> u64 {
     3600
+}
+
+fn default_workflow_watchdog_age_minutes() -> u64 {
+    240
+}
+
+fn default_workflow_watchdog_interval_secs() -> u64 {
+    300
+}
+
+fn default_workflow_watchdog_batch_size() -> u32 {
+    100
+}
+
+fn default_runtime_retention_days() -> u64 {
+    30
+}
+
+fn default_runtime_retention_batch_size() -> u32 {
+    1_000
+}
+
+fn default_runtime_retention_interval_secs() -> u64 {
+    3_600
 }
 
 fn default_true() -> bool {

@@ -61,6 +61,14 @@ runtime_retry_policy:
   activity_retries: {}
 storage:
   schema_namespace: workflow
+  workflow_watchdog_enabled: false
+  workflow_watchdog_age_minutes: 240
+  workflow_watchdog_interval_secs: 300
+  workflow_watchdog_batch_size: 100
+  runtime_retention_enabled: false
+  runtime_retention_days: 30
+  runtime_retention_batch_size: 1000
+  runtime_retention_interval_secs: 3600
 activities:
   implement_issue:
     prompt: default

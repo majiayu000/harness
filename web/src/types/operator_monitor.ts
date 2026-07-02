@@ -4,6 +4,7 @@ export interface OperatorMonitorPayload {
   health: OperatorHealth;
   activity: OperatorActivity;
   operator_actions: OperatorAction[];
+  stuck_workflows: StuckWorkflow[];
   failures: FailureGroup[];
   worktrees: OperatorWorktreeSummary;
 }
@@ -22,6 +23,7 @@ export interface OperatorActivity {
   runtime_workflows: RuntimeWorkflowCounts;
   legacy_queue: LegacyQueueCounts;
   by_source: SourceActivity[];
+  token_dispatch_by_repo: GitHubTokenDispatchCounter[];
 }
 
 export interface RuntimeWorkflowCounts {
@@ -67,6 +69,30 @@ export interface OperatorAction {
   evidence_url: string | null;
   next_action: string;
   source: string;
+}
+
+export interface StuckWorkflow {
+  workflow_id: string;
+  definition_id: string;
+  state: string;
+  repo: string | null;
+  issue: number | null;
+  pr: number | null;
+  age_secs: number;
+  updated_at: string;
+  url: string | null;
+  source: string;
+}
+
+export interface GitHubTokenDispatchCounter {
+  repo: string;
+  server_github_poll_count: number;
+  agent_implement_issue_count: number;
+  agent_address_feedback_count: number;
+  agent_merge_pr_count: number;
+  agent_dependency_analysis_count: number;
+  agent_skipped_covered_issue_count: number;
+  agent_skipped_same_fact_hash_count: number;
 }
 
 export interface FailureGroup {

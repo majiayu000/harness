@@ -380,6 +380,70 @@ async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> an
 }
 
 #[tokio::test]
+async fn endpoint_includes_config_enabled_stuck_workflows() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-stuck-workflow-")?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        "---\nstorage:\n  workflow_watchdog_enabled: true\n  workflow_watchdog_age_minutes: 60\n---\nBody\n",
+    )?;
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    let workflow_runtime_store = Arc::new(
+        WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+            Some(&test_helpers::test_database_url()?),
+        )
+        .await?,
+    );
+    workflow_runtime_store
+        .upsert_instance(
+            &workflow(
+                "awaiting_feedback",
+                json!({
+                    "source": "github",
+                    "repo": "owner/repo",
+                    "issue_number": 44,
+                    "pr_number": 45,
+                    "pr_url": "https://github.com/owner/repo/pull/45",
+                }),
+            )
+            .with_id("stuck-awaiting-feedback".to_string()),
+        )
+        .await?;
+    sqlx::query(
+        "UPDATE workflow_instances SET updated_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+    )
+    .bind("stuck-awaiting-feedback")
+    .execute(workflow_runtime_store.pool())
+    .await?;
+    state.core.workflow_runtime_store = Some(workflow_runtime_store);
+
+    let app = Router::new()
+        .route("/api/operator-monitor", get(operator_monitor))
+        .with_state(Arc::new(state));
+
+    let req = axum::http::Request::builder()
+        .uri("/api/operator-monitor")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    let stuck = body["stuck_workflows"]
+        .as_array()
+        .expect("stuck_workflows should be an array");
+
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(stuck[0]["workflow_id"], "stuck-awaiting-feedback");
+    assert_eq!(stuck[0]["state"], "awaiting_feedback");
+    assert_eq!(stuck[0]["repo"], "owner/repo");
+    assert_eq!(stuck[0]["issue"], 44);
+    assert_eq!(stuck[0]["pr"], 45);
+    Ok(())
+}
+
+#[tokio::test]
 async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-recent-failed-")?;

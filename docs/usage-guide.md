@@ -486,7 +486,7 @@ If no new commits have landed since the last review, the cycle is skipped.
 
 ## Scheduled Background Systems
 
-Harness runs four background schedulers automatically when the server starts:
+Harness runs several background schedulers automatically when the server starts:
 
 ### 1. Periodic Review (`[review]`)
 
@@ -513,6 +513,33 @@ Every 24 hours, runs `RuleEngine::scan()` on the project root:
 - Persists violations as `rule_check` events
 - Generates a health report with quality grade and violation summary
 - Logged as `scheduler: periodic health report`
+
+### Workflow Runtime Sweepers
+
+Workflow-runtime watchdog and retention sweepers are configured in
+`WORKFLOW.md` under `storage`. Both are disabled by default on first rollout:
+
+```yaml
+storage:
+  workflow_watchdog_enabled: false
+  workflow_watchdog_age_minutes: 240
+  workflow_watchdog_interval_secs: 300
+  workflow_watchdog_batch_size: 100
+  runtime_retention_enabled: false
+  runtime_retention_days: 30
+  runtime_retention_batch_size: 1000
+  runtime_retention_interval_secs: 3600
+```
+
+Enable `workflow_watchdog_enabled` first. It is read-only: aged `blocked` and
+`awaiting_feedback` workflow instances appear in `/api/operator-monitor` under
+`stuck_workflows` and are logged at error level.
+
+Enable `runtime_retention_enabled` only after the stuck list is clean. Retention
+deletes terminal workflow families older than `runtime_retention_days` in
+bounded batches and relies on the Postgres runtime-store cascade constraints to
+remove events, decisions, commands, jobs, runtime events, and artifacts. Active
+workflow families are never pruned.
 
 ### 3. GC Runner (always on)
 

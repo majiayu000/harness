@@ -489,6 +489,134 @@ async fn nonterminal_listing_uses_definition_specific_terminal_states() -> anyho
     Ok(())
 }
 
+#[tokio::test]
+async fn aged_wait_listing_filters_by_age_and_terminal_state() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let old_blocked = project_issue_instance("/project-a", 301, "blocked");
+    let old_feedback = project_issue_instance("/project-a", 302, "awaiting_feedback");
+    let fresh_blocked = project_issue_instance("/project-a", 303, "blocked");
+    let old_done = project_issue_instance("/project-a", 304, "done");
+    for instance in [&old_blocked, &old_feedback, &fresh_blocked, &old_done] {
+        store.upsert_instance(instance).await?;
+    }
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = ANY($1::text[])")
+        .bind(vec![
+            old_blocked.id.clone(),
+            old_feedback.id.clone(),
+            old_done.id.clone(),
+        ])
+        .bind(Utc::now() - Duration::hours(2))
+        .execute(store.pool())
+        .await?;
+
+    let ids: std::collections::HashSet<_> = store
+        .list_aged_wait_instances(
+            &["blocked", "awaiting_feedback", "done"],
+            Utc::now() - Duration::hours(1),
+            10,
+        )
+        .await?
+        .into_iter()
+        .map(|instance| instance.id)
+        .collect();
+
+    assert!(ids.contains(&old_blocked.id));
+    assert!(ids.contains(&old_feedback.id));
+    assert!(!ids.contains(&fresh_blocked.id));
+    assert!(!ids.contains(&old_done.id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let terminal_parent = project_issue_instance("/project-a", 401, "done");
+    let terminal_child = quality_gate_instance("passed")
+        .with_id("terminal-family-child")
+        .with_parent(&terminal_parent.id);
+    let active_parent = project_issue_instance("/project-a", 402, "done");
+    let active_child = quality_gate_instance("checking")
+        .with_id("active-family-child")
+        .with_parent(&active_parent.id);
+    for instance in [
+        &terminal_parent,
+        &terminal_child,
+        &active_parent,
+        &active_child,
+    ] {
+        store.upsert_instance(instance).await?;
+    }
+    store
+        .append_event(&terminal_parent.id, "TerminalEvent", "test", json!({}))
+        .await?;
+    store
+        .append_event(&active_parent.id, "ActiveFamilyEvent", "test", json!({}))
+        .await?;
+    let command = WorkflowCommand::enqueue_activity("quality_gate", "terminal-family-command");
+    let command_id = store
+        .enqueue_command(&terminal_parent.id, None, &command)
+        .await?;
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "quality_gate" }),
+        )
+        .await?;
+    store
+        .record_runtime_event(&runtime_job.id, "RuntimePromptPrepared", json!({}))
+        .await?;
+    sqlx::query(
+        "INSERT INTO workflow_artifacts (id, workflow_id, runtime_job_id, artifact_type, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind("terminal-family-artifact")
+    .bind(&terminal_parent.id)
+    .bind(&runtime_job.id)
+    .bind("test")
+    .bind("{}")
+    .execute(store.pool())
+    .await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = ANY($1::text[])")
+        .bind(vec![
+            terminal_parent.id.clone(),
+            terminal_child.id.clone(),
+            active_parent.id.clone(),
+            active_child.id.clone(),
+        ])
+        .bind(Utc::now() - Duration::days(45))
+        .execute(store.pool())
+        .await?;
+
+    let summary = store
+        .prune_terminal_runtime_history(Utc::now() - Duration::days(30), 100)
+        .await?;
+
+    assert_eq!(summary.workflow_instances_deleted, 2);
+    assert_eq!(summary.workflow_events_deleted, 1);
+    assert_eq!(summary.workflow_commands_deleted, 1);
+    assert_eq!(summary.runtime_jobs_deleted, 1);
+    assert_eq!(summary.runtime_events_deleted, 1);
+    assert_eq!(summary.workflow_artifacts_deleted, 1);
+    assert!(store.get_instance(&terminal_parent.id).await?.is_none());
+    assert!(store.get_instance(&terminal_child.id).await?.is_none());
+    assert!(store.get_instance(&active_parent.id).await?.is_some());
+    assert!(store.get_instance(&active_child.id).await?.is_some());
+    assert_eq!(store.events_for(&active_parent.id).await?.len(), 1);
+    Ok(())
+}
+
 fn runtime_job_status_str(status: RuntimeJobStatus) -> anyhow::Result<String> {
     let value = serde_json::to_value(status)?;
     value
