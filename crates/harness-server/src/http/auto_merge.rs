@@ -55,6 +55,14 @@ pub(crate) fn prepare_auto_merge_workflow_from_snapshot(
         "merge_require_clean_merge_state".to_string(),
         serde_json::json!(policy.require_clean_merge_state),
     );
+    data.insert(
+        "merge_execution".to_string(),
+        serde_json::json!(policy.merge_execution.to_string()),
+    );
+    data.insert(
+        "verify_merge_completion".to_string(),
+        serde_json::json!(policy.verify_merge_completion),
+    );
     if let Some(expected_base_ref) = expected_base_ref {
         data.insert(
             "expected_base_ref".to_string(),

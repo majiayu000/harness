@@ -548,7 +548,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 "pull_request": {
                     "required": true,
                     "fields": ["pr_number", "pr_url", "state", "merged", "merge_commit_sha", "head_sha"],
-                    "success_requires": "state=merged or merged=true after re-reading GitHub immediately after merge"
+                    "success_requires": "state=merged or merged=true after re-reading GitHub immediately after merge; Harness server independently verifies this before accepting completion when verify_merge_completion is enabled"
                 }
             }
         }),
