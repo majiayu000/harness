@@ -305,7 +305,7 @@ fn stuck_workflows_from_instances(
             }
         })
         .collect::<Vec<_>>();
-    stuck.sort_by(|a, b| b.age_secs.cmp(&a.age_secs));
+    stuck.sort_by_key(|workflow| std::cmp::Reverse(workflow.age_secs));
     stuck
 }
 
