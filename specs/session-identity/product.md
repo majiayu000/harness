@@ -42,7 +42,7 @@ Today the same agent run has a different identity in every tool: a harness task/
 - Two concurrent runs never share or overwrite each other's binding lines.
 - Reading tools tolerate a registry containing malformed lines (skip and continue).
 
-## Open Questions
+## Decisions
 
-- Should keepline also act as a minter when it *recovers* a session (new run id vs inheriting the lost run's id)? Leaning: recovery inherits, with a `recovered_from` marker.
-- Registry rotation policy: size-based cap vs age-based pruning.
+- keepline recovery **inherits** the lost run's id and records a `recovered_from` marker. A recovered session continues the same unit of work; the identity chain must not break at exactly the moment it is most useful.
+- Registry rotation is size-based (10 MB cap, one rotated file kept), as specified in the tech spec. Age-based pruning adds a clock dependency for no added value at this write volume.
