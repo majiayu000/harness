@@ -31,6 +31,7 @@ decision = "forbidden"
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
     config.server.project_root = project_root;
+    config.server.allow_unauthenticated = true;
     config.rules.exec_policy_paths = vec![policy_path];
     config.rules.requirements_path = Some(requirements_path);
     let server = Arc::new(HarnessServer::new(

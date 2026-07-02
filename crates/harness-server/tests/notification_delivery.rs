@@ -113,6 +113,7 @@ async fn make_state(root: &std::path::Path) -> anyhow::Result<harness_server::ht
     let mut config = HarnessConfig::default();
     config.server.data_dir = root.join("server-data");
     config.server.project_root = project_root;
+    config.server.allow_unauthenticated = true;
 
     let server = Arc::new(HarnessServer::new(
         config,
@@ -132,6 +133,7 @@ async fn make_state_with_mock(
     let mut config = HarnessConfig::default();
     config.server.data_dir = root.join("server-data");
     config.server.project_root = project_root;
+    config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock".to_string();
 
     let mut registry = AgentRegistry::new("mock");

@@ -77,11 +77,13 @@ fn resolve_api_token(config: &HarnessConfig) -> Option<String> {
         .server
         .api_token
         .as_deref()
+        .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
         .or_else(|| {
             std::env::var("HARNESS_API_TOKEN")
                 .ok()
+                .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty())
         })
 }

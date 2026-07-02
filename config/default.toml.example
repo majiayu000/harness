@@ -15,6 +15,10 @@
 transport = "http"
 http_addr = "127.0.0.1:9800"
 database_url = "postgres://harness:harness@localhost:5432/harness"
+# Set this or HARNESS_API_TOKEN before exposing HTTP routes. Server startup
+# fails closed without a token unless allow_unauthenticated is explicitly true.
+# api_token = "change-me"
+# allow_unauthenticated = true
 # Harness opens separate Postgres pools per logical store. The default is
 # intentionally conservative; local Postgres can usually use a higher budget.
 # database_pool_max_connections = 16

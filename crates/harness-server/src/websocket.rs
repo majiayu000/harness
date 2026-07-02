@@ -95,7 +95,15 @@ pub async fn ws_handler(
     // Layer 2: Bearer token auth for all clients when a token is configured.
     // Origin headers can be forged by non-browser tools, so they do not exempt
     // a client from token authentication.
-    if let Some(expected) = crate::http::auth::resolve_api_token(&state.core.server.config.server) {
+    let auth_mode = match crate::http::auth::resolve_api_auth_mode(&state.core.server.config.server)
+    {
+        Ok(mode) => mode,
+        Err(error) => {
+            tracing::error!("WebSocket auth misconfigured after startup: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if let Some(expected) = auth_mode.expected_token() {
         let authorized = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -264,8 +272,9 @@ mod tests {
 
     async fn make_test_state_with_config(
         dir: &std::path::Path,
-        config: HarnessConfig,
+        mut config: HarnessConfig,
     ) -> anyhow::Result<AppState> {
+        config.server.allow_unauthenticated = true;
         let db_setup_guard = crate::test_helpers::acquire_db_state_guard().await;
         let notification_broadcast_capacity = config.server.notification_broadcast_capacity.max(1);
         let notification_lag_log_every = config.server.notification_lag_log_every;

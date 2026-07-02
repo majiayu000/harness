@@ -42,6 +42,7 @@ async fn gc_run_uses_configured_project_root_across_cwd() -> anyhow::Result<()> 
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
     config.server.project_root = project_root.clone();
+    config.server.allow_unauthenticated = true;
     let server = Arc::new(HarnessServer::new(
         config,
         ThreadManager::new(),

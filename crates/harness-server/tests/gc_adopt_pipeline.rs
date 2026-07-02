@@ -95,6 +95,7 @@ async fn make_state_with_auto_pr(
     let mut config = HarnessConfig::default();
     config.server.data_dir = root.join("server-data");
     config.server.project_root = project_root;
+    config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock-pr".to_string();
     config.gc.auto_pr = auto_pr;
 
@@ -114,6 +115,7 @@ async fn make_state_without_default_agent(
     let mut config = HarnessConfig::default();
     config.server.data_dir = root.join("server-data");
     config.server.project_root = project_root;
+    config.server.allow_unauthenticated = true;
     config.agents.default_agent = "missing".to_string();
     config.gc.auto_pr = true;
 
@@ -403,6 +405,7 @@ async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
     config.server.project_root = project_root.clone();
+    config.server.allow_unauthenticated = true;
     config.agents.default_agent = "capturing".to_string();
     config.gc.auto_pr = true;
     // Point workspace root at a path under the blocker file so create_dir_all fails.

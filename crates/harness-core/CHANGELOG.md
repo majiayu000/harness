@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(config)* add the explicit `allow_unauthenticated` HTTP API opt-in and
+  normalize blank or whitespace-only `api_token` values as absent.
+
 ## [0.6.34](https://github.com/majiayu000/harness/compare/harness-core-v0.1.0...harness-core-v0.6.34) - 2026-06-29
 
 ### Added
