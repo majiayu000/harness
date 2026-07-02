@@ -1,10 +1,12 @@
 use super::AppState;
 use axum::{
     extract::State,
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
+use harness_core::config::server::ServerConfig;
 use serde_json::json;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -90,25 +92,100 @@ mod tests {
         assert!(is_auth_exempt_path("/usage"));
         assert!(!is_auth_exempt_path("/api/usage-monitor"));
     }
+
+    #[test]
+    fn resolve_auth_mode_refuses_tokenless_without_opt_in() {
+        let err = resolve_api_auth_mode(&ServerConfig::default()).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("api_token"));
+        assert!(message.contains("HARNESS_API_TOKEN"));
+        assert!(message.contains("allow_unauthenticated"));
+    }
+
+    #[test]
+    fn resolve_auth_mode_allows_explicit_tokenless_opt_in() {
+        let config = ServerConfig {
+            allow_unauthenticated: true,
+            ..ServerConfig::default()
+        };
+
+        assert_eq!(resolve_api_auth_mode(&config).unwrap(), ApiAuthMode::Open);
+    }
+
+    #[test]
+    fn resolve_auth_mode_token_wins_over_opt_in() {
+        let config = ServerConfig {
+            api_token: Some(" secret ".to_string()),
+            allow_unauthenticated: true,
+            ..ServerConfig::default()
+        };
+
+        assert_eq!(
+            resolve_api_auth_mode(&config).unwrap(),
+            ApiAuthMode::Enforced("secret".to_string())
+        );
+    }
 }
 
-/// Resolve the effective API token from server config or `HARNESS_API_TOKEN` env var.
+/// Resolve the effective API token from server config.
 ///
-/// Filters empty strings *before* the env-var fallback so that an explicit
-/// `api_token = ""` in server.toml does not shadow `HARNESS_API_TOKEN`.
-pub(crate) fn resolve_api_token(
-    config: &harness_core::config::server::ServerConfig,
-) -> Option<String> {
+/// `HARNESS_API_TOKEN` is applied during config loading; request-time auth must
+/// use the startup config snapshot rather than process-global environment state.
+pub(crate) fn resolve_api_token(config: &ServerConfig) -> Option<String> {
     config
         .api_token
         .as_deref()
+        .map(str::trim)
         .filter(|t| !t.is_empty())
-        .map(|t| t.to_owned())
-        .or_else(|| {
-            std::env::var("HARNESS_API_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
+        .map(str::to_owned)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApiAuthMode {
+    Enforced(String),
+    Open,
+}
+
+impl ApiAuthMode {
+    pub(crate) fn expected_token(&self) -> Option<&str> {
+        match self {
+            Self::Enforced(token) => Some(token.as_str()),
+            Self::Open => None,
+        }
+    }
+}
+
+pub(crate) fn resolve_api_auth_mode(config: &ServerConfig) -> anyhow::Result<ApiAuthMode> {
+    if let Some(token) = resolve_api_token(config) {
+        return Ok(ApiAuthMode::Enforced(token));
+    }
+
+    if config.allow_unauthenticated {
+        return Ok(ApiAuthMode::Open);
+    }
+
+    anyhow::bail!(
+        "API authentication is not configured: set server.api_token (api_token) in config or HARNESS_API_TOKEN, or explicitly set server.allow_unauthenticated = true for tokenless local development"
+    )
+}
+
+pub(crate) fn log_api_auth_mode(mode: &ApiAuthMode, config: &ServerConfig) {
+    match mode {
+        ApiAuthMode::Enforced(_) if config.allow_unauthenticated => {
+            tracing::warn!(
+                "server.allow_unauthenticated=true is ignored because an API token is configured; API bearer-token authentication is enforced"
+            );
+        }
+        ApiAuthMode::Enforced(_) => {
+            tracing::info!("API bearer-token authentication is enforced");
+        }
+        ApiAuthMode::Open => {
+            tracing::warn!(
+                "API authentication is disabled because server.allow_unauthenticated=true and no API token is configured"
+            );
+        }
+    }
 }
 
 pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
@@ -143,9 +220,9 @@ pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
 /// **all** clients (including those that present a localhost Origin) when a token
 /// is configured.  Origin alone is not trusted for auth because it can be forged
 /// by non-browser tools.
-/// All other endpoints require an `Authorization: Bearer <token>` header when
-/// `api_token` is configured. When no token is configured the middleware is a
-/// no-op (backward compat).
+/// All other endpoints require an `Authorization: Bearer <token>` header in
+/// enforced mode. Open mode is only reachable when startup accepted the explicit
+/// `allow_unauthenticated = true` opt-in.
 pub(crate) async fn api_auth_middleware(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -159,8 +236,21 @@ pub(crate) async fn api_auth_middleware(
         return next.run(req).await;
     }
 
-    let Some(expected) = resolve_api_token(&state.core.server.config.server) else {
-        // No token configured — skip auth for backward compatibility.
+    let auth_mode = match resolve_api_auth_mode(&state.core.server.config.server) {
+        Ok(mode) => mode,
+        Err(error) => {
+            tracing::error!("API authentication misconfigured after startup: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "authentication_misconfigured",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(expected) = auth_mode.expected_token() else {
         return next.run(req).await;
     };
 

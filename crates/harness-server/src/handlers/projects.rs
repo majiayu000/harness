@@ -241,6 +241,7 @@ mod tests {
         let mut config = HarnessConfig::default();
         config.server.project_root = project_root.to_path_buf();
         config.server.data_dir = data_dir.to_path_buf();
+        config.server.allow_unauthenticated = true;
         let server = Arc::new(HarnessServer::new(
             config,
             ThreadManager::new(),
@@ -338,6 +339,7 @@ mod tests {
         let mut config = HarnessConfig::default();
         config.server.project_root = canonical_root.clone();
         config.server.data_dir = data_dir.path().to_path_buf();
+        config.server.allow_unauthenticated = true;
         config.concurrency.per_project.insert(queue_key.clone(), 3);
         let server = Arc::new(HarnessServer::new(
             config,

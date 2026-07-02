@@ -410,6 +410,37 @@ async fn query_param_token_rejected_on_protected_endpoint() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn query_param_token_still_authorizes_sse_stream_endpoint() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.api_token = Some("secret123".to_string());
+    let state = make_read_only_route_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = Router::new()
+        .route("/tasks/{id}/stream", get(|| async { StatusCode::OK }))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::api_auth_middleware,
+        ))
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/tasks/task-1/stream?token=secret123")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
 async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_read_only_route_test_state(dir.path()).await?;
@@ -428,6 +459,27 @@ async fn dashboard_no_auth_configured_remains_public() -> anyhow::Result<()> {
                 .uri("/dashboard?tab=submit")
                 .body(Body::empty())?,
         )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn protected_route_passes_with_explicit_unauthenticated_opt_in() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.allow_unauthenticated = true;
+    let state = make_read_only_route_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = authed_app(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);

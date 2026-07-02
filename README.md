@@ -259,6 +259,10 @@ transport = "stdio"
 http_addr = "127.0.0.1:9800"
 data_dir = "~/.local/share/harness"
 project_root = "."
+# Set this or HARNESS_API_TOKEN before exposing HTTP routes.
+# api_token = "change-me"
+# Local-dev escape hatch for tokenless HTTP operation:
+# allow_unauthenticated = true
 
 [agents]
 default_agent = "auto"
@@ -297,6 +301,12 @@ environment = "production"
 exporter = "otlp-http"
 # endpoint = "http://127.0.0.1:4318"
 ```
+
+HTTP API authentication now fails closed by default. Starting `harness serve`
+without `server.api_token` or `HARNESS_API_TOKEN` exits with an actionable
+configuration error. For intentional tokenless local development, set
+`server.allow_unauthenticated = true`; if both a token and the opt-in are set,
+the token wins and bearer authentication stays enforced.
 
 ### Multi-Project Configuration
 

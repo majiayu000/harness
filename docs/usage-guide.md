@@ -46,6 +46,10 @@ Create or edit `config/default.toml`:
 transport = "stdio"
 http_addr = "127.0.0.1:9800"
 data_dir = "~/.local/share/harness"
+# Set this or HARNESS_API_TOKEN before using HTTP routes.
+# api_token = "change-me"
+# Intentional tokenless local-dev opt-in:
+# allow_unauthenticated = true
 
 [agents]
 default_agent = "auto"
@@ -320,6 +324,8 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 | `http_addr` | `"127.0.0.1:9800"` | HTTP listen address |
 | `data_dir` | `"~/.local/share/harness"` | Data directory for Harness server state, database metadata, and persisted `harness serve` runtime logs under `logs/` |
 | `project_root` | `"."` | Default project root (single-project mode) |
+| `api_token` | — | Bearer token for non-exempt HTTP routes. `HARNESS_API_TOKEN` can set the same value during config loading. |
+| `allow_unauthenticated` | `false` | Explicit local-dev opt-in for tokenless HTTP operation. Without this or a token, server startup fails closed. Ignored when a token is configured. |
 | `github_webhook_secret` | — | HMAC-SHA256 secret for GitHub webhook verification |
 | `notification_broadcast_capacity` | `256` | Internal notification channel capacity |
 
@@ -338,6 +344,11 @@ requests, typically a fine-grained token with repository contents write access
 and pull request read access, or an installation token with equivalent
 repository permissions. Agent mode does not add token requirements, but merge
 completion verification still needs read access to the pull request.
+
+Upgrade note: tokenless HTTP deployments that previously started
+unauthenticated now fail at startup. Recover by setting `api_token` /
+`HARNESS_API_TOKEN`, or by setting `allow_unauthenticated = true` for a
+deliberate local-only deployment.
 
 ### `[agents]`
 

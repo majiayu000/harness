@@ -127,6 +127,7 @@ async fn make_state(
     let mut config = HarnessConfig::default();
     config.server.data_dir = root.join("server-data");
     config.server.project_root = project_root.clone();
+    config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock".to_string();
 
     let mut registry = AgentRegistry::new("mock");
@@ -316,6 +317,7 @@ async fn turn_fails_when_agent_not_registered() -> anyhow::Result<()> {
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
     config.server.project_root = project_root.clone();
+    config.server.allow_unauthenticated = true;
     // "ghost" is the configured default agent but is never registered.
     config.agents.default_agent = "ghost".to_string();
 
@@ -355,6 +357,7 @@ async fn turn_fails_on_stall_timeout() -> anyhow::Result<()> {
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
     config.server.project_root = project_root.clone();
+    config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock".to_string();
     // Use a very short stall timeout so the test completes quickly.
     config.concurrency.stall_timeout_secs = 1;

@@ -11,6 +11,12 @@ use harness_core::{
 };
 use std::sync::Arc;
 
+fn unauthenticated_test_config() -> HarnessConfig {
+    let mut config = HarnessConfig::default();
+    config.server.allow_unauthenticated = true;
+    config
+}
+
 #[test]
 fn http_listener_starts_before_background_work() {
     let source = include_str!("mod.rs");
@@ -81,7 +87,7 @@ async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
         let data_dir = data_dir.to_path_buf();
         let database_url = database_url.clone();
         async move {
-            let mut config = HarnessConfig::default();
+            let mut config = unauthenticated_test_config();
             config.server.project_root = project_root;
             config.server.data_dir = data_dir;
             config.server.database_url = Some(database_url);
@@ -138,13 +144,41 @@ async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn build_app_state_refuses_tokenless_startup_without_opt_in() -> anyhow::Result<()> {
+    let sandbox = tempfile::tempdir()?;
+    let project_root = sandbox.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+
+    let mut config = HarnessConfig::default();
+    config.server.project_root = project_root;
+    config.server.data_dir = sandbox.path().join("data");
+    config.server.api_token = Some("   ".to_string());
+
+    let server = Arc::new(HarnessServer::new(
+        config,
+        ThreadManager::new(),
+        AgentRegistry::new("test"),
+    ));
+    let err = match build_app_state(server).await {
+        Ok(_) => anyhow::bail!("tokenless startup without opt-in should fail"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+
+    assert!(message.contains("api_token"));
+    assert!(message.contains("HARNESS_API_TOKEN"));
+    assert!(message.contains("allow_unauthenticated"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn build_app_state_auto_registers_builtin_guard() -> anyhow::Result<()> {
     let _lock = HOME_LOCK.lock().await;
     let sandbox = tempfile::tempdir()?;
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
 
-    let mut config = HarnessConfig::default();
+    let mut config = unauthenticated_test_config();
     config.server.project_root = project_root;
     config.server.data_dir = sandbox.path().join("data");
 
@@ -173,7 +207,7 @@ async fn build_app_state_registers_startup_project_metadata() -> anyhow::Result<
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
 
-    let mut config = HarnessConfig::default();
+    let mut config = unauthenticated_test_config();
     config.server.project_root = project_root.clone();
     config.server.data_dir = sandbox.path().join("data");
 
@@ -211,7 +245,7 @@ async fn build_app_state_registers_default_project_metadata_from_startup_entry(
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
 
-    let mut config = HarnessConfig::default();
+    let mut config = unauthenticated_test_config();
     config.server.project_root = project_root.clone();
     config.server.data_dir = sandbox.path().join("data");
 
@@ -249,7 +283,7 @@ async fn build_app_state_preserves_partial_startup_project_metadata() -> anyhow:
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
 
-    let mut config = HarnessConfig::default();
+    let mut config = unauthenticated_test_config();
     config.server.project_root = project_root.clone();
     config.server.data_dir = sandbox.path().join("data");
 
@@ -297,7 +331,7 @@ async fn build_app_state_ignores_stale_default_project_metadata_for_different_ro
     std::fs::create_dir_all(&startup_root)?;
     std::fs::create_dir_all(&override_root)?;
 
-    let mut config = HarnessConfig::default();
+    let mut config = unauthenticated_test_config();
     config.server.project_root = override_root.clone();
     config.server.data_dir = sandbox.path().join("data");
 

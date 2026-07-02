@@ -48,10 +48,16 @@ pub struct ServerConfig {
     ///
     /// When set (via this field or the `HARNESS_API_TOKEN` environment variable),
     /// all non-webhook and non-health HTTP endpoints require an
-    /// `Authorization: Bearer <token>` header. When not configured, authentication
-    /// is skipped for backward-compatible local development.
+    /// `Authorization: Bearer <token>` header. When not configured, HTTP startup
+    /// fails closed unless `allow_unauthenticated` is explicitly enabled.
     #[serde(default)]
     pub api_token: Option<String>,
+    /// Explicit opt-in for tokenless local development.
+    ///
+    /// This restores the legacy unauthenticated behavior when no API token is
+    /// configured. It is ignored when `api_token` or `HARNESS_API_TOKEN` is set.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
     /// Allowlist of base directories under which project roots may be registered.
     ///
     /// When non-empty, `POST /projects` rejects any root that is not a descendant
@@ -105,6 +111,7 @@ impl ServerConfig {
     /// - `GITHUB_TOKEN` / `GH_TOKEN` — `github_token`
     /// - `GITHUB_WEBHOOK_SECRET`   — `github_webhook_secret`
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        self.normalize_api_token();
         if let Ok(v) = std::env::var("HARNESS_DATA_DIR") {
             if !v.is_empty() {
                 self.data_dir = std::path::PathBuf::from(v);
@@ -139,8 +146,9 @@ impl ServerConfig {
             }
         }
         if let Ok(v) = std::env::var("HARNESS_API_TOKEN") {
-            if !v.is_empty() {
-                self.api_token = Some(v);
+            let token = v.trim();
+            if !token.is_empty() {
+                self.api_token = Some(token.to_string());
             }
         }
         if self
@@ -165,7 +173,18 @@ impl ServerConfig {
                 self.github_webhook_secret = Some(v);
             }
         }
+        self.normalize_api_token();
         Ok(())
+    }
+
+    /// Normalize absent API tokens so blank/whitespace values cannot satisfy auth.
+    pub fn normalize_api_token(&mut self) {
+        self.api_token = self
+            .api_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
     }
 
     /// Apply the `HARNESS_HTTP_ADDR` env var override.
@@ -205,6 +224,7 @@ impl fmt::Debug for ServerConfig {
             ws_heartbeat_interval_secs,
             trusted_proxies,
             api_token,
+            allow_unauthenticated,
             allowed_project_roots,
             max_webhook_body_bytes,
             signal_rate_limit_per_minute,
@@ -239,6 +259,7 @@ impl fmt::Debug for ServerConfig {
             .field("ws_heartbeat_interval_secs", ws_heartbeat_interval_secs)
             .field("trusted_proxies", trusted_proxies)
             .field("api_token", &api_token.as_ref().map(|_| "[REDACTED]"))
+            .field("allow_unauthenticated", allow_unauthenticated)
             .field("allowed_project_roots", allowed_project_roots)
             .field("max_webhook_body_bytes", max_webhook_body_bytes)
             .field("signal_rate_limit_per_minute", signal_rate_limit_per_minute)
@@ -269,6 +290,7 @@ impl Default for ServerConfig {
             ws_heartbeat_interval_secs: default_ws_heartbeat_interval_secs(),
             trusted_proxies: Vec::new(),
             api_token: None,
+            allow_unauthenticated: false,
             allowed_project_roots: Vec::new(),
             max_webhook_body_bytes: default_max_webhook_body_bytes(),
             signal_rate_limit_per_minute: default_signal_rate_limit_per_minute(),
@@ -539,6 +561,32 @@ mod tests {
     }
 
     #[test]
+    fn env_override_whitespace_api_token_does_not_override_toml_token() {
+        temp_env::with_vars([("HARNESS_API_TOKEN", Some("   "))], || {
+            let mut cfg = ServerConfig {
+                api_token: Some("real-token".to_string()),
+                ..ServerConfig::default()
+            };
+            cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.api_token, Some("real-token".to_string()));
+        });
+    }
+
+    #[test]
+    fn normalize_api_token_trims_and_removes_blank_token() {
+        let mut cfg = ServerConfig {
+            api_token: Some("  real-token  ".to_string()),
+            ..ServerConfig::default()
+        };
+        cfg.normalize_api_token();
+        assert_eq!(cfg.api_token.as_deref(), Some("real-token"));
+
+        cfg.api_token = Some("   ".to_string());
+        cfg.normalize_api_token();
+        assert_eq!(cfg.api_token, None);
+    }
+
+    #[test]
     fn env_override_empty_github_token_does_not_override_toml_token() {
         temp_env::with_vars(
             [("GITHUB_TOKEN", Some("")), ("GH_TOKEN", None::<&str>)],
@@ -633,6 +681,7 @@ mod tests {
             database_url = "postgres://harness:harness@localhost:5432/harness"
             database_pool_max_connections = 8
             database_pool_acquire_timeout_secs = 30
+            allow_unauthenticated = true
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(
@@ -641,6 +690,7 @@ mod tests {
         );
         assert_eq!(config.database_pool_max_connections, Some(8));
         assert_eq!(config.database_pool_acquire_timeout_secs, Some(30));
+        assert!(config.allow_unauthenticated);
     }
 
     // --- existing tests ---

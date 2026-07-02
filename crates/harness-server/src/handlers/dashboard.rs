@@ -263,7 +263,8 @@ mod tests {
         make_test_state_with_config(config).await
     }
 
-    async fn make_test_state_with_config(config: HarnessConfig) -> anyhow::Result<AppState> {
+    async fn make_test_state_with_config(mut config: HarnessConfig) -> anyhow::Result<AppState> {
+        config.server.allow_unauthenticated = true;
         let server = Arc::new(HarnessServer::new(
             config,
             ThreadManager::new(),

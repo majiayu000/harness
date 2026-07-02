@@ -42,6 +42,7 @@ async fn build_app_state_opens_runtime_state_store_from_shared_schema() -> anyho
     let mut config = HarnessConfig::default();
     config.server.project_root = project_root.path().to_path_buf();
     config.server.data_dir = data_dir.path().to_path_buf();
+    config.server.allow_unauthenticated = true;
 
     let server = Arc::new(HarnessServer::new(
         config,
@@ -188,6 +189,7 @@ async fn build_app_state_restores_runtime_snapshot() -> anyhow::Result<()> {
     let mut config = HarnessConfig::default();
     config.server.project_root = project_root.path().to_path_buf();
     config.server.data_dir = data_dir.path().to_path_buf();
+    config.server.allow_unauthenticated = true;
 
     let first_server = Arc::new(HarnessServer::new(
         config.clone(),

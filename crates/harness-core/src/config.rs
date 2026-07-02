@@ -86,6 +86,7 @@ impl HarnessConfig {
     /// Serde field defaults cannot see sibling fields, so cross-field defaults
     /// are resolved after loading, rebasing, and environment overrides.
     pub fn apply_derived_defaults(&mut self) {
+        self.server.normalize_api_token();
         self.workspace
             .use_data_dir_default_root(&self.server.data_dir);
     }

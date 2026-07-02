@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **security:** HTTP API authentication now fails closed when neither
+  `api_token` nor `HARNESS_API_TOKEN` is configured. Operators must set a token
+  or explicitly opt in to tokenless local development with
+  `allow_unauthenticated = true`.
+
 ## [0.6.34] - 2026-05-30
 
 First release with a tracked changelog. This is a workflow-runtime reliability

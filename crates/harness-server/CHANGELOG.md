@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(security)* fail closed during server startup when neither `api_token` nor
+  `HARNESS_API_TOKEN` is configured; tokenless operation now requires
+  `allow_unauthenticated = true`, and a configured token wins over the opt-in.
+
 ## [0.6.34](https://github.com/majiayu000/harness/releases/tag/harness-server-v0.6.34) - 2026-06-29
 
 ### Added

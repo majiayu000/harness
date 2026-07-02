@@ -64,15 +64,17 @@ Runtime-host mutations, including watched-project sync, fail with
 but the runtime state store is unavailable. This prevents a successful response
 from hiding non-durable host state.
 
-Authentication: when `api_token` is configured, all routes require proof of the
-token; without a configured token the middleware is a no-op (backward
-compatibility).  Exempt routes that bypass auth entirely: `/health`,
-`/webhook`, `/webhook/feishu`, `/signals`, and `/favicon.ico` (these carry
-their own HMAC-based protection or are intentionally public).  For browser
-clients that cannot set `Authorization` headers on WebSocket upgrades or
-top-level navigation requests, `/ws` and `/` additionally accept a
-`?token=<value>` query parameter as a fallback; all other routes only accept
-`Authorization: Bearer <token>`.
+Authentication: `harness serve` fails closed unless `api_token` or
+`HARNESS_API_TOKEN` is configured, or `allow_unauthenticated = true` is set
+explicitly for tokenless local development. When a token is configured, all
+non-exempt routes require `Authorization: Bearer <token>`; if both a token and
+`allow_unauthenticated = true` are set, the token wins and the opt-in is
+ignored. Exempt routes that bypass auth entirely: `/health`, `/webhook`,
+`/webhook/feishu`, `/signals`, and `/favicon.ico` (these carry their own
+HMAC-based protection or are intentionally public). For browser clients that
+cannot set `Authorization` headers on SSE requests, `/tasks/{id}/stream`
+additionally accepts a `?token=<value>` query parameter as a fallback; all other
+routes only accept `Authorization: Bearer <token>`.
 
 ### JSON-RPC 2.0 — agent-facing (data plane)
 
