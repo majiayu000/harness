@@ -17,10 +17,7 @@ use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
     prompt_task_request_for_job, PromptTaskRequest,
 };
-use super::merge_completion::{
-    server_merge_execution_enabled, server_merge_execution_unavailable_result,
-    verify_merge_completion_if_needed,
-};
+use super::merge_completion::verify_merge_completion_if_needed;
 use super::pr_feedback_inspection::{
     execute_pr_feedback_inspection, is_server_owned_pr_feedback_inspection,
 };
@@ -34,6 +31,7 @@ use super::runtime_profile::{
     agent_name_for_runtime_kind, runtime_profile_approval_policy, runtime_profile_for_job,
     runtime_profile_sandbox_mode,
 };
+use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 
 const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 3600;
@@ -245,7 +243,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 Some(execute_pr_feedback_inspection(self.state, job, parent).await),
             ),
             "merge_pr" if server_merge_execution_enabled(self.state, job, parent) => {
-                Ok(Some(server_merge_execution_unavailable_result(job, parent)))
+                Ok(Some(execute_server_merge(self.state, job, parent).await))
             }
             _ => Ok(None),
         }

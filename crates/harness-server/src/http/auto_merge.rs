@@ -87,7 +87,7 @@ pub(crate) fn prepare_auto_merge_workflow_from_snapshot(
     Ok(AutoMergeSnapshotGate::Ready(Box::new(workflow)))
 }
 
-fn auto_merge_snapshot_satisfies_policy(
+pub(crate) fn auto_merge_snapshot_satisfies_policy(
     snapshot: &Value,
     policy: &ResolvedGitHubAutoMergePolicy,
     expected_base_ref: Option<&str>,

@@ -335,8 +335,8 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 |-------|---------|-------------|
 | `enabled` | `false` | Enables server-side auto-merge gating for configured GitHub issue workflows. |
 | `method` | `"squash"` | Merge method requested after the deterministic gate passes. |
-| `delete_branch` | `true` | Whether merge execution should delete the source branch after merge. |
-| `merge_execution` | `"agent"` | Selects the merge executor. `"agent"` keeps the current agent-executed merge path and requires server-side completion verification. `"server"` is reserved for the server-executed merge rollout and fails closed until that rollout lands. |
+| `delete_branch` | `true` | Whether merge execution should request source branch cleanup where the selected executor supports it. |
+| `merge_execution` | `"agent"` | Selects the merge executor. `"agent"` keeps the current agent-executed merge path and requires server-side completion verification. `"server"` runs the merge through the GitHub REST API, then re-reads the pull request before terminal success. |
 | `verify_merge_completion` | `true` | When true, an agent-reported `merge_pr` success is accepted only after Harness re-reads GitHub and observes the PR as merged. |
 
 Server-executed merge mode requires a GitHub token that can merge pull

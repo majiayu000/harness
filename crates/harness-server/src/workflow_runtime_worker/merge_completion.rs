@@ -3,7 +3,7 @@ use crate::github_pr_snapshot::{
     GitHubPrSnapshotTarget, GITHUB_PR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ERROR_ARTIFACT,
 };
 use crate::http::AppState;
-use harness_core::config::intake::{GitHubAutoMergeConfig, GitHubMergeExecution};
+use harness_core::config::intake::GitHubAutoMergeConfig;
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivityStatus, RuntimeJob,
     WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, SERVER_PR_SNAPSHOT_ARTIFACT,
@@ -15,38 +15,6 @@ use super::data_helpers::activity_name;
 const MERGE_COMPLETION_VERIFICATION_ARTIFACT: &str = "merge_completion_verification";
 const MERGE_COMPLETION_VERIFICATION_SCHEMA: &str =
     "harness.github.merge_completion_verification.v1";
-
-pub(super) fn server_merge_execution_enabled(
-    state: &AppState,
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-) -> bool {
-    merge_activity_matches(job, workflow)
-        && auto_merge_config(state).merge_execution == GitHubMergeExecution::Server
-}
-
-pub(super) fn server_merge_execution_unavailable_result(
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-) -> ActivityResult {
-    let activity = activity_name(job);
-    let error = "merge_execution = \"server\" is configured, but server-executed merge is not implemented in this Phase 1 slice";
-    let mut result =
-        ActivityResult::failed(activity, "Server-executed merge is not available.", error)
-            .with_error_kind(ActivityErrorKind::Configuration);
-    result.artifacts.push(ActivityArtifact::new(
-        MERGE_COMPLETION_VERIFICATION_ARTIFACT,
-        json!({
-            "schema": MERGE_COMPLETION_VERIFICATION_SCHEMA,
-            "verified": false,
-            "outcome": "server_execution_unavailable",
-            "workflow_id": workflow.map(|workflow| workflow.id.as_str()),
-            "reason": error,
-        }),
-    ));
-    result
-}
-
 pub(super) async fn verify_merge_completion_if_needed(
     state: &AppState,
     job: &RuntimeJob,
@@ -59,15 +27,6 @@ pub(super) async fn verify_merge_completion_if_needed(
     let config = auto_merge_config(state);
     if !config.verify_merge_completion {
         return result;
-    }
-    if config.merge_execution == GitHubMergeExecution::Server {
-        return merge_completion_failed(
-            result,
-            ActivityErrorKind::Configuration,
-            "Server-side merge completion verification failed.",
-            "merge_execution = \"server\" is configured, but server-executed merge is not implemented in this Phase 1 slice",
-            None,
-        );
     }
     let target = match merge_completion_target(job, workflow, &result) {
         Ok(target) => target,
@@ -107,7 +66,7 @@ pub(super) async fn verify_merge_completion_if_needed(
     }
 }
 
-fn auto_merge_config(state: &AppState) -> GitHubAutoMergeConfig {
+pub(super) fn auto_merge_config(state: &AppState) -> GitHubAutoMergeConfig {
     state
         .core
         .server
@@ -129,7 +88,10 @@ fn merge_completion_needs_verification(
         && result_reports_merged(result)
 }
 
-fn merge_activity_matches(job: &RuntimeJob, workflow: Option<&WorkflowInstance>) -> bool {
+pub(super) fn merge_activity_matches(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> bool {
     activity_name(job) == "merge_pr"
         && workflow
             .map(|workflow| workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID)
@@ -141,6 +103,26 @@ fn merge_completion_target(
     workflow: Option<&WorkflowInstance>,
     result: &ActivityResult,
 ) -> Result<GitHubPrSnapshotTarget, String> {
+    merge_activity_target(
+        job,
+        workflow,
+        merged_pull_request_artifact(result)
+            .and_then(|artifact| value_u64(artifact.get("pr_number"))),
+    )
+}
+
+pub(super) fn merge_execution_target(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> Result<GitHubPrSnapshotTarget, String> {
+    merge_activity_target(job, workflow, None)
+}
+
+fn merge_activity_target(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+    reported_pr_number: Option<u64>,
+) -> Result<GitHubPrSnapshotTarget, String> {
     let workflow_data = workflow.map(|workflow| &workflow.data);
     let repo_slug = workflow_data
         .and_then(|data| value_string(data.get("repo")))
@@ -149,8 +131,6 @@ fn merge_completion_target(
     let bound_pr_number = workflow_data
         .and_then(|data| value_u64(data.get("pr_number")))
         .or_else(|| value_u64(job.input.get("pr_number")));
-    let reported_pr_number = merged_pull_request_artifact(result)
-        .and_then(|artifact| value_u64(artifact.get("pr_number")));
     if let (Some(bound), Some(reported)) = (bound_pr_number, reported_pr_number) {
         if bound != reported {
             return Err(format!(
@@ -192,7 +172,7 @@ fn pull_request_artifact_is_merged(value: &Value) -> bool {
             .is_some_and(|state| state.eq_ignore_ascii_case("merged"))
 }
 
-fn snapshot_observes_merged(snapshot: &Value) -> bool {
+pub(super) fn snapshot_observes_merged(snapshot: &Value) -> bool {
     snapshot.get("merged").and_then(Value::as_bool) == Some(true)
         || snapshot
             .get("state")
@@ -200,7 +180,7 @@ fn snapshot_observes_merged(snapshot: &Value) -> bool {
             .is_some_and(|state| state.eq_ignore_ascii_case("MERGED"))
 }
 
-fn merge_completion_verified(
+pub(super) fn merge_completion_verified(
     mut result: ActivityResult,
     target: &GitHubPrSnapshotTarget,
     snapshot: GitHubPrSnapshotArtifacts,
