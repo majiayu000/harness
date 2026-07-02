@@ -30,7 +30,8 @@ use self::reconciliation_github::{
     classify_issue_state, classify_pr_state, GitHubIssueState, GitHubPullState,
 };
 pub(crate) use self::reconciliation_github::{
-    fetch_issue_state_with_token, fetch_pr_state_by_slug_with_token, GitHubState,
+    fetch_issue_state_with_token, fetch_pr_state_by_slug_with_token, github_api_base_url,
+    GitHubState,
 };
 use self::reconciliation_legacy::{apply_transition, resolve_github_state};
 #[cfg(test)]

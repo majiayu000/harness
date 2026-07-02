@@ -23,7 +23,7 @@ pub(super) struct GitHubIssueState {
     pub(super) state: String,
 }
 
-fn github_api_base_url() -> String {
+pub(crate) fn github_api_base_url() -> String {
     std::env::var("HARNESS_GITHUB_API_BASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())

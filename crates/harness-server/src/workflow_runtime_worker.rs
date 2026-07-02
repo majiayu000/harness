@@ -10,6 +10,7 @@ mod pr_feedback_inspection;
 mod prompt_input_telemetry;
 mod prompt_packet;
 mod runtime_profile;
+mod server_merge;
 mod workspace;
 
 use crate::http::AppState;
