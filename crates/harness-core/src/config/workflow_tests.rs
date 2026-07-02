@@ -57,6 +57,16 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.pr_scope_guard.max_files_changed, 30);
     assert_eq!(cfg.pr_scope_guard.max_lines_added, 1500);
     assert_eq!(cfg.storage.schema_namespace, "workflow");
+    assert!(cfg.storage.orphan_reaper_enabled);
+    assert_eq!(cfg.storage.orphan_reaper_interval_secs, 3600);
+    assert!(!cfg.storage.workflow_watchdog_enabled);
+    assert_eq!(cfg.storage.workflow_watchdog_age_minutes, 240);
+    assert_eq!(cfg.storage.workflow_watchdog_interval_secs, 300);
+    assert_eq!(cfg.storage.workflow_watchdog_batch_size, 100);
+    assert!(!cfg.storage.runtime_retention_enabled);
+    assert_eq!(cfg.storage.runtime_retention_days, 30);
+    assert_eq!(cfg.storage.runtime_retention_batch_size, 1000);
+    assert_eq!(cfg.storage.runtime_retention_interval_secs, 3600);
     assert!(!cfg.issue_workflow.require_human_gate_before_merge);
     assert!(cfg.activities.is_empty());
     Ok(())
@@ -184,6 +194,16 @@ runtime_retry_policy:
       max_retry_delay_secs: 60
 storage:
   schema_namespace: orchestration
+  orphan_reaper_enabled: false
+  orphan_reaper_interval_secs: 44
+  workflow_watchdog_enabled: true
+  workflow_watchdog_age_minutes: 12
+  workflow_watchdog_interval_secs: 13
+  workflow_watchdog_batch_size: 14
+  runtime_retention_enabled: true
+  runtime_retention_days: 45
+  runtime_retention_batch_size: 46
+  runtime_retention_interval_secs: 47
 activities:
   implement_issue:
     prompt: issue-default
@@ -330,6 +350,16 @@ Body
         Some(60)
     );
     assert_eq!(cfg.storage.schema_namespace, "orchestration");
+    assert!(!cfg.storage.orphan_reaper_enabled);
+    assert_eq!(cfg.storage.orphan_reaper_interval_secs, 44);
+    assert!(cfg.storage.workflow_watchdog_enabled);
+    assert_eq!(cfg.storage.workflow_watchdog_age_minutes, 12);
+    assert_eq!(cfg.storage.workflow_watchdog_interval_secs, 13);
+    assert_eq!(cfg.storage.workflow_watchdog_batch_size, 14);
+    assert!(cfg.storage.runtime_retention_enabled);
+    assert_eq!(cfg.storage.runtime_retention_days, 45);
+    assert_eq!(cfg.storage.runtime_retention_batch_size, 46);
+    assert_eq!(cfg.storage.runtime_retention_interval_secs, 47);
     let activity = cfg
         .activities
         .get("implement_issue")

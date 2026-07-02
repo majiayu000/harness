@@ -1,11 +1,13 @@
 use super::{
     command_store, insert_decision_record_tx, insert_event_tx, insert_instance_if_absent_tx,
     load_or_insert_initial_instance_tx, to_jsonb_string, workflow_instance_from_row,
-    WorkflowDecisionTransition, WorkflowInstancePage, WorkflowRejectedDecisionTransition,
-    WorkflowRuntimeStore,
+    RuntimeHistoryPruneSummary, WorkflowDecisionTransition, WorkflowInstancePage,
+    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{WorkflowDecisionRecord, WorkflowInstance};
-use crate::runtime::state_registry::workflow_terminal_state_names_for_definition;
+use crate::runtime::state_registry::{
+    known_workflow_definition_ids, workflow_terminal_state_names_for_definition,
+};
 use crate::runtime::status::WorkflowCommandStatus;
 use chrono::{DateTime, Utc};
 
@@ -321,6 +323,188 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    pub async fn list_aged_wait_instances(
+        &self,
+        states: &[&str],
+        older_than: DateTime<Utc>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT data::text, updated_at FROM workflow_instances
+             WHERE state = ANY($1::text[])
+               AND updated_at < $2
+             ORDER BY updated_at ASC, id ASC
+             LIMIT $3",
+        )
+        .bind(states)
+        .bind(older_than)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
+            .filter_map(|result| match result {
+                Ok(instance) if !instance.is_terminal() => Some(Ok(instance)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    pub async fn prune_terminal_runtime_history(
+        &self,
+        terminal_before: DateTime<Utc>,
+        batch_limit: i64,
+    ) -> anyhow::Result<RuntimeHistoryPruneSummary> {
+        let batch_limit = batch_limit.clamp(1, 10_000);
+        let (terminal_definition_ids, terminal_states) = terminal_state_pairs();
+        if terminal_definition_ids.is_empty() {
+            return Ok(RuntimeHistoryPruneSummary::default());
+        }
+
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "WITH RECURSIVE terminal_states(definition_id, state) AS (
+                 SELECT * FROM unnest($1::text[], $2::text[])
+             ),
+             candidate_roots AS (
+                 SELECT root.id
+                 FROM workflow_instances AS root
+                 WHERE root.parent_workflow_id IS NULL
+                   AND root.updated_at < $3
+                   AND EXISTS (
+                       SELECT 1
+                       FROM terminal_states AS terminal
+                       WHERE terminal.definition_id = root.definition_id
+                         AND terminal.state = root.state
+                   )
+                 ORDER BY root.updated_at ASC, root.id ASC
+                 LIMIT $4
+             ),
+             family AS (
+                 SELECT root.id AS root_id,
+                        root.id,
+                        root.definition_id,
+                        root.state,
+                        root.updated_at
+                 FROM workflow_instances AS root
+                 JOIN candidate_roots ON candidate_roots.id = root.id
+                 UNION ALL
+                 SELECT family.root_id,
+                        child.id,
+                        child.definition_id,
+                        child.state,
+                        child.updated_at
+                 FROM workflow_instances AS child
+                 JOIN family ON child.parent_workflow_id = family.id
+             ),
+             eligible_roots AS (
+                 SELECT family.root_id
+                 FROM family
+                 GROUP BY family.root_id
+                 HAVING bool_and(family.updated_at < $3)
+                    AND bool_and(EXISTS (
+                        SELECT 1
+                        FROM terminal_states AS terminal
+                        WHERE terminal.definition_id = family.definition_id
+                          AND terminal.state = family.state
+                    ))
+             )
+             SELECT family.id
+             FROM family
+             JOIN eligible_roots ON eligible_roots.root_id = family.root_id
+             ORDER BY family.root_id ASC, family.id ASC",
+        )
+        .bind(&terminal_definition_ids)
+        .bind(&terminal_states)
+        .bind(terminal_before)
+        .bind(batch_limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let workflow_ids: Vec<String> = rows.into_iter().map(|(id,)| id).collect();
+        if workflow_ids.is_empty() {
+            return Ok(RuntimeHistoryPruneSummary::default());
+        }
+
+        let mut summary = self
+            .runtime_history_counts_for_workflows(&workflow_ids)
+            .await?;
+        let result = sqlx::query("DELETE FROM workflow_instances WHERE id = ANY($1::text[])")
+            .bind(&workflow_ids)
+            .execute(&self.pool)
+            .await?;
+        summary.workflow_instances_deleted = result.rows_affected() as usize;
+        Ok(summary)
+    }
+
+    async fn runtime_history_counts_for_workflows(
+        &self,
+        workflow_ids: &[String],
+    ) -> anyhow::Result<RuntimeHistoryPruneSummary> {
+        let (workflow_instances,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM workflow_instances WHERE id = ANY($1::text[])")
+                .bind(workflow_ids)
+                .fetch_one(&self.pool)
+                .await?;
+        let (workflow_events,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workflow_events WHERE workflow_id = ANY($1::text[])",
+        )
+        .bind(workflow_ids)
+        .fetch_one(&self.pool)
+        .await?;
+        let (workflow_decisions,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workflow_decisions WHERE workflow_id = ANY($1::text[])",
+        )
+        .bind(workflow_ids)
+        .fetch_one(&self.pool)
+        .await?;
+        let (workflow_commands,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workflow_commands WHERE workflow_id = ANY($1::text[])",
+        )
+        .bind(workflow_ids)
+        .fetch_one(&self.pool)
+        .await?;
+        let (runtime_jobs,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE command.workflow_id = ANY($1::text[])",
+        )
+        .bind(workflow_ids)
+        .fetch_one(&self.pool)
+        .await?;
+        let (runtime_events,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)
+             FROM runtime_events AS event
+             JOIN runtime_jobs AS job ON job.id = event.runtime_job_id
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE command.workflow_id = ANY($1::text[])",
+        )
+        .bind(workflow_ids)
+        .fetch_one(&self.pool)
+        .await?;
+        let (workflow_artifacts,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workflow_artifacts WHERE workflow_id = ANY($1::text[])",
+        )
+        .bind(workflow_ids)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(RuntimeHistoryPruneSummary {
+            workflow_instances_deleted: workflow_instances.max(0) as usize,
+            workflow_events_deleted: workflow_events.max(0) as usize,
+            workflow_decisions_deleted: workflow_decisions.max(0) as usize,
+            workflow_commands_deleted: workflow_commands.max(0) as usize,
+            runtime_jobs_deleted: runtime_jobs.max(0) as usize,
+            runtime_events_deleted: runtime_events.max(0) as usize,
+            workflow_artifacts_deleted: workflow_artifacts.max(0) as usize,
+        })
+    }
+
     pub async fn touch_instance(&self, workflow_id: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE workflow_instances SET updated_at = clock_timestamp() WHERE id = $1")
             .bind(workflow_id)
@@ -489,4 +673,16 @@ impl WorkflowRuntimeStore {
             .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
             .collect()
     }
+}
+
+fn terminal_state_pairs() -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut definition_ids = Vec::new();
+    let mut states = Vec::new();
+    for definition_id in known_workflow_definition_ids() {
+        for state in workflow_terminal_state_names_for_definition(definition_id) {
+            definition_ids.push(*definition_id);
+            states.push(state);
+        }
+    }
+    (definition_ids, states)
 }

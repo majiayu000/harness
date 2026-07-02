@@ -82,8 +82,8 @@ pub use state_registry::{
 };
 pub use status::WorkflowCommandStatus;
 pub use store::{
-    WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
-    WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
+    RuntimeHistoryPruneSummary, WorkflowDecisionTransition, WorkflowRejectedDecisionTransition,
+    WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload,
 };
 pub use submission::{

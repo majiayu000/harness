@@ -141,8 +141,10 @@ function makeMonitor(): OperatorMonitorPayload {
         done: 0,
       },
       by_source: [],
+      token_dispatch_by_repo: [],
     },
     operator_actions: [],
+    stuck_workflows: [],
     failures: [],
     worktrees: {
       used: 0,

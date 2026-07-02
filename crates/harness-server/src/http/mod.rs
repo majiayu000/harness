@@ -26,12 +26,14 @@ pub(crate) mod misc_routes;
 mod orphan_reaper;
 pub(crate) mod pr_hygiene_background;
 pub(crate) mod rate_limit;
+mod runtime_retention;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
 pub(crate) mod task_mutation_routes;
 pub(crate) mod task_query_routes;
 pub(crate) mod task_routes;
 pub(crate) mod task_submission_routes;
+mod workflow_watchdog;
 
 #[cfg(test)]
 mod reviewer_resolution_tests;
@@ -249,6 +251,13 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Periodically reap orphaned path-derived Postgres schemas whose owning
     // workspace directory has been removed, bounding catalog growth (storage RFC).
     orphan_reaper::spawn_orphan_schema_reaper(&state);
+
+    // Periodically surface aged workflow wait states for operator attention.
+    workflow_watchdog::spawn_workflow_watchdog(&state);
+
+    // Periodically prune terminal workflow-runtime history when explicitly
+    // enabled by workflow storage policy.
+    runtime_retention::spawn_runtime_retention(&state);
 
     // Convert workflow command outbox rows into runtime jobs when the workflow
     // policy keeps the dispatcher enabled.

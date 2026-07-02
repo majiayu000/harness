@@ -1,7 +1,7 @@
 import { Panel } from "@/components/Panel";
 import { useOperatorMonitor } from "@/lib/queries";
 import { fmtInt } from "@/lib/format";
-import type { FailureGroup, OperatorAction, OperatorMonitorPayload, SourceActivity } from "@/types";
+import type { FailureGroup, OperatorAction, OperatorMonitorPayload, SourceActivity, StuckWorkflow } from "@/types";
 
 function fmtDuration(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -67,6 +67,29 @@ function FailureRow({ failure }: { failure: FailureGroup }) {
   );
 }
 
+function StuckWorkflowRow({ workflow }: { workflow: StuckWorkflow }) {
+  return (
+    <tr className="border-b border-line last:border-b-0">
+      <td className="px-3 py-2 font-mono text-[11px] text-warn">{workflow.state.replace(/_/g, " ")}</td>
+      <td className="px-3 py-2 font-mono text-[11px] text-ink-3">{workflow.repo ?? "untracked"}</td>
+      <td className="px-3 py-2 font-mono text-[11px] text-ink-3">
+        {workflow.issue ? `#${workflow.issue}` : workflow.workflow_id}
+        {workflow.pr ? ` -> PR #${workflow.pr}` : ""}
+      </td>
+      <td className="px-3 py-2 font-mono text-[11px] text-ink-4">{fmtDuration(workflow.age_secs)}</td>
+      <td className="px-3 py-2 text-right font-mono text-[11px]">
+        {workflow.url ? (
+          <a href={workflow.url} target="_blank" rel="noreferrer" className="text-rust hover:underline">
+            open
+          </a>
+        ) : (
+          <span className="text-ink-4">unlinked</span>
+        )}
+      </td>
+    </tr>
+  );
+}
+
 function SourceRow({ source }: { source: SourceActivity }) {
   return (
     <tr className="border-b border-line last:border-b-0">
@@ -127,6 +150,16 @@ function MonitorBody({ data }: { data: OperatorMonitorPayload }) {
 
       <div className="grid grid-cols-[1.2fr_1fr]">
         <div className="border-r border-line">
+          <div className="border-b border-line">
+            <div className="px-4 py-2 font-mono text-[10px] uppercase tracking-[0.1em] text-ink-3">Stuck workflows</div>
+            {data.stuck_workflows.length === 0 ? (
+              <p className="border-t border-line px-4 py-3 font-mono text-[11px] text-ink-4">No aged stuck workflows.</p>
+            ) : (
+              <table className="w-full border-t border-line">
+                <tbody>{data.stuck_workflows.map((workflow) => <StuckWorkflowRow key={workflow.workflow_id} workflow={workflow} />)}</tbody>
+              </table>
+            )}
+          </div>
           <div className="px-4 py-2 font-mono text-[10px] uppercase tracking-[0.1em] text-ink-3">Grouped failures</div>
           {data.failures.length === 0 ? (
             <p className="border-t border-line px-4 py-3 font-mono text-[11px] text-ink-4">No recent failures.</p>

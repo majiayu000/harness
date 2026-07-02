@@ -42,6 +42,7 @@ struct OperatorMonitorPayload {
     health: OperatorHealth,
     activity: OperatorActivity,
     operator_actions: Vec<OperatorAction>,
+    stuck_workflows: Vec<StuckWorkflow>,
     failures: Vec<FailureGroup>,
     worktrees: WorktreeSummary,
 }
@@ -87,6 +88,20 @@ struct OperatorAction {
     url: Option<String>,
     evidence_url: Option<String>,
     next_action: &'static str,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StuckWorkflow {
+    workflow_id: String,
+    definition_id: String,
+    state: String,
+    repo: Option<String>,
+    issue: Option<u64>,
+    pr: Option<u64>,
+    age_secs: u64,
+    updated_at: String,
+    url: Option<String>,
     source: String,
 }
 
@@ -184,6 +199,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     );
     let by_source = source_activity(&workflows, &active_tasks);
     let operator_actions = operator_actions(&workflows, generated_at);
+    let stuck_workflows = list_stuck_workflows(state, generated_at).await?;
     let failures = grouped_failures(&recent_failures, &workflows);
     let capacity = state.concurrency.task_queue.global_limit() as u64;
     let local_live_worktrees = state
@@ -220,6 +236,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
             token_dispatch_by_repo: state.intake.github_token_dispatch_snapshot(),
         },
         operator_actions,
+        stuck_workflows,
         failures,
         worktrees: WorktreeSummary {
             used: worktree_used_count(local_live_worktrees, worktree_cards.len())
@@ -230,6 +247,66 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
             cards: worktree_cards,
         },
     })
+}
+
+async fn list_stuck_workflows(
+    state: &AppState,
+    generated_at: DateTime<Utc>,
+) -> anyhow::Result<Vec<StuckWorkflow>> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let workflow_cfg =
+        harness_core::config::workflow::load_workflow_config(&state.core.project_root)?;
+    if !workflow_cfg.storage.workflow_watchdog_enabled {
+        return Ok(Vec::new());
+    }
+    let cutoff = generated_at
+        - chrono::Duration::minutes(workflow_cfg.storage.workflow_watchdog_age_minutes as i64);
+    let workflows = store
+        .list_aged_wait_instances(
+            &["blocked", "awaiting_feedback"],
+            cutoff,
+            workflow_cfg.storage.workflow_watchdog_batch_size as i64,
+        )
+        .await?;
+    Ok(stuck_workflows_from_instances(&workflows, generated_at))
+}
+
+fn stuck_workflows_from_instances(
+    workflows: &[WorkflowInstance],
+    generated_at: DateTime<Utc>,
+) -> Vec<StuckWorkflow> {
+    let mut stuck = workflows
+        .iter()
+        .map(|workflow| {
+            let repo = string_field(&workflow.data, "repo");
+            let issue = u64_field(&workflow.data, "issue_number");
+            let pr = u64_field(&workflow.data, "pr_number");
+            let pr_url = string_field(&workflow.data, "pr_url");
+            let issue_url = repo
+                .as_ref()
+                .zip(issue)
+                .map(|(repo, issue)| format!("https://github.com/{repo}/issues/{issue}"));
+            StuckWorkflow {
+                workflow_id: workflow.id.clone(),
+                definition_id: workflow.definition_id.clone(),
+                state: workflow.state.clone(),
+                repo,
+                issue,
+                pr,
+                age_secs: generated_at
+                    .signed_duration_since(workflow.updated_at)
+                    .num_seconds()
+                    .max(0) as u64,
+                updated_at: workflow.updated_at.to_rfc3339(),
+                url: pr_url.or(issue_url),
+                source: workflow_source(workflow),
+            }
+        })
+        .collect::<Vec<_>>();
+    stuck.sort_by(|a, b| b.age_secs.cmp(&a.age_secs));
+    stuck
 }
 
 async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<WorkflowInstance>> {

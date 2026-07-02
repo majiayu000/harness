@@ -60,6 +60,7 @@ function makeMonitor(): OperatorMonitorPayload {
           failed: 0,
         },
       ],
+      token_dispatch_by_repo: [],
     },
     operator_actions: [
       {
@@ -74,6 +75,20 @@ function makeMonitor(): OperatorMonitorPayload {
         url: "https://github.com/owner/repo/pull/43",
         evidence_url: "/tasks/task-42",
         next_action: "Review and merge",
+        source: "github",
+      },
+    ],
+    stuck_workflows: [
+      {
+        workflow_id: "workflow-stuck",
+        definition_id: "github_issue_pr",
+        state: "awaiting_feedback",
+        repo: "owner/repo",
+        issue: 44,
+        pr: 45,
+        age_secs: 18_000,
+        updated_at: "2026-06-11T19:00:00Z",
+        url: "https://github.com/owner/repo/pull/45",
         source: "github",
       },
     ],
@@ -132,10 +147,12 @@ describe("<OperatorMonitorPanel>", () => {
     expect(screen.getByText("runtime running")).toBeInTheDocument();
     expect(screen.getByText("ready to merge")).toBeInTheDocument();
     expect(screen.getByText("#42 -> PR #43")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "open" })).toHaveAttribute(
+    expect(screen.getAllByRole("link", { name: "open" })[0]).toHaveAttribute(
       "href",
       "https://github.com/owner/repo/pull/43",
     );
+    expect(screen.getByText("awaiting feedback")).toBeInTheDocument();
+    expect(screen.getByText("#44 -> PR #45")).toBeInTheDocument();
   });
 
   it("renders grouped retryable GitHub fetch failures", () => {
