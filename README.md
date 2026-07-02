@@ -538,7 +538,7 @@ See [`SECURITY.md`](SECURITY.md) for vulnerability reporting.
 
 ## The Agent Infra Stack
 
-This project is one layer of an open-source stack for running coding agents (Claude Code, Codex) as serious infrastructure. Every piece works standalone; together they close the loop:
+This project is one layer of an open-source stack for running coding agents (Claude Code, Codex) as serious infrastructure. Each piece works independently; together they close the loop:
 
 `harness` is the **Orchestrate** layer — where skills, rules, memory, and models come together into long-running agent runs.
 
