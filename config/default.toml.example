@@ -137,6 +137,12 @@ enabled = false
 # sprint_timeout_secs = 10800
 # retry_backoff_base_secs = 15
 # retry_backoff_max_secs = 120
+# [intake.github.auto_merge]
+# enabled = false
+# method = "squash"
+# delete_branch = true
+# merge_execution = "agent"
+# verify_merge_completion = true
 
 # Register projects below (can also pass --project-root / --project on CLI).
 # [[projects]]

@@ -49,6 +49,23 @@ impl fmt::Display for GitHubMergeMethod {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubMergeExecution {
+    #[default]
+    Agent,
+    Server,
+}
+
+impl fmt::Display for GitHubMergeExecution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Agent => f.write_str("agent"),
+            Self::Server => f.write_str("server"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubAutoMergeConfig {
     /// Explicitly enable automatic merge dispatch. Default: false.
@@ -62,6 +79,14 @@ pub struct GitHubAutoMergeConfig {
     pub require_review_threads_resolved: bool,
     #[serde(default = "default_true")]
     pub require_clean_merge_state: bool,
+    /// Who executes the merge action once the server-side gate passes.
+    /// Default is agent execution with server-side completion verification.
+    #[serde(default)]
+    pub merge_execution: GitHubMergeExecution,
+    /// Verify agent-reported merge completion with a server-side GitHub read.
+    /// Default true; disabling restores the legacy trust-agent behavior.
+    #[serde(default = "default_true")]
+    pub verify_merge_completion: bool,
 }
 
 /// How GitHub issue intake is driven.
@@ -196,6 +221,8 @@ impl GitHubIntakeConfig {
             require_clean_merge_state: repo_cfg
                 .and_then(|config| config.require_clean_merge_state)
                 .unwrap_or(self.auto_merge.require_clean_merge_state),
+            merge_execution: self.auto_merge.merge_execution,
+            verify_merge_completion: self.auto_merge.verify_merge_completion,
         }
     }
 }
@@ -207,6 +234,8 @@ pub struct ResolvedGitHubAutoMergePolicy {
     pub delete_branch: bool,
     pub require_review_threads_resolved: bool,
     pub require_clean_merge_state: bool,
+    pub merge_execution: GitHubMergeExecution,
+    pub verify_merge_completion: bool,
 }
 
 fn default_intake_label() -> String {
@@ -241,6 +270,8 @@ impl Default for GitHubAutoMergeConfig {
             delete_branch: true,
             require_review_threads_resolved: true,
             require_clean_merge_state: true,
+            merge_execution: GitHubMergeExecution::Agent,
+            verify_merge_completion: true,
         }
     }
 }
@@ -426,6 +457,8 @@ method = "squash"
 delete_branch = true
 require_review_threads_resolved = true
 require_clean_merge_state = true
+merge_execution = "agent"
+verify_merge_completion = true
 
 [[repos]]
 repo = "owner/auto"
@@ -449,6 +482,8 @@ label = "harness"
         assert!(!auto.delete_branch);
         assert!(!auto.require_review_threads_resolved);
         assert!(!auto.require_clean_merge_state);
+        assert_eq!(auto.merge_execution, GitHubMergeExecution::Agent);
+        assert!(auto.verify_merge_completion);
 
         let manual = config.auto_merge_policy_for_repo("owner/manual");
         assert!(!manual.enabled);
@@ -456,6 +491,8 @@ label = "harness"
         assert!(manual.delete_branch);
         assert!(manual.require_review_threads_resolved);
         assert!(manual.require_clean_merge_state);
+        assert_eq!(manual.merge_execution, GitHubMergeExecution::Agent);
+        assert!(manual.verify_merge_completion);
     }
 }
 

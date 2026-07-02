@@ -17,6 +17,10 @@ use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
     prompt_task_request_for_job, PromptTaskRequest,
 };
+use super::merge_completion::{
+    server_merge_execution_enabled, server_merge_execution_unavailable_result,
+    verify_merge_completion_if_needed,
+};
 use super::pr_feedback_inspection::{
     execute_pr_feedback_inspection, is_server_owned_pr_feedback_inspection,
 };
@@ -182,7 +186,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 .thread_manager
                 .get_turn(&thread_id, &turn_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime turn disappeared before completion"))?;
-            Ok(activity_result_from_turn(
+            let result = activity_result_from_turn(
                 &job,
                 &turn.status,
                 &turn.items,
@@ -191,7 +195,11 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 agent_name,
                 &project_root,
                 &prompt_packet_digest,
-            ))
+            );
+            Ok(
+                verify_merge_completion_if_needed(self.state, &job, workflow.as_ref(), result)
+                    .await,
+            )
         }
         .await;
         let finish_result = finish_runtime_workspace(self.state, &runtime_workspace).await;
@@ -236,6 +244,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             activity if activity == harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY => Ok(
                 Some(execute_pr_feedback_inspection(self.state, job, parent).await),
             ),
+            "merge_pr" if server_merge_execution_enabled(self.state, job, parent) => {
+                Ok(Some(server_merge_execution_unavailable_result(job, parent)))
+            }
             _ => Ok(None),
         }
     }

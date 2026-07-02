@@ -168,11 +168,15 @@ async fn fetch_github_pr_snapshot_value(
             pullRequest(number: $pr) {
               number
               state
+              merged
               url
               title
               baseRefName
               headRefName
               headRefOid
+              mergeCommit {
+                oid
+              }
               isDraft
               mergeStateStatus
               reviewDecision
@@ -274,11 +278,19 @@ fn normalize_github_pr_snapshot(
     let pr_number = value_u64(pr.get("number")).context("GitHub PR snapshot missing number")?;
     let pr_url = value_string(pr.get("url")).context("GitHub PR snapshot missing url")?;
     let state = value_string(pr.get("state"));
+    let merged = pr.get("merged").and_then(Value::as_bool).or_else(|| {
+        state
+            .as_deref()
+            .map(|state| state.eq_ignore_ascii_case("MERGED"))
+    });
     let title = value_string(pr.get("title"));
     let base_ref = value_string(pr.get("baseRefName"));
     let expected_base_ref = target.expected_base_ref.clone();
     let head_ref = value_string(pr.get("headRefName"));
     let head_oid = value_string(pr.get("headRefOid"));
+    let merge_commit_sha = pr
+        .pointer("/mergeCommit/oid")
+        .and_then(|value| value_string(Some(value)));
     let is_draft = pr.get("isDraft").and_then(Value::as_bool);
     let merge_state_status = value_string(pr.get("mergeStateStatus"));
     let review_decision = value_string(pr.get("reviewDecision"));
@@ -300,6 +312,7 @@ fn normalize_github_pr_snapshot(
         "repo": target.repo_slug,
         "pr_number": pr_number,
         "state": state,
+        "merged": merged,
         "pr_url": pr_url,
         "url": pr_url,
         "title": title,
@@ -310,6 +323,8 @@ fn normalize_github_pr_snapshot(
         "headRefName": head_ref,
         "head_oid": head_oid,
         "headRefOid": head_oid,
+        "merge_commit_sha": merge_commit_sha,
+        "mergeCommitOid": merge_commit_sha,
         "is_draft": is_draft,
         "isDraft": is_draft,
         "merge_state_status": merge_state_status,

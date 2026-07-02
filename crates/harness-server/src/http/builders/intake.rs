@@ -84,6 +84,15 @@ pub(crate) async fn build_intake(
     });
 
     let github_cfg = github_polling_config(server.config.intake.github.as_ref());
+    if let Some(cfg) = github_cfg {
+        tracing::info!(
+            enabled = cfg.auto_merge.enabled,
+            merge_execution = %cfg.auto_merge.merge_execution,
+            verify_merge_completion = cfg.auto_merge.verify_merge_completion,
+            method = %cfg.auto_merge.method,
+            "intake: GitHub auto-merge configuration loaded"
+        );
+    }
     let github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = if let Some(cfg) =
         github_runtime_polling_config(github_cfg, registry.workflow_runtime_store.is_some())
     {

@@ -323,6 +323,22 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 | `github_webhook_secret` | — | HMAC-SHA256 secret for GitHub webhook verification |
 | `notification_broadcast_capacity` | `256` | Internal notification channel capacity |
 
+### `[intake.github.auto_merge]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enables server-side auto-merge gating for configured GitHub issue workflows. |
+| `method` | `"squash"` | Merge method requested after the deterministic gate passes. |
+| `delete_branch` | `true` | Whether merge execution should delete the source branch after merge. |
+| `merge_execution` | `"agent"` | Selects the merge executor. `"agent"` keeps the current agent-executed merge path and requires server-side completion verification. `"server"` is reserved for the server-executed merge rollout and fails closed until that rollout lands. |
+| `verify_merge_completion` | `true` | When true, an agent-reported `merge_pr` success is accepted only after Harness re-reads GitHub and observes the PR as merged. |
+
+Server-executed merge mode requires a GitHub token that can merge pull
+requests, typically a fine-grained token with repository contents write access
+and pull request read access, or an installation token with equivalent
+repository permissions. Agent mode does not add token requirements, but merge
+completion verification still needs read access to the pull request.
+
 ### `[agents]`
 
 | Field | Default | Description |
