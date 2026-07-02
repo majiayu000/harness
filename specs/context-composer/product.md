@@ -13,7 +13,7 @@ Two failure modes, both invisible today:
 
 ## Product Behavior
 
-- At `thread/start` (and on resume/steer), registered providers propose typed context items with a declared size, priority, and degrade ladder (full text → summary → one-line pointer).
+- At `thread/start` (and on resume), registered providers propose typed context items with a declared size, priority, and degrade ladder (full text → summary → one-line pointer).
 - The composer deduplicates, scores, and fits items into a configured token budget. Items that don't fit are degraded down their ladder before being excluded; every exclusion has a recorded reason.
 - Every composition emits a **manifest**: what was included, degraded, excluded, and why, with size accounting — stored as a harness-observe event, queryable later.
 - `context/preview` lets a human dry-run the composition for a task before running it.
@@ -47,8 +47,8 @@ Two failure modes, both invisible today:
 - Every excluded or degraded item appears in the manifest with a reason. No silent drops.
 - A count of instruction-bearing items > 15 raises a recorded warning in the manifest.
 
-## Open Questions
+## Decisions
 
-- Default class quotas (proposal in tech spec: rules 30 / skills 25 / contract 25 / brief 15 / drafts 5) — needs shadow-mode data to validate.
-- Token estimation: bytes/4 heuristic vs a real tokenizer; per-agent budget defaults for Claude Code vs Codex.
-- Should `turn/steer` recompose or only append? Leaning: recompose only on resume, never mid-turn.
+- Class quotas ship with the proposed defaults (rule 30 / skill 25 / contract 25 / brief 15 / draft 5). They are configuration, and shadow-mode manifests are the instrument for revising them — no further quota debate before that data exists.
+- v1 token estimation is `bytes / 4` behind the `Estimator` trait: deterministic, dependency-free, and shadow mode makes its error harmless. A real tokenizer is a drop-in replacement later.
+- Recomposition happens at `thread/start` and `thread/resume` only. `turn/steer` never recomposes mid-turn — steering text is user intent, not managed context.
