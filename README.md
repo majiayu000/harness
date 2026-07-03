@@ -2,7 +2,7 @@
 
 # Harness
 
-**An orchestration layer for AI coding agents — govern, observe, and improve agent workflows at scale.**
+**Run fleets of parallel coding agents with governance — orchestrate, police, review, and observe Claude Code / Codex at scale.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml)
@@ -26,11 +26,13 @@
 
 ---
 
-Harness is a Rust-native platform that wraps AI coding agents (Claude Code, Codex, Anthropic API) with structured lifecycle management, policy enforcement, and continuous feedback loops. Instead of replacing agents, it standardizes how they run, what they're allowed to do, and how their output is reviewed.
+AI development is no longer one agent in one terminal — it is fleets of agents working in parallel across issues, branches, and repositories. The hard problems move up a level: who assigns the work, what each agent is allowed to do, who reviews the output, and what happens when a run goes wrong at 3 a.m.
+
+Harness is a Rust-native control plane for that fleet. It wraps AI coding agents (Claude Code, Codex, Anthropic API) with structured lifecycle management, policy enforcement, and continuous feedback loops. Instead of replacing agents, it standardizes how they run, what they're allowed to do, and how their output is reviewed.
 
 ## Key Features
 
-- **Multi-agent orchestration** — Pluggable adapters for Claude Code CLI, Codex CLI, and Anthropic API with unified task/thread/turn lifecycle
+- **Fleet orchestration** — Run many agents in parallel with a unified task/thread/turn lifecycle; pluggable adapters for Claude Code CLI, Codex CLI, and Anthropic API
 - **Independent agent review** — Automatic cross-agent code review between implementation and GitHub review, preventing self-review by architecture
 - **Policy engine** — Starlark-based execution policies with hardened parser dialect (no `load`/`def`/`lambda`) for sandboxed rule evaluation
 - **Signal-driven GC** — Detects repeated warnings, chronic blockers, and hot files; generates and adopts remediation drafts within configurable budgets
