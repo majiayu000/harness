@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
 use harness_core::config::agents::SandboxMode;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -177,6 +178,7 @@ impl CodexAdapter {
             state.reset_child().await;
         }
 
+        let run_identity = crate::resolve_agent_run_identity(&HashMap::new());
         let mut cmd = tokio::process::Command::new(&self.cli_path);
         cmd.arg("app-server")
             .arg("--listen")
@@ -189,12 +191,21 @@ impl CodexAdapter {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
+        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         let mut child = cmd.spawn().map_err(|error| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to spawn codex app-server: {error}"
             ))
         })?;
+        if let Some(pid) = child.id() {
+            crate::write_provisional_agent_run_binding(
+                &run_identity,
+                "codex",
+                pid,
+                &req.project_root,
+            );
+        }
 
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {

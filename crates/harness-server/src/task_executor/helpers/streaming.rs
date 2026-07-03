@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::error::HarnessError;
 use harness_core::prompts;
+use harness_core::run_id::{RunId, RunIdentity};
 use harness_core::types::{
     Decision, Event, EventMetadata, ExecutionPhase, Item, SessionId, TokenUsage, TurnFailure,
     TurnTelemetry,
@@ -62,6 +63,7 @@ mod tests {
             Some("gpt-5"),
             "/repo",
             &usage,
+            None,
         )
         .ok_or_else(|| anyhow::anyhow!("missing llm_usage event"))?;
         assert_eq!(event.hook, "llm_usage");
@@ -96,6 +98,7 @@ mod tests {
             None,
             "/repo",
             &TokenUsage::default(),
+            None,
         );
         assert!(event.is_none());
     }
@@ -112,6 +115,7 @@ mod tests {
             "/repo",
             "hello world",
             2,
+            None,
         );
 
         assert_eq!(event.hook, "llm_prompt_input");
@@ -132,6 +136,44 @@ mod tests {
         assert_eq!(payload["prompt_bytes"], 11);
         assert_eq!(payload["context_items"], 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_events_include_explicit_run_id() -> anyhow::Result<()> {
+        let task_id = TaskId::from_str("run-id-telemetry");
+        let run_id: RunId = "ar-01j1qb3c9r7v5m2k8x4tznq6wd".parse()?;
+
+        let prompt_event = build_prompt_input_event(
+            &task_id,
+            1,
+            "execution",
+            "codex",
+            None,
+            "/repo",
+            "prompt",
+            0,
+            Some(run_id.clone()),
+        );
+        let usage_event = build_llm_usage_event(
+            &task_id,
+            1,
+            "execution",
+            "codex",
+            None,
+            "/repo",
+            &TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                total_tokens: 2,
+                cost_usd: 0.0,
+            },
+            Some(run_id.clone()),
+        )
+        .ok_or_else(|| anyhow::anyhow!("missing llm_usage event"))?;
+
+        assert_eq!(prompt_event.run_id, Some(run_id.clone()));
+        assert_eq!(usage_event.run_id, Some(run_id));
         Ok(())
     }
 
@@ -242,8 +284,10 @@ async fn log_llm_usage_event(
     model: Option<&str>,
     project: &str,
     usage: &TokenUsage,
+    run_id: Option<RunId>,
 ) {
-    let Some(event) = build_llm_usage_event(task_id, turn, phase, agent, model, project, usage)
+    let Some(event) =
+        build_llm_usage_event(task_id, turn, phase, agent, model, project, usage, run_id)
     else {
         return;
     };
@@ -268,6 +312,7 @@ async fn log_prompt_input_event(
     project: &str,
     prompt: &str,
     context_items: usize,
+    run_id: Option<RunId>,
 ) {
     let event = build_prompt_input_event(
         task_id,
@@ -278,6 +323,7 @@ async fn log_prompt_input_event(
         project,
         prompt,
         context_items,
+        run_id,
     );
     log_usage_event_with_timeout(
         task_id,
@@ -298,6 +344,7 @@ fn build_prompt_input_event(
     project: &str,
     prompt: &str,
     context_items: usize,
+    run_id: Option<RunId>,
 ) -> Event {
     let reported_at = Utc::now();
     let prompt_chars = prompt.chars().count();
@@ -320,6 +367,7 @@ fn build_prompt_input_event(
         agent,
         Decision::Complete,
     );
+    event.run_id = run_id;
     event.ts = reported_at;
     event.detail = Some(format!(
         "task_id={} project={} model={} prompt_chars={} prompt_bytes={}",
@@ -348,6 +396,7 @@ fn build_llm_usage_event(
     model: Option<&str>,
     project: &str,
     usage: &TokenUsage,
+    run_id: Option<RunId>,
 ) -> Option<Event> {
     if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.total_tokens == 0 {
         return None;
@@ -367,6 +416,7 @@ fn build_llm_usage_event(
         "reported_total_tokens": usage_metrics.reported_total_tokens,
     });
     let mut event = Event::new(SessionId::new(), "llm_usage", agent, Decision::Complete);
+    event.run_id = run_id;
     event.ts = reported_at;
     event.detail = Some(format!(
         "task_id={} project={} model={} tokens={}",
@@ -453,7 +503,7 @@ pub(crate) async fn run_agent_streaming(
 
 pub(crate) async fn run_agent_streaming_with_options(
     agent: &dyn CodeAgent,
-    req: AgentRequest,
+    mut req: AgentRequest,
     task_id: &TaskId,
     store: &TaskStore,
     turn: u32,
@@ -469,6 +519,16 @@ pub(crate) async fn run_agent_streaming_with_options(
     let project = usage_project_label(task_project_root.as_deref(), &req.project_root);
     let is_prompt_only = is_prompt_only_task(store, task_id);
     let phase_str = execution_phase_label(req.execution_phase);
+    let run_id = match RunIdentity::ensure_env_vars(&mut req.env_vars) {
+        Ok(identity) => Some(identity.run_id),
+        Err(error) => {
+            tracing::error!(
+                task_id = %task_id,
+                "invalid agent run identity environment; telemetry events will not include run_id: {error}"
+            );
+            None
+        }
+    };
     if !is_prompt_only {
         let redacted_prompt = crate::redact::redact_secrets(&req.prompt, &req.env_vars);
         if let Err(e) = store
@@ -490,6 +550,7 @@ pub(crate) async fn run_agent_streaming_with_options(
                 &project,
                 &req.prompt,
                 req.context.len(),
+                run_id.clone(),
             )
             .await;
         }
@@ -618,6 +679,7 @@ pub(crate) async fn run_agent_streaming_with_options(
             requested_model.as_deref(),
             &project,
             &token_usage,
+            run_id,
         )
         .await;
     }

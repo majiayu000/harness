@@ -187,6 +187,7 @@ impl CodexAgent {
                 ))
             })?;
 
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
@@ -202,6 +203,7 @@ impl CodexAgent {
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
+        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -230,6 +232,14 @@ impl CodexAgent {
             tracing::error!(agent = "codex", mode = "review", error_kind = ?error.kind(), "{message}");
             harness_core::error::HarnessError::AgentExecution(message)
         })?;
+        if let Some(pid) = child.id() {
+            crate::write_provisional_agent_run_binding(
+                &run_identity,
+                "codex",
+                pid,
+                &req.project_root,
+            );
+        }
 
         if use_stdin_prompt {
             let Some(instructions) = req.instructions.as_deref() else {
@@ -489,6 +499,7 @@ impl CodeAgent for CodexAgent {
                 ))
             })?;
 
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
@@ -500,6 +511,7 @@ impl CodeAgent for CodexAgent {
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
+        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -530,6 +542,14 @@ impl CodeAgent for CodexAgent {
             );
             harness_core::error::HarnessError::AgentExecution(message)
         })?;
+        if let Some(pid) = child.id() {
+            crate::write_provisional_agent_run_binding(
+                &run_identity,
+                "codex",
+                pid,
+                &req.project_root,
+            );
+        }
         let mut child = crate::ManagedChild::new(child, "codex execute");
         let output = child.wait_with_output().await.map_err(|err| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -599,6 +619,7 @@ impl CodeAgent for CodexAgent {
                 ))
             })?;
 
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
@@ -610,6 +631,7 @@ impl CodeAgent for CodexAgent {
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
+        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -640,6 +662,14 @@ impl CodeAgent for CodexAgent {
             );
             harness_core::error::HarnessError::AgentExecution(message)
         })?;
+        if let Some(pid) = child.id() {
+            crate::write_provisional_agent_run_binding(
+                &run_identity,
+                "codex",
+                pid,
+                &req.project_root,
+            );
+        }
         let mut child = crate::ManagedChild::new(child, "codex execute_stream");
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
