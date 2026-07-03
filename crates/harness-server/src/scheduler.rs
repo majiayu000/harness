@@ -245,7 +245,7 @@ mod tests {
             .find(|entry| entry["surface"] == "thread_manager")
             .and_then(|entry| entry["count"].as_u64())
             .unwrap_or(0);
-        assert!(thread_manager_count >= before + 1);
+        assert!(thread_manager_count > before);
         Ok(())
     }
 

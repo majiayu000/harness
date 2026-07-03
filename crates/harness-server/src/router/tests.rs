@@ -818,8 +818,8 @@ async fn usage_probe_counts_thread_and_turn_rpc_dispatch() -> anyhow::Result<()>
         .find(|entry| entry.surface == "turn_rpc")
         .ok_or_else(|| anyhow::anyhow!("missing turn_rpc count"))?;
 
-    assert!(thread_rpc.count >= thread_before + 1);
-    assert!(turn_rpc.count >= turn_before + 1);
+    assert!(thread_rpc.count > thread_before);
+    assert!(turn_rpc.count > turn_before);
     Ok(())
 }
 
@@ -935,7 +935,7 @@ async fn usage_probe_report_is_queryable_from_event_detail() -> anyhow::Result<(
         .find(|entry| entry["surface"] == "task_runner")
         .and_then(|entry| entry["count"].as_u64())
         .unwrap_or(0);
-    assert!(task_runner_count >= before + 1);
+    assert!(task_runner_count > before);
     assert!(events[0].content.is_none());
     Ok(())
 }

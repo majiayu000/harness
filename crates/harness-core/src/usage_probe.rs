@@ -123,7 +123,7 @@ mod tests {
         record_usage(UsageProbeSurface::ReviewStore);
 
         assert!(count_for("thread_rpc") >= thread_before + 2);
-        assert!(count_for("review_store") >= review_before + 1);
+        assert!(count_for("review_store") > review_before);
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
             .find(|entry| entry["surface"] == "task_runner")
             .and_then(|entry| entry["count"].as_u64())
             .unwrap_or(0);
-        assert!(task_runner_count >= before + 1);
+        assert!(task_runner_count > before);
         assert!(
             event.content.is_none(),
             "queryable summary must be in detail"
