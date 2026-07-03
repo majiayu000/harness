@@ -117,6 +117,20 @@ discovery_paths = []
 session_renewal_secs = 1800
 log_retention_days = 90
 
+[context]
+# Shadow mode records composition manifests without changing injected context.
+mode = "shadow"
+budget_tokens = 24000
+reserved_headroom = 0.20
+provider_timeout_ms = 2000
+
+[context.quotas]
+rule = 0.30
+skill = 0.25
+contract = 0.25
+brief = 0.15
+draft = 0.05
+
 [otel]
 environment = "development"
 exporter = "disabled"

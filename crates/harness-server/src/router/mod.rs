@@ -212,6 +212,15 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         } => Some(
             handlers::cross_review::cross_review(state, id, project_root, target, max_rounds).await,
         ),
+
+        // === Context composer ===
+        Method::ContextPreview {
+            request,
+            supplied_items,
+        } => Some(handlers::context::context_preview(state, id, request, supplied_items).await),
+        Method::ContextManifestGet { thread_id } => {
+            Some(handlers::context::context_manifest_get(state, id, thread_id).await)
+        }
     }
 }
 

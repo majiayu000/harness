@@ -14,6 +14,7 @@ harness-workflow = { workspace = true }
 harness-gc = { workspace = true }
 harness-rules = { workspace = true }
 harness-skills = { workspace = true }
+harness-context = { workspace = true }
 harness-observe = { workspace = true }
 harness-exec = { workspace = true }
 harness-eval = { workspace = true }

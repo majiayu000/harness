@@ -1154,6 +1154,123 @@ async fn skill_delete_removes_skill() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn context_rpc_preview_with_supplied_items_returns_manifest() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let request = harness_context::ComposeRequest {
+        thread_id: harness_core::types::ThreadId::from_str("thread-preview"),
+        run_id: None,
+        project: harness_core::types::ProjectId::from_str("project-preview"),
+        task_profile: harness_context::TaskProfile {
+            prompt: Some("preview supplied context".to_string()),
+            ..Default::default()
+        },
+        budget_hint: 100,
+    };
+    let supplied = vec![harness_context::ContextItem {
+        id: harness_context::ItemId::new("rule:supplied"),
+        class: harness_context::ItemClass::Rule,
+        content: "Follow the supplied rule.".to_string(),
+        est_tokens: 0,
+        priority: harness_context::Priority::P1,
+        relevance: 1.0,
+        degrade: vec![harness_context::Degraded::Pointer(
+            "See supplied rule.".to_string(),
+        )],
+        dedupe_key: None,
+        instruction_bearing: true,
+    }];
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ContextPreview {
+            request,
+            supplied_items: supplied,
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    assert!(
+        resp.error.is_none(),
+        "context preview should succeed: {:?}",
+        resp.error
+    );
+    let result = resp
+        .result
+        .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+    assert!(result["rendered"]
+        .as_str()
+        .unwrap_or("")
+        .contains("supplied rule"));
+    assert_eq!(result["manifest"]["mode"], serde_json::json!("preview"));
+    let manifest_items = result["manifest"]["items"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("manifest items should be an array"))?;
+    assert!(manifest_items
+        .iter()
+        .any(|item| item["id"] == serde_json::json!("rule:supplied")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_shadow_thread_start_logs_manifest_without_response_shape_change(
+) -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let proj_dir = crate::test_helpers::tempdir_in_home("harness-context-shadow-")?;
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ThreadStart {
+            cwd: proj_dir.path().to_path_buf(),
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    assert!(
+        resp.error.is_none(),
+        "thread_start should preserve success: {:?}",
+        resp.error
+    );
+    let result = resp
+        .result
+        .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+    let thread_id = result["thread_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing thread_id"))?
+        .to_string();
+    assert_eq!(
+        result.as_object().map(|object| object.len()),
+        Some(1),
+        "shadow mode must not add response fields"
+    );
+
+    let get_req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(2)),
+        method: Method::ContextManifestGet {
+            thread_id: harness_core::types::ThreadId::from_str(&thread_id),
+        },
+    };
+    let get_resp = handle_request(&state, get_req).await.expect("response");
+    assert!(
+        get_resp.error.is_none(),
+        "manifest get should succeed: {:?}",
+        get_resp.error
+    );
+    let manifest = get_resp
+        .result
+        .ok_or_else(|| anyhow::anyhow!("missing manifest result"))?;
+    assert_eq!(manifest["manifest"]["mode"], serde_json::json!("shadow"));
+    assert_eq!(
+        manifest["manifest"]["thread_id"],
+        serde_json::json!(thread_id)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_errors_for_unknown_thread() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
