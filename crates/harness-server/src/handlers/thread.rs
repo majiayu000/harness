@@ -289,6 +289,21 @@ pub async fn turn_steer(
         .find_thread_for_turn(&turn_id)
     {
         Some(thread_id) => {
+            let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) else {
+                return RpcResponse::error(id, NOT_FOUND, "thread not found");
+            };
+            let profile =
+                task_profile_for_thread(state, &thread, "turn_steer", Some(instruction.clone()));
+            if let Err(error) = crate::handlers::context::record_context_composition(
+                state,
+                &thread_id,
+                harness_core::types::ProjectId::from_path(&thread.project_root),
+                profile,
+            )
+            .await
+            {
+                return RpcResponse::error(id, INTERNAL_ERROR, error);
+            }
             match state
                 .core
                 .server
@@ -344,26 +359,27 @@ pub async fn thread_resume(
     id: Option<serde_json::Value>,
     thread_id: ThreadId,
 ) -> RpcResponse {
+    let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) else {
+        return RpcResponse::error(id, INTERNAL_ERROR, format!("thread not found: {thread_id}"));
+    };
+    let profile = task_profile_for_thread(
+        state,
+        &thread,
+        "thread_resume",
+        latest_user_message(&thread),
+    );
+    if let Err(error) = crate::handlers::context::record_context_composition(
+        state,
+        &thread_id,
+        harness_core::types::ProjectId::from_path(&thread.project_root),
+        profile,
+    )
+    .await
+    {
+        return RpcResponse::error(id, INTERNAL_ERROR, error);
+    }
     match state.core.server.thread_manager.resume_thread(&thread_id) {
         Ok(()) => {
-            if let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) {
-                let profile = task_profile_for_thread(
-                    state,
-                    &thread,
-                    "thread_resume",
-                    latest_user_message(&thread),
-                );
-                if let Err(error) = crate::handlers::context::record_context_composition(
-                    state,
-                    &thread_id,
-                    harness_core::types::ProjectId::from_path(&thread.project_root),
-                    profile,
-                )
-                .await
-                {
-                    return RpcResponse::error(id, INTERNAL_ERROR, error);
-                }
-            }
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "resumed": true }))
         }

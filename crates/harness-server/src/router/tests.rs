@@ -6,9 +6,15 @@ use crate::{
     thread_manager::ThreadManager,
 };
 use harness_agents::registry::AgentRegistry;
-use harness_core::config::HarnessConfig;
+use harness_core::{
+    agent::{AgentAdapter, AgentEvent, TurnRequest},
+    config::HarnessConfig,
+};
 use harness_protocol::{methods::Method, methods::RpcRequest, methods::VALIDATION_ERROR};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::RwLock;
 
 async fn make_test_state_with_config_and_registry(
@@ -1323,6 +1329,149 @@ async fn context_enforce_thread_start_fails_closed_until_injection_is_wired() ->
         error.message
     );
     assert!(resp.result.is_none());
+    Ok(())
+}
+
+struct SteerTrackingAdapter {
+    steer_called: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for SteerTrackingAdapter {
+    fn name(&self) -> &str {
+        "tracking"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: TurnRequest,
+        _tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn steer(&self, _text: String) -> harness_core::error::Result<()> {
+        self.steer_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn context_enforce_thread_resume_does_not_mutate_thread_status() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.context.mode = harness_core::config::misc::ContextMode::Enforce;
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), config, AgentRegistry::new("claude"))
+            .await?;
+    let proj_dir = tempfile::tempdir()?;
+    let thread_id = state
+        .core
+        .server
+        .thread_manager
+        .start_thread(proj_dir.path().to_path_buf());
+    {
+        let mut thread = state
+            .core
+            .server
+            .thread_manager
+            .threads_cache()
+            .get_mut(thread_id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("thread should exist"))?;
+        thread.status = harness_core::types::ThreadStatus::Archived;
+    }
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ThreadResume {
+            thread_id: thread_id.clone(),
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    let error = resp
+        .error
+        .ok_or_else(|| anyhow::anyhow!("enforce mode should fail closed"))?;
+
+    assert!(
+        error.message.contains("context enforce mode"),
+        "unexpected error: {}",
+        error.message
+    );
+    let thread = state
+        .core
+        .server
+        .thread_manager
+        .get_thread(&thread_id)
+        .ok_or_else(|| anyhow::anyhow!("thread should remain present"))?;
+    assert_eq!(thread.status, harness_core::types::ThreadStatus::Archived);
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_enforce_turn_steer_does_not_call_adapter_or_append_item() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.context.mode = harness_core::config::misc::ContextMode::Enforce;
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), config, AgentRegistry::new("claude"))
+            .await?;
+    let proj_dir = tempfile::tempdir()?;
+    let thread_id = state
+        .core
+        .server
+        .thread_manager
+        .start_thread(proj_dir.path().to_path_buf());
+    let turn_id = state.core.server.thread_manager.start_turn(
+        &thread_id,
+        "initial task".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+    let steer_called = Arc::new(AtomicBool::new(false));
+    state.core.server.thread_manager.register_active_adapter(
+        &turn_id,
+        Arc::new(SteerTrackingAdapter {
+            steer_called: steer_called.clone(),
+        }),
+    );
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::TurnSteer {
+            turn_id: turn_id.clone(),
+            instruction: "redirect here".to_string(),
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    let error = resp
+        .error
+        .ok_or_else(|| anyhow::anyhow!("enforce mode should fail closed"))?;
+
+    assert!(
+        error.message.contains("context enforce mode"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert!(
+        !steer_called.load(Ordering::SeqCst),
+        "adapter steer must not run when context enforce fails"
+    );
+    let turn = state
+        .core
+        .server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should remain present"))?;
+    assert_eq!(
+        turn.items.len(),
+        1,
+        "failed enforce steer must not append a user message"
+    );
     Ok(())
 }
 
