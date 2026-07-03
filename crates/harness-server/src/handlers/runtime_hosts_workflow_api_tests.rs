@@ -9,6 +9,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+use chrono::Utc;
 use harness_workflow::runtime::{
     ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeKind, WorkflowCommand, WorkflowInstance,
     WorkflowRuntimeStore, WorkflowSubject,
@@ -213,6 +214,57 @@ async fn runtime_job_claim_endpoint_blocks_duplicate_claims() -> anyhow::Result<
     )
     .await?;
     assert_eq!(second["claimed"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_claim_endpoint_defers_open_circuit_profile() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state.clone());
+    register_host(&app, "host-a").await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-open-circuit",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "remote_check" }),
+    )
+    .await?;
+    let now = Utc::now();
+    for index in 0..5 {
+        state.runtime_circuit_breakers.record_failure(
+            "remote-host-default",
+            &format!("seed-failure-{index}"),
+            crate::runtime_circuit_breaker::FailureClass::QuotaInteractiveWait,
+            now,
+        );
+    }
+
+    let json = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(json["claimed"], false);
+    let deferred = store
+        .get_runtime_job(&job.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("remote host job should still exist"))?;
+    assert_eq!(deferred.status, RuntimeJobStatus::Pending);
+    assert!(deferred.lease.is_none());
+    assert!(deferred
+        .not_before
+        .is_some_and(|not_before| not_before > now));
+    let events = store.runtime_events_for(&job.id).await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "RuntimeJobClaimDeferred");
+    assert_eq!(events[0].event["claim_api"], "runtime_host");
     Ok(())
 }
 

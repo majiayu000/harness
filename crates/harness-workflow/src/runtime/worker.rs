@@ -5,7 +5,7 @@ use super::model::{
 use super::store::WorkflowRuntimeStore;
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use std::time::Duration as StdDuration;
 
@@ -22,10 +22,29 @@ pub trait RuntimeJobExecutor: Send + Sync {
     async fn execute(&self, job: RuntimeJob) -> ActivityResult;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeJobClaimDecision {
+    Proceed,
+    Defer {
+        not_before: DateTime<Utc>,
+        reason: String,
+    },
+}
+
+pub trait RuntimeJobClaimGuard: Send + Sync {
+    fn before_execute(
+        &self,
+        job: &RuntimeJob,
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> RuntimeJobClaimDecision;
+}
+
 pub struct RuntimeWorker<'a> {
     store: &'a WorkflowRuntimeStore,
     owner: String,
     lease_ttl: Duration,
+    claim_guard: Option<&'a (dyn RuntimeJobClaimGuard + Send + Sync)>,
 }
 
 impl<'a> RuntimeWorker<'a> {
@@ -34,11 +53,20 @@ impl<'a> RuntimeWorker<'a> {
             store,
             owner: owner.into(),
             lease_ttl: Duration::minutes(15),
+            claim_guard: None,
         }
     }
 
     pub fn with_lease_ttl(mut self, lease_ttl: Duration) -> Self {
         self.lease_ttl = lease_ttl;
+        self
+    }
+
+    pub fn with_claim_guard(
+        mut self,
+        claim_guard: &'a (dyn RuntimeJobClaimGuard + Send + Sync),
+    ) -> Self {
+        self.claim_guard = Some(claim_guard);
         self
     }
 
@@ -58,6 +86,43 @@ impl<'a> RuntimeWorker<'a> {
         else {
             return Ok(None);
         };
+
+        if let Some(claim_guard) = self.claim_guard {
+            match claim_guard.before_execute(&job, Utc::now(), lease_expires_at) {
+                RuntimeJobClaimDecision::Proceed => {}
+                RuntimeJobClaimDecision::Defer { not_before, reason } => {
+                    let Some(_) = self
+                        .store
+                        .defer_runtime_job_claim_if_owned(
+                            &job.id,
+                            &self.owner,
+                            lease_expires_at,
+                            not_before,
+                        )
+                        .await?
+                    else {
+                        tracing::warn!(
+                            runtime_job_id = %job.id,
+                            owner = %self.owner,
+                            "runtime job claim defer ignored because the worker no longer owns the lease"
+                        );
+                        return Ok(None);
+                    };
+                    self.store
+                        .record_runtime_event(
+                            &job.id,
+                            "RuntimeJobClaimDeferred",
+                            json!({
+                                "owner": self.owner.as_str(),
+                                "not_before": not_before,
+                                "reason": reason,
+                            }),
+                        )
+                        .await?;
+                    return Ok(None);
+                }
+            }
+        }
 
         self.store
             .record_runtime_event(
@@ -454,6 +519,24 @@ mod tests {
         }
     }
 
+    struct DeferringClaimGuard {
+        not_before: DateTime<Utc>,
+    }
+
+    impl RuntimeJobClaimGuard for DeferringClaimGuard {
+        fn before_execute(
+            &self,
+            _job: &RuntimeJob,
+            _now: DateTime<Utc>,
+            _lease_expires_at: DateTime<Utc>,
+        ) -> RuntimeJobClaimDecision {
+            RuntimeJobClaimDecision::Defer {
+                not_before: self.not_before,
+                reason: "test guard".to_string(),
+            }
+        }
+    }
+
     async fn enqueue_test_runtime_job(
         store: &WorkflowRuntimeStore,
         key: &str,
@@ -520,6 +603,63 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "RuntimeJobClaimed");
         assert_eq!(events[1].event_type, "ActivityResultReady");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_guard_defers_job_before_runtime_dispatch() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = match WorkflowRuntimeStore::open(&harness_core::config::dirs::default_db_path(
+            dir.path(),
+            "workflow_runtime",
+        ))
+        .await
+        {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!("runtime worker claim guard test skipped: {error}");
+                return Ok(());
+            }
+        };
+        let job = enqueue_test_runtime_job(
+            &store,
+            "guard-defer",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "check" }),
+        )
+        .await?;
+        let not_before = Utc::now() + Duration::minutes(10);
+        let guard = DeferringClaimGuard { not_before };
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executor = PreflightRuntimeExecutor {
+            result: ActivityResult::succeeded("check", "should not run"),
+            executions: executions.clone(),
+        };
+
+        let completed = RuntimeWorker::new(&store, "runtime-1")
+            .with_lease_ttl(Duration::minutes(5))
+            .with_claim_guard(&guard)
+            .run_once(&executor)
+            .await?;
+
+        assert!(completed.is_none());
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let deferred = store
+            .get_runtime_job(&job.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("runtime job should still exist"))?;
+        assert_eq!(deferred.status, RuntimeJobStatus::Pending);
+        assert!(deferred.lease.is_none());
+        assert_eq!(deferred.not_before, Some(not_before));
+        let events = store.runtime_events_for(&job.id).await?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "RuntimeJobClaimDeferred");
+        assert_eq!(events[0].event["reason"], "test guard");
         Ok(())
     }
 

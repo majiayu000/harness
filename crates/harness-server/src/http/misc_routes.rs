@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -111,6 +111,33 @@ pub(crate) async fn project_queue_stats(
         },
         "projects": projects,
     }))
+}
+
+pub(crate) async fn reset_runtime_circuit_breaker(
+    State(state): State<Arc<AppState>>,
+    Path(profile): Path<String>,
+) -> Response {
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "runtime profile is required" })),
+        )
+            .into_response();
+    }
+    let event = state
+        .runtime_circuit_breakers
+        .reset(profile, chrono::Utc::now());
+    crate::workflow_runtime_worker::emit_circuit_breaker_events(&state, vec![event]).await;
+    let circuit_breakers = state.runtime_circuit_breakers.snapshots(chrono::Utc::now());
+    (
+        StatusCode::OK,
+        Json(json!({
+            "profile": profile,
+            "circuit_breakers": circuit_breakers,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]

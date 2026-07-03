@@ -44,6 +44,7 @@ pub mod redact;
 pub mod review_store;
 pub mod router;
 pub mod rule_enforcer;
+pub(crate) mod runtime_circuit_breaker;
 pub mod runtime_hosts;
 pub mod runtime_hosts_state;
 pub mod runtime_project_cache;

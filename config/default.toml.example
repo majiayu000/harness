@@ -34,6 +34,14 @@ project_root = "."
 # Increase this when using gpt-5.5/xhigh for background workflow runtime jobs.
 # stall_timeout_secs = 3600
 
+[workflow.circuit_breaker]
+# Pause dispatch for a runtime profile after repeated same-class failures.
+enabled = true
+consecutive_failures = 5
+cooldown_secs = 600
+backoff_factor = 2.0
+max_cooldown_secs = 7200
+
 [agents]
 default_agent = "codex"
 # Optional: preferred routing order for complex/critical tasks.

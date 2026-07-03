@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::http::state::AppState;
+use crate::runtime_circuit_breaker::CircuitBreakerSnapshot;
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
 #[path = "misc_routes_runtime_tree_nodes.rs"]
 mod nodes;
@@ -129,6 +130,7 @@ struct WorkflowRuntimeTreeSummary {
     pub running_job_lease_statuses: BTreeMap<String, usize>,
     pub activity_outcomes: BTreeMap<String, usize>,
     pub jobs_without_activity_envelope: usize,
+    pub circuit_breakers: Vec<CircuitBreakerSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +203,7 @@ pub(crate) async fn get_workflow_runtime_tree(
             WorkflowRuntimeTreeDetail::Full => WorkflowRuntimeTreeMode::Full,
         }
     };
+    let circuit_breakers = state.runtime_circuit_breakers.snapshots(chrono::Utc::now());
     if mode.summary_only() {
         return match build_workflow_runtime_tree_summary_only(
             store,
@@ -209,6 +212,7 @@ pub(crate) async fn get_workflow_runtime_tree(
             offset,
             job_limit as usize,
             mode,
+            circuit_breakers,
         )
         .await
         {
@@ -231,6 +235,7 @@ pub(crate) async fn get_workflow_runtime_tree(
             query.project_id.as_deref(),
             job_limit as usize,
             mode,
+            circuit_breakers,
         )
         .await
         {
@@ -256,8 +261,10 @@ async fn build_workflow_runtime_tree_summary_only(
     offset: i64,
     job_limit: usize,
     mode: WorkflowRuntimeTreeMode,
+    circuit_breakers: Vec<CircuitBreakerSnapshot>,
 ) -> anyhow::Result<WorkflowRuntimeTreeResponse> {
-    let (summary, total_workflows) = workflow_runtime_tree_summary(store, project_id).await?;
+    let (summary, total_workflows) =
+        workflow_runtime_tree_summary(store, project_id, circuit_breakers).await?;
     Ok(WorkflowRuntimeTreeResponse {
         total_workflows,
         pagination: WorkflowRuntimeTreePagination::new(
@@ -281,13 +288,14 @@ async fn build_workflow_runtime_tree(
     project_id: Option<&str>,
     job_limit: usize,
     mode: WorkflowRuntimeTreeMode,
+    circuit_breakers: Vec<CircuitBreakerSnapshot>,
 ) -> anyhow::Result<WorkflowRuntimeTreeResponse> {
     let instances = page.instances;
     let workflow_ids: Vec<String> = instances
         .iter()
         .map(|instance| instance.id.clone())
         .collect();
-    let (summary, _) = workflow_runtime_tree_summary(store, project_id).await?;
+    let (summary, _) = workflow_runtime_tree_summary(store, project_id, circuit_breakers).await?;
 
     let (mut by_id, children_by_parent) = match mode {
         WorkflowRuntimeTreeMode::Full => {
@@ -353,6 +361,7 @@ async fn build_workflow_runtime_tree(
 async fn workflow_runtime_tree_summary(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     project_id: Option<&str>,
+    circuit_breakers: Vec<CircuitBreakerSnapshot>,
 ) -> anyhow::Result<(WorkflowRuntimeTreeSummary, usize)> {
     let aggregate_summary = store
         .runtime_summary_counts_for_instances(
@@ -380,6 +389,7 @@ async fn workflow_runtime_tree_summary(
             running_job_lease_statuses: aggregate_summary.running_job_lease_statuses,
             activity_outcomes: aggregate_summary.activity_outcomes,
             jobs_without_activity_envelope: aggregate_summary.jobs_without_activity_envelope,
+            circuit_breakers,
         },
         total_workflows,
     ))

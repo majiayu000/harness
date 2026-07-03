@@ -63,6 +63,8 @@ pub(super) struct WorkflowRuntimeJobNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub not_before: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -95,6 +97,7 @@ impl WorkflowRuntimeJobNode {
             input: Some(job.input),
             output: job.output,
             error: job.error,
+            failure_class: job.failure_class,
             not_before: job.not_before,
             created_at: job.created_at,
             updated_at: job.updated_at,
@@ -148,6 +151,7 @@ impl WorkflowRuntimeJobNode {
             input: None,
             output: None,
             error: job.error,
+            failure_class: job.failure_class,
             not_before: job.not_before,
             created_at: job.created_at,
             updated_at: job.updated_at,

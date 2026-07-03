@@ -27,6 +27,8 @@ pub mod validator;
 pub mod worker;
 
 #[cfg(test)]
+mod circuit_breaker_store_tests;
+#[cfg(test)]
 mod tests;
 
 pub use bus::InMemoryWorkflowBus;
@@ -95,4 +97,6 @@ pub use validator::{
     DecisionValidator, TransitionAllowlist, TransitionRule, ValidationContext,
     WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
 };
-pub use worker::{RuntimeJobExecutor, RuntimeWorker};
+pub use worker::{
+    RuntimeJobClaimDecision, RuntimeJobClaimGuard, RuntimeJobExecutor, RuntimeWorker,
+};

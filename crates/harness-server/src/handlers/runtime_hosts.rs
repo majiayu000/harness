@@ -6,7 +6,8 @@ use axum::{
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use harness_workflow::runtime::{
-    ActivityResult, RuntimeJobNotFoundError, RuntimeKind, WorkflowRuntimeStore,
+    ActivityResult, RuntimeJobClaimDecision, RuntimeJobClaimGuard, RuntimeJobNotFoundError,
+    RuntimeKind, WorkflowRuntimeStore,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -294,6 +295,62 @@ pub async fn claim_runtime_job_for_runtime_host(
         }
     };
 
+    match state
+        .runtime_circuit_breakers
+        .before_execute(&job, Utc::now(), lease_expires_at)
+    {
+        RuntimeJobClaimDecision::Proceed => {}
+        RuntimeJobClaimDecision::Defer { not_before, reason } => {
+            match store
+                .defer_runtime_job_claim_if_owned(&job.id, &host_id, lease_expires_at, not_before)
+                .await
+            {
+                Ok(Some(_)) => {
+                    if let Err(e) = store
+                        .record_runtime_event(
+                            &job.id,
+                            "RuntimeJobClaimDeferred",
+                            json!({
+                                "owner": host_id.as_str(),
+                                "not_before": not_before,
+                                "reason": reason,
+                                "claim_api": "runtime_host",
+                            }),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            runtime_job_id = %job.id,
+                            error = %e,
+                            "runtime host claim defer succeeded but runtime event recording failed"
+                        );
+                    }
+                    return (StatusCode::OK, Json(json!({ "claimed": false })));
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        runtime_job_id = %job.id,
+                        host_id = %host_id,
+                        "runtime host claim defer ignored because the host no longer owns the lease"
+                    );
+                    return (StatusCode::OK, Json(json!({ "claimed": false })));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        runtime_job_id = %job.id,
+                        host_id = %host_id,
+                        error = %e,
+                        "runtime host failed to defer circuit-breaker-blocked runtime job"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": format!("failed to defer runtime job: {e}") })),
+                    );
+                }
+            }
+        }
+    }
+
     if let Err(e) = store
         .record_runtime_event(
             &job.id,
@@ -400,11 +457,26 @@ pub async fn complete_runtime_job_for_runtime_host(
         );
     }
 
+    let mut runtime_job = completion.runtime_job;
+    if let Err(e) = crate::workflow_runtime_worker::record_runtime_circuit_breaker_completion(
+        state.as_ref(),
+        store.as_ref(),
+        &mut runtime_job,
+    )
+    .await
+    {
+        tracing::warn!(
+            runtime_job_id = %runtime_job_id,
+            error = %e,
+            "runtime host completion succeeded but circuit breaker update failed"
+        );
+    }
+
     (
         StatusCode::OK,
         Json(json!({
             "completed": true,
-            "runtime_job": completion.runtime_job,
+            "runtime_job": runtime_job,
             "workflow_event": completion.workflow_event,
             "decision": completion.decision,
         })),

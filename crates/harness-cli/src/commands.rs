@@ -9,6 +9,7 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 
 mod exec;
 mod reconcile;
+mod runtime;
 mod serve;
 mod status;
 
@@ -140,6 +141,12 @@ pub enum Command {
         /// Print raw combined JSON instead of a compact text summary.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Workflow runtime operator commands
+    Runtime {
+        #[command(subcommand)]
+        cmd: RuntimeCommand,
     },
 
     /// Reconcile harness task state against GitHub PR/issue state
@@ -300,6 +307,27 @@ pub enum PlanCommand {
     Status {
         /// Plan ID or file path
         plan: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RuntimeCommand {
+    /// Circuit breaker operator commands
+    Breaker {
+        #[command(subcommand)]
+        cmd: RuntimeBreakerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RuntimeBreakerCommand {
+    /// Reset the circuit breaker state for a runtime profile
+    Reset {
+        /// Runtime profile to reset
+        profile: String,
+        /// Server base URL. Defaults to server.http_addr from config.
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 
@@ -912,6 +940,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             status::run(&config, url, project_id, runtime_limit, json).await?;
         }
 
+        Command::Runtime { cmd } => {
+            runtime::run(&config, cmd).await?;
+        }
+
         Command::Reconcile { dry_run, project } => {
             reconcile::run(dry_run, project, &config).await?;
         }
@@ -1204,6 +1236,32 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected Status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_runtime_breaker_reset() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "runtime",
+            "breaker",
+            "reset",
+            "codex-default",
+            "--url",
+            "127.0.0.1:9800",
+        ])
+        .expect("runtime breaker reset should parse");
+        match cli.command {
+            Command::Runtime {
+                cmd:
+                    RuntimeCommand::Breaker {
+                        cmd: RuntimeBreakerCommand::Reset { profile, url },
+                    },
+            } => {
+                assert_eq!(profile, "codex-default");
+                assert_eq!(url.as_deref(), Some("127.0.0.1:9800"));
+            }
+            _ => panic!("expected Runtime breaker reset command"),
         }
     }
 

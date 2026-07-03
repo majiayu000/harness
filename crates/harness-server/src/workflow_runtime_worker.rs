@@ -14,16 +14,20 @@ mod server_merge;
 mod workspace;
 
 use crate::http::AppState;
+use crate::runtime_circuit_breaker::{
+    classify_agent_failure, CircuitBreakerEvent, CircuitBreakerEventKind, FailureClass,
+};
 use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::task_runner::{TaskFailureKind, TaskKind, TaskState, TaskStatus};
 use chrono::Duration;
 use data_helpers::{optional_data_string, optional_data_u64};
 use executor::ServerRuntimeJobExecutor;
+use harness_core::types::{Decision, Event, SessionId};
 use harness_workflow::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeWorker,
     WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -74,10 +78,14 @@ pub(crate) async fn run_runtime_job_worker_tick(
             ..RuntimeJobWorkerTick::default()
         });
     };
-    let worker = RuntimeWorker::new(store.as_ref(), owner).with_lease_ttl(lease_ttl);
+    defer_open_runtime_profiles(state, store.as_ref()).await?;
+    let worker = RuntimeWorker::new(store.as_ref(), owner)
+        .with_lease_ttl(lease_ttl)
+        .with_claim_guard(state.runtime_circuit_breakers.as_ref());
     let executor = ServerRuntimeJobExecutor::new(state);
-    let completed = worker.run_once(&executor).await?;
-    if let Some(job) = completed.as_ref() {
+    let mut completed = worker.run_once(&executor).await?;
+    if let Some(job) = completed.as_mut() {
+        record_runtime_circuit_breaker_completion(state, store.as_ref(), job).await?;
         if let Err(error) = notify_runtime_submission_terminal(state, job).await {
             tracing::warn!(
                 runtime_job_id = %job.id,
@@ -86,6 +94,129 @@ pub(crate) async fn run_runtime_job_worker_tick(
         }
     }
     Ok(RuntimeJobWorkerTick::from_completed_job(completed))
+}
+
+async fn defer_open_runtime_profiles(
+    state: &AppState,
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+) -> anyhow::Result<()> {
+    for deferred in state
+        .runtime_circuit_breakers
+        .defer_open_profiles(chrono::Utc::now())
+    {
+        let deferred_jobs = store
+            .defer_ready_runtime_jobs_for_profile(&deferred.profile, deferred.until)
+            .await?;
+        if deferred_jobs > 0 {
+            tracing::warn!(
+                runtime_profile = %deferred.profile,
+                deferred_runtime_jobs = deferred_jobs,
+                cooldown_until = %deferred.until,
+                "runtime circuit breaker deferred ready jobs"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn record_runtime_circuit_breaker_completion(
+    state: &AppState,
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    job: &mut RuntimeJob,
+) -> anyhow::Result<()> {
+    let events = match job.status {
+        RuntimeJobStatus::Succeeded => state.runtime_circuit_breakers.record_success(
+            &job.runtime_profile,
+            &job.id,
+            chrono::Utc::now(),
+        ),
+        RuntimeJobStatus::Failed => {
+            let failure_class = classify_agent_failure(job.error.as_deref().unwrap_or_default());
+            if let Some(updated) = store
+                .record_runtime_job_failure_class(&job.id, failure_class.as_str())
+                .await?
+            {
+                *job = updated;
+            }
+            state.runtime_circuit_breakers.record_failure(
+                &job.runtime_profile,
+                &job.id,
+                failure_class,
+                chrono::Utc::now(),
+            )
+        }
+        RuntimeJobStatus::Cancelled | RuntimeJobStatus::Pending | RuntimeJobStatus::Running => {
+            Vec::new()
+        }
+    };
+    emit_circuit_breaker_events(state, events).await;
+    Ok(())
+}
+
+pub(crate) async fn emit_circuit_breaker_events(
+    state: &AppState,
+    events: Vec<CircuitBreakerEvent>,
+) {
+    for event in events {
+        emit_circuit_breaker_event(state, event).await;
+    }
+}
+
+async fn emit_circuit_breaker_event(state: &AppState, event: CircuitBreakerEvent) {
+    let class = event.class.map(FailureClass::as_str);
+    let (level, breaker_state, decision, reason) = match event.kind {
+        CircuitBreakerEventKind::Opened => (
+            "error",
+            "open",
+            Decision::Block,
+            "runtime circuit breaker opened",
+        ),
+        CircuitBreakerEventKind::Closed => (
+            "info",
+            "closed",
+            Decision::Complete,
+            "runtime circuit breaker closed",
+        ),
+        CircuitBreakerEventKind::Reset => (
+            "info",
+            "closed",
+            Decision::Complete,
+            "runtime circuit breaker reset",
+        ),
+    };
+    let detail = json!({
+        "level": level,
+        "profile": event.profile,
+        "state": breaker_state,
+        "failure_class": class,
+        "consecutive": event.consecutive,
+        "cooldown_until": event.cooldown_until,
+    });
+    match event.kind {
+        CircuitBreakerEventKind::Opened => tracing::error!(
+            runtime_profile = %detail["profile"],
+            failure_class = ?detail["failure_class"],
+            consecutive = ?event.consecutive,
+            cooldown_until = ?event.cooldown_until,
+            "runtime circuit breaker opened"
+        ),
+        CircuitBreakerEventKind::Closed | CircuitBreakerEventKind::Reset => tracing::info!(
+            runtime_profile = %detail["profile"],
+            failure_class = ?detail["failure_class"],
+            "runtime circuit breaker recovered"
+        ),
+    }
+    let mut observe_event = Event::new(
+        SessionId::new(),
+        "runtime_circuit_breaker",
+        detail["profile"].as_str().unwrap_or("runtime"),
+        decision,
+    );
+    observe_event.reason = Some(reason.to_string());
+    observe_event.detail = Some(detail.to_string());
+    if let Err(error) = state.observability.events.log(&observe_event).await {
+        tracing::warn!("failed to record runtime circuit breaker event: {error}");
+    }
 }
 
 pub(crate) async fn notify_runtime_submission_terminal(
