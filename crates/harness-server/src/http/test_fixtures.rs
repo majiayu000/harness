@@ -230,6 +230,9 @@ async fn make_read_only_route_test_state_with_project_root(
         ),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: AtomicBool::new(false),
+        runtime_circuit_breakers: Arc::new(
+            crate::runtime_circuit_breaker::RuntimeCircuitBreakerRegistry::new(Default::default()),
+        ),
         notifications: NotificationServices {
             notification_tx,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),

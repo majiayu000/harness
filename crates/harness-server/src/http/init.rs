@@ -276,6 +276,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             .in_quiet_window(chrono::Utc::now());
         Arc::new(AtomicBool::new(in_window))
     };
+    let runtime_circuit_breakers = Arc::new(
+        crate::runtime_circuit_breaker::RuntimeCircuitBreakerRegistry::new(
+            server.config.workflow.circuit_breaker.clone(),
+        ),
+    );
 
     let (review_store, review_status) =
         build_review_store(&dir, server.config.server.database_url.as_deref()).await?;
@@ -350,6 +355,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         runtime_project_cache: services.runtime_project_cache,
         runtime_state_persist_lock: Mutex::new(()),
         runtime_state_dirty: AtomicBool::new(false),
+        runtime_circuit_breakers,
         notifications: NotificationServices {
             notification_tx: broadcast::channel(notification_broadcast_capacity).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),

@@ -8,12 +8,14 @@ pub mod resolve;
 pub mod server;
 pub mod shutdown;
 pub mod workflow;
+pub mod workflow_circuit_breaker;
 
 use self::agents::*;
 use self::intake::*;
 use self::maintenance::*;
 use self::misc::*;
 use self::server::*;
+use self::workflow_circuit_breaker::*;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
@@ -61,6 +63,8 @@ pub struct HarnessConfig {
     pub reconciliation: ReconciliationConfig,
     #[serde(default)]
     pub maintenance_window: MaintenanceWindowConfig,
+    #[serde(default)]
+    pub workflow: WorkflowRuntimeConfig,
     /// Projects declared in the config file. Registered on server startup.
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
@@ -153,6 +157,7 @@ impl Default for HarnessConfig {
             retry_scheduler: RetrySchedulerConfig::default(),
             reconciliation: ReconciliationConfig::default(),
             maintenance_window: MaintenanceWindowConfig::default(),
+            workflow: WorkflowRuntimeConfig::default(),
             projects: Vec::new(),
         };
         config.apply_derived_defaults();
@@ -192,6 +197,8 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             #[serde(default)]
             maintenance_window: MaintenanceWindowConfig,
             #[serde(default)]
+            workflow: WorkflowRuntimeConfig,
+            #[serde(default)]
             projects: Vec<ProjectEntry>,
         }
 
@@ -212,6 +219,7 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             retry_scheduler: input.retry_scheduler,
             reconciliation: input.reconciliation,
             maintenance_window: input.maintenance_window,
+            workflow: input.workflow,
             projects: input.projects,
         };
         config.apply_derived_defaults();
@@ -226,3 +234,7 @@ mod tests;
 #[cfg(test)]
 #[path = "config_context_tests.rs"]
 mod context_tests;
+
+#[cfg(test)]
+#[path = "config_workflow_circuit_breaker_tests.rs"]
+mod workflow_circuit_breaker_tests;

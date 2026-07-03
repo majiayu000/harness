@@ -263,6 +263,8 @@ pub struct AppState {
     /// in-memory mutation (e.g. idempotent deregister retry) still trigger a
     /// persist when this flag is set, converging durable state.
     pub runtime_state_dirty: AtomicBool,
+    pub(crate) runtime_circuit_breakers:
+        Arc<crate::runtime_circuit_breaker::RuntimeCircuitBreakerRegistry>,
     pub notifications: NotificationServices,
     pub intake: IntakeServices,
     pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,

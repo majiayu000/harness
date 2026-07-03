@@ -373,6 +373,9 @@ pub(super) async fn make_test_state_with_project_root(
         ),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        runtime_circuit_breakers: Arc::new(
+            crate::runtime_circuit_breaker::RuntimeCircuitBreakerRegistry::new(Default::default()),
+        ),
         notifications: crate::http::NotificationServices {
             notification_tx: tokio::sync::broadcast::channel(32).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
@@ -456,6 +459,7 @@ pub(super) async fn make_test_state_with_issue_workflows(
         runtime_project_cache: state.runtime_project_cache.clone(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        runtime_circuit_breakers: state.runtime_circuit_breakers.clone(),
         notifications: crate::http::NotificationServices {
             notification_tx: tokio::sync::broadcast::channel(32).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),
@@ -576,6 +580,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         runtime_project_cache: state.runtime_project_cache.clone(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
+        runtime_circuit_breakers: state.runtime_circuit_breakers.clone(),
         notifications: crate::http::NotificationServices {
             notification_tx: tokio::sync::broadcast::channel(32).0,
             notification_lagged_total: Arc::new(AtomicU64::new(0)),

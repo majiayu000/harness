@@ -528,6 +528,8 @@ pub struct RuntimeJob {
     pub output: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_before: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -553,6 +555,7 @@ impl RuntimeJob {
             input,
             output: None,
             error: None,
+            failure_class: None,
             not_before: None,
             created_at: now,
             updated_at: now,
@@ -587,6 +590,7 @@ impl RuntimeJob {
         };
         self.output = Some(serde_json::to_value(result)?);
         self.error = result.error.clone();
+        self.failure_class = None;
         self.lease = None;
         self.updated_at = Utc::now();
         Ok(())

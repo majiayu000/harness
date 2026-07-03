@@ -98,6 +98,7 @@ pub struct RuntimeJobCompactRecord {
     pub lease: Option<WorkflowLease>,
     pub lease_generation: u64,
     pub error: Option<String>,
+    pub failure_class: Option<String>,
     pub not_before: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -159,6 +160,7 @@ type RuntimeJobCompactRecordRow = (
     String,
     Option<String>,
     i64,
+    Option<String>,
     Option<String>,
     Option<DateTime<Utc>>,
     DateTime<Utc>,
@@ -1489,6 +1491,128 @@ impl WorkflowRuntimeStore {
         Ok(Some(job))
     }
 
+    pub async fn defer_runtime_job_claim_if_owned(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
+        not_before: DateTime<Utc>,
+    ) -> anyhow::Result<Option<RuntimeJob>> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(runtime_job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        };
+        let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let is_current_lease = job.status == RuntimeJobStatus::Running
+            && job
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.owner == owner && lease.expires_at == lease_expires_at);
+        if !is_current_lease {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        job.status = RuntimeJobStatus::Pending;
+        job.lease = None;
+        job.not_before = Some(not_before);
+        job.updated_at = Utc::now();
+        let updated = to_jsonb_string(&job)?;
+        let status = enum_str(&job.status)?;
+        sqlx::query(
+            "UPDATE runtime_jobs
+             SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4",
+        )
+        .bind(&status)
+        .bind(job.not_before)
+        .bind(&updated)
+        .bind(runtime_job_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(job))
+    }
+
+    pub async fn record_runtime_job_failure_class(
+        &self,
+        runtime_job_id: &str,
+        failure_class: &str,
+    ) -> anyhow::Result<Option<RuntimeJob>> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(runtime_job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        job.failure_class = Some(failure_class.to_string());
+        job.updated_at = Utc::now();
+        let updated = to_jsonb_string(&job)?;
+        sqlx::query(
+            "UPDATE runtime_jobs
+             SET data = $1::jsonb, updated_at = $2
+             WHERE id = $3",
+        )
+        .bind(&updated)
+        .bind(job.updated_at)
+        .bind(runtime_job_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(job))
+    }
+
+    pub async fn defer_ready_runtime_jobs_for_profile(
+        &self,
+        runtime_profile: &str,
+        not_before: DateTime<Utc>,
+    ) -> anyhow::Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, data::text FROM runtime_jobs
+             WHERE runtime_profile = $1
+               AND status = 'pending'
+               AND (not_before IS NULL OR not_before <= CURRENT_TIMESTAMP)
+             ORDER BY created_at ASC
+             FOR UPDATE",
+        )
+        .bind(runtime_profile)
+        .fetch_all(&mut *tx)
+        .await?;
+        let now = Utc::now();
+        let mut deferred = 0usize;
+        for (id, data) in rows {
+            let mut job: RuntimeJob = serde_json::from_str(&data)?;
+            job.not_before = Some(not_before);
+            job.updated_at = now;
+            let updated = to_jsonb_string(&job)?;
+            sqlx::query(
+                "UPDATE runtime_jobs
+                 SET not_before = $1, data = $2::jsonb, updated_at = $3
+                 WHERE id = $4",
+            )
+            .bind(not_before)
+            .bind(&updated)
+            .bind(now)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            deferred += 1;
+        }
+        tx.commit().await?;
+        Ok(deferred)
+    }
+
     pub async fn get_runtime_job(
         &self,
         runtime_job_id: &str,
@@ -1718,6 +1842,7 @@ impl WorkflowRuntimeStore {
                     job.status, (job.data->'lease')::text AS lease,
                     COALESCE((job.data->>'lease_generation')::bigint, 0),
                     job.data->>'error',
+                    job.data->>'failure_class',
                     (job.data->>'not_before')::timestamptz,
                     job.created_at, job.updated_at
              FROM unnest($1::text[]) AS selected(command_id)
@@ -1746,6 +1871,7 @@ impl WorkflowRuntimeStore {
             lease_json,
             lease_generation,
             error,
+            failure_class,
             not_before,
             created_at,
             updated_at,
@@ -1765,6 +1891,7 @@ impl WorkflowRuntimeStore {
                 lease,
                 lease_generation: lease_generation.max(0) as u64,
                 error,
+                failure_class,
                 not_before,
                 created_at,
                 updated_at,

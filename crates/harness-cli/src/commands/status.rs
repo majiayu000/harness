@@ -21,6 +21,7 @@ struct RuntimeTreeSummary {
     running_job_lease_statuses: BTreeMap<String, usize>,
     activity_outcomes: BTreeMap<String, usize>,
     jobs_without_activity_envelope: usize,
+    circuit_breakers: Vec<Value>,
 }
 
 pub async fn run(
@@ -72,7 +73,7 @@ pub async fn run(
     Ok(())
 }
 
-fn resolve_api_token(config: &HarnessConfig) -> Option<String> {
+pub(crate) fn resolve_api_token(config: &HarnessConfig) -> Option<String> {
     config
         .server
         .api_token
@@ -88,7 +89,10 @@ fn resolve_api_token(config: &HarnessConfig) -> Option<String> {
         })
 }
 
-fn server_base_url(config: &HarnessConfig, override_url: Option<String>) -> anyhow::Result<String> {
+pub(crate) fn server_base_url(
+    config: &HarnessConfig,
+    override_url: Option<String>,
+) -> anyhow::Result<String> {
     if let Some(url) = override_url {
         let trimmed = url.trim().trim_end_matches('/');
         if trimmed.is_empty() {
@@ -244,6 +248,7 @@ fn print_summary(combined: &Value) {
             runtime_summary.jobs_without_activity_envelope
         );
     }
+    print_circuit_breakers(&runtime_summary.circuit_breakers);
 }
 
 fn summarize_runtime_tree(tree: &Value) -> RuntimeTreeSummary {
@@ -268,6 +273,10 @@ fn summarize_runtime_tree(tree: &Value) -> RuntimeTreeSummary {
         summary.jobs_without_activity_envelope = tree["summary"]["jobs_without_activity_envelope"]
             .as_u64()
             .unwrap_or(0) as usize;
+        summary.circuit_breakers = tree["summary"]["circuit_breakers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
     }
     if let Some(workflows) = tree["workflows"].as_array() {
         for workflow in workflows {
@@ -360,6 +369,40 @@ fn print_count_map(label: &str, counts: &BTreeMap<String, usize>) {
         .collect::<Vec<_>>()
         .join(", ");
     println!("{label}: {rendered}");
+}
+
+fn print_circuit_breakers(circuit_breakers: &[Value]) {
+    let rendered = circuit_breakers
+        .iter()
+        .filter(|breaker| breaker["state"].as_str() != Some("closed"))
+        .filter_map(render_circuit_breaker)
+        .collect::<Vec<_>>();
+    if !rendered.is_empty() {
+        println!("Circuit breakers: {}", rendered.join(", "));
+    }
+}
+
+fn render_circuit_breaker(breaker: &Value) -> Option<String> {
+    let profile = breaker["profile"].as_str()?;
+    let state = breaker["state"].as_str().unwrap_or("unknown");
+    let class = breaker["class"].as_str();
+    let consecutive = breaker["consecutive"].as_u64();
+    let cooldown_until = breaker["cooldown_until"].as_str();
+    let mut parts = Vec::new();
+    if let Some(class) = class {
+        parts.push(class.to_string());
+    }
+    if let Some(consecutive) = consecutive {
+        parts.push(format!("consecutive={consecutive}"));
+    }
+    if let Some(cooldown_until) = cooldown_until {
+        parts.push(format!("until={cooldown_until}"));
+    }
+    if parts.is_empty() {
+        Some(format!("{profile}:{state}"))
+    } else {
+        Some(format!("{profile}:{state}({})", parts.join(" ")))
+    }
 }
 
 #[cfg(test)]

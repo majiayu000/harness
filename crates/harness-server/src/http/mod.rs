@@ -60,7 +60,7 @@ pub use state::{
 pub(crate) use misc_routes::{
     get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
     get_workflow_runtime_tree, github_webhook, handle_rpc, health_check, ingest_signal,
-    intake_status, password_reset, project_queue_stats,
+    intake_status, password_reset, project_queue_stats, reset_runtime_circuit_breaker,
 };
 pub(crate) use sse_routes::stream_task_sse;
 pub(crate) use task_query_routes::get_task_proof;
