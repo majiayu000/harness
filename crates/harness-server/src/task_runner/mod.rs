@@ -207,7 +207,7 @@ mod usage_probe_tests {
             )
             .await?
             .contains_key("issue-1"));
-        assert!(store.list_siblings(dir.path(), &task_id).is_empty());
+        assert_eq!(store.list_siblings(dir.path(), &task_id).len(), 1);
         let since = chrono::Utc::now() - chrono::TimeDelta::days(1);
         assert_eq!(store.count_done_since(since).await, 0);
         assert!(store.done_per_project_hour_since(since).await.is_empty());
