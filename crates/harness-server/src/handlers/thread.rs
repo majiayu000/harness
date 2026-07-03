@@ -59,6 +59,25 @@ pub async fn thread_start(
 ) -> RpcResponse {
     let cwd = validate_root!(&cwd, id, &state.core.home_dir);
     let thread_id = state.core.server.thread_manager.start_thread(cwd);
+    if let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) {
+        crate::handlers::context::record_context_composition(
+            state,
+            &thread_id,
+            harness_core::types::ProjectId::from_path(&thread.project_root),
+            harness_context::TaskProfile {
+                task_kind: Some("thread_start".to_string()),
+                target_paths: vec![thread.project_root],
+                agent_kind: state
+                    .core
+                    .server
+                    .agent_registry
+                    .resolved_default_agent_name()
+                    .map(str::to_string),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
     persist_thread_insert(state, &thread_id).await;
     crate::notify::emit(
         &state.notifications.notify_tx,
@@ -315,6 +334,25 @@ pub async fn thread_resume(
 ) -> RpcResponse {
     match state.core.server.thread_manager.resume_thread(&thread_id) {
         Ok(()) => {
+            if let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) {
+                crate::handlers::context::record_context_composition(
+                    state,
+                    &thread_id,
+                    harness_core::types::ProjectId::from_path(&thread.project_root),
+                    harness_context::TaskProfile {
+                        task_kind: Some("thread_resume".to_string()),
+                        target_paths: vec![thread.project_root],
+                        agent_kind: state
+                            .core
+                            .server
+                            .agent_registry
+                            .resolved_default_agent_name()
+                            .map(str::to_string),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "resumed": true }))
         }
