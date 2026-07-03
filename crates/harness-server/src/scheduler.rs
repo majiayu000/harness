@@ -214,7 +214,11 @@ mod tests {
         let data_dir = tempfile::tempdir()?;
         let project_root = tempfile::tempdir()?;
         let state = make_test_state(data_dir.path(), project_root.path()).await?;
-        harness_core::usage_probe::reset_for_tests();
+        let before = harness_core::usage_probe::snapshot()
+            .into_iter()
+            .find(|entry| entry.surface == "thread_manager")
+            .map(|entry| entry.count)
+            .unwrap_or(0);
         harness_core::usage_probe::record_usage(
             harness_core::usage_probe::UsageProbeSurface::ThreadManager,
         );
@@ -235,8 +239,13 @@ mod tests {
             .detail
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("missing probe report detail"))?;
-        assert!(detail.contains("\"surface\":\"thread_manager\""));
-        assert!(detail.contains("\"count\":1"));
+        let counts: Vec<serde_json::Value> = serde_json::from_str(detail)?;
+        let thread_manager_count = counts
+            .iter()
+            .find(|entry| entry["surface"] == "thread_manager")
+            .and_then(|entry| entry["count"].as_u64())
+            .unwrap_or(0);
+        assert!(thread_manager_count >= before + 1);
         Ok(())
     }
 

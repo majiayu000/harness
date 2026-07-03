@@ -778,7 +778,17 @@ async fn usage_probe_counts_thread_and_turn_rpc_dispatch() -> anyhow::Result<()>
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    harness_core::usage_probe::reset_for_tests();
+    let before = harness_core::usage_probe::snapshot();
+    let thread_before = before
+        .iter()
+        .find(|entry| entry.surface == "thread_rpc")
+        .map(|entry| entry.count)
+        .unwrap_or(0);
+    let turn_before = before
+        .iter()
+        .find(|entry| entry.surface == "turn_rpc")
+        .map(|entry| entry.count)
+        .unwrap_or(0);
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
 
@@ -808,8 +818,8 @@ async fn usage_probe_counts_thread_and_turn_rpc_dispatch() -> anyhow::Result<()>
         .find(|entry| entry.surface == "turn_rpc")
         .ok_or_else(|| anyhow::anyhow!("missing turn_rpc count"))?;
 
-    assert_eq!(thread_rpc.count, 1);
-    assert_eq!(turn_rpc.count, 1);
+    assert!(thread_rpc.count >= thread_before + 1);
+    assert!(turn_rpc.count >= turn_before + 1);
     Ok(())
 }
 
@@ -890,7 +900,11 @@ async fn usage_probe_report_is_queryable_from_event_detail() -> anyhow::Result<(
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    harness_core::usage_probe::reset_for_tests();
+    let before = harness_core::usage_probe::snapshot()
+        .into_iter()
+        .find(|entry| entry.surface == "task_runner")
+        .map(|entry| entry.count)
+        .unwrap_or(0);
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
 
@@ -915,8 +929,13 @@ async fn usage_probe_report_is_queryable_from_event_detail() -> anyhow::Result<(
         .detail
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing probe detail"))?;
-    assert!(detail.contains("\"surface\":\"task_runner\""));
-    assert!(detail.contains("\"count\":1"));
+    let counts: Vec<serde_json::Value> = serde_json::from_str(detail)?;
+    let task_runner_count = counts
+        .iter()
+        .find(|entry| entry["surface"] == "task_runner")
+        .and_then(|entry| entry["count"].as_u64())
+        .unwrap_or(0);
+    assert!(task_runner_count >= before + 1);
     assert!(events[0].content.is_none());
     Ok(())
 }

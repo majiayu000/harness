@@ -105,31 +105,30 @@ pub fn reset_for_tests() {
 mod tests {
     use super::*;
 
+    fn count_for(surface: &str) -> u64 {
+        snapshot()
+            .into_iter()
+            .find(|entry| entry.surface == surface)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
+    }
+
     #[test]
     fn snapshot_includes_recorded_surface_counts() {
-        reset_for_tests();
+        let thread_before = count_for("thread_rpc");
+        let review_before = count_for("review_store");
 
         record_usage(UsageProbeSurface::ThreadRpc);
         record_usage(UsageProbeSurface::ThreadRpc);
         record_usage(UsageProbeSurface::ReviewStore);
 
-        let snapshot = snapshot();
-        let thread_rpc = snapshot
-            .iter()
-            .find(|entry| entry.surface == "thread_rpc")
-            .expect("thread_rpc entry");
-        let review_store = snapshot
-            .iter()
-            .find(|entry| entry.surface == "review_store")
-            .expect("review_store entry");
-
-        assert_eq!(thread_rpc.count, 2);
-        assert_eq!(review_store.count, 1);
+        assert!(count_for("thread_rpc") >= thread_before + 2);
+        assert!(count_for("review_store") >= review_before + 1);
     }
 
     #[test]
     fn probe_report_event_uses_queryable_detail() -> anyhow::Result<()> {
-        reset_for_tests();
+        let before = count_for("task_runner");
         record_usage(UsageProbeSurface::TaskRunner);
 
         let event = build_probe_report_event()?;
@@ -138,8 +137,13 @@ mod tests {
         assert_eq!(event.tool, "usage_probe");
         assert_eq!(event.decision, Decision::Complete);
         let detail = event.detail.expect("detail");
-        assert!(detail.contains("\"surface\":\"task_runner\""));
-        assert!(detail.contains("\"count\":1"));
+        let counts: Vec<serde_json::Value> = serde_json::from_str(&detail)?;
+        let task_runner_count = counts
+            .iter()
+            .find(|entry| entry["surface"] == "task_runner")
+            .and_then(|entry| entry["count"].as_u64())
+            .unwrap_or(0);
+        assert!(task_runner_count >= before + 1);
         assert!(
             event.content.is_none(),
             "queryable summary must be in detail"

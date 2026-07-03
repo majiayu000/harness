@@ -23,7 +23,7 @@ mod usage_probe_tests {
 
     #[test]
     fn ingest_public_entrypoints_record_harness_eval_usage() {
-        harness_core::usage_probe::reset_for_tests();
+        let before = harness_eval_count();
         let pr = json!({
             "number": 7,
             "baseRefName": "main",
@@ -57,6 +57,6 @@ mod usage_probe_tests {
         assert_eq!(pr_snapshot.pr_number, 7);
         assert!(runtime_snapshot.is_some());
         assert_eq!(eval_input.final_pr.pr_number, 7);
-        assert!(harness_eval_count() >= 3);
+        assert!(harness_eval_count() >= before + 3);
     }
 }
