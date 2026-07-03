@@ -6,9 +6,15 @@ use crate::{
     thread_manager::ThreadManager,
 };
 use harness_agents::registry::AgentRegistry;
-use harness_core::config::HarnessConfig;
+use harness_core::{
+    agent::{AgentAdapter, AgentEvent, TurnRequest},
+    config::HarnessConfig,
+};
 use harness_protocol::{methods::Method, methods::RpcRequest, methods::VALIDATION_ERROR};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::RwLock;
 
 async fn make_test_state_with_config_and_registry(
@@ -1150,6 +1156,322 @@ async fn skill_delete_removes_skill() -> anyhow::Result<()> {
         .result
         .ok_or_else(|| anyhow::anyhow!("missing result"))?;
     assert_eq!(result["deleted"], serde_json::json!(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_rpc_preview_with_supplied_items_returns_manifest() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let request = harness_context::ComposeRequest {
+        thread_id: harness_core::types::ThreadId::from_str("thread-preview"),
+        run_id: None,
+        project: harness_core::types::ProjectId::from_str("project-preview"),
+        task_profile: harness_context::TaskProfile {
+            prompt: Some("preview supplied context".to_string()),
+            ..Default::default()
+        },
+        budget_hint: 100,
+    };
+    let supplied = vec![harness_context::ContextItem {
+        id: harness_context::ItemId::new("rule:supplied"),
+        class: harness_context::ItemClass::Rule,
+        content: "Follow the supplied rule.".to_string(),
+        est_tokens: 0,
+        priority: harness_context::Priority::P1,
+        relevance: 1.0,
+        degrade: vec![harness_context::Degraded::Pointer(
+            "See supplied rule.".to_string(),
+        )],
+        dedupe_key: None,
+        instruction_bearing: true,
+    }];
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ContextPreview {
+            request,
+            supplied_items: supplied,
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    assert!(
+        resp.error.is_none(),
+        "context preview should succeed: {:?}",
+        resp.error
+    );
+    let result = resp
+        .result
+        .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+    assert!(result["rendered"]
+        .as_str()
+        .unwrap_or("")
+        .contains("supplied rule"));
+    assert_eq!(result["manifest"]["mode"], serde_json::json!("preview"));
+    let manifest_items = result["manifest"]["items"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("manifest items should be an array"))?;
+    assert!(manifest_items
+        .iter()
+        .any(|item| item["id"] == serde_json::json!("rule:supplied")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_shadow_thread_start_logs_manifest_without_response_shape_change(
+) -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let proj_dir = crate::test_helpers::tempdir_in_home("harness-context-shadow-")?;
+    std::fs::write(
+        proj_dir.path().join("AGENTS.md"),
+        "Project instruction body",
+    )?;
+    std::fs::write(
+        proj_dir.path().join("WORKFLOW.md"),
+        "---\nworkflow:\n  id: context-shadow-test\n---\nWorkflow prompt body\n",
+    )?;
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ThreadStart {
+            cwd: proj_dir.path().to_path_buf(),
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    assert!(
+        resp.error.is_none(),
+        "thread_start should preserve success: {:?}",
+        resp.error
+    );
+    let result = resp
+        .result
+        .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+    let thread_id = result["thread_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing thread_id"))?
+        .to_string();
+    assert_eq!(
+        result.as_object().map(|object| object.len()),
+        Some(1),
+        "shadow mode must not add response fields"
+    );
+
+    let get_req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(2)),
+        method: Method::ContextManifestGet {
+            thread_id: harness_core::types::ThreadId::from_str(&thread_id),
+        },
+    };
+    let get_resp = handle_request(&state, get_req).await.expect("response");
+    assert!(
+        get_resp.error.is_none(),
+        "manifest get should succeed: {:?}",
+        get_resp.error
+    );
+    let manifest = get_resp
+        .result
+        .ok_or_else(|| anyhow::anyhow!("missing manifest result"))?;
+    assert_eq!(manifest["manifest"]["mode"], serde_json::json!("shadow"));
+    assert_eq!(
+        manifest["manifest"]["thread_id"],
+        serde_json::json!(thread_id)
+    );
+    let items = manifest["manifest"]["items"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("manifest items should be an array"))?;
+    assert!(
+        items
+            .iter()
+            .any(|item| item["id"] == serde_json::json!("brief:task")),
+        "thread_start should record a task brief item"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item["id"] == serde_json::json!("contract:task")),
+        "thread_start should record a project/workflow contract item"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_enforce_thread_start_fails_closed_until_injection_is_wired() -> anyhow::Result<()>
+{
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.context.mode = harness_core::config::misc::ContextMode::Enforce;
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), config, AgentRegistry::new("claude"))
+            .await?;
+    let proj_dir = crate::test_helpers::tempdir_in_home("harness-context-enforce-")?;
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ThreadStart {
+            cwd: proj_dir.path().to_path_buf(),
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    let error = resp
+        .error
+        .ok_or_else(|| anyhow::anyhow!("enforce mode should fail closed"))?;
+
+    assert!(
+        error.message.contains("context enforce mode"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert!(resp.result.is_none());
+    Ok(())
+}
+
+struct SteerTrackingAdapter {
+    steer_called: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for SteerTrackingAdapter {
+    fn name(&self) -> &str {
+        "tracking"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: TurnRequest,
+        _tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn steer(&self, _text: String) -> harness_core::error::Result<()> {
+        self.steer_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn context_enforce_thread_resume_does_not_mutate_thread_status() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.context.mode = harness_core::config::misc::ContextMode::Enforce;
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), config, AgentRegistry::new("claude"))
+            .await?;
+    let proj_dir = tempfile::tempdir()?;
+    let thread_id = state
+        .core
+        .server
+        .thread_manager
+        .start_thread(proj_dir.path().to_path_buf());
+    {
+        let mut thread = state
+            .core
+            .server
+            .thread_manager
+            .threads_cache()
+            .get_mut(thread_id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("thread should exist"))?;
+        thread.status = harness_core::types::ThreadStatus::Archived;
+    }
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ThreadResume {
+            thread_id: thread_id.clone(),
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    let error = resp
+        .error
+        .ok_or_else(|| anyhow::anyhow!("enforce mode should fail closed"))?;
+
+    assert!(
+        error.message.contains("context enforce mode"),
+        "unexpected error: {}",
+        error.message
+    );
+    let thread = state
+        .core
+        .server
+        .thread_manager
+        .get_thread(&thread_id)
+        .ok_or_else(|| anyhow::anyhow!("thread should remain present"))?;
+    assert_eq!(thread.status, harness_core::types::ThreadStatus::Archived);
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_enforce_turn_steer_does_not_call_adapter_or_append_item() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.context.mode = harness_core::config::misc::ContextMode::Enforce;
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), config, AgentRegistry::new("claude"))
+            .await?;
+    let proj_dir = tempfile::tempdir()?;
+    let thread_id = state
+        .core
+        .server
+        .thread_manager
+        .start_thread(proj_dir.path().to_path_buf());
+    let turn_id = state.core.server.thread_manager.start_turn(
+        &thread_id,
+        "initial task".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+    let steer_called = Arc::new(AtomicBool::new(false));
+    state.core.server.thread_manager.register_active_adapter(
+        &turn_id,
+        Arc::new(SteerTrackingAdapter {
+            steer_called: steer_called.clone(),
+        }),
+    );
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::TurnSteer {
+            turn_id: turn_id.clone(),
+            instruction: "redirect here".to_string(),
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    let error = resp
+        .error
+        .ok_or_else(|| anyhow::anyhow!("enforce mode should fail closed"))?;
+
+    assert!(
+        error.message.contains("context enforce mode"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert!(
+        !steer_called.load(Ordering::SeqCst),
+        "adapter steer must not run when context enforce fails"
+    );
+    let turn = state
+        .core
+        .server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should remain present"))?;
+    assert_eq!(
+        turn.items.len(),
+        1,
+        "failed enforce steer must not append a user message"
+    );
     Ok(())
 }
 

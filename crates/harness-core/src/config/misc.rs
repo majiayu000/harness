@@ -417,6 +417,98 @@ impl Default for ObserveConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextMode {
+    #[default]
+    Shadow,
+    Enforce,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextQuotasConfig {
+    #[serde(default = "default_context_rule_quota")]
+    pub rule: f32,
+    #[serde(default = "default_context_skill_quota")]
+    pub skill: f32,
+    #[serde(default = "default_context_contract_quota")]
+    pub contract: f32,
+    #[serde(default = "default_context_brief_quota")]
+    pub brief: f32,
+    #[serde(default = "default_context_draft_quota")]
+    pub draft: f32,
+}
+
+fn default_context_rule_quota() -> f32 {
+    0.30
+}
+
+fn default_context_skill_quota() -> f32 {
+    0.25
+}
+
+fn default_context_contract_quota() -> f32 {
+    0.25
+}
+
+fn default_context_brief_quota() -> f32 {
+    0.15
+}
+
+fn default_context_draft_quota() -> f32 {
+    0.05
+}
+
+impl Default for ContextQuotasConfig {
+    fn default() -> Self {
+        Self {
+            rule: default_context_rule_quota(),
+            skill: default_context_skill_quota(),
+            contract: default_context_contract_quota(),
+            brief: default_context_brief_quota(),
+            draft: default_context_draft_quota(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextConfig {
+    #[serde(default)]
+    pub mode: ContextMode,
+    #[serde(default = "default_context_budget_tokens")]
+    pub budget_tokens: u32,
+    #[serde(default = "default_context_reserved_headroom")]
+    pub reserved_headroom: f32,
+    #[serde(default = "default_context_provider_timeout_ms")]
+    pub provider_timeout_ms: u64,
+    #[serde(default)]
+    pub quotas: ContextQuotasConfig,
+}
+
+fn default_context_budget_tokens() -> u32 {
+    24_000
+}
+
+fn default_context_reserved_headroom() -> f32 {
+    0.20
+}
+
+fn default_context_provider_timeout_ms() -> u64 {
+    2_000
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            mode: ContextMode::Shadow,
+            budget_tokens: default_context_budget_tokens(),
+            reserved_headroom: default_context_reserved_headroom(),
+            provider_timeout_ms: default_context_provider_timeout_ms(),
+            quotas: ContextQuotasConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OtelConfig {
     #[serde(default = "default_otel_environment")]

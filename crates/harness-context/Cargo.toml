@@ -1,0 +1,22 @@
+[package]
+name = "harness-context"
+version.workspace = true
+edition.workspace = true
+description = "Deterministic context composition for the Harness agent orchestration layer"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-core = { workspace = true }
+harness-rules = { workspace = true }
+harness-skills = { workspace = true }
+harness-gc = { workspace = true }
+harness-exec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

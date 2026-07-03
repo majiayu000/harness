@@ -1,5 +1,8 @@
 use crate::{http::AppState, validate_root};
-use harness_core::{types::ThreadId, types::ThreadStatus, types::TurnStatus};
+use harness_core::{
+    config::workflow::load_workflow_document,
+    types::{Item, Thread, ThreadId, ThreadStatus, TurnStatus},
+};
 use harness_protocol::{
     methods::RpcResponse, methods::INTERNAL_ERROR, methods::NOT_FOUND, notifications::Notification,
 };
@@ -59,6 +62,20 @@ pub async fn thread_start(
 ) -> RpcResponse {
     let cwd = validate_root!(&cwd, id, &state.core.home_dir);
     let thread_id = state.core.server.thread_manager.start_thread(cwd);
+    if let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) {
+        let profile = task_profile_for_thread(state, &thread, "thread_start", None);
+        if let Err(error) = crate::handlers::context::record_context_composition(
+            state,
+            &thread_id,
+            harness_core::types::ProjectId::from_path(&thread.project_root),
+            profile,
+        )
+        .await
+        {
+            state.core.server.thread_manager.delete_thread(&thread_id);
+            return RpcResponse::error(id, INTERNAL_ERROR, error);
+        }
+    }
     persist_thread_insert(state, &thread_id).await;
     crate::notify::emit(
         &state.notifications.notify_tx,
@@ -120,6 +137,20 @@ pub async fn turn_start(
         .unwrap_or("claude")
         .to_string();
     let agent_id = harness_core::types::AgentId::from_str(&agent_name);
+    let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) else {
+        return RpcResponse::error(id, NOT_FOUND, "thread not found");
+    };
+    let profile = task_profile_for_thread(state, &thread, "turn_start", Some(input.clone()));
+    if let Err(error) = crate::handlers::context::record_context_composition(
+        state,
+        &thread_id,
+        harness_core::types::ProjectId::from_path(&thread.project_root),
+        profile,
+    )
+    .await
+    {
+        return RpcResponse::error(id, INTERNAL_ERROR, error);
+    }
     match state
         .core
         .server
@@ -258,6 +289,21 @@ pub async fn turn_steer(
         .find_thread_for_turn(&turn_id)
     {
         Some(thread_id) => {
+            let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) else {
+                return RpcResponse::error(id, NOT_FOUND, "thread not found");
+            };
+            let profile =
+                task_profile_for_thread(state, &thread, "turn_steer", Some(instruction.clone()));
+            if let Err(error) = crate::handlers::context::record_context_composition(
+                state,
+                &thread_id,
+                harness_core::types::ProjectId::from_path(&thread.project_root),
+                profile,
+            )
+            .await
+            {
+                return RpcResponse::error(id, INTERNAL_ERROR, error);
+            }
             match state
                 .core
                 .server
@@ -313,12 +359,101 @@ pub async fn thread_resume(
     id: Option<serde_json::Value>,
     thread_id: ThreadId,
 ) -> RpcResponse {
+    let Some(thread) = state.core.server.thread_manager.get_thread(&thread_id) else {
+        return RpcResponse::error(id, INTERNAL_ERROR, format!("thread not found: {thread_id}"));
+    };
+    let profile = task_profile_for_thread(
+        state,
+        &thread,
+        "thread_resume",
+        latest_user_message(&thread),
+    );
+    if let Err(error) = crate::handlers::context::record_context_composition(
+        state,
+        &thread_id,
+        harness_core::types::ProjectId::from_path(&thread.project_root),
+        profile,
+    )
+    .await
+    {
+        return RpcResponse::error(id, INTERNAL_ERROR, error);
+    }
     match state.core.server.thread_manager.resume_thread(&thread_id) {
         Ok(()) => {
             persist_thread(state, &thread_id).await;
             RpcResponse::success(id, serde_json::json!({ "resumed": true }))
         }
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
+    }
+}
+
+fn task_profile_for_thread(
+    state: &AppState,
+    thread: &Thread,
+    task_kind: &str,
+    prompt: Option<String>,
+) -> harness_context::TaskProfile {
+    harness_context::TaskProfile {
+        task_kind: Some(task_kind.to_string()),
+        target_paths: vec![thread.project_root.clone()],
+        agent_kind: state
+            .core
+            .server
+            .agent_registry
+            .resolved_default_agent_name()
+            .map(str::to_string),
+        prompt: Some(prompt.unwrap_or_else(|| default_thread_brief(thread, task_kind))),
+        contract: context_contract_for_project(&thread.project_root),
+    }
+}
+
+fn default_thread_brief(thread: &Thread, task_kind: &str) -> String {
+    format!("{task_kind} for project {}", thread.project_root.display())
+}
+
+fn latest_user_message(thread: &Thread) -> Option<String> {
+    thread
+        .turns
+        .iter()
+        .rev()
+        .flat_map(|turn| turn.items.iter().rev())
+        .find_map(|item| match item {
+            Item::UserMessage { content } => Some(content.clone()),
+            _ => None,
+        })
+}
+
+fn context_contract_for_project(project_root: &std::path::Path) -> Option<String> {
+    let mut sections = Vec::new();
+    let project_instructions = harness_core::agents_md::load_agents_md(project_root);
+    if !project_instructions.trim().is_empty() {
+        sections.push(format!(
+            "Project instructions:\n{}",
+            project_instructions.trim()
+        ));
+    }
+
+    match load_workflow_document(project_root) {
+        Ok(document) => {
+            if !document.prompt_template.trim().is_empty() {
+                let source = document
+                    .source_path
+                    .as_deref()
+                    .map(|path| format!(" from {path}"))
+                    .unwrap_or_default();
+                sections.push(format!(
+                    "Workflow prompt template{source}:\n{}",
+                    document.prompt_template.trim()
+                ));
+            }
+        }
+        Err(error) => sections.push(format!("Workflow contract load error: {error}")),
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
     }
 }
 

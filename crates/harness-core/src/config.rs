@@ -42,6 +42,8 @@ pub struct HarnessConfig {
     pub gc: GcConfig,
     pub rules: RulesConfig,
     pub observe: ObserveConfig,
+    #[serde(default)]
+    pub context: ContextConfig,
     pub otel: OtelConfig,
     #[serde(default)]
     pub validation: ValidationConfig,
@@ -141,6 +143,7 @@ impl Default for HarnessConfig {
             gc: GcConfig::default(),
             rules: RulesConfig::default(),
             observe: ObserveConfig::default(),
+            context: ContextConfig::default(),
             otel: OtelConfig::default(),
             validation: ValidationConfig::default(),
             workspace: WorkspaceConfig::default(),
@@ -169,6 +172,8 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             gc: GcConfig,
             rules: RulesConfig,
             observe: ObserveConfig,
+            #[serde(default)]
+            context: ContextConfig,
             otel: OtelConfig,
             #[serde(default)]
             validation: ValidationConfig,
@@ -197,6 +202,7 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             gc: input.gc,
             rules: input.rules,
             observe: input.observe,
+            context: input.context,
             otel: input.otel,
             validation: input.validation,
             workspace: input.workspace,
@@ -216,3 +222,7 @@ impl<'de> Deserialize<'de> for HarnessConfig {
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "config_context_tests.rs"]
+mod context_tests;

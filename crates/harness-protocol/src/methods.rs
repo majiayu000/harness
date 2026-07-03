@@ -188,6 +188,16 @@ pub enum Method {
         target: String,
         max_rounds: Option<u32>,
     },
+
+    // === Context composer ===
+    ContextPreview {
+        request: harness_context::ComposeRequest,
+        #[serde(default)]
+        supplied_items: Vec<harness_context::ContextItem>,
+    },
+    ContextManifestGet {
+        thread_id: ThreadId,
+    },
 }
 
 /// JSON-RPC 2.0 request envelope.
@@ -353,6 +363,8 @@ impl Method {
             Self::AgentList => "agent/list",
             Self::Preflight { .. } => "preflight",
             Self::CrossReview { .. } => "cross_review",
+            Self::ContextPreview { .. } => "context/preview",
+            Self::ContextManifestGet { .. } => "context/manifest/get",
             Self::SkillGovernanceView { .. } => "skill/governance/view",
             Self::SkillGovernanceHistory { .. } => "skill/governance/history",
             Self::SkillStale => "skill/stale",
@@ -374,3 +386,69 @@ pub const NOT_INITIALIZED: i32 = -32003;
 pub const STORAGE_ERROR: i32 = -32004;
 pub const AGENT_ERROR: i32 = -32005;
 pub const VALIDATION_ERROR: i32 = -32006;
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn context_rpc_preview_slash_method_deserializes() -> anyhow::Result<()> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "context/preview",
+            "params": {
+                "request": {
+                    "thread_id": "thread-1",
+                    "project": "project-1",
+                    "task_profile": {"prompt": "implement context composer"},
+                    "budget_hint": 100
+                },
+                "supplied_items": [{
+                    "id": "rule:test",
+                    "class": "rule",
+                    "content": "Follow the test rule.",
+                    "est_tokens": 0,
+                    "priority": "p1",
+                    "relevance": 1.0,
+                    "degrade": [{"level": "pointer", "content": "See test rule"}],
+                    "instruction_bearing": true
+                }]
+            }
+        });
+
+        let parsed: RpcRequest = serde_json::from_value(request)?;
+        assert_eq!(parsed.method.method_name(), "context/preview");
+        match parsed.method {
+            Method::ContextPreview {
+                request,
+                supplied_items,
+            } => {
+                assert_eq!(request.thread_id.as_str(), "thread-1");
+                assert_eq!(supplied_items.len(), 1);
+            }
+            other => panic!("unexpected method: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context_rpc_manifest_get_slash_method_deserializes() -> anyhow::Result<()> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "context/manifest/get",
+            "params": {"thread_id": "thread-1"}
+        });
+
+        let parsed: RpcRequest = serde_json::from_value(request)?;
+        assert_eq!(parsed.method.method_name(), "context/manifest/get");
+        match parsed.method {
+            Method::ContextManifestGet { thread_id } => {
+                assert_eq!(thread_id.as_str(), "thread-1");
+            }
+            other => panic!("unexpected method: {other:?}"),
+        }
+        Ok(())
+    }
+}
