@@ -1,4 +1,5 @@
 use crate::db::DbSerializable;
+use crate::run_id::{RunId, RunIdentity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -400,6 +401,8 @@ pub struct Event {
     pub id: EventId,
     pub ts: DateTime<Utc>,
     pub session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run_id: Option<RunId>,
     pub hook: String,
     pub tool: String,
     pub decision: Decision,
@@ -419,6 +422,10 @@ impl Event {
             id: EventId::new(),
             ts: Utc::now(),
             session_id,
+            run_id: RunIdentity::from_env()
+                .ok()
+                .flatten()
+                .map(|identity| identity.run_id),
             hook: hook.to_string(),
             tool: tool.to_string(),
             decision,
@@ -774,6 +781,7 @@ impl ReasoningBudget {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventFilters {
     pub session_id: Option<SessionId>,
+    pub run_id: Option<RunId>,
     pub hook: Option<String>,
     /// Filter by `Event.tool` (e.g. rule id for `rule_check` events).
     pub tool: Option<String>,

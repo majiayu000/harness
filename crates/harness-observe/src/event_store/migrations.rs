@@ -86,4 +86,11 @@ pub(super) static EVENT_MIGRATIONS: &[Migration] = &[
             PRIMARY KEY (store_key, legacy_schema)
         )",
     },
+    Migration {
+        version: 7,
+        description: "add nullable agent run id to events",
+        sql: "ALTER TABLE events ADD COLUMN IF NOT EXISTS run_id TEXT;
+              CREATE INDEX IF NOT EXISTS idx_events_store_run_id
+              ON events (store_key, run_id)",
+    },
 ];

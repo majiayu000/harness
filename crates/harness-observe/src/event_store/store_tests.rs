@@ -2,11 +2,13 @@ use super::*;
 use harness_core::{
     config::misc::OtelExporter,
     db::{pg_open_pool, resolve_database_url},
+    run_id::{RunId, AGENT_RUN_ID_ENV},
     types::{
         AutoFixAttempt, EventMetadata, RuleId, TaskId, TurnFailure, TurnFailureKind, TurnTelemetry,
     },
 };
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -16,6 +18,7 @@ use tokio::sync::OnceCell;
 // shared external session budget for the whole workspace.
 static DB_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn db_semaphore() -> Arc<tokio::sync::Semaphore> {
     DB_SEMAPHORE
@@ -97,6 +100,37 @@ async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
 
 fn make_event(hook: &str, decision: Decision) -> Event {
     Event::new(SessionId::new(), hook, "Edit", decision)
+}
+
+#[test]
+fn run_id_event_new_stamps_valid_env_value() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let original = std::env::var(AGENT_RUN_ID_ENV).ok();
+    let expected = "ar-01j1qb3c9r7v5m2k8x4tznq6wd";
+    unsafe { std::env::set_var(AGENT_RUN_ID_ENV, expected) };
+
+    let event = make_event("run_id_stamp", Decision::Pass);
+
+    assert_eq!(event.run_id.as_ref().map(RunId::as_str), Some(expected));
+    match original {
+        Some(value) => unsafe { std::env::set_var(AGENT_RUN_ID_ENV, value) },
+        None => unsafe { std::env::remove_var(AGENT_RUN_ID_ENV) },
+    }
+}
+
+#[test]
+fn run_id_event_new_stays_none_when_env_absent() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let original = std::env::var(AGENT_RUN_ID_ENV).ok();
+    unsafe { std::env::remove_var(AGENT_RUN_ID_ENV) };
+
+    let event = make_event("run_id_absent", Decision::Pass);
+
+    assert!(event.run_id.is_none());
+    match original {
+        Some(value) => unsafe { std::env::set_var(AGENT_RUN_ID_ENV, value) },
+        None => unsafe { std::env::remove_var(AGENT_RUN_ID_ENV) },
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -331,6 +365,33 @@ async fn query_filters_by_session_id() -> anyhow::Result<()> {
         .await?;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].session_id, sid1);
+    store.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_id_query_filters_by_run_id() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(store) = open_test_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let run_id = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd")?;
+    let mut matching = make_event("run_id_query", Decision::Pass);
+    matching.run_id = Some(run_id.clone());
+    let mut other = make_event("run_id_query", Decision::Pass);
+    other.run_id = Some(RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6we")?);
+    store.log(&matching).await?;
+    store.log(&other).await?;
+
+    let results = store
+        .query(&EventFilters {
+            run_id: Some(run_id.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].run_id, Some(run_id));
     store.close().await;
     Ok(())
 }

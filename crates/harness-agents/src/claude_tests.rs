@@ -6,6 +6,7 @@ use harness_core::{types::ExecutionPhase, types::Item, types::ReasoningBudget};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -347,6 +348,92 @@ fn write_executable_script(script_body: &str) -> (tempfile::TempDir, PathBuf) {
         fs::set_permissions(&path, perms).expect("set executable permissions");
     }
     (dir, path)
+}
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct ScopedEnvVar {
+    entries: Vec<(String, Option<String>)>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedEnvVar {
+    fn set_pairs(pairs: &[(&str, &str)]) -> Self {
+        let guard = env_lock().lock().expect("env lock should not be poisoned");
+        let entries = pairs
+            .iter()
+            .map(|(key, value)| {
+                let original = std::env::var(key).ok();
+                unsafe { std::env::set_var(key, value) };
+                (key.to_string(), original)
+            })
+            .collect();
+        Self {
+            entries,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        for (key, original) in &self.entries {
+            if let Some(value) = original {
+                unsafe { std::env::set_var(key, value) };
+            } else {
+                unsafe { std::env::remove_var(key) };
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn run_id_execute_exports_agent_run_id_after_claude_env_strip() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state_dir = dir.path().join("state");
+    let state_dir_str = state_dir.to_string_lossy().to_string();
+    let _guard = ScopedEnvVar::set_pairs(&[
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CODE_ENTRYPOINT", "claude-code"),
+        ("XDG_STATE_HOME", &state_dir_str),
+    ]);
+
+    let agent_capture = dir.path().join("agent-env.txt");
+    let (_script_dir, script) = write_executable_script(&format!(
+        r#"
+env > "{}"
+"#,
+        agent_capture.display()
+    ));
+    let expected_run_id = "ar-01j1qb3c9r7v5m2k8x4tznq6wd";
+    let agent = ClaudeCodeAgent::new(
+        script,
+        "test-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    );
+    let mut request = AgentRequest {
+        prompt: "ping".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+    request.env_vars.insert(
+        harness_core::run_id::AGENT_RUN_ID_ENV.to_string(),
+        expected_run_id.to_string(),
+    );
+
+    agent.execute(request).await?;
+
+    let agent_env = fs::read_to_string(agent_capture)?;
+    assert!(agent_env
+        .lines()
+        .any(|line| line == format!("AGENT_RUN_ID={expected_run_id}")));
+    assert!(!agent_env
+        .lines()
+        .any(|line| line.starts_with("CLAUDECODE=")));
+    Ok(())
 }
 
 #[tokio::test]

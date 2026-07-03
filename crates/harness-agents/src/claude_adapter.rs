@@ -8,6 +8,7 @@ use harness_observe::usage::parse_result_usage_metrics;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{collections::HashMap, process::Stdio};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -63,6 +64,7 @@ impl AgentAdapter for ClaudeAdapter {
         }
 
         let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let run_identity = crate::resolve_agent_run_identity(&HashMap::new());
         let mut cmd = Command::new(&self.cli_path);
         // Prompt MUST follow -p immediately: Claude CLI parses `-p <VALUE>`.
         cmd.arg("-p")
@@ -74,13 +76,14 @@ impl AgentAdapter for ClaudeAdapter {
             .arg(model)
             .arg("--verbose")
             .current_dir(&req.project_root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
+        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         if !req.allowed_tools.is_empty() {
             cmd.arg("--allowedTools").arg(req.allowed_tools.join(","));
@@ -99,6 +102,14 @@ impl AgentAdapter for ClaudeAdapter {
                 "failed to spawn claude: {e}"
             ))
         })?;
+        if let Some(pid) = child.id() {
+            crate::write_provisional_agent_run_binding(
+                &run_identity,
+                "claude-code",
+                pid,
+                &req.project_root,
+            );
+        }
 
         let stdout = child.stdout.take().ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(

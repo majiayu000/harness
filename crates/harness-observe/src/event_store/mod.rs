@@ -1,12 +1,14 @@
 use chrono::{DateTime, Utc};
 use harness_core::config::misc::OtelConfig;
 use harness_core::db::{pg_open_pool, PgStoreContext};
+use harness_core::run_id::RunId;
 use harness_core::types::{
     AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
     SessionId, Severity, Violation,
 };
 use sqlx::postgres::PgPool;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 
 mod legacy;
@@ -386,14 +388,15 @@ impl EventStore {
         };
         sqlx::query(
             "INSERT INTO events
-                (store_key, id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                (store_key, id, ts, session_id, run_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT (store_key, id) DO NOTHING",
         )
         .bind(&self.store_key)
         .bind(event.id.as_str())
         .bind(&ts)
         .bind(event.session_id.as_str())
+        .bind(event.run_id.as_ref().map(RunId::as_str))
         .bind(&event.hook)
         .bind(&event.tool)
         .bind(decision)
@@ -423,13 +426,17 @@ impl EventStore {
             "NULL as content"
         };
         let mut sql = format!(
-            "SELECT id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, {content_col}, metadata
+            "SELECT id, ts, session_id, run_id, hook, tool, decision, reason, detail, duration_ms, {content_col}, metadata
              FROM events WHERE store_key = $1",
         );
         let mut param_count = 1usize;
         if filters.session_id.is_some() {
             param_count += 1;
             sql.push_str(&format!(" AND session_id = ${param_count}"));
+        }
+        if filters.run_id.is_some() {
+            param_count += 1;
+            sql.push_str(&format!(" AND run_id = ${param_count}"));
         }
         if filters.hook.is_some() {
             param_count += 1;
@@ -463,6 +470,9 @@ impl EventStore {
         if let Some(ref sid) = filters.session_id {
             q = q.bind(sid.as_str());
         }
+        if let Some(ref run_id) = filters.run_id {
+            q = q.bind(run_id.as_str());
+        }
         if let Some(ref hook) = filters.hook {
             q = q.bind(hook.as_str());
         }
@@ -495,6 +505,7 @@ impl EventStore {
         let id: String = row.try_get("id")?;
         let ts_str: String = row.try_get("ts")?;
         let session_id: String = row.try_get("session_id")?;
+        let run_id: Option<String> = row.try_get("run_id")?;
         let hook: String = row.try_get("hook")?;
         let tool: String = row.try_get("tool")?;
         let decision_str: String = row.try_get("decision")?;
@@ -515,6 +526,7 @@ impl EventStore {
             id: EventId::from_str(&id),
             ts,
             session_id: SessionId::from_str(&session_id),
+            run_id: run_id.as_deref().map(RunId::from_str).transpose()?,
             hook,
             tool,
             decision,

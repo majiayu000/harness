@@ -195,6 +195,7 @@ impl CodeAgent for ClaudeCodeAgent {
             "spawning claude agent"
         );
 
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
@@ -206,6 +207,7 @@ impl CodeAgent for ClaudeCodeAgent {
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
+        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         let _provider_permit = self
             .provider_gate
@@ -219,6 +221,14 @@ impl CodeAgent for ClaudeCodeAgent {
         let child = cmd.spawn().map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
         })?;
+        if let Some(pid) = child.id() {
+            crate::write_provisional_agent_run_binding(
+                &run_identity,
+                "claude-code",
+                pid,
+                &req.project_root,
+            );
+        }
         let mut child = crate::ManagedChild::new(child, "claude execute");
 
         let output = child.wait_with_output().await.map_err(|e| {
@@ -315,6 +325,7 @@ impl CodeAgent for ClaudeCodeAgent {
             "claude execute_stream admitted by provider gate"
         );
 
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
         let mut cmd = Command::new(&wrapped_command.program);
         cmd.args(&wrapped_command.args)
             .current_dir(&req.project_root)
@@ -326,6 +337,7 @@ impl CodeAgent for ClaudeCodeAgent {
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
+        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         // ETXTBSY (error 26) occurs on Linux when a security scanner or indexer
         // briefly opens the executable for writing after it is written. Retry once.
@@ -346,6 +358,14 @@ impl CodeAgent for ClaudeCodeAgent {
                 )));
             }
         };
+        if let Some(pid) = child.id() {
+            crate::write_provisional_agent_run_binding(
+                &run_identity,
+                "claude-code",
+                pid,
+                &req.project_root,
+            );
+        }
         let mut child = crate::ManagedChild::new(child, "claude execute_stream");
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));

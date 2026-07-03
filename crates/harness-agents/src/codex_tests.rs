@@ -717,6 +717,55 @@ async fn execute_stream_removes_claude_code_env_vars() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn run_id_execute_exports_agent_run_id_after_claude_env_strip() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let state_dir = dir.path().join("state");
+    let state_dir_str = state_dir.to_string_lossy().to_string();
+    let _guard = ScopedEnvVar::set_pairs(&[
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CODE_ENTRYPOINT", "claude-code"),
+        ("XDG_STATE_HOME", &state_dir_str),
+    ]);
+
+    let agent_capture = dir.path().join("agent-env.txt");
+    let cli_script = dir.path().join("capture-run-id-env.sh");
+    fs::write(
+        &cli_script,
+        format!("#!/bin/sh\nenv > \"{}\"\nexit 0\n", agent_capture.display()),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&cli_script)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&cli_script, perms)?;
+    }
+
+    let expected_run_id = "ar-01j1qb3c9r7v5m2k8x4tznq6wd";
+    let agent = CodexAgent::new(cli_script, SandboxMode::DangerFullAccess);
+    let mut request = AgentRequest {
+        prompt: "ping".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+    request.env_vars.insert(
+        harness_core::run_id::AGENT_RUN_ID_ENV.to_string(),
+        expected_run_id.to_string(),
+    );
+
+    agent.execute(request).await?;
+
+    let agent_env = fs::read_to_string(agent_capture)?;
+    assert!(agent_env
+        .lines()
+        .any(|line| line == format!("AGENT_RUN_ID={expected_run_id}")));
+    assert!(!agent_env
+        .lines()
+        .any(|line| line.starts_with("CLAUDECODE=")));
+    Ok(())
+}
+
 #[test]
 fn codex_sandbox_mode_maps_to_codex_cli_values() {
     assert_eq!(codex_sandbox_mode(SandboxMode::ReadOnly), "read-only");

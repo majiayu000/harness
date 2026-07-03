@@ -42,10 +42,10 @@ pub async fn migrate_legacy_event_store_if_needed(
     let mut tx = target_store.pool.begin().await?;
     let events_sql = format!(
         "INSERT INTO events (
-            store_key, id, ts, session_id, hook, tool, decision, reason, detail,
+            store_key, id, ts, session_id, run_id, hook, tool, decision, reason, detail,
             duration_ms, content, metadata
          )
-         SELECT $1, id, ts, session_id, hook, tool, decision, reason, detail,
+         SELECT $1, id, ts, session_id, run_id, hook, tool, decision, reason, detail,
                 duration_ms, content, metadata
          FROM {legacy_schema_sql}.events
          ON CONFLICT (store_key, id) DO NOTHING"
