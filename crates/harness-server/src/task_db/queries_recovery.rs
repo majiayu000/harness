@@ -19,6 +19,7 @@ impl TaskDb {
         pr_url: Option<&str>,
         terminal_status: Option<&str>,
     ) -> anyhow::Result<()> {
+        super::record_task_db_usage();
         if let Some(status) = terminal_status {
             let scheduler_state_row: Option<(String, i32)> = sqlx::query_as(
                 "SELECT scheduler_state, version FROM tasks WHERE store_key = $1 AND id = $2",
@@ -82,6 +83,7 @@ impl TaskDb {
 
     /// Recovery on server restart: resume or fail interrupted tasks.
     pub async fn recover_in_progress(&self) -> anyhow::Result<RecoveryResult> {
+        super::record_task_db_usage();
         let rows = {
             let resumable = TaskStatus::resumable_statuses();
             let placeholders = Self::numbered_placeholders(2, resumable.len());

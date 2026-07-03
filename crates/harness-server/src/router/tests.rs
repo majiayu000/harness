@@ -773,6 +773,47 @@ async fn thread_start_persists_to_db() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn usage_probe_counts_thread_and_turn_rpc_dispatch() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    harness_core::usage_probe::reset_for_tests();
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    let thread_req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ThreadList,
+    };
+    let turn_req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(2)),
+        method: Method::TurnStatus {
+            turn_id: harness_core::types::TurnId::from_str("missing-turn"),
+        },
+    };
+
+    let _ = handle_request(&state, thread_req).await;
+    let _ = handle_request(&state, turn_req).await;
+
+    let counts = harness_core::usage_probe::snapshot();
+    let thread_rpc = counts
+        .iter()
+        .find(|entry| entry.surface == "thread_rpc")
+        .ok_or_else(|| anyhow::anyhow!("missing thread_rpc count"))?;
+    let turn_rpc = counts
+        .iter()
+        .find(|entry| entry.surface == "turn_rpc")
+        .ok_or_else(|| anyhow::anyhow!("missing turn_rpc count"))?;
+
+    assert_eq!(thread_rpc.count, 1);
+    assert_eq!(turn_rpc.count, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn event_log_then_query_roundtrip() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
@@ -840,6 +881,43 @@ async fn event_log_then_query_roundtrip() -> anyhow::Result<()> {
         serde_json::json!(event.id.as_str()),
         "returned event id should match logged event"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn usage_probe_report_is_queryable_from_event_detail() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    harness_core::usage_probe::reset_for_tests();
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+
+    harness_core::usage_probe::record_usage(
+        harness_core::usage_probe::UsageProbeSurface::TaskRunner,
+    );
+    let event = harness_core::usage_probe::build_probe_report_event()?;
+    state.observability.events.log(&event).await?;
+
+    let events = state
+        .observability
+        .events
+        .query(&harness_core::types::EventFilters {
+            hook: Some("probe_report".to_string()),
+            tool: Some("usage_probe".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    assert_eq!(events.len(), 1);
+    let detail = events[0]
+        .detail
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing probe detail"))?;
+    assert!(detail.contains("\"surface\":\"task_runner\""));
+    assert!(detail.contains("\"count\":1"));
+    assert!(events[0].content.is_none());
     Ok(())
 }
 

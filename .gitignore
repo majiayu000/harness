@@ -11,6 +11,7 @@ crates/*/.harness/
 ~/.local/
 .omx/
 docs/artifacts/
+archives/
 
 # Git worktrees (superpowers skill convention)
 .worktrees/

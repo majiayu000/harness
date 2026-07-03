@@ -3,6 +3,7 @@ use crate::model::{
     PrRepairEvalInput, PullRequestSnapshot, ReviewDecision, ReviewThreadSnapshot, ReviewerJudgment,
     RuntimeJobSnapshot, RuntimeSnapshot,
 };
+use harness_core::usage_probe::{record_usage, UsageProbeSurface};
 use serde_json::Value;
 
 mod usage_ingest;
@@ -26,6 +27,7 @@ pub fn github_pr_snapshot_from_value(
     collected_at: &str,
     value: &Value,
 ) -> PullRequestSnapshot {
+    record_usage(UsageProbeSurface::HarnessEval);
     let review_threads = review_thread_values(value)
         .filter(|thread| {
             !thread
@@ -145,6 +147,7 @@ pub fn runtime_snapshot_from_values(
     task_detail: &Value,
     collected_at: &str,
 ) -> Option<RuntimeSnapshot> {
+    record_usage(UsageProbeSurface::HarnessEval);
     let task_id = optional_string_field(submission, "task_id")
         .or_else(|| optional_string_field(submission, "submission_id"))
         .or_else(|| optional_string_field(task_detail, "id"));
@@ -181,6 +184,7 @@ pub fn runtime_snapshot_from_values(
 }
 
 pub fn pr_repair_eval_input_from_values(input: PrRepairEvalIngest<'_>) -> PrRepairEvalInput {
+    record_usage(UsageProbeSurface::HarnessEval);
     let baseline_pr =
         github_pr_snapshot_from_value(input.repo, input.baseline_collected_at, input.baseline);
     let final_pr_snapshot =

@@ -10,6 +10,7 @@ use harness_core::{
     types::Turn,
     types::TurnId,
     types::TurnStatus,
+    usage_probe::{record_usage, UsageProbeSurface},
 };
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -69,6 +70,7 @@ impl ThreadManager {
     }
 
     pub fn start_thread(&self, cwd: std::path::PathBuf) -> ThreadId {
+        record_usage(UsageProbeSurface::ThreadManager);
         let thread = Thread::new(cwd);
         let id = thread.id.clone();
         self.threads.insert(id.as_str().to_string(), thread);
@@ -76,18 +78,22 @@ impl ThreadManager {
     }
 
     pub fn get_thread(&self, id: &ThreadId) -> Option<Thread> {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.threads.get(id.as_str()).map(|t| t.clone())
     }
 
     pub fn list_threads(&self) -> Vec<Thread> {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.threads.iter().map(|e| e.value().clone()).collect()
     }
 
     pub fn delete_thread(&self, id: &ThreadId) -> bool {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.threads.remove(id.as_str()).is_some()
     }
 
     pub fn register_turn_task(&self, turn_id: &TurnId, handle: JoinHandle<()>) {
+        record_usage(UsageProbeSurface::ThreadManager);
         if let Some((_, previous)) = self.running_turn_tasks.remove(turn_id.as_str()) {
             previous.abort();
         }
@@ -96,10 +102,12 @@ impl ThreadManager {
     }
 
     pub fn clear_turn_task(&self, turn_id: &TurnId) {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.running_turn_tasks.remove(turn_id.as_str());
     }
 
     pub fn abort_turn_task(&self, turn_id: &TurnId) -> bool {
+        record_usage(UsageProbeSurface::ThreadManager);
         if let Some((_, handle)) = self.running_turn_tasks.remove(turn_id.as_str()) {
             handle.abort();
             true
@@ -114,6 +122,7 @@ impl ThreadManager {
         input: String,
         agent_id: AgentId,
     ) -> harness_core::error::Result<TurnId> {
+        record_usage(UsageProbeSurface::ThreadManager);
         let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
             harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
         })?;
@@ -178,6 +187,7 @@ impl ThreadManager {
         thread_id: &ThreadId,
         turn_id: &TurnId,
     ) -> harness_core::error::Result<Option<TokenUsage>> {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.transition_turn(thread_id, turn_id, TurnStatus::Completed)
     }
 
@@ -186,6 +196,7 @@ impl ThreadManager {
         thread_id: &ThreadId,
         turn_id: &TurnId,
     ) -> harness_core::error::Result<Option<TokenUsage>> {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.transition_turn(thread_id, turn_id, TurnStatus::Failed)
     }
 
@@ -194,6 +205,7 @@ impl ThreadManager {
         thread_id: &ThreadId,
         turn_id: &TurnId,
     ) -> harness_core::error::Result<Option<TokenUsage>> {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.abort_turn_task(turn_id);
         self.transition_turn(thread_id, turn_id, TurnStatus::Cancelled)
     }
@@ -204,6 +216,7 @@ impl ThreadManager {
         turn_id: &TurnId,
         item: Item,
     ) -> harness_core::error::Result<()> {
+        record_usage(UsageProbeSurface::ThreadManager);
         let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
             harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
         })?;
@@ -221,6 +234,7 @@ impl ThreadManager {
         turn_id: &TurnId,
         usage: TokenUsage,
     ) -> harness_core::error::Result<bool> {
+        record_usage(UsageProbeSurface::ThreadManager);
         let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
             harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
         })?;
@@ -237,12 +251,14 @@ impl ThreadManager {
     }
 
     pub fn get_turn(&self, thread_id: &ThreadId, turn_id: &TurnId) -> Option<Turn> {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.threads
             .get(thread_id.as_str())
             .and_then(|thread| thread.turns.iter().find(|t| t.id == *turn_id).cloned())
     }
 
     pub fn is_turn_running(&self, thread_id: &ThreadId, turn_id: &TurnId) -> bool {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.get_turn(thread_id, turn_id)
             .is_some_and(|turn| matches!(turn.status, TurnStatus::Running))
     }
@@ -253,6 +269,7 @@ impl ThreadManager {
         turn_id: &TurnId,
         message: String,
     ) -> harness_core::error::Result<Option<TokenUsage>> {
+        record_usage(UsageProbeSurface::ThreadManager);
         if let Err(e) = self.add_item(thread_id, turn_id, Item::Error { code: -1, message }) {
             tracing::warn!("thread manager: failed to add error item for turn {turn_id}: {e}");
         }
@@ -260,14 +277,17 @@ impl ThreadManager {
     }
 
     pub fn active_turn_task_count(&self) -> usize {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.running_turn_tasks.len()
     }
 
     pub fn has_turn_task(&self, turn_id: &TurnId) -> bool {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.running_turn_tasks.contains_key(turn_id.as_str())
     }
 
     pub fn find_thread_and_turn(&self, turn_id: &TurnId) -> Option<(ThreadId, Turn)> {
+        record_usage(UsageProbeSurface::ThreadManager);
         for entry in self.threads.iter() {
             if let Some(turn) = entry.value().turns.iter().find(|turn| turn.id == *turn_id) {
                 return Some((entry.value().id.clone(), turn.clone()));
@@ -278,6 +298,7 @@ impl ThreadManager {
 
     /// Find which thread contains a given turn.
     pub fn find_thread_for_turn(&self, turn_id: &TurnId) -> Option<ThreadId> {
+        record_usage(UsageProbeSurface::ThreadManager);
         for entry in self.threads.iter() {
             if entry.value().turns.iter().any(|t| t.id == *turn_id) {
                 return Some(entry.value().id.clone());
@@ -293,6 +314,7 @@ impl ThreadManager {
         turn_id: &TurnId,
         instruction: String,
     ) -> harness_core::error::Result<()> {
+        record_usage(UsageProbeSurface::ThreadManager);
         let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
             harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
         })?;
@@ -308,6 +330,7 @@ impl ThreadManager {
 
     /// Resume an archived thread back to Idle.
     pub fn resume_thread(&self, id: &ThreadId) -> harness_core::error::Result<()> {
+        record_usage(UsageProbeSurface::ThreadManager);
         let mut thread = self
             .threads
             .get_mut(id.as_str())
@@ -324,6 +347,7 @@ impl ThreadManager {
         id: &ThreadId,
         from_turn: Option<&TurnId>,
     ) -> harness_core::error::Result<ThreadId> {
+        record_usage(UsageProbeSurface::ThreadManager);
         // Clone eagerly and drop the read guard before any subsequent write to
         // `self.threads`.  DashMap shards reads with a RwLock: holding a read
         // Ref while calling `insert` on a key that hashes to the same shard
@@ -361,6 +385,7 @@ impl ThreadManager {
 
     /// Compact a thread by clearing items from all completed turns.
     pub fn compact_thread(&self, id: &ThreadId) -> harness_core::error::Result<()> {
+        record_usage(UsageProbeSurface::ThreadManager);
         let mut thread = self
             .threads
             .get_mut(id.as_str())
@@ -377,12 +402,14 @@ impl ThreadManager {
 
     /// Register an active `AgentAdapter` for a running turn.
     pub fn register_active_adapter(&self, turn_id: &TurnId, adapter: Arc<dyn AgentAdapter>) {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.running_adapters
             .insert(turn_id.as_str().to_string(), adapter);
     }
 
     /// Remove the adapter registration for a completed or cancelled turn.
     pub fn deregister_active_adapter(&self, turn_id: &TurnId) {
+        record_usage(UsageProbeSurface::ThreadManager);
         self.running_adapters.remove(turn_id.as_str());
     }
 
@@ -398,6 +425,7 @@ impl ThreadManager {
         turn_id: &TurnId,
         instruction: String,
     ) -> harness_core::error::Result<()> {
+        record_usage(UsageProbeSurface::ThreadManager);
         // Only append steering instructions to running turns.
         if !self.is_turn_running(thread_id, turn_id) {
             return Err(harness_core::error::HarnessError::Unsupported(format!(
@@ -466,6 +494,7 @@ impl ThreadManager {
         request_id: String,
         decision: ApprovalDecision,
     ) -> harness_core::error::Result<()> {
+        record_usage(UsageProbeSurface::ThreadManager);
         let adapter = self
             .running_adapters
             .get(turn_id.as_str())

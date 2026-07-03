@@ -10,6 +10,7 @@
 
 use crate::handlers;
 use crate::http::AppState;
+use harness_core::usage_probe::{record_usage, UsageProbeSurface};
 use harness_protocol::{methods::Method, methods::RpcRequest, methods::RpcResponse};
 
 /// Route a JSON-RPC request to the appropriate handler.
@@ -28,6 +29,21 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
                 "Server not initialized. Send 'initialize' first.",
             ));
         }
+        _ => {}
+    }
+
+    match &req.method {
+        Method::ThreadStart { .. }
+        | Method::ThreadList
+        | Method::ThreadDelete { .. }
+        | Method::ThreadResume { .. }
+        | Method::ThreadFork { .. }
+        | Method::ThreadCompact { .. } => record_usage(UsageProbeSurface::ThreadRpc),
+        Method::TurnStart { .. }
+        | Method::TurnCancel { .. }
+        | Method::TurnStatus { .. }
+        | Method::TurnSteer { .. }
+        | Method::TurnRespondApproval { .. } => record_usage(UsageProbeSurface::TurnRpc),
         _ => {}
     }
 
