@@ -1,8 +1,8 @@
 use crate::http::AppState;
 use harness_context::{
     providers::{
-        ContractProvider, ErrorProvider, GcDraftsProvider, RulesProvider, SkillsProvider,
-        TaskBriefProvider,
+        ContractProvider, ErrorProvider, ExecPlanProvider, GcDraftsProvider, RulesProvider,
+        SkillsProvider, TaskBriefProvider,
     },
     ComposeConfig, ComposeManifest, ComposeMode, ComposeRequest, Composition, ContextComposer,
     ContextItem,
@@ -69,7 +69,7 @@ pub(crate) async fn record_context_composition(
     thread_id: &ThreadId,
     project: ProjectId,
     task_profile: harness_context::TaskProfile,
-) {
+) -> Result<(), String> {
     let mode = state.core.server.config.context.mode.into();
     let request = ComposeRequest {
         thread_id: thread_id.clone(),
@@ -80,23 +80,43 @@ pub(crate) async fn record_context_composition(
     };
     let composer = build_composer(state, mode).await;
     let outcome = composer.compose(&request);
-    let (manifest, decision, reason) = match outcome {
+    let (manifest, decision, reason, fatal_error) = match outcome {
         Ok(composition) => {
-            let decision = if composition.manifest.provider_errors.is_empty()
-                && composition.manifest.warnings.is_empty()
-            {
-                Decision::Pass
+            let mut manifest = composition.manifest;
+            if mode == ComposeMode::Enforce {
+                let message = "context enforce mode is not available until composed injection replaces legacy injection paths";
+                manifest
+                    .warnings
+                    .push("context_enforce_not_wired".to_string());
+                tracing::error!(thread_id = %thread_id, "context enforce mode requested before injection wiring is available");
+                (
+                    manifest,
+                    Decision::Block,
+                    Some("context_enforce_not_wired".to_string()),
+                    Some(message.to_string()),
+                )
             } else {
-                Decision::Warn
-            };
-            (composition.manifest, decision, None)
+                let decision =
+                    if manifest.provider_errors.is_empty() && manifest.warnings.is_empty() {
+                        Decision::Pass
+                    } else {
+                        Decision::Warn
+                    };
+                (manifest, decision, None, None)
+            }
         }
         Err(error) => {
             tracing::error!(thread_id = %thread_id, error = %error, "context composition failed");
+            let fatal_error = if mode == ComposeMode::Enforce {
+                Some(error.to_string())
+            } else {
+                None
+            };
             (
                 error.manifest().clone(),
                 Decision::Block,
                 Some("compose_error".to_string()),
+                fatal_error,
             )
         }
     };
@@ -104,6 +124,10 @@ pub(crate) async fn record_context_composition(
     if let Err(error) = log_manifest_event(state, thread_id, manifest, decision, reason).await {
         tracing::warn!(thread_id = %thread_id, error = %error, "context manifest logging failed");
     }
+    if let Some(error) = fatal_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn build_composer(state: &AppState, mode: ComposeMode) -> ContextComposer {
@@ -118,8 +142,15 @@ async fn build_composer(state: &AppState, mode: ComposeMode) -> ContextComposer 
         let skills = state.engines.skills.read().await;
         skills.list().to_vec()
     };
+    let plans = state
+        .core
+        .plan_cache
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect::<Vec<_>>();
     let composer = ContextComposer::new(config)
         .with_provider(Box::new(ContractProvider))
+        .with_provider(Box::new(ExecPlanProvider::new(plans)))
         .with_provider(Box::new(RulesProvider::new(rules)))
         .with_provider(Box::new(SkillsProvider::new(skills)))
         .with_provider(Box::new(TaskBriefProvider));

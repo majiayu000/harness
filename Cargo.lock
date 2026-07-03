@@ -1284,11 +1284,13 @@ version = "0.6.34"
 dependencies = [
  "anyhow",
  "harness-core",
+ "harness-exec",
  "harness-gc",
  "harness-rules",
  "harness-skills",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
