@@ -1,4 +1,4 @@
-use crate::providers::StaticProvider;
+use crate::providers::{ExecPlanProvider, StaticProvider};
 use crate::*;
 use harness_core::types::{ProjectId, ThreadId};
 
@@ -206,4 +206,26 @@ fn manifest_serialization_omits_item_content() {
 
     assert!(manifest_json.contains("rule:secret"));
     assert!(!manifest_json.contains(secret_content));
+}
+
+#[test]
+fn providers_include_active_exec_plans_for_matching_project() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut plan = harness_exec::plan::ExecPlan::from_spec("# Ship context composer", dir.path())
+        .expect("plan");
+    plan.activate();
+    let provider = ExecPlanProvider::new(vec![plan.clone()]);
+    let mut request = req();
+    request.project = ProjectId::from_path(dir.path());
+
+    let items = provider.propose(&request).expect("provider succeeds");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].id.as_str(),
+        format!("contract:exec-plan:{}", plan.id)
+    );
+    assert_eq!(items[0].class, ItemClass::Contract);
+    assert_eq!(items[0].priority, Priority::P0);
+    assert!(items[0].content.contains("Ship context composer"));
 }

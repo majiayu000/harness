@@ -2,7 +2,7 @@ use crate::{
     ComposeRequest, ContextItem, ContextProvider, Degraded, ItemClass, ItemId, Priority,
     ProviderError, ProviderId,
 };
-use harness_core::types::DraftStatus;
+use harness_core::types::{DraftStatus, ExecPlanStatus, ProjectId};
 use harness_rules::engine::Rule;
 use harness_skills::store::Skill;
 
@@ -128,6 +128,58 @@ impl ContextProvider for ContractProvider {
             dedupe_key: Some("contract:task".to_string()),
             instruction_bearing: true,
         }])
+    }
+}
+
+pub struct ExecPlanProvider {
+    plans: Vec<harness_exec::plan::ExecPlan>,
+}
+
+impl ExecPlanProvider {
+    pub fn new(plans: Vec<harness_exec::plan::ExecPlan>) -> Self {
+        Self { plans }
+    }
+}
+
+impl ContextProvider for ExecPlanProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("contract")
+    }
+
+    fn propose(&self, req: &ComposeRequest) -> Result<Vec<ContextItem>, ProviderError> {
+        let mut plans = self
+            .plans
+            .iter()
+            .filter(|plan| ProjectId::from_path(&plan.project_root) == req.project)
+            .filter(|plan| matches!(plan.status, ExecPlanStatus::Draft | ExecPlanStatus::Active))
+            .cloned()
+            .collect::<Vec<_>>();
+        plans.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+
+        Ok(plans
+            .into_iter()
+            .map(|plan| {
+                let priority = if plan.status == ExecPlanStatus::Active {
+                    Priority::P0
+                } else {
+                    Priority::P1
+                };
+                ContextItem {
+                    id: ItemId::new(format!("contract:exec-plan:{}", plan.id)),
+                    class: ItemClass::Contract,
+                    content: plan.to_markdown(),
+                    est_tokens: 0,
+                    priority,
+                    relevance: if priority == Priority::P0 { 1.0 } else { 0.7 },
+                    degrade: vec![
+                        Degraded::Summary(format!("ExecPlan {}: {}", plan.id, plan.purpose)),
+                        Degraded::Pointer(format!("See ExecPlan {}", plan.id)),
+                    ],
+                    dedupe_key: Some(format!("contract:exec-plan:{}", plan.id)),
+                    instruction_bearing: true,
+                }
+            })
+            .collect())
     }
 }
 

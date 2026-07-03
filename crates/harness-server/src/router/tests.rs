@@ -1219,6 +1219,14 @@ async fn context_shadow_thread_start_logs_manifest_without_response_shape_change
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
     let proj_dir = crate::test_helpers::tempdir_in_home("harness-context-shadow-")?;
+    std::fs::write(
+        proj_dir.path().join("AGENTS.md"),
+        "Project instruction body",
+    )?;
+    std::fs::write(
+        proj_dir.path().join("WORKFLOW.md"),
+        "---\nworkflow:\n  id: context-shadow-test\n---\nWorkflow prompt body\n",
+    )?;
 
     let req = RpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -1267,6 +1275,54 @@ async fn context_shadow_thread_start_logs_manifest_without_response_shape_change
         manifest["manifest"]["thread_id"],
         serde_json::json!(thread_id)
     );
+    let items = manifest["manifest"]["items"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("manifest items should be an array"))?;
+    assert!(
+        items
+            .iter()
+            .any(|item| item["id"] == serde_json::json!("brief:task")),
+        "thread_start should record a task brief item"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item["id"] == serde_json::json!("contract:task")),
+        "thread_start should record a project/workflow contract item"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_enforce_thread_start_fails_closed_until_injection_is_wired() -> anyhow::Result<()>
+{
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    let dir = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.context.mode = harness_core::config::misc::ContextMode::Enforce;
+    let state =
+        make_test_state_with_config_and_registry(dir.path(), config, AgentRegistry::new("claude"))
+            .await?;
+    let proj_dir = crate::test_helpers::tempdir_in_home("harness-context-enforce-")?;
+
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: Method::ThreadStart {
+            cwd: proj_dir.path().to_path_buf(),
+        },
+    };
+    let resp = handle_request(&state, req).await.expect("response");
+    let error = resp
+        .error
+        .ok_or_else(|| anyhow::anyhow!("enforce mode should fail closed"))?;
+
+    assert!(
+        error.message.contains("context enforce mode"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert!(resp.result.is_none());
     Ok(())
 }
 
