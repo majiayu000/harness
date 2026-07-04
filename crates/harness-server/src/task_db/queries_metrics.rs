@@ -11,6 +11,7 @@ impl TaskDb {
     pub async fn list_terminal_first_token_latencies_ms(
         &self,
     ) -> anyhow::Result<Vec<(String, Option<i64>)>> {
+        super::record_task_db_usage();
         let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
             "SELECT id, \
              (SELECT (r.value ->> 'first_token_latency_ms')::BIGINT \
@@ -31,6 +32,7 @@ impl TaskDb {
 
     /// Return `(task_id, turn)` pairs for the 500 most-recently-completed terminal tasks.
     pub async fn list_terminal_turn_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        super::record_task_db_usage();
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT id, turn FROM tasks \
              WHERE store_key = $1 AND status IN ('done', 'failed') \
@@ -44,6 +46,7 @@ impl TaskDb {
 
     /// Return `(id, status)` pairs for all tasks.
     pub async fn list_id_status(&self) -> anyhow::Result<Vec<(String, String)>> {
+        super::record_task_db_usage();
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, status FROM tasks WHERE store_key = $1 ORDER BY created_at DESC",
         )
@@ -55,6 +58,7 @@ impl TaskDb {
 
     /// Return only task IDs whose `status` matches any value in `statuses`.
     pub async fn list_ids_by_status(&self, statuses: &[&str]) -> anyhow::Result<Vec<String>> {
+        super::record_task_db_usage();
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
@@ -71,6 +75,7 @@ impl TaskDb {
 
     /// Return the status of a single task, fetching only the `status` column.
     pub async fn get_status_only(&self, id: &str) -> anyhow::Result<Option<String>> {
+        super::record_task_db_usage();
         let row: Option<(String,)> =
             sqlx::query_as("SELECT status FROM tasks WHERE store_key = $1 AND id = $2")
                 .bind(&self.store_key)
@@ -93,6 +98,7 @@ impl TaskDb {
 
     /// Return `true` if a task row with the given ID exists in the database.
     pub async fn exists_by_id(&self, id: &str) -> anyhow::Result<bool> {
+        super::record_task_db_usage();
         let row: Option<(String,)> =
             sqlx::query_as("SELECT id FROM tasks WHERE store_key = $1 AND id = $2")
                 .bind(&self.store_key)
@@ -104,6 +110,7 @@ impl TaskDb {
 
     /// Return the `pr_url` of the most recently completed Done task that has one.
     pub async fn latest_done_pr_url(&self) -> anyhow::Result<Option<String>> {
+        super::record_task_db_usage();
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT pr_url FROM tasks \
              WHERE store_key = $1 AND status = 'done' AND pr_url IS NOT NULL \
@@ -120,6 +127,7 @@ impl TaskDb {
         &self,
         project: &str,
     ) -> anyhow::Result<Option<String>> {
+        super::record_task_db_usage();
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT pr_url FROM tasks \
              WHERE store_key = $1 AND status = 'done' AND pr_url IS NOT NULL AND project = $2 \
@@ -136,6 +144,7 @@ impl TaskDb {
     pub async fn latest_done_pr_urls_all_projects(
         &self,
     ) -> anyhow::Result<HashMap<String, String>> {
+        super::record_task_db_usage();
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT project, pr_url FROM (\
                SELECT project, pr_url, \
@@ -157,6 +166,7 @@ impl TaskDb {
     pub async fn count_done_failed_by_project(
         &self,
     ) -> anyhow::Result<(u64, u64, Vec<(String, u64, u64)>)> {
+        super::record_task_db_usage();
         let outcome_statuses = [TaskStatus::Done.as_ref(), TaskStatus::Failed.as_ref()];
         let global_sql = format!(
             "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
@@ -198,6 +208,7 @@ impl TaskDb {
 
     /// Count tasks that reached `done` status with `updated_at >= since`.
     pub async fn count_done_since(&self, since: DateTime<Utc>) -> anyhow::Result<u64> {
+        super::record_task_db_usage();
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM tasks \
              WHERE store_key = $1 AND status = 'done' AND updated_at >= $2",
@@ -214,6 +225,7 @@ impl TaskDb {
         &self,
         since: DateTime<Utc>,
     ) -> anyhow::Result<Vec<(String, String, u64)>> {
+        super::record_task_db_usage();
         let rows: Vec<(Option<String>, String, i64)> = sqlx::query_as(
             "SELECT project, \
                     TO_CHAR(date_trunc('hour', updated_at AT TIME ZONE 'UTC'), \
@@ -235,6 +247,7 @@ impl TaskDb {
 
     /// Return all tasks whose `parent_id` matches the given parent task ID.
     pub async fn list_children(&self, parent_id: &str) -> anyhow::Result<Vec<TaskState>> {
+        super::record_task_db_usage();
         let sql = format!(
             "SELECT {TASK_ROW_COLUMNS} FROM tasks \
              WHERE store_key = $1 AND parent_id = $2 ORDER BY created_at DESC"
@@ -253,6 +266,7 @@ impl TaskDb {
         stale_threshold: std::time::Duration,
         project: Option<&str>,
     ) -> anyhow::Result<Vec<TaskState>> {
+        super::record_task_db_usage();
         let cutoff = Utc::now() - chrono::Duration::from_std(stale_threshold)?;
         let sql = if project.is_some() {
             format!(
@@ -294,6 +308,7 @@ impl TaskDb {
         &self,
         limit: i64,
     ) -> anyhow::Result<Vec<crate::task_runner::RecentFailureTask>> {
+        super::record_task_db_usage();
         let rows = sqlx::query_as::<_, RecentFailureRow>(
             "SELECT id, failure_kind, external_id, project, workspace_path, workspace_owner, \
              run_generation, error, updated_at FROM tasks \

@@ -23,6 +23,9 @@ impl fmt::Display for ScoringError {
 impl Error for ScoringError {}
 
 pub fn score_pr_repair_eval(input: PrRepairEvalInput) -> Result<QualitySnapshot, ScoringError> {
+    harness_core::usage_probe::record_usage(
+        harness_core::usage_probe::UsageProbeSurface::HarnessEval,
+    );
     let target_matches = target_matches_pr(&input)?;
     let branch_safe = branch_safe(&input);
     let no_unrelated_pr = !input.created_unrelated_pr;

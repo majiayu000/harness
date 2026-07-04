@@ -7,6 +7,7 @@ use super::TaskDb;
 
 impl TaskDb {
     pub async fn insert(&self, state: &TaskState) -> anyhow::Result<()> {
+        super::record_task_db_usage();
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let status = state.status.as_ref();
@@ -70,6 +71,7 @@ impl TaskDb {
     }
 
     pub async fn update(&self, state: &TaskState) -> anyhow::Result<()> {
+        super::record_task_db_usage();
         let rounds_json = serde_json::to_string(&state.rounds)?;
         let depends_on_json = serde_json::to_string(&state.depends_on)?;
         let phase_json = serde_json::to_string(&state.phase)?;
@@ -134,6 +136,7 @@ impl TaskDb {
     }
 
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<TaskState>> {
+        super::record_task_db_usage();
         let sql = format!("SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE store_key = $1 AND id = $2");
         let row = sqlx::query_as::<_, TaskRow>(&sql)
             .bind(&self.store_key)
@@ -144,6 +147,7 @@ impl TaskDb {
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<TaskState>> {
+        super::record_task_db_usage();
         let sql = format!(
             "SELECT {TASK_ROW_COLUMNS} FROM tasks WHERE store_key = $1 ORDER BY created_at DESC"
         );
@@ -158,6 +162,7 @@ impl TaskDb {
     ///
     /// Returns an empty `Vec` when `statuses` is empty.
     pub async fn list_by_status(&self, statuses: &[&str]) -> anyhow::Result<Vec<TaskState>> {
+        super::record_task_db_usage();
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
@@ -175,6 +180,7 @@ impl TaskDb {
 
     /// Return pending tasks that have no PR URL and no checkpoint row.
     pub async fn pending_orphan_tasks(&self) -> anyhow::Result<Vec<TaskState>> {
+        super::record_task_db_usage();
         let sql = format!(
             "SELECT {TASK_ROW_COLUMNS} \
              FROM tasks t \
@@ -201,6 +207,7 @@ impl TaskDb {
         project: &str,
         repo: Option<&str>,
     ) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+        super::record_task_db_usage();
         let base_sql = "SELECT external_id, status, created_at FROM (\
                  SELECT external_id, status, created_at, \
                         ROW_NUMBER() OVER (PARTITION BY external_id ORDER BY created_at DESC, id DESC) AS rn \
@@ -241,6 +248,7 @@ impl TaskDb {
         project: &str,
         external_id: &str,
     ) -> anyhow::Result<Option<String>> {
+        super::record_task_db_usage();
         let active_statuses: Vec<&str> = std::iter::once(TaskStatus::Pending.as_ref())
             .chain(std::iter::once(TaskStatus::AwaitingDeps.as_ref()))
             .chain(TaskStatus::resumable_statuses().iter().copied())
@@ -267,6 +275,7 @@ impl TaskDb {
         project: &str,
         external_id: &str,
     ) -> anyhow::Result<Option<(String, String)>> {
+        super::record_task_db_usage();
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT id, pr_url FROM tasks \
              WHERE store_key = $1 AND project = $2 AND external_id = $3 \
@@ -319,6 +328,7 @@ impl TaskDb {
         external_id: &str,
         expected_version: i32,
     ) -> anyhow::Result<()> {
+        super::record_task_db_usage();
         let result = sqlx::query(
             "UPDATE tasks SET external_id = $1, updated_at = CURRENT_TIMESTAMP, \
              version = version + 1 \
@@ -347,6 +357,7 @@ impl TaskDb {
         external_id: &str,
         expected_version: i32,
     ) -> anyhow::Result<()> {
+        super::record_task_db_usage();
         let result = sqlx::query(
             "UPDATE tasks SET external_id = $1, updated_at = CURRENT_TIMESTAMP, \
              version = version + 1 \
@@ -370,6 +381,7 @@ impl TaskDb {
 
     /// Return all tasks as lightweight summaries, skipping the heavy `rounds` column.
     pub async fn list_summaries(&self) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
+        super::record_task_db_usage();
         let rows = sqlx::query_as::<_, TaskSummaryRow>(
             "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \
@@ -386,6 +398,7 @@ impl TaskDb {
     pub async fn list_active_summaries(
         &self,
     ) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
+        super::record_task_db_usage();
         let rows = sqlx::query_as::<_, TaskSummaryRow>(
             "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \
@@ -405,6 +418,7 @@ impl TaskDb {
         &self,
         filter: &TaskSummaryFilter,
     ) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
+        super::record_task_db_usage();
         let mut query = QueryBuilder::<Postgres>::new(
             "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \
@@ -440,6 +454,7 @@ impl TaskDb {
         cursor: Option<&TaskSummaryPageCursor>,
         limit: usize,
     ) -> anyhow::Result<Vec<crate::task_runner::TaskSummary>> {
+        super::record_task_db_usage();
         let mut query = QueryBuilder::<Postgres>::new(
             "SELECT id, task_kind, status, failure_kind, turn, pr_url, error, source, external_id, parent_id, \
              created_at, repo, depends_on, project, workspace_path, workspace_owner, \

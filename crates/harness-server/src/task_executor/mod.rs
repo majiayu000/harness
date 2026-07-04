@@ -49,9 +49,74 @@ use std::collections::HashMap;
 #[cfg(test)]
 use tokio::time::Instant;
 
-pub(crate) use run_task::run_task;
-// Re-export so existing call sites in handlers/ don't need updating.
-pub(crate) use turn_lifecycle::run_turn_lifecycle;
+use run_task::run_task as run_task_impl;
+use turn_lifecycle::run_turn_lifecycle as run_turn_lifecycle_impl;
+// Wrappers keep existing call sites stable while counting old task surfaces.
+pub(crate) async fn run_task(
+    store: &crate::task_runner::TaskStore,
+    task_id: &crate::task_runner::TaskId,
+    agent: &dyn harness_core::agent::CodeAgent,
+    reviewer: Option<&dyn harness_core::agent::CodeAgent>,
+    skills: Arc<tokio::sync::RwLock<harness_skills::store::SkillStore>>,
+    events: Arc<harness_observe::event_store::EventStore>,
+    interceptors: SharedTurnInterceptors,
+    req: &crate::task_runner::CreateTaskRequest,
+    project: std::path::PathBuf,
+    project_root: std::path::PathBuf,
+    server_config: &harness_core::config::HarnessConfig,
+    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
+    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
+    turns_used_acc: &mut u32,
+) -> anyhow::Result<()> {
+    harness_core::usage_probe::record_usage(
+        harness_core::usage_probe::UsageProbeSurface::TaskExecutor,
+    );
+    run_task_impl(
+        store,
+        task_id,
+        agent,
+        reviewer,
+        skills,
+        events,
+        interceptors,
+        req,
+        project,
+        project_root,
+        server_config,
+        issue_workflow_store,
+        workflow_runtime_store,
+        turns_used_acc,
+    )
+    .await
+}
+
+pub(crate) async fn run_turn_lifecycle(
+    server: Arc<crate::server::HarnessServer>,
+    thread_db: Option<crate::thread_db::ThreadDb>,
+    notify_tx: Option<crate::notify::NotifySender>,
+    notification_tx: tokio::sync::broadcast::Sender<
+        harness_protocol::notifications::RpcNotification,
+    >,
+    thread_id: harness_core::types::ThreadId,
+    turn_id: harness_core::types::TurnId,
+    prompt: String,
+    agent_name: String,
+) {
+    harness_core::usage_probe::record_usage(
+        harness_core::usage_probe::UsageProbeSurface::TaskExecutor,
+    );
+    run_turn_lifecycle_impl(
+        server,
+        thread_db,
+        notify_tx,
+        notification_tx,
+        thread_id,
+        turn_id,
+        prompt,
+        agent_name,
+    )
+    .await;
+}
 pub(crate) use validation_gate::run_test_gate;
 
 pub(crate) type TurnInterceptorHandle = Arc<dyn TurnInterceptor>;

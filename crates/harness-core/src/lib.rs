@@ -20,6 +20,7 @@ pub mod store_backend;
 mod test_support;
 pub mod tool_isolation;
 pub mod types;
+pub mod usage_probe;
 pub mod validation;
 
 pub use config::misc::OtelExporter;

@@ -100,9 +100,16 @@ pub struct ReviewStore {
     pool: PgPool,
 }
 
+fn record_review_store_usage() {
+    harness_core::usage_probe::record_usage(
+        harness_core::usage_probe::UsageProbeSurface::ReviewStore,
+    );
+}
+
 impl ReviewStore {
     /// Open (or create) the review store, running any pending migrations.
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        record_review_store_usage();
         Self::open_with_database_url(path, None).await
     }
 
@@ -110,6 +117,7 @@ impl ReviewStore {
         path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
+        record_review_store_usage();
         let context = PgStoreContext::from_legacy_path_schema(path, configured_database_url)?;
         let pool = context.open_migrated_pool(REVIEW_MIGRATIONS).await?;
         Ok(Self { pool })
@@ -118,6 +126,7 @@ impl ReviewStore {
     pub fn shared_schema_context(
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<PgStoreContext> {
+        record_review_store_usage();
         PostgresBackend::new(configured_database_url.map(ToOwned::to_owned)).store_context(
             &StoreLocation::SharedSchema(REVIEW_STORE_SCHEMA.to_string()),
         )
@@ -127,6 +136,7 @@ impl ReviewStore {
         context: &PgStoreContext,
         setup_pool: &PgPool,
     ) -> anyhow::Result<Self> {
+        record_review_store_usage();
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, REVIEW_MIGRATIONS)
             .await?;
@@ -147,6 +157,7 @@ impl ReviewStore {
         review_id: &str,
         findings: &[ReviewFinding],
     ) -> anyhow::Result<usize> {
+        record_review_store_usage();
         let mut seen_ids = std::collections::HashSet::with_capacity(findings.len());
         for f in findings {
             if !seen_ids.insert(f.id.as_str()) {
@@ -216,6 +227,7 @@ impl ReviewStore {
 
     /// List all open findings, ordered by priority then impact.
     pub async fn list_open(&self) -> anyhow::Result<Vec<ReviewFinding>> {
+        record_review_store_usage();
         let rows: Vec<FindingRow> = sqlx::query_as(
             "SELECT id, rule_id, priority, impact, confidence, effort, \
                     file, line, title, description, action, task_id \
@@ -237,6 +249,7 @@ impl ReviewStore {
         review_id: &str,
         priorities: &[&str],
     ) -> anyhow::Result<Vec<ReviewFinding>> {
+        record_review_store_usage();
         if priorities.is_empty() {
             return Ok(vec![]);
         }
@@ -271,6 +284,7 @@ impl ReviewStore {
         rule_id: &str,
         file: &str,
     ) -> anyhow::Result<bool> {
+        record_review_store_usage();
         let result = sqlx::query(
             "UPDATE review_findings SET task_id = 'pending', claimed_at = CURRENT_TIMESTAMP \
              WHERE project_root = $1 AND rule_id = $2 AND file = $3 AND status = 'open' \
@@ -297,6 +311,7 @@ impl ReviewStore {
         stale_secs: i64,
         get_task_outcome: impl Fn(&str) -> Option<bool>,
     ) -> anyhow::Result<u64> {
+        record_review_store_usage();
         let with_real_id: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT rule_id, file, real_task_id \
              FROM review_findings \
@@ -344,6 +359,7 @@ impl ReviewStore {
         &self,
         project_root: &str,
     ) -> anyhow::Result<Vec<String>> {
+        record_review_store_usage();
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT real_task_id FROM review_findings \
              WHERE project_root = $1 AND task_id = 'pending' AND status = 'open' \
@@ -363,6 +379,7 @@ impl ReviewStore {
         file: &str,
         real_task_id: &str,
     ) -> anyhow::Result<()> {
+        record_review_store_usage();
         sqlx::query(
             "UPDATE review_findings SET real_task_id = $1 \
              WHERE project_root = $2 AND rule_id = $3 AND file = $4 \
@@ -385,6 +402,7 @@ impl ReviewStore {
         file: &str,
         task_id: &str,
     ) -> anyhow::Result<()> {
+        record_review_store_usage();
         sqlx::query(
             "UPDATE review_findings SET task_id = $1 \
              WHERE project_root = $2 AND rule_id = $3 AND file = $4 \
@@ -411,6 +429,7 @@ impl ReviewStore {
         rule_id: &str,
         file: &str,
     ) -> anyhow::Result<u64> {
+        record_review_store_usage();
         let result = sqlx::query(
             "UPDATE review_findings \
              SET task_id = NULL, \
@@ -437,6 +456,7 @@ impl ReviewStore {
         rule_id: &str,
         file: &str,
     ) -> anyhow::Result<()> {
+        record_review_store_usage();
         sqlx::query(
             "UPDATE review_findings \
              SET failure_count = 0, cooldown_until = NULL \
@@ -459,6 +479,7 @@ impl ReviewStore {
         project_root: &str,
         current_review_id: &str,
     ) -> anyhow::Result<u64> {
+        record_review_store_usage();
         let result = sqlx::query(
             "UPDATE review_findings \
              SET failure_count = 0, cooldown_until = NULL \
@@ -501,6 +522,7 @@ impl ReviewStore {
         rule_id: &str,
         file: &str,
     ) -> anyhow::Result<()> {
+        record_review_store_usage();
         sqlx::query(
             "UPDATE review_findings SET task_id = NULL \
              WHERE project_root = $1 AND rule_id = $2 AND file = $3 \
@@ -559,6 +581,7 @@ pub async fn migrate_legacy_review_store_if_needed(
     configured_database_url: Option<&str>,
     target_store: &ReviewStore,
 ) -> anyhow::Result<u64> {
+    record_review_store_usage();
     let legacy_context =
         PgStoreContext::from_legacy_path_schema(legacy_path, configured_database_url)?;
     let legacy_schema = legacy_context.schema();
@@ -611,6 +634,7 @@ pub async fn migrate_legacy_review_store_if_needed(
 /// The agent may wrap the JSON in markdown code fences; this function
 /// strips them before parsing.
 pub fn parse_review_output(raw: &str) -> anyhow::Result<ReviewOutput> {
+    record_review_store_usage();
     let trimmed = raw.trim();
 
     const START_MARKER: &str = "REVIEW_JSON_START";

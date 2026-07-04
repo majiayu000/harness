@@ -81,6 +81,9 @@ pub struct PrRepairBenchmarkSummary {
 }
 
 pub fn summarize_pr_repair_benchmark(input: PrRepairBenchmarkInput) -> PrRepairBenchmarkSummary {
+    harness_core::usage_probe::record_usage(
+        harness_core::usage_probe::UsageProbeSurface::HarnessEval,
+    );
     if input.cases.is_empty() {
         return PrRepairBenchmarkSummary {
             suite: input.suite,

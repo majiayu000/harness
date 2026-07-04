@@ -14,6 +14,7 @@ impl TaskDb {
         pr_url: Option<&str>,
         last_phase: &str,
     ) -> anyhow::Result<()> {
+        super::record_task_db_usage();
         sqlx::query(
             "INSERT INTO task_checkpoints \
                  (store_key, task_id, triage_output, plan_output, pr_url, last_phase, updated_at) \
@@ -37,6 +38,7 @@ impl TaskDb {
     }
 
     pub async fn load_checkpoint(&self, task_id: &str) -> anyhow::Result<Option<TaskCheckpoint>> {
+        super::record_task_db_usage();
         let row = sqlx::query_as::<_, TaskCheckpoint>(
             "SELECT task_id, triage_output, plan_output, pr_url, last_phase, \
                     TO_CHAR(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at \
@@ -56,6 +58,7 @@ impl TaskDb {
         artifact_type: &str,
         content: &str,
     ) -> anyhow::Result<()> {
+        super::record_task_db_usage();
         let stored = if content.len() > ARTIFACT_MAX_BYTES {
             let mut boundary = ARTIFACT_MAX_BYTES;
             while boundary > 0 && !content.is_char_boundary(boundary) {
@@ -85,6 +88,7 @@ impl TaskDb {
     }
 
     pub async fn list_artifacts(&self, task_id: &str) -> anyhow::Result<Vec<TaskArtifact>> {
+        super::record_task_db_usage();
         let rows = sqlx::query_as::<_, TaskArtifact>(
             "SELECT task_id, turn, artifact_type, content, \
                     TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at \
@@ -104,6 +108,7 @@ impl TaskDb {
         phase: &str,
         prompt: &str,
     ) -> anyhow::Result<()> {
+        super::record_task_db_usage();
         let stored = if prompt.len() > PROMPT_MAX_BYTES {
             let mut boundary = PROMPT_MAX_BYTES;
             while boundary > 0 && !prompt.is_char_boundary(boundary) {
@@ -129,6 +134,7 @@ impl TaskDb {
     }
 
     pub async fn get_task_prompts(&self, task_id: &str) -> anyhow::Result<Vec<TaskPrompt>> {
+        super::record_task_db_usage();
         let rows = sqlx::query_as::<_, TaskPrompt>(
             "SELECT task_id, turn, phase, prompt, \
                     TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at \
@@ -144,6 +150,7 @@ impl TaskDb {
     pub async fn pending_tasks_with_checkpoint(
         &self,
     ) -> anyhow::Result<Vec<(TaskState, TaskCheckpoint)>> {
+        super::record_task_db_usage();
         let rows = sqlx::query_as::<_, PendingCheckpointRow>(
             "SELECT t.id, t.task_kind, t.status, t.turn, t.pr_url, t.rounds, t.error, t.source, \
                     t.external_id, t.parent_id, t.created_at, t.updated_at, t.repo, t.depends_on, \

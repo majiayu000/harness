@@ -112,6 +112,8 @@ impl Scheduler {
             .events
             .persist_rule_scan(&project_root, &violations)
             .await;
+        let probe_report = harness_core::usage_probe::build_probe_report_event()?;
+        state.observability.events.log(&probe_report).await?;
         let report = generate_health_report(&events, &violations);
         tracing::info!(
             grade = ?report.quality.grade,
@@ -200,6 +202,50 @@ mod tests {
         let expected_root = project_root.path().display().to_string();
         assert_eq!(scan.detail.as_deref(), Some(expected_root.as_str()));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_tick_persists_usage_probe_report() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let data_dir = tempfile::tempdir()?;
+        let project_root = tempfile::tempdir()?;
+        let state = make_test_state(data_dir.path(), project_root.path()).await?;
+        let before = harness_core::usage_probe::snapshot()
+            .into_iter()
+            .find(|entry| entry.surface == "thread_manager")
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        harness_core::usage_probe::record_usage(
+            harness_core::usage_probe::UsageProbeSurface::ThreadManager,
+        );
+
+        Scheduler::run_health_tick(&state).await?;
+
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters {
+                hook: Some("probe_report".to_string()),
+                tool: Some("usage_probe".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(events.len(), 1);
+        let detail = events[0]
+            .detail
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("missing probe report detail"))?;
+        let counts: Vec<serde_json::Value> = serde_json::from_str(detail)?;
+        let thread_manager_count = counts
+            .iter()
+            .find(|entry| entry["surface"] == "thread_manager")
+            .and_then(|entry| entry["count"].as_u64())
+            .unwrap_or(0);
+        assert!(thread_manager_count > before);
         Ok(())
     }
 

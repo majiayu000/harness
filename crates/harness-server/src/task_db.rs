@@ -22,6 +22,10 @@ pub struct TaskDb {
     store_key: String,
 }
 
+fn record_task_db_usage() {
+    harness_core::usage_probe::record_usage(harness_core::usage_probe::UsageProbeSurface::TaskDb);
+}
+
 impl TaskDb {
     /// Open a Postgres-backed task database.
     ///
@@ -30,6 +34,7 @@ impl TaskDb {
     /// fully isolated. The schema is created if it does not exist and migrations
     /// are applied before any queries run.
     pub async fn open(db_path: &Path) -> anyhow::Result<Self> {
+        record_task_db_usage();
         Self::open_with_database_url(db_path, None).await
     }
 
@@ -37,6 +42,7 @@ impl TaskDb {
         db_path: &Path,
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<Self> {
+        record_task_db_usage();
         let context = PgStoreContext::from_legacy_path_schema(db_path, configured_database_url)?;
         let schema = context.schema().to_owned();
         let store_key = schema.clone();
@@ -51,6 +57,7 @@ impl TaskDb {
     pub fn shared_schema_context(
         configured_database_url: Option<&str>,
     ) -> anyhow::Result<PgStoreContext> {
+        record_task_db_usage();
         PostgresBackend::new(configured_database_url.map(ToOwned::to_owned))
             .store_context(&StoreLocation::SharedSchema(TASK_DB_SCHEMA.to_string()))
     }
@@ -59,6 +66,7 @@ impl TaskDb {
         context: &PgStoreContext,
         setup_pool: &PgPool,
     ) -> anyhow::Result<Self> {
+        record_task_db_usage();
         Self::open_with_context_and_store_key(context, setup_pool, context.schema().to_owned())
             .await
     }
@@ -68,6 +76,7 @@ impl TaskDb {
         setup_pool: &PgPool,
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
+        record_task_db_usage();
         let store_key = Self::store_key_for_data_dir(data_dir)?;
         Self::open_with_context_and_store_key(context, setup_pool, store_key).await
     }
@@ -89,6 +98,7 @@ impl TaskDb {
     }
 
     pub async fn from_pg_pool(pool: PgPool) -> anyhow::Result<Self> {
+        record_task_db_usage();
         let schema: String = sqlx::query_scalar("SELECT current_schema()")
             .fetch_one(&pool)
             .await?;
@@ -102,10 +112,12 @@ impl TaskDb {
     }
 
     pub fn schema(&self) -> &str {
+        record_task_db_usage();
         &self.schema
     }
 
     pub fn store_key_for_data_dir(data_dir: &Path) -> anyhow::Result<String> {
+        record_task_db_usage();
         let canonical = data_dir.canonicalize().map_err(|error| {
             anyhow::anyhow!(
                 "failed to canonicalize task data_dir {}: {error}",
@@ -116,6 +128,7 @@ impl TaskDb {
     }
 
     pub fn store_key(&self) -> &str {
+        record_task_db_usage();
         &self.store_key
     }
 

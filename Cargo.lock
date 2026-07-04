@@ -1321,6 +1321,7 @@ dependencies = [
 name = "harness-eval"
 version = "0.6.34"
 dependencies = [
+ "harness-core",
  "serde",
  "serde_json",
 ]
