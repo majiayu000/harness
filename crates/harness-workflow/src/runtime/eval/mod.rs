@@ -7,6 +7,7 @@
 pub mod evidence;
 pub mod manifest;
 pub mod model;
+pub mod report;
 pub mod run;
 pub mod scoring;
 
@@ -17,6 +18,11 @@ pub use evidence::{
 pub use manifest::{
     parse_benchmark_manifest_str, EvalBenchmarkCase, EvalBenchmarkManifest, ManifestError,
     DEFAULT_CASE_TIMEOUT_SECS,
+};
+pub use report::{
+    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence, EvalCaseTransition,
+    EvalCaseTransitionKind, EvalReportCase, EvalReportCaseStatus, EvalReportError,
+    EvalReportMetricDelta, EvalReportMetrics, EvalRunReport, EvalRunReportDiff,
 };
 pub use run::{
     dispatch_eval_case_workflow, enqueue_eval_case_workflow, EvalCaseDispatchOutcome,
