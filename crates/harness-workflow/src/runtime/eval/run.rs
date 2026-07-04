@@ -62,7 +62,17 @@ pub struct EvalRunCleanupSummary {
     pub active_runtime_jobs: usize,
     pub orphan_workspaces: usize,
     pub orphan_pull_requests: usize,
+    /// Eval runs reuse the workflow runtime schema and must not create per-run schemas.
     pub orphan_schemas: usize,
+    pub cleanup_failures: Vec<EvalRunCleanupFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalRunCleanupFailure {
+    pub case_id: String,
+    pub workflow_id: String,
+    pub step: String,
+    pub error: String,
 }
 
 impl EvalRunCleanupSummary {
@@ -79,6 +89,7 @@ impl EvalRunCleanupSummary {
             orphan_workspaces: 0,
             orphan_pull_requests: 0,
             orphan_schemas: 0,
+            cleanup_failures: Vec::new(),
         }
     }
 
@@ -89,6 +100,22 @@ impl EvalRunCleanupSummary {
             && self.orphan_workspaces == 0
             && self.orphan_pull_requests == 0
             && self.orphan_schemas == 0
+            && self.cleanup_failures.is_empty()
+    }
+
+    fn record_failure(
+        &mut self,
+        case_id: &str,
+        workflow_id: &str,
+        step: &str,
+        error: impl std::fmt::Display,
+    ) {
+        self.cleanup_failures.push(EvalRunCleanupFailure {
+            case_id: case_id.to_string(),
+            workflow_id: workflow_id.to_string(),
+            step: step.to_string(),
+            error: error.to_string(),
+        });
     }
 }
 
@@ -216,33 +243,70 @@ pub async fn cleanup_cancelled_eval_run(
     let mut summary = EvalRunCleanupSummary::new(eval_run_id);
     for case in input.cases {
         let workflow_id = eval_case_workflow_id(eval_run_id, &case.case_id);
-        let Some(instance) = store.get_instance(&workflow_id).await? else {
-            continue;
+        let instance = match store.get_instance(&workflow_id).await {
+            Ok(Some(instance)) => instance,
+            Ok(None) => continue,
+            Err(error) => {
+                summary.record_failure(&case.case_id, &workflow_id, "load_workflow", error);
+                continue;
+            }
         };
         summary.workflows_seen += 1;
 
-        let commands = store.commands_for(&workflow_id).await?;
+        let commands = match store.commands_for(&workflow_id).await {
+            Ok(commands) => commands,
+            Err(error) => {
+                summary.record_failure(&case.case_id, &workflow_id, "load_commands", error);
+                continue;
+            }
+        };
         for command in commands {
             if !active_command_status(command.status) {
                 continue;
             }
-            summary.commands_cancelled += 1;
-            summary.runtime_jobs_cancelled += store
+            match store
                 .cancel_command_and_unfinished_runtime_jobs(
                     &command.id,
                     command.command.runtime_activity_key(),
                     reason,
                 )
-                .await?;
+                .await
+            {
+                Ok(cancelled_jobs) => {
+                    summary.commands_cancelled += 1;
+                    summary.runtime_jobs_cancelled += cancelled_jobs;
+                }
+                Err(error) => {
+                    summary.record_failure(&case.case_id, &workflow_id, "cancel_command", error);
+                }
+            }
         }
 
-        if !instance.is_terminal()
-            && cancel_eval_workflow_instance(store, instance, eval_run_id, case, reason).await?
+        let mut final_instance = instance.clone();
+        if !instance.is_terminal() {
+            match cancel_eval_workflow_instance(store, &instance, eval_run_id, case, reason).await {
+                Ok(Some(cancelled_instance)) => {
+                    summary.workflows_cancelled += 1;
+                    final_instance = cancelled_instance;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    summary.record_failure(&case.case_id, &workflow_id, "cancel_workflow", error);
+                }
+            }
+        };
+
+        if let Err(error) =
+            collect_remaining_eval_resources(store, &workflow_id, &final_instance, &mut summary)
+                .await
         {
-            summary.workflows_cancelled += 1;
+            summary.record_failure(
+                &case.case_id,
+                &workflow_id,
+                "collect_remaining_resources",
+                error,
+            );
         }
-
-        collect_remaining_eval_resources(store, &workflow_id, &mut summary).await?;
     }
 
     Ok(summary)
@@ -250,11 +314,11 @@ pub async fn cleanup_cancelled_eval_run(
 
 async fn cancel_eval_workflow_instance(
     store: &WorkflowRuntimeStore,
-    instance: WorkflowInstance,
+    instance: &WorkflowInstance,
     eval_run_id: &str,
     case: &EvalBenchmarkCase,
     reason: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<WorkflowInstance>> {
     let observed_state = instance.state.clone();
     let mut final_instance = instance.clone();
     final_instance.state = "cancelled".to_string();
@@ -285,7 +349,7 @@ async fn cancel_eval_workflow_instance(
     .high_confidence();
 
     crate::runtime::DecisionValidator::github_issue_pr().validate(
-        &instance,
+        instance,
         &decision,
         &ValidationContext::new("eval-cleanup", Utc::now()),
     )?;
@@ -306,26 +370,35 @@ async fn cancel_eval_workflow_instance(
             command_status: WorkflowCommandStatus::Pending,
         })
         .await?;
-    Ok(record.is_some())
+    Ok(record.map(|_| final_instance))
 }
 
 async fn collect_remaining_eval_resources(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
+    instance: &WorkflowInstance,
     summary: &mut EvalRunCleanupSummary,
 ) -> anyhow::Result<()> {
-    if let Some(instance) = store.get_instance(workflow_id).await? {
-        if !instance.is_terminal() {
-            summary.active_workflows += 1;
-        }
-        if instance.data.pointer("/eval/workspace_path").is_some() {
-            summary.orphan_workspaces += 1;
-        }
-        if instance.data.pointer("/pr_number").is_some()
-            || instance.data.pointer("/eval/pr_number").is_some()
-        {
-            summary.orphan_pull_requests += 1;
-        }
+    if !instance.is_terminal() {
+        summary.active_workflows += 1;
+    }
+    if instance
+        .data
+        .pointer("/eval/workspace_path")
+        .is_some_and(|value| !value.is_null())
+    {
+        summary.orphan_workspaces += 1;
+    }
+    if instance
+        .data
+        .pointer("/pr_number")
+        .is_some_and(|value| !value.is_null())
+        || instance
+            .data
+            .pointer("/eval/pr_number")
+            .is_some_and(|value| !value.is_null())
+    {
+        summary.orphan_pull_requests += 1;
     }
 
     for command in store.commands_for(workflow_id).await? {
