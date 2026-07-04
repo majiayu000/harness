@@ -1,5 +1,6 @@
 use crate::http::AppState;
 use async_trait::async_trait;
+use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_core::types::{AgentId, ThreadId};
 use harness_workflow::runtime::{
@@ -7,6 +8,7 @@ use harness_workflow::runtime::{
     WorkflowInstance,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -162,6 +164,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     approval_policy,
                     timeout_secs: runtime_profile.timeout_secs,
                     stall_timeout_secs: None,
+                    env_vars: isolation_spawn_env_vars(&job),
                     // Always drive Codex turns through the `codex exec` CLI rather
                     // than the persistent `codex app-server` JSON-RPC adapter. The
                     // app-server holds one long-lived connection per turn, which is
@@ -346,6 +349,37 @@ fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
     is_builtin_lifecycle_activity(job) || is_server_owned_pr_feedback_inspection(job)
 }
 
+fn isolation_spawn_env_vars(job: &RuntimeJob) -> HashMap<String, String> {
+    let mut env_vars = HashMap::new();
+    let Some(isolation) = job.input.get("isolation").and_then(Value::as_object) else {
+        return env_vars;
+    };
+    if let Some(tier) = isolation
+        .get("tier")
+        .and_then(Value::as_str)
+        .filter(|tier| !tier.trim().is_empty())
+    {
+        env_vars.insert(AGENT_ISOLATION_TIER_ENV.to_string(), tier.to_string());
+    }
+    let allowlist = isolation
+        .get("network_allowlist")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    if !allowlist.is_empty() {
+        env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
+    }
+    env_vars
+}
+
 async fn persist_created_thread(state: &AppState, thread_id: &ThreadId) {
     let Some(db) = state.core.thread_db.as_ref() else {
         return;
@@ -487,6 +521,30 @@ mod tests {
             "codex-default",
             json!({ "activity": activity }),
         )
+    }
+
+    #[test]
+    fn isolation_spawn_env_vars_extracts_tier_and_allowlist() {
+        let mut job = runtime_job("implement_issue");
+        job.input = json!({
+            "activity": "implement_issue",
+            "isolation": {
+                "tier": "container",
+                "trust_class": "non_collaborator",
+                "network_allowlist": ["github.com", " api.anthropic.com ", ""],
+            }
+        });
+
+        let env_vars = isolation_spawn_env_vars(&job);
+
+        assert_eq!(
+            env_vars.get(AGENT_ISOLATION_TIER_ENV),
+            Some(&"container".to_string())
+        );
+        assert_eq!(
+            env_vars.get(AGENT_NETWORK_ALLOWLIST_ENV),
+            Some(&"github.com,api.anthropic.com".to_string())
+        );
     }
 
     fn workflow(definition_id: &str) -> WorkflowInstance {

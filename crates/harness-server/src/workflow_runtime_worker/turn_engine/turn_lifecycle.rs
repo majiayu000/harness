@@ -7,6 +7,7 @@ use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::error::HarnessError;
 use harness_core::types::{ExecutionPhase, TurnId};
 use harness_protocol::notifications::{Notification, RpcNotification};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -91,6 +92,7 @@ pub(crate) struct TurnLifecycleOptions {
     pub timeout_secs: Option<u64>,
     pub stall_timeout_secs: Option<u64>,
     pub force_code_agent: bool,
+    pub env_vars: HashMap<String, String>,
 }
 
 pub(crate) async fn run_turn_lifecycle_with_options(
@@ -263,6 +265,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             execution_phase: options.execution_phase,
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
+            env_vars: options.env_vars.clone(),
             ..Default::default()
         };
         Box::pin(agent.execute_stream(req, stream_tx))

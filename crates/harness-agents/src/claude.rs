@@ -15,7 +15,7 @@ use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
     types::Capability, types::ReasoningBudget,
 };
-use harness_sandbox::{wrap_command, SandboxSpec};
+use harness_sandbox::SandboxSpec;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -181,33 +181,36 @@ impl CodeAgent for ClaudeCodeAgent {
         } else {
             SandboxSpec::new(sandbox_mode, &req.project_root)
         };
-        let wrapped_command =
-            wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "sandbox setup failed for claude: {error}"
-                ))
+        let mut spawn_env_vars = req.env_vars.clone();
+        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
+        run_identity.write_env_vars(&mut spawn_env_vars);
+        let prepared_spawn =
+            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+                program: &self.cli_path,
+                args: &base_args,
+                project_root: &req.project_root,
+                sandbox_spec: &sandbox_spec,
+                env_vars: &spawn_env_vars,
             })?;
 
         tracing::debug!(
-            cli = %wrapped_command.program.display(),
-            project_root = %req.project_root.display(),
+            cli = %prepared_spawn.program.display(),
+            project_root = %prepared_spawn.current_dir.display(),
             model = %self.resolve_model(&req),
             "spawning claude agent"
         );
 
-        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let mut cmd = Command::new(&wrapped_command.program);
-        cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root)
+        let mut cmd = Command::new(&prepared_spawn.program);
+        cmd.args(&prepared_spawn.args)
+            .current_dir(&prepared_spawn.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
+        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
         crate::strip_claude_env(&mut cmd);
-        cmd.envs(&req.env_vars);
-        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         let _provider_permit = self
             .provider_gate
@@ -231,7 +234,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 &run_identity,
                 "claude-code",
                 pid,
-                &req.project_root,
+                &prepared_spawn.current_dir,
             );
         }
         let mut child = crate::ManagedChild::new(child, "claude execute");
@@ -292,16 +295,21 @@ impl CodeAgent for ClaudeCodeAgent {
         } else {
             SandboxSpec::new(sandbox_mode, &req.project_root)
         };
-        let wrapped_command =
-            wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "sandbox setup failed for claude: {error}"
-                ))
+        let mut spawn_env_vars = req.env_vars.clone();
+        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
+        run_identity.write_env_vars(&mut spawn_env_vars);
+        let prepared_spawn =
+            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+                program: &self.cli_path,
+                args: &base_args,
+                project_root: &req.project_root,
+                sandbox_spec: &sandbox_spec,
+                env_vars: &spawn_env_vars,
             })?;
 
         // Dump full args (truncate each to 120 chars) so we can diagnose
         // exactly what is being passed to the Claude CLI process.
-        let args_debug: Vec<String> = wrapped_command
+        let args_debug: Vec<String> = prepared_spawn
             .args
             .iter()
             .enumerate()
@@ -315,8 +323,8 @@ impl CodeAgent for ClaudeCodeAgent {
             })
             .collect();
         tracing::info!(
-            program = %wrapped_command.program.display(),
-            arg_count = wrapped_command.args.len(),
+            program = %prepared_spawn.program.display(),
+            arg_count = prepared_spawn.args.len(),
             prompt_len = req.prompt.len(),
             args = %args_debug.join(" | "),
             "claude execute_stream: full command args"
@@ -330,19 +338,17 @@ impl CodeAgent for ClaudeCodeAgent {
             "claude execute_stream admitted by provider gate"
         );
 
-        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let mut cmd = Command::new(&wrapped_command.program);
-        cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root)
+        let mut cmd = Command::new(&prepared_spawn.program);
+        cmd.args(&prepared_spawn.args)
+            .current_dir(&prepared_spawn.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
+        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
         crate::strip_claude_env(&mut cmd);
-        cmd.envs(&req.env_vars);
-        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         // ETXTBSY (error 26) occurs on Linux when a security scanner or indexer
         // briefly opens the executable for writing after it is written. Retry once.
@@ -374,7 +380,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 &run_identity,
                 "claude-code",
                 pid,
-                &req.project_root,
+                &prepared_spawn.current_dir,
             );
         }
         let mut child = crate::ManagedChild::new(child, "claude execute_stream");
