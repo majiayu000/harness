@@ -175,9 +175,14 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     let runtime_log_state = state.core.server.runtime_logs.state.as_str();
     let degraded_subsystems = state.degraded_subsystems.clone();
     let runtime_state_dirty = state.is_runtime_state_dirty();
+    let isolation_degraded = !state
+        .isolation_availability
+        .unavailable_required_tiers(&state.core.server.config.isolation)
+        .is_empty();
     let health_status = if degraded_subsystems.is_empty()
         && runtime_log_state != "degraded"
         && !runtime_state_dirty
+        && !isolation_degraded
     {
         "ok"
     } else {

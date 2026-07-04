@@ -1,6 +1,9 @@
 use super::*;
 use harness_core::{
-    config::isolation::{IsolationConfig, IsolationRule, IsolationTier, IsolationTrustClass},
+    config::isolation::{
+        IsolationAvailability, IsolationConfig, IsolationRule, IsolationTier, IsolationTierStatus,
+        IsolationTrustClass,
+    },
     db::resolve_database_url,
 };
 use serde_json::json;
@@ -41,7 +44,11 @@ async fn tier_resolution_runtime_dispatch_records_isolation_evidence() -> anyhow
             tier: IsolationTier::Container,
         }],
         network_allowlist: Vec::new(),
-    });
+    })
+    .with_isolation_availability(IsolationAvailability::new(vec![
+        IsolationTierStatus::available(IsolationTier::Host),
+        IsolationTierStatus::available(IsolationTier::Container),
+    ]));
 
     let outcome = dispatcher
         .dispatch_once()

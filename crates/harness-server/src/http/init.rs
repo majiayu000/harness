@@ -282,6 +282,10 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             server.config.workflow.circuit_breaker.clone(),
         ),
     );
+    let isolation_availability = crate::isolation_health::probe_isolation_availability().await;
+    let isolation_required_unavailable = !isolation_availability
+        .unavailable_required_tiers(&server.config.isolation)
+        .is_empty();
 
     let (review_store, review_status) =
         build_review_store(&dir, server.config.server.database_url.as_deref()).await?;
@@ -297,6 +301,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .collect();
     if services.snapshot_load_failed && !degraded_subsystems.contains(&"runtime_state_store") {
         degraded_subsystems.push("runtime_state_store");
+    }
+    if isolation_required_unavailable && !degraded_subsystems.contains(&"isolation") {
+        degraded_subsystems.push("isolation");
     }
 
     Ok(AppState {
@@ -353,6 +360,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         _db_state_guard: None,
         runtime_hosts: services.runtime_hosts,
         runtime_project_cache: services.runtime_project_cache,
+        isolation_availability,
         runtime_state_persist_lock: Mutex::new(()),
         runtime_state_dirty: AtomicBool::new(false),
         runtime_circuit_breakers,

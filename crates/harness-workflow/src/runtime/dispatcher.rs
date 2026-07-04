@@ -6,13 +6,16 @@ use super::tier_resolution::{
 };
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
-use harness_core::config::isolation::{IsolationConfig, IsolationTrustClass};
+use harness_core::config::isolation::{
+    IsolationAvailability, IsolationConfig, IsolationTrustClass,
+};
 use serde_json::json;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const COMMAND_STATUS_SKIPPED: WorkflowCommandStatus = WorkflowCommandStatus::Skipped;
 const COMMAND_STATUS_CANCELLED: WorkflowCommandStatus = WorkflowCommandStatus::Cancelled;
+const COMMAND_STATUS_FAILED: WorkflowCommandStatus = WorkflowCommandStatus::Failed;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandDispatchOutcome {
@@ -110,6 +113,7 @@ pub struct RuntimeCommandDispatcher<'a> {
     store: &'a WorkflowRuntimeStore,
     profile_selector: RuntimeProfileSelector,
     isolation_config: IsolationConfig,
+    isolation_availability: IsolationAvailability,
     batch_limit: i64,
     dispatcher_id: String,
     lease_duration: Duration,
@@ -128,6 +132,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             store,
             profile_selector,
             isolation_config: IsolationConfig::default(),
+            isolation_availability: IsolationAvailability::default(),
             batch_limit: 25,
             dispatcher_id: format!("dispatcher:{}", Uuid::new_v4()),
             lease_duration: Duration::seconds(30),
@@ -136,6 +141,14 @@ impl<'a> RuntimeCommandDispatcher<'a> {
 
     pub fn with_isolation_config(mut self, isolation_config: IsolationConfig) -> Self {
         self.isolation_config = isolation_config;
+        self
+    }
+
+    pub fn with_isolation_availability(
+        mut self,
+        isolation_availability: IsolationAvailability,
+    ) -> Self {
+        self.isolation_availability = isolation_availability;
         self
     }
 
@@ -228,6 +241,32 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                         command.workflow_id
                     )
                 })?;
+        if let Err(error) = self
+            .isolation_availability
+            .ensure_tier_available(isolation.tier)
+        {
+            let reason = error.to_string();
+            self.store
+                .mark_command_status(&command.id, COMMAND_STATUS_FAILED)
+                .await?;
+            self.store
+                .append_event(
+                    &command.workflow_id,
+                    "WorkflowRuntimeIsolationUnavailable",
+                    "workflow_runtime_command_dispatcher",
+                    json!({
+                        "command_id": command.id.clone(),
+                        "tier": isolation.tier,
+                        "trust_class": isolation.trust_class,
+                        "reason": reason.clone(),
+                    }),
+                )
+                .await?;
+            return Ok(CommandDispatchOutcome::Skipped {
+                command_id: command.id,
+                reason,
+            });
+        }
         let not_before = retry_not_before_for_command(&command)?;
         match self
             .store

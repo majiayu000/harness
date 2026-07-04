@@ -95,6 +95,46 @@ async fn health_degraded_when_runtime_circuit_breaker_open() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn health_degraded_when_required_isolation_tier_unavailable() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut state = make_read_only_route_test_state(dir.path()).await?;
+    let state_mut = Arc::get_mut(&mut state).expect("unique state");
+    let server = Arc::get_mut(&mut state_mut.core.server).expect("unique server");
+    server.config.isolation.rules = vec![harness_core::config::isolation::IsolationRule {
+        trust: harness_core::config::isolation::IsolationTrustClass::NonCollaborator,
+        tier: harness_core::config::isolation::IsolationTier::Container,
+    }];
+    state_mut.isolation_availability =
+        harness_core::config::isolation::IsolationAvailability::new(vec![
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Host,
+            ),
+            harness_core::config::isolation::IsolationTierStatus::unavailable(
+                harness_core::config::isolation::IsolationTier::Container,
+                "docker missing",
+            ),
+        ]);
+
+    let health = call_health(state).await?;
+
+    assert_eq!(health.status, "degraded");
+    assert!(health.persistence.degraded_subsystems.is_empty());
+    assert_eq!(
+        health.isolation["unavailable_required_tiers"][0]["tier"],
+        "container"
+    );
+    assert_eq!(
+        health.isolation["unavailable_required_tiers"][0]["reason"],
+        "docker missing"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
     let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;

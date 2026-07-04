@@ -115,6 +115,7 @@ async fn make_test_state_with_config_and_registry(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         runtime_circuit_breakers: std::sync::Arc::new(
@@ -1875,6 +1876,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         runtime_circuit_breakers: std::sync::Arc::new(

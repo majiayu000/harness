@@ -29,6 +29,7 @@ pub mod handlers;
 pub mod hook_enforcer;
 pub mod http;
 pub mod intake;
+pub(crate) mod isolation_health;
 pub mod memory_monitor;
 pub mod notify;
 pub mod overview;

@@ -305,6 +305,7 @@ async fn make_state_inner(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         runtime_circuit_breakers: std::sync::Arc::new(

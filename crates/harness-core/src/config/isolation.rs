@@ -10,6 +10,16 @@ pub enum IsolationTier {
     Microvm,
 }
 
+impl IsolationTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Container => "container",
+            Self::Microvm => "microvm",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationTrustClass {
@@ -41,6 +51,99 @@ impl Default for IsolationConfig {
             rules: Vec::new(),
             network_allowlist: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationTierStatus {
+    pub tier: IsolationTier,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl IsolationTierStatus {
+    pub fn available(tier: IsolationTier) -> Self {
+        Self {
+            tier,
+            available: true,
+            reason: None,
+        }
+    }
+
+    pub fn unavailable(tier: IsolationTier, reason: impl Into<String>) -> Self {
+        Self {
+            tier,
+            available: false,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationAvailability {
+    #[serde(default)]
+    pub tiers: Vec<IsolationTierStatus>,
+}
+
+impl Default for IsolationAvailability {
+    fn default() -> Self {
+        Self {
+            tiers: vec![
+                IsolationTierStatus::available(IsolationTier::Host),
+                IsolationTierStatus::unavailable(
+                    IsolationTier::Container,
+                    "isolation tier `container` has not been probed",
+                ),
+                IsolationTierStatus::unavailable(
+                    IsolationTier::Microvm,
+                    "isolation tier `microvm` is reserved but not implemented",
+                ),
+            ],
+        }
+    }
+}
+
+impl IsolationAvailability {
+    pub fn new(tiers: Vec<IsolationTierStatus>) -> Self {
+        Self { tiers }
+    }
+
+    pub fn status_for(&self, tier: IsolationTier) -> IsolationTierStatus {
+        self.tiers
+            .iter()
+            .find(|status| status.tier == tier)
+            .cloned()
+            .unwrap_or_else(|| {
+                IsolationTierStatus::unavailable(
+                    tier,
+                    format!("isolation tier `{}` has not been probed", tier.as_str()),
+                )
+            })
+    }
+
+    pub fn unavailable_required_tiers(&self, config: &IsolationConfig) -> Vec<IsolationTierStatus> {
+        config
+            .required_tiers()
+            .into_iter()
+            .map(|tier| self.status_for(tier))
+            .filter(|status| !status.available)
+            .collect()
+    }
+
+    pub fn ensure_tier_available(&self, tier: IsolationTier) -> anyhow::Result<()> {
+        let status = self.status_for(tier);
+        if status.available {
+            return Ok(());
+        }
+        let reason = status
+            .reason
+            .as_deref()
+            .unwrap_or("tier availability probe failed");
+        anyhow::bail!(
+            "required isolation tier `{}` is unavailable: {reason}",
+            tier.as_str()
+        )
     }
 }
 
@@ -114,6 +217,32 @@ tier = "container"
             vec!["github.com".to_string(), "api.anthropic.com".to_string()]
         );
         assert!(config.validate_startup_support().is_ok());
+    }
+
+    #[test]
+    fn isolation_availability_reports_unavailable_required_tier() {
+        let config = IsolationConfig {
+            default_tier: IsolationTier::Host,
+            rules: vec![IsolationRule {
+                trust: IsolationTrustClass::NonCollaborator,
+                tier: IsolationTier::Container,
+            }],
+            network_allowlist: Vec::new(),
+        };
+        let availability = IsolationAvailability::new(vec![
+            IsolationTierStatus::available(IsolationTier::Host),
+            IsolationTierStatus::unavailable(IsolationTier::Container, "docker unavailable"),
+        ]);
+
+        let unavailable = availability.unavailable_required_tiers(&config);
+
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].tier, IsolationTier::Container);
+        assert!(availability
+            .ensure_tier_available(IsolationTier::Container)
+            .expect_err("container should be unavailable")
+            .to_string()
+            .contains("docker unavailable"));
     }
 
     #[test]
