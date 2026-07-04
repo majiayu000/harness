@@ -62,10 +62,34 @@ where
     Ok(store)
 }
 
+async fn recovered_task(store: &TaskStore, id: &str) -> anyhow::Result<TaskState> {
+    store
+        .get_with_db_fallback(&CoreTaskId(id.to_string()))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{id} should be fetchable after recovery"))
+}
+
+fn assert_not_limbo(task: &TaskState) {
+    assert!(
+        !task.status.is_inflight(),
+        "{} recovered into in-flight limbo status {:?}",
+        task.id.0,
+        task.status
+    );
+}
+
+fn database_tests_configured() -> bool {
+    std::env::var("HARNESS_DATABASE_URL").is_ok_and(|url| !url.trim().is_empty())
+}
+
 /// Restart with no checkpoints: all interrupted tasks (implementing, agent_review,
 /// reviewing, waiting) must become Failed; Pending/Done/Failed are left unchanged.
 #[tokio::test]
 async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         db.insert(&make_task("t-impl", TaskStatus::Implementing))
             .await?;
@@ -130,10 +154,119 @@ async fn restart_no_checkpoint_fails_interrupted_tasks() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn recovery_no_limbo_restart_mid_review_states_resume_or_terminalize() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
+    let store = setup_store(|db| async move {
+        let mut review_with_pr = make_task("review-with-pr", TaskStatus::AgentReview);
+        review_with_pr.pr_url = Some("https://github.com/owner/repo/pull/1465".to_string());
+        db.insert(&review_with_pr).await?;
+
+        db.insert(&make_task("review-with-plan", TaskStatus::ReviewGenerating))
+            .await?;
+        db.write_checkpoint(
+            "review-with-plan",
+            None,
+            Some("persisted implementation plan"),
+            None,
+            "plan_done",
+        )
+        .await?;
+
+        db.insert(&make_task("reviewing-no-checkpoint", TaskStatus::Reviewing))
+            .await?;
+        db.insert(&make_task("waiting-no-checkpoint", TaskStatus::Waiting))
+            .await?;
+        Ok(())
+    })
+    .await?;
+
+    let review_with_pr = recovered_task(&store, "review-with-pr").await?;
+    assert_not_limbo(&review_with_pr);
+    assert_eq!(review_with_pr.status, TaskStatus::Pending);
+    assert!(matches!(
+        review_with_pr.scheduler.authority_state,
+        harness_server::task_runner::SchedulerAuthorityState::Recovering
+    ));
+
+    let review_with_plan = recovered_task(&store, "review-with-plan").await?;
+    assert_not_limbo(&review_with_plan);
+    assert_eq!(review_with_plan.status, TaskStatus::Pending);
+    assert!(matches!(
+        review_with_plan.scheduler.authority_state,
+        harness_server::task_runner::SchedulerAuthorityState::Recovering
+    ));
+
+    for id in ["reviewing-no-checkpoint", "waiting-no-checkpoint"] {
+        let task = recovered_task(&store, id).await?;
+        assert_not_limbo(&task);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(
+            task.error
+                .as_deref()
+                .is_some_and(|error| error.contains("recovered after restart")),
+            "{id} should carry a restart recovery failure reason"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_no_limbo_shutdown_drain_states_are_queued_or_terminal() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
+    let store = setup_store(|db| async move {
+        db.insert(&make_task("drained-pending", TaskStatus::Pending))
+            .await?;
+
+        let mut implementing = make_task("drained-implementing", TaskStatus::Implementing);
+        implementing.scheduler.claim_scheduler("shutdown-worker");
+        db.insert(&implementing).await?;
+
+        let mut review_waiting = make_task("drained-review-waiting", TaskStatus::ReviewWaiting);
+        review_waiting.scheduler.claim_scheduler("shutdown-worker");
+        db.insert(&review_waiting).await?;
+        Ok(())
+    })
+    .await?;
+
+    let pending = recovered_task(&store, "drained-pending").await?;
+    assert_not_limbo(&pending);
+    assert_eq!(pending.status, TaskStatus::Pending);
+    assert!(matches!(
+        pending.scheduler.authority_state,
+        harness_server::task_runner::SchedulerAuthorityState::Queued
+    ));
+
+    for id in ["drained-implementing", "drained-review-waiting"] {
+        let task = recovered_task(&store, id).await?;
+        assert_not_limbo(&task);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(
+            task.error
+                .as_deref()
+                .is_some_and(|error| error.contains("recovered after restart")),
+            "{id} should carry a restart recovery failure reason"
+        );
+    }
+
+    Ok(())
+}
+
 /// Restart with a `tasks.pr_url` set: the task resumes to Pending with a diagnostic
 /// error message referencing the PR URL.
 #[tokio::test]
 async fn restart_with_pr_url_resumes_task() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         let mut task = make_task("t-impl-pr", TaskStatus::Implementing);
         task.pr_url = Some("https://github.com/owner/repo/pull/42".to_string());
@@ -167,6 +300,10 @@ async fn restart_with_pr_url_resumes_task() -> anyhow::Result<()> {
 /// Restart with a checkpoint PR URL (checkpoint table, not tasks table): task resumes.
 #[tokio::test]
 async fn restart_with_checkpoint_pr_url_resumes_task() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         db.insert(&make_task("t-ck-pr", TaskStatus::AgentReview))
             .await?;
@@ -202,6 +339,10 @@ async fn restart_with_checkpoint_pr_url_resumes_task() -> anyhow::Result<()> {
 /// Restart with a plan checkpoint: task resumes to Pending.
 #[tokio::test]
 async fn restart_with_plan_checkpoint_resumes_task() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         db.insert(&make_task("t-plan", TaskStatus::Implementing))
             .await?;
@@ -237,6 +378,10 @@ async fn restart_with_plan_checkpoint_resumes_task() -> anyhow::Result<()> {
 /// Restart with a triage-only checkpoint: task resumes to Pending.
 #[tokio::test]
 async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         db.insert(&make_task("t-triage", TaskStatus::Implementing))
             .await?;
@@ -271,6 +416,10 @@ async fn restart_with_triage_checkpoint_resumes_task() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn restart_review_task_without_system_input_fails() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         let mut task = make_task("t-review-missing-input", TaskStatus::ReviewGenerating);
         task.task_kind = TaskKind::Review;
@@ -296,6 +445,10 @@ async fn restart_review_task_without_system_input_fails() -> anyhow::Result<()> 
 /// "retrying after transient failure") must become Failed on restart.
 #[tokio::test]
 async fn restart_transient_retry_task_fails() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         let mut task = make_task("t-transient", TaskStatus::Pending);
         task.error = Some("retrying after transient failure (attempt 2)".to_string());
@@ -344,6 +497,10 @@ async fn restart_transient_retry_task_fails() -> anyhow::Result<()> {
 /// Mixed scenario: some tasks resume, some fail — recovery counts are correct.
 #[tokio::test]
 async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         // Will be resumed: has plan checkpoint.
         db.insert(&make_task("t-resumable-plan", TaskStatus::Implementing))
@@ -398,6 +555,10 @@ async fn restart_mixed_recovery_counts() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn restart_marks_resumed_task_as_recovering_in_scheduler_state() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
     let store = setup_store(|db| async move {
         db.insert(&make_task("t-recovering", TaskStatus::Implementing))
             .await?;

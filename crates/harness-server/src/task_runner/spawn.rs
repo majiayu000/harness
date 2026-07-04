@@ -734,9 +734,16 @@ where
                     .await;
             }
             Err(join_err) if join_err.is_cancelled() => {
-                // abort() was called by the cancel endpoint; status already set to
-                // Cancelled before abort() was called — do not overwrite with Failed.
+                // User cancellation persists Cancelled before abort(). Shutdown-style
+                // aborts do not, so the exit guard terminalizes any non-terminal row.
                 tracing::info!("task {id_watcher:?} cancelled via abort");
+                ensure_terminal_or_requeued_on_spawn_exit(
+                    &store_watcher,
+                    &events_watcher,
+                    &id_watcher,
+                    "spawn_task_aborted",
+                )
+                .await;
                 if let Some(wmgr) = workspace_mgr_watcher.as_ref() {
                     let final_state = store_watcher.get(&id_watcher);
                     if should_remove_workspace_after_task(
