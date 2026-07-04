@@ -22,7 +22,7 @@ async fn acquire_and_release_single_permit() {
     assert_eq!(q.running_count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn only_max_concurrent_tasks_run_simultaneously() {
     let q = Arc::new(TaskQueue::new(&config(2, 16)));
 
@@ -45,7 +45,7 @@ async fn only_max_concurrent_tasks_run_simultaneously() {
     assert_eq!(q.running_count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn queue_overflow_returns_error() {
     // 1 concurrent slot, queue capacity 2.
     let q = Arc::new(TaskQueue::new(&config(1, 2)));
@@ -68,7 +68,7 @@ async fn queue_overflow_returns_error() {
     assert!(result.unwrap_err().to_string().contains("max_queue_size=2"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn permit_drop_releases_slot_on_panic() {
     let q = Arc::new(TaskQueue::new(&config(1, 4)));
 
@@ -87,7 +87,7 @@ async fn permit_drop_releases_slot_on_panic() {
     assert!(result.is_ok(), "permit should be released after panic");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn queued_count_increments_while_waiting() {
     let q = Arc::new(TaskQueue::new(&config(1, 8)));
 
@@ -114,7 +114,7 @@ async fn running_count_and_queued_count_reset_after_completion() {
     assert_eq!(q.queued_count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn per_project_limit_enforced() {
     use std::collections::HashMap;
     let mut per_project = HashMap::new();
@@ -143,7 +143,7 @@ async fn per_project_limit_enforced() {
     drop(p_b);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn project_cannot_starve_another() {
     use std::collections::HashMap;
     // global=2, proj_a=1 → proj_a can use at most 1 global slot,
@@ -175,7 +175,7 @@ async fn project_cannot_starve_another() {
     assert!(pb.is_ok(), "proj_b should get the remaining global slot");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn project_stats_reflect_running_and_queued() {
     let q = Arc::new(TaskQueue::new(&config(4, 16)));
 
@@ -206,7 +206,7 @@ async fn project_stats_reflect_running_and_queued() {
     assert_eq!(stats2.queued, 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_project_limit_reconfigures_existing_project_queue() {
     let q = Arc::new(TaskQueue::new(&config(4, 16)));
 
@@ -225,7 +225,7 @@ async fn set_project_limit_reconfigures_existing_project_queue() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reset_project_limit_restores_global_fallback() {
     let mut cfg = config(4, 16);
     cfg.per_project.insert("proj".to_string(), 2);
@@ -247,7 +247,7 @@ async fn reset_project_limit_restores_global_fallback() {
 
 // --- Priority tests ---
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn high_priority_acquired_before_low_when_slots_full() {
     // 1 slot: hold it, then enqueue priority=0 then priority=1.
     // When the slot is released, priority=1 should unblock first.
@@ -283,7 +283,7 @@ async fn high_priority_acquired_before_low_when_slots_full() {
     assert_eq!(first, 1, "priority=1 task should unblock before priority=0");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn same_priority_is_fifo() {
     // 1 slot: hold it, then enqueue three priority=1 waiters in order.
     // They should unblock in enqueue order (FIFO).
@@ -325,7 +325,7 @@ async fn priority_zero_default_compiles() {
 
 // --- running_count correctness ---
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn running_count_correct_with_global_waiters() {
     // limit=2; fill both slots, add a waiter in the global queue.
     // running_count must still report 2 — waiters do not reduce available_permits.
@@ -347,7 +347,7 @@ async fn running_count_correct_with_global_waiters() {
 
 // --- Cancellation-safety tests ---
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cancelled_project_wait_does_not_leak_queued_count() {
     // 1 project slot; hold it so the next acquire blocks at project-wait.
     use std::collections::HashMap;
@@ -384,7 +384,7 @@ async fn cancelled_project_wait_does_not_leak_queued_count() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cancelled_global_wait_releases_project_permit() {
     // project limit=2, global limit=1; hold global so the next acquire
     // passes project-wait then blocks at global-wait.
@@ -435,7 +435,7 @@ async fn cancelled_global_wait_releases_project_permit() {
 /// Regression: project permit must not be permanently lost when the future is
 /// cancelled *after* `release()` sends the signal but *before* `rx.await`
 /// completes (the "mid-send" race on the project queue).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn project_permit_not_leaked_on_mid_send_cancellation() {
     use std::collections::HashMap;
     let mut per_project = HashMap::new();
@@ -475,7 +475,7 @@ async fn project_permit_not_leaked_on_mid_send_cancellation() {
 /// Regression: global permit must not be permanently lost when the future is
 /// cancelled *after* `release()` sends the global signal but *before*
 /// `rx.await` completes (the "mid-send" race on the global queue).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn global_permit_not_leaked_on_mid_send_cancellation() {
     use std::collections::HashMap;
     let mut per_project = HashMap::new();
@@ -539,7 +539,7 @@ async fn task_admission_succeeds_no_pressure() {
 
 // ── saturation / cancellation stress tests ───────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cancelled_acquire_releases_permit_for_next_waiter() {
     let q = Arc::new(TaskQueue::new(&config(1, 16)));
 
@@ -562,7 +562,7 @@ async fn cancelled_acquire_releases_permit_for_next_waiter() {
     assert!(result.is_ok(), "permit leaked after waiter cancellation");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn queue_recovers_after_repeated_cancellations() {
     let q = Arc::new(TaskQueue::new(&config(1, 64)));
 
@@ -593,7 +593,7 @@ async fn queue_recovers_after_repeated_cancellations() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn server_stays_responsive_after_saturation_and_abort() {
     let q = Arc::new(TaskQueue::new(&config(2, 32)));
 
