@@ -37,8 +37,12 @@ pub use bus::InMemoryWorkflowBus;
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use errors::RuntimeJobNotFoundError;
 pub use eval::{
-    parse_benchmark_manifest_str, score_pr_repair_eval, EvalBenchmarkCase, EvalBenchmarkManifest,
-    ManifestError, ScoringError, DEFAULT_CASE_TIMEOUT_SECS,
+    collect_eval_case_evidence, collect_eval_case_evidence_from_records,
+    dispatch_eval_case_workflow, enqueue_eval_case_workflow, parse_benchmark_manifest_str,
+    score_pr_repair_eval, EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseDispatchOutcome,
+    EvalCaseEnqueueOutcome, EvalCaseEvidence, EvalCaseWorkflowInput, EvalCaseWorkflowPlan,
+    EvalEvidenceStatus, EvalQualityGateEvidence, EvalSubmissionEvidence, ManifestError,
+    ScoringError, DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use model::{
