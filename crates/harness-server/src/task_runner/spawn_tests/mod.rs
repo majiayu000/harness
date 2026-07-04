@@ -1,4 +1,6 @@
 use super::*;
+use crate::task_runner::{SchedulerAuthorityState, TaskSchedulerState};
+use std::path::Path;
 use tokio::time::Duration;
 
 mod helpers;
@@ -188,6 +190,83 @@ fn abort_after_handle_registration_only_targets_live_terminal_tasks() {
         !should_abort_after_abort_handle_registration(&implementing, false),
         "non-terminal tasks must keep running"
     );
+}
+
+#[test]
+fn spawn_exit_paths_allow_only_terminal_or_requeued_states() {
+    let mut done = TaskState::new(tid("done"));
+    done.status = TaskStatus::Done;
+    done.scheduler.mark_terminal(&TaskStatus::Done);
+    assert!(spawn_exit_state_is_allowed(&done));
+
+    let queued = TaskState::new(tid("queued"));
+    assert!(spawn_exit_state_is_allowed(&queued));
+
+    let mut retry_backoff = TaskState::new(tid("retry-backoff"));
+    retry_backoff.scheduler.mark_retry_backoff();
+    assert!(spawn_exit_state_is_allowed(&retry_backoff));
+
+    let mut awaiting = TaskState::new(tid("awaiting"));
+    awaiting.status = TaskStatus::AwaitingDeps;
+    awaiting.scheduler = TaskSchedulerState::awaiting_dependencies();
+    assert!(spawn_exit_state_is_allowed(&awaiting));
+
+    let mut waiting = TaskState::new(tid("waiting"));
+    waiting.status = TaskStatus::Waiting;
+    waiting.scheduler.claim_scheduler("local-scheduler");
+    assert!(
+        !spawn_exit_state_is_allowed(&waiting),
+        "spawn must not exit while a task is still waiting/running"
+    );
+}
+
+#[tokio::test]
+async fn spawn_exit_paths_guard_terminalizes_running_waiting_state() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = crate::test_helpers::tempdir_in_home("harness-test-spawn-exit-")?;
+    let database_url = crate::test_helpers::test_database_url()?;
+    let store = TaskStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir.path(), "tasks"),
+        Some(&database_url),
+    )
+    .await?;
+    let events = harness_observe::event_store::EventStore::new_with_database_url(
+        dir.path(),
+        Some(&database_url),
+    )
+    .await?;
+    let task_id = tid("spawn-exit-waiting");
+    let mut state = TaskState::new(task_id.clone());
+    state.status = TaskStatus::Waiting;
+    state.turn = 2;
+    state.scheduler.claim_scheduler("local-scheduler");
+    store.insert(&state).await;
+
+    ensure_terminal_or_requeued_on_spawn_exit(&store, &events, &task_id, "test_exit").await;
+
+    let updated = store
+        .get(&task_id)
+        .ok_or_else(|| anyhow::anyhow!("task should remain in store"))?;
+    assert_eq!(updated.status, TaskStatus::Failed);
+    assert_eq!(updated.failure_kind, Some(TaskFailureKind::Task));
+    assert_eq!(
+        updated.scheduler.authority_state,
+        SchedulerAuthorityState::Failed
+    );
+    assert!(updated
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("spawn exit invariant violated")));
+    let guard_round = updated
+        .rounds
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("guard should record a diagnostic round"))?;
+    assert_eq!(guard_round.action, "spawn_exit_guard");
+    assert_eq!(guard_round.result, "nonterminal_exit");
+    Ok(())
 }
 
 #[tokio::test]

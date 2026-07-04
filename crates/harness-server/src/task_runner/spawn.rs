@@ -1,8 +1,40 @@
+#[path = "spawn/classification.rs"]
+mod classification;
+#[path = "spawn/dependencies.rs"]
+mod dependencies;
+#[path = "spawn/exit_guard.rs"]
+mod exit_guard;
+#[path = "spawn/parallel.rs"]
+mod parallel;
+#[path = "spawn/project.rs"]
+mod project;
+#[path = "spawn/workspace_lifecycle.rs"]
+mod workspace_lifecycle;
+
 use harness_core::agent::CodeAgent;
-use harness_core::types::{Decision, Event, SessionId};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+pub(super) use classification::parse_pr_url;
+pub use classification::{effective_turn_timeout, prompt_requires_plan};
+#[cfg(test)]
+pub(super) use dependencies::detect_cycle;
+pub(super) use dependencies::{check_awaiting_deps, spawn_task_awaiting_deps};
+use exit_guard::ensure_terminal_or_requeued_on_spawn_exit;
+#[cfg(test)]
+pub(super) use exit_guard::spawn_exit_state_is_allowed;
+pub(super) use parallel::record_parallel_subtask_results;
+pub use project::resolve_canonical_project;
+use project::{resolve_project_root_with, validate_spawn_project_root};
+#[cfg(test)]
+pub(super) use workspace_lifecycle::is_issue_pr_task;
+use workspace_lifecycle::{
+    log_task_failure_event, record_task_failure, record_workspace_lifecycle_failure,
+};
+pub(super) use workspace_lifecycle::{
+    should_abort_after_abort_handle_registration, should_remove_workspace_after_task,
+};
 
 use super::request::{
     detect_main_worktree, summarize_request_description, CreateTaskRequest,
@@ -49,41 +81,6 @@ const ACCOUNT_LIMIT_PATTERN: &str = "hit your limit";
 /// Maximum number of automatic retries for transient failures.
 const MAX_TRANSIENT_RETRIES: u32 = 2;
 
-/// Return `true` when a free-text prompt is complex enough to require a Plan phase
-/// before implementation.
-///
-/// Heuristic: prompt longer than 200 words OR contains 3 or more file-path-like
-/// tokens (sequences containing `/` or ending in a recognised source extension).
-pub fn prompt_requires_plan(prompt: &str) -> bool {
-    let word_count = prompt.split_whitespace().count();
-    if word_count > 200 {
-        return true;
-    }
-    let file_path_count = prompt
-        .split_whitespace()
-        .filter(|tok| {
-            // Exclude XML/HTML tags — `</foo>` contains '/' but is not a file path.
-            // System prompts wrap user data in `<external_data>...</external_data>`
-            // which would otherwise trigger false positives.
-            let is_xml_tag = tok.starts_with('<');
-            if is_xml_tag {
-                return false;
-            }
-            tok.contains('/') || {
-                let lower = tok.to_lowercase();
-                lower.ends_with(".rs")
-                    || lower.ends_with(".ts")
-                    || lower.ends_with(".tsx")
-                    || lower.ends_with(".go")
-                    || lower.ends_with(".py")
-                    || lower.ends_with(".toml")
-                    || lower.ends_with(".json")
-            }
-        })
-        .count();
-    file_path_count >= 3
-}
-
 fn classify_task_kind(req: &CreateTaskRequest) -> TaskKind {
     req.task_kind()
 }
@@ -116,286 +113,6 @@ pub(super) fn is_transient_error(reason: &str) -> bool {
     TRANSIENT_PATTERNS
         .iter()
         .any(|p| lower.contains(&p.to_lowercase()))
-}
-
-fn subtask_succeeded(result: &crate::parallel_dispatch::SubtaskResult) -> bool {
-    result
-        .response
-        .as_ref()
-        .is_some_and(|resp| !resp.output.trim().is_empty())
-}
-
-fn subtask_round_detail(result: &crate::parallel_dispatch::SubtaskResult) -> Option<String> {
-    match (&result.response, &result.error) {
-        (Some(resp), _) if !resp.output.trim().is_empty() => Some(resp.output.clone()),
-        (Some(_), _) => Some("agent returned empty output".to_string()),
-        (None, Some(error)) => Some(error.clone()),
-        (None, None) => None,
-    }
-}
-
-fn record_parallel_subtask_results(
-    state: &mut TaskState,
-    run_result: &crate::parallel_dispatch::ParallelRunResult,
-) {
-    let succeeded = run_result.results.iter().all(subtask_succeeded);
-    for result in &run_result.results {
-        state.rounds.push(RoundResult::new(
-            (result.index as u32).saturating_add(1),
-            format!("parallel_subtask_{}", result.index),
-            if subtask_succeeded(result) {
-                "success"
-            } else {
-                "failed"
-            },
-            subtask_round_detail(result),
-            None,
-            None,
-        ));
-    }
-    if succeeded {
-        state.status = TaskStatus::Done;
-        state.scheduler.mark_terminal(&TaskStatus::Done);
-    } else {
-        let failed_count = run_result
-            .results
-            .iter()
-            .filter(|result| !subtask_succeeded(result))
-            .count();
-        let total_count = run_result.results.len();
-        state.status = TaskStatus::Failed;
-        state.scheduler.mark_terminal(&TaskStatus::Failed);
-        state.error = Some(if run_result.is_sequential {
-            format!(
-                "{failed_count}/{total_count} sequential subtasks failed; remaining steps were skipped"
-            )
-        } else {
-            format!("{failed_count}/{total_count} parallel subtasks failed")
-        });
-    }
-}
-
-/// Extract `(owner, repo, number)` from a GitHub PR URL.
-///
-/// Expects format: `https://github.com/{owner}/{repo}/pull/{number}[#...]`
-pub(super) fn parse_pr_url(pr_url: &str) -> Option<(String, String, u64)> {
-    // Strip fragment (e.g. #discussion_r...)
-    let url = pr_url.split('#').next().unwrap_or(pr_url);
-    let parts: Vec<&str> = url.trim_end_matches('/').split('/').collect();
-    // Expected: ["https:", "", "github.com", owner, repo, "pull", number]
-    let pull_idx = parts.iter().rposition(|&p| p == "pull")?;
-    if pull_idx + 1 >= parts.len() || pull_idx < 2 {
-        return None;
-    }
-    let number: u64 = parts[pull_idx + 1].parse().ok()?;
-    let repo = parts[pull_idx - 1].to_string();
-    let owner = parts[pull_idx - 2].to_string();
-    Some((owner, repo, number))
-}
-
-/// Convert a user-facing timeout value to a Duration.
-/// `0` means "no timeout" and maps to ~277 hours (effectively unlimited).
-pub fn effective_turn_timeout(secs: u64) -> tokio::time::Duration {
-    if secs == 0 {
-        tokio::time::Duration::from_secs(999_999)
-    } else {
-        tokio::time::Duration::from_secs(secs)
-    }
-}
-
-fn describe_detect_main_worktree_join_error(join_err: &tokio::task::JoinError) -> String {
-    if join_err.is_panic() {
-        format!("detect_main_worktree panicked: {join_err}")
-    } else if join_err.is_cancelled() {
-        format!("detect_main_worktree was cancelled: {join_err}")
-    } else {
-        format!("detect_main_worktree failed: {join_err}")
-    }
-}
-
-async fn resolve_project_root_with(
-    requested_project: Option<PathBuf>,
-    detect_worktree: impl FnOnce() -> PathBuf + Send + 'static,
-) -> anyhow::Result<PathBuf> {
-    match requested_project {
-        Some(project) => Ok(project),
-        None => tokio::task::spawn_blocking(detect_worktree)
-            .await
-            .map_err(|join_err| {
-                let reason = describe_detect_main_worktree_join_error(&join_err);
-                tracing::error!("{reason}");
-                anyhow::anyhow!("{reason}")
-            }),
-    }
-}
-
-fn validate_spawn_project_root(
-    raw_project: &Path,
-    home_dir: &Path,
-    allowed_project_roots: &[PathBuf],
-) -> Result<PathBuf, String> {
-    if allowed_project_roots.is_empty() {
-        return crate::handlers::validate_project_root(raw_project, home_dir);
-    }
-
-    let canonical = raw_project
-        .canonicalize()
-        .map_err(|e| format!("invalid project root '{}': {e}", raw_project.display()))?;
-    if !canonical.is_dir() {
-        return Err(format!(
-            "project root is not a directory: {}",
-            canonical.display()
-        ));
-    }
-    crate::project_registry::check_allowed_roots(&canonical, allowed_project_roots)?;
-    Ok(canonical)
-}
-
-/// Resolve and canonicalize the project root so the caller can obtain a stable
-/// semaphore key before acquiring the concurrency permit.
-///
-/// When `project` is `None` the main git worktree is detected automatically.
-/// Symlinks, relative paths and the `None` sentinel all converge to the same
-/// canonical `PathBuf`, preventing the same repository from landing in
-/// different per-project buckets due to path aliasing.
-///
-/// This function only resolves symlinks — it does NOT enforce the HOME-boundary
-/// restriction applied by `validate_project_root`. Full validation still
-/// happens inside `spawn_task` once the task is running.
-/// Returns true when `external_id` marks this as an issue- or PR-keyed task.
-/// Issue/PR-keyed workspaces are reused across consecutive tasks (issue #969).
-fn is_issue_pr_task(eid: Option<&str>) -> bool {
-    eid.is_some_and(|id| id.starts_with("issue:") || id.starts_with("pr:"))
-}
-
-fn is_issue_pr_task_state(state: &TaskState) -> bool {
-    is_issue_pr_task(state.external_id.as_deref())
-        || state.issue.is_some()
-        || matches!(state.task_kind, TaskKind::Issue | TaskKind::Pr)
-}
-
-fn should_remove_workspace_after_task(state: Option<&TaskState>, auto_cleanup: bool) -> bool {
-    let Some(state) = state else {
-        return auto_cleanup;
-    };
-    if !state.status.is_terminal() {
-        return false;
-    }
-    if state.status == TaskStatus::Failed {
-        return true;
-    }
-    auto_cleanup && !is_issue_pr_task_state(state)
-}
-
-fn should_abort_after_abort_handle_registration(state: &TaskState, handle_finished: bool) -> bool {
-    state.status.is_terminal() && !handle_finished
-}
-
-pub async fn resolve_canonical_project(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    let raw = resolve_project_root_with(project, detect_main_worktree).await?;
-    // Best-effort canonicalize: if the path doesn't exist yet (e.g. in tests
-    // using a path that will be created later) fall back to the raw path so
-    // we at least get a consistent string key.
-    Ok(raw.canonicalize().unwrap_or(raw))
-}
-
-async fn log_task_failure_event(
-    events: &harness_observe::event_store::EventStore,
-    task_id: &TaskId,
-    reason: &str,
-) {
-    let mut event = Event::new(
-        SessionId::new(),
-        "task_failure",
-        "task_runner",
-        Decision::Block,
-    );
-    event.reason = Some(reason.to_string());
-    event.detail = Some(format!("task_id={}", task_id.0));
-    if let Err(e) = events.log(&event).await {
-        tracing::warn!("failed to log task_failure event for {task_id:?}: {e}");
-    }
-}
-
-/// Record a task failure, marking the task as failed.
-async fn record_task_failure(
-    store: &TaskStore,
-    events: &harness_observe::event_store::EventStore,
-    task_id: &TaskId,
-    reason: String,
-) {
-    log_task_failure_event(events, task_id, &reason).await;
-    store.log_event(crate::event_replay::TaskEvent::Failed {
-        task_id: task_id.0.clone(),
-        ts: crate::event_replay::now_ts(),
-        reason: reason.clone(),
-    });
-    if let Err(e) = mutate_and_persist(store, task_id, |s| {
-        s.status = TaskStatus::Failed;
-        s.failure_kind = Some(TaskFailureKind::Task);
-        s.error = Some(reason);
-        s.scheduler.mark_terminal(&TaskStatus::Failed);
-    })
-    .await
-    {
-        tracing::error!("failed to persist task failure for {task_id:?}: {e}");
-    }
-}
-
-async fn record_workspace_lifecycle_failure(
-    store: &TaskStore,
-    events: &harness_observe::event_store::EventStore,
-    task_id: &TaskId,
-    workspace_path: PathBuf,
-    reason: String,
-) {
-    log_task_failure_event(events, task_id, &reason).await;
-    store.log_event(crate::event_replay::TaskEvent::Failed {
-        task_id: task_id.0.clone(),
-        ts: crate::event_replay::now_ts(),
-        reason: reason.clone(),
-    });
-    if let Err(e) = mutate_and_persist(store, task_id, |s| {
-        s.status = TaskStatus::Failed;
-        s.failure_kind = Some(TaskFailureKind::WorkspaceLifecycle);
-        s.error = Some(reason.clone());
-        s.workspace_path = Some(workspace_path.clone());
-        s.scheduler.mark_terminal(&TaskStatus::Failed);
-        s.rounds.push(RoundResult::new(
-            s.turn.saturating_add(1),
-            "workspace_lifecycle",
-            "missing_workspace",
-            Some(reason.clone()),
-            None,
-            None,
-        ));
-    })
-    .await
-    {
-        tracing::error!("failed to persist workspace lifecycle failure for {task_id:?}: {e}");
-    }
-}
-
-/// DFS cycle detection. Returns true if any dependency transitively reaches `new_id`.
-/// Called before the new task is inserted into the store.
-fn detect_cycle(store: &TaskStore, new_id: &TaskId, depends_on: &[TaskId]) -> bool {
-    let mut stack: Vec<TaskId> = depends_on.to_vec();
-    let mut visited: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
-    while let Some(dep_id) = stack.pop() {
-        if dep_id == *new_id {
-            return true;
-        }
-        if visited.contains(&dep_id) {
-            continue;
-        }
-        visited.insert(dep_id.clone());
-        if let Some(dep_state) = store.get(&dep_id) {
-            for transitive in &dep_state.depends_on {
-                stack.push(transitive.clone());
-            }
-        }
-    }
-    false
 }
 
 pub async fn spawn_task(
@@ -641,6 +358,13 @@ where
                             s.error = Some(msg);
                         })
                         .await?;
+                        ensure_terminal_or_requeued_on_spawn_exit(
+                            &store,
+                            &events,
+                            &id,
+                            "parallel_dispatch_rejected",
+                        )
+                        .await;
                         return Ok(());
                     }
                 };
@@ -719,6 +443,13 @@ where
                         record_parallel_subtask_results(s, &run_result);
                     })
                     .await?;
+                    ensure_terminal_or_requeued_on_spawn_exit(
+                        &store,
+                        &events,
+                        &id,
+                        "parallel_dispatch_completed",
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -791,6 +522,13 @@ where
                     })
                     .await?;
                     tracing::warn!(task_id = %id.0, error = %error_message, "workspace admission failed");
+                    ensure_terminal_or_requeued_on_spawn_exit(
+                        &store,
+                        &events,
+                        &id,
+                        "workspace_admission_failure",
+                    )
+                    .await;
                     return Ok(());
                 }
             };
@@ -943,6 +681,9 @@ where
             }
         };
 
+        ensure_terminal_or_requeued_on_spawn_exit(&store, &events, &id, "spawn_task_run_loop")
+            .await;
+
         // Cleanup workspace when task ends.
         // Cleanup is based on the persisted task status, not the raw executor
         // result, so waiting/review/validation workspaces cannot be removed
@@ -1031,155 +772,6 @@ where
     });
 
     task_id
-}
-
-/// Create a task that waits for its dependencies before starting.
-///
-/// If all deps are already Done, registers as Pending immediately.
-/// If deps are unresolved, registers as AwaitingDeps.
-/// Returns Err if a circular dependency is detected.
-pub async fn spawn_task_awaiting_deps(
-    store: Arc<TaskStore>,
-    req: CreateTaskRequest,
-) -> anyhow::Result<TaskId> {
-    let depends_on = req.depends_on.clone();
-    let task_id = TaskId::new();
-
-    if detect_cycle(&store, &task_id, &depends_on) {
-        anyhow::bail!("circular dependency detected for task {}", task_id.0);
-    }
-
-    let mut all_done = true;
-    for dep_id in &depends_on {
-        if !matches!(store.dep_status(dep_id).await, Some(TaskStatus::Done)) {
-            all_done = false;
-            break;
-        }
-    }
-
-    let mut state = TaskState::new(task_id.clone());
-    state.task_kind = classify_task_kind(&req);
-    state.depends_on = depends_on;
-    state.source = req.source.clone();
-    state.external_id = req.external_id.clone();
-    state.repo = req.repo.clone();
-    state.priority = req.priority;
-    state.issue = req.issue;
-    state.phase = state.task_kind.default_phase();
-    state.description = summarize_request_description(&req);
-    state.request_settings = Some(PersistedRequestSettings::from_req(&req));
-    // Persist the caller's resolved project root so that duplicate detection
-    // (which keys on project_root + external_id) and the dep-watcher's project
-    // path resolution both work correctly for waiting tasks.
-    state.project_root = req.project.clone();
-    if let Some(parent) = req.parent_task_id.clone() {
-        state.parent_id = Some(parent);
-    }
-
-    if !all_done && !state.depends_on.is_empty() {
-        state.status = TaskStatus::AwaitingDeps;
-        state.scheduler = crate::task_runner::TaskSchedulerState::awaiting_dependencies();
-    }
-
-    store.insert(&state).await;
-    store.register_task_stream(&task_id);
-    Ok(task_id)
-}
-
-/// Check all AwaitingDeps tasks and transition ready ones to Pending.
-/// Returns the IDs of tasks that were transitioned to Pending.
-///
-/// Async because dependency status checks fall back to the database for
-/// terminal tasks (Done/Failed) that were evicted from the startup cache.
-///
-/// Returns `(ready_ids, newly_failed_ids)`.  Both sets must be persisted by
-/// the caller so that status transitions survive a process restart.
-pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>) {
-    let mut ready = Vec::new();
-    // (task_id, dep_id, dep_terminal_status_label) — label is "failed" or "cancelled".
-    let mut failed_deps: Vec<(TaskId, TaskId, &'static str)> = Vec::new();
-
-    // Snapshot AwaitingDeps tasks from cache before async work.
-    let awaiting: Vec<(TaskId, Vec<TaskId>)> = store
-        .cache
-        .iter()
-        .filter_map(|e| {
-            let task = e.value();
-            if matches!(task.status, TaskStatus::AwaitingDeps) {
-                Some((task.id.clone(), task.depends_on.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for (task_id, depends_on) in awaiting {
-        // Single pass: one DB lookup per dep (cache-first, then lightweight
-        // `SELECT status` — no `rounds` JSON decode).
-        let mut failed_dep_id: Option<(TaskId, &'static str)> = None;
-        let mut all_done = true;
-        for dep_id in &depends_on {
-            match store.dep_status(dep_id).await {
-                Some(TaskStatus::Failed) => {
-                    failed_dep_id = Some((dep_id.clone(), "failed"));
-                    break; // fail-fast — no need to inspect remaining deps
-                }
-                Some(TaskStatus::Cancelled) => {
-                    // A cancelled dependency hard-fails its dependents. When a
-                    // task is re-queued it always receives a new TaskId, so the
-                    // original (now-cancelled) TaskId in `depends_on` can never
-                    // transition to Done. Leaving the dependent in AwaitingDeps
-                    // would block it indefinitely; failing it immediately lets
-                    // the caller re-submit with correct dependency IDs.
-                    failed_dep_id = Some((dep_id.clone(), "cancelled"));
-                    break; // fail-fast — no need to inspect remaining deps
-                }
-                Some(TaskStatus::Done) => {} // this dep is satisfied
-                _ => {
-                    // Pending, Implementing, or unknown — not ready yet.
-                    // Keep scanning in case a later dep is Failed.
-                    all_done = false;
-                }
-            }
-        }
-        if let Some((fd, label)) = failed_dep_id {
-            failed_deps.push((task_id, fd, label));
-            continue;
-        }
-        if all_done {
-            ready.push(task_id);
-        }
-    }
-
-    let mut newly_failed: Vec<TaskId> = Vec::new();
-    for (task_id, failed_dep_id, label) in &failed_deps {
-        if let Some(mut entry) = store.cache.get_mut(task_id) {
-            // Only overwrite if the task is still AwaitingDeps — a concurrent
-            // cancel or status transition must not be clobbered.
-            if matches!(entry.status, TaskStatus::AwaitingDeps) {
-                entry.status = TaskStatus::Failed;
-                entry.scheduler.mark_terminal(&TaskStatus::Failed);
-                entry.error = Some(format!("dependency {} {}", failed_dep_id.0, label));
-                newly_failed.push(task_id.clone());
-            }
-        }
-    }
-    // Only return IDs where the transition actually happened.  If a task was
-    // cancelled or otherwise moved out of AwaitingDeps between the snapshot
-    // and this guard, it must NOT be included — the dep-watcher would otherwise
-    // launch an already-terminal or concurrently-cancelled task.
-    let mut actually_ready: Vec<TaskId> = Vec::with_capacity(ready.len());
-    for task_id in &ready {
-        if let Some(mut entry) = store.cache.get_mut(task_id) {
-            if matches!(entry.status, TaskStatus::AwaitingDeps) {
-                entry.status = TaskStatus::Pending;
-                entry.scheduler.clear_to_queued();
-                actually_ready.push(task_id.clone());
-            }
-        }
-    }
-
-    (actually_ready, newly_failed)
 }
 
 #[cfg(test)]
