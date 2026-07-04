@@ -355,6 +355,7 @@ async fn release_issue_after_dependencies(
                 "depends_on": depends_on_strings(depends_on),
                 "tracker_source": fields.tracker_source,
                 "tracker_external_id": fields.tracker_external_id,
+                "author_trust_class": fields.author_trust_class,
                 "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
             }),
         )

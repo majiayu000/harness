@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use harness_core::config::isolation::IsolationTrustClass;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,9 @@ pub struct IncomingIssue {
     pub priority: Option<i32>,
     pub labels: Vec<String>,
     pub created_at: Option<DateTime<Utc>>,
+    /// Trust class derived from source metadata. Non-GitHub/internal sources default to trusted.
+    #[serde(default)]
+    pub author_trust_class: IsolationTrustClass,
     /// Project root override for this issue's repo.
     #[serde(default)]
     pub project_root: Option<std::path::PathBuf>,
@@ -467,6 +471,7 @@ mod tests {
             priority: Some(2),
             labels: vec!["inbox".to_string()],
             created_at: None,
+            author_trust_class: harness_core::config::isolation::IsolationTrustClass::Trusted,
             project_root: None,
         }
     }

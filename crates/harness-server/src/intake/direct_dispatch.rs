@@ -170,6 +170,7 @@ pub(super) async fn run_direct_issue_dispatch(
                 source: Some(source.name()),
                 external_id: Some(ext_id.as_str()),
                 remote_fact_hash: fact_hash.as_deref(),
+                author_trust_class: Some(issue.author_trust_class),
             },
         )
         .await
@@ -230,6 +231,7 @@ mod tests {
             priority: None,
             labels: vec![],
             created_at: None,
+            author_trust_class: harness_core::config::isolation::IsolationTrustClass::Trusted,
             project_root: None,
         }
     }

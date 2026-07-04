@@ -1,7 +1,7 @@
 use super::{
-    depends_on_strings, merge_last_decision, optional_string_field, string_field,
-    IssueSubmissionRuntimeContext, PromptSubmissionRuntimeContext, WorkflowSubmissionRuntimeRecord,
-    EXECUTION_PATH_WORKFLOW_RUNTIME,
+    depends_on_strings, insert_author_trust_class, merge_last_decision, optional_string_field,
+    string_field, IssueSubmissionRuntimeContext, PromptSubmissionRuntimeContext,
+    WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use super::{
     prompt_memory::{cache_prompt_submission_prompt, remove_prompt_submission_prompt},
@@ -288,7 +288,7 @@ fn new_submission_event_id(event: &SubmissionEventSelection) -> Option<String> {
 }
 
 fn issue_submission_event_payload(ctx: &IssueSubmissionRuntimeContext<'_>) -> serde_json::Value {
-    json!({
+    let mut payload = json!({
         "task_id": ctx.task_id.as_str(),
         "repo": ctx.repo,
         "issue_number": ctx.issue_number,
@@ -303,7 +303,9 @@ fn issue_submission_event_payload(ctx: &IssueSubmissionRuntimeContext<'_>) -> se
         "tracker_source": super::issue_tracker_source(ctx),
         "tracker_external_id": super::issue_tracker_external_id(ctx),
         "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
-    })
+    });
+    insert_author_trust_class(&mut payload, ctx.author_trust_class);
+    payload
 }
 
 fn prompt_submission_event_payload(ctx: &PromptSubmissionRuntimeContext<'_>) -> serde_json::Value {

@@ -174,6 +174,7 @@ async fn get_task_runtime_issue_exposes_tracker_identity() -> anyhow::Result<()>
             source: Some("github"),
             external_id: Some("issue:64"),
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -618,6 +619,7 @@ async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Re
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -702,6 +704,7 @@ async fn cancel_task_accepts_runtime_submission_handle_without_task_row() -> any
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;

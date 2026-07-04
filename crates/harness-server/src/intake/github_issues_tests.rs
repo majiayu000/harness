@@ -739,6 +739,7 @@ async fn runtime_aware_checker_preserves_runtime_issue_handles() -> anyhow::Resu
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;

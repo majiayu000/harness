@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use harness_core::config::isolation::IsolationTrustClass;
 use reqwest::header::{ACCEPT, LINK, USER_AGENT};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -324,6 +325,8 @@ struct GhIssue {
     pull_request: Option<serde_json::Value>,
     #[serde(default)]
     labels: Vec<GhLabel>,
+    #[serde(default)]
+    author_association: Option<String>,
     #[serde(alias = "createdAt")]
     created_at: Option<DateTime<Utc>>,
 }
@@ -372,6 +375,7 @@ fn parse_gh_output(
             priority: None,
             labels: issue.labels.into_iter().map(|l| l.name).collect(),
             created_at: issue.created_at,
+            author_trust_class: classify_author_association(issue.author_association.as_deref()),
             project_root: project_root.map(|p| p.to_path_buf()),
         })
         .collect();
@@ -395,6 +399,18 @@ fn github_issues_url(api_base_url: &str, repo: &str, label: &str) -> anyhow::Res
         }
     }
     Ok(url.to_string())
+}
+
+fn classify_author_association(author_association: Option<&str>) -> IsolationTrustClass {
+    match author_association
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("COLLABORATOR" | "MEMBER" | "OWNER") => IsolationTrustClass::Trusted,
+        _ => IsolationTrustClass::NonCollaborator,
+    }
 }
 
 struct GitHubIssuePage {
@@ -518,3 +534,7 @@ impl IntakeSource for GitHubIssuesPoller {
 #[cfg(test)]
 #[path = "github_issues_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "github_issues_trust_tests.rs"]
+mod trust_tests;

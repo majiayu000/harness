@@ -1,4 +1,5 @@
 use crate::task_runner::TaskId;
+use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
     build_issue_submission_decision, build_prompt_submission_decision, DecisionValidator,
     IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, ValidationContext,
@@ -75,6 +76,7 @@ pub(crate) struct IssueSubmissionRuntimeContext<'a> {
     pub source: Option<&'a str>,
     pub external_id: Option<&'a str>,
     pub remote_fact_hash: Option<&'a str>,
+    pub author_trust_class: Option<IsolationTrustClass>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,27 +350,35 @@ fn issue_submission_data(
         .remote_fact_hash
         .map(ToOwned::to_owned)
         .or_else(|| optional_string_field(existing_data, "last_remote_fact_hash"));
-    crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        ctx.project_root,
-        json!({
-            "project_id": project_id,
-            "repo": ctx.repo,
-            "issue_number": ctx.issue_number,
-            "submission_id": submission_id_for_data(existing_data, ctx.task_id),
-            "task_id": ctx.task_id.as_str(),
-            "task_ids": task_id_history(existing_data, ctx.task_id),
-            "labels": ctx.labels,
-            "force_execute": ctx.force_execute,
-            "additional_prompt": ctx.additional_prompt,
-            "depends_on": depends_on_strings(ctx.depends_on),
-            "dependencies_blocked": ctx.dependencies_blocked,
-            "source": ctx.source,
-            "external_id": ctx.external_id,
-            "last_remote_fact_hash": last_remote_fact_hash,
-            "tracker_source": issue_tracker_source(ctx),
-            "tracker_external_id": issue_tracker_external_id(ctx),
-        }),
-    )
+    let mut data = json!({
+        "project_id": project_id,
+        "repo": ctx.repo,
+        "issue_number": ctx.issue_number,
+        "submission_id": submission_id_for_data(existing_data, ctx.task_id),
+        "task_id": ctx.task_id.as_str(),
+        "task_ids": task_id_history(existing_data, ctx.task_id),
+        "labels": ctx.labels,
+        "force_execute": ctx.force_execute,
+        "additional_prompt": ctx.additional_prompt,
+        "depends_on": depends_on_strings(ctx.depends_on),
+        "dependencies_blocked": ctx.dependencies_blocked,
+        "source": ctx.source,
+        "external_id": ctx.external_id,
+        "last_remote_fact_hash": last_remote_fact_hash,
+        "tracker_source": issue_tracker_source(ctx),
+        "tracker_external_id": issue_tracker_external_id(ctx),
+    });
+    insert_author_trust_class(&mut data, ctx.author_trust_class);
+    crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data)
+}
+
+fn insert_author_trust_class(
+    data: &mut serde_json::Value,
+    author_trust_class: Option<IsolationTrustClass>,
+) {
+    if let (Some(object), Some(author_trust_class)) = (data.as_object_mut(), author_trust_class) {
+        object.insert("author_trust_class".to_string(), json!(author_trust_class));
+    }
 }
 
 pub(super) fn issue_tracker_source(
@@ -452,6 +462,7 @@ struct IssueSubmissionFields {
     additional_prompt: Option<String>,
     tracker_source: Option<String>,
     tracker_external_id: Option<String>,
+    author_trust_class: Option<IsolationTrustClass>,
 }
 
 fn issue_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<IssueSubmissionFields> {
@@ -472,7 +483,24 @@ fn issue_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<IssueS
         additional_prompt: optional_string_field(&instance.data, "additional_prompt"),
         tracker_source: optional_string_field(&instance.data, "tracker_source"),
         tracker_external_id: optional_string_field(&instance.data, "tracker_external_id"),
+        author_trust_class: author_trust_class_field(&instance.data)?,
     })
+}
+
+fn author_trust_class_field(
+    data: &serde_json::Value,
+) -> anyhow::Result<Option<IsolationTrustClass>> {
+    let Some(value) = data.get("author_trust_class") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| {
+            anyhow::anyhow!("runtime issue workflow has invalid author_trust_class: {error}")
+        })
 }
 
 #[derive(Debug)]
@@ -602,6 +630,10 @@ mod dependency_tests;
 #[cfg(test)]
 #[path = "workflow_runtime_submission/replay_tests.rs"]
 mod replay_tests;
+
+#[cfg(test)]
+#[path = "workflow_runtime_submission/trust_tests.rs"]
+mod trust_tests;
 
 #[cfg(test)]
 #[path = "workflow_runtime_submission_tests.rs"]
