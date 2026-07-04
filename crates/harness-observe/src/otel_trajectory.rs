@@ -219,11 +219,10 @@ fn span_id_from_seed(seed: impl AsRef<[u8]>) -> Option<SpanId> {
     let digest = Sha256::digest(seed.as_ref());
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
-    let mut value = u64::from_be_bytes(bytes);
-    if value == 0 {
-        value = 1;
+    if bytes.iter().all(|byte| *byte == 0) {
+        bytes[7] = 1;
     }
-    parse_span_id(&format!("{value:016x}"))
+    Some(SpanId::from_bytes(bytes))
 }
 
 fn parse_trace_id(value: &str) -> Option<TraceId> {

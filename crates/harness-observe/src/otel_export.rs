@@ -264,55 +264,30 @@ impl OtelPipeline {
             tracer_provider,
             logger_provider,
             meter_provider,
-            trajectory_export_errors_total,
             ..
         } = self;
         let shutdown_result = tokio::task::spawn_blocking(move || {
             for result in tracer_provider.force_flush() {
                 if let Err(err) = result {
-                    report_pipeline_error(
-                        &trajectory_export_errors_total,
-                        "failed to force flush tracer provider",
-                        err,
-                    );
+                    report_pipeline_error("failed to force flush tracer provider", err);
                 }
             }
             if let Err(err) = tracer_provider.shutdown() {
-                report_pipeline_error(
-                    &trajectory_export_errors_total,
-                    "failed to shut down tracer provider",
-                    err,
-                );
+                report_pipeline_error("failed to shut down tracer provider", err);
             }
             if let Err(err) = meter_provider.force_flush() {
-                report_pipeline_error(
-                    &trajectory_export_errors_total,
-                    "failed to force flush meter provider",
-                    err,
-                );
+                report_pipeline_error("failed to force flush meter provider", err);
             }
             if let Err(err) = meter_provider.shutdown() {
-                report_pipeline_error(
-                    &trajectory_export_errors_total,
-                    "failed to shut down meter provider",
-                    err,
-                );
+                report_pipeline_error("failed to shut down meter provider", err);
             }
             for result in logger_provider.force_flush() {
                 if let Err(err) = result {
-                    report_pipeline_error(
-                        &trajectory_export_errors_total,
-                        "failed to force flush logger provider",
-                        err,
-                    );
+                    report_pipeline_error("failed to force flush logger provider", err);
                 }
             }
             if let Err(err) = logger_provider.shutdown() {
-                report_pipeline_error(
-                    &trajectory_export_errors_total,
-                    "failed to shut down logger provider",
-                    err,
-                );
+                report_pipeline_error("failed to shut down logger provider", err);
             }
         })
         .await;
@@ -551,15 +526,7 @@ fn severity_for_decision(decision: Decision) -> Severity {
     }
 }
 
-fn report_pipeline_error(
-    trajectory_export_errors_total: &Counter<u64>,
-    message: &str,
-    err: impl std::fmt::Display,
-) {
-    trajectory_export_errors_total.add(
-        1,
-        &[KeyValue::new("harness.otel.operation", "provider_shutdown")],
-    );
+fn report_pipeline_error(message: &str, err: impl std::fmt::Display) {
     tracing::warn!("{message}: {err}");
     eprintln!("harness-observe: {message}: {err}");
 }
