@@ -644,6 +644,7 @@ async fn dispatch_runtime_command_with_project_policy(
     let dispatch_gate_fact_hash = command_dispatch_gate_fact_hash(&command);
     let outcome = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
         .with_isolation_config(isolation_config)
+        .with_isolation_availability(state.isolation_availability.clone())
         .with_dispatcher_id(dispatch_owner)
         .dispatch_command(command)
         .await?;

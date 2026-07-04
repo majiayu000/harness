@@ -92,6 +92,98 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn runtime_command_dispatch_tick_refuses_unavailable_isolation_tier() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-isolation-unavailable");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.isolation.rules = vec![harness_core::config::isolation::IsolationRule {
+        trust: harness_core::config::isolation::IsolationTrustClass::NonCollaborator,
+        tier: harness_core::config::isolation::IsolationTier::Container,
+    }];
+    let mut state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .isolation_availability =
+        harness_core::config::isolation::IsolationAvailability::new(vec![
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Host,
+            ),
+            harness_core::config::isolation::IsolationTierStatus::unavailable(
+                harness_core::config::isolation::IsolationTier::Container,
+                "docker missing",
+            ),
+        ]);
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "replanning",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:126"),
+    )
+    .with_id("issue-126")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 126,
+        "author_trust_class": "non_collaborator",
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command =
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-126");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 0);
+    assert_eq!(tick.already_dispatched, 0);
+    assert_eq!(tick.skipped, 1);
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "failed");
+    let events = store.events_for(&workflow.id).await?;
+    let event = events
+        .iter()
+        .find(|event| event.event_type == "WorkflowRuntimeIsolationUnavailable")
+        .expect("isolation refusal event should be recorded");
+    assert_eq!(event.event["command_id"], command_id);
+    assert_eq!(event.event["tier"], "container");
+    assert!(event.event["reason"]
+        .as_str()
+        .expect("reason should be a string")
+        .contains("docker missing"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_command_dispatch_tick_fails_command_when_workflow_config_is_malformed(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {

@@ -53,6 +53,10 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
     let runtime_degraded = circuit_breakers
         .iter()
         .any(|breaker| breaker.state != "closed");
+    let unavailable_required_tiers = state
+        .isolation_availability
+        .unavailable_required_tiers(&state.core.server.config.isolation);
+    let isolation_degraded = !unavailable_required_tiers.is_empty();
     let startup_statuses: Vec<serde_json::Value> = state
         .startup_statuses
         .iter()
@@ -65,7 +69,7 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
             })
         })
         .collect();
-    let status = if degraded.is_empty() && !dirty && !runtime_degraded {
+    let status = if degraded.is_empty() && !dirty && !runtime_degraded && !isolation_degraded {
         "ok"
     } else {
         "degraded"
@@ -87,6 +91,10 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
         },
         "runtime": {
             "circuit_breakers": circuit_breakers,
+        },
+        "isolation": {
+            "tiers": state.isolation_availability.tiers.clone(),
+            "unavailable_required_tiers": unavailable_required_tiers,
         }
     }))
 }

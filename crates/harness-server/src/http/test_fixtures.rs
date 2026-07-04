@@ -227,6 +227,7 @@ async fn make_read_only_route_test_state_with_project_root(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: AtomicBool::new(false),
         runtime_circuit_breakers: Arc::new(

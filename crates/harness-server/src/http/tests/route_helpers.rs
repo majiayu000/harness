@@ -497,6 +497,7 @@ pub(super) struct HealthResponse {
     pub(super) persistence: PersistenceBlock,
     pub(super) runtime_logs: RuntimeLogsBlock,
     pub(super) runtime: serde_json::Value,
+    pub(super) isolation: serde_json::Value,
 }
 
 #[derive(serde::Deserialize, Debug)]

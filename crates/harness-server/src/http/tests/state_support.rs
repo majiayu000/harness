@@ -370,6 +370,7 @@ pub(super) async fn make_test_state_with_project_root(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         runtime_circuit_breakers: Arc::new(
@@ -455,6 +456,7 @@ pub(super) async fn make_test_state_with_issue_workflows(
         _db_state_guard: None,
         runtime_hosts: state.runtime_hosts.clone(),
         runtime_project_cache: state.runtime_project_cache.clone(),
+        isolation_availability: state.isolation_availability.clone(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         runtime_circuit_breakers: state.runtime_circuit_breakers.clone(),
@@ -575,6 +577,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         _db_state_guard: None,
         runtime_hosts: state.runtime_hosts.clone(),
         runtime_project_cache: state.runtime_project_cache.clone(),
+        isolation_availability: state.isolation_availability.clone(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
         runtime_circuit_breakers: state.runtime_circuit_breakers.clone(),
