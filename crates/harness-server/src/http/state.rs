@@ -74,8 +74,6 @@ pub struct CoreServices {
     pub workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
-    /// Q-value store for MemRL rule utility tracking. None when unavailable.
-    pub q_values: Option<Arc<crate::q_value_store::QValueStore>>,
     /// Set to `true` while the daily maintenance window is active.
     /// Pollers skip dispatch and HTTP POST /tasks returns 503 when this is set.
     /// Initialized to the correct value at startup (handles server starting mid-window).

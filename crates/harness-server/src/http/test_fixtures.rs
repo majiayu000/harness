@@ -201,7 +201,6 @@ async fn make_read_only_route_test_state_with_project_root(
             workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
-            q_values: None,
             maintenance_active: Arc::new(AtomicBool::new(false)),
         },
         engines: EngineServices {

@@ -22,7 +22,6 @@ const LEGACY_WORKSPACE_STORE_PATHS: &[&str] = &[
     "project_workflows.db",
     "evals.db",
     "reviews.db",
-    "q_values.db",
     "runtime_state.db",
     "events.db",
     "workflow_runtime.db",

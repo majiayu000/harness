@@ -340,7 +340,6 @@ pub(super) async fn make_test_state_with_project_root(
             workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
-            q_values: None,
             maintenance_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         engines: crate::http::EngineServices {
@@ -434,7 +433,6 @@ pub(super) async fn make_test_state_with_issue_workflows(
             workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
-            q_values: None,
             maintenance_active: state.core.maintenance_active.clone(),
         },
         engines: crate::http::EngineServices {
@@ -555,7 +553,6 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
             workflow_runtime_store: Some(workflow_runtime_store),
             project_registry: None,
             runtime_state_store: None,
-            q_values: None,
             maintenance_active: state.core.maintenance_active.clone(),
         },
         engines: crate::http::EngineServices {

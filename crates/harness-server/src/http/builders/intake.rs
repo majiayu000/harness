@@ -17,13 +17,13 @@ pub(crate) struct IntakeBundle {
 }
 
 /// Initialize task queue, intake sources (Feishu, GitHub), quality trigger,
-/// and the completion callback (including Q-value wrapper when available).
+/// and the completion callback.
 ///
-/// Depends on: `storage` (q_values), `engines` (gc_agent, events),
+/// Depends on: `engines` (gc_agent, events),
 /// `registry` (project_registry) — must follow all three.
 pub(crate) async fn build_intake(
     server: &Arc<HarnessServer>,
-    storage: &StorageBundle,
+    _storage: &StorageBundle,
     engines: &EnginesBundle,
     registry: &RegistryBundle,
     project_root: &Path,
@@ -178,64 +178,6 @@ pub(crate) async fn build_intake(
         server.config.server.github_token.clone(),
         registry.issue_workflow_store.clone(),
     );
-
-    // Wrap completion callback to record Q-value pipeline events and apply
-    // backprop on every live task completion (Done/Failed).
-    // Guard IDs are captured once at startup; they are stable after registration.
-    let completion_callback = if let Some(ref qv) = storage.q_values {
-        let qv = qv.clone();
-        let inner = completion_callback;
-        let cb: task_runner::CompletionCallback = Arc::new(move |state: task_runner::TaskState| {
-            let qv = qv.clone();
-            let inner = inner.clone();
-            Box::pin(async move {
-                let reward = match state.status {
-                    task_runner::TaskStatus::Done => {
-                        if state.pr_url.is_some() {
-                            Some(crate::q_value_store::REWARD_MERGED)
-                        } else {
-                            None
-                        }
-                    }
-                    task_runner::TaskStatus::Failed => Some(crate::q_value_store::REWARD_CLOSED),
-                    task_runner::TaskStatus::Cancelled => {
-                        Some(crate::q_value_store::REWARD_UNKNOWN_CLOSED)
-                    }
-                    _ => None,
-                };
-                if let Some(reward) = reward {
-                    match qv.get_experiences_for_task(&state.id.0).await {
-                        Ok(exp_ids) if !exp_ids.is_empty() => {
-                            if let Err(e) = qv
-                                .apply_q_update(
-                                    &exp_ids,
-                                    reward,
-                                    crate::q_value_store::DEFAULT_ALPHA,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    task_id = %state.id.0,
-                                    "q_value apply_q_update failed: {e}"
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(
-                            task_id = %state.id.0,
-                            "q_value get_experiences_for_task failed: {e}"
-                        ),
-                    }
-                }
-                if let Some(cb) = inner {
-                    cb(state).await;
-                }
-            })
-        });
-        Some(cb)
-    } else {
-        completion_callback
-    };
 
     Ok(IntakeBundle {
         task_queue,

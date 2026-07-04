@@ -81,10 +81,6 @@ mod tests {
                 crate::eval_store::EvalStore::shared_schema_context(Some(TEST_DATABASE_URL))?,
             ),
             (
-                "q_value_store",
-                crate::q_value_store::QValueStore::shared_schema_context(Some(TEST_DATABASE_URL))?,
-            ),
-            (
                 "thread_db",
                 crate::thread_db::ThreadDb::shared_schema_context(Some(TEST_DATABASE_URL))?,
             ),

@@ -38,7 +38,6 @@ LEGACY_STORE_TYPES = {
     "RuntimeStateStore",
     "EvalStore",
     "PlanDb",
-    "QValueStore",
     "ReviewStore",
     "WorkflowRuntimeStore",
     "IssueWorkflowStore",

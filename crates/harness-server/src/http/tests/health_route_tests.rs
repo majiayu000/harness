@@ -128,18 +128,18 @@ async fn health_degraded_multiple_subsystems() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = make_read_only_route_test_state(dir.path()).await?;
     Arc::get_mut(&mut state).unwrap().startup_statuses = vec![
-        crate::http::state::StoreStartupResult::optional("q_value_store")
+        crate::http::state::StoreStartupResult::optional("eval_store")
             .failed("pool timed out while waiting for an open connection"),
         crate::http::state::StoreStartupResult::optional("runtime_state_store")
             .failed("runtime state snapshot restore failed"),
     ];
     Arc::get_mut(&mut state).unwrap().degraded_subsystems =
-        vec!["q_value_store", "runtime_state_store"];
+        vec!["eval_store", "runtime_state_store"];
     let health = call_health(state).await?;
     assert_eq!(health.status, "degraded");
     assert_eq!(
         health.persistence.degraded_subsystems,
-        ["q_value_store", "runtime_state_store"]
+        ["eval_store", "runtime_state_store"]
     );
     assert_eq!(health.persistence.startup.stores.len(), 2);
     Ok(())

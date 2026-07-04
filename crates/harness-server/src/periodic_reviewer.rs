@@ -772,10 +772,9 @@ async fn run_review_tick(
     // agent runs inside a worktree that may contain nested `.harness/worktrees/`
     // from previous runs; scanning there inflates violation counts ~3x.
     //
-    // Only scan repos that have opted in via `.harness/guards`.  The shared
+    // Only scan repos that have opted in via `.harness/guards`. The shared
     // RuleEngine holds guards from all registered projects; scanning an unrelated
-    // repo with those guards produces false positives (mirrors the opt-in check
-    // in rule_enforcer.rs).
+    // repo with those guards produces false positives.
     let guard_scan_output: Option<String> = if project_root.join(".harness").join("guards").is_dir()
     {
         let rules = state.engines.rules.read().await;
