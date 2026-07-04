@@ -181,7 +181,12 @@ jobs:
             run_server=true
           fi
           if [ "$AGENTS_CHANGED" = "true" ]; then
+            # harness-server depends on harness-agents, so agent changes must
+            # also run the server test profiles: a behavioral regression in
+            # the agent adapters would otherwise ship untested (clippy only
+            # catches compile breakage).
             pkgs="$pkgs -p harness-agents"
+            run_server=true
             case "$pkgs" in
               *"-p harness-core"*) ;;
               *) pkgs="$pkgs -p harness-core" ;;
