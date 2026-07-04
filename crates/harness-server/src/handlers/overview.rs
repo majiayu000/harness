@@ -408,17 +408,17 @@ fn parse_llm_usage_event(event: &Event) -> Option<LlmUsageRecord> {
 }
 
 #[derive(Debug, Default)]
-struct ActiveTaskOverviewCounts {
-    total: u64,
-    running: u64,
-    queued: u64,
-    by_project: HashMap<String, ActiveProjectCounts>,
+pub(crate) struct ActiveTaskOverviewCounts {
+    pub(crate) total: u64,
+    pub(crate) running: u64,
+    pub(crate) queued: u64,
+    pub(crate) by_project: HashMap<String, ActiveProjectCounts>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct ActiveProjectCounts {
-    running: u64,
-    queued: u64,
+pub(crate) struct ActiveProjectCounts {
+    pub(crate) running: u64,
+    pub(crate) queued: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,7 +448,7 @@ impl ActiveTaskOverviewCounts {
     }
 }
 
-async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCounts {
+pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCounts {
     let mut counts = ActiveTaskOverviewCounts::default();
     let mut active_legacy_task_ids = HashSet::new();
     let mut loaded_legacy_tasks = false;

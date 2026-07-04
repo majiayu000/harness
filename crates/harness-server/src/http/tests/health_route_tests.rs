@@ -14,28 +14,24 @@ async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn health_runtime_logs_redacts_absolute_path() -> anyhow::Result<()> {
+async fn health_runtime_logs_reports_active_path_hint() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = make_read_only_route_test_state(dir.path()).await?;
     let state_mut = Arc::get_mut(&mut state).expect("unique state");
     let server = Arc::get_mut(&mut state_mut.core.server).expect("unique server");
-    server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(
-        dir.path()
-            .join("logs/harness-serve-20260430T120000Z-pid1.log"),
-        45,
-    );
+    let active_path = dir
+        .path()
+        .join("logs/harness-serve-20260430T120000Z-pid1.log");
+    let expected_path = active_path.to_string_lossy().into_owned();
+    server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(active_path, 45);
 
     let health = call_health(state).await?;
     assert_eq!(health.runtime_logs.state, "enabled");
     assert_eq!(
         health.runtime_logs.path_hint.as_deref(),
-        Some("logs/harness-serve-20260430T120000Z-pid1.log")
+        Some(expected_path.as_str())
     );
     assert_eq!(health.runtime_logs.retention_days, 45);
-    assert!(
-        !format!("{health:?}").contains(&dir.path().display().to_string()),
-        "health response must not expose an absolute runtime log path"
-    );
     Ok(())
 }
 

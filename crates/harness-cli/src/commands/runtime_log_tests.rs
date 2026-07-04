@@ -28,11 +28,7 @@ fn prepare_logging_creates_runtime_log_for_serve() {
     assert!(active_path.exists(), "runtime log file should be created");
     assert_eq!(
         bootstrap.runtime_logs.path_hint.as_deref(),
-        active_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("logs/{name}"))
-            .as_deref()
+        Some(active_path.to_string_lossy().as_ref())
     );
 }
 

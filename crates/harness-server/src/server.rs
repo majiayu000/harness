@@ -59,9 +59,7 @@ impl RuntimeLogMetadata {
     }
 
     pub fn public_path_hint(path: &Path) -> String {
-        path.file_name()
-            .map(|name| format!("logs/{}", name.to_string_lossy()))
-            .unwrap_or_else(|| "logs".to_string())
+        path.to_string_lossy().into_owned()
     }
 }
 
@@ -105,5 +103,24 @@ impl HarnessServer {
     /// Start in HTTP + WebSocket mode.
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
         crate::http::serve(self, addr).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enabled_runtime_log_metadata_uses_active_path_as_hint() {
+        let active_path = PathBuf::from(
+            "/tmp/harness-codex-runtime/logs/harness-serve-20260430T120000Z-pid1.log",
+        );
+        let metadata = RuntimeLogMetadata::enabled(active_path.clone(), 30);
+
+        assert_eq!(metadata.active_path.as_deref(), Some(active_path.as_path()));
+        assert_eq!(
+            metadata.path_hint.as_deref(),
+            Some(active_path.to_string_lossy().as_ref())
+        );
     }
 }

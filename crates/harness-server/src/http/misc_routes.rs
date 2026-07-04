@@ -7,6 +7,7 @@ use axum::{
 };
 use harness_protocol::methods::RpcRequest;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
@@ -104,24 +105,37 @@ pub(crate) async fn project_queue_stats(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let tq = &state.concurrency.task_queue;
-    let projects: serde_json::Map<String, serde_json::Value> = tq
-        .all_project_stats()
+    let active_counts = crate::handlers::overview::active_task_overview_counts(&state).await;
+    let queue_project_stats = tq.all_project_stats();
+    let mut project_ids: BTreeSet<String> = active_counts.by_project.keys().cloned().collect();
+    project_ids.extend(queue_project_stats.iter().map(|(id, _)| id.clone()));
+    let projects: serde_json::Map<String, serde_json::Value> = project_ids
         .into_iter()
-        .map(|(id, s)| {
+        .map(|id| {
+            let active = active_counts
+                .by_project
+                .get(&id)
+                .copied()
+                .unwrap_or_default();
+            let limit = queue_project_stats
+                .iter()
+                .find(|(project_id, _)| project_id == &id)
+                .map(|(_, stats)| stats.limit)
+                .unwrap_or_else(|| tq.project_stats(&id).limit);
             (
                 id,
                 json!({
-                    "running": s.running,
-                    "queued": s.queued,
-                    "limit": s.limit,
+                    "running": active.running,
+                    "queued": active.queued,
+                    "limit": limit,
                 }),
             )
         })
         .collect();
     Json(json!({
         "global": {
-            "running": tq.running_count(),
-            "queued": tq.queued_count(),
+            "running": active_counts.running,
+            "queued": active_counts.queued,
             "limit": tq.global_limit(),
         },
         "projects": projects,
