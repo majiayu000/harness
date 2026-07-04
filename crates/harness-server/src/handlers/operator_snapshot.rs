@@ -630,11 +630,11 @@ mod tests {
         let mut state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
         let state_mut = Arc::get_mut(&mut state).expect("unique state");
         let server = Arc::get_mut(&mut state_mut.core.server).expect("unique server");
-        server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(
-            dir.path()
-                .join("logs/harness-serve-20260430T120000Z-pid1.log"),
-            30,
-        );
+        let active_path = dir
+            .path()
+            .join("logs/harness-serve-20260430T120000Z-pid1.log");
+        let expected_path = active_path.display().to_string();
+        server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(active_path, 30);
 
         let app = Router::new()
             .route("/api/operator-snapshot", get(operator_snapshot))
@@ -649,16 +649,11 @@ mod tests {
         assert_eq!(body["runtime_logs"]["state"], "enabled");
         assert_eq!(
             body["runtime_logs"]["active_path"],
-            serde_json::Value::String(
-                dir.path()
-                    .join("logs/harness-serve-20260430T120000Z-pid1.log")
-                    .display()
-                    .to_string(),
-            )
+            serde_json::Value::String(expected_path.clone())
         );
         assert_eq!(
             body["runtime_logs"]["path_hint"],
-            serde_json::Value::String("logs/harness-serve-20260430T120000Z-pid1.log".to_string())
+            serde_json::Value::String(expected_path)
         );
         Ok(())
     }
