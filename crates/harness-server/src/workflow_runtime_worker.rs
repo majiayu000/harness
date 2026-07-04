@@ -132,7 +132,7 @@ pub(crate) async fn record_runtime_circuit_breaker_completion(
             chrono::Utc::now(),
         ),
         RuntimeJobStatus::Failed => {
-            let failure_class = classify_agent_failure(job.error.as_deref().unwrap_or_default());
+            let failure_class = runtime_job_failure_class(job);
             if let Some(updated) = store
                 .record_runtime_job_failure_class(&job.id, failure_class.as_str())
                 .await?
@@ -310,6 +310,15 @@ fn runtime_job_activity_result(job: &RuntimeJob) -> Option<ActivityResult> {
         .and_then(|output| serde_json::from_value(output.clone()).ok())
 }
 
+fn runtime_job_failure_class(job: &RuntimeJob) -> FailureClass {
+    if runtime_job_activity_result(job)
+        .is_some_and(|result| result.error_kind == Some(ActivityErrorKind::SpawnFailure))
+    {
+        return FailureClass::ZeroOutputSpawnFailure;
+    }
+    classify_agent_failure(job.error.as_deref().unwrap_or_default())
+}
+
 fn runtime_failure_kind(
     status: &TaskStatus,
     result: Option<&ActivityResult>,
@@ -465,6 +474,51 @@ mod tests {
             task.error.as_deref(),
             Some("provider temporarily unavailable")
         );
+    }
+
+    #[test]
+    fn runtime_job_failure_class_uses_structured_spawn_failure() -> anyhow::Result<()> {
+        let mut job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        );
+        let result = ActivityResult::failed(
+            "implement_issue",
+            "Agent completed without assistant output.",
+            "Agent completed without assistant output; treating as spawn failure.",
+        )
+        .with_error_kind(ActivityErrorKind::SpawnFailure);
+        job.complete(&result)?;
+
+        assert_eq!(
+            runtime_job_failure_class(&job),
+            FailureClass::ZeroOutputSpawnFailure
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_job_failure_class_falls_back_to_error_text() -> anyhow::Result<()> {
+        let mut job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        );
+        let result = ActivityResult::failed(
+            "implement_issue",
+            "Codex limit reached.",
+            "codex exited with exit status: 1: stderr=[Reading additional input]",
+        );
+        job.complete(&result)?;
+
+        assert_eq!(
+            runtime_job_failure_class(&job),
+            FailureClass::QuotaInteractiveWait
+        );
+        Ok(())
     }
 
     #[test]
