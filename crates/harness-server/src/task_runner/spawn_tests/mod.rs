@@ -270,6 +270,93 @@ async fn spawn_exit_paths_guard_terminalizes_running_waiting_state() -> anyhow::
 }
 
 #[tokio::test]
+async fn recovery_no_limbo_shutdown_abort_terminalizes_running_task() -> anyhow::Result<()> {
+    let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = crate::test_helpers::tempdir_in_home("harness-test-shutdown-abort-")?;
+    let database_url = crate::test_helpers::test_database_url()?;
+    let store = TaskStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir.path(), "tasks"),
+        Some(&database_url),
+    )
+    .await?;
+    let skills = Arc::new(RwLock::new(harness_skills::store::SkillStore::new()));
+    let events = Arc::new(
+        harness_observe::event_store::EventStore::new_with_database_url(
+            dir.path(),
+            Some(&database_url),
+        )
+        .await?,
+    );
+    let agent = helpers::BlockingAgent::new();
+    let req = CreateTaskRequest {
+        project: Some(dir.path().to_path_buf()),
+        prompt: Some("block until shutdown abort".to_string()),
+        wait_secs: 0,
+        max_rounds: Some(1),
+        turn_timeout_secs: 3600,
+        ..Default::default()
+    };
+
+    let queue = crate::task_queue::TaskQueue::unbounded();
+    let permit = queue.acquire("test", 0).await?;
+    let task_id = spawn_task(
+        store.clone(),
+        agent.clone(),
+        None,
+        Default::default(),
+        skills,
+        events,
+        vec![],
+        req,
+        None,
+        permit,
+        None,
+        None,
+        None,
+        vec![],
+    )
+    .await;
+
+    agent.wait_started(Duration::from_secs(15)).await?;
+    assert!(
+        store.abort_task(&task_id),
+        "running task should have an abort handle"
+    );
+    helpers::wait_until(Duration::from_secs(15), || {
+        store
+            .get(&task_id)
+            .is_some_and(|state| matches!(state.status, TaskStatus::Failed))
+    })
+    .await?;
+
+    let final_state = store
+        .get(&task_id)
+        .ok_or_else(|| anyhow::anyhow!("task should remain in store"))?;
+    assert_eq!(final_state.failure_kind, Some(TaskFailureKind::Task));
+    assert_eq!(
+        final_state.scheduler.authority_state,
+        SchedulerAuthorityState::Failed
+    );
+    assert!(
+        final_state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("spawn exit invariant violated")),
+        "shutdown abort must terminalize instead of leaving a running task in limbo"
+    );
+    let guard_round = final_state
+        .rounds
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("shutdown abort should record a diagnostic round"))?;
+    assert_eq!(guard_round.action, "spawn_exit_guard");
+    assert_eq!(guard_round.result, "nonterminal_exit");
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_abort_releases_workspace_after_watcher_observes_join() -> anyhow::Result<()> {
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
