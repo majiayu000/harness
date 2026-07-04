@@ -218,8 +218,13 @@ impl CodeAgent for ClaudeCodeAgent {
             )
             .await?;
 
-        let child = cmd.spawn().map_err(|e| {
-            harness_core::error::HarnessError::AgentExecution(format!("failed to run claude: {e}"))
+        let child = cmd.spawn().map_err(|error| {
+            let message = crate::classify_missing_workspace_spawn_failure(
+                &error,
+                &req.project_root,
+                format!("failed to run claude: {error}"),
+            );
+            harness_core::error::HarnessError::AgentExecution(message)
         })?;
         if let Some(pid) = child.id() {
             crate::write_provisional_agent_run_binding(
@@ -347,15 +352,21 @@ impl CodeAgent for ClaudeCodeAgent {
             Err(ref e) if e.raw_os_error() == Some(26) => {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 cmd.spawn().map_err(|error| {
-                    harness_core::error::HarnessError::AgentExecution(format!(
-                        "failed to run claude: {error}"
-                    ))
+                    let message = crate::classify_missing_workspace_spawn_failure(
+                        &error,
+                        &req.project_root,
+                        format!("failed to run claude: {error}"),
+                    );
+                    harness_core::error::HarnessError::AgentExecution(message)
                 })?
             }
             Err(error) => {
-                return Err(harness_core::error::HarnessError::AgentExecution(format!(
-                    "failed to run claude: {error}"
-                )));
+                let message = crate::classify_missing_workspace_spawn_failure(
+                    &error,
+                    &req.project_root,
+                    format!("failed to run claude: {error}"),
+                );
+                return Err(harness_core::error::HarnessError::AgentExecution(message));
             }
         };
         if let Some(pid) = child.id() {
