@@ -1439,6 +1439,10 @@ impl WorkflowRuntimeStore {
         .await?;
 
         tx.commit().await?;
+        if let Some(decision) = decision_record.as_ref() {
+            self.record_terminal_repo_memory_for_completion(&event, decision)
+                .await;
+        }
         Ok(Some(RuntimeActivityCompletion {
             runtime_job: job,
             command: Some(command),
