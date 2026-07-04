@@ -203,11 +203,15 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         );
     }
     let stall_timeout = Duration::from_secs(stall_normalization.effective_secs);
+    let stall_timeout_enabled = timeout_secs
+        .map(|timeout_secs| stall_normalization.effective_secs < timeout_secs)
+        .unwrap_or(true);
     tracing::debug!(
         thread_id = %thread_id,
         turn_id = %turn_id,
         stall_timeout_secs = stall_timeout.as_secs(),
         timeout_secs = ?timeout_secs,
+        stall_timeout_enabled,
         "starting agent turn with stall timeout"
     );
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
@@ -304,7 +308,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     }
                 }
             }
-            _ = tokio::time::sleep_until(last_activity + stall_timeout) => {
+            _ = tokio::time::sleep_until(last_activity + stall_timeout), if stall_timeout_enabled && execution_result.is_none() => {
                 let elapsed = last_activity.elapsed();
                 tracing::warn!(
                     thread_id = %thread_id,

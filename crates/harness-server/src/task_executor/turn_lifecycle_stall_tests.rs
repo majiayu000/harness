@@ -90,3 +90,57 @@ async fn lifecycle_fails_silent_stream_with_stall_reason() -> anyhow::Result<()>
     )));
     Ok(())
 }
+
+#[tokio::test]
+async fn lifecycle_wall_clock_timeout_wins_when_stall_cannot_be_shorter() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.server.project_root = root.path().to_path_buf();
+    config.agents.default_agent = "codex".to_string();
+
+    let mut registry = AgentRegistry::new("codex");
+    registry.register("codex", Arc::new(SilentLifecycleAgent));
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let thread_id = server
+        .thread_manager
+        .start_thread(root.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        AgentId::from_str("codex"),
+    )?;
+    let (notification_tx, _) = tokio::sync::broadcast::channel(16);
+
+    run_turn_lifecycle_with_options(
+        server.clone(),
+        None,
+        None,
+        notification_tx,
+        thread_id.clone(),
+        turn_id.clone(),
+        "prompt".to_string(),
+        "codex".to_string(),
+        TurnLifecycleOptions {
+            timeout_secs: Some(1),
+            stall_timeout_secs: Some(600),
+            force_code_agent: true,
+            ..TurnLifecycleOptions::default()
+        },
+    )
+    .await;
+
+    let turn = server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(turn.items.iter().any(|item| matches!(
+        item,
+        Item::Error { message, .. } if message.contains("Agent turn timed out after 1s")
+    )));
+    assert!(!turn.items.iter().any(|item| matches!(
+        item,
+        Item::Error { message, .. } if message.contains("Agent stream stalled")
+    )));
+    Ok(())
+}
