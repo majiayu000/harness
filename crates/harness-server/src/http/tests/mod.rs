@@ -31,6 +31,7 @@ mod health_route_tests;
 mod intake_auth_list_tests;
 mod recovery_followup_tests;
 mod recovery_tests;
+mod repo_memory_api_tests;
 mod runtime_dispatch_tests;
 mod runtime_task_route_tests;
 mod runtime_tree_tests;

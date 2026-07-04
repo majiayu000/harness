@@ -88,6 +88,16 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(task_mutation_routes::cancel_workflow_runtime),
         )
         .route(
+            "/api/projects/{id}/memory",
+            get(crate::handlers::repo_memory_api::list_project_repo_memory_route),
+        )
+        .route(
+            "/api/memory/{id}",
+            axum::routing::delete(
+                crate::handlers::repo_memory_api::delete_repo_memory_record_route,
+            ),
+        )
+        .route(
             "/api/runtime-hosts",
             get(crate::handlers::runtime_hosts::list_runtime_hosts),
         )
