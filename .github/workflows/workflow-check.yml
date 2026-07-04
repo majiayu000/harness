@@ -37,7 +37,8 @@ jobs:
             tests/test_evaluate.py \
             tests/test_github_pr_evidence.py \
             tests/test_pr_gate.py \
-            tests/test_specrail_review_regressions.py
+            tests/test_specrail_review_regressions.py \
+            tests/test_task_event_liveness.py
       - name: Check committed whitespace
         run: |
           set -euo pipefail

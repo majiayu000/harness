@@ -37,6 +37,7 @@ REQUIRED_FILES = [
     "checks/github_pr_evidence.py",
     "checks/pr_gate.py",
     "checks/route_gate.py",
+    "checks/task_event_liveness.py",
     "templates/issue_bug.md",
     "templates/issue_feature.md",
     "templates/product_spec.md",
