@@ -392,4 +392,42 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_state_updated_at
               ON workflow_instances (state, updated_at)",
     },
+    Migration {
+        version: 17,
+        description: "create workflow repo memory records",
+        sql: "CREATE TABLE IF NOT EXISTS workflow_repo_memory (
+            id              UUID PRIMARY KEY,
+            repo            TEXT NOT NULL,
+            activity_class  TEXT NOT NULL,
+            outcome         TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            payload_json    JSONB NOT NULL,
+            evidence_ref    TEXT,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_used_at    TIMESTAMPTZ,
+            use_count       BIGINT NOT NULL DEFAULT 0,
+            CONSTRAINT workflow_repo_memory_repo_not_blank
+                CHECK (btrim(repo) <> ''),
+            CONSTRAINT workflow_repo_memory_activity_class_not_blank
+                CHECK (btrim(activity_class) <> ''),
+            CONSTRAINT workflow_repo_memory_outcome_check
+                CHECK (outcome IN ('done', 'failed')),
+            CONSTRAINT workflow_repo_memory_kind_check
+                CHECK (kind IN (
+                    'validation_command',
+                    'failure_lesson',
+                    'reviewer_pattern',
+                    'environment_note'
+                )),
+            CONSTRAINT workflow_repo_memory_use_count_nonnegative
+                CHECK (use_count >= 0)
+        );
+        CREATE INDEX IF NOT EXISTS idx_workflow_repo_memory_repo_created
+          ON workflow_repo_memory (repo, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_workflow_repo_memory_repo_activity_created
+          ON workflow_repo_memory (repo, activity_class, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_workflow_repo_memory_repo_outcome_kind
+          ON workflow_repo_memory (repo, outcome, kind)",
+    },
 ];
