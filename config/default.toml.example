@@ -38,6 +38,8 @@ project_root = "."
 # Pause dispatch for a runtime profile after repeated same-class failures.
 enabled = true
 consecutive_failures = 5
+distinct_runtime_jobs = 3
+failure_window_secs = 300
 cooldown_secs = 600
 backoff_factor = 2.0
 max_cooldown_secs = 7200

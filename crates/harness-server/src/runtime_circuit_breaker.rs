@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use harness_core::config::workflow_circuit_breaker::RuntimeCircuitBreakerPolicy;
 use harness_workflow::runtime::{RuntimeJob, RuntimeJobClaimDecision, RuntimeJobClaimGuard};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -96,7 +96,7 @@ pub(crate) struct CircuitBreakerEvent {
 #[derive(Debug, Clone)]
 enum ProfileBreaker {
     Closed {
-        consecutive: BTreeMap<FailureClass, u32>,
+        consecutive: BTreeMap<FailureClass, FailureWindow>,
     },
     Open {
         class: FailureClass,
@@ -109,6 +109,42 @@ enum ProfileBreaker {
         backoff_exp: u32,
         probe_runtime_job_id: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Default)]
+struct FailureWindow {
+    entries: Vec<FailureObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct FailureObservation {
+    runtime_job_id: String,
+    recorded_at: DateTime<Utc>,
+}
+
+impl FailureWindow {
+    fn record(&mut self, runtime_job_id: &str, now: DateTime<Utc>, window: Duration) {
+        let cutoff = now - window;
+        self.entries
+            .retain(|entry| entry.recorded_at >= cutoff && entry.recorded_at <= now);
+        self.entries.push(FailureObservation {
+            runtime_job_id: runtime_job_id.to_string(),
+            recorded_at: now,
+        });
+    }
+
+    fn count(&self) -> u32 {
+        self.entries.len().min(u32::MAX as usize) as u32
+    }
+
+    fn distinct_jobs(&self) -> u32 {
+        self.entries
+            .iter()
+            .map(|entry| entry.runtime_job_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            .min(u32::MAX as usize) as u32
+    }
 }
 
 #[derive(Debug)]
@@ -213,6 +249,8 @@ impl RuntimeCircuitBreakerRegistry {
         }
         let config = self.config.clone();
         let threshold = config.consecutive_failures.max(1);
+        let distinct_threshold = config.distinct_runtime_jobs.max(1);
+        let failure_window = Duration::seconds(config.failure_window_secs.max(1) as i64);
         let mut inner = self.inner.lock().expect("runtime breaker mutex poisoned");
         let state = inner
             .entry(profile.to_string())
@@ -221,24 +259,24 @@ impl RuntimeCircuitBreakerRegistry {
             });
         match state {
             ProfileBreaker::Closed { consecutive } => {
-                let count = consecutive.entry(class).or_insert(0);
-                *count = count.saturating_add(1);
-                if *count < threshold {
+                let window = consecutive.entry(class).or_default();
+                window.record(runtime_job_id, now, failure_window);
+                let count = window.count();
+                if count < threshold || window.distinct_jobs() < distinct_threshold {
                     return Vec::new();
                 }
                 let until = now + cooldown_duration_for_config(&config, 0);
-                let consecutive_count = *count;
                 *state = ProfileBreaker::Open {
                     class,
                     until,
                     backoff_exp: 0,
-                    consecutive: consecutive_count,
+                    consecutive: count,
                 };
                 vec![CircuitBreakerEvent {
                     kind: CircuitBreakerEventKind::Opened,
                     profile: profile.to_string(),
                     class: Some(class),
-                    consecutive: Some(consecutive_count),
+                    consecutive: Some(count),
                     cooldown_until: Some(until),
                 }]
             }
@@ -328,15 +366,15 @@ impl RuntimeCircuitBreakerRegistry {
                     cooldown_until: None,
                 }),
                 ProfileBreaker::Closed { consecutive } if !consecutive.is_empty() => {
-                    let (class, count) = consecutive
+                    let (class, window) = consecutive
                         .iter()
-                        .max_by_key(|(_, count)| *count)
+                        .max_by_key(|(_, window)| window.count())
                         .expect("non-empty consecutive map has max");
                     snapshots.push(CircuitBreakerSnapshot {
                         profile: profile.clone(),
                         state: "closed",
                         class: Some(class.as_str().to_string()),
-                        consecutive: Some(*count),
+                        consecutive: Some(window.count()),
                         cooldown_until: None,
                     });
                 }
@@ -424,6 +462,8 @@ mod tests {
         RuntimeCircuitBreakerRegistry::new(RuntimeCircuitBreakerPolicy {
             enabled: true,
             consecutive_failures: 3,
+            distinct_runtime_jobs: 1,
+            failure_window_secs: 300,
             cooldown_secs: 10,
             backoff_factor: 2.0,
             max_cooldown_secs: 60,
@@ -662,11 +702,11 @@ mod tests {
         let registry = RuntimeCircuitBreakerRegistry::new(RuntimeCircuitBreakerPolicy::default());
         let now = Utc::now();
 
-        for _ in 0..4 {
+        for index in 0..4 {
             assert!(registry
                 .record_failure(
                     "codex",
-                    "storm-job",
+                    &format!("storm-job-{index}"),
                     FailureClass::QuotaInteractiveWait,
                     now
                 )
@@ -675,7 +715,7 @@ mod tests {
         }
         let events = registry.record_failure(
             "codex",
-            "storm-job",
+            "storm-job-4",
             FailureClass::QuotaInteractiveWait,
             now,
         );
@@ -715,5 +755,43 @@ mod tests {
             Some(after_cooldown + Duration::seconds(1200))
         );
         assert_eq!(registry.defer_open_profiles(after_cooldown).len(), 1);
+    }
+
+    #[test]
+    fn storm_replay_requires_distinct_jobs_within_window() {
+        let registry = RuntimeCircuitBreakerRegistry::new(RuntimeCircuitBreakerPolicy::default());
+        let now = Utc::now();
+
+        for _ in 0..5 {
+            assert!(registry
+                .record_failure(
+                    "codex",
+                    "single-dead-job",
+                    FailureClass::ZeroOutputSpawnFailure,
+                    now
+                )
+                .is_empty());
+        }
+        assert!(registry.defer_open_profiles(now).is_empty());
+        assert_eq!(registry.snapshots(now)[0].consecutive, Some(5));
+
+        let outside_window = now + Duration::seconds(301);
+        for index in 0..4 {
+            assert!(registry
+                .record_failure(
+                    "codex",
+                    &format!("window-job-{index}"),
+                    FailureClass::ZeroOutputSpawnFailure,
+                    outside_window
+                )
+                .is_empty());
+        }
+        let events = registry.record_failure(
+            "codex",
+            "window-job-4",
+            FailureClass::ZeroOutputSpawnFailure,
+            outside_window,
+        );
+        assert_eq!(events[0].kind, CircuitBreakerEventKind::Opened);
     }
 }
