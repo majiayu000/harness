@@ -1,3 +1,4 @@
+use super::isolation::IsolationConfig;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -153,6 +154,9 @@ pub struct ProjectConfig {
     /// Per-project triage overrides. `None` inherits from defaults.
     #[serde(default)]
     pub triage: Option<ProjectTriageConfig>,
+    /// Per-project isolation overrides. `None` inherits from server defaults.
+    #[serde(default)]
+    pub isolation: Option<IsolationConfig>,
     /// Project type used to select review focus criteria. Default: mixed.
     #[serde(default)]
     pub review_type: ReviewType,
@@ -194,6 +198,7 @@ mod tests {
                 .and_then(|triage| triage.skip_on_review_label),
             None
         );
+        assert!(config.isolation.is_none());
         Ok(())
     }
 
@@ -229,6 +234,14 @@ branch_prefix = "featx/"
 [triage]
 skip_on_review_label = true
 
+[isolation]
+default_tier = "host"
+network_allowlist = ["github.com"]
+
+[[isolation.rules]]
+trust = "non_collaborator"
+tier = "container"
+
 review_type = "rust"
 "#,
         )?;
@@ -243,6 +256,13 @@ review_type = "rust"
                 .as_ref()
                 .and_then(|triage| triage.skip_on_review_label),
             Some(true)
+        );
+        let isolation = config.isolation.expect("isolation config should parse");
+        assert_eq!(
+            isolation.tier_for_trust_class(
+                super::super::isolation::IsolationTrustClass::NonCollaborator
+            ),
+            super::super::isolation::IsolationTier::Container
         );
         Ok(())
     }

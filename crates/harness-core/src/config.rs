@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod dirs;
 pub mod intake;
+pub mod isolation;
 pub mod maintenance;
 pub mod misc;
 pub mod project;
@@ -13,6 +14,7 @@ pub mod workflow_circuit_breaker;
 
 use self::agents::*;
 use self::intake::*;
+use self::isolation::*;
 use self::maintenance::*;
 use self::misc::*;
 use self::server::*;
@@ -66,6 +68,8 @@ pub struct HarnessConfig {
     pub maintenance_window: MaintenanceWindowConfig,
     #[serde(default)]
     pub workflow: WorkflowRuntimeConfig,
+    #[serde(default)]
+    pub isolation: IsolationConfig,
     /// Projects declared in the config file. Registered on server startup.
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
@@ -159,6 +163,7 @@ impl Default for HarnessConfig {
             reconciliation: ReconciliationConfig::default(),
             maintenance_window: MaintenanceWindowConfig::default(),
             workflow: WorkflowRuntimeConfig::default(),
+            isolation: IsolationConfig::default(),
             projects: Vec::new(),
         };
         config.apply_derived_defaults();
@@ -200,6 +205,8 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             #[serde(default)]
             workflow: WorkflowRuntimeConfig,
             #[serde(default)]
+            isolation: IsolationConfig,
+            #[serde(default)]
             projects: Vec<ProjectEntry>,
         }
 
@@ -221,6 +228,7 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             reconciliation: input.reconciliation,
             maintenance_window: input.maintenance_window,
             workflow: input.workflow,
+            isolation: input.isolation,
             projects: input.projects,
         };
         config.apply_derived_defaults();

@@ -6,8 +6,12 @@ use crate::{
 };
 use harness_agents::registry::AgentRegistry;
 use harness_core::{
-    config::HarnessConfig, types::EventFilters, types::RuleId, types::Severity,
-    types::SkillLocation, types::Violation,
+    config::{isolation::IsolationTier, HarnessConfig},
+    types::EventFilters,
+    types::RuleId,
+    types::Severity,
+    types::SkillLocation,
+    types::Violation,
 };
 use std::sync::Arc;
 
@@ -168,6 +172,33 @@ async fn build_app_state_refuses_tokenless_startup_without_opt_in() -> anyhow::R
     assert!(message.contains("api_token"));
     assert!(message.contains("HARNESS_API_TOKEN"));
     assert!(message.contains("allow_unauthenticated"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_app_state_rejects_reserved_microvm_isolation_tier() -> anyhow::Result<()> {
+    let sandbox = tempfile::tempdir()?;
+    let project_root = sandbox.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+
+    let mut config = unauthenticated_test_config();
+    config.server.project_root = project_root;
+    config.server.data_dir = sandbox.path().join("data");
+    config.isolation.default_tier = IsolationTier::Microvm;
+
+    let server = Arc::new(HarnessServer::new(
+        config,
+        ThreadManager::new(),
+        AgentRegistry::new("test"),
+    ));
+    let err = match build_app_state(server).await {
+        Ok(_) => anyhow::bail!("reserved microvm tier should fail startup"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+
+    assert!(message.contains("microvm"));
+    assert!(message.contains("not implemented"));
     Ok(())
 }
 
