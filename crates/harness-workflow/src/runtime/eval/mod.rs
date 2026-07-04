@@ -25,8 +25,8 @@ pub use report::{
     EvalReportMetricDelta, EvalReportMetrics, EvalRunReport, EvalRunReportDiff,
 };
 pub use run::{
-    dispatch_eval_case_workflow, enqueue_eval_case_workflow, EvalCaseDispatchOutcome,
-    EvalCaseEnqueueOutcome, EvalCaseWorkflowInput, EvalCaseWorkflowPlan, EVAL_BRANCH_PREFIX,
-    EVAL_PR_DRAFT_MODE,
+    cleanup_cancelled_eval_run, dispatch_eval_case_workflow, enqueue_eval_case_workflow,
+    EvalCaseDispatchOutcome, EvalCaseEnqueueOutcome, EvalCaseWorkflowInput, EvalCaseWorkflowPlan,
+    EvalRunCleanupInput, EvalRunCleanupSummary, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
 pub use scoring::{score_pr_repair_eval, ScoringError};
