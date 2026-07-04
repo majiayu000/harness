@@ -33,6 +33,7 @@ use std::sync::{
 
 mod issue_planning;
 mod local_review;
+mod otel_spans;
 mod p1_followups;
 mod pr_repair_evidence;
 mod replay_determinism;

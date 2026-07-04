@@ -1,3 +1,7 @@
+use crate::otel_trajectory::{
+    record_activity_span, record_agent_turn_span, record_workflow_root_span, ActivitySpan,
+    AgentTurnSpan, WorkflowRootSpan,
+};
 use harness_core::config::misc::{OtelConfig, OtelExporter};
 use harness_core::types::{Decision, Event};
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger, LoggerProvider as _, Severity};
@@ -9,6 +13,7 @@ use opentelemetry_sdk::logs::LoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use std::collections::{HashSet, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -53,7 +58,7 @@ impl SessionStartDeduper {
 
 pub struct OtelPipeline {
     log_user_prompt: bool,
-    _trajectory_enabled: bool,
+    trajectory_enabled: bool,
     _capture_content: bool,
     seen_sessions: Mutex<SessionStartDeduper>,
     tracer_provider: opentelemetry_sdk::trace::TracerProvider,
@@ -65,6 +70,7 @@ pub struct OtelPipeline {
     api_request_total: Counter<u64>,
     tool_decision_total: Counter<u64>,
     tool_execution_duration_ms: Histogram<u64>,
+    trajectory_export_errors_total: Counter<u64>,
 }
 
 impl OtelPipeline {
@@ -105,10 +111,14 @@ impl OtelPipeline {
             .u64_histogram("harness.tool_execution.duration_ms")
             .with_description("Tool execution duration in milliseconds.")
             .build();
+        let trajectory_export_errors_total = meter
+            .u64_counter("harness.otel.trajectory_export_errors.total")
+            .with_description("OpenTelemetry trajectory span recording/export isolation errors.")
+            .build();
 
         Ok(Some(Self {
             log_user_prompt: config.log_user_prompt,
-            _trajectory_enabled: config.trajectory,
+            trajectory_enabled: config.trajectory,
             _capture_content: config.capture_content,
             seen_sessions: Mutex::new(SessionStartDeduper::new(MAX_TRACKED_CONVERSATION_SESSIONS)),
             tracer_provider,
@@ -120,12 +130,13 @@ impl OtelPipeline {
             api_request_total,
             tool_decision_total,
             tool_execution_duration_ms,
+            trajectory_export_errors_total,
         }))
     }
 
     #[cfg(test)]
     fn trajectory_enabled(&self) -> bool {
-        self._trajectory_enabled
+        self.trajectory_enabled
     }
 
     #[cfg(test)]
@@ -214,6 +225,38 @@ impl OtelPipeline {
             record.add_attribute(attr.key.clone(), attr.value.to_string());
         }
         self.logger.emit(record);
+    }
+
+    pub(crate) fn record_workflow_root_span(&self, input: WorkflowRootSpan) {
+        self.record_trajectory_span("workflow_root", || {
+            record_workflow_root_span(&self.tracer, input);
+        });
+    }
+
+    pub(crate) fn record_activity_span(&self, input: ActivitySpan) {
+        self.record_trajectory_span("activity", || {
+            record_activity_span(&self.tracer, input);
+        });
+    }
+
+    pub(crate) fn record_agent_turn_span(&self, input: AgentTurnSpan) {
+        self.record_trajectory_span("agent_turn", || {
+            record_agent_turn_span(&self.tracer, input);
+        });
+    }
+
+    fn record_trajectory_span(&self, operation: &'static str, record: impl FnOnce()) {
+        if !self.trajectory_enabled {
+            return;
+        }
+        if catch_unwind(AssertUnwindSafe(record)).is_err() {
+            self.trajectory_export_errors_total
+                .add(1, &[KeyValue::new("harness.otel.operation", operation)]);
+            tracing::error!(
+                otel_operation = operation,
+                "OpenTelemetry trajectory span recording failed; dropping span"
+            );
+        }
     }
 
     pub async fn shutdown(self) {
@@ -580,6 +623,40 @@ mod tests {
 
         assert!(pipeline.trajectory_enabled());
         assert!(pipeline.capture_content_enabled());
+        pipeline.shutdown().await;
+        accept.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn otel_failure_isolation_drops_invalid_trajectory_context() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        let config = OtelConfig {
+            exporter: OtelExporter::OtlpHttp,
+            endpoint: Some(endpoint),
+            trajectory: true,
+            ..OtelConfig::default()
+        };
+        let pipeline = OtelPipeline::from_config(&config)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("enabled exporter should initialize"))?;
+
+        pipeline.record_activity_span(crate::otel_trajectory::ActivitySpan {
+            trace_context: crate::otel_trajectory::TrajectoryTraceContext {
+                trace_id: "0".to_string(),
+                root_span_id: "0".to_string(),
+            },
+            workflow_id: "wf-1".to_string(),
+            runtime_job_id: "job-1".to_string(),
+            activity_kind: "implement".to_string(),
+            outcome: "succeeded".to_string(),
+            retry_attempt: None,
+            started_at: None,
+            ended_at: None,
+        });
+
         pipeline.shutdown().await;
         accept.await??;
         Ok(())

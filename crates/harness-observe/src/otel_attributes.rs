@@ -10,6 +10,10 @@ pub const HARNESS_WORKFLOW_ID: &str = "harness.workflow.id";
 pub const HARNESS_ACTIVITY_KIND: &str = "harness.activity.kind";
 pub const HARNESS_OUTCOME: &str = "harness.outcome";
 pub const HARNESS_COST_USD: &str = "harness.cost_usd";
+pub const HARNESS_RUNTIME_JOB_ID: &str = "harness.runtime.job.id";
+pub const HARNESS_THREAD_ID: &str = "harness.thread.id";
+pub const HARNESS_TURN_ID: &str = "harness.turn.id";
+pub const HARNESS_RETRY_ATTEMPT: &str = "harness.retry.attempt";
 
 pub const ATTRIBUTE_ALLOWLIST: &[&str] = &[
     GEN_AI_SYSTEM,
@@ -20,6 +24,10 @@ pub const ATTRIBUTE_ALLOWLIST: &[&str] = &[
     HARNESS_WORKFLOW_ID,
     HARNESS_ACTIVITY_KIND,
     HARNESS_OUTCOME,
+    HARNESS_RUNTIME_JOB_ID,
+    HARNESS_THREAD_ID,
+    HARNESS_TURN_ID,
+    HARNESS_RETRY_ATTEMPT,
 ];
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -32,6 +40,10 @@ pub struct GenAiTurnAttributes {
     pub workflow_id: Option<String>,
     pub activity_kind: Option<String>,
     pub outcome: Option<String>,
+    pub runtime_job_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub retry_attempt: Option<u64>,
 }
 
 pub fn is_allowed_attribute(key: &str) -> bool {
@@ -51,6 +63,10 @@ pub fn gen_ai_turn_attributes(input: GenAiTurnAttributes) -> Vec<KeyValue> {
     push_string(&mut attrs, HARNESS_WORKFLOW_ID, input.workflow_id);
     push_string(&mut attrs, HARNESS_ACTIVITY_KIND, input.activity_kind);
     push_string(&mut attrs, HARNESS_OUTCOME, input.outcome);
+    push_string(&mut attrs, HARNESS_RUNTIME_JOB_ID, input.runtime_job_id);
+    push_string(&mut attrs, HARNESS_THREAD_ID, input.thread_id);
+    push_string(&mut attrs, HARNESS_TURN_ID, input.turn_id);
+    push_u64(&mut attrs, HARNESS_RETRY_ATTEMPT, input.retry_attempt);
     attrs
 }
 
@@ -87,6 +103,10 @@ mod tests {
             workflow_id: Some("wf-1".to_string()),
             activity_kind: Some("implement".to_string()),
             outcome: Some("done".to_string()),
+            runtime_job_id: Some("job-1".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            retry_attempt: Some(2),
         });
 
         let keys: Vec<_> = attrs.iter().map(|attr| attr.key.as_str()).collect();
@@ -105,6 +125,10 @@ mod tests {
             workflow_id: None,
             activity_kind: None,
             outcome: None,
+            runtime_job_id: None,
+            thread_id: None,
+            turn_id: None,
+            retry_attempt: None,
         });
 
         assert_eq!(attrs.len(), 1);
