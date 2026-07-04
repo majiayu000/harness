@@ -161,6 +161,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     sandbox_mode,
                     approval_policy,
                     timeout_secs: runtime_profile.timeout_secs,
+                    stall_timeout_secs: None,
                     // Always drive Codex turns through the `codex exec` CLI rather
                     // than the persistent `codex app-server` JSON-RPC adapter. The
                     // app-server holds one long-lived connection per turn, which is

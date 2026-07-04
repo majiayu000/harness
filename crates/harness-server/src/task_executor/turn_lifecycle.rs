@@ -3,6 +3,7 @@ use super::helpers::{
 };
 use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
 use harness_core::config::agents::SandboxMode;
+use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::error::HarnessError;
 use harness_core::types::{ExecutionPhase, TurnId};
 use harness_protocol::notifications::{Notification, RpcNotification};
@@ -88,6 +89,7 @@ pub(crate) struct TurnLifecycleOptions {
     pub sandbox_mode: Option<SandboxMode>,
     pub approval_policy: Option<String>,
     pub timeout_secs: Option<u64>,
+    pub stall_timeout_secs: Option<u64>,
     pub force_code_agent: bool,
 }
 
@@ -183,7 +185,35 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         }
     });
 
-    let stall_timeout = Duration::from_secs(server.config.concurrency.stall_timeout_secs);
+    let timeout_secs = options.timeout_secs.map(|secs| secs.max(1));
+    let stall_normalization = normalize_stall_timeout_secs(
+        options
+            .stall_timeout_secs
+            .unwrap_or(server.config.concurrency.stall_timeout_secs),
+        timeout_secs,
+    );
+    if stall_normalization.was_adjusted() {
+        tracing::warn!(
+            thread_id = %thread_id,
+            turn_id = %turn_id,
+            requested_stall_timeout_secs = stall_normalization.requested_secs,
+            stall_timeout_secs = stall_normalization.effective_secs,
+            timeout_secs = ?stall_normalization.wall_clock_timeout_secs,
+            "agent stream stall timeout adjusted"
+        );
+    }
+    let stall_timeout = Duration::from_secs(stall_normalization.effective_secs);
+    let stall_timeout_enabled = timeout_secs
+        .map(|timeout_secs| stall_normalization.effective_secs < timeout_secs)
+        .unwrap_or(true);
+    tracing::debug!(
+        thread_id = %thread_id,
+        turn_id = %turn_id,
+        stall_timeout_secs = stall_timeout.as_secs(),
+        timeout_secs = ?timeout_secs,
+        stall_timeout_enabled,
+        "starting agent turn with stall timeout"
+    );
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
 
     // Use the adapter for turn execution only when its registered strategy says
@@ -220,7 +250,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             approval_policy: options.approval_policy.clone(),
             allowed_tools: vec![],
             context: vec![],
-            timeout_secs: options.timeout_secs,
+            timeout_secs,
             capability_token: None,
         };
         Box::pin(async move { adapter_arc.start_turn(turn_req, event_tx).await })
@@ -241,9 +271,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut stream_error: Option<String> = None;
     let mut last_activity = Instant::now();
-    let execution_deadline = options
-        .timeout_secs
-        .map(|secs| Instant::now() + Duration::from_secs(secs.max(1)));
+    let execution_deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
     let execution_timeout = async {
         if let Some(deadline) = execution_deadline {
             tokio::time::sleep_until(deadline).await;
@@ -280,7 +308,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     }
                 }
             }
-            _ = tokio::time::sleep_until(last_activity + stall_timeout) => {
+            _ = tokio::time::sleep_until(last_activity + stall_timeout), if stall_timeout_enabled && execution_result.is_none() => {
                 let elapsed = last_activity.elapsed();
                 tracing::warn!(
                     thread_id = %thread_id,
@@ -298,7 +326,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 break 'outer;
             }
             _ = &mut execution_timeout, if execution_result.is_none() => {
-                let timeout_secs = options.timeout_secs.unwrap_or_default().max(1);
+                let timeout_secs = timeout_secs.unwrap_or(1);
                 tracing::warn!(
                     thread_id = %thread_id,
                     turn_id = %turn_id,

@@ -1,6 +1,9 @@
 use crate::task_runner::{TaskId, TaskStore};
 use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::config::stall_timeout::{
+    normalize_stall_timeout_secs, DEFAULT_STALL_TIMEOUT_SECS,
+};
 use harness_core::error::HarnessError;
 use harness_core::prompts;
 use harness_core::run_id::{RunId, RunIdentity};
@@ -558,6 +561,22 @@ pub(crate) async fn run_agent_streaming_with_options(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(128);
     let mut exec = std::pin::pin!(agent.execute_stream(req, tx));
+    let request_settings = store.get(task_id).and_then(|state| state.request_settings);
+    let wall_clock_timeout_secs = request_settings.as_ref().map(|settings| {
+        crate::task_runner::effective_turn_timeout(settings.turn_timeout_secs).as_secs()
+    });
+    let stall = normalize_stall_timeout_secs(
+        request_settings
+            .as_ref()
+            .map(|settings| settings.stall_timeout_secs)
+            .unwrap_or(DEFAULT_STALL_TIMEOUT_SECS),
+        wall_clock_timeout_secs,
+    );
+    if stall.was_adjusted() {
+        tracing::warn!(task_id = %task_id, turn, requested_stall_timeout_secs = stall.requested_secs, stall_timeout_secs = stall.effective_secs, timeout_secs = ?stall.wall_clock_timeout_secs, "agent stream stall timeout adjusted");
+    }
+    tracing::debug!(task_id = %task_id, turn, phase = %phase_str, stall_timeout_secs = stall.effective_secs, timeout_secs = ?stall.wall_clock_timeout_secs, "starting streamed agent turn with stall timeout");
+    let stall_timeout = Duration::from_secs(stall.effective_secs);
     let mut exec_result: Option<harness_core::error::Result<()>> = None;
     let mut channel_closed = false;
     let mut output = String::new();
@@ -576,6 +595,7 @@ pub(crate) async fn run_agent_streaming_with_options(
         && store
             .get(task_id)
             .is_some_and(|s| s.source.as_deref() == Some("auto-fix"));
+    let mut last_activity = Instant::now();
 
     loop {
         tokio::select! {
@@ -585,6 +605,7 @@ pub(crate) async fn run_agent_streaming_with_options(
             item = rx.recv(), if !channel_closed => {
                 match item {
                     Some(item) => {
+                        last_activity = Instant::now();
                         store.publish_stream_item(task_id, item.clone());
                         match &item {
                             StreamItem::MessageDelta { text } => {
@@ -650,6 +671,14 @@ pub(crate) async fn run_agent_streaming_with_options(
                         channel_closed = true;
                     }
                 }
+            }
+            _ = async {
+                tokio::time::sleep_until(last_activity + stall_timeout).await;
+            }, if exec_result.is_none() => {
+                let secs = stall_timeout.as_secs();
+                tracing::warn!(task_id = %task_id, turn, phase = %phase_str, elapsed_secs = last_activity.elapsed().as_secs(), "agent stream stall detected; no output for {}s", secs);
+                exec_result = Some(Err(HarnessError::AgentExecution(format!("Agent stream stalled: no output for {secs}s"))));
+                break;
             }
         }
         if exec_result.is_some() && channel_closed {

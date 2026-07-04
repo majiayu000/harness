@@ -4,7 +4,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
-use harness_core::config::HarnessConfig;
+use harness_core::config::{stall_timeout::MIN_STALL_TIMEOUT_SECS, HarnessConfig};
 use harness_core::error::HarnessError;
 use harness_core::types::{Capability, Item, ThreadId, TokenUsage, Turn, TurnId, TurnStatus};
 use harness_server::{
@@ -344,11 +344,11 @@ async fn turn_fails_when_agent_not_registered() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// When the agent blocks indefinitely without emitting any stream items,
-/// the stall detection in `run_turn_lifecycle` fires after `stall_timeout_secs`
-/// and transitions the turn to Failed.
+/// The HTTP `turn_start` path must normalize an absurdly small configured stall
+/// timeout to the shared floor. The lifecycle stall-to-Failed transition is
+/// covered by the focused `turn_lifecycle_stall_tests` unit surface.
 #[tokio::test]
-async fn turn_fails_on_stall_timeout() -> anyhow::Result<()> {
+async fn turn_stall_timeout_enforces_minimum_floor() -> anyhow::Result<()> {
     let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let project_root = sandbox.path().join("project");
@@ -359,7 +359,6 @@ async fn turn_fails_on_stall_timeout() -> anyhow::Result<()> {
     config.server.project_root = project_root.clone();
     config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock".to_string();
-    // Use a very short stall timeout so the test completes quickly.
     config.concurrency.stall_timeout_secs = 1;
 
     let mut registry = AgentRegistry::new("mock");
@@ -373,17 +372,32 @@ async fn turn_fails_on_stall_timeout() -> anyhow::Result<()> {
     let running = fetch_turn(&state, &turn_id).await?;
     assert_eq!(running.status, TurnStatus::Running);
 
-    // Allow 5s for the 1s stall to fire and persist the Failed state.
-    let failed =
-        wait_for_status(&state, &turn_id, TurnStatus::Failed, Duration::from_secs(5)).await?;
-    // The stall-detection path must append an Item::Error with the stall-specific reason,
-    // not merely a generic fallback message.
+    let observation_window = Duration::from_secs(2);
+    assert!(observation_window.as_secs() < MIN_STALL_TIMEOUT_SECS);
+    sleep(observation_window).await;
+
+    let still_running = fetch_turn(&state, &turn_id).await?;
+    assert_eq!(
+        still_running.status,
+        TurnStatus::Running,
+        "1s stall config should be normalized to the shared floor before failing"
+    );
     assert!(
-        failed.items.iter().any(|item| matches!(
+        !still_running.items.iter().any(|item| matches!(
             item,
             Item::Error { message, .. } if message.contains("stalled") || message.contains("no output for")
         )),
-        "stall-timed-out turn should include an Item::Error from stall detection"
+        "turn should not include a premature stall error before the floor elapses"
     );
+
+    let _ = result_value(turn_cancel(&state, Some(serde_json::json!(4)), turn_id.clone()).await)?;
+    let cancelled = wait_for_status(
+        &state,
+        &turn_id,
+        TurnStatus::Cancelled,
+        Duration::from_secs(2),
+    )
+    .await?;
+    assert_eq!(cancelled.status, TurnStatus::Cancelled);
     Ok(())
 }

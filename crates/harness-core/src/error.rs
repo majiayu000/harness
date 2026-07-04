@@ -198,6 +198,16 @@ fn classify_agent_execution_failure(message: &str) -> TurnFailure {
         };
     }
 
+    if message.starts_with("Agent stream stalled:") || message.starts_with("Agent turn timed out") {
+        return TurnFailure {
+            kind: TurnFailureKind::Timeout,
+            provider: provider_from_message(message),
+            upstream_status: None,
+            message: Some(message.to_string()),
+            body_excerpt: excerpt_after_colon(message),
+        };
+    }
+
     if message.contains("stdout unavailable")
         || message.contains("stream send failed")
         || message.contains("failed reading ")
@@ -347,5 +357,21 @@ mod tests {
 
         assert_eq!(failure.kind, TurnFailureKind::LocalProcess);
         assert_eq!(failure.provider.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn classify_agent_stream_stall_as_timeout_failure() {
+        let Some(failure) =
+            HarnessError::AgentExecution("Agent stream stalled: no output for 600s".to_string())
+                .turn_failure()
+        else {
+            panic!("turn failure");
+        };
+
+        assert_eq!(failure.kind, TurnFailureKind::Timeout);
+        assert_eq!(
+            failure.message.as_deref(),
+            Some("Agent stream stalled: no output for 600s")
+        );
     }
 }
