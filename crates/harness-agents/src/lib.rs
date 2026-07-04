@@ -7,6 +7,7 @@ pub mod codex;
 pub mod codex_adapter;
 pub mod provider_backpressure;
 pub mod registry;
+pub mod scoped_token;
 mod spawn_contract;
 mod streaming;
 
