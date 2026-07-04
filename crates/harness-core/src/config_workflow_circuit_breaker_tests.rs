@@ -54,6 +54,8 @@ fn workflow_circuit_breaker_config_defaults() {
 
     assert!(breaker.enabled);
     assert_eq!(breaker.consecutive_failures, 5);
+    assert_eq!(breaker.distinct_runtime_jobs, 3);
+    assert_eq!(breaker.failure_window_secs, 300);
     assert_eq!(breaker.cooldown_secs, 600);
     assert_eq!(breaker.backoff_factor, 2.0);
     assert_eq!(breaker.max_cooldown_secs, 7200);
@@ -66,6 +68,8 @@ fn harness_config_deserializes_workflow_circuit_breaker() {
         [workflow.circuit_breaker]
         enabled = false
         consecutive_failures = 7
+        distinct_runtime_jobs = 4
+        failure_window_secs = 240
         cooldown_secs = 120
         backoff_factor = 1.5
         max_cooldown_secs = 900
@@ -77,6 +81,8 @@ fn harness_config_deserializes_workflow_circuit_breaker() {
 
     assert!(!breaker.enabled);
     assert_eq!(breaker.consecutive_failures, 7);
+    assert_eq!(breaker.distinct_runtime_jobs, 4);
+    assert_eq!(breaker.failure_window_secs, 240);
     assert_eq!(breaker.cooldown_secs, 120);
     assert_eq!(breaker.backoff_factor, 1.5);
     assert_eq!(breaker.max_cooldown_secs, 900);
