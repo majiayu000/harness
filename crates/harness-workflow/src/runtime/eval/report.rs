@@ -244,23 +244,35 @@ fn report_case_from_evidence(
 ) -> EvalReportCase {
     let (total_tokens, cost_usd_micros) = evidence_usage_totals(&evidence);
     let passed = evidence.status == EvalEvidenceStatus::Passed;
+    let status = evidence_case_status(&evidence, passed);
     EvalReportCase {
         case_id: case.case_id.clone(),
         repo: case.repo.clone(),
         issue: case.issue,
         base_commit: case.base_commit.clone(),
         verify_commands: case.verify_commands.clone(),
-        status: if passed {
-            EvalReportCaseStatus::Passed
-        } else {
-            EvalReportCaseStatus::Failed
-        },
+        status,
         passed,
         workflow_id: evidence.workflow_id,
         total_tokens,
         cost_usd_micros,
         missing_evidence: evidence.missing_evidence,
     }
+}
+
+fn evidence_case_status(evidence: &EvalCaseEvidence, passed: bool) -> EvalReportCaseStatus {
+    if passed {
+        return EvalReportCaseStatus::Passed;
+    }
+    if evidence.missing_evidence.iter().any(|missing| {
+        matches!(
+            missing.as_str(),
+            "workflow_instance" | "terminal_runtime_state"
+        )
+    }) {
+        return EvalReportCaseStatus::InfraFailed;
+    }
+    EvalReportCaseStatus::Failed
 }
 
 fn evidence_usage_totals(evidence: &EvalCaseEvidence) -> (u64, u64) {
@@ -377,6 +389,11 @@ fn transition_kind(
 fn validate_k(k: u32) -> Result<(), EvalReportError> {
     if k == 0 {
         return Err(EvalReportError::new("k must be greater than zero"));
+    }
+    if k > i32::MAX as u32 {
+        return Err(EvalReportError::new(
+            "k must be less than or equal to i32::MAX",
+        ));
     }
     Ok(())
 }

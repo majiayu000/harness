@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::{Args, Subcommand};
 use harness_workflow::runtime::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
@@ -88,19 +89,36 @@ async fn run_eval_report(args: EvalRunArgs) -> anyhow::Result<()> {
 fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
     let baseline = read_run_report(&args.baseline)?;
     let candidate = read_run_report(&args.candidate)?;
+    if baseline.suite != candidate.suite {
+        anyhow::bail!(
+            "cannot diff reports from different suites: baseline={}, candidate={}",
+            baseline.suite,
+            candidate.suite
+        );
+    }
+    if baseline.k != candidate.k {
+        anyhow::bail!(
+            "cannot diff reports with different k values: baseline={}, candidate={}",
+            baseline.k,
+            candidate.k
+        );
+    }
     let diff = diff_eval_run_reports(&baseline, &candidate);
     emit_diff(&diff, args.json, args.output.as_deref())
 }
 
 fn read_eval_manifest(path: &Path) -> anyhow::Result<EvalBenchmarkManifest> {
-    let content = fs::read_to_string(path)?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read eval manifest at {}", path.display()))?;
     parse_benchmark_manifest_str(&content)
         .map_err(|error| anyhow::anyhow!("invalid eval manifest {}: {error}", path.display()))
 }
 
 fn read_evidence(path: &Path) -> anyhow::Result<Vec<EvalCaseEvidence>> {
-    let content = fs::read_to_string(path)?;
-    let input: EvidenceInput = serde_json::from_str(&content)?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read eval evidence at {}", path.display()))?;
+    let input: EvidenceInput = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse eval evidence at {}", path.display()))?;
     Ok(match input {
         EvidenceInput::Cases(cases) => cases,
         EvidenceInput::Wrapped { cases } => cases,
@@ -108,7 +126,8 @@ fn read_evidence(path: &Path) -> anyhow::Result<Vec<EvalCaseEvidence>> {
 }
 
 fn read_run_report(path: &Path) -> anyhow::Result<EvalRunReport> {
-    let content = fs::read_to_string(path)?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read eval report at {}", path.display()))?;
     serde_json::from_str(&content)
         .map_err(|error| anyhow::anyhow!("invalid eval report {}: {error}", path.display()))
 }
@@ -135,6 +154,14 @@ fn emit_diff(diff: &EvalRunReportDiff, json: bool, output: Option<&Path>) -> any
 
 fn write_json_output<T: serde::Serialize>(value: &T, output: Option<&Path>) -> anyhow::Result<()> {
     if let Some(output) = output {
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create output directory {}", parent.display())
+            })?;
+        }
         fs::write(output, serde_json::to_string_pretty(value)?)?;
     }
     Ok(())
@@ -364,6 +391,25 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
     }
 
     #[test]
+    fn eval_report_rejects_invalid_k_values() {
+        let zero_error = match eval_report_dry_run(&sample_eval_manifest(), "run-zero", 0) {
+            Ok(_) => panic!("zero k should be rejected"),
+            Err(error) => error,
+        };
+        assert!(zero_error.to_string().contains("greater than zero"));
+
+        let excessive_k = i32::MAX as u32 + 1;
+        let excessive_error =
+            match eval_report_dry_run(&sample_eval_manifest(), "run-excessive", excessive_k) {
+                Ok(_) => panic!("k values above i32::MAX should be rejected"),
+                Err(error) => error,
+            };
+        assert!(excessive_error
+            .to_string()
+            .contains("less than or equal to i32::MAX"));
+    }
+
+    #[test]
     fn eval_report_evidence_text_includes_pass_cost_and_tokens() {
         let report = eval_report_from_evidence(
             &sample_eval_manifest(),
@@ -388,6 +434,38 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         assert!(rendered.contains("pass@1: 0.5000"));
         assert!(rendered.contains("pass^3: 0.8750"));
         assert!(rendered.contains("missing_evidence: case_evidence"));
+    }
+
+    #[test]
+    fn eval_report_marks_missing_runtime_evidence_as_infra_failure() {
+        let report = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "run-1",
+            3,
+            vec![
+                case_evidence(
+                    "case-pass",
+                    EvalEvidenceStatus::Failed,
+                    vec![usage_snapshot(10, 5)],
+                    vec!["terminal_runtime_state".to_string()],
+                ),
+                case_evidence(
+                    "case-fail",
+                    EvalEvidenceStatus::Passed,
+                    vec![usage_snapshot(20, 10)],
+                    Vec::new(),
+                ),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("evidence report should build: {error}"));
+        let rendered = render_run_report(&report);
+
+        assert_eq!(report.metrics.scored_cases, 1);
+        assert_eq!(report.metrics.passed_cases, 1);
+        assert_eq!(report.metrics.failed_cases, 0);
+        assert_eq!(report.metrics.infra_failed_cases, 1);
+        assert_eq!(report.metrics.pass_at_1, 1.0);
+        assert!(rendered.contains("status=infra_failed"));
     }
 
     #[test]
@@ -422,6 +500,77 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         assert!(rendered.contains("pass_to_fail"));
         assert!(rendered.contains("tokens delta: -20"));
         assert!(rendered.contains("cost_usd_micros delta: -10"));
+    }
+
+    #[test]
+    fn eval_report_diff_rejects_suite_or_k_mismatch() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let baseline_path = tempdir.path().join("baseline.json");
+        let candidate_path = tempdir.path().join("candidate.json");
+        let baseline = eval_report_dry_run(&sample_eval_manifest(), "baseline", 3)
+            .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
+        let mut candidate = baseline.clone();
+        candidate.run_id = "candidate".to_string();
+        candidate.suite = "different-suite".to_string();
+        fs::write(
+            &baseline_path,
+            serde_json::to_string_pretty(&baseline)
+                .unwrap_or_else(|error| panic!("baseline should serialize: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("baseline should write: {error}"));
+        fs::write(
+            &candidate_path,
+            serde_json::to_string_pretty(&candidate)
+                .unwrap_or_else(|error| panic!("candidate should serialize: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("candidate should write: {error}"));
+
+        let error = match diff_eval_reports(EvalDiffArgs {
+            baseline: baseline_path.clone(),
+            candidate: candidate_path.clone(),
+            json: false,
+            output: None,
+        }) {
+            Ok(_) => panic!("different suites should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("different suites"));
+
+        candidate.suite = baseline.suite.clone();
+        candidate.k = 5;
+        fs::write(
+            &candidate_path,
+            serde_json::to_string_pretty(&candidate)
+                .unwrap_or_else(|error| panic!("candidate should serialize: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("candidate should write: {error}"));
+        let error = match diff_eval_reports(EvalDiffArgs {
+            baseline: baseline_path,
+            candidate: candidate_path,
+            json: false,
+            output: None,
+        }) {
+            Ok(_) => panic!("different k values should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("different k values"));
+    }
+
+    #[test]
+    fn eval_report_output_creates_parent_directory() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let output = tempdir.path().join("nested").join("report.json");
+        let report = eval_report_dry_run(&sample_eval_manifest(), "run-dry", 3)
+            .unwrap_or_else(|error| panic!("dry run report should build: {error}"));
+
+        write_json_output(&report, Some(&output))
+            .unwrap_or_else(|error| panic!("nested output should write: {error}"));
+
+        assert!(output.exists());
     }
 
     fn case_evidence(
