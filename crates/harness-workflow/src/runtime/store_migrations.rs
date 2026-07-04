@@ -430,4 +430,51 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_workflow_repo_memory_repo_outcome_kind
           ON workflow_repo_memory (repo, outcome, kind)",
     },
+    Migration {
+        version: 18,
+        description: "create workflow runtime usage records",
+        sql: "CREATE TABLE IF NOT EXISTS runtime_usage_events (
+            id                          TEXT PRIMARY KEY,
+            runtime_job_id              TEXT NOT NULL,
+            usage_key                   TEXT NOT NULL,
+            command_id                  TEXT NOT NULL,
+            workflow_id                 TEXT NOT NULL,
+            turn_id                     TEXT,
+            runtime_kind                TEXT NOT NULL,
+            runtime_profile             TEXT NOT NULL,
+            agent                       TEXT NOT NULL,
+            model                       TEXT NOT NULL,
+            project                     TEXT NOT NULL,
+            task_id                     TEXT,
+            candidate_group_id          TEXT,
+            candidate_id                TEXT,
+            candidate_index             BIGINT,
+            candidate_count             BIGINT,
+            input_tokens                BIGINT NOT NULL,
+            output_tokens               BIGINT NOT NULL,
+            cache_read_input_tokens     BIGINT NOT NULL,
+            cache_creation_input_tokens BIGINT NOT NULL,
+            reported_total_tokens       BIGINT,
+            reported_at                 TIMESTAMPTZ NOT NULL,
+            created_at                  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at                  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (runtime_job_id, usage_key),
+            CONSTRAINT runtime_usage_events_tokens_nonnegative
+                CHECK (
+                    input_tokens >= 0
+                    AND output_tokens >= 0
+                    AND cache_read_input_tokens >= 0
+                    AND cache_creation_input_tokens >= 0
+                    AND (reported_total_tokens IS NULL OR reported_total_tokens >= 0)
+                )
+        );
+        CREATE INDEX IF NOT EXISTS idx_runtime_usage_events_reported_at
+          ON runtime_usage_events (reported_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_runtime_usage_events_runtime_job
+          ON runtime_usage_events (runtime_job_id);
+        CREATE INDEX IF NOT EXISTS idx_runtime_usage_events_command
+          ON runtime_usage_events (command_id);
+        CREATE INDEX IF NOT EXISTS idx_runtime_usage_events_workflow
+          ON runtime_usage_events (workflow_id)",
+    },
 ];

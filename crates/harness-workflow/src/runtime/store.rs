@@ -26,8 +26,13 @@ mod command_store;
 mod instances;
 #[path = "store/runtime_completion.rs"]
 mod runtime_completion;
+#[path = "store/runtime_usage.rs"]
+mod runtime_usage;
 #[path = "store/submission_commit.rs"]
 mod submission_commit;
+pub use runtime_usage::{
+    RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
+};
 pub use submission_commit::{
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload,

@@ -1,5 +1,6 @@
 use super::helpers::{
     emit_runtime_notification, mark_turn_failed, persist_runtime_thread, process_stream_item,
+    RuntimeUsageContext,
 };
 use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
 use harness_core::config::agents::SandboxMode;
@@ -93,6 +94,7 @@ pub(crate) struct TurnLifecycleOptions {
     pub stall_timeout_secs: Option<u64>,
     pub force_code_agent: bool,
     pub env_vars: HashMap<String, String>,
+    pub runtime_usage: Option<RuntimeUsageContext>,
 }
 
 pub(crate) async fn run_turn_lifecycle_with_options(
@@ -301,6 +303,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                             &thread_db,
                             &notify_tx,
                             &notification_tx,
+                            options.runtime_usage.as_ref(),
                             &thread_id,
                             &turn_id,
                             item,

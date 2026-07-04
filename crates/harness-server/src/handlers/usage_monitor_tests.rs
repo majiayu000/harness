@@ -2,9 +2,10 @@ use super::usage_monitor_aggregate::UsageAggregate;
 use super::usage_monitor_candidate::{
     candidate_attribution_index, candidate_usage_groups, CandidateUsageAttribution,
 };
+use super::usage_monitor_records::{parse_usage_event, usage_record_from_runtime_usage};
 use super::*;
-use harness_core::types::{Decision, SessionId};
-use harness_workflow::runtime::{RuntimeKind, WorkflowCommandType};
+use harness_core::types::{Decision, Event, SessionId};
+use harness_workflow::runtime::{RuntimeKind, RuntimeUsageRecord, WorkflowCommandType};
 
 #[test]
 fn burn_level_marks_stale_running_job_high() {
@@ -171,6 +172,69 @@ fn candidate_usage_parse_event_uses_runtime_candidate_attribution() {
     );
     assert_eq!(candidate.candidate_index, Some(2));
     assert_eq!(record.metrics.total_tokens(), 20);
+}
+
+#[test]
+fn parse_usage_event_reports_malformed_payload() {
+    let mut event = Event::new(SessionId::new(), "llm_usage", "codex", Decision::Complete);
+    event.content = Some(r#"{"agent":"codex","model":"gpt-5"}"#.to_string());
+
+    let error = parse_usage_event(
+        &event,
+        &PriceCatalog::default(),
+        &candidate_attribution_index(&[]),
+    )
+    .expect_err("missing usage metrics should be reported");
+
+    assert!(error.to_string().contains("missing token metrics"));
+}
+
+#[test]
+fn runtime_usage_record_becomes_usage_record_with_candidate() -> anyhow::Result<()> {
+    let runtime_record = RuntimeUsageRecord {
+        id: "usage-1".to_string(),
+        runtime_job_id: "runtime-job-1".to_string(),
+        usage_key: "turn:turn-1".to_string(),
+        command_id: "command-1".to_string(),
+        workflow_id: "workflow-1".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        runtime_kind: "codex_exec".to_string(),
+        runtime_profile: "codex-default".to_string(),
+        agent: "codex".to_string(),
+        model: "gpt-5".to_string(),
+        project: "/repo".to_string(),
+        task_id: Some("issue-1449-c2".to_string()),
+        candidate_group_id: Some("workflow-1449:candidate-group:issue-1449".to_string()),
+        candidate_id: Some("workflow-1449:candidate-group:issue-1449:c2".to_string()),
+        candidate_index: Some(2),
+        candidate_count: Some(3),
+        metrics: UsageMetrics {
+            input_tokens: 21,
+            output_tokens: 8,
+            cache_read_input_tokens: 1,
+            cache_creation_input_tokens: 0,
+            reported_total_tokens: Some(30),
+        },
+        reported_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let record = usage_record_from_runtime_usage(
+        runtime_record,
+        &PriceCatalog::default(),
+        &candidate_attribution_index(&[]),
+    )?;
+
+    assert_eq!(record.agent, "codex");
+    assert_eq!(record.metrics.total_tokens(), 30);
+    assert_eq!(
+        record
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.candidate_id.as_str()),
+        Some("workflow-1449:candidate-group:issue-1449:c2")
+    );
+    Ok(())
 }
 
 #[test]

@@ -1484,6 +1484,7 @@ dependencies = [
  "futures",
  "harness-core",
  "harness-exec",
+ "harness-observe",
  "serde",
  "serde_json",
  "sha2",

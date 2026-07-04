@@ -130,7 +130,8 @@ pub use state_registry::{
 };
 pub use status::WorkflowCommandStatus;
 pub use store::{
-    RuntimeHistoryPruneSummary, WorkflowDecisionTransition, WorkflowRejectedDecisionTransition,
+    RuntimeHistoryPruneSummary, RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert,
+    RuntimeUsageUpsertOutcome, WorkflowDecisionTransition, WorkflowRejectedDecisionTransition,
     WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload,
 };
