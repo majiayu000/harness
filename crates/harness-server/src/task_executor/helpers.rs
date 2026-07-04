@@ -614,3 +614,7 @@ pub(crate) async fn persist_artifact(
 #[cfg(test)]
 #[path = "helpers_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "helpers_stall_tests.rs"]
+mod stall_tests;

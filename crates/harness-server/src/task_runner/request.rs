@@ -52,7 +52,7 @@ pub struct CreateTaskRequest {
     /// Maximum backoff cap in milliseconds for validation retries. Default: 300 000 ms (5 min).
     #[serde(default = "default_retry_max_backoff_ms")]
     pub retry_max_backoff_ms: u64,
-    /// Seconds of silence from the agent stream before declaring a stall; defaults to 3600.
+    /// Seconds of silence from the agent stream before declaring a stall; defaults to 600.
     /// Overrides the global `concurrency.stall_timeout_secs` for this task.
     #[serde(default = "default_stall_timeout")]
     pub stall_timeout_secs: u64,
@@ -399,7 +399,7 @@ pub(super) fn default_turn_timeout() -> u64 {
 }
 
 pub(super) fn default_stall_timeout() -> u64 {
-    3600
+    harness_core::config::stall_timeout::DEFAULT_STALL_TIMEOUT_SECS
 }
 
 #[cfg(test)]
@@ -419,6 +419,13 @@ mod tests {
         let req = CreateTaskRequest::default();
         assert!(!req.skip_triage);
         assert!(!req.force_execute);
+    }
+
+    #[test]
+    fn create_task_request_default_stall_timeout_is_shorter_than_turn_timeout() {
+        let req = CreateTaskRequest::default();
+        assert_eq!(req.stall_timeout_secs, 600);
+        assert!(req.stall_timeout_secs < req.turn_timeout_secs);
     }
 
     #[test]

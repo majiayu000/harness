@@ -7,6 +7,7 @@ pub mod project;
 pub mod resolve;
 pub mod server;
 pub mod shutdown;
+pub mod stall_timeout;
 pub mod workflow;
 pub mod workflow_circuit_breaker;
 
