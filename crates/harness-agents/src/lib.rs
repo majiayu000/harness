@@ -51,6 +51,23 @@ pub(crate) fn apply_agent_run_identity_env(
     }
 }
 
+pub(crate) fn classify_missing_workspace_spawn_failure(
+    error: &std::io::Error,
+    project_root: &Path,
+    fallback_message: String,
+) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound
+        && matches!(project_root.try_exists(), Ok(false))
+    {
+        format!(
+            "workspace missing: {}; {fallback_message}",
+            project_root.display()
+        )
+    } else {
+        fallback_message
+    }
+}
+
 pub(crate) fn write_provisional_agent_run_binding(
     identity: &RunIdentity,
     native_kind: &str,
@@ -411,5 +428,47 @@ mod run_id_tests {
         assert!(record.native.id.is_empty());
         assert_eq!(record.pid, 42);
         assert_eq!(record.source, "harness-adapter");
+    }
+}
+
+#[cfg(test)]
+mod spawn_failure_tests {
+    use super::*;
+
+    #[test]
+    fn missing_workspace_spawn_failure_is_primary_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let missing = dir.path().join("missing-workspace");
+        let error = std::io::Error::from_raw_os_error(2);
+
+        let message = classify_missing_workspace_spawn_failure(
+            &error,
+            &missing,
+            "failed to run codex: No such file or directory".to_string(),
+        );
+
+        assert!(
+            message.starts_with(&format!("workspace missing: {}", missing.display())),
+            "missing workspace must be the primary error, got: {message}"
+        );
+        assert!(message.contains("failed to run codex"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_binary_in_existing_workspace_keeps_original_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let error = std::io::Error::from_raw_os_error(2);
+
+        let message = classify_missing_workspace_spawn_failure(
+            &error,
+            dir.path(),
+            "failed to run codex: No such file or directory".to_string(),
+        );
+
+        assert_eq!(message, "failed to run codex: No such file or directory");
+        Ok(())
     }
 }

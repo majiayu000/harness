@@ -97,10 +97,13 @@ impl AgentAdapter for ClaudeAdapter {
             "claude adapter admitted by provider gate"
         );
 
-        let mut child = cmd.spawn().map_err(|e| {
-            harness_core::error::HarnessError::AgentExecution(format!(
-                "failed to spawn claude: {e}"
-            ))
+        let mut child = cmd.spawn().map_err(|error| {
+            let message = crate::classify_missing_workspace_spawn_failure(
+                &error,
+                &req.project_root,
+                format!("failed to spawn claude: {error}"),
+            );
+            harness_core::error::HarnessError::AgentExecution(message)
         })?;
         if let Some(pid) = child.id() {
             crate::write_provisional_agent_run_binding(
@@ -523,6 +526,31 @@ mod tests {
         let adapter = ClaudeAdapter::new(PathBuf::from("claude"), "test-model".into());
         // Should not error when no child process exists
         adapter.interrupt().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let missing = dir.path().join("missing-workspace");
+        let adapter = ClaudeAdapter::new(std::env::current_exe()?, "test-model".into());
+        let request = turn_request("ignored", missing.clone());
+        let (tx, _rx) = mpsc::channel(4);
+
+        let error = match adapter.start_turn(request, tx).await {
+            Ok(()) => panic!("missing project root should fail before claude starts"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(
+            message.starts_with(&format!(
+                "agent execution failed: workspace missing: {}",
+                missing.display()
+            )),
+            "missing workspace must be primary, got: {message}"
+        );
+        assert!(message.contains("failed to spawn claude"));
+        Ok(())
     }
 
     #[tokio::test]
