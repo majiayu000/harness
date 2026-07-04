@@ -8,6 +8,7 @@ pub mod bus;
 mod candidate_fanout;
 mod candidate_promotion;
 mod candidate_selection;
+mod candidate_terminal;
 pub mod dispatcher;
 pub mod errors;
 pub mod eval;

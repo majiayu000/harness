@@ -35,6 +35,7 @@ use super::candidate_promotion::{
     candidate_promotion_success_decision, candidate_selection_record_from_activity_result,
     deferred_candidate_result_decision,
 };
+use super::candidate_terminal::deferred_candidate_terminal_decision;
 use super::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowEvent, WorkflowInstance,
@@ -85,6 +86,11 @@ pub fn reduce_runtime_job_completed(
         ActivityStatus::Failed => {
             if let Some(command) = event_workflow_command(event) {
                 if let Some(decision) =
+                    deferred_candidate_terminal_decision(instance, event, &result, &command)
+                {
+                    return decision.map(Some);
+                }
+                if let Some(decision) =
                     candidate_promotion_failure_decision(instance, event, &result, &command)
                 {
                     return decision.map(Some);
@@ -95,7 +101,16 @@ pub fn reduce_runtime_job_completed(
                     .unwrap_or_else(|| runtime_failed_decision(instance, event, &result)),
             )
         }
-        ActivityStatus::Cancelled => Some(runtime_cancelled_decision(instance, event, &result)),
+        ActivityStatus::Cancelled => {
+            if let Some(command) = event_workflow_command(event) {
+                if let Some(decision) =
+                    deferred_candidate_terminal_decision(instance, event, &result, &command)
+                {
+                    return decision.map(Some);
+                }
+            }
+            Some(runtime_cancelled_decision(instance, event, &result))
+        }
     };
     Ok(decision)
 }
@@ -488,7 +503,8 @@ fn prompt_task_has_validation_evidence(result: &ActivityResult) -> bool {
 mod tests {
     use super::*;
     use crate::runtime::model::{
-        ActivityResult, WorkflowCommandType, WorkflowEvent, WorkflowInstance, WorkflowSubject,
+        ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowEvent,
+        WorkflowInstance, WorkflowSubject,
     };
     use crate::runtime::validator::{DecisionValidator, ValidationContext};
     use chrono::Utc;
@@ -532,6 +548,68 @@ mod tests {
             &decision,
             &ValidationContext::new("runtime-1", Utc::now()),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_stall_timeout_records_terminal_evidence_without_failing_workflow(
+    ) -> anyhow::Result<()> {
+        let instance = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:1449"),
+        )
+        .with_id("workflow-1449");
+        let command = WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "candidate-1",
+            json!({
+                "activity": "implement_issue",
+                "submission_mode": "deferred",
+                "candidate": {
+                    "candidate_group_id": "workflow-1449:candidate-group:issue-1449",
+                    "candidate_id": "workflow-1449:candidate-group:issue-1449:c1",
+                    "candidate_index": 1,
+                    "candidate_count": 2,
+                },
+            }),
+        );
+        let result = ActivityResult::failed(
+            "implement_issue",
+            "Candidate stalled before completion.",
+            "Agent stream stalled: no output for 300s",
+        )
+        .with_error_kind(ActivityErrorKind::Timeout);
+        let event = WorkflowEvent::new(
+            &instance.id,
+            1,
+            RUNTIME_JOB_COMPLETED_EVENT,
+            "runtime-worker",
+        )
+        .with_payload(json!({
+            "command_id": "command-c1",
+            "runtime_job_id": "job-c1",
+            "command": command,
+            "activity_result": result,
+        }));
+
+        let decision = reduce_runtime_job_completed(&instance, &event)?
+            .ok_or_else(|| anyhow::anyhow!("candidate timeout should produce a decision"))?;
+
+        assert_eq!(decision.decision, "record_deferred_candidate_stalled");
+        assert_eq!(decision.next_state, "implementing");
+        assert!(
+            decision.commands.is_empty(),
+            "candidate timeouts must not fail or retry the parent workflow"
+        );
+        let candidate_evidence = decision
+            .evidence
+            .iter()
+            .find(|evidence| evidence.kind == "candidate_terminal")
+            .ok_or_else(|| anyhow::anyhow!("missing candidate terminal evidence"))?;
+        assert!(candidate_evidence.summary.contains("outcome=stalled"));
+        assert!(candidate_evidence.summary.contains("runtime_job_id=job-c1"));
         Ok(())
     }
 }
