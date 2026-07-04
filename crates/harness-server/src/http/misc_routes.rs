@@ -49,6 +49,10 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
     let dirty = state.is_runtime_state_dirty();
     let degraded = &state.degraded_subsystems;
     let runtime_logs = &state.core.server.runtime_logs;
+    let circuit_breakers = state.runtime_circuit_breakers.snapshots(chrono::Utc::now());
+    let runtime_degraded = circuit_breakers
+        .iter()
+        .any(|breaker| breaker.state != "closed");
     let startup_statuses: Vec<serde_json::Value> = state
         .startup_statuses
         .iter()
@@ -61,7 +65,7 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
             })
         })
         .collect();
-    let status = if degraded.is_empty() && !dirty {
+    let status = if degraded.is_empty() && !dirty && !runtime_degraded {
         "ok"
     } else {
         "degraded"
@@ -80,6 +84,9 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
             "state": runtime_logs.state.as_str(),
             "path_hint": runtime_logs.path_hint.clone(),
             "retention_days": runtime_logs.retention_days,
+        },
+        "runtime": {
+            "circuit_breakers": circuit_breakers,
         }
     }))
 }
