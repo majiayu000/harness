@@ -69,6 +69,20 @@ impl CandidateEvidence {
         }
     }
 
+    pub fn stalled(candidate_id: impl Into<String>) -> Self {
+        Self {
+            outcome: CandidateOutcome::Stalled,
+            ..Self::succeeded(candidate_id)
+        }
+    }
+
+    pub fn cancelled(candidate_id: impl Into<String>) -> Self {
+        Self {
+            outcome: CandidateOutcome::Cancelled,
+            ..Self::succeeded(candidate_id)
+        }
+    }
+
     pub fn with_validation(mut self, validation: CandidateCheckConclusion) -> Self {
         self.validation = validation;
         self
@@ -373,6 +387,28 @@ mod tests {
             .ranking
             .iter()
             .all(|ranking| ranking.rank_reason == "ineligible_terminal_outcome"));
+    }
+
+    #[test]
+    fn candidate_stall_selection_ranks_remaining_terminal_candidates() {
+        let record = selection(vec![
+            CandidateEvidence::stalled("candidate-stalled")
+                .with_validation(CandidateCheckConclusion::Passed)
+                .with_ci(CandidateCheckConclusion::Passed)
+                .with_quality_score(100),
+            CandidateEvidence::succeeded("candidate-success")
+                .with_validation(CandidateCheckConclusion::Unknown)
+                .with_ci(CandidateCheckConclusion::Unknown)
+                .with_quality_score(10),
+        ]);
+
+        assert_eq!(
+            record.selected_candidate_id.as_deref(),
+            Some("candidate-success")
+        );
+        assert_eq!(record.ranking[0].candidate_id, "candidate-success");
+        assert_eq!(record.ranking[1].candidate_id, "candidate-stalled");
+        assert_eq!(record.ranking[1].rank_reason, "ineligible_terminal_outcome");
     }
 
     #[test]
