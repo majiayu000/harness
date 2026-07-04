@@ -56,6 +56,82 @@ fn activity_result_from_turn_fails_when_no_fenced_block_present() {
 }
 
 #[test]
+fn activity_result_from_turn_classifies_zero_output_completion_as_spawn_failure() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_issue"
+        }),
+    );
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Completed,
+        &[],
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.activity, "implement_issue");
+    assert_eq!(result.status, ActivityStatus::Failed);
+    assert_eq!(result.error_kind, Some(ActivityErrorKind::SpawnFailure));
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("no observable activity")));
+    assert!(result.signals.iter().any(|signal| {
+        signal.signal_type == "AgentZeroOutputSpawnFailure"
+            && signal.signal["classification"] == "spawn_failure"
+    }));
+    let gate = artifact_by_type(&result, "agent_activity_gate");
+    assert_eq!(gate.artifact["classification"], "spawn_failure");
+    assert_eq!(gate.artifact["assistant_messages"], 0);
+    assert_eq!(gate.artifact["tool_invocations"], 0);
+    assert_eq!(gate.artifact["structured_result_artifacts"], 0);
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "zero_output_spawn_failure");
+    assert_eq!(envelope["final_result"]["error_kind"], "spawn_failure");
+}
+
+#[test]
+fn activity_result_from_turn_does_not_classify_tool_only_completion_as_spawn_failure() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_issue"
+        }),
+    );
+    let items = vec![Item::ToolCall {
+        name: "read_file".to_string(),
+        input: json!({"path": "README.md"}),
+        output: Some(json!({"ok": true})),
+    }];
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.status, ActivityStatus::Failed);
+    assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "missing_structured_output");
+}
+
+#[test]
 fn activity_result_from_turn_parses_structured_activity_result_block() {
     let job = RuntimeJob::pending(
         "command-1",

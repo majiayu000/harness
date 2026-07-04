@@ -1,5 +1,6 @@
 mod activity_contract;
 mod activity_result;
+mod activity_status_contract;
 mod child_workflow;
 mod child_workflow_non_issue;
 mod child_workflow_replay;
@@ -319,6 +320,7 @@ fn runtime_failure_kind(
     match result.and_then(|result| result.error_kind) {
         Some(
             ActivityErrorKind::Retryable
+            | ActivityErrorKind::SpawnFailure
             | ActivityErrorKind::Timeout
             | ActivityErrorKind::ExternalDependency,
         ) => Some(TaskFailureKind::WorkspaceLifecycle),
