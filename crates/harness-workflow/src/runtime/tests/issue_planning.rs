@@ -16,6 +16,7 @@ fn issue_submission_decision_force_execute_starts_implementation() {
             depends_on: &[],
             dependencies_blocked: false,
             remote_fact_hash: None,
+            submission_mode: SubmissionMode::Immediate,
         },
     );
 
@@ -58,6 +59,7 @@ fn issue_submission_decision_uses_remote_fact_hash_for_implementation_dedupe() {
             depends_on: &[],
             dependencies_blocked: false,
             remote_fact_hash: Some("sha256:abc"),
+            submission_mode: SubmissionMode::Immediate,
         },
     );
 
@@ -73,6 +75,43 @@ fn issue_submission_decision_uses_remote_fact_hash_for_implementation_dedupe() {
         output.decision.commands[0].command["dispatch_gate"]["fact_hash"],
         "sha256:abc"
     );
+}
+
+#[test]
+fn submission_mode_threads_through_issue_submission_commands() {
+    let labels = Vec::new();
+    let instance = issue_instance("discovered");
+
+    for (mode, expected) in [
+        (SubmissionMode::Immediate, "immediate"),
+        (SubmissionMode::Deferred, "deferred"),
+    ] {
+        let output = build_issue_submission_decision(
+            &instance,
+            IssueSubmissionDecisionInput {
+                task_id: "task-submission-mode",
+                repo: Some("owner/repo"),
+                issue_number: 123,
+                labels: &labels,
+                force_execute: true,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+                remote_fact_hash: None,
+                submission_mode: mode,
+            },
+        );
+
+        assert_eq!(output.decision.next_state, "implementing");
+        assert_eq!(
+            output.decision.commands[0].activity_name(),
+            Some("implement_issue")
+        );
+        assert_eq!(
+            output.decision.commands[0].command["submission_mode"],
+            expected
+        );
+    }
 }
 
 #[test]
@@ -110,6 +149,7 @@ fn issue_plan_success_starts_implementation_with_plan_payload() {
         decision.commands[0].command["issue_plan_summary"],
         "Patch the PR repair completion reducer before touching prompts."
     );
+    assert_eq!(decision.commands[0].command["submission_mode"], "immediate");
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
@@ -117,6 +157,55 @@ fn issue_plan_success_starts_implementation_with_plan_payload() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("issue plan completion decision should validate");
+}
+
+#[test]
+fn submission_mode_deferred_survives_issue_plan_completion() {
+    let instance = issue_instance("planning");
+    let plan_payload = json!({
+        "summary": "Patch the submission reducer.",
+        "task_class": "runtime_or_data",
+        "target_files": [
+            "crates/harness-workflow/src/runtime/submission.rs"
+        ],
+        "validation_plan": ["cargo test -p harness-workflow submission_mode"],
+        "blockers": []
+    });
+    let result = ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Issue plan ready.")
+        .with_artifact(ActivityArtifact::new(
+            super::super::ISSUE_PLAN_ARTIFACT,
+            plan_payload,
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "plan-command-deferred",
+        "command": WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "plan-command-deferred",
+            json!({
+                "activity": super::super::ISSUE_PLAN_ACTIVITY,
+                "submission_mode": "deferred",
+            }),
+        ),
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("issue planning success should start implementation");
+
+    assert_eq!(decision.decision, "start_implementation_after_issue_plan");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("implement_issue")
+    );
+    assert_eq!(decision.commands[0].command["submission_mode"], "deferred");
 }
 
 #[test]

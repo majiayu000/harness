@@ -2,7 +2,7 @@ use crate::task_runner::TaskId;
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
     build_issue_submission_decision, build_prompt_submission_decision, DecisionValidator,
-    IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, ValidationContext,
+    IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, SubmissionMode, ValidationContext,
     WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance,
     WorkflowRuntimeStore, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
 };
@@ -148,6 +148,7 @@ async fn persist_issue_submission(
             depends_on: &depends_on_strings(ctx.depends_on),
             dependencies_blocked: ctx.dependencies_blocked,
             remote_fact_hash: ctx.remote_fact_hash,
+            submission_mode: SubmissionMode::Immediate,
         },
     );
     apply_decision(

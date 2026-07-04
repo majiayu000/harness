@@ -1,6 +1,32 @@
 use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, WorkflowInstance};
 use super::plan_issue::ISSUE_PLAN_ACTIVITY;
 use super::remote_facts::remote_fact_command_dedupe_key;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionMode {
+    #[default]
+    Immediate,
+    Deferred,
+}
+
+impl SubmissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    pub fn from_wire_value(value: &str) -> Option<Self> {
+        match value {
+            "immediate" => Some(Self::Immediate),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueSubmissionWorkflowAction {
@@ -20,6 +46,7 @@ pub struct IssueSubmissionDecisionInput<'a> {
     pub depends_on: &'a [String],
     pub dependencies_blocked: bool,
     pub remote_fact_hash: Option<&'a str>,
+    pub submission_mode: SubmissionMode,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +109,7 @@ pub fn build_issue_submission_decision(
                     "fact_hash": input.remote_fact_hash,
                 },
                 "remote_fact_hash": input.remote_fact_hash,
+                "submission_mode": input.submission_mode.as_str(),
             }),
         ));
     } else if !input.dependencies_blocked {
@@ -106,6 +134,7 @@ pub fn build_issue_submission_decision(
                     "fact_hash": input.remote_fact_hash,
                 },
                 "remote_fact_hash": input.remote_fact_hash,
+                "submission_mode": input.submission_mode.as_str(),
             }),
         ));
     }

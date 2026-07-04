@@ -15,12 +15,12 @@ use super::{
     PrFeedbackDecisionInput, PrFeedbackOutcome, PrFeedbackSweepDecisionInput,
     PrFeedbackWorkflowAction, PromptSubmissionDecisionInput, QualityGateDecisionInput,
     QualityGateWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
-    RuntimeProfileSelector, RuntimeWorker, WorkflowCommandStatus, WorkflowDecisionTransition,
-    WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
-    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
-    SCOPE_TOO_LARGE_SIGNAL,
+    RuntimeProfileSelector, RuntimeWorker, SubmissionMode, WorkflowCommandStatus,
+    WorkflowDecisionTransition, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
+    LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL, SCOPE_TOO_LARGE_SIGNAL,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -184,6 +184,7 @@ fn issue_submission_decision_starts_discovered_issue_planning() {
             depends_on: &[],
             dependencies_blocked: false,
             remote_fact_hash: None,
+            submission_mode: SubmissionMode::Immediate,
         },
     );
 
@@ -228,6 +229,7 @@ fn issue_submission_decision_can_reopen_failed_issue_when_requested() {
             depends_on: &[],
             dependencies_blocked: false,
             remote_fact_hash: None,
+            submission_mode: SubmissionMode::Immediate,
         },
     );
 
@@ -257,6 +259,7 @@ fn issue_submission_decision_can_reopen_terminal_issue_for_planning() {
                 depends_on: &[],
                 dependencies_blocked: false,
                 remote_fact_hash: None,
+                submission_mode: SubmissionMode::Immediate,
             },
         );
 
@@ -295,6 +298,7 @@ fn issue_submission_decision_waits_for_dependencies_without_runtime_command() {
             depends_on: &depends_on,
             dependencies_blocked: true,
             remote_fact_hash: None,
+            submission_mode: SubmissionMode::Immediate,
         },
     );
 
@@ -325,6 +329,7 @@ fn issue_submission_decision_releases_dependencies_to_planning() {
             depends_on: &[],
             dependencies_blocked: false,
             remote_fact_hash: None,
+            submission_mode: SubmissionMode::Immediate,
         },
     );
 
