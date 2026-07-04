@@ -519,6 +519,10 @@ pub struct OtelConfig {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub log_user_prompt: bool,
+    #[serde(default)]
+    pub trajectory: bool,
+    #[serde(default)]
+    pub capture_content: bool,
 }
 
 impl Default for OtelConfig {
@@ -528,6 +532,8 @@ impl Default for OtelConfig {
             exporter: OtelExporter::default(),
             endpoint: None,
             log_user_prompt: false,
+            trajectory: false,
+            capture_content: false,
         }
     }
 }
