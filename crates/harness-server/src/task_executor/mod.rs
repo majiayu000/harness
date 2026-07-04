@@ -1,3 +1,9 @@
+//! Legacy task execution path.
+//!
+//! The live workflow-runtime turn engine is owned by
+//! `workflow_runtime_worker::turn_engine`. This module remains for the legacy
+//! task path pending GH-1434 removal.
+
 pub(crate) mod agent_review;
 mod agent_review_provider_gate;
 #[cfg(test)]
@@ -18,11 +24,6 @@ pub(crate) mod review_loop;
 mod review_loop_wait_budget_tests;
 mod run_task;
 pub(crate) mod triage_pipeline;
-pub(crate) mod turn_lifecycle;
-#[cfg(test)]
-mod turn_lifecycle_stall_tests;
-#[cfg(test)]
-mod turn_lifecycle_terminal_error_tests;
 mod validation_gate;
 
 use harness_core::{config::agents::CapabilityProfile, interceptor::TurnInterceptor};
@@ -52,7 +53,6 @@ use std::collections::HashMap;
 use tokio::time::Instant;
 
 use run_task::run_task as run_task_impl;
-use turn_lifecycle::run_turn_lifecycle as run_turn_lifecycle_impl;
 // Wrappers keep existing call sites stable while counting old task surfaces.
 pub(crate) async fn run_task(
     store: &crate::task_runner::TaskStore,
@@ -90,34 +90,6 @@ pub(crate) async fn run_task(
         turns_used_acc,
     )
     .await
-}
-
-pub(crate) async fn run_turn_lifecycle(
-    server: Arc<crate::server::HarnessServer>,
-    thread_db: Option<crate::thread_db::ThreadDb>,
-    notify_tx: Option<crate::notify::NotifySender>,
-    notification_tx: tokio::sync::broadcast::Sender<
-        harness_protocol::notifications::RpcNotification,
-    >,
-    thread_id: harness_core::types::ThreadId,
-    turn_id: harness_core::types::TurnId,
-    prompt: String,
-    agent_name: String,
-) {
-    harness_core::usage_probe::record_usage(
-        harness_core::usage_probe::UsageProbeSurface::TaskExecutor,
-    );
-    run_turn_lifecycle_impl(
-        server,
-        thread_db,
-        notify_tx,
-        notification_tx,
-        thread_id,
-        turn_id,
-        prompt,
-        agent_name,
-    )
-    .await;
 }
 pub(crate) use validation_gate::run_test_gate;
 

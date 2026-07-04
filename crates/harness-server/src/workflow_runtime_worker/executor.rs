@@ -1,5 +1,4 @@
 use crate::http::AppState;
-use crate::task_executor::turn_lifecycle::TurnLifecycleOptions;
 use async_trait::async_trait;
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_core::types::{AgentId, ThreadId};
@@ -32,6 +31,7 @@ use super::runtime_profile::{
     runtime_profile_sandbox_mode,
 };
 use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
+use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 
 const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 3600;
@@ -145,7 +145,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             )?;
             persist_created_thread(self.state, &thread_id).await;
 
-            crate::task_executor::turn_lifecycle::run_turn_lifecycle_with_options(
+            run_turn_lifecycle_with_options(
                 self.state.core.server.clone(),
                 self.state.core.thread_db.clone(),
                 self.state.notifications.notify_tx.clone(),

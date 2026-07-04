@@ -14,6 +14,7 @@
 pub use harness_workflow::checkpoint;
 pub use harness_workflow::circuit_breaker;
 pub mod assets;
+pub(crate) mod command_safety;
 pub mod complexity_router;
 pub mod contract_validator;
 pub mod dashboard;

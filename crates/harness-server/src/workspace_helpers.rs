@@ -136,7 +136,7 @@ pub(super) fn repo_slug_from_workspace_key(key: &str) -> Option<String> {
 /// Returns true when the git worktree at `path` is currently on `branch`.
 /// Used to distinguish crash-recovery (same task's worktree) from a true collision.
 pub(crate) async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
-    crate::post_validator::validate_command_safety(script).map_err(|e| anyhow::anyhow!("{e}"))?;
+    crate::command_safety::validate_command_safety(script).map_err(|e| anyhow::anyhow!("{e}"))?;
     let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(script)

@@ -26,7 +26,7 @@ pub(crate) async fn run_test_gate(
         // before executing. Malicious repos could supply shell-injection payloads
         // via `.harness/config.toml` validation.pre_push.
         for cmd in custom_cmds {
-            if let Err(e) = crate::post_validator::validate_command_safety(cmd) {
+            if let Err(e) = crate::command_safety::validate_command_safety(cmd) {
                 return Err(format!("test gate: command rejected by safety check: {e}"));
             }
         }

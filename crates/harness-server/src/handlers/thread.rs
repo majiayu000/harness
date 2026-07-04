@@ -179,7 +179,7 @@ pub async fn turn_start(
             let lifecycle_agent = agent_name;
 
             let handle = tokio::spawn(async move {
-                crate::task_executor::run_turn_lifecycle(
+                crate::workflow_runtime_worker::turn_engine::turn_lifecycle::run_turn_lifecycle(
                     lifecycle_server,
                     lifecycle_thread_db,
                     lifecycle_notify_tx,
