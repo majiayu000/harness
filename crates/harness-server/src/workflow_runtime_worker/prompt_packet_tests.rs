@@ -1,7 +1,8 @@
 use super::*;
 use harness_workflow::runtime::{
-    RuntimeKind, WorkflowSubject, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT,
-    ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
+    RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, RetrievedRepoMemoryRecord, RuntimeKind,
+    WorkflowSubject, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL,
+    PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 
 #[test]
@@ -343,6 +344,7 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
         Path::new("/repo"),
         &runtime_profile,
         &workflow_document,
+        &[],
     );
     assert_eq!(packet["project"]["root"], "/workspaces/job-1");
     assert_eq!(packet["project"]["source_root"], "/repo");
@@ -354,4 +356,100 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
     let prompt = build_runtime_job_prompt(&packet, None);
     assert!(prompt.contains("Repository workflow prompt template:"));
     assert!(prompt.contains("Follow the repository workflow prompt."));
+}
+
+#[test]
+fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_issue",
+            "repo": "owner/repo"
+        }),
+    );
+    let workflow_document = WorkflowDocument::default();
+    let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    let record = RepoMemoryRecord::new(
+        "owner/repo",
+        "implement_issue",
+        RepoMemoryOutcome::Failed,
+        RepoMemoryKind::FailureLesson,
+        json!({
+            "lesson": "cargo clippy catches CI-only warnings",
+            "validation": [{"command": "cargo clippy --workspace --all-targets -- -D warnings", "status": "failed"}]
+        }),
+    )
+    .with_evidence_ref("workflow:run-1:event:event-1");
+    let record_id = record.id.to_string();
+    let repo_memory = vec![RetrievedRepoMemoryRecord {
+        record,
+        estimated_tokens: 64,
+    }];
+
+    let packet = build_runtime_prompt_packet(
+        &job,
+        None,
+        Path::new("/workspaces/job-1"),
+        Path::new("/repo"),
+        &runtime_profile,
+        &workflow_document,
+        &repo_memory,
+    );
+
+    assert_eq!(
+        packet["repo_memory"]["schema"],
+        "harness.runtime.repo_memory.v1"
+    );
+    assert_eq!(
+        packet["repo_memory"]["preamble"],
+        REPO_MEMORY_PROMPT_PREAMBLE
+    );
+    assert_eq!(packet["repo_memory"]["records"][0]["id"], record_id);
+    assert_eq!(packet["repo_memory"]["records"][0]["outcome"], "failed");
+    assert_eq!(
+        packet["repo_memory"]["records"][0]["kind"],
+        "failure_lesson"
+    );
+    assert_eq!(
+        packet["repo_memory"]["records"][0]["payload"]["lesson"],
+        "cargo clippy catches CI-only warnings"
+    );
+
+    let prompt = build_runtime_job_prompt(&packet, None);
+    assert!(prompt.contains("Repo memory:"));
+    assert!(prompt.contains("```repo-memory"));
+    assert!(prompt.contains(REPO_MEMORY_PROMPT_PREAMBLE));
+    assert!(prompt.contains("\"lesson\": \"cargo clippy catches CI-only warnings\""));
+}
+
+#[test]
+fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_issue",
+            "repo": "owner/fresh"
+        }),
+    );
+    let workflow_document = WorkflowDocument::default();
+    let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+
+    let packet = build_runtime_prompt_packet(
+        &job,
+        None,
+        Path::new("/workspaces/job-1"),
+        Path::new("/repo"),
+        &runtime_profile,
+        &workflow_document,
+        &[],
+    );
+
+    assert!(packet.get("repo_memory").is_none());
+    let prompt = build_runtime_job_prompt(&packet, None);
+    assert!(!prompt.contains("Repo memory:"));
+    assert!(!prompt.contains("```repo-memory"));
 }

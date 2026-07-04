@@ -11,6 +11,7 @@ mod otel_trajectory;
 mod pr_feedback_inspection;
 mod prompt_input_telemetry;
 mod prompt_packet;
+mod repo_memory_prompt;
 mod runtime_profile;
 mod server_merge;
 pub(crate) mod turn_engine;
