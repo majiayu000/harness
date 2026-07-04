@@ -41,6 +41,7 @@ async fn issue_submission_records_pending_runtime_implementation_command() -> an
             source: Some("github"),
             external_id: Some("issue:42"),
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -300,6 +301,7 @@ async fn issue_submission_preserves_prior_task_handles_for_lookup() -> anyhow::R
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -318,6 +320,7 @@ async fn issue_submission_preserves_prior_task_handles_for_lookup() -> anyhow::R
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -380,6 +383,7 @@ async fn cancel_issue_submission_cancels_dispatched_runtime_jobs() -> anyhow::Re
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -454,6 +458,7 @@ async fn cancel_issue_submission_cancels_dispatching_runtime_command() -> anyhow
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -534,6 +539,7 @@ async fn cancel_issue_submission_by_workflow_id_uses_stable_runtime_handle() -> 
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -670,6 +676,7 @@ async fn rejected_issue_submission_keeps_existing_runtime_data() -> anyhow::Resu
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -738,6 +745,7 @@ async fn issue_submission_waits_for_dependencies_then_releases_runtime_command(
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;

@@ -226,6 +226,7 @@ async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> a
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -252,6 +253,7 @@ async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> a
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -298,6 +300,7 @@ async fn issue_submission_releases_dependency_by_github_issue_handle_when_canoni
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -333,6 +336,7 @@ async fn issue_submission_releases_dependency_by_github_issue_handle_when_canoni
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -381,6 +385,7 @@ async fn issue_submission_keeps_blocked_runtime_dependency_without_closed_eviden
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -407,6 +412,7 @@ async fn issue_submission_keeps_blocked_runtime_dependency_without_closed_eviden
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -447,6 +453,7 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_persisted_clo
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -480,6 +487,7 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_persisted_clo
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -528,6 +536,7 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_closed_issue_
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -583,6 +592,7 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_closed_issue_
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -634,6 +644,7 @@ async fn dependency_release_rotates_waiting_rows_to_prevent_starvation() -> anyh
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -660,6 +671,7 @@ async fn dependency_release_rotates_waiting_rows_to_prevent_starvation() -> anyh
             source: None,
             external_id: None,
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;

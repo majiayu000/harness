@@ -147,6 +147,7 @@ pub(super) async fn execute_start_child_workflow(
                     source: Some(source.as_str()),
                     external_id: Some(external_id.as_str()),
                     remote_fact_hash: None,
+                    author_trust_class: None,
                 },
             )
             .await?;

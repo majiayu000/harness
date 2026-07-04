@@ -32,6 +32,7 @@ async fn issue_submission_records_explicit_submission_id() -> anyhow::Result<()>
             source: Some("github"),
             external_id: Some("issue:1129"),
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;

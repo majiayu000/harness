@@ -113,6 +113,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
             source: Some("github"),
             external_id: Some("129"),
             remote_fact_hash: None,
+            author_trust_class: None,
         },
     )
     .await?;

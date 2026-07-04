@@ -178,6 +178,7 @@ mod tests {
             priority: None,
             labels: vec!["harness".to_string()],
             created_at: None,
+            author_trust_class: harness_core::config::isolation::IsolationTrustClass::Trusted,
             project_root: None,
         };
 
