@@ -125,7 +125,11 @@ fn non_empty(value: String, field: &str) -> Result<String, ManifestError> {
     if trimmed.is_empty() {
         return Err(ManifestError::new(format!("{field} must not be empty")));
     }
-    Ok(trimmed.to_string())
+    if trimmed.len() == value.len() {
+        Ok(value)
+    } else {
+        Ok(trimmed.to_string())
+    }
 }
 
 fn validate_repo(repo: &str) -> Result<(), ManifestError> {
@@ -136,7 +140,7 @@ fn validate_repo(repo: &str) -> Result<(), ManifestError> {
     };
     if owner.is_empty()
         || name.is_empty()
-        || repo.split('/').count() != 2
+        || name.contains('/')
         || repo.chars().any(char::is_whitespace)
     {
         return Err(ManifestError::new(format!(

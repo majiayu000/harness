@@ -205,17 +205,15 @@ fn runtime_has_failed_terminal_state(runtime: &RuntimeSnapshot) -> bool {
 }
 
 fn is_failed_runtime_terminal_state(state: &str) -> bool {
-    matches!(
-        state.trim().to_ascii_lowercase().as_str(),
-        "failed"
-            | "cancelled"
-            | "canceled"
-            | "timed_out"
-            | "timeout"
-            | "errored"
-            | "error"
-            | "expired"
-    )
+    let state = state.trim();
+    state.eq_ignore_ascii_case("failed")
+        || state.eq_ignore_ascii_case("cancelled")
+        || state.eq_ignore_ascii_case("canceled")
+        || state.eq_ignore_ascii_case("timed_out")
+        || state.eq_ignore_ascii_case("timeout")
+        || state.eq_ignore_ascii_case("errored")
+        || state.eq_ignore_ascii_case("error")
+        || state.eq_ignore_ascii_case("expired")
 }
 
 fn gate(
@@ -380,17 +378,17 @@ fn cost_efficiency_points(runtime: Option<&RuntimeSnapshot>, has_usage: bool) ->
     let Some(runtime) = runtime else {
         return if has_usage { 6 } else { 4 };
     };
-    let failed_jobs = runtime
-        .runtime_jobs
-        .iter()
-        .filter(|job| runtime_job_failed(job))
-        .count();
-    let repeated_non_retryable = runtime
-        .runtime_jobs
-        .iter()
-        .filter(|job| runtime_job_failed(job) && runtime_job_error_is_non_retryable(job))
-        .count()
-        > 1;
+    let mut failed_jobs = 0;
+    let mut non_retryable_failed_jobs = 0;
+    for job in &runtime.runtime_jobs {
+        if runtime_job_failed(job) {
+            failed_jobs += 1;
+            if runtime_job_error_is_non_retryable(job) {
+                non_retryable_failed_jobs += 1;
+            }
+        }
+    }
+    let repeated_non_retryable = non_retryable_failed_jobs > 1;
 
     if repeated_non_retryable {
         0
