@@ -20,10 +20,10 @@ async fn health_degraded_when_subsystem_missing() -> anyhow::Result<()> {
     let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let mut state = make_read_only_route_test_state(dir.path()).await?;
-    Arc::get_mut(&mut state).unwrap().degraded_subsystems = vec!["q_value_store"];
+    Arc::get_mut(&mut state).unwrap().degraded_subsystems = vec!["eval_store"];
     let health = call_health(state).await?;
     assert_eq!(health.status, "degraded");
-    assert_eq!(health.persistence.degraded_subsystems, ["q_value_store"]);
+    assert_eq!(health.persistence.degraded_subsystems, ["eval_store"]);
     assert!(!health.persistence.runtime_state_dirty);
     Ok(())
 }

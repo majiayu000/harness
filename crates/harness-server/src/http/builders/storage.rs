@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::http::state::StoreStartupResult;
 use crate::{
     eval_store::{migrate_legacy_eval_store_if_needed, EvalStore},
-    q_value_store::QValueStore,
     task_runner::TaskStore,
 };
 
@@ -13,7 +12,6 @@ use crate::{
 pub(crate) struct StorageBundle {
     pub tasks: Option<Arc<TaskStore>>,
     pub eval_store: Option<Arc<EvalStore>>,
-    pub q_values: Option<Arc<QValueStore>>,
     pub startup_results: Vec<StoreStartupResult>,
 }
 
@@ -21,7 +19,6 @@ fn failed_storage_startup_results(error: &str) -> Vec<StoreStartupResult> {
     vec![
         StoreStartupResult::critical("tasks").failed(error),
         StoreStartupResult::optional("eval_store").failed(error),
-        StoreStartupResult::optional("q_value_store").failed(error),
     ]
 }
 
@@ -29,13 +26,12 @@ fn failed_storage_bundle(error: &str) -> StorageBundle {
     StorageBundle {
         tasks: None,
         eval_store: None,
-        q_values: None,
         startup_results: failed_storage_startup_results(error),
     }
 }
 
 /// Initialize persistent storage: validate `data_dir`, open the task DB and
-/// optionally the Q-value DB.
+/// optional eval store.
 ///
 /// On Unix this function refuses to proceed if `data_dir` is a symbolic link
 /// to prevent symlink-hijacking attacks on the persistent data directory.
@@ -70,8 +66,6 @@ pub(crate) async fn build_storage_with_database_url(
 
     let db_path = harness_core::config::dirs::default_db_path(data_dir, "tasks");
     tracing::debug!("task db: {}", db_path.display());
-    let q_values_db_path = harness_core::config::dirs::default_db_path(data_dir, "q_values");
-    tracing::debug!("q_value db: {}", q_values_db_path.display());
     let eval_db_path = harness_core::config::dirs::default_db_path(data_dir, "evals");
     tracing::debug!("eval db: {}", eval_db_path.display());
 
@@ -141,46 +135,6 @@ pub(crate) async fn build_storage_with_database_url(
         }
     };
 
-    let (q_values, q_value_result) = match super::forced_startup_error("q_value_store") {
-        Some(error) => (
-            None,
-            StoreStartupResult::optional("q_value_store").failed(error),
-        ),
-        None => {
-            match async {
-                let q_value_context = QValueStore::shared_schema_context(Some(&database_url))?;
-                super::ensure_startup_context_not_path_derived("q_value_store", &q_value_context)?;
-                let store =
-                    QValueStore::open_shared_with_data_dir(&q_value_context, &setup_pool, data_dir)
-                        .await?;
-                crate::q_value_store::migrate_legacy_q_value_store_if_needed(
-                    &q_values_db_path,
-                    Some(&database_url),
-                    &store,
-                )
-                .await?;
-                Ok::<_, anyhow::Error>(store)
-            }
-            .await
-            {
-                Ok(store) => (
-                    Some(Arc::new(store)),
-                    StoreStartupResult::optional("q_value_store"),
-                ),
-                Err(error) => (
-                    None,
-                    StoreStartupResult::optional("q_value_store").failed(error.to_string()),
-                ),
-            }
-        }
-    };
-
-    if let Some(error) = q_value_result.error.as_deref() {
-        tracing::warn!(
-            path = %q_values_db_path.display(),
-            "q_value store init failed, rule utility tracking will be disabled: {error}"
-        );
-    }
     if let Some(error) = eval_result.error.as_deref() {
         tracing::warn!(
             path = %eval_db_path.display(),
@@ -193,8 +147,7 @@ pub(crate) async fn build_storage_with_database_url(
     Ok(StorageBundle {
         tasks,
         eval_store,
-        q_values,
-        startup_results: vec![task_result, eval_result, q_value_result],
+        startup_results: vec![task_result, eval_result],
     })
 }
 
@@ -203,7 +156,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn happy_path_both_dbs_open() {
+    async fn happy_path_storage_stores_open() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bundle = build_storage(dir.path())
             .await
@@ -218,7 +171,6 @@ mod tests {
             "eval store should be ready: {:?}",
             bundle.startup_results
         );
-        drop(bundle.q_values);
     }
 
     #[tokio::test]
@@ -244,29 +196,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_storage_opens_q_value_store_from_shared_schema() {
-        let database_url = match harness_core::db::resolve_database_url(None) {
-            Ok(url) => url,
-            Err(_) => return,
-        };
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bundle = build_storage_with_database_url(dir.path(), Some(&database_url))
-            .await
-            .expect("build_storage should succeed");
-        let q_values = bundle.q_values.expect("q_value store should be ready");
-
-        assert_eq!(
-            q_values.schema_for_test(),
-            crate::q_value_store::Q_VALUE_STORE_SCHEMA
-        );
-        assert_eq!(
-            q_values.store_key_for_test(),
-            crate::q_value_store::QValueStore::store_key_for_data_dir(dir.path())
-                .expect("store key")
-        );
-    }
-
-    #[tokio::test]
     async fn build_storage_opens_eval_store_from_shared_schema() {
         let database_url = match harness_core::db::resolve_database_url(None) {
             Ok(url) => url,
@@ -285,47 +214,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn q_value_failure_is_recorded_as_optional() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bundle = super::super::with_forced_startup_failures(
-            &[(
-                "q_value_store",
-                "pool timed out while waiting for an open connection",
-            )],
-            build_storage(dir.path()),
-        )
-        .await
-        .expect("build_storage should succeed");
-        assert!(
-            bundle.tasks.is_some(),
-            "critical task store should still open: {:?}",
-            bundle.startup_results
-        );
-        assert!(
-            bundle.q_values.is_none(),
-            "optional q_value store should stay disabled"
-        );
-        assert_eq!(bundle.startup_results.len(), 3);
-        assert!(bundle.startup_results[0].ready);
-        assert!(bundle.startup_results[1].ready);
-        assert!(!bundle.startup_results[2].ready);
-        assert!(!bundle.startup_results[2].is_critical());
-    }
-
     #[test]
     fn bootstrap_failure_records_all_storage_statuses() {
         let statuses = failed_storage_startup_results("database unavailable");
-        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses.len(), 2);
         assert_eq!(statuses[0].name, "tasks");
         assert!(statuses[0].is_critical());
         assert!(!statuses[0].ready);
         assert_eq!(statuses[1].name, "eval_store");
         assert!(!statuses[1].is_critical());
         assert!(!statuses[1].ready);
-        assert_eq!(statuses[2].name, "q_value_store");
-        assert!(!statuses[2].is_critical());
-        assert!(!statuses[2].ready);
     }
 
     #[cfg(unix)]

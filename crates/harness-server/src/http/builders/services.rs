@@ -55,12 +55,6 @@ pub(crate) async fn build_services(
     let hook_enforcement = server.config.rules.hook_enforcement;
     let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> = vec![
         Arc::new(crate::contract_validator::ContractValidator::new()),
-        // RuleEnforcer disabled: false-positives on test fixtures in other repo
-        // worktrees (SEC-02 hardcoded secrets in test code) block periodic_review
-        // tasks. Re-enable after adding source-aware filtering or allowlists.
-        // Arc::new(crate::rule_enforcer::RuleEnforcer::new(
-        //     engines.rules.clone(),
-        // )),
         Arc::new(crate::hook_enforcer::HookEnforcer::new(
             engines.rules.clone(),
             events.clone(),
@@ -224,7 +218,6 @@ mod tests {
             .await
             .expect("build_services");
         // 3 interceptors: ContractValidator, HookEnforcer, PostExecutionValidator
-        // (RuleEnforcer temporarily disabled due to false-positive blocks)
         assert_eq!(bundle.interceptors.len(), 3, "expected 3 interceptors");
     }
 }

@@ -87,7 +87,6 @@ async fn make_test_state_with_config_and_registry(
             workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
-            q_values: None,
             maintenance_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         engines: crate::http::EngineServices {
@@ -1848,7 +1847,6 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             workflow_runtime_store: None,
             project_registry: None,
             runtime_state_store: None,
-            q_values: None,
             maintenance_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         engines: crate::http::EngineServices {

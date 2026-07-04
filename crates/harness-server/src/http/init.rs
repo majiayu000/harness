@@ -195,7 +195,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
 
     let mut startup_statuses = Vec::new();
 
-    // Phase 1: storage — dir validation (symlink check, chmod), task DB, q_value DB.
+    // Phase 1: storage — dir validation (symlink check, chmod), task DB, eval store.
     let storage = builders::storage::build_storage_with_database_url(
         &dir,
         server.config.server.database_url.as_deref(),
@@ -231,8 +231,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         return Err(error);
     }
 
-    // Phase 4: intake — task queue, Feishu/GitHub pollers, quality trigger, completion callback
-    // (including Q-value wrapper).
+    // Phase 4: intake — task queue, Feishu/GitHub pollers, quality trigger,
+    // completion callback.
     // Depends on: engines.gc_agent + engines.events (quality trigger),
     //             registry.project_registry (unused directly but ordering is stable).
     let intake =
@@ -326,7 +326,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                     .expect("critical project registry should be present after startup validation"),
             ),
             runtime_state_store: registry.runtime_state_store,
-            q_values: storage.q_values,
             maintenance_active,
         },
         engines: EngineServices {
@@ -715,32 +714,5 @@ mod tests {
         };
         assert!(crate::test_helpers::is_pool_timeout(&err));
         assert!(err.to_string().contains("tasks"));
-    }
-
-    #[tokio::test]
-    async fn build_app_state_records_optional_q_value_failure() {
-        if resolve_database_url(None).is_err() {
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let server = make_test_server(dir.path());
-        let state = builders::with_forced_startup_failures(
-            &[(
-                "q_value_store",
-                "pool timed out while waiting for an open connection",
-            )],
-            build_app_state(server),
-        )
-        .await
-        .expect("optional q_value failure should not abort startup");
-        assert!(state.core.q_values.is_none());
-        assert!(state.degraded_subsystems.contains(&"q_value_store"));
-        let status = state
-            .startup_statuses
-            .iter()
-            .find(|status| status.name == "q_value_store")
-            .expect("q_value startup status");
-        assert!(!status.is_critical());
-        assert!(!status.ready);
     }
 }

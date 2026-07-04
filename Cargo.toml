@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/harness-core",
     "crates/harness-protocol",
-    "crates/harness-api",
     "crates/harness-server",
     "crates/harness-agents",
     "crates/harness-sandbox",
@@ -29,7 +28,6 @@ repository = "https://github.com/majiayu000/harness"
 # Internal crates (version required so they can be published to crates.io)
 harness-core = { path = "crates/harness-core", version = "0.6.34" }
 harness-protocol = { path = "crates/harness-protocol", version = "0.6.34" }
-harness-api = { path = "crates/harness-api", version = "0.6.34" }
 harness-server = { path = "crates/harness-server", version = "0.6.34" }
 harness-agents = { path = "crates/harness-agents", version = "0.6.34" }
 harness-sandbox = { path = "crates/harness-sandbox", version = "0.6.34" }
