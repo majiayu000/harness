@@ -600,14 +600,20 @@ impl DecisionValidator {
         context: &ValidationContext,
     ) -> Result<bool, WorkflowDecisionRejection> {
         if self.kind != DecisionValidatorKind::GithubIssuePr
-            || !github_issue_pr_validation::is_blocked_done_transition(decision)
+            || !github_issue_pr_validation::is_reconciliation_only_pr_merge_done_transition(
+                decision,
+            )
         {
             return Ok(false);
         }
 
-        let rule = TransitionRule::new("blocked", "done", [WorkflowCommandType::MarkDone]);
+        let rule = TransitionRule::new(
+            decision.observed_state.as_str(),
+            "done",
+            [WorkflowCommandType::MarkDone],
+        );
         self.validate_commands(&rule, decision, context)?;
-        github_issue_pr_validation::validate_blocked_done_reconciliation(decision, context)?;
+        github_issue_pr_validation::validate_reconciliation_only_pr_merge_done(decision, context)?;
         Ok(true)
     }
 
