@@ -25,6 +25,12 @@ impl WorkflowOtelTraceContext {
     }
 }
 
+impl Default for WorkflowOtelTraceContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn is_lower_hex(value: &str, expected_len: usize) -> bool {
     value.len() == expected_len
         && value.as_bytes().iter().any(|byte| *byte != b'0')
