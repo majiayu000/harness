@@ -163,6 +163,7 @@ async fn build_review_store(
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
     let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
+    server.config.isolation.validate_startup_support()?;
     let api_auth_mode = super::auth::resolve_api_auth_mode(&server.config.server)?;
     super::auth::log_api_auth_mode(&api_auth_mode, &server.config.server);
     #[cfg(test)]
