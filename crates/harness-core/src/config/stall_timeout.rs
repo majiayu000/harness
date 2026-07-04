@@ -19,21 +19,22 @@ pub fn normalize_stall_timeout_secs(
     wall_clock_timeout_secs: Option<u64>,
 ) -> StallTimeoutNormalization {
     let minimum = match wall_clock_timeout_secs {
-        Some(timeout_secs) if timeout_secs > 1 => MIN_STALL_TIMEOUT_SECS.min(timeout_secs - 1),
-        Some(_) => 1,
+        Some(timeout_secs) => MIN_STALL_TIMEOUT_SECS
+            .min(timeout_secs.saturating_sub(1))
+            .max(1),
         None => MIN_STALL_TIMEOUT_SECS,
     };
     let mut effective_secs = requested_secs.max(minimum);
 
-    if let Some(timeout_secs) = wall_clock_timeout_secs.filter(|timeout_secs| *timeout_secs > 1) {
+    if let Some(timeout_secs) = wall_clock_timeout_secs {
         if effective_secs >= timeout_secs {
-            effective_secs = timeout_secs - 1;
+            effective_secs = timeout_secs.saturating_sub(1).max(1);
         }
     }
 
     StallTimeoutNormalization {
         requested_secs,
-        effective_secs: effective_secs.max(1),
+        effective_secs,
         wall_clock_timeout_secs,
     }
 }
@@ -71,6 +72,13 @@ mod tests {
     #[test]
     fn normalize_handles_tiny_wall_clock_timeout() {
         let normalized = normalize_stall_timeout_secs(60, Some(2));
+        assert_eq!(normalized.effective_secs, 1);
+        assert!(normalized.was_adjusted());
+    }
+
+    #[test]
+    fn normalize_handles_one_second_wall_clock_timeout() {
+        let normalized = normalize_stall_timeout_secs(600, Some(1));
         assert_eq!(normalized.effective_secs, 1);
         assert!(normalized.was_adjusted());
     }

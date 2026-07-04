@@ -674,7 +674,7 @@ pub(crate) async fn run_agent_streaming_with_options(
             }
             _ = async {
                 tokio::time::sleep_until(last_activity + stall_timeout).await;
-            }, if exec_result.is_none() || !channel_closed => {
+            }, if exec_result.is_none() => {
                 let secs = stall_timeout.as_secs();
                 tracing::warn!(task_id = %task_id, turn, phase = %phase_str, elapsed_secs = last_activity.elapsed().as_secs(), "agent stream stall detected; no output for {}s", secs);
                 exec_result = Some(Err(HarnessError::AgentExecution(format!("Agent stream stalled: no output for {secs}s"))));
