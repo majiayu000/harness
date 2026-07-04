@@ -332,7 +332,7 @@ mod tests {
             .iter()
             .all(|record| record.repo == "owner/repo"));
 
-        let used_at = Utc::now();
+        let used_at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")?.with_timezone(&Utc);
         let touched = store
             .touch_repo_memory_records(&[inserted_first.id, inserted_second.id], used_at)
             .await?;
