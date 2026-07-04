@@ -6,21 +6,84 @@ set -euo pipefail
 # tests that spawn their own git repos in temp directories.
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE 2>/dev/null || true
 
+# Derive the cargo package scope from staged files so clippy/test only cover
+# the crates touched by this commit. Falls back to the full workspace when:
+#   - workspace-level manifests (Cargo.toml / Cargo.lock) are staged
+#   - Rust files outside crates/ are staged
+#   - a staged path maps to a directory that is not a cargo package
+#   - no crate paths are staged at all (safe default)
+# harness-core is depended on by nearly every crate, so a core change expands
+# to its main dependents (mirrors the server/agents path filters in ci.yml).
+derive_scope() {
+    staged=$(git diff --cached --name-only)
+    full=0
+    pkgs=" "
+    for f in $staged; do
+        case "$f" in
+            Cargo.toml|Cargo.lock)
+                full=1
+                ;;
+            crates/*/*)
+                crate=${f#crates/}
+                crate=${crate%%/*}
+                if [ ! -f "crates/$crate/Cargo.toml" ]; then
+                    full=1
+                    continue
+                fi
+                case "$pkgs" in
+                    *" $crate "*) ;;
+                    *) pkgs="$pkgs$crate " ;;
+                esac
+                ;;
+            *.rs)
+                # Rust file outside crates/ — scope is unknown, be safe.
+                full=1
+                ;;
+        esac
+    done
+    if [ "$pkgs" != " " ]; then
+        case "$pkgs" in
+            *" harness-core "*)
+                for dep in harness-server harness-workflow harness-agents; do
+                    case "$pkgs" in
+                        *" $dep "*) ;;
+                        *) pkgs="$pkgs$dep " ;;
+                    esac
+                done
+                ;;
+        esac
+    fi
+    if [ "$full" -eq 1 ] || [ "$pkgs" = " " ]; then
+        echo "--workspace"
+    else
+        scope=""
+        for p in $pkgs; do
+            scope="$scope -p $p"
+        done
+        echo "$scope"
+    fi
+}
+
+scope=$(derive_scope)
+echo "=== pre-commit: cargo scope: $scope ==="
+
 echo "=== pre-commit: fmt ==="
 cargo fmt --all -- --check
 
 echo "=== pre-commit: clippy ==="
-cargo clippy --workspace --all-targets -- -D warnings
+# shellcheck disable=SC2086 # scope is an intentional word-split flag list
+cargo clippy $scope --all-targets -- -D warnings
 
 echo "=== pre-commit: test ==="
 # Live Postgres tests require a configured Harness database URL.
 # Run them when available; otherwise skip only the known live-Postgres lib tests
 # and let CI or a configured local database provide full DB coverage.
+# shellcheck disable=SC2086 # scope is an intentional word-split flag list
 if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
-    cargo test --workspace --lib
+    cargo test $scope --lib
 else
     echo "HARNESS_DATABASE_URL not set — skipping live Postgres lib tests"
-    cargo test --workspace --lib -- --skip db::tests
+    cargo test $scope --lib -- --skip db::tests
 fi
 
 echo "=== pre-commit: all checks passed ==="
