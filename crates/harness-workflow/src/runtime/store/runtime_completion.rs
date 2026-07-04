@@ -36,6 +36,10 @@ impl WorkflowRuntimeStore {
             apply_runtime_completion_decision_for_instance_tx(&mut tx, instance, source, &event)
                 .await?;
         tx.commit().await?;
+        if let Some(decision) = decision.as_ref() {
+            self.record_terminal_repo_memory_for_completion(&event, decision)
+                .await;
+        }
         Ok(decision)
     }
 }

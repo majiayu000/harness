@@ -10,6 +10,7 @@ pub mod errors;
 pub mod eval;
 mod job_claim;
 pub mod lease_state;
+mod memory_extract;
 pub mod model;
 mod otel_trace_context;
 pub mod plan_issue;
