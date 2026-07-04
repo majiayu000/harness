@@ -75,6 +75,22 @@ fn apply_completed_sets_terminal() {
 }
 
 #[test]
+fn apply_cancelled_sets_terminal() {
+    let mut states = HashMap::new();
+    apply_event(
+        &mut states,
+        TaskEvent::Cancelled {
+            task_id: "t1".into(),
+            ts: ts(),
+            reason: Some("operator_cancelled".into()),
+        },
+    );
+    let s = &states["t1"];
+    assert!(matches!(s.status, Some(TaskStatus::Cancelled)));
+    assert!(s.terminal);
+}
+
+#[test]
 fn apply_event_ignores_status_changed_after_terminal_failed() {
     let mut states = HashMap::new();
     apply_event(

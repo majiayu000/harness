@@ -30,9 +30,15 @@ pub use state::{
     RecentFailureTask, RoundResult, SchedulerAuthorityState, SchedulerOwner, SchedulerOwnerKind,
     TaskSchedulerState, TaskState, TaskSummary, TaskWorkflowSummary,
 };
-use store::{mutate_and_persist as mutate_and_persist_impl, update_status as update_status_impl};
-pub use store::{TaskStore, TaskSummaryFilter, TaskSummaryPageCursor};
-pub use types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
+use store::{
+    mark_terminal_once as mark_terminal_once_impl, mutate_and_persist as mutate_and_persist_impl,
+    update_status as update_status_impl,
+};
+pub use store::{TaskStore, TaskSummaryFilter, TaskSummaryPageCursor, TerminalTransition};
+pub use types::{
+    TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus, TaskTerminalFailure,
+    TaskTerminalOutcome,
+};
 
 fn record_task_runner_usage() {
     harness_core::usage_probe::record_usage(
@@ -151,6 +157,15 @@ pub async fn mutate_and_persist(
 ) -> anyhow::Result<()> {
     record_task_runner_usage();
     mutate_and_persist_impl(store, id, f).await
+}
+
+pub async fn mark_terminal_once(
+    store: &TaskStore,
+    id: &TaskId,
+    outcome: TaskTerminalOutcome,
+) -> anyhow::Result<TerminalTransition> {
+    record_task_runner_usage();
+    mark_terminal_once_impl(store, id, outcome).await
 }
 
 impl TaskStore {

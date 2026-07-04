@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::request::PersistedRequestSettings;
-use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus};
+use super::types::{TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus, TaskTerminalOutcome};
 use chrono::{DateTime, Utc};
 use harness_core::types::{TurnFailure, TurnTelemetry};
 
@@ -594,5 +594,60 @@ impl TaskState {
                 }
             }
         }
+    }
+
+    pub(crate) fn apply_terminal_outcome_once(&mut self, outcome: TaskTerminalOutcome) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
+
+        let status = outcome.status();
+        self.status = status.clone();
+        self.phase = TaskPhase::Terminal;
+        self.error = outcome.reason_string();
+        self.scheduler.mark_terminal(&status);
+        true
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use crate::task_runner::TaskTerminalFailure;
+
+    #[test]
+    fn terminal_exactly_once_round_budget_exhausted() {
+        let mut state = TaskState::new(TaskId::from_str("terminal-once"));
+        state.status = TaskStatus::Reviewing;
+
+        let outcome = TaskTerminalOutcome::Failed(TaskTerminalFailure::round_budget_exhausted(
+            3,
+            state.status.clone(),
+            Some("local_review_gate".to_string()),
+        ));
+        assert!(state.apply_terminal_outcome_once(outcome));
+
+        assert_eq!(state.status, TaskStatus::Failed);
+        assert_eq!(state.phase, TaskPhase::Terminal);
+        assert_eq!(
+            state.error.as_deref(),
+            Some(
+                r#"{"reason":"round_budget_exhausted","rounds_used":3,"last_status":"reviewing","waiting_on":"local_review_gate"}"#
+            )
+        );
+        assert_eq!(
+            state.scheduler.authority_state,
+            SchedulerAuthorityState::Failed
+        );
+
+        let second = TaskTerminalOutcome::Completed;
+        assert!(!state.apply_terminal_outcome_once(second));
+        assert_eq!(state.status, TaskStatus::Failed);
+        assert_eq!(
+            state.error.as_deref(),
+            Some(
+                r#"{"reason":"round_budget_exhausted","rounds_used":3,"last_status":"reviewing","waiting_on":"local_review_gate"}"#
+            )
+        );
     }
 }
