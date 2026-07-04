@@ -47,6 +47,12 @@ pub enum TaskEvent {
     },
     /// Task reached terminal `Done` state.
     Completed { task_id: String, ts: u64 },
+    /// Task reached terminal `Cancelled` state.
+    Cancelled {
+        task_id: String,
+        ts: u64,
+        reason: Option<String>,
+    },
     /// A pull-request URL was extracted from the agent's output.
     PrDetected {
         task_id: String,
@@ -70,6 +76,7 @@ impl TaskEvent {
             | TaskEvent::StatusChanged { task_id, .. }
             | TaskEvent::Failed { task_id, .. }
             | TaskEvent::Completed { task_id, .. }
+            | TaskEvent::Cancelled { task_id, .. }
             | TaskEvent::PrDetected { task_id, .. }
             | TaskEvent::RoundCompleted { task_id, .. } => task_id,
         }
@@ -248,6 +255,10 @@ pub fn apply_event(states: &mut HashMap<String, ReplayedState>, event: TaskEvent
         }
         TaskEvent::Completed { .. } => {
             state.status = Some(TaskStatus::Done);
+            state.terminal = true;
+        }
+        TaskEvent::Cancelled { .. } => {
+            state.status = Some(TaskStatus::Cancelled);
             state.terminal = true;
         }
         TaskEvent::PrDetected { pr_url, .. } => {

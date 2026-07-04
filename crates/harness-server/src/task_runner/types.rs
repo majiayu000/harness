@@ -156,7 +156,7 @@ pub enum TaskPhase {
     Terminal,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
@@ -176,6 +176,73 @@ pub enum TaskStatus {
     Done,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTerminalFailure {
+    pub reason: String,
+    pub rounds_used: u32,
+    pub last_status: TaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+}
+
+impl TaskTerminalFailure {
+    pub fn new(
+        reason: impl Into<String>,
+        rounds_used: u32,
+        last_status: TaskStatus,
+        waiting_on: Option<String>,
+    ) -> Self {
+        Self {
+            reason: reason.into(),
+            rounds_used,
+            last_status,
+            waiting_on,
+        }
+    }
+
+    pub fn round_budget_exhausted(
+        rounds_used: u32,
+        last_status: TaskStatus,
+        waiting_on: Option<String>,
+    ) -> Self {
+        Self::new(
+            "round_budget_exhausted",
+            rounds_used,
+            last_status,
+            waiting_on,
+        )
+    }
+
+    pub fn to_reason_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| self.reason.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskTerminalOutcome {
+    Completed,
+    Failed(TaskTerminalFailure),
+    Cancelled(Option<String>),
+}
+
+impl TaskTerminalOutcome {
+    pub fn status(&self) -> TaskStatus {
+        match self {
+            Self::Completed => TaskStatus::Done,
+            Self::Failed(_) => TaskStatus::Failed,
+            Self::Cancelled(_) => TaskStatus::Cancelled,
+        }
+    }
+
+    pub fn reason_string(&self) -> Option<String> {
+        match self {
+            Self::Completed => None,
+            Self::Failed(reason) => Some(reason.to_reason_string()),
+            Self::Cancelled(reason) => reason.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
