@@ -11,6 +11,21 @@ const PATH_DERIVED_DIRECTORY_OWNER_KIND: &str = "path_derived_directory_store";
 const LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND: &str = "path_derived_schema";
 const PATH_DERIVED_RETENTION_CLASS: &str = "path_derived";
 
+#[path = "db_pg_schema_reaper.rs"]
+mod db_pg_schema_reaper;
+pub use db_pg_schema_reaper::{
+    reap_orphaned_path_schemas, reap_orphaned_path_schemas_with_legacy_options,
+    reap_orphaned_path_schemas_with_workspace_roots, PgSchemaReapReport,
+    DEFAULT_ORPHAN_REAPER_LEGACY_BATCH,
+};
+
+#[cfg(test)]
+pub(crate) use db_pg_schema_reaper::{
+    legacy_orphaned_path_schema_names, live_legacy_workspace_schema_names,
+    orphaned_path_schema_names, owner_path_is_orphaned,
+    owner_path_is_orphaned_with_workspace_roots,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PgSchemaOwnership {
     pub schema_name: String,
@@ -520,159 +535,6 @@ async fn delete_schema_ownership(pool: &PgPool, schema: &str) -> anyhow::Result<
     .execute(pool)
     .await?;
     Ok(())
-}
-
-/// Report from a reap pass over orphaned path-derived schemas.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct PgSchemaReapReport {
-    /// Number of registered path-derived schemas examined.
-    pub scanned: usize,
-    /// Schemas whose owning workspace directory no longer exists (orphans).
-    pub orphans: Vec<String>,
-    /// `true` if the orphans were dropped, `false` for a dry run.
-    pub dropped: bool,
-}
-
-/// True if a path-derived schema's owner store path is orphaned.
-///
-/// File-style logical paths use the directory that contained the store (the owner
-/// path's parent) as the liveness signal. Directory owner paths are registered
-/// separately and use the owner path itself as the liveness signal, so deleting a
-/// workspace directory whose parent still exists is still detected as orphaned.
-/// Older registry rows did not distinguish directory owners, so generated
-/// workspace-key children of known workspace roots are treated as legacy
-/// directory owners.
-///
-/// Only a definitive `NotFound` counts as orphaned. Any other error reading the
-/// liveness path metadata (permissions, a transiently-unavailable mount, etc.) is
-/// treated as "keep", so a transient IO failure can never cause a destructive
-/// drop of a live schema. `metadata` (not `Path::exists`) is used precisely so
-/// these two cases can be distinguished.
-#[cfg(test)]
-fn owner_path_is_orphaned(owner_kind: &str, owner_path: &Path) -> bool {
-    owner_path_is_orphaned_with_workspace_roots(owner_kind, owner_path, &[])
-}
-
-fn owner_path_is_orphaned_with_workspace_roots(
-    owner_kind: &str,
-    owner_path: &Path,
-    workspace_roots: &[PathBuf],
-) -> bool {
-    let liveness_path = if owner_kind == PATH_DERIVED_DIRECTORY_OWNER_KIND
-        || ((owner_kind == PATH_DERIVED_OWNER_KIND
-            || owner_kind == LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND)
-            && is_legacy_workspace_directory_owner_path(owner_path, workspace_roots))
-    {
-        owner_path
-    } else {
-        let Some(parent) = owner_path.parent() else {
-            return false;
-        };
-        parent
-    };
-    match std::fs::metadata(liveness_path) {
-        Ok(_) => false,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-    }
-}
-
-fn orphaned_path_schema_names(
-    rows: Vec<(String, String, Option<String>, Option<String>)>,
-    workspace_roots: Vec<PathBuf>,
-) -> Vec<String> {
-    let mut orphans = Vec::new();
-    for (schema_name, owner_kind, owner_key, owner_path) in rows {
-        // No recorded path: cannot prove the schema is orphaned, so keep it.
-        let Some(liveness_path) =
-            owner_liveness_path(&owner_kind, owner_key.as_deref(), owner_path.as_deref())
-        else {
-            continue;
-        };
-        if owner_path_is_orphaned_with_workspace_roots(
-            &owner_kind,
-            Path::new(liveness_path),
-            &workspace_roots,
-        ) {
-            orphans.push(schema_name);
-        }
-    }
-    orphans
-}
-
-fn owner_liveness_path<'a>(
-    owner_kind: &str,
-    owner_key: Option<&'a str>,
-    owner_path: Option<&'a str>,
-) -> Option<&'a str> {
-    owner_path.or_else(|| {
-        if owner_kind == LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND {
-            owner_key.filter(|key| Path::new(key).is_absolute())
-        } else {
-            None
-        }
-    })
-}
-
-/// Drop registered path-derived schemas whose owning workspace directory is gone.
-///
-/// This bounds Postgres catalog growth automatically: per-job / ephemeral stores
-/// create a schema under their workspace path, and once the workspace is removed
-/// the schema becomes a dead orphan that nothing can reopen. Reaping drops only
-/// those orphans (the owner directory or file owner parent is missing) and the
-/// matching registry rows — never a live store's schema.
-///
-/// With `apply = false` it reports what would be reaped (dry run) without
-/// dropping anything. Must run on the host that owns the workspace paths.
-pub async fn reap_orphaned_path_schemas(
-    pool: &PgPool,
-    apply: bool,
-) -> anyhow::Result<PgSchemaReapReport> {
-    reap_orphaned_path_schemas_with_workspace_roots(pool, apply, &[]).await
-}
-
-pub async fn reap_orphaned_path_schemas_with_workspace_roots(
-    pool: &PgPool,
-    apply: bool,
-    workspace_roots: &[PathBuf],
-) -> anyhow::Result<PgSchemaReapReport> {
-    ensure_pg_schema_registry(pool).await?;
-    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT schema_name, owner_kind, owner_key, owner_path
-         FROM \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\"
-         WHERE owner_kind IN ($1, $2, $3)"
-    ))
-    .bind(PATH_DERIVED_OWNER_KIND)
-    .bind(PATH_DERIVED_DIRECTORY_OWNER_KIND)
-    .bind(LEGACY_PATH_DERIVED_SCHEMA_OWNER_KIND)
-    .fetch_all(pool)
-    .await?;
-
-    let scanned = rows.len();
-    let workspace_roots = workspace_roots.to_vec();
-    let orphans = tokio::task::spawn_blocking(move || {
-        let workspace_roots: Vec<PathBuf> = workspace_roots
-            .iter()
-            .map(|root| normalize_path_for_comparison(root))
-            .collect();
-        orphaned_path_schema_names(rows, workspace_roots)
-    })
-    .await?;
-
-    if apply {
-        for schema_name in &orphans {
-            // Reaping is registry-driven, so stale rows may point at schemas
-            // already removed by manual cleanup or an interrupted prior run.
-            // Delete those ownership rows and keep processing later orphans.
-            drop_schema_cascade_if_exists(pool, schema_name).await?;
-            delete_schema_ownership(pool, schema_name).await?;
-        }
-    }
-
-    Ok(PgSchemaReapReport {
-        scanned,
-        orphans,
-        dropped: apply,
-    })
 }
 
 #[cfg(test)]

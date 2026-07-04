@@ -59,6 +59,8 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.storage.schema_namespace, "workflow");
     assert!(cfg.storage.orphan_reaper_enabled);
     assert_eq!(cfg.storage.orphan_reaper_interval_secs, 3600);
+    assert!(cfg.storage.orphan_reaper_legacy_enabled);
+    assert_eq!(cfg.storage.orphan_reaper_legacy_batch, 200);
     assert!(!cfg.storage.workflow_watchdog_enabled);
     assert_eq!(cfg.storage.workflow_watchdog_age_minutes, 240);
     assert_eq!(cfg.storage.workflow_watchdog_interval_secs, 300);
@@ -196,6 +198,8 @@ storage:
   schema_namespace: orchestration
   orphan_reaper_enabled: false
   orphan_reaper_interval_secs: 44
+  orphan_reaper_legacy_enabled: false
+  orphan_reaper_legacy_batch: 55
   workflow_watchdog_enabled: true
   workflow_watchdog_age_minutes: 12
   workflow_watchdog_interval_secs: 13
@@ -352,6 +356,8 @@ Body
     assert_eq!(cfg.storage.schema_namespace, "orchestration");
     assert!(!cfg.storage.orphan_reaper_enabled);
     assert_eq!(cfg.storage.orphan_reaper_interval_secs, 44);
+    assert!(!cfg.storage.orphan_reaper_legacy_enabled);
+    assert_eq!(cfg.storage.orphan_reaper_legacy_batch, 55);
     assert!(cfg.storage.workflow_watchdog_enabled);
     assert_eq!(cfg.storage.workflow_watchdog_age_minutes, 12);
     assert_eq!(cfg.storage.workflow_watchdog_interval_secs, 13);

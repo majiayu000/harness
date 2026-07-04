@@ -262,6 +262,13 @@ pub struct WorkflowStoragePolicy {
     /// Interval, in seconds, between background orphan-schema reap passes.
     #[serde(default = "default_orphan_reaper_interval_secs")]
     pub orphan_reaper_interval_secs: u64,
+    /// Whether the orphan reaper also scans legacy unregistered path-derived
+    /// schemas by subtracting live workspace-derived schema hashes.
+    #[serde(default = "default_true")]
+    pub orphan_reaper_legacy_enabled: bool,
+    /// Maximum legacy unregistered path-derived schemas to drop per tick.
+    #[serde(default = "default_orphan_reaper_legacy_batch")]
+    pub orphan_reaper_legacy_batch: usize,
     /// Enable workflow-runtime stuck-instance reporting. Off by default so
     /// existing deployments keep their current background behavior on upgrade.
     #[serde(default)]
@@ -406,6 +413,8 @@ impl Default for WorkflowStoragePolicy {
             schema_namespace: default_workflow_schema_namespace(),
             orphan_reaper_enabled: true,
             orphan_reaper_interval_secs: default_orphan_reaper_interval_secs(),
+            orphan_reaper_legacy_enabled: true,
+            orphan_reaper_legacy_batch: default_orphan_reaper_legacy_batch(),
             workflow_watchdog_enabled: false,
             workflow_watchdog_age_minutes: default_workflow_watchdog_age_minutes(),
             workflow_watchdog_interval_secs: default_workflow_watchdog_interval_secs(),
@@ -560,6 +569,10 @@ fn default_workflow_schema_namespace() -> String {
 
 fn default_orphan_reaper_interval_secs() -> u64 {
     3600
+}
+
+fn default_orphan_reaper_legacy_batch() -> usize {
+    crate::db_pg_schema_registry::DEFAULT_ORPHAN_REAPER_LEGACY_BATCH
 }
 
 fn default_workflow_watchdog_age_minutes() -> u64 {

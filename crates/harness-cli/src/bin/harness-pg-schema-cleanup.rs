@@ -61,23 +61,27 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else if report.orphans.is_empty() {
             println!(
-                "No orphaned path-derived schemas (scanned {})",
-                report.scanned
+                "No orphaned path-derived schemas (registered scanned {}, legacy scanned {})",
+                report.registered_scanned, report.legacy_scanned
             );
+            print_legacy_scan_errors(&report.legacy_scan_errors);
         } else {
             println!(
-                "{} {} orphaned schema(s) of {} scanned:",
+                "{} {} orphaned schema(s) of {} scanned (registered reaped {}, legacy reaped {}):",
                 if report.dropped {
                     "Reaped"
                 } else {
                     "Would reap"
                 },
                 report.orphans.len(),
-                report.scanned
+                report.scanned,
+                report.registered_reaped,
+                report.legacy_reaped
             );
             for schema in &report.orphans {
                 println!("  {schema}");
             }
+            print_legacy_scan_errors(&report.legacy_scan_errors);
             if !report.dropped {
                 println!("Re-run with --confirm-drop to drop them.");
             }
@@ -186,6 +190,12 @@ fn print_plan(plan: &PgSchemaCleanupPlan) {
             candidate.estimated_row_count,
             candidate.reason
         );
+    }
+}
+
+fn print_legacy_scan_errors(errors: &[String]) {
+    for error in errors {
+        println!("Legacy scan skipped: {error}");
     }
 }
 
