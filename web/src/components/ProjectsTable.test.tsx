@@ -23,6 +23,7 @@ const p: OverviewProject = {
   queued: 4,
   done: 28,
   failed: 1,
+  stalled: 0,
   merged_24h: 28,
   trend: [1, 2, 3, 4],
   avg_score: 92,

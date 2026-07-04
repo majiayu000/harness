@@ -46,8 +46,8 @@ function wrap(ui: React.ReactElement) {
 }
 
 const PROJECTS = [
-  { id: "alpha", root: "/alpha", agents: ["claude", "codex"], running: 0, queued: 0, done: 0, failed: 0, merged_24h: 0, trend: [], avg_score: null, worktrees: null, tokens_24h: null, latest_pr: null },
-  { id: "beta", root: "/beta", agents: ["gemini"], running: 0, queued: 0, done: 0, failed: 0, merged_24h: 0, trend: [], avg_score: null, worktrees: null, tokens_24h: null, latest_pr: null },
+  { id: "alpha", root: "/alpha", agents: ["claude", "codex"], running: 0, queued: 0, done: 0, failed: 0, stalled: 0, merged_24h: 0, trend: [], avg_score: null, worktrees: null, tokens_24h: null, latest_pr: null },
+  { id: "beta", root: "/beta", agents: ["gemini"], running: 0, queued: 0, done: 0, failed: 0, stalled: 0, merged_24h: 0, trend: [], avg_score: null, worktrees: null, tokens_24h: null, latest_pr: null },
 ];
 
 beforeEach(() => {

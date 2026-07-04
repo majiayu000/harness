@@ -7,6 +7,8 @@ struct FullTaskResponse {
     #[serde(flatten)]
     inner: crate::task_runner::TaskState,
     #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: Option<TaskTerminalInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workflow: Option<TaskWorkflowSummary>,
 }
 
@@ -40,6 +42,8 @@ struct RuntimeTaskResponse {
     issue: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: Option<TaskTerminalInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     depends_on: Vec<TaskId>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -62,8 +66,10 @@ pub(crate) async fn get_task(
     match state.core.tasks.get_with_db_fallback(&task_id).await {
         Ok(Some(task)) => {
             let workflow = enrich_task_workflow(&state, &task).await;
+            let terminal = TaskTerminalInfo::from_status_error(&task.status, task.error.as_deref());
             Json(FullTaskResponse {
                 inner: task,
+                terminal,
                 workflow,
             })
             .into_response()
@@ -137,6 +143,8 @@ async fn runtime_task_response_by_handle(
     let submission_id = submission_handle
         .map(|handle| handle.0)
         .unwrap_or_else(|| task_id.0.clone());
+    let error = runtime_string_field(&workflow.data, "failure_reason");
+    let terminal = TaskTerminalInfo::from_status_error(&task_status, error.as_deref());
     Ok(Some(RuntimeTaskResponse {
         id: submission_id.clone(),
         task_id: submission_id.clone(),
@@ -161,7 +169,8 @@ async fn runtime_task_response_by_handle(
             .map(ToOwned::to_owned),
         project: project_id,
         issue,
-        error: runtime_string_field(&workflow.data, "failure_reason"),
+        error,
+        terminal,
         depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
         subtask_ids: Vec::new(),
         workflow: Some(TaskWorkflowSummary::from_runtime(&workflow)),

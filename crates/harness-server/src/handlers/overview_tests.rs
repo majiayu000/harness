@@ -404,6 +404,74 @@ async fn overview_returns_expected_shape() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = test_helpers::tempdir_in_home("harness-test-overview-stalled-")?;
+    let canonical_root = dir.path().canonicalize()?;
+    let project_root = canonical_root.to_string_lossy().into_owned();
+    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    state
+        .project_svc
+        .register(crate::project_registry::Project {
+            id: project_root.clone(),
+            root: canonical_root.clone(),
+            name: None,
+            max_concurrent: None,
+            default_agent: None,
+            active: true,
+            created_at: Utc::now().to_rfc3339(),
+        })
+        .await?;
+    let mut task = crate::task_runner::TaskState::new(harness_core::types::TaskId(
+        "overview-stalled-task".to_string(),
+    ));
+    task.project_root = Some(canonical_root.clone());
+    task.status = crate::task_runner::TaskStatus::Failed;
+    task.phase = crate::task_runner::TaskPhase::Terminal;
+    task.error = Some(
+        crate::task_runner::TaskTerminalFailure::round_budget_exhausted(
+            1,
+            crate::task_runner::TaskStatus::Reviewing,
+            Some("local_review_gate".to_string()),
+        )
+        .to_reason_string(),
+    );
+    task.scheduler
+        .mark_terminal(&crate::task_runner::TaskStatus::Failed);
+    state.core.tasks.insert(&task).await;
+
+    let app = Router::new()
+        .route("/api/overview", get(overview))
+        .with_state(state);
+    let req = axum::http::Request::builder()
+        .uri("/api/overview")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+    assert_eq!(body["distribution"]["failed"], 1);
+    assert_eq!(body["distribution"]["stalled"], 1);
+    assert_eq!(body["global"]["failed"], 1);
+    assert_eq!(body["global"]["stalled"], 1);
+    let project = body["projects"]
+        .as_array()
+        .and_then(|projects| {
+            projects
+                .iter()
+                .find(|project| project["root"].as_str() == Some(project_root.as_str()))
+        })
+        .ok_or_else(|| anyhow::anyhow!("overview project should be present"))?;
+    assert_eq!(project["failed"], 1);
+    assert_eq!(project["stalled"], 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     if !test_helpers::db_tests_enabled().await {

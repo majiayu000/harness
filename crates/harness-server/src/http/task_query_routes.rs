@@ -15,7 +15,7 @@ use super::state::AppState;
 use crate::runtime_projection::{runtime_string_field, RuntimeWorkflowProjection};
 use crate::task_runner::{
     SchedulerAuthorityState, TaskId, TaskKind, TaskState, TaskStatus, TaskSummary,
-    TaskSummaryFilter, TaskSummaryPageCursor, TaskWorkflowSummary,
+    TaskSummaryFilter, TaskSummaryPageCursor, TaskTerminalInfo, TaskWorkflowSummary,
 };
 use harness_core::proof_of_work::{CiStatus, ProofOfWork, QualitySignal, ReviewOutcome};
 
@@ -54,11 +54,30 @@ struct TaskListCursor {
 
 #[derive(Serialize)]
 struct TaskListResponse {
-    data: Vec<TaskSummary>,
+    data: Vec<TaskSummaryResponse>,
     page: TaskListPage,
     counts: TaskListCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded: Option<TaskListDegradation>,
+}
+
+#[derive(Serialize)]
+struct TaskSummaryResponse {
+    #[serde(flatten)]
+    inner: TaskSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: Option<TaskTerminalInfo>,
+}
+
+impl From<TaskSummary> for TaskSummaryResponse {
+    fn from(summary: TaskSummary) -> Self {
+        let terminal =
+            TaskTerminalInfo::from_status_error(&summary.status, summary.error.as_deref());
+        Self {
+            inner: summary,
+            terminal,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -233,7 +252,7 @@ pub(crate) async fn list_tasks(
             let (data, page) = paginate_task_summaries(&summaries, &query);
             let counts = task_list_counts(&data);
             Json(TaskListResponse {
-                data,
+                data: data.into_iter().map(TaskSummaryResponse::from).collect(),
                 page,
                 counts,
                 degraded,

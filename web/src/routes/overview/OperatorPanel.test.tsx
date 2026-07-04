@@ -110,4 +110,34 @@ describe("<OperatorPanel>", () => {
 
     expect(screen.getByText("Runtime log path unavailable.")).toBeInTheDocument();
   });
+
+  it("renders stalled terminal failures with a readable reason", () => {
+    const snapshot = makeSnapshot();
+    snapshot.recent_failures = [
+      {
+        task_id: "failed-1",
+        external_id: "issue:2",
+        project: "proj",
+        error:
+          '{"reason":"round_budget_exhausted","rounds_used":1,"last_status":"reviewing","waiting_on":"local_review_gate"}',
+        terminal: {
+          status: "failed",
+          classification: "stalled",
+          reason: "round_budget_exhausted",
+          rounds_used: 1,
+          last_status: "reviewing",
+          waiting_on: "local_review_gate",
+        },
+        failed_at: null,
+      },
+    ];
+    mockUseOperatorSnapshot.mockReturnValue({
+      data: snapshot,
+      isError: false,
+    });
+
+    wrap(<OperatorPanel />);
+
+    expect(screen.getByText("Stalled: round budget exhausted · waiting on local review gate")).toBeInTheDocument();
+  });
 });

@@ -147,4 +147,41 @@ describe("<History>", () => {
       "/dashboard?tab=submit&project=harness",
     );
   });
+
+  it("renders budget-exhausted terminal failures as stalled with reason", () => {
+    mockUseAllTasks.mockReturnValue({
+      data: historyTaskList([
+        makeHistoryTask("stalled-budget", {
+          status: "failed",
+          description: "Review budget stopped",
+          error:
+            '{"reason":"round_budget_exhausted","rounds_used":1,"last_status":"reviewing","waiting_on":"local_review_gate"}',
+          terminal: {
+            status: "failed",
+            classification: "stalled",
+            reason: "round_budget_exhausted",
+            rounds_used: 1,
+            last_status: "reviewing",
+            waiting_on: "local_review_gate",
+          },
+        }),
+        makeHistoryTask("plain-failed", {
+          status: "failed",
+          description: "Plain failure",
+          error: "agent crashed",
+        }),
+      ]),
+      isLoading: false,
+      isError: false,
+    });
+
+    render(<History />);
+
+    expect(screen.getAllByText("Stalled").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("round budget exhausted · waiting on local review gate")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "stalled" } });
+    expect(screen.getByText("Review budget stopped")).toBeInTheDocument();
+    expect(screen.queryByText("Plain failure")).not.toBeInTheDocument();
+  });
 });

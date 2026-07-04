@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 pub type TaskId = CoreTaskId;
 
+pub const ROUND_BUDGET_EXHAUSTED_REASON: &str = "round_budget_exhausted";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -208,7 +210,7 @@ impl TaskTerminalFailure {
         waiting_on: Option<String>,
     ) -> Self {
         Self::new(
-            "round_budget_exhausted",
+            ROUND_BUDGET_EXHAUSTED_REASON,
             rounds_used,
             last_status,
             waiting_on,
@@ -218,6 +220,71 @@ impl TaskTerminalFailure {
     pub fn to_reason_string(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| self.reason.clone())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTerminalClassification {
+    Done,
+    Failed,
+    Stalled,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTerminalInfo {
+    pub status: TaskStatus,
+    pub classification: TaskTerminalClassification,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rounds_used: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<TaskStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+}
+
+impl TaskTerminalInfo {
+    pub fn from_status_error(status: &TaskStatus, error: Option<&str>) -> Option<Self> {
+        if !status.is_terminal() {
+            return None;
+        }
+        let failure = error.and_then(parse_terminal_failure);
+        let classification = match status {
+            TaskStatus::Done => TaskTerminalClassification::Done,
+            TaskStatus::Cancelled => TaskTerminalClassification::Cancelled,
+            TaskStatus::Failed
+                if failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.reason == ROUND_BUDGET_EXHAUSTED_REASON) =>
+            {
+                TaskTerminalClassification::Stalled
+            }
+            TaskStatus::Failed => TaskTerminalClassification::Failed,
+            _ => return None,
+        };
+        let reason = failure
+            .as_ref()
+            .map(|failure| failure.reason.clone())
+            .or_else(|| error.map(ToOwned::to_owned));
+        Some(Self {
+            status: status.clone(),
+            classification,
+            reason,
+            rounds_used: failure.as_ref().map(|failure| failure.rounds_used),
+            last_status: failure.as_ref().map(|failure| failure.last_status.clone()),
+            waiting_on: failure.and_then(|failure| failure.waiting_on),
+        })
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        self.classification == TaskTerminalClassification::Stalled
+    }
+}
+
+pub fn parse_terminal_failure(error: &str) -> Option<TaskTerminalFailure> {
+    serde_json::from_str::<TaskTerminalFailure>(error).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

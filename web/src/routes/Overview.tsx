@@ -38,6 +38,13 @@ export function Overview() {
   const isSystemHealthy = !isError && !isOperatorSnapshotError;
   const agentTokens = [...(data?.agent_tokens ?? [])].sort((a, b) => b.tokens_24h - a.tokens_24h);
   const maxAgentTokens = Math.max(...agentTokens.map((a) => a.tokens_24h), 0);
+  const distribution = data?.distribution;
+  const distributionTotal =
+    (distribution?.queued ?? 0) +
+    (distribution?.running ?? 0) +
+    (distribution?.review ?? 0) +
+    (distribution?.merged ?? 0) +
+    (distribution?.failed ?? 0);
 
   const sections: SidebarSection[] = [
     {
@@ -125,13 +132,13 @@ export function Overview() {
             </Panel>
             <Panel
               title="Task distribution"
-              sub={`${fmtInt(Object.values(data?.distribution ?? {}).reduce((a, b) => a + b, 0))} tasks`}
+              sub={`${fmtInt(distributionTotal)} tasks`}
             >
               <div className="p-5">
                 <div className="font-mono text-[11px] text-ink-3">
                   queued {fmtInt(data?.distribution.queued)} · running {fmtInt(data?.distribution.running)} · review{" "}
                   {fmtInt(data?.distribution.review)} · merged {fmtInt(data?.distribution.merged)} · failed{" "}
-                  {fmtInt(data?.distribution.failed)}
+                  {fmtInt(data?.distribution.failed)} · stalled {fmtInt(data?.distribution.stalled)}
                 </div>
                 <div className="mt-5 border-t border-line pt-4">
                   <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-ink-3">Agent usage</div>

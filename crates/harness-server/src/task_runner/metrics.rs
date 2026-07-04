@@ -6,6 +6,7 @@ use std::collections::HashMap;
 pub struct ProjectCounts {
     pub done: u64,
     pub failed: u64,
+    pub stalled: u64,
 }
 
 /// Combined global and per-project done/failed counts produced by a single
@@ -14,6 +15,7 @@ pub struct ProjectCounts {
 pub struct DashboardCounts {
     pub global_done: u64,
     pub global_failed: u64,
+    pub global_stalled: u64,
     pub by_project: HashMap<String, ProjectCounts>,
 }
 

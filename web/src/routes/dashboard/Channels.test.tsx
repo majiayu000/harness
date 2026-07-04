@@ -31,8 +31,8 @@ const hosts = [
 ];
 
 const projects = [
-  { id: "harness", root: "/srv/repos/harness", tasks: { running: 0, queued: 0, done: 0, failed: 0 }, latest_pr: null },
-  { id: "other", root: "/srv/repos/other", tasks: { running: 0, queued: 0, done: 0, failed: 0 }, latest_pr: null },
+  { id: "harness", root: "/srv/repos/harness", tasks: { running: 0, queued: 0, done: 0, failed: 0, stalled: 0 }, latest_pr: null },
+  { id: "other", root: "/srv/repos/other", tasks: { running: 0, queued: 0, done: 0, failed: 0, stalled: 0 }, latest_pr: null },
 ];
 
 beforeEach(() => {
