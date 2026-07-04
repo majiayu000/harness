@@ -118,7 +118,7 @@ pub use store::{
 };
 pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,
-    IssueSubmissionWorkflowAction,
+    IssueSubmissionWorkflowAction, SubmissionMode,
 };
 pub use terminal_state::{workflow_terminal_state, WorkflowTerminalState};
 pub use tier_resolution::{resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution};

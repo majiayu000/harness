@@ -1,9 +1,9 @@
 use super::manifest::EvalBenchmarkCase;
 use crate::runtime::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeCommandDispatcher,
-    RuntimeJobStatus, RuntimeProfile, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
-    WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition,
-    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    RuntimeJobStatus, RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand,
+    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition,
+    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
     GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use chrono::Utc;
@@ -144,6 +144,7 @@ pub async fn enqueue_eval_case_workflow(
             depends_on: &[],
             dependencies_blocked: false,
             remote_fact_hash: None,
+            submission_mode: SubmissionMode::Immediate,
         },
     );
     let decision = with_eval_command_metadata(output.decision, input);
@@ -592,6 +593,7 @@ mod tests {
                 depends_on: &[],
                 dependencies_blocked: false,
                 remote_fact_hash: None,
+                submission_mode: SubmissionMode::Immediate,
             },
         );
         let decision = with_eval_command_metadata(output.decision, input);

@@ -2,7 +2,7 @@ use crate::task_runner::{TaskId, TaskStatus, TaskStore};
 use harness_workflow::runtime::{
     activity_result_value_has_closed_issue_evidence, build_issue_submission_decision,
     build_prompt_submission_decision, value_has_closed_issue_evidence,
-    IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, WorkflowCommand,
+    IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, SubmissionMode, WorkflowCommand,
     WorkflowCommandType, WorkflowDecision, WorkflowEvent, WorkflowInstance, WorkflowRuntimeStore,
     RUNTIME_JOB_COMPLETED_EVENT,
 };
@@ -341,6 +341,7 @@ async fn release_issue_after_dependencies(
             depends_on: &depends_on_strings(depends_on),
             dependencies_blocked: false,
             remote_fact_hash: None,
+            submission_mode: SubmissionMode::Immediate,
         },
     );
     let event = store

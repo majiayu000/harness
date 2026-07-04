@@ -10,6 +10,7 @@ use crate::runtime::plan_issue::{
     ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL,
 };
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
+use crate::runtime::SubmissionMode;
 use serde_json::{json, Value};
 
 pub(super) fn issue_plan_decision_from_activity_result(
@@ -41,6 +42,7 @@ pub(super) fn issue_plan_decision_from_activity_result(
         issue_plan_summary(&issue_plan).unwrap_or_else(|| result.summary.trim().to_string());
     let completion_command_id =
         event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+    let submission_mode = submission_mode_from_event(event);
 
     Some(
         WorkflowDecision::new(
@@ -60,12 +62,22 @@ pub(super) fn issue_plan_decision_from_activity_result(
                 "activity": "implement_issue",
                 "issue_plan": issue_plan,
                 "issue_plan_summary": plan_summary,
+                "submission_mode": submission_mode.as_str(),
             }),
         ))
         .with_evidence(WorkflowEvidence::new("issue_plan", plan_summary))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
+}
+
+fn submission_mode_from_event(event: &WorkflowEvent) -> SubmissionMode {
+    event
+        .event
+        .pointer("/command/command/submission_mode")
+        .and_then(Value::as_str)
+        .and_then(SubmissionMode::from_wire_value)
+        .unwrap_or_default()
 }
 
 fn issue_plan_payload(result: &ActivityResult) -> Option<Value> {
