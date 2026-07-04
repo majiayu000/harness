@@ -198,11 +198,11 @@ pub async fn reap_orphaned_path_schemas_with_legacy_options(
         let legacy_workspace_roots = workspace_roots.to_vec();
         let legacy_candidates = unregistered_legacy_path_schema_names(pool).await?;
         tokio::task::spawn_blocking(move || {
-            legacy_orphaned_path_schema_names(
-                legacy_candidates,
-                &legacy_workspace_roots,
-                legacy_batch,
-            )
+            let workspace_roots: Vec<PathBuf> = legacy_workspace_roots
+                .iter()
+                .map(|root| normalize_path_for_comparison(root))
+                .collect();
+            legacy_orphaned_path_schema_names(legacy_candidates, &workspace_roots, legacy_batch)
         })
         .await?
     } else {
