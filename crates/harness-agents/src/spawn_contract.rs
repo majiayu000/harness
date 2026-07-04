@@ -7,6 +7,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+use crate::scoped_token::{
+    CONTAINER_GH_TOKEN_ENV, CONTAINER_GITHUB_TOKEN_ENV, SCOPED_GITHUB_TOKEN_ENV,
+};
+
 const DEFAULT_AGENT_CONTAINER_IMAGE: &str = "harness-agent:latest";
 const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
 const AGENT_EGRESS_PROXY_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY";
@@ -162,17 +166,32 @@ fn host_process_env(env_vars: &HashMap<String, String>) -> BTreeMap<String, Stri
     env_vars
         .iter()
         .filter(|(key, _)| !is_spawn_control_env(key))
+        .filter(|(key, _)| key.as_str() != SCOPED_GITHUB_TOKEN_ENV)
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
 
 fn container_env_vars(env_vars: &HashMap<String, String>) -> BTreeMap<String, String> {
-    env_vars
+    let mut env = env_vars
         .iter()
         .filter(|(key, _)| !is_spawn_control_env(key))
+        .filter(|(key, _)| key.as_str() != SCOPED_GITHUB_TOKEN_ENV)
         .filter(|(key, _)| !is_operator_secret_env(key))
         .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    if let Some(scoped_token) = env_vars
+        .get(SCOPED_GITHUB_TOKEN_ENV)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        env.insert(
+            CONTAINER_GITHUB_TOKEN_ENV.to_string(),
+            scoped_token.to_string(),
+        );
+        env.insert(CONTAINER_GH_TOKEN_ENV.to_string(), scoped_token.to_string());
+    }
+    env
 }
 
 fn docker_process_env() -> BTreeMap<String, String> {
@@ -190,6 +209,7 @@ fn is_spawn_control_env(key: &str) -> bool {
             | AGENT_NETWORK_ALLOWLIST_ENV
             | AGENT_CONTAINER_IMAGE_ENV
             | AGENT_EGRESS_PROXY_ENV
+            | SCOPED_GITHUB_TOKEN_ENV
     )
 }
 
@@ -427,7 +447,11 @@ mod container_spawn_tests {
 
         let args = string_args(&spawn);
         assert!(args.contains(&format!("{AGENT_RUN_ID_ENV}=ar-01j00000000000000000000000")));
-        assert!(args.contains(&"HARNESS_SCOPED_GITHUB_TOKEN=scoped-token".to_string()));
+        assert!(args.contains(&"GITHUB_TOKEN=scoped-token".to_string()));
+        assert!(args.contains(&"GH_TOKEN=scoped-token".to_string()));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("HARNESS_SCOPED_GITHUB_TOKEN=")));
         assert!(args.contains(&"CARGO_TARGET_DIR=/workspace/target".to_string()));
         assert!(!args.iter().any(|arg| arg.contains("operator-token")));
         assert!(!args.iter().any(|arg| arg.contains("operator-key")));
