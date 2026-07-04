@@ -1,8 +1,12 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
 use super::status::WorkflowCommandStatus;
 use super::store::{RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
+use super::tier_resolution::{
+    resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution,
+};
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
+use harness_core::config::isolation::{IsolationConfig, IsolationTrustClass};
 use serde_json::json;
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -105,6 +109,7 @@ impl From<RuntimeProfile> for RuntimeProfileSelector {
 pub struct RuntimeCommandDispatcher<'a> {
     store: &'a WorkflowRuntimeStore,
     profile_selector: RuntimeProfileSelector,
+    isolation_config: IsolationConfig,
     batch_limit: i64,
     dispatcher_id: String,
     lease_duration: Duration,
@@ -122,10 +127,16 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         Self {
             store,
             profile_selector,
+            isolation_config: IsolationConfig::default(),
             batch_limit: 25,
             dispatcher_id: format!("dispatcher:{}", Uuid::new_v4()),
             lease_duration: Duration::seconds(30),
         }
+    }
+
+    pub fn with_isolation_config(mut self, isolation_config: IsolationConfig) -> Self {
+        self.isolation_config = isolation_config;
+        self
     }
 
     pub fn with_batch_limit(mut self, batch_limit: i64) -> Self {
@@ -186,7 +197,8 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             });
         }
 
-        if let Some(instance) = self.store.get_instance(&command.workflow_id).await? {
+        let instance = self.store.get_instance(&command.workflow_id).await?;
+        if let Some(instance) = instance.as_ref() {
             if instance.is_terminal() {
                 let command_status = if instance.state == "cancelled" {
                     COMMAND_STATUS_CANCELLED
@@ -208,6 +220,14 @@ impl<'a> RuntimeCommandDispatcher<'a> {
 
         let activity = command.command.runtime_activity_key().to_string();
         let runtime_profile = self.profile_for_command(&command).await?;
+        let isolation =
+            isolation_resolution_for_instance(instance.as_ref(), &self.isolation_config)
+                .with_context(|| {
+                    format!(
+                        "failed to resolve isolation tier for workflow {}",
+                        command.workflow_id
+                    )
+                })?;
         let not_before = retry_not_before_for_command(&command)?;
         match self
             .store
@@ -224,6 +244,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                     "activity": activity,
                     "command": command.command.command.clone(),
                     "runtime_profile": runtime_profile.clone(),
+                    "isolation": isolation,
                 }),
                 not_before,
             )
@@ -265,6 +286,33 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             )
             .clone())
     }
+}
+
+fn isolation_resolution_for_instance(
+    instance: Option<&super::model::WorkflowInstance>,
+    config: &IsolationConfig,
+) -> anyhow::Result<IsolationTierResolution> {
+    let metadata = match instance {
+        Some(instance) => IsolationTaskMetadata {
+            author_trust_class: author_trust_class_from_data(&instance.data)?,
+        },
+        None => IsolationTaskMetadata::default(),
+    };
+    Ok(resolve_isolation_tier(metadata, config))
+}
+
+fn author_trust_class_from_data(
+    data: &serde_json::Value,
+) -> anyhow::Result<Option<IsolationTrustClass>> {
+    let Some(value) = data.get("author_trust_class") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .with_context(|| format!("invalid author_trust_class in workflow metadata: {value}"))
 }
 
 fn retry_not_before_for_command(
