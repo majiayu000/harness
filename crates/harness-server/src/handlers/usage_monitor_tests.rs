@@ -1,5 +1,10 @@
+use super::usage_monitor_aggregate::UsageAggregate;
+use super::usage_monitor_candidate::{
+    candidate_attribution_index, candidate_usage_groups, CandidateUsageAttribution,
+};
 use super::*;
-use harness_workflow::runtime::RuntimeKind;
+use harness_core::types::{Decision, SessionId};
+use harness_workflow::runtime::{RuntimeKind, WorkflowCommandType};
 
 #[test]
 fn burn_level_marks_stale_running_job_high() {
@@ -93,6 +98,143 @@ fn runtime_attribution_tokens_include_runtime_job_and_command_ids() {
 
     assert!(tokens.contains("command-1"));
     assert!(tokens.contains(&runtime_job_id));
+}
+
+#[test]
+fn candidate_usage_attribution_index_matches_runtime_candidate_keys() {
+    let row = candidate_runtime_row(2);
+    let runtime_job_id = row.runtime_job.id.clone();
+    let index = candidate_attribution_index(&[row]);
+
+    assert_eq!(
+        index
+            .get("command-1449-c2")
+            .map(|candidate| candidate.candidate_id.as_str()),
+        Some("workflow-1449:candidate-group:issue-1449:c2")
+    );
+    assert_eq!(
+        index
+            .get(runtime_job_id.as_str())
+            .map(|candidate| candidate.candidate_id.as_str()),
+        Some("workflow-1449:candidate-group:issue-1449:c2")
+    );
+    assert_eq!(
+        index
+            .get("workflow-1449:candidate-group:issue-1449:c2")
+            .map(|candidate| candidate.candidate_index),
+        Some(Some(2))
+    );
+    assert_eq!(
+        index
+            .get("issue-1449-c2")
+            .map(|candidate| candidate.candidate_id.as_str()),
+        Some("workflow-1449:candidate-group:issue-1449:c2")
+    );
+    assert!(
+        !index.contains_key("workflow-task"),
+        "shared workflow task IDs must not be attributed to a single candidate"
+    );
+}
+
+#[test]
+fn candidate_usage_parse_event_uses_runtime_candidate_attribution() {
+    let row = candidate_runtime_row(2);
+    let index = candidate_attribution_index(&[row]);
+    let mut event = Event::new(SessionId::new(), "llm_usage", "codex", Decision::Complete);
+    event.content = Some(
+        serde_json::json!({
+            "agent": "codex",
+            "model": "gpt-5",
+            "task_id": "issue-1449-c2",
+            "project": "/repo",
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 3,
+            "cache_creation_input_tokens": 2,
+        })
+        .to_string(),
+    );
+
+    let record = parse_usage_event(&event, &PriceCatalog::default(), &index)
+        .expect("usage event should parse");
+    let candidate = record
+        .candidate
+        .expect("candidate attribution should be resolved");
+
+    assert_eq!(
+        candidate.candidate_group_id,
+        "workflow-1449:candidate-group:issue-1449"
+    );
+    assert_eq!(
+        candidate.candidate_id,
+        "workflow-1449:candidate-group:issue-1449:c2"
+    );
+    assert_eq!(candidate.candidate_index, Some(2));
+    assert_eq!(record.metrics.total_tokens(), 20);
+}
+
+#[test]
+fn candidate_usage_group_total_equals_candidate_sum() {
+    let records = vec![
+        candidate_usage_record(
+            1,
+            UsageMetrics {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 2,
+                cache_creation_input_tokens: 1,
+                reported_total_tokens: None,
+            },
+            Some(1.0),
+        ),
+        candidate_usage_record(
+            2,
+            UsageMetrics {
+                input_tokens: 7,
+                output_tokens: 9,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 3,
+                reported_total_tokens: None,
+            },
+            Some(2.0),
+        ),
+    ];
+
+    let groups = candidate_usage_groups(&records, true);
+
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!(
+        group.candidate_group_id,
+        "workflow-1449:candidate-group:issue-1449"
+    );
+    assert_eq!(group.candidates.len(), 2);
+    assert_eq!(group.candidates[0].candidate_index, Some(1));
+    assert_eq!(group.candidates[1].candidate_index, Some(2));
+
+    let candidate_token_sum: u64 = group
+        .candidates
+        .iter()
+        .map(|candidate| candidate.total_tokens)
+        .sum();
+    let candidate_request_sum: u64 = group
+        .candidates
+        .iter()
+        .map(|candidate| candidate.request_count)
+        .sum();
+    let candidate_cost_sum: f64 = group
+        .candidates
+        .iter()
+        .map(|candidate| candidate.estimated_cost_usd.unwrap_or_default())
+        .sum();
+
+    assert_eq!(group.total_tokens, candidate_token_sum);
+    assert_eq!(group.request_count, candidate_request_sum);
+    assert_eq!(group.estimated_cost_usd, Some(candidate_cost_sum));
+    assert_eq!(group.input_tokens, 17);
+    assert_eq!(group.output_tokens, 14);
+    assert_eq!(group.cache_read_input_tokens, 2);
+    assert_eq!(group.cache_creation_input_tokens, 4);
 }
 
 #[test]
@@ -238,6 +380,86 @@ fn agent_invocation_ends_in_flight_after_latest_turn_result() {
     let invocation = agent_invocation_from_row(&row, now);
 
     assert!(!invocation.in_flight_model_turn);
+}
+
+fn candidate_runtime_row(candidate_index: u32) -> RuntimeUsageRow {
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1449"),
+    )
+    .with_id("workflow-1449")
+    .with_data(serde_json::json!({
+        "issue_number": 1449,
+        "task_id": "workflow-task",
+    }));
+    let command_id = format!("command-1449-c{candidate_index}");
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        format!("impl-1449-c{candidate_index}"),
+        serde_json::json!({
+            "activity": "implement_issue",
+            "candidate": candidate_metadata(candidate_index),
+        }),
+    );
+    let mut runtime_job = RuntimeJob::pending(
+        command_id.clone(),
+        RuntimeKind::CodexExec,
+        "codex-default",
+        serde_json::json!({
+            "workflow_id": "workflow-1449",
+            "command_id": command_id,
+            "activity": "implement_issue",
+            "command": command.command.clone(),
+        }),
+    );
+    runtime_job.id = format!("runtime-job-c{candidate_index}");
+
+    RuntimeUsageRow {
+        workflow,
+        command_id: format!("command-1449-c{candidate_index}"),
+        command_status: "dispatched".to_string(),
+        command,
+        runtime_job,
+        latest_runtime_event_type: None,
+        latest_runtime_event_at: None,
+        runtime_turn_started: false,
+        activity_result_ready_after_latest_turn: false,
+    }
+}
+
+fn candidate_usage_record(
+    candidate_index: u32,
+    metrics: UsageMetrics,
+    estimated_cost_usd: Option<f64>,
+) -> UsageRecord {
+    UsageRecord {
+        agent: "codex".to_string(),
+        model: "gpt-5".to_string(),
+        project: "/repo".to_string(),
+        metrics,
+        estimated_cost_usd,
+        candidate: Some(candidate_attribution(candidate_index)),
+    }
+}
+
+fn candidate_attribution(candidate_index: u32) -> CandidateUsageAttribution {
+    CandidateUsageAttribution {
+        candidate_group_id: "workflow-1449:candidate-group:issue-1449".to_string(),
+        candidate_id: format!("workflow-1449:candidate-group:issue-1449:c{candidate_index}"),
+        candidate_index: Some(candidate_index),
+        candidate_count: Some(2),
+    }
+}
+
+fn candidate_metadata(candidate_index: u32) -> serde_json::Value {
+    serde_json::json!({
+        "candidate_group_id": "workflow-1449:candidate-group:issue-1449",
+        "candidate_id": format!("workflow-1449:candidate-group:issue-1449:c{candidate_index}"),
+        "candidate_index": candidate_index,
+        "candidate_count": 2,
+    })
 }
 
 fn test_invocation(
