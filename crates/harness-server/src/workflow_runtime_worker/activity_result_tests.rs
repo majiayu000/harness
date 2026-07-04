@@ -116,6 +116,153 @@ Final result:
 }
 
 #[test]
+fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_issue"
+        }),
+    );
+    let items = vec![Item::AgentReasoning {
+        content: r#"Implementation report.
+
+```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":"PR is open with pending CI/review quota blockers. Gemini and Codex review bots both posted quota/credit-limit notices, so this is not merge-ready."}
+```"#
+            .to_string(),
+    }];
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.activity, "implement_issue");
+    assert_eq!(result.status, ActivityStatus::Blocked);
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("claimed succeeded")));
+    assert!(result.signals.iter().any(|signal| {
+        signal.signal_type == "ActivityStatusContractDowngraded"
+            && signal.signal["effective_status"] == "blocked"
+    }));
+    let contract = artifact_by_type(&result, "activity_status_contract");
+    assert_eq!(contract.artifact["claimed_status"], "succeeded");
+    assert_eq!(contract.artifact["effective_status"], "blocked");
+    assert!(contract.artifact["blocker_signals"]
+        .as_array()
+        .is_some_and(|signals| signals.iter().any(|signal| signal == "text:pending_ci")));
+    assert!(contract.artifact["blocker_signals"]
+        .as_array()
+        .is_some_and(|signals| signals
+            .iter()
+            .any(|signal| signal == "text:review_quota_blocker")));
+    assert!(contract.artifact["blocker_signals"]
+        .as_array()
+        .is_some_and(|signals| signals
+            .iter()
+            .any(|signal| signal == "text:not_merge_ready")));
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "status_contract_downgraded");
+    assert_eq!(envelope["final_result"]["status"], "blocked");
+}
+
+#[test]
+fn activity_result_from_turn_downgrades_succeeded_with_structured_blockers() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "inspect_pr_feedback"
+        }),
+    );
+    let items = vec![Item::AgentReasoning {
+        content: r#"Inspection report.
+
+```harness-activity-result
+{"activity":"inspect_pr_feedback","status":"succeeded","summary":"PR feedback inspection completed.","artifacts":[{"artifact_type":"pr_readiness","artifact":{"open_review_threads":2,"pending_checks":["Test"],"review_decision":"CHANGES_REQUESTED"}}]}
+```"#
+            .to_string(),
+    }];
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.status, ActivityStatus::Blocked);
+    let contract = artifact_by_type(&result, "activity_status_contract");
+    let Some(blockers) = contract.artifact["blocker_signals"].as_array() else {
+        panic!("blocker signals should be recorded");
+    };
+    assert!(blockers
+        .iter()
+        .any(|signal| signal == "field:open_review_threads"));
+    assert!(blockers
+        .iter()
+        .any(|signal| signal == "field:pending_checks"));
+    assert!(blockers
+        .iter()
+        .any(|signal| signal == "field:review_decision_changes_requested"));
+}
+
+#[test]
+fn activity_result_from_turn_leaves_blocked_status_unchanged() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_issue"
+        }),
+    );
+    let items = vec![Item::AgentReasoning {
+        content: r#"Implementation report.
+
+```harness-activity-result
+{"activity":"implement_issue","status":"blocked","summary":"PR is open with pending CI."}
+```"#
+            .to_string(),
+    }];
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.status, ActivityStatus::Blocked);
+    assert!(!result
+        .signals
+        .iter()
+        .any(|signal| signal.signal_type == "ActivityStatusContractDowngraded"));
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "accepted");
+    assert_eq!(envelope["final_result"]["status"], "blocked");
+}
+
+#[test]
 fn activity_result_from_turn_rejects_generic_json_activity_result_block() {
     let job = RuntimeJob::pending(
         "command-1",
