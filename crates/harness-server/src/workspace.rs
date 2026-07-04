@@ -226,13 +226,21 @@ pub(crate) struct StartupReconciliation {
     pub(crate) released_leases: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedLiveWorkspace {
+    pub(crate) path: PathBuf,
+    pub(crate) task_id: TaskId,
+    pub(crate) owner_session: String,
+}
+
 /// Summary produced by the periodic disk reconciliation scan.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct DiskReconciliationSummary {
     pub(crate) scanned: u32,
     pub(crate) removed: u32,
     pub(crate) skipped_uuid: u32,
     pub(crate) skipped_open: u32,
+    pub(crate) skipped_live: Vec<SkippedLiveWorkspace>,
     pub(crate) released_leases: u32,
 }
 

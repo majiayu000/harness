@@ -131,6 +131,9 @@ async fn reconcile_disk_removes_closed_issue_pool_slot_workspace() {
 #[tokio::test]
 async fn reconcile_disk_skips_live_persisted_lease_from_other_manager() -> anyhow::Result<()> {
     let _env_guard = async_env_lock().lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
     let source = tempfile::tempdir()?;
     init_git_repo(source.path());
     let branch = current_branch(source.path());
@@ -176,6 +179,10 @@ async fn reconcile_disk_skips_live_persisted_lease_from_other_manager() -> anyho
 
     assert_eq!(summary.removed, 0);
     assert_eq!(summary.skipped_open, 1);
+    assert_eq!(summary.skipped_live.len(), 1);
+    assert_eq!(summary.skipped_live[0].path, lease.workspace_path);
+    assert_eq!(summary.skipped_live[0].task_id, task_id);
+    assert_eq!(summary.skipped_live[0].owner_session, lease.owner_session);
     assert!(
         lease.workspace_path.exists(),
         "disk GC must not remove a workspace with a persisted live lease from another manager"
@@ -261,6 +268,126 @@ async fn reconcile_disk_releases_dead_persisted_lease_before_cleanup() -> anyhow
         "dead persisted lease should be released before disk GC preservation checks"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn reclaim_gate_skips_live_persisted_lease() -> anyhow::Result<()> {
+    let _env_guard = async_env_lock().lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("workspace-leases")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let mgr = WorkspaceManager::new_with_pool(
+        config,
+        WorkspacePoolConfig::default(),
+        Some(store.clone()),
+    )?;
+    let task_id = harness_core::types::TaskId("reclaim-gate-live-task".to_string());
+
+    let lease = mgr
+        .create_workspace(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("myorg/my-repo"),
+        )
+        .await?;
+
+    let outcome =
+        try_reclaim_workspace(source.path(), &lease.workspace_path, Some(&store), None).await?;
+
+    assert_eq!(
+        outcome,
+        WorkspaceReclaimOutcome::SkippedLiveLease {
+            task_id: task_id.clone(),
+            owner_session: lease.owner_session.clone(),
+        }
+    );
+    assert!(
+        lease.workspace_path.exists(),
+        "reclaim gate must preserve live leased workspaces"
+    );
+
+    mgr.remove_workspace(&task_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_orphan_worktrees_reclaim_gate_skips_live_persisted_lease() -> anyhow::Result<()> {
+    let _env_guard = async_env_lock().lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("workspace-leases")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let mgr_a = WorkspaceManager::new_with_pool(
+        config.clone(),
+        WorkspacePoolConfig::default(),
+        Some(store.clone()),
+    )?;
+    let mgr_b =
+        WorkspaceManager::new_with_pool(config, WorkspacePoolConfig::default(), Some(store))?;
+    let task_id = harness_core::types::TaskId("live-terminal-orphan-task".to_string());
+
+    let lease = mgr_a
+        .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
+        .await?;
+
+    mgr_b
+        .cleanup_orphan_worktrees(source.path(), std::slice::from_ref(&task_id))
+        .await;
+
+    assert!(
+        lease.workspace_path.exists(),
+        "orphan cleanup must not remove a workspace with a persisted live lease from another manager"
+    );
+
+    mgr_a.remove_workspace(&task_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reclaim_gate_deletes_workspace_without_live_lease() -> anyhow::Result<()> {
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let workspace = tempfile::tempdir()?;
+    let workspace_path = workspace.path().join("dead-workspace");
+    std::fs::create_dir_all(&workspace_path)?;
+
+    let outcome = try_reclaim_workspace(source.path(), &workspace_path, None, Some(false)).await?;
+
+    assert_eq!(outcome, WorkspaceReclaimOutcome::Deleted);
+    assert!(
+        !workspace_path.exists(),
+        "reclaim gate must delete unleased workspaces"
+    );
     Ok(())
 }
 
