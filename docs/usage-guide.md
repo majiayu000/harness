@@ -731,6 +731,11 @@ harness gc run .           # Detect signals, generate remediation drafts
 # Skills
 harness skill list         # List discovered skills
 
+# Container isolation
+See `docs/container-tier-operator-guide.md` to build the reference Codex/Claude
+agent image, pin it by digest, and route non-collaborator intake to the
+container tier.
+
 # ExecPlan
 harness plan init spec.md           # Initialize execution plan
 harness plan status exec-plan.md    # Check plan status
