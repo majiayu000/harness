@@ -11,6 +11,8 @@ pub struct IsolationTierResolution {
     pub tier: IsolationTier,
     pub reason: String,
     pub trust_class: IsolationTrustClass,
+    #[serde(default)]
+    pub network_allowlist: Vec<String>,
 }
 
 pub fn resolve_isolation_tier(
@@ -35,6 +37,7 @@ pub fn resolve_isolation_tier(
         tier,
         reason,
         trust_class,
+        network_allowlist: config.network_allowlist.clone(),
     }
 }
 
@@ -59,6 +62,7 @@ mod tests {
 
         assert_eq!(resolution.tier, IsolationTier::Host);
         assert_eq!(resolution.trust_class, IsolationTrustClass::Trusted);
+        assert!(resolution.network_allowlist.is_empty());
         assert!(resolution.reason.contains("default isolation tier"));
     }
 
@@ -70,7 +74,7 @@ mod tests {
                 trust: IsolationTrustClass::NonCollaborator,
                 tier: IsolationTier::Container,
             }],
-            network_allowlist: Vec::new(),
+            network_allowlist: vec!["github.com".to_string(), "api.anthropic.com".to_string()],
         };
 
         let resolution = resolve_isolation_tier(
@@ -82,6 +86,10 @@ mod tests {
 
         assert_eq!(resolution.tier, IsolationTier::Container);
         assert_eq!(resolution.trust_class, IsolationTrustClass::NonCollaborator);
+        assert_eq!(
+            resolution.network_allowlist,
+            vec!["github.com".to_string(), "api.anthropic.com".to_string()]
+        );
         assert!(resolution
             .reason
             .contains("matched configured isolation rule"));

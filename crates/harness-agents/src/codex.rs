@@ -389,26 +389,34 @@ impl CodeAgent for CodexAgent {
         } else {
             SandboxSpec::new(sandbox_mode, &req.project_root)
         };
-        let wrapped_command =
-            wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "sandbox setup failed for codex: {error}"
-                ))
+        let mut spawn_env_vars = req.env_vars.clone();
+        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
+        run_identity.write_env_vars(&mut spawn_env_vars);
+        if self.cloud.enabled {
+            for key in &self.cloud.setup_secret_env {
+                spawn_env_vars.remove(key);
+            }
+        }
+        let prepared_spawn =
+            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+                program: &self.cli_path,
+                args: &base_args,
+                project_root: &req.project_root,
+                sandbox_spec: &sandbox_spec,
+                env_vars: &spawn_env_vars,
             })?;
 
-        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let mut cmd = Command::new(&wrapped_command.program);
-        cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root)
+        let mut cmd = Command::new(&prepared_spawn.program);
+        cmd.args(&prepared_spawn.args)
+            .current_dir(&prepared_spawn.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
+        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
         crate::strip_claude_env(&mut cmd);
-        cmd.envs(&req.env_vars);
-        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -417,18 +425,18 @@ impl CodeAgent for CodexAgent {
         }
 
         log_codex_spawn_attempt(
-            &wrapped_command.program,
-            wrapped_command.args.len(),
+            &prepared_spawn.program,
+            prepared_spawn.args.len(),
             &req,
-            wrapped_command.engine,
+            prepared_spawn.sandbox_engine,
             "execute",
         );
         let child = cmd.spawn().map_err(|err| {
             let message = codex_spawn_failure_message(
                 &err,
-                &wrapped_command.program,
+                &prepared_spawn.program,
                 &req,
-                wrapped_command.engine,
+                prepared_spawn.sandbox_engine,
                 "execute",
             );
             tracing::error!(
@@ -444,7 +452,7 @@ impl CodeAgent for CodexAgent {
                 &run_identity,
                 "codex",
                 pid,
-                &req.project_root,
+                &prepared_spawn.current_dir,
             );
         }
         let mut child = crate::ManagedChild::new(child, "codex execute");
@@ -509,26 +517,34 @@ impl CodeAgent for CodexAgent {
         } else {
             SandboxSpec::new(sandbox_mode, &req.project_root)
         };
-        let wrapped_command =
-            wrap_command(&self.cli_path, &base_args, &sandbox_spec).map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "sandbox setup failed for codex: {error}"
-                ))
+        let mut spawn_env_vars = req.env_vars.clone();
+        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
+        run_identity.write_env_vars(&mut spawn_env_vars);
+        if self.cloud.enabled {
+            for key in &self.cloud.setup_secret_env {
+                spawn_env_vars.remove(key);
+            }
+        }
+        let prepared_spawn =
+            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+                program: &self.cli_path,
+                args: &base_args,
+                project_root: &req.project_root,
+                sandbox_spec: &sandbox_spec,
+                env_vars: &spawn_env_vars,
             })?;
 
-        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let mut cmd = Command::new(&wrapped_command.program);
-        cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root)
+        let mut cmd = Command::new(&prepared_spawn.program);
+        cmd.args(&prepared_spawn.args)
+            .current_dir(&prepared_spawn.current_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
+        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
         crate::strip_claude_env(&mut cmd);
-        cmd.envs(&req.env_vars);
-        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -537,18 +553,18 @@ impl CodeAgent for CodexAgent {
         }
 
         log_codex_spawn_attempt(
-            &wrapped_command.program,
-            wrapped_command.args.len(),
+            &prepared_spawn.program,
+            prepared_spawn.args.len(),
             &req,
-            wrapped_command.engine,
+            prepared_spawn.sandbox_engine,
             "execute_stream",
         );
         let child = cmd.spawn().map_err(|error| {
             let message = codex_spawn_failure_message(
                 &error,
-                &wrapped_command.program,
+                &prepared_spawn.program,
                 &req,
-                wrapped_command.engine,
+                prepared_spawn.sandbox_engine,
                 "execute_stream",
             );
             tracing::error!(
@@ -564,7 +580,7 @@ impl CodeAgent for CodexAgent {
                 &run_identity,
                 "codex",
                 pid,
-                &req.project_root,
+                &prepared_spawn.current_dir,
             );
         }
         let mut child = crate::ManagedChild::new(child, "codex execute_stream");

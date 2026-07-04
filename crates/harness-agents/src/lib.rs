@@ -7,6 +7,7 @@ pub mod codex;
 pub mod codex_adapter;
 pub mod provider_backpressure;
 pub mod registry;
+mod spawn_contract;
 mod streaming;
 
 use harness_core::run_id::{RunIdentity, AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
