@@ -664,3 +664,87 @@ fn legacy_path_schema_name_detection_is_exact() {
     assert!(!is_legacy_path_schema_name("h0123456789abcdeg"));
     assert!(!is_legacy_path_schema_name("h0123456789abcde"));
 }
+
+#[test]
+fn live_legacy_workspace_schema_names_hashes_workspace_and_known_stores() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let workspace_root = parent.path().join("workspaces");
+    let workspace = workspace_root.join("abcd1234__owner_repo__issue_42");
+    std::fs::create_dir_all(&workspace)?;
+
+    let live_schemas = live_legacy_workspace_schema_names(&[workspace_root])?;
+
+    assert!(live_schemas.contains(&crate::db_pg::pg_schema_for_path(&workspace)?));
+    assert!(live_schemas.contains(&crate::db_pg::pg_schema_for_path(
+        &crate::config::dirs::default_db_path(&workspace, "tasks")
+    )?));
+    assert!(live_schemas.contains(&crate::db_pg::pg_schema_for_path(
+        &crate::config::dirs::default_db_path(&workspace, "plans")
+    )?));
+    Ok(())
+}
+
+#[test]
+fn legacy_orphan_selection_keeps_live_workspace_schemas_and_bounds_batch() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let workspace_root = parent.path().join("workspaces");
+    let workspace = workspace_root.join("550e8400-e29b-41d4-a716-446655440000");
+    std::fs::create_dir_all(&workspace)?;
+    let live_schema = crate::db_pg::pg_schema_for_path(&crate::config::dirs::default_db_path(
+        &workspace, "tasks",
+    ))?;
+    let first_orphan = "h1111111111111111".to_string();
+    let second_orphan = "h2222222222222222".to_string();
+
+    let scan = legacy_orphaned_path_schema_names(
+        vec![live_schema.clone(), first_orphan.clone(), second_orphan],
+        &[workspace_root],
+        1,
+    );
+
+    assert_eq!(scan.scanned, 3);
+    assert_eq!(scan.orphans, vec![first_orphan]);
+    assert!(scan.errors.is_empty());
+    assert!(!scan.orphans.contains(&live_schema));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_orphan_selection_normalizes_symlinked_workspace_root() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let workspace_root = parent.path().join("workspaces");
+    let linked_root = parent.path().join("linked-workspaces");
+    let workspace = workspace_root.join("550e8400-e29b-41d4-a716-446655440000");
+    std::fs::create_dir_all(&workspace)?;
+    std::os::unix::fs::symlink(&workspace_root, &linked_root)?;
+    let live_schema = crate::db_pg::pg_schema_for_path(&crate::config::dirs::default_db_path(
+        &workspace, "tasks",
+    ))?;
+    let orphan = "h3333333333333333".to_string();
+
+    let scan = legacy_orphaned_path_schema_names(
+        vec![live_schema.clone(), orphan.clone()],
+        &[linked_root],
+        10,
+    );
+
+    assert_eq!(scan.orphans, vec![orphan]);
+    assert!(!scan.orphans.contains(&live_schema));
+    assert!(scan.errors.is_empty());
+    Ok(())
+}
+
+#[test]
+fn legacy_orphan_selection_keeps_all_candidates_when_workspace_root_is_ambiguous() {
+    let scan = legacy_orphaned_path_schema_names(
+        vec!["h1111111111111111".to_string()],
+        &[PathBuf::from("/definitely/missing/harness/workspaces")],
+        200,
+    );
+
+    assert_eq!(scan.scanned, 1);
+    assert!(scan.orphans.is_empty());
+    assert_eq!(scan.errors.len(), 1);
+    assert!(scan.errors[0].contains("failed to read workspace root"));
+}

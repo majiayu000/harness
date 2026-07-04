@@ -29,6 +29,13 @@ database_url = "postgres://harness:harness@localhost:5432/harness"
 data_dir = "/home/yourname/.local/share/harness"
 project_root = "."
 
+# Workflow storage sweepers are configured in WORKFLOW.md, not this TOML file.
+# The orphan schema reaper defaults are:
+#   orphan_reaper_enabled: true
+#   orphan_reaper_interval_secs: 3600
+#   orphan_reaper_legacy_enabled: true
+#   orphan_reaper_legacy_batch: 200
+
 [concurrency]
 # High-reasoning agent runs can stay silent for several minutes while thinking.
 # Increase this when using gpt-5.5/xhigh for background workflow runtime jobs.

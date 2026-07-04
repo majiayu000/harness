@@ -11,9 +11,10 @@ pub use crate::db_pg::{
 };
 pub use crate::db_pg_schema_registry::{
     apply_pg_schema_cleanup, ensure_pg_schema_registry, pg_schema_cleanup_plan,
-    reap_orphaned_path_schemas, reap_orphaned_path_schemas_with_workspace_roots,
-    register_pg_schema_ownership, PgSchemaCleanupAction, PgSchemaCleanupCandidate,
-    PgSchemaCleanupPlan, PgSchemaDropResult, PgSchemaOwnership, PgSchemaReapReport,
+    reap_orphaned_path_schemas, reap_orphaned_path_schemas_with_legacy_options,
+    reap_orphaned_path_schemas_with_workspace_roots, register_pg_schema_ownership,
+    PgSchemaCleanupAction, PgSchemaCleanupCandidate, PgSchemaCleanupPlan, PgSchemaDropResult,
+    PgSchemaOwnership, PgSchemaReapReport, DEFAULT_ORPHAN_REAPER_LEGACY_BATCH,
     PG_SCHEMA_REGISTRY_SCHEMA, PG_SCHEMA_REGISTRY_TABLE,
 };
 

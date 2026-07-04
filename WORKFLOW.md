@@ -56,6 +56,10 @@ runtime_retry_policy:
   activity_retries: {}
 storage:
   schema_namespace: workflow
+  orphan_reaper_enabled: true
+  orphan_reaper_interval_secs: 3600
+  orphan_reaper_legacy_enabled: true
+  orphan_reaper_legacy_batch: 200
   workflow_watchdog_enabled: false
   workflow_watchdog_age_minutes: 240
   workflow_watchdog_interval_secs: 300

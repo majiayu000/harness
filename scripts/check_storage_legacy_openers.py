@@ -285,6 +285,18 @@ def is_allowed_legacy_context(
     return False
 
 
+def is_allowed_legacy_hash_discovery(
+    path: Path,
+    current_function: str | None,
+    pattern: str,
+) -> bool:
+    return (
+        path.name == "db_pg_schema_reaper.rs"
+        and current_function == "live_legacy_workspace_schema_names"
+        and pattern == "pg_schema_for_path("
+    )
+
+
 def scan_file(path: Path) -> list[Violation]:
     if is_test_source(path):
         return []
@@ -363,7 +375,7 @@ def scan_file(path: Path) -> list[Violation]:
         for pattern in LEGACY_PATTERNS:
             if pattern not in line:
                 continue
-            if is_allowed:
+            if is_allowed or is_allowed_legacy_hash_discovery(path, current_function, pattern):
                 continue
             violations.append(Violation(path, index + 1, pattern, line))
         for alias, function_name in function_aliases.items():
@@ -607,6 +619,14 @@ def run_self_test() -> int:
                 pub fn allowed_cfg_nested_all_test(path: &std::path::Path) {
                     let _ = PgStoreContext::from_legacy_path_schema(path, None);
                 }
+            }
+            """,
+        )
+        write(
+            root / "crates/demo/src/db_pg_schema_reaper.rs",
+            """
+            pub fn live_legacy_workspace_schema_names(path: &std::path::Path) {
+                let _ = pg_schema_for_path(path);
             }
             """,
         )

@@ -61,21 +61,46 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
             } else if let Some(store) = state.core.workflow_runtime_store.as_ref() {
                 let workspace_roots =
                     workspace_roots_for_reaper(state.concurrency.workspace_mgr.as_deref());
-                match harness_core::db::reap_orphaned_path_schemas_with_workspace_roots(
+                match harness_core::db::reap_orphaned_path_schemas_with_legacy_options(
                     store.pool(),
                     true,
                     &workspace_roots,
+                    workflow_cfg.storage.orphan_reaper_legacy_enabled,
+                    workflow_cfg.storage.orphan_reaper_legacy_batch,
                 )
                 .await
                 {
-                    Ok(report) if !report.orphans.is_empty() => {
-                        tracing::info!(
-                            scanned = report.scanned,
-                            reaped = report.orphans.len(),
-                            "orphan schema reaper dropped orphaned path-derived schemas"
-                        );
+                    Ok(report) => {
+                        if !report.legacy_scan_errors.is_empty() {
+                            tracing::warn!(
+                                registered_scanned = report.registered_scanned,
+                                registered_reaped = report.registered_reaped,
+                                legacy_scanned = report.legacy_scanned,
+                                legacy_reaped = report.legacy_reaped,
+                                legacy_scan_errors = ?report.legacy_scan_errors,
+                                "orphan schema reaper skipped legacy path-derived schema reaping"
+                            );
+                        }
+                        if report.orphans.is_empty() {
+                            tracing::debug!(
+                                registered_scanned = report.registered_scanned,
+                                registered_reaped = report.registered_reaped,
+                                legacy_scanned = report.legacy_scanned,
+                                legacy_reaped = report.legacy_reaped,
+                                "orphan schema reaper tick found no orphaned path-derived schemas"
+                            );
+                        } else {
+                            tracing::info!(
+                                scanned = report.scanned,
+                                reaped = report.orphans.len(),
+                                registered_scanned = report.registered_scanned,
+                                registered_reaped = report.registered_reaped,
+                                legacy_scanned = report.legacy_scanned,
+                                legacy_reaped = report.legacy_reaped,
+                                "orphan schema reaper dropped orphaned path-derived schemas"
+                            );
+                        }
                     }
-                    Ok(_) => {}
                     Err(error) => {
                         tracing::warn!("orphan schema reaper tick failed: {error}");
                     }

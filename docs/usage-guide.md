@@ -532,6 +532,10 @@ Workflow-runtime watchdog and retention sweepers are configured in
 
 ```yaml
 storage:
+  orphan_reaper_enabled: true
+  orphan_reaper_interval_secs: 3600
+  orphan_reaper_legacy_enabled: true
+  orphan_reaper_legacy_batch: 200
   workflow_watchdog_enabled: false
   workflow_watchdog_age_minutes: 240
   workflow_watchdog_interval_secs: 300
@@ -541,6 +545,11 @@ storage:
   runtime_retention_batch_size: 1000
   runtime_retention_interval_secs: 3600
 ```
+
+The orphan schema reaper is enabled by default. It drops registered
+path-derived schemas with dead owner paths and, in bounded batches, legacy
+unregistered `h<16-hex>` schemas that cannot be matched to a live workspace
+directory or known store path under the configured workspace root.
 
 Enable `workflow_watchdog_enabled` first. It is read-only: aged `blocked` and
 `awaiting_feedback` workflow instances appear in `/api/operator-monitor` under
