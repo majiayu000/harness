@@ -236,6 +236,50 @@ pub(super) async fn cleanup_workspace_path(
     cleanup_workspace_path_with_registration(source_repo, workspace_path, None).await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceReclaimOutcome {
+    Deleted,
+    SkippedLiveLease {
+        task_id: TaskId,
+        owner_session: String,
+    },
+    SkippedLeaseLookupFailed {
+        error: String,
+    },
+}
+
+pub(super) async fn try_reclaim_workspace(
+    source_repo: &Path,
+    workspace_path: &Path,
+    lease_store: Option<&WorkspaceLeaseStore>,
+    known_worktree_registered: Option<bool>,
+) -> anyhow::Result<WorkspaceReclaimOutcome> {
+    if let Some(store) = lease_store {
+        match store.leased_workspace_path(workspace_path).await {
+            Ok(Some(record)) => {
+                return Ok(WorkspaceReclaimOutcome::SkippedLiveLease {
+                    task_id: record.task_id,
+                    owner_session: record.owner_session,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(WorkspaceReclaimOutcome::SkippedLeaseLookupFailed {
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+
+    cleanup_workspace_path_with_registration(
+        source_repo,
+        workspace_path,
+        known_worktree_registered,
+    )
+    .await?;
+    Ok(WorkspaceReclaimOutcome::Deleted)
+}
+
 pub(super) async fn cleanup_workspace_path_with_registration(
     source_repo: &Path,
     workspace_path: &Path,

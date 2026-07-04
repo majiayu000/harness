@@ -38,6 +38,20 @@ impl DiskRateLimiter {
     }
 }
 
+fn record_skipped_live_workspace(
+    summary: &mut DiskReconciliationSummary,
+    path: &Path,
+    task_id: TaskId,
+    owner_session: String,
+) {
+    summary.skipped_open += 1;
+    summary.skipped_live.push(SkippedLiveWorkspace {
+        path: path.to_path_buf(),
+        task_id,
+        owner_session,
+    });
+}
+
 impl WorkspaceManager {
     pub(crate) async fn reconcile_startup(
         &self,
@@ -276,7 +290,12 @@ impl WorkspaceManager {
                             task_id = %record.task_id.0,
                             "reconcile_disk_workspaces: skipping workspace with persisted live lease"
                         );
-                        summary.skipped_open += 1;
+                        record_skipped_live_workspace(
+                            &mut summary,
+                            &path,
+                            record.task_id,
+                            record.owner_session,
+                        );
                         continue;
                     }
                     Ok(None) => {}
@@ -338,8 +357,30 @@ impl WorkspaceManager {
             );
 
             if should_remove {
-                match self.cleanup_workspace_path_locked(source_repo, &path).await {
-                    Ok(()) => summary.removed += 1,
+                let _git_ops = self.git_ops.lock().await;
+                match try_reclaim_workspace(source_repo, &path, self.lease_store.as_deref(), None)
+                    .await
+                {
+                    Ok(WorkspaceReclaimOutcome::Deleted) => summary.removed += 1,
+                    Ok(WorkspaceReclaimOutcome::SkippedLiveLease {
+                        task_id,
+                        owner_session,
+                    }) => {
+                        tracing::debug!(
+                            workspace_path = ?path,
+                            task_id = %task_id.0,
+                            owner_session = %owner_session,
+                            "reconcile_disk_workspaces: reclaim gate skipped live workspace"
+                        );
+                        record_skipped_live_workspace(&mut summary, &path, task_id, owner_session);
+                    }
+                    Ok(WorkspaceReclaimOutcome::SkippedLeaseLookupFailed { error }) => {
+                        tracing::warn!(
+                            workspace_path = ?path,
+                            "reconcile_disk_workspaces: reclaim gate failed closed after lease lookup error: {error}"
+                        );
+                        summary.skipped_open += 1;
+                    }
                     Err(e) => tracing::warn!(
                         "reconcile_disk_workspaces: cleanup failed for {path:?}: {e}"
                     ),
@@ -354,6 +395,8 @@ impl WorkspaceManager {
             removed = summary.removed,
             skipped_uuid = summary.skipped_uuid,
             skipped_open = summary.skipped_open,
+            skipped_live = summary.skipped_live.len(),
+            skipped_live_workspaces = ?summary.skipped_live,
             released_leases = summary.released_leases,
             "reconcile_disk_workspaces: scan complete"
         );
@@ -431,12 +474,34 @@ impl WorkspaceManager {
             if self.active.iter().any(|e| e.workspace_path == path) {
                 continue;
             }
-            tracing::info!(
-                "cleanup_orphan_worktrees: removing orphan worktree {:?}",
-                path
-            );
-            if let Err(e) = remove_worktree(source_repo, &path).await {
-                tracing::warn!("cleanup_orphan_worktrees: failed to remove {:?}: {e}", path);
+            match try_reclaim_workspace(source_repo, &path, self.lease_store.as_deref(), None).await
+            {
+                Ok(WorkspaceReclaimOutcome::Deleted) => {
+                    tracing::info!(
+                        "cleanup_orphan_worktrees: removed orphan worktree {:?}",
+                        path
+                    );
+                }
+                Ok(WorkspaceReclaimOutcome::SkippedLiveLease {
+                    task_id,
+                    owner_session,
+                }) => {
+                    tracing::debug!(
+                        workspace_path = ?path,
+                        task_id = %task_id.0,
+                        owner_session = %owner_session,
+                        "cleanup_orphan_worktrees: reclaim gate skipped live workspace"
+                    );
+                }
+                Ok(WorkspaceReclaimOutcome::SkippedLeaseLookupFailed { error }) => {
+                    tracing::warn!(
+                        workspace_path = ?path,
+                        "cleanup_orphan_worktrees: reclaim gate failed closed after lease lookup error: {error}"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("cleanup_orphan_worktrees: failed to remove {:?}: {e}", path);
+                }
             }
         }
 
