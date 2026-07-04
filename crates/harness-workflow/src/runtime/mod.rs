@@ -37,12 +37,15 @@ pub use bus::InMemoryWorkflowBus;
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use errors::RuntimeJobNotFoundError;
 pub use eval::{
-    collect_eval_case_evidence, collect_eval_case_evidence_from_records,
-    dispatch_eval_case_workflow, enqueue_eval_case_workflow, parse_benchmark_manifest_str,
-    score_pr_repair_eval, EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseDispatchOutcome,
-    EvalCaseEnqueueOutcome, EvalCaseEvidence, EvalCaseWorkflowInput, EvalCaseWorkflowPlan,
-    EvalEvidenceStatus, EvalQualityGateEvidence, EvalSubmissionEvidence, ManifestError,
-    ScoringError, DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
+    collect_eval_case_evidence, collect_eval_case_evidence_from_records, diff_eval_run_reports,
+    dispatch_eval_case_workflow, enqueue_eval_case_workflow, eval_report_dry_run,
+    eval_report_from_evidence, parse_benchmark_manifest_str, score_pr_repair_eval,
+    EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseDispatchOutcome, EvalCaseEnqueueOutcome,
+    EvalCaseEvidence, EvalCaseTransition, EvalCaseTransitionKind, EvalCaseWorkflowInput,
+    EvalCaseWorkflowPlan, EvalEvidenceStatus, EvalQualityGateEvidence, EvalReportCase,
+    EvalReportCaseStatus, EvalReportError, EvalReportMetricDelta, EvalReportMetrics, EvalRunReport,
+    EvalRunReportDiff, EvalSubmissionEvidence, ManifestError, ScoringError,
+    DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use model::{
