@@ -1,5 +1,6 @@
 pub mod event_store;
 pub mod health;
+pub mod otel_attributes;
 mod otel_export;
 pub mod quality;
 pub mod session;

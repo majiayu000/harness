@@ -53,6 +53,8 @@ impl SessionStartDeduper {
 
 pub struct OtelPipeline {
     log_user_prompt: bool,
+    _trajectory_enabled: bool,
+    _capture_content: bool,
     seen_sessions: Mutex<SessionStartDeduper>,
     tracer_provider: opentelemetry_sdk::trace::TracerProvider,
     tracer: opentelemetry_sdk::trace::Tracer,
@@ -106,6 +108,8 @@ impl OtelPipeline {
 
         Ok(Some(Self {
             log_user_prompt: config.log_user_prompt,
+            _trajectory_enabled: config.trajectory,
+            _capture_content: config.capture_content,
             seen_sessions: Mutex::new(SessionStartDeduper::new(MAX_TRACKED_CONVERSATION_SESSIONS)),
             tracer_provider,
             tracer,
@@ -117,6 +121,16 @@ impl OtelPipeline {
             tool_decision_total,
             tool_execution_duration_ms,
         }))
+    }
+
+    #[cfg(test)]
+    fn trajectory_enabled(&self) -> bool {
+        self._trajectory_enabled
+    }
+
+    #[cfg(test)]
+    fn capture_content_enabled(&self) -> bool {
+        self._capture_content
     }
 
     pub fn record_event(&self, event: &Event) {
@@ -530,5 +544,44 @@ mod tests {
         };
         let result = OtelPipeline::from_config(&config).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn otel_trajectory_config_defaults_off_and_accepts_explicit_flags() {
+        let default_config = OtelConfig::default();
+        assert!(!default_config.trajectory);
+        assert!(!default_config.capture_content);
+
+        let config = OtelConfig {
+            trajectory: true,
+            capture_content: true,
+            ..OtelConfig::default()
+        };
+        assert!(config.trajectory);
+        assert!(config.capture_content);
+    }
+
+    #[tokio::test]
+    async fn otel_trajectory_config_reaches_pipeline_flags() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        let config = OtelConfig {
+            exporter: OtelExporter::OtlpHttp,
+            endpoint: Some(endpoint),
+            trajectory: true,
+            capture_content: true,
+            ..OtelConfig::default()
+        };
+
+        let pipeline = OtelPipeline::from_config(&config)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("enabled exporter should initialize"))?;
+
+        assert!(pipeline.trajectory_enabled());
+        assert!(pipeline.capture_content_enabled());
+        pipeline.shutdown().await;
+        accept.await??;
+        Ok(())
     }
 }
