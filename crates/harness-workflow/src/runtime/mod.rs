@@ -5,6 +5,7 @@
 //! instances, accepted commands, runtime jobs, and structured activity results.
 
 pub mod bus;
+mod candidate_selection;
 pub mod dispatcher;
 pub mod errors;
 pub mod eval;
@@ -40,6 +41,11 @@ mod tests;
 mod tier_resolution_dispatch_tests;
 
 pub use bus::InMemoryWorkflowBus;
+pub use candidate_selection::{
+    select_candidate, CandidateCheckConclusion, CandidateDiffScope, CandidateEvidence,
+    CandidateOutcome, CandidatePromotionRecord, CandidateRankingRecord, CandidateSelectionInput,
+    CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
+};
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use errors::RuntimeJobNotFoundError;
 pub use eval::{
