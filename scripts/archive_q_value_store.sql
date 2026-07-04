@@ -40,9 +40,13 @@ BEGIN
             'q_value_store_legacy_backfills'
         ]
         LOOP
-            EXECUTE format('SELECT count(*) FROM %I.%I', archive_schema, archive_table)
-                INTO archived_rows;
-            RAISE NOTICE '%.% rows: %', archive_schema, archive_table, archived_rows;
+            IF to_regclass(format('%I.%I', archive_schema, archive_table)) IS NULL THEN
+                RAISE NOTICE '%.% table is absent', archive_schema, archive_table;
+            ELSE
+                EXECUTE format('SELECT count(*) FROM %I.%I', archive_schema, archive_table)
+                    INTO archived_rows;
+                RAISE NOTICE '%.% rows: %', archive_schema, archive_table, archived_rows;
+            END IF;
         END LOOP;
     END IF;
 END
