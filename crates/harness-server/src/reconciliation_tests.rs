@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 
 #[path = "reconciliation_blocked_done_tests.rs"]
 mod blocked_done_tests;
+#[path = "reconciliation_local_review_gate_tests.rs"]
+mod local_review_gate_tests;
 #[path = "reconciliation_ready_to_merge_tests.rs"]
 mod ready_to_merge_tests;
 

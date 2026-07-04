@@ -5,29 +5,25 @@ pub(super) fn validate_decision(
     decision: &WorkflowDecision,
     context: &ValidationContext,
 ) -> Result<(), WorkflowDecisionRejection> {
-    if is_blocked_done_transition(decision) {
-        validate_blocked_done_reconciliation(decision, context)?;
+    if is_reconciliation_only_pr_merge_done_transition(decision) {
+        validate_reconciliation_only_pr_merge_done(decision, context)?;
     }
     Ok(())
 }
 
-pub(super) fn is_blocked_done_transition(decision: &WorkflowDecision) -> bool {
-    decision.observed_state == "blocked" && decision.next_state == "done"
-}
-
-pub(super) fn validate_blocked_done_reconciliation(
+pub(super) fn validate_reconciliation_only_pr_merge_done(
     decision: &WorkflowDecision,
     context: &ValidationContext,
 ) -> Result<(), WorkflowDecisionRejection> {
     if context.actor != "reconciliation" || decision.decision != "reconcile_pr_merged" {
         return Err(missing_terminal_evidence(
-            "blocked issue workflows can only be marked done by PR-merge reconciliation",
+            "issue workflows in reconciliation-only states can only be marked done by PR-merge reconciliation",
         ));
     }
 
     if !decision.commands.iter().any(is_pr_merge_mark_done_command) {
         return Err(missing_terminal_evidence(
-            "blocked issue PR-merge reconciliation requires pr_number plus pr_url or repo evidence",
+            "issue PR-merge reconciliation requires pr_number plus pr_url or repo evidence",
         ));
     }
 
@@ -37,11 +33,18 @@ pub(super) fn validate_blocked_done_reconciliation(
         .any(|evidence| evidence.kind == "github_pr")
     {
         return Err(missing_terminal_evidence(
-            "blocked issue PR-merge reconciliation requires github_pr evidence",
+            "issue PR-merge reconciliation requires github_pr evidence",
         ));
     }
 
     Ok(())
+}
+
+pub(super) fn is_reconciliation_only_pr_merge_done_transition(decision: &WorkflowDecision) -> bool {
+    matches!(
+        decision.observed_state.as_str(),
+        "blocked" | "local_review_gate"
+    ) && decision.next_state == "done"
 }
 
 fn is_pr_merge_mark_done_command(command: &WorkflowCommand) -> bool {
