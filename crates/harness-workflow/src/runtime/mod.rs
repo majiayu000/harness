@@ -7,6 +7,7 @@
 pub mod bus;
 pub mod dispatcher;
 pub mod errors;
+pub mod eval;
 mod job_claim;
 pub mod lease_state;
 pub mod model;
@@ -35,6 +36,10 @@ mod tests;
 pub use bus::InMemoryWorkflowBus;
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use errors::RuntimeJobNotFoundError;
+pub use eval::{
+    parse_benchmark_manifest_str, score_pr_repair_eval, EvalBenchmarkCase, EvalBenchmarkManifest,
+    ManifestError, ScoringError, DEFAULT_CASE_TIMEOUT_SECS,
+};
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use model::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, ActivityStatus,
