@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum FailureClass {
+    ZeroOutputSpawnFailure,
     QuotaInteractiveWait,
     CliMissingFile,
     WorktreeCollision,
@@ -18,6 +19,7 @@ pub(crate) enum FailureClass {
 impl FailureClass {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::ZeroOutputSpawnFailure => "zero-output-spawn-failure",
             Self::QuotaInteractiveWait => "quota-interactive-wait",
             Self::CliMissingFile => "cli-missing-file",
             Self::WorktreeCollision => "worktree-collision",
@@ -30,6 +32,12 @@ impl FailureClass {
 
 pub(crate) fn classify_agent_failure(error: &str) -> FailureClass {
     let lower = error.to_ascii_lowercase();
+    if lower.contains("zero_output_spawn_failure")
+        || lower.contains("zero-output spawn failure")
+        || lower.contains("completed without assistant output")
+    {
+        return FailureClass::ZeroOutputSpawnFailure;
+    }
     if error.contains("Reading additional input")
         || lower.contains("hit your limit")
         || lower.contains("hit your usage limit")
@@ -424,6 +432,14 @@ mod tests {
 
     #[test]
     fn classify_agent_failure_maps_known_classes() {
+        assert_eq!(
+            classify_agent_failure("agent completed without assistant output"),
+            FailureClass::ZeroOutputSpawnFailure
+        );
+        assert_eq!(
+            classify_agent_failure("outcome=zero_output_spawn_failure"),
+            FailureClass::ZeroOutputSpawnFailure
+        );
         assert_eq!(
             classify_agent_failure(
                 "codex exited with exit status: 1: stderr=[Reading additional input"
