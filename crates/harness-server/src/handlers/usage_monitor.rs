@@ -20,12 +20,21 @@ use crate::http::AppState;
 
 #[path = "usage_monitor_active.rs"]
 mod usage_monitor_active;
+#[path = "usage_monitor_aggregate.rs"]
+mod usage_monitor_aggregate;
+#[path = "usage_monitor_candidate.rs"]
+mod usage_monitor_candidate;
 #[path = "usage_monitor_local_usage.rs"]
 mod usage_monitor_local_usage;
 #[path = "usage_monitor_process.rs"]
 mod usage_monitor_process;
 
 use usage_monitor_active::{aggregate_active_counts, burn_level, runtime_job_status, runtime_kind};
+use usage_monitor_aggregate::{aggregate_usage, total_usage_aggregate, UsageGroup};
+use usage_monitor_candidate::{
+    candidate_attribution_index, candidate_usage_groups, usage_record_candidate,
+    CandidateUsageGroup,
+};
 use usage_monitor_local_usage::{load_local_usage_summaries, LocalUsageSourceSummary};
 use usage_monitor_process::{sample_agent_processes, AgentProcess};
 
@@ -47,6 +56,7 @@ struct UsageMonitorResponse {
     tokens_by_agent: Vec<UsageGroup>,
     tokens_by_project: Vec<UsageGroup>,
     tokens_by_model: Vec<UsageGroup>,
+    candidate_usage: Vec<CandidateUsageGroup>,
     agent_invocations: Vec<AgentInvocation>,
     external_agent_processes: Vec<AgentProcess>,
     local_usage_sources: Vec<LocalUsageSourceSummary>,
@@ -102,63 +112,6 @@ struct UsageSummary {
     external_agent_processes: u64,
 }
 
-#[derive(Debug, Default, Clone)]
-struct UsageAggregate {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
-    request_count: u64,
-    estimated_cost_usd: f64,
-    missing_price: bool,
-}
-
-impl UsageAggregate {
-    fn add(&mut self, metrics: &UsageMetrics, estimated_cost_usd: Option<f64>) {
-        self.input_tokens = self.input_tokens.saturating_add(metrics.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(metrics.output_tokens);
-        self.cache_read_input_tokens = self
-            .cache_read_input_tokens
-            .saturating_add(metrics.cache_read_input_tokens);
-        self.cache_creation_input_tokens = self
-            .cache_creation_input_tokens
-            .saturating_add(metrics.cache_creation_input_tokens);
-        self.request_count = self.request_count.saturating_add(1);
-        match estimated_cost_usd {
-            Some(cost) => self.estimated_cost_usd += cost,
-            None => self.missing_price = true,
-        }
-    }
-
-    fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cache_read_input_tokens)
-            .saturating_add(self.cache_creation_input_tokens)
-    }
-
-    fn estimated_cost_json(&self, prices_configured: bool) -> Option<f64> {
-        if prices_configured && !self.missing_price {
-            Some(round_cost(self.estimated_cost_usd))
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct UsageGroup {
-    name: String,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
-    total_tokens: u64,
-    request_count: u64,
-    estimated_cost_usd: Option<f64>,
-    cost_confidence: &'static str,
-}
-
 #[derive(Debug)]
 struct UsageRecord {
     agent: String,
@@ -166,6 +119,7 @@ struct UsageRecord {
     project: String,
     metrics: UsageMetrics,
     estimated_cost_usd: Option<f64>,
+    candidate: Option<usage_monitor_candidate::CandidateUsageAttribution>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,8 +281,10 @@ async fn build_usage_monitor_response(
     let now = Utc::now();
     let window = UsageWindow::from_query(query.hours, now);
     let price_catalog = PriceCatalog::from_env_cached();
-    let usage_records = load_usage_records(state, window, price_catalog).await?;
     let runtime_rows = load_runtime_usage_rows(state, window.since, query.limit).await?;
+    let candidate_attributions = candidate_attribution_index(&runtime_rows);
+    let usage_records =
+        load_usage_records(state, window, price_catalog, &candidate_attributions).await?;
     let agent_invocations = runtime_rows
         .iter()
         .map(|row| agent_invocation_from_row(row, now))
@@ -346,6 +302,7 @@ async fn build_usage_monitor_response(
     );
     let tokens_by_model =
         aggregate_usage(&usage_records, |record| record.model.clone(), price_catalog);
+    let candidate_usage = candidate_usage_groups(&usage_records, price_catalog.configured());
     let total_usage = total_usage_aggregate(&usage_records);
 
     let running_agent_invocations = agent_invocations
@@ -417,6 +374,7 @@ async fn build_usage_monitor_response(
         tokens_by_agent,
         tokens_by_project,
         tokens_by_model,
+        candidate_usage,
         active_by_repo: aggregate_active_counts(&agent_invocations, |invocation| {
             invocation
                 .repo
@@ -442,6 +400,7 @@ async fn load_usage_records(
     state: &AppState,
     window: UsageWindow,
     price_catalog: &PriceCatalog,
+    candidate_attributions: &usage_monitor_candidate::CandidateAttributionIndex,
 ) -> anyhow::Result<Vec<UsageRecord>> {
     let events = state
         .observability
@@ -456,11 +415,15 @@ async fn load_usage_records(
         .await?;
     Ok(events
         .iter()
-        .filter_map(|event| parse_usage_event(event, price_catalog))
+        .filter_map(|event| parse_usage_event(event, price_catalog, candidate_attributions))
         .collect())
 }
 
-fn parse_usage_event(event: &Event, price_catalog: &PriceCatalog) -> Option<UsageRecord> {
+fn parse_usage_event(
+    event: &Event,
+    price_catalog: &PriceCatalog,
+    candidate_attributions: &usage_monitor_candidate::CandidateAttributionIndex,
+) -> Option<UsageRecord> {
     let content = event.content.as_deref()?;
     let payload: Value = serde_json::from_str(content).ok()?;
     let metrics = UsageMetrics::from_payload(&payload)?;
@@ -480,12 +443,14 @@ fn parse_usage_event(event: &Event, price_catalog: &PriceCatalog) -> Option<Usag
         .unwrap_or_default()
         .to_string();
     let estimated_cost_usd = price_catalog.estimate(&model, &metrics);
+    let candidate = usage_record_candidate(&payload, candidate_attributions);
     Some(UsageRecord {
         agent,
         model,
         project,
         metrics,
         estimated_cost_usd,
+        candidate,
     })
 }
 
@@ -717,59 +682,6 @@ fn runtime_profile_from_job(job: &RuntimeJob) -> Option<RuntimeProfile> {
     job.input
         .get("runtime_profile")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
-}
-
-fn aggregate_usage<F>(
-    records: &[UsageRecord],
-    key_fn: F,
-    price_catalog: &PriceCatalog,
-) -> Vec<UsageGroup>
-where
-    F: Fn(&UsageRecord) -> String,
-{
-    let mut groups: BTreeMap<String, UsageAggregate> = BTreeMap::new();
-    for record in records {
-        groups
-            .entry(key_fn(record))
-            .or_default()
-            .add(&record.metrics, record.estimated_cost_usd);
-    }
-    let mut rows = groups
-        .into_iter()
-        .map(|(name, usage)| usage_group(name, usage, price_catalog.configured()))
-        .collect::<Vec<_>>();
-    rows.sort_by(|a, b| {
-        b.total_tokens
-            .cmp(&a.total_tokens)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    rows
-}
-
-fn total_usage_aggregate(records: &[UsageRecord]) -> UsageAggregate {
-    let mut usage = UsageAggregate::default();
-    for record in records {
-        usage.add(&record.metrics, record.estimated_cost_usd);
-    }
-    usage
-}
-
-fn usage_group(name: String, usage: UsageAggregate, prices_configured: bool) -> UsageGroup {
-    UsageGroup {
-        name,
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_input_tokens: usage.cache_read_input_tokens,
-        cache_creation_input_tokens: usage.cache_creation_input_tokens,
-        total_tokens: usage.total_tokens(),
-        request_count: usage.request_count,
-        estimated_cost_usd: usage.estimated_cost_json(prices_configured),
-        cost_confidence: if prices_configured && !usage.missing_price {
-            "exact_tokens_estimated_price"
-        } else {
-            "price_unavailable"
-        },
-    }
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
