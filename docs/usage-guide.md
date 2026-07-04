@@ -451,6 +451,11 @@ If no new commits have landed since the last review, the cycle is skipped.
 | `exporter` | `"disabled"` | OTLP exporter: `disabled`, `otlp-http`, `otlp-grpc` |
 | `endpoint` | — | OTLP collector endpoint URL |
 | `log_user_prompt` | `false` | Include user prompts in trace spans |
+| `trajectory` | `false` | Emit derived workflow, activity, and agent-turn spans when an OTLP exporter is enabled |
+| `capture_content` | `false` | Privacy gate for prompt or response content events; keep disabled unless content export has explicit operator approval |
+
+See [OTel Trajectory Quickstart](otel-trajectory-quickstart.md) for a local
+Tempo walkthrough.
 
 ### `[concurrency]`
 

@@ -1,0 +1,14 @@
+services:
+  otel-lgtm:
+    image: grafana/otel-lgtm:latest
+    container_name: harness-otel-lgtm
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    volumes:
+      - harness_otel_lgtm_data:/data
+
+volumes:
+  harness_otel_lgtm_data:
+    name: harness_otel_lgtm_data
