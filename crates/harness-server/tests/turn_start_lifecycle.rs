@@ -4,7 +4,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
-use harness_core::config::HarnessConfig;
+use harness_core::config::{stall_timeout::MIN_STALL_TIMEOUT_SECS, HarnessConfig};
 use harness_core::error::HarnessError;
 use harness_core::types::{Capability, Item, ThreadId, TokenUsage, Turn, TurnId, TurnStatus};
 use harness_server::{
@@ -16,7 +16,7 @@ use harness_server::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{advance, sleep, Duration, Instant};
 
 static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -359,8 +359,7 @@ async fn turn_fails_on_stall_timeout() -> anyhow::Result<()> {
     config.server.project_root = project_root.clone();
     config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock".to_string();
-    // Use a very short stall timeout so the test completes quickly.
-    config.concurrency.stall_timeout_secs = 1;
+    config.concurrency.stall_timeout_secs = MIN_STALL_TIMEOUT_SECS;
 
     let mut registry = AgentRegistry::new("mock");
     registry.register("mock", MockAgent::block_forever());
@@ -373,9 +372,11 @@ async fn turn_fails_on_stall_timeout() -> anyhow::Result<()> {
     let running = fetch_turn(&state, &turn_id).await?;
     assert_eq!(running.status, TurnStatus::Running);
 
-    // Allow 5s for the 1s stall to fire and persist the Failed state.
+    tokio::time::pause();
+    advance(Duration::from_secs(MIN_STALL_TIMEOUT_SECS + 1)).await;
+
     let failed =
-        wait_for_status(&state, &turn_id, TurnStatus::Failed, Duration::from_secs(5)).await?;
+        wait_for_status(&state, &turn_id, TurnStatus::Failed, Duration::from_secs(1)).await?;
     // The stall-detection path must append an Item::Error with the stall-specific reason,
     // not merely a generic fallback message.
     assert!(

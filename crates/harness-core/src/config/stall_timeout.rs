@@ -56,6 +56,13 @@ mod tests {
     }
 
     #[test]
+    fn normalize_floors_without_wall_clock_timeout() {
+        let normalized = normalize_stall_timeout_secs(1, None);
+        assert_eq!(normalized.effective_secs, MIN_STALL_TIMEOUT_SECS);
+        assert!(normalized.was_adjusted());
+    }
+
+    #[test]
     fn normalize_clamps_stall_below_wall_clock_timeout() {
         let normalized = normalize_stall_timeout_secs(3600, Some(3600));
         assert_eq!(normalized.effective_secs, 3599);
