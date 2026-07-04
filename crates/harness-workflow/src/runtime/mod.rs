@@ -18,6 +18,7 @@ pub mod prompt_task;
 pub mod quality_gate;
 pub mod reducer;
 pub mod remote_facts;
+pub mod repo_memory;
 pub mod state_registry;
 pub mod status;
 pub mod store;
@@ -94,6 +95,7 @@ pub use reducer::{
 pub use remote_facts::{
     remote_fact_command_dedupe_key, stable_remote_fact_hash, RemoteFactSnapshot,
 };
+pub use repo_memory::{RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord};
 pub use state_registry::{
     known_workflow_definition_ids, workflow_state_definition, workflow_state_exists,
     workflow_states_for_definition, workflow_terminal_state_names_for_definition,
