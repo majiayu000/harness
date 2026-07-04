@@ -1,7 +1,11 @@
-use super::model::{WorkflowCommand, WorkflowDecision, WorkflowEvidence, WorkflowInstance};
+use super::candidate_fanout::CandidateFanoutRequest;
+use super::model::{
+    WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
+};
 use super::plan_issue::ISSUE_PLAN_ACTIVITY;
 use super::remote_facts::remote_fact_command_dedupe_key;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,7 +39,7 @@ pub enum IssueSubmissionWorkflowAction {
     WaitForDependencies,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct IssueSubmissionDecisionInput<'a> {
     pub task_id: &'a str,
     pub repo: Option<&'a str>,
@@ -47,6 +51,7 @@ pub struct IssueSubmissionDecisionInput<'a> {
     pub dependencies_blocked: bool,
     pub remote_fact_hash: Option<&'a str>,
     pub submission_mode: SubmissionMode,
+    pub candidate_fanout: Option<CandidateFanoutRequest>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,10 +103,10 @@ pub fn build_issue_submission_decision(
                 input.task_id
             ),
         );
-        decision = decision.with_command(WorkflowCommand::new(
-            super::model::WorkflowCommandType::EnqueueActivity,
+        let command = WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
             dedupe_key,
-            serde_json::json!({
+            json!({
                 "activity": "implement_issue",
                 "additional_prompt": input.additional_prompt,
                 "dispatch_gate": {
@@ -111,7 +116,8 @@ pub fn build_issue_submission_decision(
                 "remote_fact_hash": input.remote_fact_hash,
                 "submission_mode": input.submission_mode.as_str(),
             }),
-        ));
+        );
+        decision = append_candidate_commands(decision, command, input.candidate_fanout.as_ref());
     } else if !input.dependencies_blocked {
         let dedupe_key = submission_command_dedupe_key(
             ISSUE_PLAN_ACTIVITY,
@@ -124,9 +130,9 @@ pub fn build_issue_submission_decision(
             ),
         );
         decision = decision.with_command(WorkflowCommand::new(
-            super::model::WorkflowCommandType::EnqueueActivity,
+            WorkflowCommandType::EnqueueActivity,
             dedupe_key,
-            serde_json::json!({
+            json!({
                 "activity": ISSUE_PLAN_ACTIVITY,
                 "additional_prompt": input.additional_prompt,
                 "dispatch_gate": {
@@ -155,6 +161,51 @@ pub fn build_issue_submission_decision(
     .high_confidence();
 
     IssueSubmissionDecisionOutput { action, decision }
+}
+
+pub(crate) fn append_candidate_commands(
+    mut decision: WorkflowDecision,
+    command: WorkflowCommand,
+    candidate_fanout: Option<&CandidateFanoutRequest>,
+) -> WorkflowDecision {
+    let Some(candidate_fanout) = candidate_fanout else {
+        return decision.with_command(command);
+    };
+    for candidate_index in 1..=candidate_fanout.candidate_count {
+        decision = decision.with_command(candidate_command(
+            &command,
+            candidate_fanout,
+            candidate_index,
+        ));
+    }
+    decision
+}
+
+pub(crate) fn candidate_command(
+    command: &WorkflowCommand,
+    candidate_fanout: &CandidateFanoutRequest,
+    candidate_index: u32,
+) -> WorkflowCommand {
+    let mut candidate_payload = command.command.clone();
+    if let Some(object) = candidate_payload.as_object_mut() {
+        object.insert(
+            "submission_mode".to_string(),
+            json!(SubmissionMode::Deferred.as_str()),
+        );
+        object.insert(
+            "candidate".to_string(),
+            candidate_fanout.command_metadata(candidate_index),
+        );
+    }
+    WorkflowCommand::new(
+        command.command_type,
+        candidate_dedupe_key(&command.dedupe_key, candidate_index),
+        candidate_payload,
+    )
+}
+
+pub(crate) fn candidate_dedupe_key(base: &str, candidate_index: u32) -> String {
+    format!("{base}:candidate:c{candidate_index}")
 }
 
 fn labels_summary(labels: &[String]) -> String {

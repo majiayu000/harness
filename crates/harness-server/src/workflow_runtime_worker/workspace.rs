@@ -296,9 +296,28 @@ pub(super) fn stable_runtime_workspace_task_id(
     workflow: Option<&WorkflowInstance>,
 ) -> TaskId {
     if let Some(workflow) = workflow {
+        if let Some(candidate_index) = runtime_candidate_index(job) {
+            if let Some(issue_number) = workflow
+                .data
+                .get("issue_number")
+                .and_then(|value| value.as_u64())
+            {
+                return TaskId::from_str(&format!("issue-{issue_number}-c{candidate_index}"));
+            }
+            let base = stable_runtime_workspace_task_id_for_workflow(workflow);
+            return TaskId::from_str(&format!("{}-c{candidate_index}", base.as_str()));
+        }
         return stable_runtime_workspace_task_id_for_workflow(workflow);
     }
     TaskId::from_str(&format!("runtime-job-{}", stable_hash_8(&job.id)))
+}
+
+fn runtime_candidate_index(job: &RuntimeJob) -> Option<u64> {
+    let candidate = job.input.get("command")?.get("candidate")?;
+    candidate
+        .get("candidate_index")?
+        .as_u64()
+        .filter(|index| *index > 0)
 }
 
 fn stable_runtime_workspace_task_id_for_workflow(workflow: &WorkflowInstance) -> TaskId {
@@ -397,6 +416,53 @@ mod tests {
             .as_str()
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'));
+    }
+
+    #[test]
+    fn candidate_fanout_workspace_task_id_uses_candidate_index() {
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:124"),
+        )
+        .with_id("/repo/root::repo:owner/repo::issue:124")
+        .with_data(json!({
+            "issue_number": 124,
+        }));
+        let first_job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue",
+                "command": {
+                    "candidate": {
+                        "candidate_index": 1,
+                    },
+                },
+            }),
+        );
+        let second_job = RuntimeJob::pending(
+            "command-2",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": "implement_issue",
+                "command": {
+                    "candidate": {
+                        "candidate_index": 2,
+                    },
+                },
+            }),
+        );
+
+        let first = stable_runtime_workspace_task_id(&first_job, Some(&workflow));
+        let second = stable_runtime_workspace_task_id(&second_job, Some(&workflow));
+
+        assert_eq!(first.as_str(), "issue-124-c1");
+        assert_eq!(second.as_str(), "issue-124-c2");
+        assert_ne!(first, second);
     }
 
     #[test]

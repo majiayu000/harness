@@ -53,6 +53,10 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.runtime_worker.lease_ttl_secs, 3900);
     assert!(cfg.runtime_retry_policy.is_empty());
     assert!(!cfg.memory.enabled);
+    assert!(!cfg.candidates.enabled);
+    assert_eq!(cfg.candidates.n, 2);
+    assert_eq!(cfg.candidates.trigger_label, "best-of-n");
+    assert_eq!(cfg.candidates.max_turns_per_candidate, None);
     assert!(cfg.issue_workflow.auto_replan_on_plan_issue);
     assert!(cfg.pr_scope_guard.enabled);
     assert_eq!(cfg.pr_scope_guard.max_files_changed, 30);
@@ -197,6 +201,11 @@ runtime_retry_policy:
       max_retry_delay_secs: 60
 memory:
   enabled: true
+candidates:
+  enabled: true
+  n: 3
+  trigger_label: frontier
+  max_turns_per_candidate: 4
 storage:
   schema_namespace: orchestration
   orphan_reaper_enabled: false
@@ -357,6 +366,10 @@ Body
         Some(60)
     );
     assert!(cfg.memory.enabled);
+    assert!(cfg.candidates.enabled);
+    assert_eq!(cfg.candidates.n, 3);
+    assert_eq!(cfg.candidates.trigger_label, "frontier");
+    assert_eq!(cfg.candidates.max_turns_per_candidate, Some(4));
     assert_eq!(cfg.storage.schema_namespace, "orchestration");
     assert!(!cfg.storage.orphan_reaper_enabled);
     assert_eq!(cfg.storage.orphan_reaper_interval_secs, 44);

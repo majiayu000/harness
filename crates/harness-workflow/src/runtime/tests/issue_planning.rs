@@ -17,6 +17,7 @@ fn issue_submission_decision_force_execute_starts_implementation() {
             dependencies_blocked: false,
             remote_fact_hash: None,
             submission_mode: SubmissionMode::Immediate,
+            candidate_fanout: None,
         },
     );
 
@@ -60,6 +61,7 @@ fn issue_submission_decision_uses_remote_fact_hash_for_implementation_dedupe() {
             dependencies_blocked: false,
             remote_fact_hash: Some("sha256:abc"),
             submission_mode: SubmissionMode::Immediate,
+            candidate_fanout: None,
         },
     );
 
@@ -99,6 +101,7 @@ fn submission_mode_threads_through_issue_submission_commands() {
                 dependencies_blocked: false,
                 remote_fact_hash: None,
                 submission_mode: mode,
+                candidate_fanout: None,
             },
         );
 
@@ -112,6 +115,69 @@ fn submission_mode_threads_through_issue_submission_commands() {
             expected
         );
     }
+}
+
+#[test]
+fn candidate_fanout_force_execute_starts_deferred_candidate_commands() -> anyhow::Result<()> {
+    let labels = vec!["best-of-n".to_string()];
+    let instance = issue_instance("discovered");
+    let fanout = CandidateFanoutRequest {
+        candidate_group_id: "wf-1:candidate-group:issue-123".to_string(),
+        candidate_count: 2,
+        trigger_label: "best-of-n".to_string(),
+        max_turns_per_candidate: Some(4),
+    };
+
+    let output = build_issue_submission_decision(
+        &instance,
+        IssueSubmissionDecisionInput {
+            task_id: "task-candidates",
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            labels: &labels,
+            force_execute: true,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            remote_fact_hash: Some("sha256:fanout"),
+            submission_mode: SubmissionMode::Immediate,
+            candidate_fanout: Some(fanout),
+        },
+    );
+
+    assert_eq!(
+        output.action,
+        IssueSubmissionWorkflowAction::RunImplementation
+    );
+    assert_eq!(output.decision.commands.len(), 2);
+    assert_eq!(
+        output.decision.commands[0].dedupe_key,
+        "implement_issue:sha256:fanout:candidate:c1"
+    );
+    assert_eq!(
+        output.decision.commands[1].dedupe_key,
+        "implement_issue:sha256:fanout:candidate:c2"
+    );
+    for (index, command) in output.decision.commands.iter().enumerate() {
+        let candidate_index = index + 1;
+        assert_eq!(command.activity_name(), Some("implement_issue"));
+        assert_eq!(command.command["submission_mode"], "deferred");
+        assert_eq!(
+            command.command["candidate"]["candidate_index"],
+            candidate_index
+        );
+        assert_eq!(command.command["candidate"]["candidate_count"], 2);
+        assert_eq!(
+            command.command["candidate"]["budget"]["max_turns_per_candidate"],
+            4
+        );
+    }
+    DecisionValidator::github_issue_pr().validate(
+        &instance,
+        &output.decision,
+        &ValidationContext::new("workflow-policy", Utc::now()),
+    )?;
+    Ok(())
 }
 
 #[test]
@@ -157,6 +223,56 @@ fn issue_plan_success_starts_implementation_with_plan_payload() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("issue plan completion decision should validate");
+}
+
+#[test]
+fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::Result<()> {
+    let fanout = CandidateFanoutRequest {
+        candidate_group_id: "wf-1:candidate-group:issue-123".to_string(),
+        candidate_count: 2,
+        trigger_label: "best-of-n".to_string(),
+        max_turns_per_candidate: None,
+    };
+    let instance = issue_instance("planning").with_data(json!({
+        "candidate_fanout": fanout,
+    }));
+    let plan_payload = json!({
+        "summary": "Patch the submission reducer.",
+        "task_class": "runtime_or_data",
+        "target_files": [
+            "crates/harness-workflow/src/runtime/submission.rs"
+        ],
+        "validation_plan": ["cargo test -p harness-workflow candidate_fanout"],
+        "blockers": []
+    });
+    let result = ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "Issue plan ready.")
+        .with_artifact(ActivityArtifact::new(
+            super::super::ISSUE_PLAN_ARTIFACT,
+            plan_payload,
+        ));
+    let event = runtime_completion_event(&instance, super::super::ISSUE_PLAN_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)?
+        .ok_or_else(|| anyhow::anyhow!("issue planning success should start implementation"))?;
+
+    assert_eq!(decision.decision, "start_implementation_after_issue_plan");
+    assert_eq!(decision.next_state, "implementing");
+    assert_eq!(decision.commands.len(), 2);
+    assert_eq!(decision.commands[0].command["submission_mode"], "deferred");
+    assert_eq!(
+        decision.commands[0].command["candidate"]["candidate_index"],
+        1
+    );
+    assert_eq!(
+        decision.commands[1].command["candidate"]["candidate_index"],
+        2
+    );
+    DecisionValidator::github_issue_pr().validate(
+        &instance,
+        &decision,
+        &ValidationContext::new("runtime-1", Utc::now()),
+    )?;
+    Ok(())
 }
 
 #[test]
