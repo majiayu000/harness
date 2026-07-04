@@ -308,6 +308,7 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
         Path::new("/repo"),
         &runtime_profile,
         &workflow_document,
+        &[],
     );
     assert_eq!(packet["project"]["root"], "/workspaces/job-1");
     assert_eq!(packet["project"]["source_root"], "/repo");
