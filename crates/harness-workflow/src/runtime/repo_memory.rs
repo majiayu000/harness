@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub const REPO_MEMORY_CONFIG_ARTIFACT: &str = "repo_memory_config";
+pub const REPO_MEMORY_DEGRADATION_ARTIFACT: &str = "repo_memory_degradation";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepoMemoryOutcome {

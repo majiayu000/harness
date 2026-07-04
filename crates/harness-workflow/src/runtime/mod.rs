@@ -101,7 +101,10 @@ pub use reducer::{
 pub use remote_facts::{
     remote_fact_command_dedupe_key, stable_remote_fact_hash, RemoteFactSnapshot,
 };
-pub use repo_memory::{RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord};
+pub use repo_memory::{
+    RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, REPO_MEMORY_CONFIG_ARTIFACT,
+    REPO_MEMORY_DEGRADATION_ARTIFACT,
+};
 pub use state_registry::{
     known_workflow_definition_ids, workflow_state_definition, workflow_state_exists,
     workflow_states_for_definition, workflow_terminal_state_names_for_definition,

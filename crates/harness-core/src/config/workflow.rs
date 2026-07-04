@@ -221,6 +221,12 @@ pub struct RuntimeActivityRetryPolicy {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowMemoryPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowConfig {
     #[serde(default)]
     pub workflow: WorkflowIdentityPolicy,
@@ -244,6 +250,8 @@ pub struct WorkflowConfig {
     pub runtime_worker: RuntimeWorkerPolicy,
     #[serde(default)]
     pub runtime_retry_policy: RuntimeRetryPolicy,
+    #[serde(default)]
+    pub memory: WorkflowMemoryPolicy,
     #[serde(default)]
     pub storage: WorkflowStoragePolicy,
     #[serde(default)]
