@@ -28,7 +28,7 @@ use super::prompt_input_telemetry::{
 use super::prompt_packet::{
     build_runtime_job_prompt, build_runtime_prompt_packet, prompt_packet_digest,
 };
-use super::repo_memory_prompt::repo_memory_for_prompt_packet;
+use super::repo_memory_prompt::{repo_memory_config_artifact, repo_memory_for_prompt_packet};
 use super::runtime_profile::{
     agent_name_for_runtime_kind, runtime_profile_approval_policy, runtime_profile_for_job,
     runtime_profile_sandbox_mode,
@@ -110,7 +110,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         .await?;
         let activity_result: anyhow::Result<ActivityResult> = async {
             let project_root = runtime_workspace.run_project.clone();
+            let memory_enabled = workflow_document.config.memory.enabled;
             let repo_memory = repo_memory_for_prompt_packet(
+                memory_enabled,
                 self.state.core.workflow_runtime_store.as_deref(),
                 workflow.as_ref(),
                 &job,
@@ -123,7 +125,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 &source_project_root,
                 &runtime_profile,
                 &workflow_document,
-                &repo_memory,
+                &repo_memory.records,
             );
             let prompt_packet_digest = prompt_packet_digest(&prompt_packet);
             self.record_prompt_packet_prepared(&job, &prompt_packet, &prompt_packet_digest)
@@ -205,7 +207,13 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 agent_name,
                 &project_root,
                 &prompt_packet_digest,
-            );
+            )
+            .with_artifact(repo_memory_config_artifact(memory_enabled));
+            let result = if let Some(degradation) = repo_memory.degradation {
+                result.with_artifact(degradation)
+            } else {
+                result
+            };
             Ok(
                 verify_merge_completion_if_needed(self.state, &job, workflow.as_ref(), result)
                     .await,

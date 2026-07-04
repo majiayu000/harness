@@ -2,7 +2,9 @@ use super::model::{
     ActivityErrorKind, ActivityResult, ActivitySignal, ValidationRecord, WorkflowDecisionRecord,
     WorkflowEvent, WorkflowInstance,
 };
-use super::repo_memory::{RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord};
+use super::repo_memory::{
+    RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, REPO_MEMORY_CONFIG_ARTIFACT,
+};
 use super::state_registry::WorkflowTerminalState;
 use super::store::WorkflowRuntimeStore;
 use serde_json::{json, Value};
@@ -60,6 +62,9 @@ fn extract_terminal_repo_memory_record(
         serde_json::from_value(event.event.get("activity_result").cloned().ok_or_else(|| {
             anyhow::anyhow!("RuntimeJobCompleted event missing activity_result")
         })?)?;
+    if !repo_memory_enabled_for_result(&result) {
+        return Ok(None);
+    }
     let Some(repo) = repo_from_completion(instance, event, &result) else {
         return Ok(None);
     };
@@ -88,6 +93,17 @@ fn extract_terminal_repo_memory_record(
         RepoMemoryRecord::new(repo, activity_class, outcome, kind, payload_json)
             .with_evidence_ref(format!("workflow:{}:event:{}", instance.id, event.id)),
     ))
+}
+
+fn repo_memory_enabled_for_result(result: &ActivityResult) -> bool {
+    result
+        .artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.artifact_type == REPO_MEMORY_CONFIG_ARTIFACT)
+        .and_then(|artifact| artifact.artifact.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn repo_memory_outcome(instance: &WorkflowInstance) -> Option<RepoMemoryOutcome> {
@@ -271,7 +287,8 @@ fn clean_string(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::runtime::model::{
-        ActivitySignal, RuntimeKind, WorkflowCommand, WorkflowDecision, WorkflowSubject,
+        ActivityArtifact, ActivitySignal, RuntimeKind, WorkflowCommand, WorkflowDecision,
+        WorkflowSubject,
     };
     use crate::runtime::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
     use chrono::{Duration, Utc};
@@ -325,18 +342,27 @@ mod tests {
         )
     }
 
+    fn with_repo_memory_enabled(result: ActivityResult) -> ActivityResult {
+        result.with_artifact(ActivityArtifact::new(
+            REPO_MEMORY_CONFIG_ARTIFACT,
+            json!({ "enabled": true }),
+        ))
+    }
+
     #[test]
     fn memory_extract_records_done_validation_commands() -> anyhow::Result<()> {
         let instance = test_prompt_workflow_instance("prompt-1", "done", Some("owner/repo"));
-        let result = ActivityResult::succeeded(
-            PROMPT_TASK_IMPLEMENT_ACTIVITY,
-            "Prompt implementation completed.",
-        )
-        .with_validation(ValidationRecord::new(
-            "cargo test -p harness-workflow memory_extract",
-            "passed",
-        ))
-        .with_validation(ValidationRecord::new("cargo clippy", "skipped"));
+        let result = with_repo_memory_enabled(
+            ActivityResult::succeeded(
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "Prompt implementation completed.",
+            )
+            .with_validation(ValidationRecord::new(
+                "cargo test -p harness-workflow memory_extract",
+                "passed",
+            ))
+            .with_validation(ValidationRecord::new("cargo clippy", "skipped")),
+        );
         let event = completion_event(&instance.id, result);
         let decision = accepted_decision(&instance.id, "done");
 
@@ -366,13 +392,15 @@ mod tests {
     #[test]
     fn memory_extract_records_failed_outcome_as_failure_lesson() -> anyhow::Result<()> {
         let instance = test_prompt_workflow_instance("prompt-2", "failed", Some("owner/repo"));
-        let result = ActivityResult::failed(
-            PROMPT_TASK_IMPLEMENT_ACTIVITY,
-            "Prompt implementation failed.",
-            "process timed out",
-        )
-        .with_error_kind(ActivityErrorKind::Timeout)
-        .with_validation(ValidationRecord::new("cargo test", "failed"));
+        let result = with_repo_memory_enabled(
+            ActivityResult::failed(
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "Prompt implementation failed.",
+                "process timed out",
+            )
+            .with_error_kind(ActivityErrorKind::Timeout)
+            .with_validation(ValidationRecord::new("cargo test", "failed")),
+        );
         let event = completion_event(&instance.id, result);
         let decision = accepted_decision(&instance.id, "failed");
 
@@ -391,12 +419,13 @@ mod tests {
     fn memory_extract_records_pr_feedback_category_when_no_validation_exists() -> anyhow::Result<()>
     {
         let instance = test_prompt_workflow_instance("prompt-3", "done", Some("owner/repo"));
-        let result =
+        let result = with_repo_memory_enabled(
             ActivityResult::succeeded("inspect_pr_feedback", "PR feedback inspection completed.")
                 .with_signal(ActivitySignal::new(
                     "PrReadyToMerge",
                     json!({ "repo": "owner/repo", "pr_number": 42 }),
-                ));
+                )),
+        );
         let event = completion_event(&instance.id, result);
         let decision = accepted_decision(&instance.id, "done");
 
@@ -419,15 +448,70 @@ mod tests {
     #[test]
     fn memory_extract_skips_terminal_runs_without_repo_scope() -> anyhow::Result<()> {
         let instance = test_prompt_workflow_instance("prompt-4", "done", None);
-        let result = ActivityResult::succeeded(
-            PROMPT_TASK_IMPLEMENT_ACTIVITY,
-            "Prompt implementation completed.",
-        )
-        .with_validation(ValidationRecord::new("cargo test", "passed"));
+        let result = with_repo_memory_enabled(
+            ActivityResult::succeeded(
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "Prompt implementation completed.",
+            )
+            .with_validation(ValidationRecord::new("cargo test", "passed")),
+        );
         let event = completion_event(&instance.id, result);
         let decision = accepted_decision(&instance.id, "done");
 
         assert!(extract_terminal_repo_memory_record(&instance, &event, &decision)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn memory_flag_degraded_disabled_flag_skips_repo_memory_extraction() -> anyhow::Result<()> {
+        let instance = test_prompt_workflow_instance("prompt-disabled", "done", Some("owner/repo"));
+        let decision = accepted_decision(&instance.id, "done");
+        let result_without_flag = ActivityResult::succeeded(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "Prompt implementation completed.",
+        )
+        .with_validation(ValidationRecord::new("cargo test", "passed"));
+        let event_without_flag = completion_event(&instance.id, result_without_flag);
+
+        assert!(
+            extract_terminal_repo_memory_record(&instance, &event_without_flag, &decision)?
+                .is_none()
+        );
+
+        let result_disabled = ActivityResult::succeeded(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "Prompt implementation completed.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            REPO_MEMORY_CONFIG_ARTIFACT,
+            json!({ "enabled": false }),
+        ))
+        .with_validation(ValidationRecord::new("cargo test", "passed"));
+        let event_disabled = completion_event(&instance.id, result_disabled);
+
+        assert!(
+            extract_terminal_repo_memory_record(&instance, &event_disabled, &decision)?.is_none()
+        );
+
+        let result_server_disabled = ActivityResult::succeeded(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "Prompt implementation completed.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            REPO_MEMORY_CONFIG_ARTIFACT,
+            json!({ "enabled": true }),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            REPO_MEMORY_CONFIG_ARTIFACT,
+            json!({ "enabled": false }),
+        ))
+        .with_validation(ValidationRecord::new("cargo test", "passed"));
+        let event_server_disabled = completion_event(&instance.id, result_server_disabled);
+
+        assert!(
+            extract_terminal_repo_memory_record(&instance, &event_server_disabled, &decision)?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -484,14 +568,16 @@ mod tests {
         let Some(store) = open_memory_extract_test_store().await? else {
             return Ok(());
         };
-        let result = ActivityResult::succeeded(
-            PROMPT_TASK_IMPLEMENT_ACTIVITY,
-            "Prompt implementation completed.",
-        )
-        .with_validation(ValidationRecord::new(
-            "cargo test -p harness-workflow memory_extract",
-            "passed",
-        ));
+        let result = with_repo_memory_enabled(
+            ActivityResult::succeeded(
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "Prompt implementation completed.",
+            )
+            .with_validation(ValidationRecord::new(
+                "cargo test -p harness-workflow memory_extract",
+                "passed",
+            )),
+        );
 
         let completion = commit_prompt_completion(&store, "prompt-commit-memory", &result)
             .await?
@@ -516,14 +602,16 @@ mod tests {
         sqlx::query("DROP TABLE workflow_repo_memory")
             .execute(store.pool())
             .await?;
-        let result = ActivityResult::succeeded(
-            PROMPT_TASK_IMPLEMENT_ACTIVITY,
-            "Prompt implementation completed.",
-        )
-        .with_validation(ValidationRecord::new(
-            "cargo test -p harness-workflow memory_extract",
-            "passed",
-        ));
+        let result = with_repo_memory_enabled(
+            ActivityResult::succeeded(
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "Prompt implementation completed.",
+            )
+            .with_validation(ValidationRecord::new(
+                "cargo test -p harness-workflow memory_extract",
+                "passed",
+            )),
+        );
 
         let completion = commit_prompt_completion(&store, "prompt-memory-insert-error", &result)
             .await?
