@@ -1,0 +1,122 @@
+suite = "harness-core"
+default_timeout_secs = 7200
+
+# PR #1502 closed GH-1437.
+[[cases]]
+case_id = "gh1437-runtime-stall-detection"
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "8b3a328375178f98d3aac0865d49fc1bf81c869e"
+verify_commands = ["cargo test -p harness-server stall"]
+
+# PR #1503 closed GH-1442.
+[[cases]]
+case_id = "gh1442-dead-server-surfaces"
+repo = "majiayu000/harness"
+issue = 1442
+base_commit = "b308b38013c9bc7693565a6f2a01bed6666a373b"
+verify_commands = ["cargo check --workspace --all-targets"]
+
+# PR #1504 closed GH-1443.
+[[cases]]
+case_id = "gh1443-turn-lifecycle-boundary"
+repo = "majiayu000/harness"
+issue = 1443
+base_commit = "956076f02f546058960bf10d7a00157e5f0139dd"
+verify_commands = ["cargo test -p harness-server turn_lifecycle"]
+
+# PR #1499 closed GH-1436.
+[[cases]]
+case_id = "gh1436-legacy-schema-reaper"
+repo = "majiayu000/harness"
+issue = 1436
+base_commit = "7527dc267200b128b010e7c9999a3411e0f3ff9b"
+verify_commands = ["cargo test -p harness-core db_pg_schema_registry"]
+
+# PR #1498 closed GH-1466.
+[[cases]]
+case_id = "gh1466-lease-aware-workspace-gc"
+repo = "majiayu000/harness"
+issue = 1466
+base_commit = "2d20cac29a362db40fa2554a01e6ddb6f46a631d"
+verify_commands = ["cargo test -p harness-server lease"]
+
+# PR #1495 closed GH-1465.
+[[cases]]
+case_id = "gh1465-terminal-event-liveness"
+repo = "majiayu000/harness"
+issue = 1465
+base_commit = "6ff74cedc1b5631711f7836b5887a17a19a60d98"
+verify_commands = ["cargo test -p harness-server terminal"]
+
+# PR #1483 closed GH-1455.
+[[cases]]
+case_id = "gh1455-virtual-time-task-queue"
+repo = "majiayu000/harness"
+issue = 1455
+base_commit = "55354d1e105fd6d63ac40269289ba331e22580cf"
+verify_commands = ["cargo test -p harness-server task_queue"]
+
+# PR #1457 closed GH-1454.
+[[cases]]
+case_id = "gh1454-scoped-ci-jobs"
+repo = "majiayu000/harness"
+issue = 1454
+base_commit = "9c0099ad458e82fd377fd20a8e288a46722762ef"
+verify_commands = ["python3 checks/check_workflow.py --repo ."]
+
+# PR #1446 closed GH-1430.
+[[cases]]
+case_id = "gh1430-runtime-circuit-breaker"
+repo = "majiayu000/harness"
+issue = 1430
+base_commit = "966b9110c5a9b3f6c9e862c9ebbcb22da1acb4c5"
+verify_commands = ["cargo test -p harness-server circuit_breaker"]
+
+# PR #1424 closed GH-1415.
+[[cases]]
+case_id = "gh1415-server-side-merge-verification"
+repo = "majiayu000/harness"
+issue = 1415
+base_commit = "f2d8122dcee35d3d11ff35e6267110fb911f2682"
+verify_commands = ["cargo test -p harness-server merge_pr"]
+
+# PR #1423 closed GH-1416.
+[[cases]]
+case_id = "gh1416-api-token-fail-closed"
+repo = "majiayu000/harness"
+issue = 1416
+base_commit = "4df6b75f3af6ec3c7f331241f62fc97bcbce028e"
+verify_commands = ["cargo test -p harness-server api_token"]
+
+# PR #1419 closed GH-1420.
+[[cases]]
+case_id = "gh1420-agent-infra-readme"
+repo = "majiayu000/harness"
+issue = 1420
+base_commit = "f413c8e1f6d6e1ca410478f810da89ab06c3de9b"
+verify_commands = ["cargo test -p harness-cli"]
+
+# PR #1411 closed GH-1410.
+[[cases]]
+case_id = "gh1410-structured-result-skill-warning"
+repo = "majiayu000/harness"
+issue = 1410
+base_commit = "fedb9b296f27573e724ced2ae38b3145cfdd45a9"
+verify_commands = ["cargo test -p harness-server activity_result_limit"]
+
+# PR #1409 closed GH-1408.
+[[cases]]
+case_id = "gh1408-startup-readiness-status"
+repo = "majiayu000/harness"
+issue = 1408
+base_commit = "23d290f6bf74ac4ea69dfbdeffcc80a5048c67e7"
+verify_commands = ["cargo test -p harness-cli status"]
+
+# PR #1406 closed GH-1405.
+[[cases]]
+case_id = "gh1405-runtime-graph-foreign-keys"
+repo = "majiayu000/harness"
+issue = 1405
+base_commit = "77fe6b2e3b541b635992d1b20d8c80dfe8ded81e"
+verify_commands = ["cargo test -p harness-workflow runtime_store"]
