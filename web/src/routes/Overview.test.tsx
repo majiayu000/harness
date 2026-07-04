@@ -56,6 +56,7 @@ function makeOverview(): OverviewPayload {
       review: 0,
       merged: 0,
       failed: 0,
+      stalled: 0,
     },
     throughput: {
       hours: [],
@@ -76,6 +77,7 @@ function makeOverview(): OverviewPayload {
       queued: 0,
       done: 0,
       failed: 0,
+      stalled: 0,
       max_concurrent: 1,
     },
   };

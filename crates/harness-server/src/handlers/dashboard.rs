@@ -35,6 +35,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     let DashboardCounts {
         global_done,
         global_failed,
+        global_stalled,
         by_project: project_counts,
     } = state.task_svc.count_for_dashboard().await;
 
@@ -176,6 +177,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 let counts = project_counts.get(&key);
                 let done = counts.map_or(0, |c| c.done);
                 let failed = counts.map_or(0, |c| c.failed);
+                let stalled = counts.map_or(0, |c| c.stalled);
                 let latest_pr = project_pr_urls.get(&key);
                 entries.push(json!({
                     "id": p.id,
@@ -185,6 +187,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                         "queued": active_project_counts.queued,
                         "done": done,
                         "failed": failed,
+                        "stalled": stalled,
                     },
                     "latest_pr": latest_pr,
                 }));
@@ -236,6 +239,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             "uptime_secs": uptime_secs,
             "done": global_done,
             "failed": global_failed,
+            "stalled": global_stalled,
             "latest_pr": latest_pr,
             "grade": grade,
             "runtime_hosts_total": runtime_hosts_total,
@@ -376,6 +380,44 @@ mod tests {
         let project = project_entry(&body, &project_root)?;
         assert_eq!(project["tasks"]["running"], 0);
         assert_eq!(project["tasks"]["queued"], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_stalled_terminal_dashboard_counts_budget_exhaustion() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-stalled-")?;
+        let canonical_root = dir.path().canonicalize()?;
+        let project_root = canonical_root.to_string_lossy().into_owned();
+        let state = Arc::new(make_test_state(dir.path()).await?);
+        let mut task = TaskState::new(TaskId::from_str("dashboard-stalled-task"));
+        task.project_root = Some(canonical_root);
+        task.status = crate::task_runner::TaskStatus::Failed;
+        task.phase = crate::task_runner::TaskPhase::Terminal;
+        task.error = Some(
+            crate::task_runner::TaskTerminalFailure::round_budget_exhausted(
+                1,
+                crate::task_runner::TaskStatus::Reviewing,
+                Some("local_review_gate".to_string()),
+            )
+            .to_reason_string(),
+        );
+        task.scheduler
+            .mark_terminal(&crate::task_runner::TaskStatus::Failed);
+        state.core.tasks.insert(&task).await;
+
+        let body = dashboard_body(state).await?;
+
+        assert_eq!(body["global"]["failed"], 1);
+        assert_eq!(body["global"]["stalled"], 1);
+        let project = project_entry(&body, &project_root)?;
+        assert_eq!(project["tasks"]["running"], 0);
+        assert_eq!(project["tasks"]["queued"], 0);
+        assert_eq!(project["tasks"]["failed"], 1);
+        assert_eq!(project["tasks"]["stalled"], 1);
         Ok(())
     }
 

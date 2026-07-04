@@ -1,4 +1,4 @@
-use crate::task_runner::{TaskState, TaskStatus};
+use crate::task_runner::{TaskState, TaskStatus, ROUND_BUDGET_EXHAUSTED_REASON};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
@@ -162,48 +162,59 @@ impl TaskDb {
         Ok(rows.into_iter().collect())
     }
 
-    /// Count done/failed tasks globally and per project.
+    /// Count done, failed, and round-budget-stalled tasks globally and per project.
     pub async fn count_done_failed_by_project(
         &self,
-    ) -> anyhow::Result<(u64, u64, Vec<(String, u64, u64)>)> {
+    ) -> anyhow::Result<(u64, u64, u64, Vec<(String, u64, u64, u64)>)> {
         super::record_task_db_usage();
         let outcome_statuses = [TaskStatus::Done.as_ref(), TaskStatus::Failed.as_ref()];
+        let stalled_pattern = format!("%\"reason\":\"{ROUND_BUDGET_EXHAUSTED_REASON}\"%");
+        let stalled_param = outcome_statuses.len() + 2;
         let global_sql = format!(
             "SELECT COUNT(CASE WHEN status = 'done' THEN 1 END), \
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END), \
+                    COUNT(CASE WHEN status = 'failed' AND error LIKE ${stalled_param} THEN 1 END) \
              FROM tasks WHERE store_key = $1 AND status IN ({})",
             Self::numbered_placeholders(2, outcome_statuses.len())
         );
-        let global: (i64, i64) = outcome_statuses
+        let global: (i64, i64, i64) = outcome_statuses
             .iter()
             .fold(
                 sqlx::query_as(&global_sql).bind(&self.store_key),
                 |q, status| q.bind(*status),
             )
+            .bind(&stalled_pattern)
             .fetch_one(&self.pool)
             .await?;
         let rows_sql = format!(
             "SELECT project, \
                     COUNT(CASE WHEN status = 'done' THEN 1 END), \
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) \
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END), \
+                    COUNT(CASE WHEN status = 'failed' AND error LIKE ${stalled_param} THEN 1 END) \
              FROM tasks \
              WHERE store_key = $1 AND status IN ({}) AND project IS NOT NULL \
              GROUP BY project",
             Self::numbered_placeholders(2, outcome_statuses.len())
         );
-        let rows: Vec<(String, i64, i64)> = outcome_statuses
+        let rows: Vec<(String, i64, i64, i64)> = outcome_statuses
             .iter()
             .fold(
                 sqlx::query_as(&rows_sql).bind(&self.store_key),
                 |q, status| q.bind(*status),
             )
+            .bind(&stalled_pattern)
             .fetch_all(&self.pool)
             .await?;
         let by_project = rows
             .into_iter()
-            .map(|(p, d, f)| (p, d as u64, f as u64))
+            .map(|(p, d, f, s)| (p, d as u64, f as u64, s as u64))
             .collect();
-        Ok((global.0 as u64, global.1 as u64, by_project))
+        Ok((
+            global.0 as u64,
+            global.1 as u64,
+            global.2 as u64,
+            by_project,
+        ))
     }
 
     /// Count tasks that reached `done` status with `updated_at >= since`.

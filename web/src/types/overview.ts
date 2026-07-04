@@ -25,6 +25,7 @@ export interface OverviewDistribution {
   review: number;
   merged: number;
   failed: number;
+  stalled: number;
 }
 
 export interface OverviewThroughputSeries {
@@ -49,6 +50,7 @@ export interface OverviewProject {
   queued: number;
   done: number;
   failed: number;
+  stalled: number;
   merged_24h: number;
   trend: number[];
   avg_score: number | null;
@@ -104,6 +106,7 @@ export interface OverviewGlobal {
   queued: number;
   done: number;
   failed: number;
+  stalled: number;
   max_concurrent: number;
 }
 

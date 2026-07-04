@@ -19,6 +19,7 @@ export interface RecentFailure {
   external_id: string;
   project: string;
   error: string;
+  terminal?: import("./task").TaskTerminalInfo | null;
   failed_at: string | null;
 }
 

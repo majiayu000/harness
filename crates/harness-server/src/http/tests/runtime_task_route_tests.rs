@@ -824,6 +824,72 @@ async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn status_stalled_terminal_list_and_detail_surface_terminal_reason() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_read_only_route_test_state(dir.path()).await?;
+    let task_id = task_runner::TaskId::from_str("stalled-budget-task");
+    let mut task = task_runner::TaskState::new(task_id.clone());
+    task.status = task_runner::TaskStatus::Failed;
+    task.phase = task_runner::TaskPhase::Terminal;
+    task.turn = 2;
+    task.error = Some(
+        task_runner::TaskTerminalFailure::round_budget_exhausted(
+            1,
+            task_runner::TaskStatus::Reviewing,
+            Some("local_review_gate".to_string()),
+        )
+        .to_reason_string(),
+    );
+    task.scheduler
+        .mark_terminal(&task_runner::TaskStatus::Failed);
+    state.core.tasks.insert(&task).await;
+
+    let app = Router::new()
+        .route("/tasks", get(list_tasks))
+        .route("/tasks/{id}", get(get_task))
+        .with_state(state);
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tasks?status=failed")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed = response_json(list_response).await?;
+    let listed_task = listed["data"]
+        .as_array()
+        .and_then(|tasks| tasks.iter().find(|task| task["id"] == task_id.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("stalled task should be listed"))?;
+    assert_eq!(listed_task["status"], "failed");
+    assert_eq!(listed_task["phase"], "terminal");
+    assert_eq!(listed_task["terminal"]["classification"], "stalled");
+    assert_eq!(listed_task["terminal"]["reason"], "round_budget_exhausted");
+    assert_eq!(listed_task["terminal"]["rounds_used"], 1);
+    assert_eq!(listed_task["terminal"]["last_status"], "reviewing");
+    assert_eq!(listed_task["terminal"]["waiting_on"], "local_review_gate");
+
+    let detail_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/tasks/{}", task_id.as_str()))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail = response_json(detail_response).await?;
+    assert_eq!(detail["terminal"]["classification"], "stalled");
+    assert_eq!(detail["terminal"]["reason"], "round_budget_exhausted");
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

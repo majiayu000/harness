@@ -9,6 +9,7 @@ interface Props {
 
 const PAGE_SIZE = 20;
 const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
+type HistoryFilter = "all" | "done" | "failed" | "stalled";
 
 function timestampValue(value: string | null | undefined): number {
   if (!value) return 0;
@@ -23,6 +24,11 @@ function statusLabel(status: string): string {
   return status;
 }
 
+function taskStatusLabel(task: Task): string {
+  if (task.terminal?.classification === "stalled") return "Stalled";
+  return statusLabel(task.status);
+}
+
 function statusClass(status: string): string {
   if (status === "done") return "border-mint/40 bg-mint/10 text-mint";
   if (status === "failed") return "border-rust/40 bg-rust/10 text-rust";
@@ -30,11 +36,29 @@ function statusClass(status: string): string {
   return "border-line bg-bg text-ink-2";
 }
 
+function taskStatusClass(task: Task): string {
+  if (task.terminal?.classification === "stalled") return "border-warn/40 bg-warn/10 text-warn";
+  return statusClass(task.status);
+}
+
 function taskTitle(task: Task): string {
   const title = task.description?.trim();
   if (title) return title;
   if (task.repo) return task.repo;
   return task.id.slice(0, 8);
+}
+
+function formatReason(value: string): string {
+  return value.replace(/_/g, " ");
+}
+
+function terminalReason(task: Task): string | null {
+  if (task.terminal?.classification !== "stalled") return null;
+  const parts = [
+    task.terminal.reason ? formatReason(task.terminal.reason) : null,
+    task.terminal.waiting_on ? `waiting on ${formatReason(task.terminal.waiting_on)}` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : "stalled";
 }
 
 function prLabel(prUrl: string): string {
@@ -45,7 +69,9 @@ function prLabel(prUrl: string): string {
 function matchesQuery(task: Task, query: string): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
-  return [task.description, task.repo, task.pr_url].some((value) => value?.toLowerCase().includes(q));
+  return [task.description, task.repo, task.pr_url, task.terminal?.reason, task.terminal?.waiting_on].some((value) =>
+    value?.toLowerCase().includes(q),
+  );
 }
 
 function sortHistoryTasks(tasks: Task[]): Task[] {
@@ -57,7 +83,7 @@ function sortHistoryTasks(tasks: Task[]): Task[] {
 }
 
 export function History({ projectFilter }: Props) {
-  const [filter, setFilter] = useState<"all" | "done" | "failed">("all");
+  const [filter, setFilter] = useState<HistoryFilter>("all");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const { data: dashboard } = useDashboard();
@@ -77,6 +103,7 @@ export function History({ projectFilter }: Props) {
     const statusFiltered =
       data?.data.filter((task) => {
         if (!TERMINAL_STATUSES.has(task.status)) return false;
+        if (filter === "stalled") return task.terminal?.classification === "stalled" && matchesQuery(task, query);
         if (filter !== "all" && task.status !== filter) return false;
         return matchesQuery(task, query);
       }) ?? [];
@@ -102,12 +129,13 @@ export function History({ projectFilter }: Props) {
         />
         <select
           value={filter}
-          onChange={(e) => setFilter(e.target.value as "all" | "done" | "failed")}
+          onChange={(e) => setFilter(e.target.value as HistoryFilter)}
           className="h-[30px] bg-bg-1 border border-line-2 text-ink font-mono text-[12px] px-2 rounded-[3px]"
         >
           <option value="all">All</option>
           <option value="done">Done</option>
           <option value="failed">Failed</option>
+          <option value="stalled">Stalled</option>
         </select>
       </div>
 
@@ -153,8 +181,8 @@ export function History({ projectFilter }: Props) {
                       {task.created_at ? relativeAgo(task.created_at) : "—"}
                     </td>
                     <td className="px-3 py-2">
-                      <span className={`inline-block border px-1.5 py-[1px] font-mono text-[10px] ${statusClass(task.status)}`}>
-                        {statusLabel(task.status)}
+                      <span className={`inline-block border px-1.5 py-[1px] font-mono text-[10px] ${taskStatusClass(task)}`}>
+                        {taskStatusLabel(task)}
                       </span>
                     </td>
                     <td className="px-3 py-2">
@@ -162,6 +190,11 @@ export function History({ projectFilter }: Props) {
                         {taskTitle(task)}
                       </div>
                       <div className="mt-1 font-mono text-[10px] text-ink-4">{task.id.slice(0, 8)}</div>
+                      {terminalReason(task) && (
+                        <div className="mt-1 line-clamp-1 font-mono text-[10px] text-warn" title={terminalReason(task) ?? undefined}>
+                          {terminalReason(task)}
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2 font-mono text-[11px] text-ink-3">
                       <span className="block truncate" title={task.repo ?? undefined}>

@@ -13,6 +13,17 @@ function timeAgo(iso: string | null | undefined): string {
   return `${Math.floor(secs / 86400)}d`;
 }
 
+function formatReason(value: string): string {
+  return value.replace(/_/g, " ");
+}
+
+function failureMessage(failure: RecentFailure): string {
+  if (failure.terminal?.classification !== "stalled") return failure.error;
+  const reason = failure.terminal.reason ? formatReason(failure.terminal.reason) : "stalled";
+  const waitingOn = failure.terminal.waiting_on ? ` · waiting on ${formatReason(failure.terminal.waiting_on)}` : "";
+  return `Stalled: ${reason}${waitingOn}`;
+}
+
 function Counter({ label, value }: { label: string; value: number }) {
   return (
     <div className="flex flex-col items-center gap-0.5 px-4 py-2 border-r border-line last:border-r-0">
@@ -37,7 +48,7 @@ function FailureRow({ failure }: { failure: RecentFailure }) {
   return (
     <div className="flex items-center gap-3 px-4 py-1.5 border-b border-line last:border-b-0 font-mono text-[11px]">
       <span className="text-ink-2 truncate w-32">{failure.external_id}</span>
-      <span className="text-rust truncate flex-1">{failure.error}</span>
+      <span className="text-rust truncate flex-1">{failureMessage(failure)}</span>
       <span className="text-ink-4 shrink-0">{timeAgo(failure.failed_at)}</span>
     </div>
   );

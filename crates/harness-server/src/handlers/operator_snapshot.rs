@@ -39,6 +39,10 @@ fn stalled_task_json(t: &crate::task_runner::TaskState) -> Value {
 }
 
 fn recent_failure_json(t: &crate::task_runner::RecentFailureTask) -> Value {
+    let terminal = crate::task_runner::TaskTerminalInfo::from_status_error(
+        &crate::task_runner::TaskStatus::Failed,
+        t.error.as_deref(),
+    );
     let error = t
         .error
         .as_deref()
@@ -69,6 +73,7 @@ fn recent_failure_json(t: &crate::task_runner::RecentFailureTask) -> Value {
         "workspace_owner": t.workspace_owner.as_deref(),
         "run_generation": t.run_generation,
         "error":      error,
+        "terminal": terminal,
         "failed_at":  t.failed_at.as_deref(),
     })
 }

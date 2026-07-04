@@ -3,6 +3,7 @@ export interface DashboardProjectTasks {
   queued: number;
   done: number;
   failed: number;
+  stalled: number;
 }
 
 export interface DashboardProject {
@@ -38,6 +39,7 @@ export interface DashboardGlobal {
   uptime_secs: number;
   done: number;
   failed: number;
+  stalled: number;
   latest_pr: string | null;
   grade: string | null;
   runtime_hosts_total: number;

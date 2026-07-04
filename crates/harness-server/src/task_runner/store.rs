@@ -870,14 +870,24 @@ impl TaskStore {
     pub async fn count_for_dashboard(&self) -> DashboardCounts {
         record_task_runner_usage();
         match self.db.count_done_failed_by_project().await {
-            Ok((global_done, global_failed, rows)) => {
+            Ok((global_done, global_failed, global_stalled, rows)) => {
                 let by_project = rows
                     .into_iter()
-                    .map(|(project, done, failed)| (project, ProjectCounts { done, failed }))
+                    .map(|(project, done, failed, stalled)| {
+                        (
+                            project,
+                            ProjectCounts {
+                                done,
+                                failed,
+                                stalled,
+                            },
+                        )
+                    })
                     .collect();
                 DashboardCounts {
                     global_done,
                     global_failed,
+                    global_stalled,
                     by_project,
                 }
             }
@@ -886,6 +896,7 @@ impl TaskStore {
                 DashboardCounts {
                     global_done: 0,
                     global_failed: 0,
+                    global_stalled: 0,
                     by_project: HashMap::new(),
                 }
             }

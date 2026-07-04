@@ -15,6 +15,7 @@ export interface Task {
   turn: number;
   pr_url: string | null;
   error: string | null;
+  terminal?: TaskTerminalInfo | null;
   source: string | null;
   parent_id: string | null;
   external_id: string | null;
@@ -28,6 +29,15 @@ export interface Task {
   project: string | null;
   workflow?: WorkflowSummary | null;
   scheduler: TaskSchedulerState;
+}
+
+export interface TaskTerminalInfo {
+  status: string;
+  classification: "done" | "failed" | "stalled" | "cancelled" | string;
+  reason?: string | null;
+  rounds_used?: number | null;
+  last_status?: string | null;
+  waiting_on?: string | null;
 }
 
 export interface TaskSchedulerOwner {

@@ -52,6 +52,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     let dashboard_counts = state.task_svc.count_for_dashboard().await;
     let global_done = dashboard_counts.global_done;
     let global_failed = dashboard_counts.global_failed;
+    let global_stalled = dashboard_counts.global_stalled;
 
     let merged_24h = state.task_svc.count_done_since(since_dt).await;
 
@@ -111,6 +112,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         let counts = dashboard_counts.by_project.get(&key);
         let done = counts.map_or(0, |c| c.done);
         let failed = counts.map_or(0, |c| c.failed);
+        let stalled = counts.map_or(0, |c| c.stalled);
         let buckets = per_project_buckets
             .remove(&key)
             .unwrap_or_else(|| vec![0; THROUGHPUT_BUCKETS]);
@@ -122,6 +124,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
             "queued": active_project_counts.queued,
             "done": done,
             "failed": failed,
+            "stalled": stalled,
             "merged_24h": merged_window,
             "trend": buckets,
             "avg_score": Value::Null,
@@ -271,6 +274,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
             "review": 0,
             "merged": global_done,
             "failed": global_failed,
+            "stalled": global_stalled,
         },
         "throughput": {
             "hours": hours,
@@ -291,6 +295,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
             "queued": queued,
             "done": global_done,
             "failed": global_failed,
+            "stalled": global_stalled,
             "max_concurrent": max_concurrent,
         },
     });

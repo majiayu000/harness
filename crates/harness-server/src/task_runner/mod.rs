@@ -36,8 +36,8 @@ use store::{
 };
 pub use store::{TaskStore, TaskSummaryFilter, TaskSummaryPageCursor, TerminalTransition};
 pub use types::{
-    TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus, TaskTerminalFailure,
-    TaskTerminalOutcome,
+    TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus, TaskTerminalClassification,
+    TaskTerminalFailure, TaskTerminalInfo, TaskTerminalOutcome, ROUND_BUDGET_EXHAUSTED_REASON,
 };
 
 fn record_task_runner_usage() {
