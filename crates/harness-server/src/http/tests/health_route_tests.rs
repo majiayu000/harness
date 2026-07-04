@@ -62,6 +62,39 @@ async fn health_runtime_logs_can_report_degraded_without_raw_error_text() -> any
 }
 
 #[tokio::test]
+async fn health_degraded_when_runtime_circuit_breaker_open() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_read_only_route_test_state(dir.path()).await?;
+    let now = Utc::now();
+    for index in 0..5 {
+        state.runtime_circuit_breakers.record_failure(
+            "codex-high",
+            &format!("job-{index}"),
+            crate::runtime_circuit_breaker::FailureClass::ZeroOutputSpawnFailure,
+            now,
+        );
+    }
+
+    let health = call_health(state).await?;
+
+    assert_eq!(health.status, "degraded");
+    let breakers = health.runtime["circuit_breakers"]
+        .as_array()
+        .expect("runtime circuit breakers should be an array");
+    assert_eq!(breakers.len(), 1);
+    assert_eq!(breakers[0]["profile"], "codex-high");
+    assert_eq!(breakers[0]["state"], "open");
+    assert_eq!(breakers[0]["class"], "zero-output-spawn-failure");
+    assert_eq!(breakers[0]["consecutive"], 5);
+    assert!(breakers[0]["cooldown_until"].is_string());
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
     let _home_lock = crate::test_helpers::HOME_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
