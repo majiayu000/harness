@@ -39,6 +39,7 @@ mod pr_repair_evidence;
 mod replay_determinism;
 mod retry;
 mod runtime_store;
+mod runtime_usage;
 
 fn issue_instance(state: &str) -> WorkflowInstance {
     WorkflowInstance::new(

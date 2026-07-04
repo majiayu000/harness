@@ -468,6 +468,18 @@ pub enum RuntimeKind {
     RemoteHost,
 }
 
+impl RuntimeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexExec => "codex_exec",
+            Self::CodexJsonrpc => "codex_jsonrpc",
+            Self::ClaudeCode => "claude_code",
+            Self::AnthropicApi => "anthropic_api",
+            Self::RemoteHost => "remote_host",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeProfile {
     pub name: String,

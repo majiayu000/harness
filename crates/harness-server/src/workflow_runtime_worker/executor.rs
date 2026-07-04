@@ -33,6 +33,7 @@ use super::runtime_profile::{
     agent_name_for_runtime_kind, runtime_profile_approval_policy, runtime_profile_for_job,
     runtime_profile_sandbox_mode,
 };
+use super::runtime_usage::runtime_usage_context;
 use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
@@ -186,6 +187,14 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     force_code_agent: matches!(
                         job.runtime_kind,
                         RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
+                    ),
+                    runtime_usage: runtime_usage_context(
+                        self.state,
+                        &job,
+                        workflow.as_ref(),
+                        &runtime_profile,
+                        agent_name,
+                        &source_project_root,
                     ),
                 },
             )

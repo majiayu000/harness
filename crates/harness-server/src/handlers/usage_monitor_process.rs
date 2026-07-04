@@ -16,16 +16,49 @@ pub(crate) struct AgentProcess {
     pub(crate) command_label: &'static str,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ProcessSample {
+    pub(crate) processes: Vec<AgentProcess>,
+    pub(crate) error_count: u64,
+}
+
 static PROCESS_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
-pub(crate) fn sample_agent_processes(
+pub(crate) async fn sample_agent_processes_for_monitor(
+    now: DateTime<Utc>,
+    attribution_tokens: BTreeSet<String>,
+) -> ProcessSample {
+    match tokio::task::spawn_blocking(move || try_sample_agent_processes(now, &attribution_tokens))
+        .await
+    {
+        Ok(Ok(processes)) => ProcessSample {
+            processes,
+            error_count: 0,
+        },
+        Ok(Err(error)) => {
+            tracing::error!("usage_monitor: process sampling failed: {error}");
+            ProcessSample {
+                processes: Vec::new(),
+                error_count: 1,
+            }
+        }
+        Err(error) => {
+            tracing::error!("usage_monitor: process sampler task failed: {error}");
+            ProcessSample {
+                processes: Vec::new(),
+                error_count: 1,
+            }
+        }
+    }
+}
+
+pub(crate) fn try_sample_agent_processes(
     now: DateTime<Utc>,
     attribution_tokens: &BTreeSet<String>,
-) -> Vec<AgentProcess> {
+) -> Result<Vec<AgentProcess>, &'static str> {
     let process_system = PROCESS_SYSTEM.get_or_init(|| Mutex::new(System::new()));
     let Ok(mut system) = process_system.lock() else {
-        tracing::error!("usage_monitor: process sampler lock poisoned");
-        return Vec::new();
+        return Err("process sampler lock poisoned");
     };
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -69,7 +102,7 @@ pub(crate) fn sample_agent_processes(
         })
         .collect::<Vec<_>>();
     processes.sort_by(|a, b| b.age_secs.cmp(&a.age_secs).then_with(|| a.pid.cmp(&b.pid)));
-    processes
+    Ok(processes)
 }
 
 fn classify_agent_process(name: &str, executable: &str, command: &str) -> Option<&'static str> {

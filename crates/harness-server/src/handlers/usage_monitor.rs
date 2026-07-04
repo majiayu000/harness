@@ -5,7 +5,6 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Duration, Utc};
-use harness_core::types::{Event, EventFilters};
 use harness_observe::usage::UsageMetrics;
 use harness_workflow::runtime::{
     runtime_job_running_lease_state_at, RuntimeJob, RuntimeJobStatus, RuntimeProfile,
@@ -28,15 +27,17 @@ mod usage_monitor_candidate;
 mod usage_monitor_local_usage;
 #[path = "usage_monitor_process.rs"]
 mod usage_monitor_process;
+#[path = "usage_monitor_records.rs"]
+mod usage_monitor_records;
 
 use usage_monitor_active::{aggregate_active_counts, burn_level, runtime_job_status, runtime_kind};
 use usage_monitor_aggregate::{aggregate_usage, total_usage_aggregate, UsageGroup};
 use usage_monitor_candidate::{
-    candidate_attribution_index, candidate_usage_groups, usage_record_candidate,
-    CandidateUsageGroup,
+    candidate_attribution_index, candidate_usage_groups, CandidateUsageGroup,
 };
 use usage_monitor_local_usage::{load_local_usage_summaries, LocalUsageSourceSummary};
-use usage_monitor_process::{sample_agent_processes, AgentProcess};
+use usage_monitor_process::{sample_agent_processes_for_monitor, AgentProcess};
+use usage_monitor_records::load_usage_records;
 
 const DEFAULT_USAGE_WINDOW_HOURS: i64 = 24;
 const MAX_USAGE_WINDOW_HOURS: i64 = 24 * 14;
@@ -120,6 +121,12 @@ struct UsageRecord {
     metrics: UsageMetrics,
     estimated_cost_usd: Option<f64>,
     candidate: Option<usage_monitor_candidate::CandidateUsageAttribution>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeRowsLoad {
+    rows: Vec<RuntimeUsageRow>,
+    malformed_rows: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +262,10 @@ struct UsageDiagnostics {
     token_source: &'static str,
     active_cost_confidence: &'static str,
     process_source: &'static str,
+    malformed_legacy_usage_events: u64,
+    malformed_runtime_usage_rows: u64,
+    malformed_runtime_invocation_rows: u64,
+    process_sampler_errors: u64,
 }
 
 pub(crate) async fn usage_monitor(
@@ -281,16 +292,19 @@ async fn build_usage_monitor_response(
     let now = Utc::now();
     let window = UsageWindow::from_query(query.hours, now);
     let price_catalog = PriceCatalog::from_env_cached();
-    let runtime_rows = load_runtime_usage_rows(state, window.since, query.limit).await?;
+    let runtime_rows_load = load_runtime_usage_rows(state, window.since, query.limit).await?;
+    let runtime_rows = runtime_rows_load.rows;
     let candidate_attributions = candidate_attribution_index(&runtime_rows);
-    let usage_records =
+    let usage_load =
         load_usage_records(state, window, price_catalog, &candidate_attributions).await?;
+    let usage_records = usage_load.records;
     let agent_invocations = runtime_rows
         .iter()
         .map(|row| agent_invocation_from_row(row, now))
         .collect::<Vec<_>>();
-    let external_agent_processes =
-        sample_agent_processes(now, &runtime_attribution_tokens(&runtime_rows));
+    let process_sample =
+        sample_agent_processes_for_monitor(now, runtime_attribution_tokens(&runtime_rows)).await;
+    let external_agent_processes = process_sample.processes;
     let local_usage_sources = load_local_usage_summaries(window).await;
 
     let tokens_by_agent =
@@ -389,68 +403,14 @@ async fn build_usage_monitor_response(
         local_usage_sources,
         diagnostics: UsageDiagnostics {
             runtime_store_available: state.core.workflow_runtime_store.is_some(),
-            token_source: "llm_usage_events",
+            token_source: "workflow_runtime_usage_and_llm_usage_events",
             active_cost_confidence: "estimated_from_agent_invocation_state",
             process_source: "external_cli_process_snapshot",
+            malformed_legacy_usage_events: usage_load.diagnostics.malformed_legacy_usage_events,
+            malformed_runtime_usage_rows: usage_load.diagnostics.malformed_runtime_usage_rows,
+            malformed_runtime_invocation_rows: runtime_rows_load.malformed_rows,
+            process_sampler_errors: process_sample.error_count,
         },
-    })
-}
-
-async fn load_usage_records(
-    state: &AppState,
-    window: UsageWindow,
-    price_catalog: &PriceCatalog,
-    candidate_attributions: &usage_monitor_candidate::CandidateAttributionIndex,
-) -> anyhow::Result<Vec<UsageRecord>> {
-    let events = state
-        .observability
-        .events
-        .query(&EventFilters {
-            hook: Some("llm_usage".to_string()),
-            since: Some(window.since),
-            until: Some(window.now),
-            include_content: true,
-            ..Default::default()
-        })
-        .await?;
-    Ok(events
-        .iter()
-        .filter_map(|event| parse_usage_event(event, price_catalog, candidate_attributions))
-        .collect())
-}
-
-fn parse_usage_event(
-    event: &Event,
-    price_catalog: &PriceCatalog,
-    candidate_attributions: &usage_monitor_candidate::CandidateAttributionIndex,
-) -> Option<UsageRecord> {
-    let content = event.content.as_deref()?;
-    let payload: Value = serde_json::from_str(content).ok()?;
-    let metrics = UsageMetrics::from_payload(&payload)?;
-    let agent = payload
-        .get("agent")
-        .and_then(Value::as_str)
-        .unwrap_or(event.tool.as_str())
-        .to_string();
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let project = payload
-        .get("project")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let estimated_cost_usd = price_catalog.estimate(&model, &metrics);
-    let candidate = usage_record_candidate(&payload, candidate_attributions);
-    Some(UsageRecord {
-        agent,
-        model,
-        project,
-        metrics,
-        estimated_cost_usd,
-        candidate,
     })
 }
 
@@ -458,101 +418,160 @@ async fn load_runtime_usage_rows(
     state: &AppState,
     recent_since: DateTime<Utc>,
     limit: Option<i64>,
-) -> anyhow::Result<Vec<RuntimeUsageRow>> {
+) -> anyhow::Result<RuntimeRowsLoad> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return Ok(Vec::new());
+        return Ok(RuntimeRowsLoad::default());
     };
     let limit = limit
         .unwrap_or(DEFAULT_RUNTIME_JOB_LIMIT)
         .clamp(1, DEFAULT_RUNTIME_JOB_LIMIT);
     let rows: Vec<RuntimeUsageSqlRow> = sqlx::query_as(
         "SELECT
-             workflow.id,
-             workflow.data::text,
-             command.id,
-             command.status,
-             command.data::text,
-             job.data::text,
-             latest_event.event_type,
-             latest_event.created_at,
-             latest_turn.sequence IS NOT NULL,
-             COALESCE(event_flags.activity_result_ready, false)
-         FROM runtime_jobs job
-         JOIN workflow_commands command ON command.id = job.command_id
-         JOIN workflow_instances workflow ON workflow.id = command.workflow_id
-         LEFT JOIN LATERAL (
-             SELECT event_type, created_at
-             FROM runtime_events event
-             WHERE event.runtime_job_id = job.id
-             ORDER BY sequence DESC
-             LIMIT 1
-         ) latest_event ON true
-         LEFT JOIN LATERAL (
-             SELECT sequence FROM runtime_events event
-             WHERE event.runtime_job_id = job.id AND event.event_type = 'RuntimeTurnStarted'
-             ORDER BY sequence DESC LIMIT 1
-         ) latest_turn ON true
-         LEFT JOIN LATERAL (
-             SELECT BOOL_OR(event_type = 'ActivityResultReady') AS activity_result_ready
-             FROM runtime_events event
-             WHERE event.runtime_job_id = job.id AND event.sequence > latest_turn.sequence
-         ) event_flags ON true
-         WHERE job.status IN ('pending', 'running')
-            OR job.updated_at >= $1
+             workflow_id,
+             workflow_data,
+             command_id,
+             command_status,
+             command_data,
+             runtime_job_data,
+             latest_event_type,
+             latest_event_created_at,
+             runtime_turn_started,
+             activity_result_ready_after_latest_turn
+         FROM (
+             SELECT
+                 workflow.id AS workflow_id,
+                 workflow.data::text AS workflow_data,
+                 command.id AS command_id,
+                 command.status AS command_status,
+                 command.data::text AS command_data,
+                 job.data::text AS runtime_job_data,
+                 latest_event.event_type AS latest_event_type,
+                 latest_event.created_at AS latest_event_created_at,
+                 latest_turn.sequence IS NOT NULL AS runtime_turn_started,
+                 COALESCE(event_flags.activity_result_ready, false)
+                    AS activity_result_ready_after_latest_turn,
+                 0 AS sort_priority,
+                 job.status AS sort_status,
+                 job.updated_at AS sort_updated_at,
+                 job.id AS sort_job_id
+             FROM runtime_jobs job
+             JOIN workflow_commands command ON command.id = job.command_id
+             JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+             LEFT JOIN LATERAL (
+                 SELECT event_type, created_at
+                 FROM runtime_events event
+                 WHERE event.runtime_job_id = job.id
+                 ORDER BY sequence DESC
+                 LIMIT 1
+             ) latest_event ON true
+             LEFT JOIN LATERAL (
+                 SELECT sequence FROM runtime_events event
+                 WHERE event.runtime_job_id = job.id AND event.event_type = 'RuntimeTurnStarted'
+                 ORDER BY sequence DESC LIMIT 1
+             ) latest_turn ON true
+             LEFT JOIN LATERAL (
+                 SELECT BOOL_OR(event_type = 'ActivityResultReady') AS activity_result_ready
+                 FROM runtime_events event
+                 WHERE event.runtime_job_id = job.id AND event.sequence > latest_turn.sequence
+             ) event_flags ON true
+             WHERE job.status IN ('pending', 'running')
+             UNION ALL
+             SELECT * FROM (
+                 SELECT
+                     workflow.id AS workflow_id,
+                     workflow.data::text AS workflow_data,
+                     command.id AS command_id,
+                     command.status AS command_status,
+                     command.data::text AS command_data,
+                     job.data::text AS runtime_job_data,
+                     latest_event.event_type AS latest_event_type,
+                     latest_event.created_at AS latest_event_created_at,
+                     latest_turn.sequence IS NOT NULL AS runtime_turn_started,
+                     COALESCE(event_flags.activity_result_ready, false)
+                        AS activity_result_ready_after_latest_turn,
+                     1 AS sort_priority,
+                     job.status AS sort_status,
+                     job.updated_at AS sort_updated_at,
+                     job.id AS sort_job_id
+                 FROM runtime_jobs job
+                 JOIN workflow_commands command ON command.id = job.command_id
+                 JOIN workflow_instances workflow ON workflow.id = command.workflow_id
+                 LEFT JOIN LATERAL (
+                     SELECT event_type, created_at
+                     FROM runtime_events event
+                     WHERE event.runtime_job_id = job.id
+                     ORDER BY sequence DESC
+                     LIMIT 1
+                 ) latest_event ON true
+                 LEFT JOIN LATERAL (
+                     SELECT sequence FROM runtime_events event
+                     WHERE event.runtime_job_id = job.id
+                       AND event.event_type = 'RuntimeTurnStarted'
+                     ORDER BY sequence DESC LIMIT 1
+                 ) latest_turn ON true
+                 LEFT JOIN LATERAL (
+                     SELECT BOOL_OR(event_type = 'ActivityResultReady') AS activity_result_ready
+                     FROM runtime_events event
+                     WHERE event.runtime_job_id = job.id AND event.sequence > latest_turn.sequence
+                 ) event_flags ON true
+                 WHERE job.status NOT IN ('pending', 'running')
+                   AND job.updated_at >= $1
+                 ORDER BY job.updated_at DESC, job.id DESC
+                 LIMIT $2
+             ) historical_rows
+         ) combined_rows
          ORDER BY
-             CASE job.status
+             sort_priority ASC,
+             CASE sort_status
                  WHEN 'running' THEN 0
                  WHEN 'pending' THEN 1
                  ELSE 2
              END ASC,
-             job.updated_at DESC,
-             job.id DESC
-         LIMIT $2",
+             sort_updated_at DESC,
+             sort_job_id DESC",
     )
     .bind(recent_since)
     .bind(limit)
     .fetch_all(store.pool())
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(
-            |(
-                workflow_id,
-                workflow,
-                command_id,
-                command_status,
-                command,
-                runtime_job,
-                latest_runtime_event_type,
-                latest_runtime_event_at,
-                runtime_turn_started,
-                activity_result_ready_after_latest_turn,
-            )| {
-                match parse_runtime_usage_row(
-                    &workflow_id,
-                    command_id,
-                    command_status,
-                    &workflow,
-                    &command,
-                    &runtime_job,
-                    latest_runtime_event_type,
-                    latest_runtime_event_at,
-                    runtime_turn_started,
-                    activity_result_ready_after_latest_turn,
-                ) {
-                    Ok(row) => Some(row),
-                    Err(error) => {
-                        tracing::warn!(
-                            workflow_id = %workflow_id,
-                            "usage_monitor: skipping invalid runtime row: {error}"
-                        );
-                        None
-                    }
-                }
-            },
-        )
-        .collect())
+    let mut load = RuntimeRowsLoad::default();
+    for (
+        workflow_id,
+        workflow,
+        command_id,
+        command_status,
+        command,
+        runtime_job,
+        latest_runtime_event_type,
+        latest_runtime_event_at,
+        runtime_turn_started,
+        activity_result_ready_after_latest_turn,
+    ) in rows
+    {
+        match parse_runtime_usage_row(
+            &workflow_id,
+            command_id,
+            command_status,
+            &workflow,
+            &command,
+            &runtime_job,
+            latest_runtime_event_type,
+            latest_runtime_event_at,
+            runtime_turn_started,
+            activity_result_ready_after_latest_turn,
+        ) {
+            Ok(row) => load.rows.push(row),
+            Err(error) => {
+                load.malformed_rows += 1;
+                tracing::error!(
+                    workflow_id = %workflow_id,
+                    "usage_monitor: skipping invalid runtime row: {error}"
+                );
+            }
+        }
+    }
+    Ok(load)
 }
 
 fn parse_runtime_usage_row(

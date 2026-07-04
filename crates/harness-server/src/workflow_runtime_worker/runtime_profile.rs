@@ -55,18 +55,8 @@ pub(super) fn runtime_profile_approval_policy(
         RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => Ok(Some(raw.to_string())),
         other => anyhow::bail!(
             "runtime profile approval_policy `{raw}` is only supported for Codex runtime kinds, not {}",
-            runtime_kind_label(other)
+            other.as_str()
         ),
-    }
-}
-
-fn runtime_kind_label(kind: RuntimeKind) -> &'static str {
-    match kind {
-        RuntimeKind::CodexExec => "codex_exec",
-        RuntimeKind::CodexJsonrpc => "codex_jsonrpc",
-        RuntimeKind::ClaudeCode => "claude_code",
-        RuntimeKind::AnthropicApi => "anthropic_api",
-        RuntimeKind::RemoteHost => "remote_host",
     }
 }
 
