@@ -103,7 +103,7 @@ impl RepoMemoryRecord {
     }
 }
 
-type RepoMemoryRecordRow = (
+pub(crate) type RepoMemoryRecordRow = (
     Uuid,
     String,
     String,
@@ -117,7 +117,7 @@ type RepoMemoryRecordRow = (
     i64,
 );
 
-fn record_from_row(row: RepoMemoryRecordRow) -> anyhow::Result<RepoMemoryRecord> {
+pub(crate) fn record_from_row(row: RepoMemoryRecordRow) -> anyhow::Result<RepoMemoryRecord> {
     let (
         id,
         repo,

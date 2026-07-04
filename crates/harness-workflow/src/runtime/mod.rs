@@ -11,6 +11,7 @@ pub mod eval;
 mod job_claim;
 pub mod lease_state;
 mod memory_extract;
+mod memory_retrieval;
 pub mod model;
 mod otel_trace_context;
 pub mod plan_issue;
@@ -53,6 +54,10 @@ pub use eval::{
     DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
+pub use memory_retrieval::{
+    RepoMemoryRetrievalOptions, RetrievedRepoMemoryRecord, DEFAULT_REPO_MEMORY_RETRIEVAL_LIMIT,
+    DEFAULT_REPO_MEMORY_TOKEN_BUDGET,
+};
 pub use model::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, ActivityStatus,
     RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord,
