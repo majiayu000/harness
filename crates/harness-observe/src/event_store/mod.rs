@@ -2,17 +2,20 @@ use chrono::{DateTime, Utc};
 use harness_core::config::misc::OtelConfig;
 use harness_core::db::{pg_open_pool, PgStoreContext};
 use harness_core::run_id::RunId;
+#[cfg(test)]
+use harness_core::types::ExternalSignal;
 use harness_core::types::{
-    AutoFixReport, Decision, Event, EventFilters, EventId, ExternalSignal, ExternalSignalId, Grade,
-    SessionId, Severity, Violation,
+    AutoFixReport, Decision, Event, EventFilters, EventId, Grade, SessionId, Severity, Violation,
 };
 use sqlx::postgres::PgPool;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
+mod external_signals;
 mod legacy;
 mod migrations;
+mod trajectory;
 
 pub use legacy::migrate_legacy_event_store_if_needed;
 use migrations::EVENT_MIGRATIONS;
@@ -747,50 +750,6 @@ impl EventStore {
             ..Default::default()
         })
         .await
-    }
-
-    fn signals_file(&self) -> std::path::PathBuf {
-        self.data_dir.join("signals.jsonl")
-    }
-
-    pub fn log_external_signal(&self, signal: &ExternalSignal) -> anyhow::Result<ExternalSignalId> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.signals_file())?;
-        let line = serde_json::to_string(signal)?;
-        writeln!(file, "{line}")?;
-        Ok(signal.id.clone())
-    }
-
-    pub fn query_external_signals(
-        &self,
-        since: Option<DateTime<Utc>>,
-    ) -> anyhow::Result<Vec<ExternalSignal>> {
-        let path = self.signals_file();
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = std::fs::File::open(&path)?;
-        let reader = std::io::BufReader::new(file);
-        let mut signals = Vec::new();
-        use std::io::BufRead;
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(sig) = serde_json::from_str::<ExternalSignal>(&line) {
-                if let Some(since) = since {
-                    if sig.received_at < since {
-                        continue;
-                    }
-                }
-                signals.push(sig);
-            }
-        }
-        Ok(signals)
     }
 
     #[cfg(test)]

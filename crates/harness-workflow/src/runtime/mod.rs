@@ -10,6 +10,7 @@ pub mod errors;
 mod job_claim;
 pub mod lease_state;
 pub mod model;
+mod otel_trace_context;
 pub mod plan_issue;
 pub mod pr_feedback;
 pub mod prompt_task;
@@ -42,6 +43,7 @@ pub use model::{
     WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
     WorkflowLease, WorkflowSubject,
 };
+pub use otel_trace_context::WorkflowOtelTraceContext;
 pub use plan_issue::{
     build_plan_issue_decision, PlanIssueDecisionInput, PlanIssueDecisionOutput,
     PlanIssueWorkflowAction, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL,

@@ -7,6 +7,7 @@ mod child_workflow_replay;
 mod data_helpers;
 mod executor;
 mod merge_completion;
+mod otel_trajectory;
 mod pr_feedback_inspection;
 mod prompt_input_telemetry;
 mod prompt_packet;
@@ -28,6 +29,7 @@ use harness_workflow::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeWorker,
     WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
 };
+use otel_trajectory::emit_runtime_job_trajectory_completion;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,6 +88,13 @@ pub(crate) async fn run_runtime_job_worker_tick(
     let executor = ServerRuntimeJobExecutor::new(state);
     let mut completed = worker.run_once(&executor).await?;
     if let Some(job) = completed.as_mut() {
+        if let Err(error) = emit_runtime_job_trajectory_completion(state, store.as_ref(), job).await
+        {
+            tracing::warn!(
+                runtime_job_id = %job.id,
+                "workflow runtime OTel trajectory emission failed: {error}"
+            );
+        }
         record_runtime_circuit_breaker_completion(state, store.as_ref(), job).await?;
         if let Err(error) = notify_runtime_submission_terminal(state, job).await {
             tracing::warn!(
