@@ -3,6 +3,7 @@ mod flow;
 mod pr_state;
 mod runtime_feedback;
 mod signals;
+mod terminal;
 mod wait_budget;
 
 pub(crate) use flow::run_review_loop;

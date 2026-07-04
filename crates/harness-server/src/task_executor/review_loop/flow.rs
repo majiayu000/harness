@@ -1,3 +1,4 @@
+use super::terminal::mark_round_budget_exhausted;
 use super::{
     decision::*, pr_state::*, runtime_feedback::*, signals::*, wait_budget::ReviewWaitBudget,
 };
@@ -327,16 +328,9 @@ pub(crate) async fn run_review_loop(
         let check_req = run_pre_execute(interceptors, check_req).await?;
         if let Some(max) = effective_max_turns {
             if *turns_used >= max {
-                let msg = format!(
-                    "Turn budget exhausted: used {} of {} allowed turns",
-                    turns_used, max
-                );
                 tracing::warn!(task_id = %task_id, turns_used, max, "turn budget exhausted in review loop");
-                mutate_and_persist(store, task_id, |s| {
-                    s.status = TaskStatus::Failed;
-                    s.error = Some(msg.clone());
-                })
-                .await?;
+                mark_round_budget_exhausted(store, task_id, *turns_used, TaskStatus::Reviewing)
+                    .await?;
                 return Ok(());
             }
         }
@@ -764,16 +758,7 @@ pub(crate) async fn run_review_loop(
         })
         .await?;
     } else {
-        mutate_and_persist(store, task_id, |s| {
-            s.status = TaskStatus::Failed;
-            s.turn = max_rounds.saturating_add(1);
-            s.error = Some(format!(
-                "Task did not receive LGTM after {} review rounds (last issues: {}).",
-                max_rounds,
-                last_issue_count.map_or("unknown".to_string(), |n| n.to_string()),
-            ));
-        })
-        .await?;
+        mark_round_budget_exhausted(store, task_id, max_rounds, TaskStatus::Reviewing).await?;
     }
     tracing::info!(
         task_id = %task_id,
