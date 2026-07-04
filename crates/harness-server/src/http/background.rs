@@ -636,10 +636,14 @@ async fn dispatch_runtime_command_with_project_policy(
         }
     };
 
+    let isolation_config = runtime_isolation_config_for_command(state, store, &command)
+        .await
+        .context("failed to load runtime isolation config")?;
     let repo = command_repo_hint(store, &command).await?;
     let activity = command.command.runtime_activity_key().to_string();
     let dispatch_gate_fact_hash = command_dispatch_gate_fact_hash(&command);
     let outcome = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
+        .with_isolation_config(isolation_config)
         .with_dispatcher_id(dispatch_owner)
         .dispatch_command(command)
         .await?;
@@ -651,6 +655,26 @@ async fn dispatch_runtime_command_with_project_policy(
         dispatch_gate_fact_hash.as_deref(),
     );
     Ok(outcome)
+}
+
+async fn runtime_isolation_config_for_command(
+    state: &Arc<AppState>,
+    store: &WorkflowRuntimeStore,
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<harness_core::config::isolation::IsolationConfig> {
+    let project_root = runtime_command_project_root(store, command, &state.core.project_root)
+        .await
+        .context("failed to resolve command project root for isolation config")?;
+    let project_config = harness_core::config::project::load_project_config(&project_root)
+        .with_context(|| {
+            format!(
+                "failed to load project config for isolation at {}",
+                project_root.display()
+            )
+        })?;
+    Ok(project_config
+        .isolation
+        .unwrap_or_else(|| state.core.server.config.isolation.clone()))
 }
 
 async fn command_repo_hint(

@@ -25,6 +25,7 @@ mod store_migrations;
 mod store_summary;
 pub mod submission;
 pub mod terminal_state;
+pub mod tier_resolution;
 pub mod validator;
 pub mod worker;
 
@@ -32,6 +33,8 @@ pub mod worker;
 mod circuit_breaker_store_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tier_resolution_dispatch_tests;
 
 pub use bus::InMemoryWorkflowBus;
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
@@ -107,6 +110,7 @@ pub use submission::{
     IssueSubmissionWorkflowAction,
 };
 pub use terminal_state::{workflow_terminal_state, WorkflowTerminalState};
+pub use tier_resolution::{resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution};
 pub use validator::{
     DecisionValidator, TransitionAllowlist, TransitionRule, ValidationContext,
     WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
