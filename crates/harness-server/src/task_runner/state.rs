@@ -602,6 +602,9 @@ impl TaskState {
         }
 
         let status = outcome.status();
+        if let TaskTerminalOutcome::Failed(failure) = &outcome {
+            self.turn = failure.rounds_used.saturating_add(1);
+        }
         self.status = status.clone();
         self.phase = TaskPhase::Terminal;
         self.error = outcome.reason_string();
@@ -628,6 +631,7 @@ mod terminal_tests {
         assert!(state.apply_terminal_outcome_once(outcome));
 
         assert_eq!(state.status, TaskStatus::Failed);
+        assert_eq!(state.turn, 4);
         assert_eq!(state.phase, TaskPhase::Terminal);
         assert_eq!(
             state.error.as_deref(),

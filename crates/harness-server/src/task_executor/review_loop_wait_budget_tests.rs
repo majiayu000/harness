@@ -1,5 +1,8 @@
 use super::review_loop::run_review_loop;
-use crate::task_runner::{CreateTaskRequest, TaskId, TaskState, TaskStatus, TaskStore};
+use crate::event_replay::TaskEvent;
+use crate::task_runner::{
+    CreateTaskRequest, TaskId, TaskPhase, TaskState, TaskStatus, TaskStore, TaskTerminalFailure,
+};
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::types::{Capability, TokenUsage};
 use std::collections::HashMap;
@@ -194,5 +197,94 @@ async fn review_loop_waiting_output_fails_when_wait_budget_exceeded() -> anyhow:
         "unexpected error: {:?}",
         final_state.error
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_loop_round_budget_exhausted_marks_terminal_once() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let dir = tempfile::tempdir()?;
+    let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+    let task_id = TaskId::new();
+    store.insert(&TaskState::new(task_id.clone())).await;
+    let agent =
+        StaticReviewAgent::new("Found 4 issues.\n1. Missing test\n2. Race\n3. Leak\n4. Panic");
+    let review_config = harness_core::config::agents::AgentReviewConfig {
+        review_wait_budget_secs: 60,
+        ..harness_core::config::agents::AgentReviewConfig::default()
+    };
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+    let interceptors = Arc::new(Vec::new());
+    let mut turns_used = 0;
+    let mut turns_used_acc = 0;
+
+    run_review_loop(
+        store.as_ref(),
+        &task_id,
+        &agent,
+        &review_config,
+        &harness_core::config::project::ProjectConfig::default(),
+        None,
+        None,
+        dir.path(),
+        &CreateTaskRequest::default(),
+        &events,
+        &interceptors,
+        &[],
+        dir.path(),
+        &HashMap::new(),
+        Some("https://github.com/owner/repo/pull/1".to_string()),
+        1,
+        None,
+        1,
+        0,
+        1,
+        false,
+        false,
+        Duration::from_secs(5),
+        &mut turns_used,
+        &mut turns_used_acc,
+        Instant::now(),
+        Instant::now(),
+        "invalid-repo-slug".to_string(),
+        0.9,
+        None,
+    )
+    .await?;
+
+    let final_state = store
+        .get(&task_id)
+        .ok_or_else(|| anyhow::anyhow!("task state should exist"))?;
+    assert_eq!(final_state.status, TaskStatus::Failed);
+    assert_eq!(final_state.phase, TaskPhase::Terminal);
+    assert_eq!(final_state.turn, 2);
+    let failure: TaskTerminalFailure = serde_json::from_str(
+        final_state
+            .error
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("terminal failure should include a reason"))?,
+    )?;
+    assert_eq!(failure.reason, "round_budget_exhausted");
+    assert_eq!(failure.rounds_used, 1);
+    assert_eq!(failure.last_status, TaskStatus::Reviewing);
+    assert_eq!(failure.waiting_on.as_deref(), Some("local_review_gate"));
+    assert_eq!(agent.request_count().await, 1);
+
+    let event_log = std::fs::read_to_string(dir.path().join("task-events.jsonl"))?;
+    let failed_events = event_log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<TaskEvent>(line).ok())
+        .filter(|event| {
+            matches!(
+                event,
+                TaskEvent::Failed { reason, .. }
+                    if reason.contains(r#""reason":"round_budget_exhausted""#)
+            )
+        })
+        .count();
+    assert_eq!(failed_events, 1);
     Ok(())
 }
