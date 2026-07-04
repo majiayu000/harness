@@ -1,15 +1,24 @@
 use super::{
     command_store, insert_decision_record_tx, insert_event_tx, insert_instance_if_absent_tx,
-    load_or_insert_initial_instance_tx, to_jsonb_string, workflow_instance_from_row,
-    RuntimeHistoryPruneSummary, WorkflowDecisionTransition, WorkflowInstancePage,
-    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    load_or_insert_initial_instance_tx, select_instance_for_update_tx, to_jsonb_string,
+    upsert_instance_tx, workflow_instance_from_row, RuntimeHistoryPruneSummary,
+    WorkflowDecisionTransition, WorkflowInstancePage, WorkflowRejectedDecisionTransition,
+    WorkflowRuntimeStore,
 };
 use crate::runtime::model::{WorkflowDecisionRecord, WorkflowInstance};
 use crate::runtime::state_registry::{
     known_workflow_definition_ids, workflow_terminal_state_names_for_definition,
 };
 use crate::runtime::status::WorkflowCommandStatus;
+use crate::runtime::WorkflowOtelTraceContext;
 use chrono::{DateTime, Utc};
+
+fn otel_trace_context_from_data(data: &serde_json::Value) -> Option<WorkflowOtelTraceContext> {
+    let context =
+        serde_json::from_value::<WorkflowOtelTraceContext>(data.get("otel_trace_context")?.clone())
+            .ok()?;
+    context.has_valid_trace_ids().then_some(context)
+}
 
 impl WorkflowRuntimeStore {
     pub async fn insert_instance_if_absent(
@@ -49,6 +58,38 @@ impl WorkflowRuntimeStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn ensure_otel_trace_context(
+        &self,
+        workflow_id: &str,
+    ) -> anyhow::Result<Option<WorkflowOtelTraceContext>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        if let Some(context) = otel_trace_context_from_data(&instance.data) {
+            tx.commit().await?;
+            return Ok(Some(context));
+        }
+
+        let context = WorkflowOtelTraceContext::new();
+        if !instance.data.is_object() {
+            instance.data = serde_json::json!({});
+        }
+        let data = instance
+            .data
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("workflow instance data is not an object"))?;
+        data.insert(
+            "otel_trace_context".to_string(),
+            serde_json::to_value(&context)?,
+        );
+        instance.version = instance.version.saturating_add(1);
+        upsert_instance_tx(&mut tx, &instance).await?;
+        tx.commit().await?;
+        Ok(Some(context))
     }
 
     pub async fn apply_decision_transition(

@@ -118,7 +118,7 @@ fn parse_error_notification() {
 }
 
 #[test]
-fn parse_token_usage_notification() {
+fn otel_turn_spans_parse_token_usage_notification() {
     let line = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15},"total":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15}}}}"#;
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
