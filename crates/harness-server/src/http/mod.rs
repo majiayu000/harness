@@ -20,6 +20,7 @@ pub(crate) mod auth;
 pub(crate) mod auto_merge;
 pub(crate) mod background;
 pub(crate) mod builders;
+pub(crate) mod github_intake_status;
 pub(crate) mod http_router;
 pub(crate) mod init;
 pub(crate) mod misc_routes;

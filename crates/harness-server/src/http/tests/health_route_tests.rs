@@ -1,5 +1,37 @@
 use super::*;
 
+async fn state_after_github_intake_startup_validation(
+    dir: &std::path::Path,
+    config: harness_core::config::HarnessConfig,
+) -> anyhow::Result<Arc<AppState>> {
+    let mut state = make_read_only_route_test_state_with(
+        dir,
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let state_mut = Arc::get_mut(&mut state).expect("unique state");
+    if let Some(status) = crate::http::github_intake_status::github_webhook_intake_startup_status(
+        &state_mut.core.server.config,
+    ) {
+        let subsystem = status.name;
+        state_mut.startup_statuses.push(status);
+        state_mut.degraded_subsystems.push(subsystem);
+    }
+    Ok(state)
+}
+
+fn github_intake_config(
+    mode: harness_core::config::intake::IntakeMode,
+) -> harness_core::config::intake::GitHubIntakeConfig {
+    harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        mode,
+        repo: "owner/repo".to_string(),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
@@ -10,6 +42,83 @@ async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
     assert_eq!(health.status, "degraded");
     assert!(health.persistence.degraded_subsystems.is_empty());
     assert!(health.persistence.runtime_state_dirty);
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_degraded_when_github_webhook_intake_secret_missing() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.github = Some(github_intake_config(
+        harness_core::config::intake::IntakeMode::Webhook,
+    ));
+    let health =
+        call_health(state_after_github_intake_startup_validation(dir.path(), config).await?)
+            .await?;
+
+    assert_eq!(health.status, "degraded");
+    assert_eq!(
+        health.persistence.degraded_subsystems,
+        [crate::http::github_intake_status::GITHUB_WEBHOOK_INTAKE_SUBSYSTEM]
+    );
+    assert_eq!(health.persistence.startup.stores.len(), 1);
+    assert_eq!(
+        health.persistence.startup.stores[0].name,
+        crate::http::github_intake_status::GITHUB_WEBHOOK_INTAKE_SUBSYSTEM
+    );
+    assert_eq!(
+        health.persistence.startup.stores[0].error.as_deref(),
+        Some("startup_failed")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_degraded_when_github_hybrid_intake_secret_is_whitespace() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.github = Some(github_intake_config(
+        harness_core::config::intake::IntakeMode::Hybrid,
+    ));
+    config.server.github_webhook_secret = Some("   ".to_string());
+    let health =
+        call_health(state_after_github_intake_startup_validation(dir.path(), config).await?)
+            .await?;
+
+    assert_eq!(health.status, "degraded");
+    assert_eq!(
+        health.persistence.degraded_subsystems,
+        [crate::http::github_intake_status::GITHUB_WEBHOOK_INTAKE_SUBSYSTEM]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_ok_when_github_poll_intake_has_no_webhook_secret() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.github = Some(github_intake_config(
+        harness_core::config::intake::IntakeMode::Poll,
+    ));
+    let health =
+        call_health(state_after_github_intake_startup_validation(dir.path(), config).await?)
+            .await?;
+
+    assert_eq!(health.status, "ok");
+    assert!(health.persistence.degraded_subsystems.is_empty());
+    assert!(health.persistence.startup.stores.is_empty());
     Ok(())
 }
 

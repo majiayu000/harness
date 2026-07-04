@@ -488,27 +488,22 @@ pub(crate) async fn github_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let secret = match state
-        .core
-        .server
-        .config
-        .server
-        .github_webhook_secret
-        .as_deref()
-    {
-        Some("") => {
+    let secret = match super::github_intake_status::github_webhook_secret_for_request(
+        &state.core.server.config.server,
+    ) {
+        Err(super::github_intake_status::GitHubWebhookSecretError::Invalid) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "invalid server.github_webhook_secret configuration"})),
             )
         }
-        Some(secret) => secret,
-        None => {
+        Err(super::github_intake_status::GitHubWebhookSecretError::Missing) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "missing server.github_webhook_secret configuration"})),
             )
         }
+        Ok(secret) => secret,
     };
     let signature = match headers
         .get("x-hub-signature-256")
@@ -720,10 +715,26 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
         })
         .count() as u64;
 
+    let github_cfg = intake_config.github.as_ref();
+    let github_mode =
+        github_cfg.map(|config| super::github_intake_status::intake_mode_name(config.mode));
+    let github_drivers = super::github_intake_status::github_intake_driver_metadata(
+        github_cfg,
+        &state.core.server.config.server,
+        state.intake.github_pollers.len(),
+    );
+    let github_effective_repos = super::github_intake_status::github_effective_repos(github_cfg);
+    let github_webhook_degraded = github_drivers["webhook"]["degraded"]
+        .as_bool()
+        .unwrap_or(false);
+
     let github_channel = json!({
         "name": "github",
-        "enabled": intake_config.github.as_ref().map(|c| c.enabled).unwrap_or(false),
-        "repo": intake_config.github.as_ref().map(|c| c.repo.as_str()).unwrap_or(""),
+        "enabled": github_cfg.map(|c| c.enabled).unwrap_or(false),
+        "repo": github_cfg.map(|c| c.repo.as_str()).unwrap_or(""),
+        "mode": github_mode,
+        "drivers": github_drivers,
+        "repos": github_effective_repos,
         "active": github_active,
     });
 
@@ -762,11 +773,25 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
         "channels": [github_channel, feishu_channel, dashboard_channel],
         "recent_dispatches": recent_dispatches,
     });
+    let mut degraded_missing = Vec::new();
     if runtime_degraded {
+        degraded_missing.push("workflow_runtime_submissions");
+    }
+    if github_webhook_degraded {
+        degraded_missing.push(super::github_intake_status::GITHUB_WEBHOOK_INTAKE_SUBSYSTEM);
+    }
+    if !degraded_missing.is_empty() {
+        let reason = if runtime_degraded && !github_webhook_degraded {
+            "runtime_submission_summaries_unavailable"
+        } else if github_webhook_degraded && !runtime_degraded {
+            "github_webhook_secret_unavailable"
+        } else {
+            "intake_status_degraded"
+        };
         response["degraded"] = json!({
             "partial": true,
-            "missing": ["workflow_runtime_submissions"],
-            "reason": "runtime_submission_summaries_unavailable",
+            "missing": degraded_missing,
+            "reason": reason,
         });
     }
     Json(response)
@@ -923,21 +948,16 @@ pub(crate) async fn ingest_signal(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let secret = match state
-        .core
-        .server
-        .config
-        .server
-        .github_webhook_secret
-        .as_deref()
-    {
-        Some("") | None => {
+    let secret = match super::github_intake_status::github_webhook_secret_for_request(
+        &state.core.server.config.server,
+    ) {
+        Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "server.github_webhook_secret not configured"})),
             )
         }
-        Some(s) => s,
+        Ok(secret) => secret,
     };
 
     let signature = match headers

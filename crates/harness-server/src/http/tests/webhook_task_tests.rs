@@ -303,6 +303,43 @@ async fn webhook_empty_secret_configuration_fails_closed() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn webhook_whitespace_secret_configuration_fails_closed() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let (state, _agent) = make_test_state_with_agent(dir.path(), Some("   ")).await?;
+    let app = webhook_app(state);
+
+    let payload = serde_json::json!({
+        "action": "created",
+        "issue": { "number": 106 },
+        "comment": { "body": "@harness please handle this issue" },
+        "repository": { "full_name": "majiayu000/harness" }
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("x-github-event", "issue_comment")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let json = response_json(response).await?;
+    assert_eq!(
+        json["error"],
+        "invalid server.github_webhook_secret configuration"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn webhook_missing_secret_configuration_fails_closed() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), None).await?;
