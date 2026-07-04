@@ -1,13 +1,17 @@
 use crate::task_runner::{TaskId, TaskKind, TaskStatus, TaskStore};
 use chrono::{DateTime, Utc};
-use harness_core::agent::{AgentRequest, AgentResponse, StreamItem};
+#[cfg(test)]
+use harness_core::agent::StreamItem;
+use harness_core::agent::{AgentRequest, AgentResponse};
 use harness_core::error::HarnessError;
 use harness_core::interceptor::{ToolUseEvent, TurnInterceptor};
 use harness_core::types::{
-    ContextItem, Decision, Event, EventMetadata, SessionId, SkillId, ThreadId, TurnFailure, TurnId,
-    TurnStatus, TurnTelemetry,
+    ContextItem, Decision, Event, EventMetadata, SessionId, SkillId, TurnFailure, TurnTelemetry,
 };
+#[cfg(test)]
+use harness_core::types::{ThreadId, TurnId};
 use harness_observe::event_store::EventStore;
+#[cfg(test)]
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use std::path::Path;
 use std::sync::Arc;
@@ -187,6 +191,7 @@ pub(crate) async fn detect_modified_files(project_root: &Path) -> Vec<std::path:
     Vec::new()
 }
 
+#[cfg(test)]
 pub(crate) fn emit_runtime_notification(
     notify_tx: &Option<crate::notify::NotifySender>,
     notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
@@ -196,6 +201,7 @@ pub(crate) fn emit_runtime_notification(
     let _ = notification_tx.send(RpcNotification::new(notification));
 }
 
+#[cfg(test)]
 pub(crate) async fn persist_runtime_thread(
     thread_db: &Option<crate::thread_db::ThreadDb>,
     server: &crate::server::HarnessServer,
@@ -210,6 +216,7 @@ pub(crate) async fn persist_runtime_thread(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn process_stream_item(
     server: &crate::server::HarnessServer,
     thread_db: &Option<crate::thread_db::ThreadDb>,
@@ -343,32 +350,6 @@ pub(crate) async fn process_stream_item(
         }
         _ => {}
     }
-}
-
-pub(crate) async fn mark_turn_failed(
-    server: &crate::server::HarnessServer,
-    thread_db: &Option<crate::thread_db::ThreadDb>,
-    notify_tx: &Option<crate::notify::NotifySender>,
-    notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
-    thread_id: &ThreadId,
-    turn_id: &TurnId,
-    error: String,
-) {
-    if let Err(err) = server.thread_manager.fail_turn(thread_id, turn_id) {
-        tracing::warn!("failed to mark turn as failed: {err}");
-    } else {
-        persist_runtime_thread(thread_db, server, thread_id).await;
-    }
-    emit_runtime_notification(
-        notify_tx,
-        notification_tx,
-        Notification::TurnCompleted {
-            turn_id: turn_id.clone(),
-            status: TurnStatus::Failed,
-            token_usage: harness_core::types::TokenUsage::default(),
-        },
-    );
-    tracing::error!("turn failed: {error}");
 }
 
 pub(crate) async fn update_status(
