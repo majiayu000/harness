@@ -342,6 +342,7 @@ async fn release_issue_after_dependencies(
             dependencies_blocked: false,
             remote_fact_hash: None,
             submission_mode: SubmissionMode::Immediate,
+            candidate_fanout: fields.candidate_fanout,
         },
     );
     let event = store

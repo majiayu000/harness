@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use harness_core::config::isolation::{
     IsolationAvailability, IsolationConfig, IsolationTrustClass,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -232,7 +232,8 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         }
 
         let activity = command.command.runtime_activity_key().to_string();
-        let runtime_profile = self.profile_for_command(&command).await?;
+        let mut runtime_profile = self.profile_for_command(&command).await?;
+        apply_candidate_runtime_budget(&mut runtime_profile, &command.command.command)?;
         let isolation =
             isolation_resolution_for_instance(instance.as_ref(), &self.isolation_config)
                 .with_context(|| {
@@ -327,6 +328,56 @@ impl<'a> RuntimeCommandDispatcher<'a> {
     }
 }
 
+fn apply_candidate_runtime_budget(
+    runtime_profile: &mut RuntimeProfile,
+    command_payload: &Value,
+) -> anyhow::Result<()> {
+    let Some(candidate) = command_payload.get("candidate") else {
+        return Ok(());
+    };
+    let candidate_count = required_positive_u32(candidate, "candidate_count")?;
+    let max_turns_per_candidate = optional_positive_u32(
+        candidate.pointer("/budget/max_turns_per_candidate"),
+        "candidate.budget.max_turns_per_candidate",
+    )?;
+    let max_turns = max_turns_per_candidate.or_else(|| {
+        runtime_profile
+            .max_turns
+            .map(|max_turns| (max_turns / candidate_count).max(1))
+    });
+    if let Some(max_turns) = max_turns {
+        runtime_profile.max_turns = Some(max_turns);
+    }
+    Ok(())
+}
+
+fn required_positive_u32(value: &Value, field: &str) -> anyhow::Result<u32> {
+    let raw = value
+        .get(field)
+        .ok_or_else(|| anyhow::anyhow!("candidate metadata missing {field}"))?;
+    positive_u32(raw, field)
+}
+
+fn optional_positive_u32(value: Option<&Value>, field: &str) -> anyhow::Result<Option<u32>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    positive_u32(value, field).map(Some)
+}
+
+fn positive_u32(value: &Value, field: &str) -> anyhow::Result<u32> {
+    let Some(raw) = value.as_u64() else {
+        anyhow::bail!("{field} must be an unsigned integer");
+    };
+    if raw == 0 || raw > u64::from(u32::MAX) {
+        anyhow::bail!("{field} must be between 1 and {}", u32::MAX);
+    }
+    Ok(raw as u32)
+}
+
 fn isolation_resolution_for_instance(
     instance: Option<&super::model::WorkflowInstance>,
     config: &IsolationConfig,
@@ -395,6 +446,44 @@ mod tests {
         assert_eq!(profile.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(profile.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(profile.timeout_secs, None);
+    }
+
+    #[test]
+    fn candidate_fanout_budget_splits_runtime_profile_max_turns() -> anyhow::Result<()> {
+        let mut profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        profile.max_turns = Some(9);
+        let payload = json!({
+            "candidate": {
+                "candidate_count": 3,
+                "budget": {
+                    "max_turns_per_candidate": null,
+                },
+            },
+        });
+
+        apply_candidate_runtime_budget(&mut profile, &payload)?;
+
+        assert_eq!(profile.max_turns, Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_fanout_budget_override_wins_over_split() -> anyhow::Result<()> {
+        let mut profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        profile.max_turns = Some(9);
+        let payload = json!({
+            "candidate": {
+                "candidate_count": 3,
+                "budget": {
+                    "max_turns_per_candidate": 5,
+                },
+            },
+        });
+
+        apply_candidate_runtime_budget(&mut profile, &payload)?;
+
+        assert_eq!(profile.max_turns, Some(5));
+        Ok(())
     }
 
     #[test]

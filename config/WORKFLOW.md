@@ -59,6 +59,10 @@ runtime_retry_policy:
   retry_delay_secs: 30
   max_retry_delay_secs: 900
   activity_retries: {}
+candidates:
+  enabled: false
+  n: 2
+  trigger_label: best-of-n
 storage:
   schema_namespace: workflow
   workflow_watchdog_enabled: false

@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod candidates;
+pub use candidates::WorkflowCandidatesPolicy;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowDocument {
     #[serde(default)]
@@ -252,6 +255,8 @@ pub struct WorkflowConfig {
     pub runtime_retry_policy: RuntimeRetryPolicy,
     #[serde(default)]
     pub memory: WorkflowMemoryPolicy,
+    #[serde(default)]
+    pub candidates: WorkflowCandidatesPolicy,
     #[serde(default)]
     pub storage: WorkflowStoragePolicy,
     #[serde(default)]

@@ -145,6 +145,7 @@ pub async fn enqueue_eval_case_workflow(
             dependencies_blocked: false,
             remote_fact_hash: None,
             submission_mode: SubmissionMode::Immediate,
+            candidate_fanout: None,
         },
     );
     let decision = with_eval_command_metadata(output.decision, input);
@@ -594,6 +595,7 @@ mod tests {
                 dependencies_blocked: false,
                 remote_fact_hash: None,
                 submission_mode: SubmissionMode::Immediate,
+                candidate_fanout: None,
             },
         );
         let decision = with_eval_command_metadata(output.decision, input);

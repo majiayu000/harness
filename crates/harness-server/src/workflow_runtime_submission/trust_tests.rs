@@ -23,7 +23,7 @@ fn intake_trust_issue_submission_data_records_author_trust_class() -> anyhow::Re
         author_trust_class: Some(IsolationTrustClass::NonCollaborator),
     };
 
-    let data = issue_submission_data(&ctx, &project_root.to_string_lossy(), &json!({}));
+    let data = issue_submission_data(&ctx, &project_root.to_string_lossy(), &json!({}), None);
 
     assert_eq!(
         data["author_trust_class"],

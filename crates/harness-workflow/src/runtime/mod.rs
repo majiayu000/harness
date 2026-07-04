@@ -5,6 +5,7 @@
 //! instances, accepted commands, runtime jobs, and structured activity results.
 
 pub mod bus;
+mod candidate_fanout;
 mod candidate_selection;
 pub mod dispatcher;
 pub mod errors;
@@ -41,6 +42,10 @@ mod tests;
 mod tier_resolution_dispatch_tests;
 
 pub use bus::InMemoryWorkflowBus;
+pub use candidate_fanout::{
+    candidate_fanout_from_policy, candidate_fanout_from_value, CandidateFanoutRequest,
+    CANDIDATE_FANOUT_BUDGET_STRATEGY, CANDIDATE_FANOUT_MAX_COUNT, CANDIDATE_FANOUT_MIN_COUNT,
+};
 pub use candidate_selection::{
     select_candidate, CandidateCheckConclusion, CandidateDiffScope, CandidateEvidence,
     CandidateOutcome, CandidatePromotionRecord, CandidateRankingRecord, CandidateSelectionInput,

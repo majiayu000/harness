@@ -1,10 +1,11 @@
 use crate::task_runner::TaskId;
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
-    build_issue_submission_decision, build_prompt_submission_decision, DecisionValidator,
-    IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, SubmissionMode, ValidationContext,
-    WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
+    build_issue_submission_decision, build_prompt_submission_decision,
+    candidate_fanout_from_policy, candidate_fanout_from_value, CandidateFanoutRequest,
+    DecisionValidator, IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, SubmissionMode,
+    ValidationContext, WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -135,7 +136,15 @@ async fn persist_issue_submission(
             true,
         ),
     };
-    let submitted_data = issue_submission_data(ctx, &project_id, &instance.data);
+    let workflow_cfg = harness_core::config::workflow::load_workflow_config(ctx.project_root)?;
+    let candidate_fanout = candidate_fanout_from_policy(
+        &instance.id,
+        ctx.issue_number,
+        ctx.labels,
+        &workflow_cfg.candidates,
+    )?;
+    let submitted_data =
+        issue_submission_data(ctx, &project_id, &instance.data, candidate_fanout.as_ref());
     let output = build_issue_submission_decision(
         &instance,
         IssueSubmissionDecisionInput {
@@ -149,6 +158,7 @@ async fn persist_issue_submission(
             dependencies_blocked: ctx.dependencies_blocked,
             remote_fact_hash: ctx.remote_fact_hash,
             submission_mode: SubmissionMode::Immediate,
+            candidate_fanout,
         },
     );
     apply_decision(
@@ -346,6 +356,7 @@ fn issue_submission_data(
     ctx: &IssueSubmissionRuntimeContext<'_>,
     project_id: &str,
     existing_data: &serde_json::Value,
+    candidate_fanout: Option<&CandidateFanoutRequest>,
 ) -> serde_json::Value {
     let last_remote_fact_hash = ctx
         .remote_fact_hash
@@ -369,6 +380,9 @@ fn issue_submission_data(
         "tracker_source": issue_tracker_source(ctx),
         "tracker_external_id": issue_tracker_external_id(ctx),
     });
+    if let (Some(object), Some(candidate_fanout)) = (data.as_object_mut(), candidate_fanout) {
+        object.insert("candidate_fanout".to_string(), json!(candidate_fanout));
+    }
     insert_author_trust_class(&mut data, ctx.author_trust_class);
     crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data)
 }
@@ -464,6 +478,7 @@ struct IssueSubmissionFields {
     tracker_source: Option<String>,
     tracker_external_id: Option<String>,
     author_trust_class: Option<IsolationTrustClass>,
+    candidate_fanout: Option<CandidateFanoutRequest>,
 }
 
 fn issue_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<IssueSubmissionFields> {
@@ -485,6 +500,7 @@ fn issue_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<IssueS
         tracker_source: optional_string_field(&instance.data, "tracker_source"),
         tracker_external_id: optional_string_field(&instance.data, "tracker_external_id"),
         author_trust_class: author_trust_class_field(&instance.data)?,
+        candidate_fanout: candidate_fanout_from_value(&instance.data)?,
     })
 }
 
