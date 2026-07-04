@@ -1,4 +1,5 @@
 use harness_workflow::runtime::{
+    CANDIDATE_BRANCH_ARTIFACT, CANDIDATE_CLEANUP_ACTIVITY, CANDIDATE_PROMOTION_ACTIVITY,
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
     ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, ISSUE_STATE_ARTIFACT,
     PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
@@ -101,10 +102,19 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
                 ])
                 .with_accepted_artifacts(vec![
                     "pull_request",
+                    CANDIDATE_BRANCH_ARTIFACT,
                     ISSUE_STATE_ARTIFACT,
                     "workflow_decision",
                 ])
-                .requires("pull_request_artifact_or_closed_issue_or_scope_too_large_signal")
+                .requires("pull_request_artifact_or_closed_issue_or_scope_too_large_signal; deferred submission mode requires candidate_branch instead of pull_request")
+        }
+        (GITHUB_ISSUE_PR_DEFINITION_ID, CANDIDATE_PROMOTION_ACTIVITY) => {
+            ActivityContract::new(workflow_definition, activity)
+                .with_accepted_artifacts(vec!["pull_request"])
+                .requires("exactly_one_pull_request_artifact_from_selected_candidate_branch")
+        }
+        (GITHUB_ISSUE_PR_DEFINITION_ID, CANDIDATE_CLEANUP_ACTIVITY) => {
+            ActivityContract::new(workflow_definition, activity)
         }
         (GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_PLAN_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)

@@ -39,8 +39,11 @@ fn activity_result_schema_describes_issue_implementation_terminal_evidence_contr
     );
     assert_eq!(
         schema["activity_contract"]["success_requires"],
-        "pull_request_artifact_or_closed_issue_or_scope_too_large_signal"
+        "pull_request_artifact_or_closed_issue_or_scope_too_large_signal; deferred submission mode requires candidate_branch instead of pull_request"
     );
+    assert!(schema["activity_contract"]["accepted_artifacts"]
+        .as_array()
+        .is_some_and(|items| items.contains(&json!(CANDIDATE_BRANCH_ARTIFACT))));
     assert_eq!(
         schema["agent_summary_contract"]["artifacts"]["issue_state"]["fields"][1],
         "state"
@@ -356,6 +359,47 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
     let prompt = build_runtime_job_prompt(&packet, None);
     assert!(prompt.contains("Repository workflow prompt template:"));
     assert!(prompt.contains("Follow the repository workflow prompt."));
+}
+
+#[test]
+fn runtime_prompt_packet_describes_deferred_candidate_submission_contract() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_issue",
+            "command": {
+                "submission_mode": "deferred",
+                "candidate": {
+                    "candidate_id": "wf-1:candidate-group:issue-1449:c1",
+                    "candidate_index": 1,
+                },
+            },
+        }),
+    );
+    let workflow_document = WorkflowDocument::default();
+    let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+
+    let packet = build_runtime_prompt_packet(
+        &job,
+        None,
+        Path::new("/workspaces/issue-1449-c1"),
+        Path::new("/repo"),
+        &runtime_profile,
+        &workflow_document,
+        &[],
+    );
+
+    assert_eq!(packet["runtime_contract"]["submission_mode"], "deferred");
+    assert!(packet["runtime_contract"]["deferred_submission_contract"]
+        .as_str()
+        .is_some_and(|value| value.contains("Do not open")));
+    assert!(
+        packet["required_structured_output"]["candidate_branch_artifact"]
+            .as_str()
+            .is_some_and(|value| value.contains(CANDIDATE_BRANCH_ARTIFACT))
+    );
 }
 
 #[test]

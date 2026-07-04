@@ -27,8 +27,13 @@ use self::runtime_failure::{
     runtime_failed_decision,
 };
 use self::support::{
-    event_command_type, event_field_string, invalid_agent_output_blocked_decision,
-    runtime_completion_evidence,
+    event_command_type, event_field_string, event_workflow_command,
+    invalid_agent_output_blocked_decision, runtime_completion_evidence,
+};
+use super::candidate_promotion::{
+    build_candidate_promotion_decision, candidate_promotion_failure_decision,
+    candidate_promotion_success_decision, candidate_selection_record_from_activity_result,
+    deferred_candidate_result_decision,
 };
 use super::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
@@ -77,10 +82,19 @@ pub fn reduce_runtime_job_completed(
         ActivityStatus::Blocked => github_issue_closed_decision(instance, event, &result)
             .or_else(|| scope_too_large_decision(instance, event, &result))
             .or_else(|| Some(runtime_blocked_decision(instance, event, &result))),
-        ActivityStatus::Failed => Some(
-            retry_failed_activity_decision(instance, event, &result)
-                .unwrap_or_else(|| runtime_failed_decision(instance, event, &result)),
-        ),
+        ActivityStatus::Failed => {
+            if let Some(command) = event_workflow_command(event) {
+                if let Some(decision) =
+                    candidate_promotion_failure_decision(instance, event, &result, &command)
+                {
+                    return decision.map(Some);
+                }
+            }
+            Some(
+                retry_failed_activity_decision(instance, event, &result)
+                    .unwrap_or_else(|| runtime_failed_decision(instance, event, &result)),
+            )
+        }
         ActivityStatus::Cancelled => Some(runtime_cancelled_decision(instance, event, &result)),
     };
     Ok(decision)
@@ -100,6 +114,48 @@ fn reduce_success(
     }
     if let Some(decision) = scope_too_large_decision(instance, event, result) {
         return Some(decision);
+    }
+    if let Some(selection) = candidate_selection_record_from_activity_result(result) {
+        return Some(
+            match selection.and_then(|selection| {
+                build_candidate_promotion_decision(instance, event, result, selection, Vec::new())
+                    .map_err(Into::into)
+            }) {
+                Ok(decision) => decision,
+                Err(error) => invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    &format!("candidate selection could not be promoted: {error}"),
+                ),
+            },
+        );
+    }
+    if let Some(command) = event_workflow_command(event) {
+        if let Some(decision) =
+            candidate_promotion_success_decision(instance, event, result, &command)
+        {
+            return Some(decision.unwrap_or_else(|error| {
+                invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    &format!("candidate promotion result could not be applied: {error}"),
+                )
+            }));
+        }
+        if let Some(decision) =
+            deferred_candidate_result_decision(instance, event, result, &command)
+        {
+            return Some(decision.unwrap_or_else(|error| {
+                invalid_agent_output_blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    &format!("deferred candidate result is invalid: {error}"),
+                )
+            }));
+        }
     }
     if let Some(reason) =
         pr_feedback_success_contract_error(instance, result, structured_decision.as_ref())
