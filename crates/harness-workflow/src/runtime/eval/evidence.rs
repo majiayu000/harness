@@ -197,9 +197,13 @@ fn quality_gate_evidence(
         .and_then(|command_id| runtime_jobs.iter().find(|job| job.command_id == command_id))
         .or_else(|| {
             runtime_jobs.iter().find(|job| {
-                activity_result_from_job(job)
-                    .as_ref()
-                    .is_some_and(|result| result.activity == QUALITY_GATE_ACTIVITY)
+                job.input
+                    .get("activity")
+                    .and_then(Value::as_str)
+                    .is_some_and(|activity| activity == QUALITY_GATE_ACTIVITY)
+                    || activity_result_from_job(job)
+                        .as_ref()
+                        .is_some_and(|result| result.activity == QUALITY_GATE_ACTIVITY)
             })
         })?;
     let result = activity_result_from_job(job);
@@ -353,6 +357,7 @@ fn usage_snapshot_from_event(
                 .saturating_add(output_tokens.unwrap_or(0))
         })
     });
+    let cost_usd_micros = first_u64_field(payload, &["cost_usd_micros"]);
     UsageSnapshot {
         agent_invocation_id: payload
             .get("agent_invocation_id")
@@ -372,9 +377,9 @@ fn usage_snapshot_from_event(
         output_tokens,
         cached_input_tokens,
         total_tokens,
-        cost_usd_micros: first_u64_field(payload, &["cost_usd_micros"]),
+        cost_usd_micros,
         token_confidence: Confidence::Observed,
-        cost_confidence: if payload.get("cost_usd_micros").is_some() {
+        cost_confidence: if cost_usd_micros.is_some() {
             Confidence::Estimated
         } else {
             Confidence::Unknown
@@ -561,6 +566,23 @@ mod tests {
             evidence.runtime.as_ref().unwrap().terminal_state,
             Some("done".to_string())
         );
+    }
+
+    #[test]
+    fn eval_usage_invalid_cost_keeps_cost_confidence_unknown() {
+        let snapshot = usage_snapshot_from_event(
+            Some("workflow-1"),
+            "job-1",
+            &json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "cost_usd_micros": "not-a-number"
+                }
+            }),
+        );
+
+        assert_eq!(snapshot.cost_usd_micros, None);
+        assert_eq!(snapshot.cost_confidence, Confidence::Unknown);
     }
 
     fn command_record(
