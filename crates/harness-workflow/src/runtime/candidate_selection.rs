@@ -84,6 +84,16 @@ impl CandidateEvidence {
         self
     }
 
+    pub fn with_runtime_job_id(mut self, runtime_job_id: impl Into<String>) -> Self {
+        self.runtime_job_id = Some(runtime_job_id.into());
+        self
+    }
+
+    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
+        self.branch = Some(branch.into());
+        self
+    }
+
     pub fn with_diff(
         mut self,
         diff_scope: CandidateDiffScope,
@@ -121,6 +131,10 @@ pub struct CandidateSelectionInput {
 pub struct CandidateRankingRecord {
     pub rank: usize,
     pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub selected: bool,
     pub outcome: CandidateOutcome,
     pub validation: CandidateCheckConclusion,
@@ -168,6 +182,8 @@ pub fn select_candidate(input: CandidateSelectionInput) -> CandidateSelectionRec
             CandidateRankingRecord {
                 rank: index + 1,
                 candidate_id: candidate.candidate_id,
+                runtime_job_id: candidate.runtime_job_id,
+                branch: candidate.branch,
                 selected,
                 outcome: candidate.outcome,
                 validation: candidate.validation,
@@ -380,7 +396,9 @@ mod tests {
     #[test]
     fn candidate_selection_record_converts_to_persistable_activity_artifact(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let record = selection(vec![CandidateEvidence::succeeded("candidate-a")]);
+        let record = selection(vec![CandidateEvidence::succeeded("candidate-a")
+            .with_runtime_job_id("job-a")
+            .with_branch("harness/issue-1-c1")]);
 
         let artifact = record.to_activity_artifact()?;
 
@@ -395,6 +413,14 @@ mod tests {
         assert_eq!(
             round_tripped.selected_candidate_id.as_deref(),
             Some("candidate-a")
+        );
+        assert_eq!(
+            round_tripped.ranking[0].runtime_job_id.as_deref(),
+            Some("job-a")
+        );
+        assert_eq!(
+            round_tripped.ranking[0].branch.as_deref(),
+            Some("harness/issue-1-c1")
         );
         Ok(())
     }

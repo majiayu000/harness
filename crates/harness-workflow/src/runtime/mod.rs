@@ -6,6 +6,7 @@
 
 pub mod bus;
 mod candidate_fanout;
+mod candidate_promotion;
 mod candidate_selection;
 pub mod dispatcher;
 pub mod errors;
@@ -45,6 +46,11 @@ pub use bus::InMemoryWorkflowBus;
 pub use candidate_fanout::{
     candidate_fanout_from_policy, candidate_fanout_from_value, CandidateFanoutRequest,
     CANDIDATE_FANOUT_BUDGET_STRATEGY, CANDIDATE_FANOUT_MAX_COUNT, CANDIDATE_FANOUT_MIN_COUNT,
+};
+pub use candidate_promotion::{
+    candidate_promotion_plan, CandidatePromotionFailure, CandidatePromotionPlan,
+    CandidatePromotionPlanError, CandidatePromotionTarget, CANDIDATE_BRANCH_ARTIFACT,
+    CANDIDATE_CLEANUP_ACTIVITY, CANDIDATE_PROMOTION_ACTIVITY,
 };
 pub use candidate_selection::{
     select_candidate, CandidateCheckConclusion, CandidateDiffScope, CandidateEvidence,

@@ -1,12 +1,13 @@
 use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
     ActivityArtifact, DecisionValidator, RetrievedRepoMemoryRecord, RuntimeJob, RuntimeProfile,
-    WorkflowInstance, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_PLAN_ACTIVITY,
-    ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, ISSUE_STATE_ARTIFACT, PROMPT_TASK_DEFINITION_ID,
-    PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
-    PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
-    SCOPE_TOO_LARGE_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
+    WorkflowInstance, CANDIDATE_BRANCH_ARTIFACT, CANDIDATE_CLEANUP_ACTIVITY,
+    CANDIDATE_PROMOTION_ACTIVITY, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
+    ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, ISSUE_STATE_ARTIFACT,
+    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
+    PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL, SCOPE_TOO_LARGE_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -79,7 +80,59 @@ pub(super) fn build_runtime_prompt_packet(
     if !repo_memory.is_empty() {
         packet["repo_memory"] = repo_memory_prompt_value(repo_memory);
     }
+    apply_candidate_submission_contract(&mut packet, job);
     packet
+}
+
+fn apply_candidate_submission_contract(packet: &mut Value, job: &RuntimeJob) {
+    let activity = activity_name(job);
+    let deferred = deferred_submission_mode(job);
+    if let Some(contract) = packet
+        .get_mut("runtime_contract")
+        .and_then(Value::as_object_mut)
+    {
+        if deferred {
+            contract.insert("submission_mode".to_string(), json!("deferred"));
+            contract.insert(
+                "deferred_submission_contract".to_string(),
+                json!(format!(
+                    "Push the candidate branch and emit a `{CANDIDATE_BRANCH_ARTIFACT}` artifact with branch evidence. Do not open, update, or bind a pull request in deferred mode."
+                )),
+            );
+        }
+        if activity == CANDIDATE_PROMOTION_ACTIVITY {
+            contract.insert(
+                "candidate_promotion_contract".to_string(),
+                json!("Open or update exactly one pull request from command_input.command.candidate.branch, then emit one pull_request artifact for that PR."),
+            );
+        }
+        if activity == CANDIDATE_CLEANUP_ACTIVITY {
+            contract.insert(
+                "candidate_cleanup_contract".to_string(),
+                json!("Clean only the non-selected candidate branches/workspaces listed in command_input.command.candidates. Do not modify the selected PR branch."),
+            );
+        }
+    }
+    if deferred {
+        if let Some(output) = packet
+            .get_mut("required_structured_output")
+            .and_then(Value::as_object_mut)
+        {
+            output.insert(
+                "candidate_branch_artifact".to_string(),
+                json!(format!(
+                    "Required for deferred candidate implementations: artifact_type `{CANDIDATE_BRANCH_ARTIFACT}` with branch and candidate evidence."
+                )),
+            );
+        }
+    }
+}
+
+fn deferred_submission_mode(job: &RuntimeJob) -> bool {
+    job.input
+        .pointer("/command/submission_mode")
+        .and_then(Value::as_str)
+        == Some("deferred")
 }
 
 pub(super) fn build_runtime_job_prompt(
