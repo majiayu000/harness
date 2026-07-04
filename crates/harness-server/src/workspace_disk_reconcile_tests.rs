@@ -309,8 +309,14 @@ async fn reclaim_gate_skips_live_persisted_lease() -> anyhow::Result<()> {
         )
         .await?;
 
-    let outcome =
-        try_reclaim_workspace(source.path(), &lease.workspace_path, Some(&store), None).await?;
+    let outcome = try_reclaim_workspace(
+        source.path(),
+        &lease.workspace_path,
+        Some(&store),
+        None,
+        WorkspaceReclaimMode::Guard,
+    )
+    .await?;
 
     assert_eq!(
         outcome,
@@ -381,7 +387,14 @@ async fn reclaim_gate_deletes_workspace_without_live_lease() -> anyhow::Result<(
     let workspace_path = workspace.path().join("dead-workspace");
     std::fs::create_dir_all(&workspace_path)?;
 
-    let outcome = try_reclaim_workspace(source.path(), &workspace_path, None, Some(false)).await?;
+    let outcome = try_reclaim_workspace(
+        source.path(),
+        &workspace_path,
+        None,
+        Some(false),
+        WorkspaceReclaimMode::Guard,
+    )
+    .await?;
 
     assert_eq!(outcome, WorkspaceReclaimOutcome::Deleted);
     assert!(

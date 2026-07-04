@@ -239,7 +239,15 @@ pub(super) async fn cleanup_workspace_path(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceReclaimOutcome {
     Deleted,
+    ForcedDeleted {
+        task_id: TaskId,
+        owner_session: String,
+    },
     SkippedLiveLease {
+        task_id: TaskId,
+        owner_session: String,
+    },
+    SkippedMissingTask {
         task_id: TaskId,
         owner_session: String,
     },
@@ -248,19 +256,40 @@ pub(crate) enum WorkspaceReclaimOutcome {
     },
 }
 
+pub(crate) enum WorkspaceReclaimMode<'a> {
+    Guard,
+    Force {
+        task_store: &'a crate::task_runner::TaskStore,
+    },
+}
+
 pub(super) async fn try_reclaim_workspace(
     source_repo: &Path,
     workspace_path: &Path,
     lease_store: Option<&WorkspaceLeaseStore>,
     known_worktree_registered: Option<bool>,
+    mode: WorkspaceReclaimMode<'_>,
 ) -> anyhow::Result<WorkspaceReclaimOutcome> {
     if let Some(store) = lease_store {
         match store.leased_workspace_path(workspace_path).await {
             Ok(Some(record)) => {
-                return Ok(WorkspaceReclaimOutcome::SkippedLiveLease {
-                    task_id: record.task_id,
-                    owner_session: record.owner_session,
-                });
+                return match mode {
+                    WorkspaceReclaimMode::Guard => Ok(WorkspaceReclaimOutcome::SkippedLiveLease {
+                        task_id: record.task_id,
+                        owner_session: record.owner_session,
+                    }),
+                    WorkspaceReclaimMode::Force { task_store } => {
+                        force_reclaim_leased_workspace(
+                            source_repo,
+                            workspace_path,
+                            store,
+                            task_store,
+                            record,
+                            known_worktree_registered,
+                        )
+                        .await
+                    }
+                };
             }
             Ok(None) => {}
             Err(error) => {
@@ -278,6 +307,55 @@ pub(super) async fn try_reclaim_workspace(
     )
     .await?;
     Ok(WorkspaceReclaimOutcome::Deleted)
+}
+
+async fn force_reclaim_leased_workspace(
+    source_repo: &Path,
+    workspace_path: &Path,
+    lease_store: &WorkspaceLeaseStore,
+    task_store: &crate::task_runner::TaskStore,
+    record: WorkspaceLeaseRecord,
+    known_worktree_registered: Option<bool>,
+) -> anyhow::Result<WorkspaceReclaimOutcome> {
+    let task_id = record.task_id.clone();
+    let owner_session = record.owner_session.clone();
+    let Some(snapshot) = task_store.get(&task_id) else {
+        return Ok(WorkspaceReclaimOutcome::SkippedMissingTask {
+            task_id,
+            owner_session,
+        });
+    };
+
+    let outcome = crate::task_runner::TaskTerminalOutcome::Failed(
+        crate::task_runner::TaskTerminalFailure::new(
+            "workspace_reclaimed",
+            snapshot.turn,
+            snapshot.status,
+            None,
+        ),
+    );
+    match crate::task_runner::mark_terminal_once(task_store, &task_id, outcome).await? {
+        crate::task_runner::TerminalTransition::Applied
+        | crate::task_runner::TerminalTransition::AlreadyTerminal(_) => {}
+        crate::task_runner::TerminalTransition::MissingTask => {
+            return Ok(WorkspaceReclaimOutcome::SkippedMissingTask {
+                task_id,
+                owner_session,
+            });
+        }
+    }
+
+    cleanup_workspace_path_with_registration(
+        source_repo,
+        workspace_path,
+        known_worktree_registered,
+    )
+    .await?;
+    lease_store.release_task(&task_id).await?;
+    Ok(WorkspaceReclaimOutcome::ForcedDeleted {
+        task_id,
+        owner_session,
+    })
 }
 
 pub(super) async fn cleanup_workspace_path_with_registration(

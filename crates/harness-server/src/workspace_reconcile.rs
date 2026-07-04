@@ -358,10 +358,17 @@ impl WorkspaceManager {
 
             if should_remove {
                 let _git_ops = self.git_ops.lock().await;
-                match try_reclaim_workspace(source_repo, &path, self.lease_store.as_deref(), None)
-                    .await
+                match try_reclaim_workspace(
+                    source_repo,
+                    &path,
+                    self.lease_store.as_deref(),
+                    None,
+                    WorkspaceReclaimMode::Guard,
+                )
+                .await
                 {
                     Ok(WorkspaceReclaimOutcome::Deleted) => summary.removed += 1,
+                    Ok(WorkspaceReclaimOutcome::ForcedDeleted { .. }) => summary.removed += 1,
                     Ok(WorkspaceReclaimOutcome::SkippedLiveLease {
                         task_id,
                         owner_session,
@@ -378,6 +385,18 @@ impl WorkspaceManager {
                         tracing::warn!(
                             workspace_path = ?path,
                             "reconcile_disk_workspaces: reclaim gate failed closed after lease lookup error: {error}"
+                        );
+                        summary.skipped_open += 1;
+                    }
+                    Ok(WorkspaceReclaimOutcome::SkippedMissingTask {
+                        task_id,
+                        owner_session,
+                    }) => {
+                        tracing::warn!(
+                            workspace_path = ?path,
+                            task_id = %task_id.0,
+                            owner_session = %owner_session,
+                            "reconcile_disk_workspaces: reclaim gate skipped workspace because owning task was missing"
                         );
                         summary.skipped_open += 1;
                     }
@@ -474,11 +493,24 @@ impl WorkspaceManager {
             if self.active.iter().any(|e| e.workspace_path == path) {
                 continue;
             }
-            match try_reclaim_workspace(source_repo, &path, self.lease_store.as_deref(), None).await
+            match try_reclaim_workspace(
+                source_repo,
+                &path,
+                self.lease_store.as_deref(),
+                None,
+                WorkspaceReclaimMode::Guard,
+            )
+            .await
             {
                 Ok(WorkspaceReclaimOutcome::Deleted) => {
                     tracing::info!(
                         "cleanup_orphan_worktrees: removed orphan worktree {:?}",
+                        path
+                    );
+                }
+                Ok(WorkspaceReclaimOutcome::ForcedDeleted { .. }) => {
+                    tracing::info!(
+                        "cleanup_orphan_worktrees: force-removed orphan worktree {:?}",
                         path
                     );
                 }
@@ -497,6 +529,17 @@ impl WorkspaceManager {
                     tracing::warn!(
                         workspace_path = ?path,
                         "cleanup_orphan_worktrees: reclaim gate failed closed after lease lookup error: {error}"
+                    );
+                }
+                Ok(WorkspaceReclaimOutcome::SkippedMissingTask {
+                    task_id,
+                    owner_session,
+                }) => {
+                    tracing::warn!(
+                        workspace_path = ?path,
+                        task_id = %task_id.0,
+                        owner_session = %owner_session,
+                        "cleanup_orphan_worktrees: reclaim gate skipped workspace because owning task was missing"
                     );
                 }
                 Err(e) => {

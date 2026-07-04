@@ -335,6 +335,27 @@ impl WorkspaceManager {
         cleanup_workspace_path(source_repo, workspace_path).await
     }
 
+    pub async fn force_reclaim_workspace(
+        &self,
+        task_store: &crate::task_runner::TaskStore,
+        source_repo: &Path,
+        workspace_path: &Path,
+    ) -> anyhow::Result<bool> {
+        let _git_ops = self.git_ops.lock().await;
+        let outcome = try_reclaim_workspace(
+            source_repo,
+            workspace_path,
+            self.lease_store.as_deref(),
+            None,
+            WorkspaceReclaimMode::Force { task_store },
+        )
+        .await?;
+        Ok(matches!(
+            outcome,
+            WorkspaceReclaimOutcome::Deleted | WorkspaceReclaimOutcome::ForcedDeleted { .. }
+        ))
+    }
+
     /// Remove the workspace for the given task. Runs `before_remove_hook` first (non-fatal).
     /// Idempotent: returns Ok if the task has no active workspace.
     pub async fn remove_workspace(&self, task_id: &TaskId) -> anyhow::Result<()> {
@@ -626,6 +647,10 @@ mod lease_store_tests;
 #[cfg(test)]
 #[path = "workspace_pool_tests.rs"]
 mod pool_tests;
+
+#[cfg(test)]
+#[path = "workspace_reclaim_tests.rs"]
+mod reclaim_tests;
 
 #[cfg(test)]
 #[path = "workspace_startup_reconcile_tests.rs"]
