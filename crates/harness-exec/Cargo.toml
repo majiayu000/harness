@@ -6,6 +6,9 @@ description = "Process execution helpers for the Harness agent orchestration lay
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 serde = { workspace = true }

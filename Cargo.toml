@@ -24,6 +24,9 @@ license = "MIT"
 rust-version = "1.88"
 repository = "https://github.com/majiayu000/harness"
 
+[workspace.lints.rust]
+warnings = "deny"
+
 [workspace.dependencies]
 # Internal crates (version required so they can be published to crates.io)
 harness-core = { path = "crates/harness-core", version = "0.6.34" }
@@ -108,3 +111,9 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 # Testing
 tempfile = "3"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

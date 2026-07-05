@@ -6,6 +6,9 @@ description = "Rule loading and evaluation for the Harness agent orchestration l
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 serde = { workspace = true }

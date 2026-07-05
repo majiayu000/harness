@@ -6,6 +6,9 @@ description = "Workflow runtime and state machine for the Harness agent orchestr
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 harness-observe = { workspace = true }

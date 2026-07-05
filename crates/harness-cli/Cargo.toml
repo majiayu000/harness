@@ -6,6 +6,9 @@ description = "Command-line interface for the Harness agent orchestration layer"
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "harness"
 path = "src/main.rs"

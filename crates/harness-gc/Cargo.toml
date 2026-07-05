@@ -6,6 +6,9 @@ description = "Garbage collection and workspace cleanup for the Harness agent or
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 harness-rules = { workspace = true }

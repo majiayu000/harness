@@ -6,6 +6,9 @@ description = "HTTP server, task runner, and workflow runtime for the Harness ag
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 harness-protocol = { workspace = true }

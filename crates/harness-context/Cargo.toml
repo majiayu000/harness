@@ -6,6 +6,9 @@ description = "Deterministic context composition for the Harness agent orchestra
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 harness-rules = { workspace = true }

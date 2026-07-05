@@ -6,6 +6,9 @@ description = "Sandbox and isolation primitives for the Harness agent orchestrat
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 thiserror = { workspace = true }
