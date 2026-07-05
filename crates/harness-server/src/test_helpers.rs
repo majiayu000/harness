@@ -204,7 +204,6 @@ async fn make_state_inner(
     agent_registry: AgentRegistry,
     mut config: HarnessConfig,
 ) -> anyhow::Result<AppState> {
-    let db_setup_guard = acquire_db_state_guard().await;
     let database_url = test_database_url()?;
     config.server.database_url = Some(database_url.clone());
     let server = Arc::new(HarnessServer::new(
@@ -268,8 +267,6 @@ async fn make_state_inner(
         None,
         vec![],
     );
-    drop(db_setup_guard);
-
     Ok(AppState {
         core: crate::http::CoreServices {
             server,
@@ -341,4 +338,20 @@ async fn make_state_inner(
         task_svc,
         execution_svc,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn db_state_guard_compatibility_shim_does_not_serialize() {
+        let _first = acquire_db_state_guard().await;
+        let second =
+            tokio::time::timeout(Duration::from_millis(50), acquire_db_state_guard()).await;
+        assert!(
+            second.is_ok(),
+            "legacy DB guard compatibility shim must not serialize callers"
+        );
+    }
 }

@@ -523,10 +523,37 @@ pub(crate) fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
 /// regardless of which store calls it.
 pub async fn pg_create_schema_if_not_exists(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
     validate_schema_name(schema)?;
-    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
+    match sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
         .execute(pool)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if pg_create_schema_if_not_exists_race(&error) => {
+            if pg_schema_exists(pool, schema).await? {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(error))
+            }
+        }
+        Err(error) => Err(anyhow::anyhow!(error)),
+    }
+}
+
+async fn pg_schema_exists(pool: &PgPool, schema: &str) -> anyhow::Result<bool> {
+    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pg_namespace WHERE nspname = $1")
+        .bind(schema)
+        .fetch_optional(pool)
         .await?;
-    Ok(())
+    Ok(exists.is_some())
+}
+
+fn pg_create_schema_if_not_exists_race(error: &sqlx::Error) -> bool {
+    let Some(db_error) = error.as_database_error() else {
+        return false;
+    };
+    db_error.code().as_deref() == Some("23505")
+        && (db_error.constraint() == Some("pg_namespace_nspname_index")
+            || db_error.message().contains("pg_namespace_nspname_index"))
 }
 
 /// Create a Postgres connection pool where every connection has `search_path`

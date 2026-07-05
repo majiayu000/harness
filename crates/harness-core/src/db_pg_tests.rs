@@ -1,7 +1,7 @@
 use super::{
-    configure_pg_pool_from_server, pg_open_pool, pg_pool_settings, pg_schema_for_path,
-    resolve_database_url, validate_schema_name, PgStoreContext, DEFAULT_PG_ACQUIRE_TIMEOUT_SECS,
-    DEFAULT_PG_MAX_CONNECTIONS,
+    configure_pg_pool_from_server, pg_create_schema_if_not_exists, pg_open_pool, pg_pool_settings,
+    pg_schema_for_path, resolve_database_url, validate_schema_name, PgStoreContext,
+    DEFAULT_PG_ACQUIRE_TIMEOUT_SECS, DEFAULT_PG_MAX_CONNECTIONS,
 };
 use crate::config::server::ServerConfig;
 use crate::db_pg_schema_registry::{PG_SCHEMA_REGISTRY_SCHEMA, PG_SCHEMA_REGISTRY_TABLE};
@@ -247,6 +247,49 @@ async fn pg_store_context_runtime_pool_errors_name_the_step() {
         err.to_string().contains("runtime pool"),
         "error should identify the runtime-pool step: {err}"
     );
+}
+
+#[tokio::test]
+async fn concurrent_schema_create_if_not_exists_is_idempotent() -> anyhow::Result<()> {
+    let database_url = {
+        let _lock = process_env_lock();
+        let Ok(database_url) = crate::db_test_safety::resolve_test_database_url(None) else {
+            return Ok(());
+        };
+        database_url
+    };
+    let setup_pool = match pg_open_pool(&database_url).await {
+        Ok(pool) => pool,
+        Err(_) => return Ok(()),
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let schema = format!("schema_race_test_{}_{}", std::process::id(), nanos);
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let pool = setup_pool.clone();
+        let schema = schema.clone();
+        handles.push(tokio::spawn(async move {
+            pg_create_schema_if_not_exists(&pool, &schema).await
+        }));
+    }
+    for handle in handles {
+        handle.await??;
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_namespace WHERE nspname = $1")
+        .bind(&schema)
+        .fetch_one(&setup_pool)
+        .await?;
+    assert_eq!(count, 1);
+
+    sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", schema))
+        .execute(&setup_pool)
+        .await?;
+    setup_pool.close().await;
+    Ok(())
 }
 
 #[test]
