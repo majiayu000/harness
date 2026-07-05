@@ -157,6 +157,11 @@ async fn make_read_only_route_test_state_with_project_root(
         Some(database_url.as_str()),
     )
     .await?;
+    let postgres_catalog = crate::postgres_catalog::PostgresCatalogMonitor::new(
+        tasks.postgres_pool(),
+        crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
+    )
+    .await;
     drop(db_state_guard);
 
     let password_reset_rate_limit = server.config.server.password_reset_rate_limit_per_hour;
@@ -187,7 +192,7 @@ async fn make_read_only_route_test_state_with_project_root(
 
     Ok(Arc::new(AppState {
         core: CoreServices {
-            server,
+            server: server.clone(),
             project_root: project_root.to_path_buf(),
             home_dir: std::env::var("HOME")
                 .map(PathBuf::from)
@@ -227,6 +232,7 @@ async fn make_read_only_route_test_state_with_project_root(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        postgres_catalog,
         isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: AtomicBool::new(false),

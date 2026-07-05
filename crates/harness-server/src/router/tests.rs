@@ -73,7 +73,7 @@ async fn make_test_state_with_config_and_registry(
     );
     Ok(AppState {
         core: crate::http::CoreServices {
-            server,
+            server: server.clone(),
             project_root: dir.to_path_buf(),
             home_dir: std::env::var("HOME")
                 .map(std::path::PathBuf::from)
@@ -114,6 +114,10 @@ async fn make_test_state_with_config_and_registry(
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
+        ),
+        postgres_catalog: crate::postgres_catalog::PostgresCatalogMonitor::unavailable(
+            crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
+            "postgres_pool_unavailable",
         ),
         isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
@@ -1834,7 +1838,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
     );
     Ok(AppState {
         core: crate::http::CoreServices {
-            server,
+            server: server.clone(),
             project_root: dir.to_path_buf(),
             home_dir: std::env::var("HOME")
                 .map(std::path::PathBuf::from)
@@ -1875,6 +1879,10 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
+        ),
+        postgres_catalog: crate::postgres_catalog::PostgresCatalogMonitor::unavailable(
+            crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
+            "postgres_pool_unavailable",
         ),
         isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),

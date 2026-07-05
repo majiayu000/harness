@@ -7,7 +7,14 @@ import { PaletteFab } from "@/components/PaletteFab";
 import { DOCS_URL } from "@/lib/links";
 import { fmtInt } from "@/lib/format";
 import { useUsageMonitor } from "@/lib/queries";
-import type { ActiveCount, AgentInvocation, AgentProcess, LocalUsageSourceSummary, UsageGroup } from "@/types";
+import type {
+  ActiveCount,
+  AgentInvocation,
+  AgentProcess,
+  LocalUsageSourceSummary,
+  PostgresCatalogCensus,
+  UsageGroup,
+} from "@/types";
 
 function fmtTokens(tokens: number | null | undefined): string {
   if (tokens == null || !Number.isFinite(tokens)) return "-";
@@ -35,6 +42,51 @@ function fmtBytes(bytes: number): string {
   if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(0)}MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)}KB`;
   return `${bytes}B`;
+}
+
+function fmtNullableInt(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "-";
+  return fmtInt(value);
+}
+
+function fmtNullableBytes(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "-";
+  return fmtBytes(value);
+}
+
+function catalogSub(catalog: PostgresCatalogCensus | undefined): string {
+  if (!catalog) return "loading";
+  if (catalog.state !== "available") return catalog.error ?? catalog.state;
+  if (catalog.threshold_breached) return catalog.breach_reasons.join(", ") || "threshold breached";
+  return `threshold ${fmtInt(catalog.absolute_schema_threshold)} schemas / ${catalog.relative_schema_multiplier}x startup`;
+}
+
+function CatalogMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[11px] uppercase tracking-[0.08em] text-ink-4">{label}</div>
+      <div className="font-mono text-lg text-ink truncate" title={value}>{value}</div>
+    </div>
+  );
+}
+
+function PostgresCatalogPanel({ catalog }: { catalog: PostgresCatalogCensus | undefined }) {
+  const tone = catalog?.threshold_breached ? "text-danger" : catalog?.state === "available" ? "text-ok" : "text-warn";
+  return (
+    <Panel title="Postgres catalog" sub={catalogSub(catalog)}>
+      <div className="grid grid-cols-4 gap-4 p-4">
+        <CatalogMetric label="schemas" value={fmtNullableInt(catalog?.schema_count)} />
+        <CatalogMetric label="objects" value={fmtNullableInt(catalog?.catalog_object_count)} />
+        <CatalogMetric label="db size" value={fmtNullableBytes(catalog?.database_size_bytes)} />
+        <div className="min-w-0">
+          <div className="text-[11px] uppercase tracking-[0.08em] text-ink-4">state</div>
+          <div className={`font-mono text-lg truncate ${tone}`} title={catalog?.state ?? "loading"}>
+            {catalog?.threshold_breached ? "breached" : (catalog?.state ?? "loading")}
+          </div>
+        </div>
+      </div>
+    </Panel>
+  );
 }
 
 function burnClass(level: AgentInvocation["burn_level"]): string {
@@ -316,6 +368,8 @@ export function UsageMonitor() {
             <KpiCard label="External procs" value={fmtInt(data?.summary.external_agent_processes)} delta="local CLI only" />
             <KpiCard label="Models" value={fmtInt(data?.tokens_by_model.length)} delta={`${fmtInt(data?.cost.missing_model_count)} unpriced`} />
           </div>
+
+          <PostgresCatalogPanel catalog={data?.postgres_catalog} />
 
           <div className="grid grid-cols-[1.2fr_1fr]">
             <Panel title="Agent invocations" sub={`${fmtInt(data?.agent_invocations.length)} recent or active`} className="border-r border-line">

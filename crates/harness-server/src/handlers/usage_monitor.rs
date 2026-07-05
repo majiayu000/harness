@@ -63,6 +63,7 @@ struct UsageMonitorResponse {
     local_usage_sources: Vec<LocalUsageSourceSummary>,
     active_by_repo: Vec<ActiveCount>,
     active_by_activity: Vec<ActiveCount>,
+    postgres_catalog: crate::postgres_catalog::PostgresCatalogCensus,
     diagnostics: UsageDiagnostics,
 }
 
@@ -306,6 +307,7 @@ async fn build_usage_monitor_response(
         sample_agent_processes_for_monitor(now, runtime_attribution_tokens(&runtime_rows)).await;
     let external_agent_processes = process_sample.processes;
     let local_usage_sources = load_local_usage_summaries(window).await;
+    let postgres_catalog = state.postgres_catalog.snapshot().await;
 
     let tokens_by_agent =
         aggregate_usage(&usage_records, |record| record.agent.clone(), price_catalog);
@@ -398,6 +400,7 @@ async fn build_usage_monitor_response(
         active_by_activity: aggregate_active_counts(&agent_invocations, |invocation| {
             invocation.activity.clone()
         }),
+        postgres_catalog,
         agent_invocations,
         external_agent_processes,
         local_usage_sources,

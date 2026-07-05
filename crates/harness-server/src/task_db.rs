@@ -116,6 +116,10 @@ impl TaskDb {
         &self.schema
     }
 
+    pub(crate) fn postgres_pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     pub fn store_key_for_data_dir(data_dir: &Path) -> anyhow::Result<String> {
         record_task_db_usage();
         let canonical = data_dir.canonicalize().map_err(|error| {

@@ -39,6 +39,7 @@ pub mod periodic_reviewer;
 pub mod reconciliation;
 pub use harness_workflow::plan_db;
 pub mod post_validator;
+pub(crate) mod postgres_catalog;
 pub mod project_registry;
 pub mod quality_trigger;
 pub mod redact;

@@ -32,6 +32,33 @@ fn usage_aggregate_requires_configured_price_for_cost() {
     assert_eq!(usage.estimated_cost_json(true), None);
 }
 
+#[tokio::test]
+async fn usage_monitor_response_includes_postgres_catalog_census() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = crate::test_helpers::make_test_state(dir.path()).await?;
+    let response = build_usage_monitor_response(
+        &state,
+        UsageMonitorQuery {
+            hours: Some(1),
+            limit: Some(1),
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        response.postgres_catalog.state,
+        crate::postgres_catalog::PostgresCatalogState::Available
+    );
+    assert!(response.postgres_catalog.schema_count.is_some());
+    assert!(response.postgres_catalog.catalog_object_count.is_some());
+    assert!(response.postgres_catalog.database_size_bytes.is_some());
+    Ok(())
+}
+
 #[test]
 fn parse_runtime_usage_row_reports_corrupt_json_without_panicking() -> anyhow::Result<()> {
     let workflow = WorkflowInstance::new(

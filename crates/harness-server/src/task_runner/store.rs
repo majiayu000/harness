@@ -359,6 +359,10 @@ impl TaskStore {
         self.cache.len()
     }
 
+    pub(crate) fn postgres_pool(&self) -> sqlx::PgPool {
+        self.db.postgres_pool()
+    }
+
     #[cfg(test)]
     pub(crate) fn pool_for_test(&self) -> &sqlx::PgPool {
         self.db.pool_for_test()

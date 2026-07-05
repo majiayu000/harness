@@ -271,6 +271,11 @@ pub(super) async fn make_test_state_with_project_root(
         Some(&database_url),
     )
     .await?;
+    let postgres_catalog = crate::postgres_catalog::PostgresCatalogMonitor::new(
+        tasks.postgres_pool(),
+        crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
+    )
+    .await;
     let events = Arc::new(
         harness_observe::event_store::EventStore::new_with_database_url(dir, Some(&database_url))
             .await?,
@@ -370,6 +375,7 @@ pub(super) async fn make_test_state_with_project_root(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        postgres_catalog,
         isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -456,6 +462,7 @@ pub(super) async fn make_test_state_with_issue_workflows(
         _db_state_guard: None,
         runtime_hosts: state.runtime_hosts.clone(),
         runtime_project_cache: state.runtime_project_cache.clone(),
+        postgres_catalog: state.postgres_catalog.clone(),
         isolation_availability: state.isolation_availability.clone(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -577,6 +584,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         _db_state_guard: None,
         runtime_hosts: state.runtime_hosts.clone(),
         runtime_project_cache: state.runtime_project_cache.clone(),
+        postgres_catalog: state.postgres_catalog.clone(),
         isolation_availability: state.isolation_availability.clone(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),

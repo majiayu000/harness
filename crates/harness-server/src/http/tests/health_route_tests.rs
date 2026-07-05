@@ -46,6 +46,54 @@ async fn health_degraded_when_runtime_state_dirty() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn health_reports_postgres_catalog_census() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_read_only_route_test_state(dir.path()).await?;
+    let health = call_health(state).await?;
+
+    assert_eq!(health.postgres_catalog["state"], "available");
+    assert!(health.postgres_catalog["schema_count"].as_u64().is_some());
+    assert!(health.postgres_catalog["catalog_object_count"]
+        .as_u64()
+        .is_some());
+    assert!(health.postgres_catalog["database_size_bytes"]
+        .as_u64()
+        .is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_reports_postgres_catalog_unavailable_state() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut state = make_read_only_route_test_state(dir.path()).await?;
+    let state_mut = Arc::get_mut(&mut state).expect("unique test state");
+    state_mut.postgres_catalog = crate::postgres_catalog::PostgresCatalogMonitor::unavailable(
+        crate::postgres_catalog::PostgresCatalogThresholds::from_server(
+            &state_mut.core.server.config.server,
+        ),
+        "postgres_pool_unavailable",
+    );
+
+    let health = call_health(state).await?;
+
+    assert_eq!(health.status, "ok");
+    assert_eq!(health.postgres_catalog["state"], "unavailable");
+    assert_eq!(
+        health.postgres_catalog["error"],
+        "postgres_pool_unavailable"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_degraded_when_github_webhook_intake_secret_missing() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
