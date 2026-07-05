@@ -331,6 +331,27 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 | `github_webhook_secret` | — | HMAC-SHA256 secret for GitHub webhook verification |
 | `notification_broadcast_capacity` | `256` | Internal notification channel capacity |
 
+### `[intake.github]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enables GitHub issue intake. |
+| `mode` | `"poll"` | Selects intake transport: `"poll"` lists GitHub issues periodically, `"webhook"` accepts GitHub issue events through `/webhook`, and `"hybrid"` enables both. |
+| `discovery_driver` | `"direct_rest"` | Selects the poll-capable backlog discovery driver. `"direct_rest"` lists issues through GitHub REST without spawning an agent for discovery; `"agent"` reserves agent-driven backlog analysis as an explicit opt-in. |
+| `repo` | — | Single-repository shorthand in `owner/repo` form. |
+| `poll_interval_secs` | `30` | Interval between poll sweeps when polling is enabled. |
+| `planner_agent` | server default | Agent used after an accepted issue is dispatched for work. Discovery with `direct_rest` does not use this agent. |
+| `sprint_timeout_secs` | `10800` | Maximum seconds for the issue work cycle after dispatch. |
+| `retry_backoff_base_secs` | `15` | Base seconds for retry backoff after transient intake enqueue failures. |
+| `retry_backoff_max_secs` | `120` | Maximum retry backoff after transient intake enqueue failures. |
+
+REST discovery requires workflow runtime persistence before pollers start. If
+the persistence layer is unavailable, Harness fails closed and reports polling
+as degraded instead of repeatedly listing GitHub issues that cannot be
+persisted or dispatched. GitHub rate-limit responses pause REST polling across
+repositories sharing the token until the safe retry time from `Retry-After`,
+`X-RateLimit-Reset`, or a bounded fallback.
+
 ### `[intake.github.auto_merge]`
 
 | Field | Default | Description |

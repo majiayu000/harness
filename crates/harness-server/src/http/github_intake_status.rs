@@ -1,5 +1,5 @@
 use harness_core::config::{
-    intake::{GitHubIntakeConfig, IntakeMode},
+    intake::{GitHubIntakeConfig, GitHubPollDiscoveryDriver, IntakeMode},
     server::ServerConfig,
     HarnessConfig,
 };
@@ -79,6 +79,18 @@ pub(crate) fn github_intake_driver_metadata(
     } else {
         None
     };
+    let discovery_driver = github
+        .map(|config| config.discovery_driver)
+        .unwrap_or_default();
+    let polling_active = polling_configured && active_poller_count > 0;
+    let polling_degraded = polling_configured && !polling_active;
+    let polling_reason = if !polling_degraded {
+        None
+    } else if discovery_driver == GitHubPollDiscoveryDriver::Agent {
+        Some("agent_discovery_selected")
+    } else {
+        Some("no_active_pollers")
+    };
     json!({
         "webhook": {
             "configured": webhook_configured,
@@ -87,9 +99,11 @@ pub(crate) fn github_intake_driver_metadata(
             "reason": webhook_reason,
         },
         "polling": {
+            "discovery_driver": discovery_driver.to_string(),
             "configured": polling_configured,
-            "active": polling_configured && active_poller_count > 0,
-            "degraded": polling_configured && active_poller_count == 0,
+            "active": polling_active,
+            "degraded": polling_degraded,
+            "reason": polling_reason,
         },
     })
 }
@@ -111,6 +125,7 @@ pub(crate) fn github_effective_repos(github: Option<&GitHubIntakeConfig>) -> Vec
                 "drivers": {
                     "webhook": config.enabled && config.mode.webhook_autonomous(),
                     "polling": config.enabled && config.mode.poller_enabled(),
+                    "discovery_driver": config.discovery_driver.to_string(),
                 },
             })
         })

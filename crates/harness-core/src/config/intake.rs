@@ -117,6 +117,26 @@ impl IntakeMode {
     }
 }
 
+/// How poll-capable GitHub intake discovers repository backlog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubPollDiscoveryDriver {
+    /// Discover issues through direct GitHub REST calls without an agent.
+    #[default]
+    DirectRest,
+    /// Reserve a richer agent-driven backlog analysis path for opt-in use.
+    Agent,
+}
+
+impl fmt::Display for GitHubPollDiscoveryDriver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DirectRest => f.write_str("direct_rest"),
+            Self::Agent => f.write_str("agent"),
+        }
+    }
+}
+
 /// GitHub Issues intake configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubIntakeConfig {
@@ -127,6 +147,9 @@ pub struct GitHubIntakeConfig {
     /// poller off), or `hybrid` (both). Default: `poll`.
     #[serde(default)]
     pub mode: IntakeMode,
+    /// Poll-capable backlog discovery driver. Default: `direct_rest`.
+    #[serde(default)]
+    pub discovery_driver: GitHubPollDiscoveryDriver,
     /// Single repo (backward compat shorthand).
     #[serde(default)]
     pub repo: String,
@@ -281,6 +304,7 @@ impl Default for GitHubIntakeConfig {
         Self {
             enabled: false,
             mode: IntakeMode::default(),
+            discovery_driver: GitHubPollDiscoveryDriver::default(),
             repo: String::new(),
             label: default_intake_label(),
             poll_interval_secs: default_poll_interval_secs(),
@@ -443,6 +467,31 @@ mod tests {
         assert_eq!(repo.repo, "owner/default");
         assert_eq!(repo.label, "triage");
         assert_eq!(repo.project_root, None);
+    }
+
+    #[test]
+    fn github_discovery_driver_defaults_to_direct_rest() {
+        let config = GitHubIntakeConfig::default();
+
+        assert_eq!(
+            config.discovery_driver,
+            GitHubPollDiscoveryDriver::DirectRest
+        );
+        assert_eq!(config.discovery_driver.to_string(), "direct_rest");
+    }
+
+    #[test]
+    fn github_discovery_driver_parses_agent() -> Result<(), toml::de::Error> {
+        let config: GitHubIntakeConfig = toml::from_str(
+            r#"
+enabled = true
+discovery_driver = "agent"
+repo = "owner/repo"
+"#,
+        )?;
+
+        assert_eq!(config.discovery_driver, GitHubPollDiscoveryDriver::Agent);
+        Ok(())
     }
 
     #[test]
