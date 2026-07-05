@@ -556,6 +556,10 @@ storage:
   runtime_retention_days: 30
   runtime_retention_batch_size: 1000
   runtime_retention_interval_secs: 3600
+  task_retention_enabled: false
+  task_retention_days: 30
+  task_retention_batch_size: 1000
+  task_retention_interval_secs: 3600
 ```
 
 The orphan schema reaper is enabled by default. It drops registered
@@ -572,6 +576,11 @@ deletes terminal workflow families older than `runtime_retention_days` in
 bounded batches and relies on the Postgres runtime-store cascade constraints to
 remove events, decisions, commands, jobs, runtime events, and artifacts. Active
 workflow families are never pruned.
+
+Enable `task_retention_enabled` only when historical task rows can be deleted.
+Retention deletes terminal tasks older than `task_retention_days` in bounded
+batches, including task-owned artifacts, prompts, and checkpoints. Active,
+pending, dependency-blocked, and resumable tasks are never pruned.
 
 ### 3. GC Runner (always on)
 

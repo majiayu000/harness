@@ -74,6 +74,10 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.storage.runtime_retention_days, 30);
     assert_eq!(cfg.storage.runtime_retention_batch_size, 1000);
     assert_eq!(cfg.storage.runtime_retention_interval_secs, 3600);
+    assert!(!cfg.storage.task_retention_enabled);
+    assert_eq!(cfg.storage.task_retention_days, 30);
+    assert_eq!(cfg.storage.task_retention_batch_size, 1000);
+    assert_eq!(cfg.storage.task_retention_interval_secs, 3600);
     assert!(!cfg.issue_workflow.require_human_gate_before_merge);
     assert!(cfg.activities.is_empty());
     Ok(())
@@ -220,6 +224,10 @@ storage:
   runtime_retention_days: 45
   runtime_retention_batch_size: 46
   runtime_retention_interval_secs: 47
+  task_retention_enabled: true
+  task_retention_days: 48
+  task_retention_batch_size: 49
+  task_retention_interval_secs: 50
 activities:
   implement_issue:
     prompt: issue-default
@@ -383,6 +391,10 @@ Body
     assert_eq!(cfg.storage.runtime_retention_days, 45);
     assert_eq!(cfg.storage.runtime_retention_batch_size, 46);
     assert_eq!(cfg.storage.runtime_retention_interval_secs, 47);
+    assert!(cfg.storage.task_retention_enabled);
+    assert_eq!(cfg.storage.task_retention_days, 48);
+    assert_eq!(cfg.storage.task_retention_batch_size, 49);
+    assert_eq!(cfg.storage.task_retention_interval_secs, 50);
     let activity = cfg
         .activities
         .get("implement_issue")

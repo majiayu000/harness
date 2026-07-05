@@ -104,7 +104,7 @@ logged by the loop.
 
 ## Test Plan
 
-- [ ] `cargo test -p harness-server task_db_retention`
+- [ ] `cargo test -p harness-server --test task_db_retention`
 - [ ] `cargo test -p harness-server task_db::migrations`
 - [ ] `cargo test -p harness-core config::workflow`
 - [ ] `cargo check -p harness-server --all-targets`

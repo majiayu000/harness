@@ -336,5 +336,15 @@ mod tests {
             migration.sql.contains("task_db_legacy_backfills"),
             "v26 should create legacy backfill markers"
         );
+        assert!(
+            migration.sql.contains("idx_task_artifacts_store_task_id"),
+            "v26 should keep artifacts-by-task reads backed by a scoped index"
+        );
+        assert!(
+            migration
+                .sql
+                .contains("ON task_artifacts(store_key, task_id, turn, id)"),
+            "artifact index should match the store_key + task_id query predicate"
+        );
     }
 }

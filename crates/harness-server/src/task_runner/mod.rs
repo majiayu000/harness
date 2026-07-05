@@ -174,6 +174,29 @@ impl TaskStore {
         record_task_runner_usage();
         self.db.list_recent_failed(limit).await
     }
+
+    pub async fn prune_terminal_tasks_before(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        batch_size: u32,
+    ) -> anyhow::Result<crate::task_db::TaskRetentionPruneSummary> {
+        record_task_runner_usage();
+        let summary = self
+            .db
+            .prune_terminal_tasks_before(cutoff, batch_size)
+            .await?;
+        for task_id in &summary.pruned_task_ids {
+            let task_id = TaskId::from_str(task_id);
+            if self
+                .cache
+                .get(&task_id)
+                .is_some_and(|entry| entry.status.is_terminal())
+            {
+                self.cache.remove(&task_id);
+            }
+        }
+        Ok(summary)
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +218,7 @@ mod usage_probe_tests {
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
-        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let store = TaskStore::open(&dir.path().join("tasks-store")).await?;
         let task_id = TaskId::from_str("probe-task");
         let mut task = TaskState::new(task_id.clone());
         task.project_root = Some(dir.path().to_path_buf());
@@ -231,6 +254,37 @@ mod usage_probe_tests {
         assert!(!store.abort_task(&task_id));
 
         assert!(task_runner_count() >= before + 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_terminal_tasks_before_removes_terminal_cache_entry() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let task_id = TaskId::from_str("retention-cache-terminal");
+        let mut task = TaskState::new(task_id.clone());
+        task.status = TaskStatus::Done;
+        task.scheduler.mark_terminal(&TaskStatus::Done);
+        store.insert(&task).await;
+        store
+            .db
+            .overwrite_updated_at_for_test(
+                task_id.as_str(),
+                chrono::Utc::now() - chrono::Duration::days(45),
+            )
+            .await?;
+
+        let summary = store
+            .prune_terminal_tasks_before(chrono::Utc::now() - chrono::Duration::days(30), 10)
+            .await?;
+
+        assert_eq!(summary.tasks_deleted, 1);
+        assert!(store.get(&task_id).is_none());
+        assert!(store.db.get(task_id.as_str()).await?.is_none());
         Ok(())
     }
 }

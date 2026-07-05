@@ -73,6 +73,10 @@ storage:
   runtime_retention_days: 30
   runtime_retention_batch_size: 1000
   runtime_retention_interval_secs: 3600
+  task_retention_enabled: false
+  task_retention_days: 30
+  task_retention_batch_size: 1000
+  task_retention_interval_secs: 3600
 activities:
   implement_issue:
     prompt: default

@@ -35,6 +35,10 @@ project_root = "."
 #   orphan_reaper_interval_secs: 3600
 #   orphan_reaper_legacy_enabled: true
 #   orphan_reaper_legacy_batch: 200
+#   task_retention_enabled: false
+#   task_retention_days: 30
+#   task_retention_batch_size: 1000
+#   task_retention_interval_secs: 3600
 
 [concurrency]
 # Default per-task agent invocation budget across implementation, validation

@@ -20,4 +20,19 @@ impl TaskDb {
             .await?;
         Ok(())
     }
+
+    #[doc(hidden)]
+    pub async fn overwrite_updated_at_for_test(
+        &self,
+        task_id: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE tasks SET updated_at = $1 WHERE store_key = $2 AND id = $3")
+            .bind(updated_at)
+            .bind(&self.store_key)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
