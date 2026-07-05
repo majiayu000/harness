@@ -256,7 +256,7 @@ fn pg_store_context_can_reuse_shared_setup_pool() {
         .build()
         .expect("tokio runtime");
     let _lock = process_env_lock();
-    let Ok(database_url) = resolve_database_url(None) else {
+    let Ok(database_url) = crate::db_test_safety::resolve_test_database_url(None) else {
         return;
     };
     runtime.block_on(async {
@@ -282,7 +282,7 @@ fn pg_store_context_can_reuse_shared_setup_pool() {
 async fn pg_store_context_registers_path_schema_with_shared_setup_pool() -> anyhow::Result<()> {
     let database_url = {
         let _lock = process_env_lock();
-        let Ok(database_url) = resolve_database_url(None) else {
+        let Ok(database_url) = crate::db_test_safety::resolve_test_database_url(None) else {
             return Ok(());
         };
         database_url

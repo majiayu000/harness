@@ -5,7 +5,10 @@ use harness_core::config::HarnessConfig;
 
 async fn make_test_server_and_tasks(
     dir: &Path,
-) -> (Arc<HarnessServer>, Arc<crate::task_runner::TaskStore>) {
+) -> Option<(Arc<HarnessServer>, Arc<crate::task_runner::TaskStore>)> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return None;
+    }
     let server = Arc::new(HarnessServer::new(
         HarnessConfig::default(),
         ThreadManager::new(),
@@ -16,13 +19,15 @@ async fn make_test_server_and_tasks(
     ))
     .await
     .expect("open tasks db");
-    (server, tasks)
+    Some((server, tasks))
 }
 
 #[tokio::test]
 async fn empty_data_dir_produces_empty_project_registry() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
     let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
         .await
         .expect("build_registry should succeed");
@@ -44,7 +49,9 @@ async fn empty_data_dir_produces_empty_project_registry() {
 #[tokio::test]
 async fn plan_cache_hydrated_from_db() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
 
     let plan_db = crate::plan_db::PlanDb::open(&harness_core::config::dirs::default_db_path(
         dir.path(),
@@ -69,7 +76,9 @@ async fn plan_cache_hydrated_from_db() {
 #[tokio::test]
 async fn build_registry_opens_thread_db_from_shared_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
     let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
         .await
         .expect("build_registry should succeed");
@@ -83,7 +92,9 @@ async fn build_registry_opens_thread_db_from_shared_schema() {
 #[tokio::test]
 async fn build_registry_opens_project_registry_from_shared_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
     let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
         .await
         .expect("build_registry should succeed");
@@ -100,7 +111,9 @@ async fn build_registry_opens_project_registry_from_shared_schema() {
 #[tokio::test]
 async fn runtime_state_failure_is_recorded_as_optional() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
     let bundle = super::super::with_forced_startup_failures(
         &[(
             "runtime_state_store",
@@ -136,7 +149,9 @@ async fn invalid_workflow_schema_namespace_disables_optional_workflow_stores() {
         "---\nstorage:\n  schema_namespace: invalid-name\n---\n",
     )
     .expect("write workflow config");
-    let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
 
     let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
         .await
@@ -176,7 +191,9 @@ fn bootstrap_failure_records_workspace_manager_status() {
 #[tokio::test]
 async fn project_registry_failure_is_recorded_as_critical() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (server, tasks) = make_test_server_and_tasks(dir.path()).await;
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
     let bundle = super::super::with_forced_startup_failures(
         &[("project_registry", "failed to open Postgres bootstrap pool")],
         build_registry(&server, dir.path(), dir.path(), &tasks),

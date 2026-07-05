@@ -1,6 +1,6 @@
 use super::*;
 use futures::FutureExt;
-use harness_core::db::{pg_open_pool, resolve_database_url, PgStoreContext};
+use harness_core::db::{pg_open_pool, resolve_test_database_url, PgStoreContext, TestSchemaGuard};
 
 fn unique_test_schema(prefix: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -25,7 +25,7 @@ fn project(id: &str, root: &str) -> Project {
 }
 
 async fn open_test_registry(name: &str) -> anyhow::Result<Option<Arc<ProjectRegistry>>> {
-    if resolve_database_url(None).is_err() {
+    if resolve_test_database_url(None).is_err() {
         return Ok(None);
     }
     let dir = tempfile::tempdir()?;
@@ -66,14 +66,14 @@ fn store_key_for_missing_relative_data_dir_is_absolute() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn shared_schema_project_registry_keeps_store_rows_isolated() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
     let dir = tempfile::tempdir()?;
     let setup_pool = pg_open_pool(&database_url).await?;
-    let shared_schema = unique_test_schema("project_registry_scope_test");
-    let shared_context = PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "project_registry_scope_test")?;
+    let shared_context = PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
     let store_a_dir = dir.path().join("store-a");
     let store_b_dir = dir.path().join("store-b");
     let registry_a =
@@ -124,22 +124,21 @@ async fn shared_schema_project_registry_keeps_store_rows_isolated() -> anyhow::R
 
     registry_a.pool().close().await;
     registry_b.pool().close().await;
-    let _ = sqlx::query(&format!(
-        "DROP SCHEMA IF EXISTS \"{shared_schema}\" CASCADE"
-    ))
-    .execute(&setup_pool)
-    .await;
+    let cleanup_result = shared_schema.cleanup_with_pool(&setup_pool).await;
     setup_pool.close().await;
 
     match result {
-        Ok(result) => result,
+        Ok(result) => {
+            cleanup_result?;
+            result
+        }
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
 #[tokio::test]
 async fn legacy_project_registry_migration_backfills_once() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
@@ -150,9 +149,9 @@ async fn legacy_project_registry_migration_backfills_once() -> anyhow::Result<()
     let legacy_schema = PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
-    let target_schema = unique_test_schema("project_registry_migration_test");
     let setup_pool = pg_open_pool(&database_url).await?;
-    let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+    let mut target_schema = TestSchemaGuard::new(&database_url, "project_registry_migration_test")?;
+    let target_context = PgStoreContext::from_schema(target_schema.schema(), Some(&database_url))?;
     let target_registry =
         ProjectRegistry::open_shared_with_data_dir(&target_context, &setup_pool, &target_data_dir)
             .await?;
@@ -240,15 +239,14 @@ async fn legacy_project_registry_migration_backfills_once() -> anyhow::Result<()
     ))
     .execute(&setup_pool)
     .await;
-    let _ = sqlx::query(&format!(
-        "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
-    ))
-    .execute(&setup_pool)
-    .await;
+    let cleanup_result = target_schema.cleanup_with_pool(&setup_pool).await;
     setup_pool.close().await;
 
     match result {
-        Ok(result) => result,
+        Ok(result) => {
+            cleanup_result?;
+            result
+        }
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
@@ -363,7 +361,7 @@ async fn resolve_path_returns_root() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn survives_reopen() -> anyhow::Result<()> {
-    if resolve_database_url(None).is_err() {
+    if resolve_test_database_url(None).is_err() {
         return Ok(());
     }
     let dir = tempfile::tempdir()?;

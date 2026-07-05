@@ -11,7 +11,10 @@ Start the local dev database with:
   bash scripts/dev-db.sh
 
 Then run:
-  HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh
+  HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-db.sh
+
+Postgres-backed tests refuse non-test database names by default. Use a database
+named harness_test, ending in _test, or starting with test_.
 EOF
   exit 2
 fi

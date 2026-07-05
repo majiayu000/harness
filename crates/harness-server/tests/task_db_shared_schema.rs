@@ -1,17 +1,7 @@
-use harness_core::db::{pg_open_pool, resolve_database_url, PgStoreContext};
+use harness_core::db::{pg_open_pool, resolve_test_database_url, PgStoreContext, TestSchemaGuard};
 use harness_core::types::TaskId as CoreTaskId;
 use harness_server::task_db::{migrate_legacy_task_db_if_needed, TaskDb, TASK_DB_SCHEMA};
 use harness_server::task_runner::{TaskKind, TaskPhase, TaskSchedulerState, TaskState, TaskStatus};
-
-fn unique_test_schema(prefix: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_nanos();
-    format!("{prefix}_{nanos}_{count}")
-}
 
 fn make_task(id: &str, description: &str) -> TaskState {
     TaskState {
@@ -78,14 +68,14 @@ fn store_key_for_data_dir_fails_when_path_cannot_be_canonicalized() -> anyhow::R
 
 #[tokio::test]
 async fn shared_schema_task_db_keeps_data_dirs_isolated() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
     let dir = tempfile::tempdir()?;
     let setup_pool = pg_open_pool(&database_url).await?;
-    let shared_schema = unique_test_schema("task_db_scope_test");
-    let shared_context = PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "task_db_scope_test")?;
+    let shared_context = PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
     let store_a_dir = dir.path().join("store-a");
     let store_b_dir = dir.path().join("store-b");
     std::fs::create_dir_all(&store_a_dir)?;
@@ -96,8 +86,8 @@ async fn shared_schema_task_db_keeps_data_dirs_isolated() -> anyhow::Result<()> 
     let db_b =
         TaskDb::open_shared_with_data_dir(&shared_context, &setup_pool, &store_b_dir).await?;
 
-    assert_eq!(db_a.schema(), shared_schema);
-    assert_eq!(db_b.schema(), shared_schema);
+    assert_eq!(db_a.schema(), shared_schema.schema());
+    assert_eq!(db_b.schema(), shared_schema.schema());
     assert_ne!(db_a.store_key(), db_b.store_key());
 
     db_a.insert(&make_task("same-task-id", "store-a")).await?;
@@ -116,13 +106,14 @@ async fn shared_schema_task_db_keeps_data_dirs_isolated() -> anyhow::Result<()> 
     assert_eq!(db_a.list().await?.len(), 1);
     assert_eq!(db_b.list().await?.len(), 1);
 
+    shared_schema.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;
     Ok(())
 }
 
 #[tokio::test]
 async fn legacy_path_task_db_backfill_is_idempotent_and_one_time() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
@@ -148,8 +139,8 @@ async fn legacy_path_task_db_backfill_is_idempotent_and_one_time() -> anyhow::Re
         .save_task_prompt("legacy-task", 1, "plan", "prompt")
         .await?;
 
-    let shared_schema = unique_test_schema("task_db_backfill_test");
-    let target_context = PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "task_db_backfill_test")?;
+    let target_context = PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
     let target_data_dir = dir.path().join("target");
     std::fs::create_dir_all(&target_data_dir)?;
     let target_db =
@@ -184,6 +175,7 @@ async fn legacy_path_task_db_backfill_is_idempotent_and_one_time() -> anyhow::Re
         "backfill marker should prevent stale legacy reimport on later startup"
     );
 
+    shared_schema.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;
     Ok(())
 }

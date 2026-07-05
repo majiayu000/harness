@@ -1,5 +1,5 @@
 use super::*;
-use harness_core::db::{pg_open_pool, resolve_database_url, PgStoreContext};
+use harness_core::db::{pg_open_pool, resolve_test_database_url, PgStoreContext, TestSchemaGuard};
 use harness_core::types::EventId;
 use sqlx::postgres::PgPool;
 use std::path::Path;
@@ -14,16 +14,6 @@ fn db_semaphore() -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
-fn unique_test_schema(prefix: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_nanos();
-    format!("{prefix}_{nanos}_{count}")
-}
-
 fn is_db_unavailable(err: &anyhow::Error) -> bool {
     let msg = format!("{:#}", err);
     msg.contains("pool timed out while waiting for an open connection")
@@ -34,7 +24,7 @@ fn is_db_unavailable(err: &anyhow::Error) -> bool {
 
 async fn setup_pool() -> anyhow::Result<Option<(String, PgPool, tokio::sync::OwnedSemaphorePermit)>>
 {
-    let Ok(database_url) = resolve_database_url(None) else {
+    let Ok(database_url) = resolve_test_database_url(None) else {
         return Ok(None);
     };
     let permit = db_semaphore()
@@ -103,8 +93,8 @@ async fn shared_schema_keeps_events_and_watermarks_isolated() -> anyhow::Result<
         return Ok(());
     };
     let dir = tempfile::tempdir()?;
-    let shared_schema = unique_test_schema("event_store_scope_test");
-    let shared_context = PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "event_store_scope_test")?;
+    let shared_context = PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
     let store_a_dir = dir.path().join("store-a");
     let store_b_dir = dir.path().join("store-b");
 
@@ -118,8 +108,8 @@ async fn shared_schema_keeps_events_and_watermarks_isolated() -> anyhow::Result<
         return Ok(());
     };
 
-    assert_eq!(store_a.schema(), shared_schema);
-    assert_eq!(store_b.schema(), shared_schema);
+    assert_eq!(store_a.schema(), shared_schema.schema());
+    assert_eq!(store_b.schema(), shared_schema.schema());
     assert_ne!(store_a.store_key(), store_b.store_key());
 
     store_a
@@ -159,6 +149,7 @@ async fn shared_schema_keeps_events_and_watermarks_isolated() -> anyhow::Result<
 
     store_a.close().await;
     store_b.close().await;
+    shared_schema.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;
     Ok(())
 }
@@ -169,8 +160,8 @@ async fn jsonl_migration_is_idempotent_per_store_key() -> anyhow::Result<()> {
         return Ok(());
     };
     let dir = tempfile::tempdir()?;
-    let shared_schema = unique_test_schema("event_store_jsonl_test");
-    let shared_context = PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "event_store_jsonl_test")?;
+    let shared_context = PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
     let store_a_dir = dir.path().join("store-a");
     let store_b_dir = dir.path().join("store-b");
     std::fs::create_dir_all(&store_a_dir)?;
@@ -206,6 +197,7 @@ async fn jsonl_migration_is_idempotent_per_store_key() -> anyhow::Result<()> {
 
     store_a.close().await;
     store_b.close().await;
+    shared_schema.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;
     Ok(())
 }
@@ -232,8 +224,8 @@ async fn shared_schema_backfills_legacy_path_schema_once() -> anyhow::Result<()>
         .await?;
     legacy_store.close().await;
 
-    let target_schema = unique_test_schema("event_store_backfill_test");
-    let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+    let mut target_schema = TestSchemaGuard::new(&database_url, "event_store_backfill_test")?;
+    let target_context = PgStoreContext::from_schema(target_schema.schema(), Some(&database_url))?;
     let target_store =
         EventStore::new_shared_with_context(&legacy_data_dir, &target_context, &setup_pool).await?;
 
@@ -265,6 +257,7 @@ async fn shared_schema_backfills_legacy_path_schema_once() -> anyhow::Result<()>
     assert_eq!(events_after_second_backfill[0].id, legacy_event.id);
 
     target_store.close().await;
+    target_schema.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;
     Ok(())
 }
