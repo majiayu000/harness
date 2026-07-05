@@ -18,8 +18,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration, Instant};
 
-static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[derive(Clone)]
 enum MockMode {
     CompleteAfter { delay: Duration },
@@ -215,7 +213,6 @@ async fn start_thread_and_turn(
 
 #[tokio::test]
 async fn running_to_completed_updates_items_and_usage() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(
         sandbox.path(),
@@ -253,7 +250,6 @@ async fn running_to_completed_updates_items_and_usage() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn running_to_failed_is_persisted() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(
         sandbox.path(),
@@ -281,7 +277,6 @@ async fn running_to_failed_is_persisted() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn running_to_cancelled_stops_turn() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let state = make_state(sandbox.path(), MockAgent::block_forever()).await?;
 
@@ -309,7 +304,6 @@ async fn running_to_cancelled_stops_turn() -> anyhow::Result<()> {
 /// an Error item containing the missing agent name.
 #[tokio::test]
 async fn turn_fails_when_agent_not_registered() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
@@ -349,7 +343,6 @@ async fn turn_fails_when_agent_not_registered() -> anyhow::Result<()> {
 /// covered by the focused `turn_lifecycle_stall_tests` unit surface.
 #[tokio::test]
 async fn turn_stall_timeout_enforces_minimum_floor() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;

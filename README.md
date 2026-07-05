@@ -180,15 +180,19 @@ HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scri
 # Full server DB, startup, recovery, route, and workflow profile.
 HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-db.sh
 
+# Optional nextest runner for the same DB-capable profile.
+HARNESS_SERVER_TEST_RUNNER=nextest HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-db.sh
+
 # Final PR handoff: full workspace coverage.
 HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test cargo test --workspace
 ```
 
 `scripts/test-server-fast.sh` is the warm local feedback path for routine
 `harness-server` changes once a test database URL is configured.
-`scripts/test-server-db.sh` runs the full server suite single-threaded so
-DB-backed startup, recovery, full `AppState`, route, and workflow-runtime
-coverage remains explicit and stable.
+`scripts/test-server-db.sh` runs the full server suite with default test
+parallelism. DB-backed tests rely on unique temporary data directories or
+explicit `TestSchemaGuard` schemas. Tests that mutate true process-global state,
+such as `HOME`, keep their own named locks.
 
 ### Run
 

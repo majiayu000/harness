@@ -229,12 +229,8 @@ struct PgSchemaInventoryRow {
 }
 
 pub async fn ensure_pg_schema_registry(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::query(&format!(
-        "CREATE SCHEMA IF NOT EXISTS \"{PG_SCHEMA_REGISTRY_SCHEMA}\""
-    ))
-    .execute(pool)
-    .await?;
-    sqlx::query(&format!(
+    crate::db_pg::pg_create_schema_if_not_exists(pool, PG_SCHEMA_REGISTRY_SCHEMA).await?;
+    let create_table = format!(
         "CREATE TABLE IF NOT EXISTS \"{PG_SCHEMA_REGISTRY_SCHEMA}\".\"{PG_SCHEMA_REGISTRY_TABLE}\" (
             schema_name     TEXT PRIMARY KEY,
             owner_kind      TEXT NOT NULL,
@@ -244,10 +240,50 @@ pub async fn ensure_pg_schema_registry(pool: &PgPool) -> anyhow::Result<()> {
             created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         )"
-    ))
-    .execute(pool)
+    );
+    match sqlx::query(&create_table).execute(pool).await {
+        Ok(_) => Ok(()),
+        Err(error) if pg_create_table_if_not_exists_race(&error) => {
+            if pg_schema_registry_table_exists(pool).await? {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(error))
+            }
+        }
+        Err(error) => Err(anyhow::anyhow!(error)),
+    }
+}
+
+async fn pg_schema_registry_table_exists(pool: &PgPool) -> anyhow::Result<bool> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = $1 AND table_name = $2
+        )",
+    )
+    .bind(PG_SCHEMA_REGISTRY_SCHEMA)
+    .bind(PG_SCHEMA_REGISTRY_TABLE)
+    .fetch_one(pool)
     .await?;
-    Ok(())
+    Ok(exists)
+}
+
+fn pg_create_table_if_not_exists_race(error: &sqlx::Error) -> bool {
+    let Some(db_error) = error.as_database_error() else {
+        return false;
+    };
+    match db_error.code().as_deref() {
+        Some("42P07") => true,
+        Some("23505") => {
+            matches!(
+                db_error.constraint(),
+                Some("pg_type_typname_nsp_index") | Some("pg_class_relname_nsp_index")
+            ) || db_error.message().contains("pg_type_typname_nsp_index")
+                || db_error.message().contains("pg_class_relname_nsp_index")
+        }
+        _ => false,
+    }
 }
 
 pub async fn register_pg_schema_ownership(
