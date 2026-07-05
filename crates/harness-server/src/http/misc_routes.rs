@@ -96,6 +96,7 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
             "state": runtime_logs.state.as_str(),
             "path_hint": runtime_logs.path_hint.clone(),
             "retention_days": runtime_logs.retention_days,
+            "retention_max_files": runtime_logs.retention_max_files,
         },
         "runtime": {
             "circuit_breakers": circuit_breakers,

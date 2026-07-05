@@ -15,7 +15,7 @@ See `specs/GH1467/product.md`.
 | Log path | `crates/harness-cli/src/commands.rs` | `runtime_log_path` writes `harness-serve-<timestamp>-pid<PID>.log` under `server.data_dir/logs/`. | Count pruning must target only this filename family. |
 | Startup logging | `prepare_runtime_logs` and `open_runtime_log_file` | Creates `logs/`, calls `purge_stale_runtime_logs`, and opens the active file. | This is the startup cleanup insertion point. |
 | Age cleanup | `purge_stale_runtime_logs_with` | Deletes matching runtime logs older than `observe.log_retention_days`; reports deletion errors as warnings. | The new count cap should extend this logic, not replace it. |
-| Config | `crates/harness-core/src/config/misc.rs` | `ObserveConfig` has `session_renewal_secs` and `log_retention_days`; default retention is 90 days. | Add max-files config with serde compatibility. |
+| Config | `crates/harness-core/src/config/observe.rs` | `ObserveConfig` has `session_renewal_secs`, `log_retention_days`, and `log_retention_max_files`; default age retention is 90 days and default count retention is 30 files. | Keep serde compatibility for configs without max-files. |
 | Metadata | `crates/harness-server/src/server.rs` | `RuntimeLogMetadata` carries `retention_days` for health/operator surfaces. | Consider whether max-files should be exposed in metadata and docs. |
 | Docs | `README.md`, `docs/usage-guide.md` | Mention runtime log path and retention window. | Must describe count cap and disable behavior. |
 | Tests | `crates/harness-cli/src/commands/runtime_log_tests.rs` | Cover log creation, age pruning, unrelated files, and warning behavior. | Add count-cap coverage. |

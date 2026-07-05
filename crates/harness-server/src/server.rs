@@ -28,33 +28,41 @@ pub struct RuntimeLogMetadata {
     pub active_path: Option<PathBuf>,
     pub path_hint: Option<String>,
     pub retention_days: u32,
+    pub retention_max_files: usize,
 }
 
 impl RuntimeLogMetadata {
-    pub fn disabled(retention_days: u32) -> Self {
+    pub fn disabled(retention_days: u32, retention_max_files: usize) -> Self {
         Self {
             state: RuntimeLogState::Disabled,
             active_path: None,
             path_hint: None,
             retention_days,
+            retention_max_files,
         }
     }
 
-    pub fn enabled(active_path: PathBuf, retention_days: u32) -> Self {
+    pub fn enabled(active_path: PathBuf, retention_days: u32, retention_max_files: usize) -> Self {
         Self {
             state: RuntimeLogState::Enabled,
             path_hint: Some(Self::public_path_hint(&active_path)),
             active_path: Some(active_path),
             retention_days,
+            retention_max_files,
         }
     }
 
-    pub fn degraded(path_hint: Option<String>, retention_days: u32) -> Self {
+    pub fn degraded(
+        path_hint: Option<String>,
+        retention_days: u32,
+        retention_max_files: usize,
+    ) -> Self {
         Self {
             state: RuntimeLogState::Degraded,
             active_path: None,
             path_hint,
             retention_days,
+            retention_max_files,
         }
     }
 
@@ -84,11 +92,12 @@ impl HarnessServer {
         #[cfg(test)]
         crate::test_helpers::configure_test_pg_pool_defaults();
         let retention_days = config.observe.log_retention_days;
+        let retention_max_files = config.observe.log_retention_max_files;
         Self {
             config,
             thread_manager,
             agent_registry: Arc::new(agent_registry),
-            runtime_logs: RuntimeLogMetadata::disabled(retention_days),
+            runtime_logs: RuntimeLogMetadata::disabled(retention_days, retention_max_files),
             startup_projects: Vec::new(),
             startup_default_project: None,
         }
@@ -115,12 +124,13 @@ mod tests {
         let active_path = PathBuf::from(
             "/tmp/harness-codex-runtime/logs/harness-serve-20260430T120000Z-pid1.log",
         );
-        let metadata = RuntimeLogMetadata::enabled(active_path.clone(), 30);
+        let metadata = RuntimeLogMetadata::enabled(active_path.clone(), 30, 30);
 
         assert_eq!(metadata.active_path.as_deref(), Some(active_path.as_path()));
         assert_eq!(
             metadata.path_hint.as_deref(),
             Some(active_path.to_string_lossy().as_ref())
         );
+        assert_eq!(metadata.retention_max_files, 30);
     }
 }

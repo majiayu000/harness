@@ -332,6 +332,7 @@ discovery_paths = []
 
 [observe]
 session_renewal_secs = 1800
+log_retention_max_files = 30
 log_retention_days = 90
 
 [otel]

@@ -180,7 +180,7 @@ async fn health_runtime_logs_reports_active_path_hint() -> anyhow::Result<()> {
         .path()
         .join("logs/harness-serve-20260430T120000Z-pid1.log");
     let expected_path = active_path.to_string_lossy().into_owned();
-    server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(active_path, 45);
+    server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(active_path, 45, 12);
 
     let health = call_health(state).await?;
     assert_eq!(health.runtime_logs.state, "enabled");
@@ -189,6 +189,7 @@ async fn health_runtime_logs_reports_active_path_hint() -> anyhow::Result<()> {
         Some(expected_path.as_str())
     );
     assert_eq!(health.runtime_logs.retention_days, 45);
+    assert_eq!(health.runtime_logs.retention_max_files, 12);
     Ok(())
 }
 
@@ -201,6 +202,7 @@ async fn health_runtime_logs_can_report_degraded_without_raw_error_text() -> any
     server.runtime_logs = crate::server::RuntimeLogMetadata::degraded(
         Some("logs/harness-serve-20260430T120000Z-pid1.log".to_string()),
         7,
+        3,
     );
 
     let health = call_health(state).await?;
@@ -210,6 +212,7 @@ async fn health_runtime_logs_can_report_degraded_without_raw_error_text() -> any
         Some("logs/harness-serve-20260430T120000Z-pid1.log")
     );
     assert_eq!(health.runtime_logs.retention_days, 7);
+    assert_eq!(health.runtime_logs.retention_max_files, 3);
     assert!(!format!("{health:?}").contains("permission denied"));
     Ok(())
 }

@@ -526,4 +526,5 @@ pub(super) struct RuntimeLogsBlock {
     pub(super) state: String,
     pub(super) path_hint: Option<String>,
     pub(super) retention_days: u32,
+    pub(super) retention_max_files: usize,
 }
