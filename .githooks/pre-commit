@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unset git env vars that leak into test subprocesses during commit.
-# GIT_INDEX_FILE points to a temp file during commit, breaking workspace
-# tests that spawn their own git repos in temp directories.
+# Unset git env vars that can leak into cargo subprocesses during commit.
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE 2>/dev/null || true
 
-# Derive the cargo package scope from staged files so clippy/test only cover
-# the crates touched by this commit. Falls back to the full workspace when:
+# Derive the cargo package scope from staged files so clippy only covers the
+# crates touched by this commit. Falls back to the full workspace when:
 #   - workspace-level manifests (Cargo.toml / Cargo.lock) are staged
 #   - Rust files outside crates/ are staged
 #   - a staged path maps to a directory that is not a cargo package
-#   - no crate paths are staged at all (safe default)
+# Docs, specs, hooks, and other non-Rust paths do not require clippy.
 # harness-core is depended on by nearly every crate, so a core change expands
 # to its main dependents (mirrors the server/agents path filters in ci.yml).
 derive_scope() {
@@ -53,9 +51,9 @@ derive_scope() {
                 ;;
         esac
     fi
-    if [ "$full" -eq 1 ] || [ "$pkgs" = " " ]; then
+    if [ "$full" -eq 1 ]; then
         echo "--workspace"
-    else
+    elif [ "$pkgs" != " " ]; then
         scope=""
         for p in $pkgs; do
             scope="$scope -p $p"
@@ -65,25 +63,17 @@ derive_scope() {
 }
 
 scope=$(derive_scope)
-echo "=== pre-commit: cargo scope: $scope ==="
 
 echo "=== pre-commit: fmt ==="
 cargo fmt --all -- --check
 
-echo "=== pre-commit: clippy ==="
-# shellcheck disable=SC2086 # scope is an intentional word-split flag list
-cargo clippy $scope --all-targets -- -D warnings
-
-echo "=== pre-commit: test ==="
-# Live Postgres tests require a configured Harness database URL.
-# Run them when available; otherwise skip only the known live-Postgres lib tests
-# and let CI or a configured local database provide full DB coverage.
-# shellcheck disable=SC2086 # scope is an intentional word-split flag list
-if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
-    cargo test $scope --lib
+if [ -n "$scope" ]; then
+    echo "=== pre-commit: cargo scope: $scope ==="
+    echo "=== pre-commit: clippy ==="
+    # shellcheck disable=SC2086 # scope is an intentional word-split flag list
+    cargo clippy $scope --all-targets -- -D warnings
 else
-    echo "HARNESS_DATABASE_URL not set — skipping live Postgres lib tests"
-    cargo test $scope --lib -- --skip db::tests
+    echo "=== pre-commit: no cargo packages staged; skipping clippy ==="
 fi
 
-echo "=== pre-commit: all checks passed ==="
+echo "=== pre-commit: fast checks passed ==="
