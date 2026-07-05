@@ -1,4 +1,4 @@
-.PHONY: setup check test lint
+.PHONY: setup check test lint gc-target
 
 setup:
 	git config core.hooksPath .githooks
@@ -13,3 +13,6 @@ lint:
 
 test:
 	cargo test --workspace
+
+gc-target:
+	scripts/gc-target.sh
