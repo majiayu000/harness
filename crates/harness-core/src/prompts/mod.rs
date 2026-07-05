@@ -1,5 +1,9 @@
 //! Prompt templates and output parsers shared across CLI and HTTP entries.
 
+use crate::agent::AgentPromptLayers;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+
 pub mod context;
 pub mod contract;
 pub mod cross_review;
@@ -72,11 +76,73 @@ impl PromptParts {
     /// the prompt-building function. Callers that previously stored the return value as a
     /// `String` should call this method to obtain it.
     pub fn to_prompt_string(&self) -> String {
-        format!(
+        let prompt = format!(
             "{}{}{}",
             self.static_instructions, self.context, self.dynamic_payload
-        )
+        );
+        register_prompt_layers(
+            &prompt,
+            AgentPromptLayers::new(
+                self.static_instructions.clone(),
+                self.context.clone(),
+                self.dynamic_payload.clone(),
+            ),
+        );
+        prompt
     }
+}
+
+const PROMPT_LAYER_REGISTRY_LIMIT: usize = 256;
+
+#[derive(Debug, Clone)]
+struct RegisteredPromptLayers {
+    flattened_prompt: String,
+    layers: AgentPromptLayers,
+}
+
+static PROMPT_LAYER_REGISTRY: OnceLock<Mutex<VecDeque<RegisteredPromptLayers>>> = OnceLock::new();
+
+fn prompt_layer_registry() -> &'static Mutex<VecDeque<RegisteredPromptLayers>> {
+    PROMPT_LAYER_REGISTRY.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn register_prompt_layers(flattened_prompt: &str, layers: AgentPromptLayers) {
+    let mut registry = prompt_layer_registry().lock().unwrap();
+    if let Some(existing_index) = registry
+        .iter()
+        .position(|entry| entry.flattened_prompt == flattened_prompt)
+    {
+        registry.remove(existing_index);
+    }
+    registry.push_back(RegisteredPromptLayers {
+        flattened_prompt: flattened_prompt.to_string(),
+        layers,
+    });
+    while registry.len() > PROMPT_LAYER_REGISTRY_LIMIT {
+        registry.pop_front();
+    }
+}
+
+pub(crate) fn prompt_layers_for_flattened_prompt(prompt: &str) -> Option<AgentPromptLayers> {
+    let registry = prompt_layer_registry().lock().unwrap();
+    registry
+        .iter()
+        .rev()
+        .filter_map(|entry| {
+            prompt.find(&entry.flattened_prompt).map(|start| {
+                let end = start + entry.flattened_prompt.len();
+                let mut layers = entry.layers.clone();
+                if start > 0 {
+                    layers.context = format!("{}{}", &prompt[..start], layers.context);
+                }
+                if end < prompt.len() {
+                    layers.append_to_dynamic_payload(&prompt[end..]);
+                }
+                (entry.flattened_prompt.len(), layers)
+            })
+        })
+        .max_by_key(|(matched_len, _)| *matched_len)
+        .map(|(_, layers)| layers)
 }
 
 /// Wrap `s` in POSIX single quotes, escaping any embedded single quotes via `'\''`.

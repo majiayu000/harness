@@ -163,22 +163,24 @@ pub fn implement_from_issue(
         None => String::new(),
     };
     PromptParts {
-        static_instructions: format!(
-            "You are a Senior Engineer implementing a change for GitHub issue #{issue}.\n\n\
+        static_instructions: String::from(
+            "You are a Senior Engineer implementing a change for a GitHub issue.\n\n\
              Your job is to write correct, tested, minimal code. Do not add features beyond \
              what the issue requests. Do not refactor unrelated code.\n\
-             {plan_section}\n\
              Steps:\n\
-             1. Read the issue: `gh issue view {issue}`\n\
+             1. Read the target issue identified in the dynamic payload\n\
              2. Understand the requirements and existing code\n\
              3. Implement the change with the minimum necessary modifications\n\
              4. Run the project's validation commands before proceeding — fix any failures first\n\
              5. Create a feature branch, commit with a descriptive message, push\n\
-             6. Create a PR with `gh pr create` (see the mandatory PR body contract below).\n"
+             6. Create a PR with `gh pr create` (see the mandatory PR body contract below).\n",
         ),
         context: git_line,
         dynamic_payload: format!(
-            "PR body contract (enforced by reviewers and dashboards):\n\
+            "Target issue #{issue}\n\
+             Read the issue with: `gh issue view {issue}`\n\
+             {plan_section}\
+             PR body contract (enforced by reviewers and dashboards):\n\
              - The body MUST contain the following line verbatim on its own line, \
              with no surrounding text:\n\
              \n\
@@ -348,17 +350,30 @@ mod tests {
     #[test]
     fn test_implement_from_issue_with_plan() {
         let plan = "1. Modify src/lib.rs\n2. Add test";
-        let p = implement_from_issue(42, None, Some(plan)).to_prompt_string();
+        let parts = implement_from_issue(42, None, Some(plan));
+        let p = parts.to_prompt_string();
         assert!(p.contains("issue #42"));
         assert!(p.contains("implementation plan"));
         assert!(p.contains("Modify src/lib.rs"));
         assert!(p.contains("PLAN_ISSUE="));
+        assert!(!parts.static_instructions.contains("Modify src/lib.rs"));
+        assert!(parts.dynamic_payload.contains("Modify src/lib.rs"));
+    }
+
+    #[test]
+    fn test_implement_from_issue_static_layer_is_issue_stable() {
+        let parts = implement_from_issue(42, None, Some("issue-specific plan"));
+        assert!(!parts.static_instructions.contains("#42"));
+        assert!(!parts.static_instructions.contains("issue-specific plan"));
+        assert!(parts.dynamic_payload.contains("#42"));
+        assert!(parts.dynamic_payload.contains("issue-specific plan"));
     }
 
     #[test]
     fn test_prompt_parts_fields_are_accessible() {
         let parts = implement_from_issue(99, None, None);
-        assert!(parts.static_instructions.contains("issue #99"));
+        assert!(parts.static_instructions.contains("GitHub issue"));
+        assert!(parts.dynamic_payload.contains("issue #99"));
         assert!(parts.dynamic_payload.contains("PR_URL="));
         assert!(parts.context.is_empty());
     }

@@ -511,7 +511,7 @@ pub(crate) async fn augment_prompt_with_skills(
 /// agents — this function injects skill content into the prompt text itself.
 ///
 /// Two sections are appended:
-/// - **Available Skills**: a brief listing of every skill (name + description).
+/// - **Available Skills**: a capped broad listing of skill names and descriptions.
 /// - **Relevant Skills**: full content of skills whose trigger patterns matched.
 ///
 /// Returns an empty string when the store is empty (no sections added).
@@ -595,6 +595,10 @@ pub(crate) async fn persist_artifact(
 #[cfg(test)]
 #[path = "helpers_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "helpers_prompt_cap_tests.rs"]
+mod prompt_cap_tests;
 
 #[cfg(test)]
 #[path = "helpers_stall_tests.rs"]

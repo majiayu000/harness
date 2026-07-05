@@ -94,15 +94,22 @@ impl ClaudeCodeAgent {
     /// "Input must be provided" errors.
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
         let model = self.resolve_model(req);
+        let prompt = req.claude_main_prompt();
         let mut base_args = vec![
             OsString::from("-p"),
-            OsString::from(&req.prompt), // prompt MUST follow -p immediately
+            OsString::from(prompt.as_ref()), // prompt MUST follow -p immediately
             OsString::from("--output-format"),
             OsString::from("stream-json"),
             OsString::from("--model"),
             OsString::from(model),
             OsString::from("--verbose"),
         ];
+
+        if let Some(system_prompt) = req.claude_system_prompt() {
+            base_args.push(OsString::from("--append-system-prompt"));
+            base_args.push(OsString::from(system_prompt.as_ref()));
+            base_args.push(OsString::from("--exclude-dynamic-system-prompt-sections"));
+        }
 
         // Hard tool enforcement at the CLI boundary (issue #514):
         //   Full profile  (allowed_tools = None)    → --dangerously-skip-permissions
@@ -487,3 +494,7 @@ fn provider_wait_message(phase: ProviderPhase) -> String {
 #[cfg(test)]
 #[path = "claude_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "claude_prompt_layer_tests.rs"]
+mod prompt_layer_tests;

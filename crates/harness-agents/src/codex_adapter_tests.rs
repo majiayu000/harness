@@ -241,6 +241,7 @@ fn approval_decision_result_uses_app_server_shape() {
 fn start_params_include_runtime_profile_overrides() {
     let req = TurnRequest {
         prompt: "ping".to_string(),
+        prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
         model: Some("gpt-runtime".to_string()),
         reasoning_effort: Some("medium".to_string()),
@@ -346,6 +347,7 @@ async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Res
     let adapter = CodexAdapter::new(std::env::current_exe()?);
     let request = TurnRequest {
         prompt: "ping".to_string(),
+        prompt_layers: None,
         project_root: missing.clone(),
         model: None,
         reasoning_effort: None,
@@ -410,6 +412,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
 
     let req = TurnRequest {
         prompt: "ping".to_string(),
+        prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
         model: None,
         reasoning_effort: None,

@@ -3,6 +3,7 @@ use crate::config::agents::SandboxMode;
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -24,7 +25,12 @@ pub trait CodeAgent: Send + Sync {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
+    /// Canonical flattened prompt used for fallback execution and audit.
     pub prompt: String,
+    /// Optional layered prompt payload for adapters with cache-friendly
+    /// static prompt channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_layers: Option<AgentPromptLayers>,
     pub project_root: PathBuf,
     /// Tool restriction for the agent invocation.
     ///
@@ -76,12 +82,41 @@ impl AgentRequest {
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
         self.allowed_tools.is_none()
     }
+
+    pub fn from_prompt_layers(prompt_layers: AgentPromptLayers, project_root: PathBuf) -> Self {
+        Self {
+            prompt: prompt_layers.to_prompt_string(),
+            prompt_layers: Some(prompt_layers),
+            project_root,
+            ..Self::default()
+        }
+    }
+
+    fn effective_prompt_layers(&self) -> Option<Cow<'_, AgentPromptLayers>> {
+        self.prompt_layers.as_ref().map(Cow::Borrowed).or_else(|| {
+            crate::prompts::prompt_layers_for_flattened_prompt(&self.prompt).map(Cow::Owned)
+        })
+    }
+
+    pub fn claude_main_prompt(&self) -> Cow<'_, str> {
+        self.effective_prompt_layers()
+            .and_then(|layers| layers.main_prompt_for_cache())
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Borrowed(self.prompt.as_str()))
+    }
+
+    pub fn claude_system_prompt(&self) -> Option<Cow<'_, str>> {
+        self.effective_prompt_layers()
+            .and_then(|layers| layers.static_system_prompt_for_cache().map(str::to_string))
+            .map(Cow::Owned)
+    }
 }
 
 impl Default for AgentRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            prompt_layers: None,
             project_root: PathBuf::from("."),
             allowed_tools: None,
             model: None,
@@ -94,6 +129,82 @@ impl Default for AgentRequest {
             env_vars: HashMap::new(),
             capability_token: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPromptLayers {
+    /// Role, workflow, and output-format instructions that are stable for
+    /// repeated tasks of the same prompt kind.
+    pub static_instructions: String,
+    /// Project and session context that should remain in the main prompt.
+    pub context: String,
+    /// Per-invocation task payload and appended runtime context.
+    pub dynamic_payload: String,
+}
+
+impl AgentPromptLayers {
+    pub fn new(
+        static_instructions: impl Into<String>,
+        context: impl Into<String>,
+        dynamic_payload: impl Into<String>,
+    ) -> Self {
+        Self {
+            static_instructions: static_instructions.into(),
+            context: context.into(),
+            dynamic_payload: dynamic_payload.into(),
+        }
+    }
+
+    pub fn to_prompt_string(&self) -> String {
+        format!(
+            "{}{}{}",
+            self.static_instructions, self.context, self.dynamic_payload
+        )
+    }
+
+    pub fn append_to_dynamic_payload(&mut self, text: &str) {
+        self.dynamic_payload.push_str(text);
+    }
+
+    pub fn static_system_prompt(&self) -> Option<&str> {
+        if self.static_instructions.trim().is_empty() {
+            None
+        } else {
+            Some(&self.static_instructions)
+        }
+    }
+
+    pub fn static_system_prompt_for_cache(&self) -> Option<&str> {
+        let has_main_prompt =
+            !self.context.trim().is_empty() || !self.dynamic_payload.trim().is_empty();
+        if has_main_prompt {
+            self.static_system_prompt()
+        } else {
+            None
+        }
+    }
+
+    pub fn main_prompt_for_cache(&self) -> Option<String> {
+        self.static_system_prompt_for_cache()?;
+        let mut prompt = String::with_capacity(self.context.len() + self.dynamic_payload.len());
+        prompt.push_str(&self.context);
+        prompt.push_str(&self.dynamic_payload);
+        if prompt.trim().is_empty() {
+            None
+        } else {
+            Some(prompt)
+        }
+    }
+}
+
+impl From<crate::prompts::PromptParts> for AgentPromptLayers {
+    fn from(parts: crate::prompts::PromptParts) -> Self {
+        Self::new(
+            parts.static_instructions,
+            parts.context,
+            parts.dynamic_payload,
+        )
     }
 }
 
@@ -197,6 +308,7 @@ pub enum ApprovalDecision {
 #[derive(Debug, Clone)]
 pub struct TurnRequest {
     pub prompt: String,
+    pub prompt_layers: Option<AgentPromptLayers>,
     pub project_root: PathBuf,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -208,6 +320,22 @@ pub struct TurnRequest {
     pub timeout_secs: Option<u64>,
     /// Scoped write capability; checked for expiry before spawning.
     pub capability_token: Option<CapabilityToken>,
+}
+
+impl TurnRequest {
+    pub fn claude_main_prompt(&self) -> Cow<'_, str> {
+        self.prompt_layers
+            .as_ref()
+            .and_then(AgentPromptLayers::main_prompt_for_cache)
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Borrowed(self.prompt.as_str()))
+    }
+
+    pub fn claude_system_prompt(&self) -> Option<&str> {
+        self.prompt_layers
+            .as_ref()
+            .and_then(AgentPromptLayers::static_system_prompt_for_cache)
+    }
 }
 
 /// Streaming agent adapter — coexists with legacy CodeAgent trait.
