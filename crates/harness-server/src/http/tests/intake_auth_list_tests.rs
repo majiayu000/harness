@@ -204,12 +204,20 @@ async fn intake_status_reports_github_mode_drivers_and_effective_repos() -> anyh
     assert_eq!(github["drivers"]["webhook"]["degraded"], false);
     assert_eq!(github["drivers"]["polling"]["configured"], true);
     assert_eq!(github["drivers"]["polling"]["active"], true);
+    assert_eq!(
+        github["drivers"]["polling"]["discovery_driver"],
+        "direct_rest"
+    );
+    assert_eq!(
+        github["drivers"]["polling"]["reason"],
+        serde_json::Value::Null
+    );
     let repos = github["repos"]
         .as_array()
         .expect("repos should be an array");
-    assert!(repos
-        .iter()
-        .any(|repo| repo["repo"] == "owner/main" && repo["mode"] == "hybrid"));
+    assert!(repos.iter().any(|repo| repo["repo"] == "owner/main"
+        && repo["mode"] == "hybrid"
+        && repo["drivers"]["discovery_driver"] == "direct_rest"));
     assert!(repos.iter().any(|repo| {
         repo["repo"] == "owner/secondary"
             && repo["label"] == "bugs"

@@ -2,16 +2,18 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use harness_core::config::isolation::IsolationTrustClass;
-use reqwest::header::{ACCEPT, LINK, USER_AGENT};
+use reqwest::header::{HeaderMap, ACCEPT, LINK, RETRY_AFTER, USER_AGENT};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
 use crate::task_runner::TaskId;
 
 const GITHUB_ISSUES_MAX_PAGES: usize = 20;
+const DEFAULT_RATE_LIMIT_RETRY_SECS: i64 = 60;
 
 #[async_trait]
 pub(crate) trait DispatchedTaskChecker: Send + Sync {
@@ -70,6 +72,39 @@ pub struct GitHubIssuesPoller {
     persist_path: Option<PathBuf>,
     task_checker: Option<Arc<dyn DispatchedTaskChecker>>,
     github_token: Option<String>,
+    throttle: Arc<GitHubRateLimitThrottle>,
+}
+
+#[derive(Debug, Default)]
+pub struct GitHubRateLimitThrottle {
+    retry_after: Mutex<Option<DateTime<Utc>>>,
+}
+
+impl GitHubRateLimitThrottle {
+    fn current_retry_after(&self, now: DateTime<Utc>) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let mut retry_after = self
+            .retry_after
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GitHub rate-limit throttle lock poisoned"))?;
+        if retry_after.as_ref().is_some_and(|at| *at <= now) {
+            *retry_after = None;
+        }
+        Ok(*retry_after)
+    }
+
+    fn record_retry_after(&self, retry_at: DateTime<Utc>) -> anyhow::Result<()> {
+        let mut retry_after = self
+            .retry_after
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GitHub rate-limit throttle lock poisoned"))?;
+        if retry_after
+            .as_ref()
+            .is_none_or(|current| retry_at > *current)
+        {
+            *retry_after = Some(retry_at);
+        }
+        Ok(())
+    }
 }
 
 impl GitHubIssuesPoller {
@@ -85,6 +120,20 @@ impl GitHubIssuesPoller {
         data_dir: Option<&Path>,
         github_token: Option<String>,
     ) -> Self {
+        Self::new_with_token_and_throttle(
+            repo_config,
+            data_dir,
+            github_token,
+            Arc::new(GitHubRateLimitThrottle::default()),
+        )
+    }
+
+    pub fn new_with_token_and_throttle(
+        repo_config: &harness_core::config::intake::GitHubRepoConfig,
+        data_dir: Option<&Path>,
+        github_token: Option<String>,
+        throttle: Arc<GitHubRateLimitThrottle>,
+    ) -> Self {
         let repo_slug = repo_config.repo.replace('/', "_");
         let persist_path = data_dir.map(|d| d.join(format!("github_dispatched_{repo_slug}.json")));
         let dispatched = Self::load_dispatched(persist_path.as_deref());
@@ -97,6 +146,7 @@ impl GitHubIssuesPoller {
             persist_path,
             task_checker: None,
             github_token,
+            throttle,
         }
     }
 
@@ -221,6 +271,16 @@ impl GitHubIssuesPoller {
         &self,
         api_base_url: &str,
     ) -> anyhow::Result<Vec<IncomingIssue>> {
+        let now = Utc::now();
+        if let Some(retry_at) = self.throttle.current_retry_after(now)? {
+            tracing::debug!(
+                repo = %self.repo,
+                retry_at = %retry_at.to_rfc3339(),
+                "GitHub issue polling skipped while token is rate-limited"
+            );
+            return Ok(Vec::new());
+        }
+
         let mut next_url = Some(github_issues_url(api_base_url, &self.repo, &self.label)?);
         let mut seen_urls = HashSet::new();
         let mut page_count = 0usize;
@@ -250,13 +310,27 @@ impl GitHubIssuesPoller {
                 break;
             }
 
-            let page = fetch_github_issue_page(
+            let page = match fetch_github_issue_page(
                 &self.client,
                 &url,
                 &self.repo,
                 self.github_token.as_deref(),
             )
-            .await?;
+            .await?
+            {
+                GitHubIssuePageFetch::Page(page) => page,
+                GitHubIssuePageFetch::RateLimited(limit) => {
+                    self.throttle.record_retry_after(limit.retry_at)?;
+                    tracing::warn!(
+                        repo = %self.repo,
+                        status = %limit.status,
+                        retry_at = %limit.retry_at.to_rfc3339(),
+                        "GitHub issue polling paused after rate-limit response"
+                    );
+                    complete_open_issue_set = false;
+                    break;
+                }
+            };
             let parsed = parse_gh_output(
                 &page.body,
                 &self.repo,
@@ -418,12 +492,22 @@ struct GitHubIssuePage {
     next_url: Option<String>,
 }
 
+enum GitHubIssuePageFetch {
+    Page(GitHubIssuePage),
+    RateLimited(GitHubRateLimit),
+}
+
+struct GitHubRateLimit {
+    status: StatusCode,
+    retry_at: DateTime<Utc>,
+}
+
 async fn fetch_github_issue_page(
     client: &reqwest::Client,
     url: &str,
     repo: &str,
     github_token: Option<&str>,
-) -> anyhow::Result<GitHubIssuePage> {
+) -> anyhow::Result<GitHubIssuePageFetch> {
     let mut request = client
         .get(url)
         .header(ACCEPT, "application/vnd.github+json")
@@ -432,15 +516,86 @@ async fn fetch_github_issue_page(
         request = request.bearer_auth(token);
     }
     let response = request.send().await?;
-    if !response.status().is_success() {
+    let status = response.status();
+    if !status.is_success() {
+        if let Some(retry_at) = rate_limit_retry_at(status, response.headers(), Utc::now()) {
+            return Ok(GitHubIssuePageFetch::RateLimited(GitHubRateLimit {
+                status,
+                retry_at,
+            }));
+        }
         anyhow::bail!(
             "GitHub issue list failed for {repo} at {url} with status {}",
-            response.status()
+            status
         );
     }
     let next_url = next_link_from_headers(response.headers());
     let body = response.bytes().await?.to_vec();
-    Ok(GitHubIssuePage { body, next_url })
+    Ok(GitHubIssuePageFetch::Page(GitHubIssuePage {
+        body,
+        next_url,
+    }))
+}
+
+fn rate_limit_retry_at(
+    status: StatusCode,
+    headers: &HeaderMap,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let retry_after = retry_after_header_time(headers, now);
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Some(retry_after.unwrap_or_else(|| default_rate_limit_retry_at(now)));
+    }
+
+    if status != StatusCode::FORBIDDEN {
+        return None;
+    }
+
+    if retry_after.is_some() || x_rate_limit_remaining_is_zero(headers) {
+        return Some(retry_after.unwrap_or_else(|| {
+            x_rate_limit_reset_time(headers).unwrap_or_else(|| default_rate_limit_retry_at(now))
+        }));
+    }
+
+    None
+}
+
+fn retry_after_header_time(headers: &HeaderMap, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let seconds = headers
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    retry_at_from_seconds(now, seconds)
+}
+
+fn x_rate_limit_reset_time(headers: &HeaderMap) -> Option<DateTime<Utc>> {
+    let epoch_seconds = headers
+        .get("x-ratelimit-reset")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    DateTime::<Utc>::from_timestamp(epoch_seconds, 0)
+}
+
+fn x_rate_limit_remaining_is_zero(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "0")
+}
+
+fn default_rate_limit_retry_at(now: DateTime<Utc>) -> DateTime<Utc> {
+    retry_at_from_seconds(now, DEFAULT_RATE_LIMIT_RETRY_SECS).unwrap_or(now)
+}
+
+fn retry_at_from_seconds(now: DateTime<Utc>, seconds: i64) -> Option<DateTime<Utc>> {
+    let duration = chrono::Duration::try_seconds(seconds.max(0))?;
+    now.checked_add_signed(duration)
 }
 
 fn next_link_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -534,6 +689,10 @@ impl IntakeSource for GitHubIssuesPoller {
 #[cfg(test)]
 #[path = "github_issues_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "github_issues_rate_limit_tests.rs"]
+mod rate_limit_tests;
 
 #[cfg(test)]
 #[path = "github_issues_trust_tests.rs"]

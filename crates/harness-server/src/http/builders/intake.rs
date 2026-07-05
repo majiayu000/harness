@@ -94,8 +94,10 @@ pub(crate) async fn build_intake(
         );
     }
     let github_pollers: Vec<(String, Arc<dyn crate::intake::IntakeSource>)> = if let Some(cfg) =
-        github_runtime_polling_config(github_cfg, registry.workflow_runtime_store.is_some())
+        github_direct_rest_polling_config(github_cfg, registry.workflow_runtime_store.is_some())
     {
+        let github_throttle =
+            Arc::new(crate::intake::github_issues::GitHubRateLimitThrottle::default());
         cfg.effective_repos()
             .into_iter()
             .map(|repo_cfg| {
@@ -105,11 +107,13 @@ pub(crate) async fn build_intake(
                     "intake: GitHub issue polling registered with server-side coverage gate"
                 );
                 let key = format!("github:{}", repo_cfg.repo);
-                let poller = crate::intake::github_issues::GitHubIssuesPoller::new_with_token(
-                    &repo_cfg,
-                    None,
-                    server.config.server.github_token.clone(),
-                );
+                let poller =
+                    crate::intake::github_issues::GitHubIssuesPoller::new_with_token_and_throttle(
+                        &repo_cfg,
+                        None,
+                        server.config.server.github_token.clone(),
+                        Arc::clone(&github_throttle),
+                    );
                 (
                     key,
                     Arc::new(poller) as Arc<dyn crate::intake::IntakeSource>,
@@ -117,10 +121,24 @@ pub(crate) async fn build_intake(
             })
             .collect()
     } else {
-        if github_cfg.is_some() && registry.workflow_runtime_store.is_none() {
-            tracing::error!(
-                "intake: GitHub issue polling requires workflow_runtime_store; pollers disabled"
-            );
+        if let Some(cfg) = github_cfg {
+            match cfg.discovery_driver {
+                harness_core::config::intake::GitHubPollDiscoveryDriver::DirectRest
+                    if registry.workflow_runtime_store.is_none() =>
+                {
+                    tracing::error!(
+                        discovery_driver = %cfg.discovery_driver,
+                        "intake: GitHub direct REST polling requires workflow_runtime_store; pollers disabled"
+                    );
+                }
+                harness_core::config::intake::GitHubPollDiscoveryDriver::Agent => {
+                    tracing::info!(
+                        discovery_driver = %cfg.discovery_driver,
+                        "intake: GitHub agent discovery selected; direct REST pollers disabled"
+                    );
+                }
+                _ => {}
+            }
         }
         Vec::new()
     };
@@ -194,11 +212,14 @@ fn github_polling_config(
     cfg.filter(|cfg| cfg.enabled && cfg.mode.poller_enabled())
 }
 
-fn github_runtime_polling_config(
+fn github_direct_rest_polling_config(
     cfg: Option<&harness_core::config::intake::GitHubIntakeConfig>,
     workflow_runtime_store_available: bool,
 ) -> Option<&harness_core::config::intake::GitHubIntakeConfig> {
-    cfg.filter(|_| workflow_runtime_store_available)
+    cfg.filter(|cfg| {
+        cfg.discovery_driver == harness_core::config::intake::GitHubPollDiscoveryDriver::DirectRest
+            && workflow_runtime_store_available
+    })
 }
 
 async fn runtime_issue_concurrency_config(
@@ -327,12 +348,15 @@ mod tests {
 
     async fn make_minimal_bundles(
         dir: &std::path::Path,
-    ) -> (
+    ) -> Option<(
         Arc<HarnessServer>,
         StorageBundle,
         EnginesBundle,
         RegistryBundle,
-    ) {
+    )> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return None;
+        }
         let server = Arc::new(HarnessServer::new(
             HarnessConfig::default(),
             ThreadManager::new(),
@@ -352,7 +376,7 @@ mod tests {
         )
         .await
         .expect("registry");
-        (server, storage, engines, registry)
+        Some((server, storage, engines, registry))
     }
 
     fn registry_project(
@@ -375,7 +399,10 @@ mod tests {
     #[tokio::test]
     async fn no_intake_config_produces_empty_intake() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (server, storage, engines, registry) = make_minimal_bundles(dir.path()).await;
+        let Some((server, storage, engines, registry)) = make_minimal_bundles(dir.path()).await
+        else {
+            return;
+        };
         let bundle = build_intake(
             &server,
             &storage,
@@ -397,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn github_runtime_polling_config_requires_workflow_runtime_store() {
+    fn github_direct_rest_polling_config_requires_workflow_runtime_store() {
         let cfg = harness_core::config::intake::GitHubIntakeConfig {
             enabled: true,
             repo: "owner/repo".to_string(),
@@ -406,12 +433,30 @@ mod tests {
         };
         let cfg = github_polling_config(Some(&cfg));
 
-        assert!(github_runtime_polling_config(cfg, true).is_some());
-        assert!(github_runtime_polling_config(cfg, false).is_none());
+        assert!(github_direct_rest_polling_config(cfg, true).is_some());
+        assert!(github_direct_rest_polling_config(cfg, false).is_none());
+    }
+
+    #[test]
+    fn github_direct_rest_polling_config_skips_agent_discovery() {
+        let cfg = harness_core::config::intake::GitHubIntakeConfig {
+            enabled: true,
+            discovery_driver: harness_core::config::intake::GitHubPollDiscoveryDriver::Agent,
+            repo: "owner/repo".to_string(),
+            label: "harness".to_string(),
+            ..Default::default()
+        };
+        let cfg = github_polling_config(Some(&cfg));
+
+        assert!(github_direct_rest_polling_config(cfg, true).is_none());
     }
 
     #[tokio::test]
     async fn github_intake_registers_server_side_poller() {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = HarnessConfig::default();
         config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
@@ -464,6 +509,10 @@ mod tests {
 
     #[tokio::test]
     async fn github_intake_webhook_mode_does_not_register_server_side_poller() {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = HarnessConfig::default();
         config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
@@ -623,7 +672,9 @@ mod tests {
         }];
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let (_, _, _, registry) = make_minimal_bundles(dir.path()).await;
+        let Some((_, _, _, registry)) = make_minimal_bundles(dir.path()).await else {
+            return;
+        };
         let cfg = runtime_review_concurrency_config(&server, &registry).await;
 
         assert_eq!(cfg.max_concurrent_tasks, 3);
@@ -642,7 +693,9 @@ mod tests {
         server.config.server.project_root = std::path::PathBuf::from("/tmp/fallback");
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let (_, _, _, registry) = make_minimal_bundles(dir.path()).await;
+        let Some((_, _, _, registry)) = make_minimal_bundles(dir.path()).await else {
+            return;
+        };
         let cfg = runtime_review_concurrency_config(&server, &registry).await;
 
         assert_eq!(cfg.max_concurrent_tasks, 2);
@@ -652,7 +705,10 @@ mod tests {
     #[tokio::test]
     async fn runtime_review_concurrency_includes_registry_projects() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (server, _storage, _engines, registry) = make_minimal_bundles(temp.path()).await;
+        let Some((server, _storage, _engines, registry)) = make_minimal_bundles(temp.path()).await
+        else {
+            return;
+        };
         let runtime_project_root = temp.path().join("runtime-project");
         std::fs::create_dir_all(&runtime_project_root).expect("create runtime project");
         registry

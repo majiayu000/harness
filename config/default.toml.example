@@ -177,6 +177,8 @@ enabled = false
 
 # [intake.github]
 # enabled = true
+# mode = "poll" # "poll", "webhook", or "hybrid"
+# discovery_driver = "direct_rest" # zero-agent REST discovery; "agent" is opt-in
 # poll_interval_secs = 300
 # planner_agent = "codex"
 # sprint_timeout_secs = 10800
