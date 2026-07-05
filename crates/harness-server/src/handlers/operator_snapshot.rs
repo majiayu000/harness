@@ -175,6 +175,7 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
                 .map(|path| path.to_string_lossy().into_owned()),
             "path_hint": runtime_logs.path_hint.clone(),
             "retention_days": runtime_logs.retention_days,
+            "retention_max_files": runtime_logs.retention_max_files,
         },
     });
 
@@ -634,7 +635,7 @@ mod tests {
             .path()
             .join("logs/harness-serve-20260430T120000Z-pid1.log");
         let expected_path = active_path.display().to_string();
-        server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(active_path, 30);
+        server.runtime_logs = crate::server::RuntimeLogMetadata::enabled(active_path, 30, 9);
 
         let app = Router::new()
             .route("/api/operator-snapshot", get(operator_snapshot))
@@ -655,6 +656,7 @@ mod tests {
             body["runtime_logs"]["path_hint"],
             serde_json::Value::String(expected_path)
         );
+        assert_eq!(body["runtime_logs"]["retention_max_files"], 9);
         Ok(())
     }
 
@@ -668,6 +670,7 @@ mod tests {
         server.runtime_logs = crate::server::RuntimeLogMetadata::degraded(
             Some("logs/harness-serve-20260430T120000Z-pid1.log".to_string()),
             30,
+            2,
         );
 
         let app = Router::new()
@@ -686,6 +689,7 @@ mod tests {
             body["runtime_logs"]["path_hint"],
             serde_json::Value::String("logs/harness-serve-20260430T120000Z-pid1.log".to_string())
         );
+        assert_eq!(body["runtime_logs"]["retention_max_files"], 2);
         Ok(())
     }
 }

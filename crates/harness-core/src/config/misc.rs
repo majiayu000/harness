@@ -402,21 +402,6 @@ pub struct RulesConfig {
     pub hook_enforcement: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObserveConfig {
-    pub session_renewal_secs: u64,
-    pub log_retention_days: u32,
-}
-
-impl Default for ObserveConfig {
-    fn default() -> Self {
-        Self {
-            session_renewal_secs: 1800,
-            log_retention_days: 90,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextMode {

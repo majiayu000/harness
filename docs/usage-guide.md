@@ -83,6 +83,7 @@ total_budget_usd = 5.0
 draft_ttl_hours = 72
 
 [observe]
+log_retention_max_files = 30
 log_retention_days = 90
 
 [otel]
@@ -282,7 +283,8 @@ curl http://127.0.0.1:9800/health
 ```
 
 The public health payload includes a `runtime_logs` block with the current
-logging state, retention window, and a redacted `logs/<filename>` hint.
+logging state, retention window, max-files cap, and a redacted
+`logs/<filename>` hint.
 
 ## Project Management API
 
@@ -441,7 +443,8 @@ If no new commits have landed since the last review, the cycle is skipped.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `session_renewal_secs` | `1800` | Session renewal interval |
-| `log_retention_days` | `90` | Log retention period |
+| `log_retention_days` | `90` | Runtime log age retention period |
+| `log_retention_max_files` | `30` | Maximum matching `harness serve` runtime logs to keep; `0` disables the count cap |
 
 ### `[otel]`
 

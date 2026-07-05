@@ -38,6 +38,7 @@ fn workflow_breaker_harness_config_toml(workflow_section: &str) -> String {
 
         [observe]
         session_renewal_secs = 1800
+        log_retention_max_files = 30
         log_retention_days = 90
 
         [otel]

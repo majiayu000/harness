@@ -222,7 +222,10 @@ available, and builds `./target/release/harness` with
 `harness serve` persists its runtime log under `server.data_dir/logs/` as
 `harness-serve-<startup-timestamp>-pid<PID>.log`. `/health` exposes a redacted
 `runtime_logs.path_hint`, while `/api/operator-snapshot` includes the full
-active path for operators.
+active path for operators. Startup cleanup removes matching runtime logs older
+than `observe.log_retention_days` and prunes the oldest extra matching logs
+beyond `observe.log_retention_max_files`; set the max-files value to `0` for
+age-only retention.
 
 **Stdio (for MCP integration):**
 
@@ -304,6 +307,7 @@ total_budget_usd = 5.0
 draft_ttl_hours = 72
 
 [observe]
+log_retention_max_files = 30
 log_retention_days = 90
 
 [otel]
@@ -467,8 +471,8 @@ curl http://127.0.0.1:9800/health
 ```
 
 The response includes a `runtime_logs` block with the logging state, retention
-window, and a redacted `logs/<filename>` hint instead of the full absolute
-path.
+window, max-files cap, and a redacted `logs/<filename>` hint instead of the full
+absolute path.
 
 ## Server Startup
 
