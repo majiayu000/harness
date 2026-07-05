@@ -254,6 +254,7 @@ pub struct AppState {
     pub _db_state_guard: Option<crate::test_helpers::DbStateGuard>,
     pub runtime_hosts: Arc<crate::runtime_hosts::RuntimeHostManager>,
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
+    pub postgres_catalog: Arc<crate::postgres_catalog::PostgresCatalogMonitor>,
     pub isolation_availability: harness_core::config::isolation::IsolationAvailability,
     /// Serializes runtime snapshot writes to avoid out-of-order persistence.
     pub runtime_state_persist_lock: Mutex<()>,

@@ -54,6 +54,8 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
     let runtime_degraded = circuit_breakers
         .iter()
         .any(|breaker| breaker.state != "closed");
+    let postgres_catalog = state.postgres_catalog.snapshot().await;
+    let postgres_catalog_degraded = postgres_catalog.threshold_breached;
     let unavailable_required_tiers = state
         .isolation_availability
         .unavailable_required_tiers(&state.core.server.config.isolation);
@@ -70,7 +72,12 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
             })
         })
         .collect();
-    let status = if degraded.is_empty() && !dirty && !runtime_degraded && !isolation_degraded {
+    let status = if degraded.is_empty()
+        && !dirty
+        && !runtime_degraded
+        && !isolation_degraded
+        && !postgres_catalog_degraded
+    {
         "ok"
     } else {
         "degraded"
@@ -93,6 +100,7 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
         "runtime": {
             "circuit_breakers": circuit_breakers,
         },
+        "postgres_catalog": postgres_catalog,
         "isolation": {
             "tiers": state.isolation_availability.tiers.clone(),
             "unavailable_required_tiers": unavailable_required_tiers,

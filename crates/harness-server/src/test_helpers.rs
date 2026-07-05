@@ -199,6 +199,11 @@ async fn make_state_inner(
         Some(&database_url),
     )
     .await?;
+    let postgres_catalog = crate::postgres_catalog::PostgresCatalogMonitor::new(
+        tasks.postgres_pool(),
+        crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
+    )
+    .await;
     let events = Arc::new(
         harness_observe::event_store::EventStore::new_with_database_url(dir, Some(&database_url))
             .await?,
@@ -291,6 +296,7 @@ async fn make_state_inner(
         runtime_project_cache: Arc::new(
             crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
         ),
+        postgres_catalog,
         isolation_availability: Default::default(),
         runtime_state_persist_lock: tokio::sync::Mutex::new(()),
         runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),

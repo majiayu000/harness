@@ -220,6 +220,11 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .as_ref()
         .expect("critical task store should be present after startup validation")
         .clone();
+    let postgres_catalog = crate::postgres_catalog::PostgresCatalogMonitor::new(
+        tasks.postgres_pool(),
+        crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
+    )
+    .await;
 
     // Phase 2: engines — rule engine, event store (+purge task), GC agent, skill store.
     // Depends on: storage (none directly, but must precede registry which uses storage.tasks).
@@ -369,6 +374,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         _db_state_guard: None,
         runtime_hosts: services.runtime_hosts,
         runtime_project_cache: services.runtime_project_cache,
+        postgres_catalog,
         isolation_availability,
         runtime_state_persist_lock: Mutex::new(()),
         runtime_state_dirty: AtomicBool::new(false),

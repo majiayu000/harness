@@ -136,6 +136,22 @@ export interface UsageDiagnostics {
   process_source: string;
 }
 
+export type PostgresCatalogState = "available" | "unavailable" | "error";
+
+export interface PostgresCatalogCensus {
+  state: PostgresCatalogState;
+  schema_count: number | null;
+  catalog_object_count: number | null;
+  database_size_bytes: number | null;
+  sampled_at: string | null;
+  startup_schema_count: number | null;
+  absolute_schema_threshold: number;
+  relative_schema_multiplier: number;
+  threshold_breached: boolean;
+  breach_reasons: string[];
+  error: string | null;
+}
+
 export interface UsageMonitorPayload {
   window: UsageWindow;
   cost: UsageCostConfig;
@@ -148,5 +164,6 @@ export interface UsageMonitorPayload {
   local_usage_sources: LocalUsageSourceSummary[];
   active_by_repo: ActiveCount[];
   active_by_activity: ActiveCount[];
+  postgres_catalog: PostgresCatalogCensus;
   diagnostics: UsageDiagnostics;
 }
