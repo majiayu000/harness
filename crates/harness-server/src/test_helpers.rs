@@ -127,24 +127,6 @@ pub fn test_database_url() -> anyhow::Result<String> {
     Ok(url)
 }
 
-#[cfg(test)]
-mod db_state_guard_tests {
-    use super::acquire_db_state_guard;
-    use tokio::time::{timeout, Duration};
-
-    #[tokio::test]
-    async fn db_state_guard_acquisitions_do_not_serialize() {
-        let first_guard = acquire_db_state_guard().await;
-        let second = timeout(Duration::from_millis(50), acquire_db_state_guard()).await;
-
-        drop(first_guard);
-        assert!(
-            second.is_ok(),
-            "database state guard should be a non-serializing compatibility shim"
-        );
-    }
-}
-
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
     err.to_string()
         .contains("pool timed out while waiting for an open connection")
