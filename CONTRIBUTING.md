@@ -27,6 +27,31 @@ HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/t
 HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh
 ```
 
+## Target Directory Cleanup
+
+Cargo build artifacts can accumulate across the default `target/` directory and
+auxiliary `target/cargo-*` target directories. Use the manual target GC command
+when disk usage grows unexpectedly or before large branch changes:
+
+```bash
+make gc-target
+```
+
+The command keeps artifacts newer than 14 days by default, prints before/after
+size reports, and summarizes freed bytes. Use a custom retention window when
+needed:
+
+```bash
+scripts/gc-target.sh --days 7
+scripts/gc-target.sh --days 30 --dry-run
+```
+
+If `cargo sweep` is installed, the script prefers it for the default Cargo
+target directory. Otherwise it falls back to bounded mtime cleanup under Cargo
+artifact subdirectories. Run this manually when no Cargo build is active;
+cleaning target directories during an active build can force rebuilds or
+conflict with Cargo's build directory activity.
+
 ## Pull Request Guidelines
 
 1. Keep PRs focused and small when possible.
