@@ -228,14 +228,29 @@ impl CodeAgent for ClaudeCodeAgent {
             )
             .await?;
 
-        let child = cmd.spawn().map_err(|error| {
-            let message = crate::classify_missing_workspace_spawn_failure(
-                &error,
-                &req.project_root,
-                format!("failed to run claude: {error}"),
-            );
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
+        let spawn_result = cmd.spawn();
+        let child = match spawn_result {
+            Ok(child) => child,
+            Err(ref error) if error.raw_os_error() == Some(26) => {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                cmd.spawn().map_err(|error| {
+                    let message = crate::classify_missing_workspace_spawn_failure(
+                        &error,
+                        &req.project_root,
+                        format!("failed to run claude: {error}"),
+                    );
+                    harness_core::error::HarnessError::AgentExecution(message)
+                })?
+            }
+            Err(error) => {
+                let message = crate::classify_missing_workspace_spawn_failure(
+                    &error,
+                    &req.project_root,
+                    format!("failed to run claude: {error}"),
+                );
+                return Err(harness_core::error::HarnessError::AgentExecution(message));
+            }
+        };
         if let Some(pid) = child.id() {
             crate::write_provisional_agent_run_binding(
                 &run_identity,
