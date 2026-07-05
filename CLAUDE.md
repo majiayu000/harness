@@ -11,13 +11,15 @@ All outputs MUST be in English, including:
 
 ## Build
 
-- `cargo check` after every change
-- `cargo test` before commit
+- Use the smallest validation command that covers the changed surface during implementation.
+- Run relevant tests before committing behavior-changing code.
 - Before pushing a PR, ALWAYS run `cargo clippy --workspace --all-targets -- -D warnings` to catch CI-equivalent warnings and lints (dead code, unused imports, missing match arms, clippy findings)
 - When adding a new enum variant, grep ALL match sites for that enum and update them — CI uses exhaustive match checks
 - Run `cargo fmt --all` before every commit — CI enforces `cargo fmt --all -- --check`
 - Dead code in `#[cfg(test)]` modules still triggers `-D warnings` in CI; delete unused test helpers instead of suppressing with `#[allow(dead_code)]`
-- Pre-commit hook (`.githooks/pre-commit`) runs fmt + clippy + test automatically. After cloning, activate with: `git config core.hooksPath .githooks`
+- Pre-commit hook (`.githooks/pre-commit`) runs fmt + staged-scope clippy as a fast commit gate. After cloning, activate with: `git config core.hooksPath .githooks`
+- Pre-push hook (`.githooks/pre-push`) runs full workspace clippy, non-server workspace lib tests, and `harness-server` lib tests when `HARNESS_DATABASE_URL` is configured.
+- Local Postgres-dependent `harness-server` tests require `HARNESS_DATABASE_URL`; without it, pre-push skips `harness-server` locally.
 
 ## Local Cargo Concurrency
 

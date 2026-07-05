@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Unset git env vars that leak into test subprocesses during push.
+# GIT_INDEX_FILE can point to a temp file during hook execution, breaking
+# workspace tests that spawn their own git repos in temp directories.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE 2>/dev/null || true
+
+echo "=== pre-push: clippy ==="
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "=== pre-push: test ==="
+# Keep HARNESS_DATABASE_URL scoped to harness-server. Some non-server tests
+# exercise process-global environment behavior and should not inherit DB config.
+echo "=== pre-push: non-server lib tests ==="
+env \
+    -u HARNESS_DATABASE_URL \
+    -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
+    -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
+    cargo test --workspace --exclude harness-server --lib
+
+if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
+    echo "=== pre-push: harness-server lib tests ==="
+    cargo test -p harness-server --lib
+else
+    echo "HARNESS_DATABASE_URL not set — skipping harness-server DB-backed lib tests"
+fi
+
+echo "=== pre-push: all checks passed ==="

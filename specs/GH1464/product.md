@@ -54,9 +54,9 @@ blocked locally before CI.
 - [ ] `.githooks/pre-push` exists, is executable, uses bash with
       `set -euo pipefail`, unsets the leaking git environment variables, and
       runs the full workspace clippy gate.
-- [ ] `.githooks/pre-push` runs `cargo test --workspace --lib` when
-      `HARNESS_DATABASE_URL` is set, and otherwise keeps the current
-      live-Postgres skip behavior for local machines without a database.
+- [ ] `.githooks/pre-push` runs non-server workspace lib tests without leaking
+      `HARNESS_DATABASE_URL`, then runs `harness-server` lib tests only when
+      `HARNESS_DATABASE_URL` is set.
 - [ ] A docs-only staged change can complete the pre-commit hook without
       running clippy or tests for unrelated crates.
 - [ ] `build.rs` continues to configure `core.hooksPath` for `.githooks`.
@@ -74,8 +74,8 @@ blocked locally before CI.
   pre-commit.
 - The pre-push hook must not break tests that create their own temporary git
   repositories.
-- Machines without a local Postgres database should receive the same explicit
-  skip message that the current hook uses.
+- Machines without a local Postgres database should receive an explicit
+  `harness-server` skip message and still run non-server workspace lib tests.
 
 ## Rollout Notes
 

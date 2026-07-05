@@ -35,15 +35,22 @@ See `specs/GH1464/product.md`.
    - Unset `GIT_INDEX_FILE`, `GIT_DIR`, and `GIT_WORK_TREE` before running
      cargo commands.
    - Run `cargo clippy --workspace --all-targets -- -D warnings`.
-   - Run `cargo test --workspace --lib` when `HARNESS_DATABASE_URL` is set.
-   - When `HARNESS_DATABASE_URL` is unset, print the existing skip message and
-     run `cargo test --workspace --lib -- --skip db::tests`.
+   - Run `cargo test --workspace --exclude harness-server --lib` with
+     `HARNESS_DATABASE_URL` unset for the command, so DB configuration does not
+     leak into non-server tests that exercise process-global environment
+     behavior.
+   - When `HARNESS_DATABASE_URL` is set, run `cargo test -p harness-server
+     --lib` after the non-server workspace pass.
+   - When `HARNESS_DATABASE_URL` is unset, print an explicit skip message for
+     `harness-server`, matching the CI convention that `harness-server` uses a
+     dedicated DB profile.
 4. Keep hook installation unchanged.
    - `build.rs` and `Makefile` can keep configuring `.githooks`; no special
      pre-push registration is needed once the hooks path is set.
 5. Update docs.
    - `CLAUDE.md` and `AGENTS.md` should say pre-commit is fast fmt plus scoped
-     clippy, and pre-push is the full workspace clippy plus lib test gate.
+     clippy, and pre-push is full workspace clippy plus the split lib test
+     gate.
    - `CONTRIBUTING.md` should tell contributors how to activate hooks and what
      runs at commit versus push time.
 
@@ -87,6 +94,8 @@ developer git hook execution.
 - [ ] Run `cargo fmt --all -- --check`.
 - [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Run `.githooks/pre-push` with local environment defaults.
+- [ ] Run `.githooks/pre-push` with `HARNESS_DATABASE_URL` configured for a
+      local test database.
 - [ ] Run `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1464`.
 - [ ] Run `python3 checks/check_workflow.py --repo .`.
 

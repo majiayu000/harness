@@ -18,6 +18,22 @@ cargo build
 cargo test
 ```
 
+5. Activate local git hooks:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The pre-commit hook is intentionally fast: it runs `cargo fmt --all -- --check`
+and clippy for the cargo packages touched by staged files. Docs-only staged
+changes skip clippy.
+
+The pre-push hook is the full local gate before upload: it runs
+`cargo clippy --workspace --all-targets -- -D warnings`, non-server workspace
+lib tests, and `harness-server` lib tests when `HARNESS_DATABASE_URL` is
+configured. Without `HARNESS_DATABASE_URL`, the hook skips `harness-server`
+locally and leaves full DB coverage to CI or a configured local database.
+
 For `harness-server` work, start with the fast local ladder and reserve the
 full DB profile for final handoff or changes that touch startup, recovery,
 full `AppState`, route persistence, or workflow runtime behavior:
