@@ -60,6 +60,24 @@ pub struct RecoveryResult {
     pub transient_failed: u32,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TaskRetentionPruneSummary {
+    pub pruned_task_ids: Vec<String>,
+    pub tasks_deleted: u64,
+    pub artifacts_deleted: u64,
+    pub prompts_deleted: u64,
+    pub checkpoints_deleted: u64,
+}
+
+impl TaskRetentionPruneSummary {
+    pub fn is_empty(&self) -> bool {
+        self.tasks_deleted == 0
+            && self.artifacts_deleted == 0
+            && self.prompts_deleted == 0
+            && self.checkpoints_deleted == 0
+    }
+}
+
 /// Row returned by the checkpoint JOIN query inside `recover_in_progress`.
 #[derive(sqlx::FromRow)]
 pub(super) struct RecoveryRow {

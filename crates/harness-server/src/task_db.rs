@@ -2,11 +2,14 @@ mod migrations;
 mod queries_aux;
 mod queries_metrics;
 mod queries_recovery;
+mod queries_retention;
 mod queries_tasks;
 mod raw_column_test_overrides;
 mod types;
 
-pub use types::{RecoveryResult, TaskArtifact, TaskCheckpoint, TaskPrompt};
+pub use types::{
+    RecoveryResult, TaskArtifact, TaskCheckpoint, TaskPrompt, TaskRetentionPruneSummary,
+};
 
 use harness_core::db::{PgMigrator, PgStoreContext};
 use harness_core::store_backend::{PostgresBackend, StoreLocation};
