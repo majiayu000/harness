@@ -137,7 +137,7 @@ pub struct ConcurrencyConfig {
     /// Maximum total agent API calls across all phases (implementation + validation retries +
     /// review rounds). `None` = unlimited. Counts every call including validation retries.
     /// Recommended production value: 20.
-    #[serde(default)]
+    #[serde(default = "default_max_turns")]
     pub max_turns: Option<u32>,
     /// Jaccard word-similarity threshold for review-loop detection.
     /// If two consecutive non-waiting review outputs have similarity >= this value,
@@ -177,6 +177,10 @@ fn default_memory_poll_interval_secs() -> u64 {
     5
 }
 
+fn default_max_turns() -> Option<u32> {
+    Some(20)
+}
+
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
@@ -184,7 +188,7 @@ impl Default for ConcurrencyConfig {
             max_queue_size: default_max_queue_size(),
             stall_timeout_secs: default_stall_timeout_secs(),
             per_project: HashMap::new(),
-            max_turns: None,
+            max_turns: default_max_turns(),
             loop_jaccard_threshold: default_loop_jaccard_threshold(),
             memory_pressure_threshold_mb: None,
             memory_poll_interval_secs: default_memory_poll_interval_secs(),
@@ -743,6 +747,7 @@ mod tests {
             cfg.memory_pressure_threshold_mb.is_none(),
             "memory monitor must be disabled by default"
         );
+        assert_eq!(cfg.max_turns, Some(20));
         assert_eq!(cfg.memory_poll_interval_secs, 5);
     }
 

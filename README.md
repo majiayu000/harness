@@ -370,6 +370,7 @@ enabled = true
 
 [concurrency]
 max_concurrent_tasks = 3
+max_turns = 20
 ```
 
 ## HTTP REST API

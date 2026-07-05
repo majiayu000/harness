@@ -37,6 +37,9 @@ project_root = "."
 #   orphan_reaper_legacy_batch: 200
 
 [concurrency]
+# Default per-task agent invocation budget across implementation, validation
+# retries, and review loops. Per-request max_turns overrides this value.
+max_turns = 20
 # High-reasoning agent runs can stay silent for several minutes while thinking.
 # Increase this when using gpt-5.5/xhigh for background workflow runtime jobs.
 # Default: fail a silent stream after 600 seconds, before the 3600-second
