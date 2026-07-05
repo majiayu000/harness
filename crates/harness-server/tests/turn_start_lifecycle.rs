@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::{stall_timeout::MIN_STALL_TIMEOUT_SECS, HarnessConfig};
+use harness_core::db::resolve_test_database_url;
 use harness_core::error::HarnessError;
 use harness_core::types::{Capability, Item, ThreadId, TokenUsage, Turn, TurnId, TurnStatus};
 use harness_server::{
@@ -17,8 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration, Instant};
-
-static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 enum MockMode {
@@ -120,12 +119,20 @@ impl CodeAgent for MockAgent {
 async fn make_state(
     root: &Path,
     agent: Arc<dyn CodeAgent>,
-) -> anyhow::Result<harness_server::http::AppState> {
+) -> anyhow::Result<Option<harness_server::http::AppState>> {
+    let database_url = match resolve_test_database_url(None) {
+        Ok(database_url) => database_url,
+        Err(error) => {
+            eprintln!("skipping DB-backed turn lifecycle test: {error}");
+            return Ok(None);
+        }
+    };
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root)?;
 
     let mut config = HarnessConfig::default();
     config.server.data_dir = root.join("server-data");
+    config.server.database_url = Some(database_url);
     config.server.project_root = project_root.clone();
     config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock".to_string();
@@ -134,7 +141,7 @@ async fn make_state(
     registry.register("mock", agent);
 
     let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
-    build_app_state(server).await
+    Ok(Some(build_app_state(server).await?))
 }
 
 fn result_value(resp: harness_protocol::methods::RpcResponse) -> anyhow::Result<serde_json::Value> {
@@ -215,13 +222,15 @@ async fn start_thread_and_turn(
 
 #[tokio::test]
 async fn running_to_completed_updates_items_and_usage() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
-    let state = make_state(
+    let Some(state) = make_state(
         sandbox.path(),
         MockAgent::complete_after(Duration::from_millis(120)),
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
 
     let (_, turn_id) =
         start_thread_and_turn(&state, sandbox.path().join("project"), "hello").await?;
@@ -253,13 +262,15 @@ async fn running_to_completed_updates_items_and_usage() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn running_to_failed_is_persisted() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
-    let state = make_state(
+    let Some(state) = make_state(
         sandbox.path(),
         MockAgent::fail_after(Duration::from_millis(120), "mock failure"),
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
 
     let (_, turn_id) =
         start_thread_and_turn(&state, sandbox.path().join("project"), "fail please").await?;
@@ -281,9 +292,10 @@ async fn running_to_failed_is_persisted() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn running_to_cancelled_stops_turn() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
-    let state = make_state(sandbox.path(), MockAgent::block_forever()).await?;
+    let Some(state) = make_state(sandbox.path(), MockAgent::block_forever()).await? else {
+        return Ok(());
+    };
 
     let (_, turn_id) =
         start_thread_and_turn(&state, sandbox.path().join("project"), "cancel me").await?;
@@ -309,13 +321,20 @@ async fn running_to_cancelled_stops_turn() -> anyhow::Result<()> {
 /// an Error item containing the missing agent name.
 #[tokio::test]
 async fn turn_fails_when_agent_not_registered() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
 
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
+    let database_url = match resolve_test_database_url(None) {
+        Ok(database_url) => database_url,
+        Err(error) => {
+            eprintln!("skipping DB-backed turn lifecycle test: {error}");
+            return Ok(());
+        }
+    };
+    config.server.database_url = Some(database_url);
     config.server.project_root = project_root.clone();
     config.server.allow_unauthenticated = true;
     // "ghost" is the configured default agent but is never registered.
@@ -349,13 +368,20 @@ async fn turn_fails_when_agent_not_registered() -> anyhow::Result<()> {
 /// covered by the focused `turn_lifecycle_stall_tests` unit surface.
 #[tokio::test]
 async fn turn_stall_timeout_enforces_minimum_floor() -> anyhow::Result<()> {
-    let _db_guard = DB_TEST_LOCK.lock().await;
     let sandbox = common::tempdir_in_home("harness-turn-lifecycle-")?;
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
 
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
+    let database_url = match resolve_test_database_url(None) {
+        Ok(database_url) => database_url,
+        Err(error) => {
+            eprintln!("skipping DB-backed turn lifecycle test: {error}");
+            return Ok(());
+        }
+    };
+    config.server.database_url = Some(database_url);
     config.server.project_root = project_root.clone();
     config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock".to_string();

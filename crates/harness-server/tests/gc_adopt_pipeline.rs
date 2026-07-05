@@ -13,6 +13,7 @@ use chrono::Utc;
 use harness_agents::registry::AgentRegistry;
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::HarnessConfig;
+use harness_core::db::resolve_test_database_url;
 use harness_core::error::HarnessError;
 use harness_core::types::{
     Artifact, ArtifactType, Capability, Draft, DraftId, DraftStatus, ProjectId, RemediationType,
@@ -75,25 +76,33 @@ impl CodeAgent for MockPrAgent {
 // Helpers
 // ---------------------------------------------------------------------------
 
-static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-async fn db_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    DB_TEST_LOCK.lock().await
+fn configured_test_database_url() -> anyhow::Result<Option<String>> {
+    match resolve_test_database_url(None) {
+        Ok(database_url) => Ok(Some(database_url)),
+        Err(error) => {
+            eprintln!("skipping DB-backed gc_adopt test: {error}");
+            Ok(None)
+        }
+    }
 }
 
-async fn make_state(root: &Path) -> anyhow::Result<harness_server::http::AppState> {
+async fn make_state(root: &Path) -> anyhow::Result<Option<harness_server::http::AppState>> {
     make_state_with_auto_pr(root, true).await
 }
 
 async fn make_state_with_auto_pr(
     root: &Path,
     auto_pr: bool,
-) -> anyhow::Result<harness_server::http::AppState> {
+) -> anyhow::Result<Option<harness_server::http::AppState>> {
+    let Some(database_url) = configured_test_database_url()? else {
+        return Ok(None);
+    };
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root)?;
 
     let mut config = HarnessConfig::default();
     config.server.data_dir = root.join("server-data");
+    config.server.database_url = Some(database_url);
     config.server.project_root = project_root;
     config.server.allow_unauthenticated = true;
     config.agents.default_agent = "mock-pr".to_string();
@@ -103,17 +112,21 @@ async fn make_state_with_auto_pr(
     registry.register("mock-pr", Arc::new(MockPrAgent));
 
     let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
-    build_app_state(server).await
+    Ok(Some(build_app_state(server).await?))
 }
 
 async fn make_state_without_default_agent(
     root: &Path,
-) -> anyhow::Result<harness_server::http::AppState> {
+) -> anyhow::Result<Option<harness_server::http::AppState>> {
+    let Some(database_url) = configured_test_database_url()? else {
+        return Ok(None);
+    };
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root)?;
 
     let mut config = HarnessConfig::default();
     config.server.data_dir = root.join("server-data");
+    config.server.database_url = Some(database_url);
     config.server.project_root = project_root;
     config.server.allow_unauthenticated = true;
     config.agents.default_agent = "missing".to_string();
@@ -121,7 +134,7 @@ async fn make_state_without_default_agent(
 
     let registry = AgentRegistry::new("missing");
     let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
-    build_app_state(server).await
+    Ok(Some(build_app_state(server).await?))
 }
 
 fn make_draft(artifact_path: &Path, content: &str) -> Draft {
@@ -153,9 +166,10 @@ fn make_draft(artifact_path: &Path, content: &str) -> Draft {
 /// gc_adopt writes artifact files and dispatches an agent task.
 #[tokio::test]
 async fn gc_adopt_dispatches_task_with_prompt() -> anyhow::Result<()> {
-    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-pipeline-")?;
-    let state = make_state(sandbox.path()).await?;
+    let Some(state) = make_state(sandbox.path()).await? else {
+        return Ok(());
+    };
 
     // Create a draft with a relative artifact path inside the sandbox.
     let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
@@ -183,9 +197,10 @@ async fn gc_adopt_dispatches_task_with_prompt() -> anyhow::Result<()> {
 /// gc_adopt returns adopted=true with null task_id when there are no artifacts.
 #[tokio::test]
 async fn gc_adopt_no_artifacts_returns_null_task_id() -> anyhow::Result<()> {
-    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-no-artifacts-")?;
-    let state = make_state(sandbox.path()).await?;
+    let Some(state) = make_state(sandbox.path()).await? else {
+        return Ok(());
+    };
 
     let draft = Draft {
         id: DraftId::new(),
@@ -218,9 +233,10 @@ async fn gc_adopt_no_artifacts_returns_null_task_id() -> anyhow::Result<()> {
 /// gc_adopt returns NOT_FOUND for an unknown draft ID.
 #[tokio::test]
 async fn gc_adopt_unknown_draft_returns_not_found() -> anyhow::Result<()> {
-    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-not-found-")?;
-    let state = make_state(sandbox.path()).await?;
+    let Some(state) = make_state(sandbox.path()).await? else {
+        return Ok(());
+    };
 
     let unknown_id = DraftId::new();
     let resp = gc_adopt(&state, Some(serde_json::json!(1)), unknown_id).await;
@@ -237,9 +253,10 @@ async fn gc_adopt_unknown_draft_returns_not_found() -> anyhow::Result<()> {
 /// gc_adopt with auto_pr=false skips task dispatch and returns null task_id.
 #[tokio::test]
 async fn gc_adopt_auto_pr_false_skips_task_dispatch() -> anyhow::Result<()> {
-    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-no-auto-pr-")?;
-    let state = make_state_with_auto_pr(sandbox.path(), false).await?;
+    let Some(state) = make_state_with_auto_pr(sandbox.path(), false).await? else {
+        return Ok(());
+    };
 
     let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
     let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
@@ -266,9 +283,10 @@ async fn gc_adopt_auto_pr_false_skips_task_dispatch() -> anyhow::Result<()> {
 /// gc_adopt with auto_pr=true (default) dispatches a task when artifacts exist.
 #[tokio::test]
 async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
-    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-auto-pr-true-")?;
-    let state = make_state_with_auto_pr(sandbox.path(), true).await?;
+    let Some(state) = make_state_with_auto_pr(sandbox.path(), true).await? else {
+        return Ok(());
+    };
 
     let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
     let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
@@ -295,9 +313,10 @@ async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
 /// gc_adopt with auto_pr=true fails before adopt when no default agent is registered.
 #[tokio::test]
 async fn gc_adopt_auto_pr_requires_default_agent() -> anyhow::Result<()> {
-    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-no-default-agent-")?;
-    let state = make_state_without_default_agent(sandbox.path()).await?;
+    let Some(state) = make_state_without_default_agent(sandbox.path()).await? else {
+        return Ok(());
+    };
 
     let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");
     let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
@@ -386,7 +405,9 @@ impl CodeAgent for CapturingAgent {
 /// runs directly against the project_root (no git worktree indirection).
 #[tokio::test]
 async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
-    let _db_guard = db_test_guard().await;
+    let Some(database_url) = configured_test_database_url()? else {
+        return Ok(());
+    };
     let sandbox = common::tempdir_in_home("gc-adopt-project-root-")?;
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
@@ -404,6 +425,7 @@ async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
 
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
+    config.server.database_url = Some(database_url);
     config.server.project_root = project_root.clone();
     config.server.allow_unauthenticated = true;
     config.agents.default_agent = "capturing".to_string();
@@ -483,9 +505,10 @@ async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
 /// Covers the repeat-adopt and reject/adopt-race scenarios identified in review round 1.
 #[tokio::test]
 async fn gc_adopt_non_pending_draft_returns_conflict() -> anyhow::Result<()> {
-    let _db_guard = db_test_guard().await;
     let sandbox = common::tempdir_in_home("gc-adopt-non-pending-")?;
-    let state = make_state(sandbox.path()).await?;
+    let Some(state) = make_state(sandbox.path()).await? else {
+        return Ok(());
+    };
 
     for non_pending in [DraftStatus::Adopted, DraftStatus::Rejected] {
         let artifact_rel = std::path::PathBuf::from(".harness/drafts/test-guard.sh");

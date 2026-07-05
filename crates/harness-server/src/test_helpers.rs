@@ -15,7 +15,6 @@ use tokio::sync::OnceCell;
 /// spurious "project root must be within HOME" failures.
 pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
-static DB_STATE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 static TEST_DATABASE_URL: OnceLock<String> = OnceLock::new();
 static TEST_PG_POOL_CONFIGURED: OnceLock<()> = OnceLock::new();
 
@@ -30,10 +29,13 @@ pub fn configure_test_pg_pool_defaults() {
     });
 }
 
-fn db_state_lock() -> Arc<tokio::sync::Mutex<()>> {
-    DB_STATE_LOCK
-        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
+#[derive(Debug)]
+pub struct DbStateGuard {
+    _private: (),
+}
+
+impl Drop for DbStateGuard {
+    fn drop(&mut self) {}
 }
 
 /// RAII guard that restores `HOME` on drop, **including on panic**.
@@ -109,9 +111,9 @@ pub async fn db_tests_enabled() -> bool {
         .await
 }
 
-pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
+pub async fn acquire_db_state_guard() -> DbStateGuard {
     configure_test_pg_pool_defaults();
-    db_state_lock().lock_owned().await
+    DbStateGuard { _private: () }
 }
 
 pub fn test_database_url() -> anyhow::Result<String> {
@@ -120,18 +122,27 @@ pub fn test_database_url() -> anyhow::Result<String> {
         return Ok(database_url.clone());
     }
 
-    if let Ok(url) = std::env::var("HARNESS_DATABASE_URL") {
-        let url = url.trim();
-        if !url.is_empty() {
-            let url = url.to_string();
-            let _ = TEST_DATABASE_URL.set(url.clone());
-            return Ok(url);
-        }
-    }
-
     let url = resolve_test_database_url(None)?;
     let _ = TEST_DATABASE_URL.set(url.clone());
     Ok(url)
+}
+
+#[cfg(test)]
+mod db_state_guard_tests {
+    use super::acquire_db_state_guard;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn db_state_guard_acquisitions_do_not_serialize() {
+        let first_guard = acquire_db_state_guard().await;
+        let second = timeout(Duration::from_millis(50), acquire_db_state_guard()).await;
+
+        drop(first_guard);
+        assert!(
+            second.is_ok(),
+            "database state guard should be a non-serializing compatibility shim"
+        );
+    }
 }
 
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {

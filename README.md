@@ -186,9 +186,17 @@ HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test carg
 
 `scripts/test-server-fast.sh` is the warm local feedback path for routine
 `harness-server` changes once a test database URL is configured.
-`scripts/test-server-db.sh` runs the full server suite single-threaded so
-DB-backed startup, recovery, full `AppState`, route, and workflow-runtime
-coverage remains explicit and stable.
+`scripts/test-server-db.sh` runs the full server suite with Cargo's default
+parallelism. DB-backed tests must isolate state through unique test data paths
+or explicit schema guards; tests that mutate true process-global state keep
+their own precise `HOME` or environment lock.
+
+When `cargo-nextest` is installed, the DB-capable server profile can also run
+with process-level parallelism:
+
+```bash
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test cargo nextest run -p harness-server
+```
 
 ### Run
 
