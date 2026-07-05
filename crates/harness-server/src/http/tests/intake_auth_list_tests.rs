@@ -1,5 +1,36 @@
 use super::*;
 
+struct DummyGithubPoller;
+
+#[async_trait]
+impl crate::intake::IntakeSource for DummyGithubPoller {
+    fn name(&self) -> &str {
+        "github"
+    }
+
+    async fn poll(&self) -> anyhow::Result<Vec<crate::intake::IncomingIssue>> {
+        Ok(Vec::new())
+    }
+
+    async fn mark_dispatched(
+        &self,
+        _external_id: &str,
+        _task_id: &task_runner::TaskId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn unmark_dispatched(&self, _external_id: &str) {}
+
+    async fn on_task_complete(
+        &self,
+        _external_id: &str,
+        _result: &crate::intake::TaskCompletionResult,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn intake_status_returns_three_channels() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -107,6 +138,138 @@ async fn intake_status_shows_github_repo_when_configured() -> anyhow::Result<()>
         .expect("github channel present");
     assert_eq!(github["enabled"], true);
     assert_eq!(github["repo"], "owner/myrepo");
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_status_reports_github_mode_drivers_and_effective_repos() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.github_webhook_secret = Some("secret".to_string());
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        mode: harness_core::config::intake::IntakeMode::Hybrid,
+        repo: "owner/main".to_string(),
+        label: "harness".to_string(),
+        repos: vec![harness_core::config::intake::GitHubRepoConfig {
+            repo: "owner/secondary".to_string(),
+            label: "bugs".to_string(),
+            project_root: Some("/tmp/secondary".to_string()),
+            auto_merge: None,
+            merge_method: None,
+            delete_branch: None,
+            require_review_threads_resolved: None,
+            require_clean_merge_state: None,
+        }],
+        ..Default::default()
+    });
+    let mut state = make_read_only_route_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let state_mut = Arc::get_mut(&mut state).expect("unique state");
+    state_mut
+        .intake
+        .github_pollers
+        .push(Arc::new(DummyGithubPoller));
+    state_mut
+        .intake
+        .github_poller_repos
+        .push("owner/main".to_string());
+    let app = intake_app(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    let github = json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "github")
+        .expect("github channel present");
+    assert_eq!(github["enabled"], true);
+    assert_eq!(github["repo"], "owner/main");
+    assert_eq!(github["mode"], "hybrid");
+    assert_eq!(github["drivers"]["webhook"]["configured"], true);
+    assert_eq!(github["drivers"]["webhook"]["accepting"], true);
+    assert_eq!(github["drivers"]["webhook"]["degraded"], false);
+    assert_eq!(github["drivers"]["polling"]["configured"], true);
+    assert_eq!(github["drivers"]["polling"]["active"], true);
+    let repos = github["repos"]
+        .as_array()
+        .expect("repos should be an array");
+    assert!(repos
+        .iter()
+        .any(|repo| repo["repo"] == "owner/main" && repo["mode"] == "hybrid"));
+    assert!(repos.iter().any(|repo| {
+        repo["repo"] == "owner/secondary"
+            && repo["label"] == "bugs"
+            && repo["project_root"] == "/tmp/secondary"
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_status_reports_webhook_driver_degraded_without_secret() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
+        enabled: true,
+        mode: harness_core::config::intake::IntakeMode::Webhook,
+        repo: "owner/webhook".to_string(),
+        ..Default::default()
+    });
+    let state = make_read_only_route_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = intake_app(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    let github = json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "github")
+        .expect("github channel present");
+    assert_eq!(github["mode"], "webhook");
+    assert_eq!(github["drivers"]["webhook"]["configured"], true);
+    assert_eq!(github["drivers"]["webhook"]["accepting"], false);
+    assert_eq!(github["drivers"]["webhook"]["degraded"], true);
+    assert_eq!(
+        github["drivers"]["webhook"]["reason"],
+        "missing_webhook_secret"
+    );
+    assert_eq!(github["drivers"]["polling"]["configured"], false);
+    assert_eq!(json["degraded"]["partial"], true);
+    assert_eq!(
+        json["degraded"]["missing"],
+        serde_json::json!([crate::http::github_intake_status::GITHUB_WEBHOOK_INTAKE_SUBSYSTEM])
+    );
+    assert_eq!(
+        json["degraded"]["reason"],
+        "github_webhook_secret_unavailable"
+    );
     Ok(())
 }
 

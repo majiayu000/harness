@@ -180,21 +180,30 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         log_retention_days = server.config.observe.log_retention_days,
         "config details (use RUST_LOG=debug to see)"
     );
-    match server.config.server.github_webhook_secret.as_deref() {
-        Some("") => {
-            tracing::warn!(
-                "server.github_webhook_secret is configured as empty string; refusing webhook requests until this is set to a non-empty value"
-            );
-        }
-        None => {
-            tracing::warn!(
-                "server.github_webhook_secret is not configured; refusing webhook requests until this is set to a non-empty value"
-            );
-        }
-        Some(_) => {}
-    }
-
     let mut startup_statuses = Vec::new();
+    if super::github_intake_status::github_intake_requires_webhook_secret(
+        server.config.intake.github.as_ref(),
+    ) {
+        match super::github_intake_status::github_webhook_secret_for_request(&server.config.server)
+        {
+            Err(super::github_intake_status::GitHubWebhookSecretError::Invalid) => {
+                tracing::warn!(
+                    "server.github_webhook_secret is configured as empty or whitespace-only; refusing webhook requests until this is set to a non-empty value"
+                );
+            }
+            Err(super::github_intake_status::GitHubWebhookSecretError::Missing) => {
+                tracing::warn!(
+                    "server.github_webhook_secret is not configured; refusing webhook requests until this is set to a non-empty value"
+                );
+            }
+            Ok(_) => {}
+        }
+        if let Some(status) =
+            super::github_intake_status::github_webhook_intake_startup_status(&server.config)
+        {
+            startup_statuses.push(status);
+        }
+    }
 
     // Phase 1: storage — dir validation (symlink check, chmod), task DB, eval store.
     let storage = builders::storage::build_storage_with_database_url(
