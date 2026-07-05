@@ -251,7 +251,7 @@ pub struct AppState {
     pub observability: ObservabilityServices,
     pub concurrency: ConcurrencyServices,
     #[cfg(test)]
-    pub _db_state_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    pub _db_state_guard: Option<crate::test_helpers::DbStateGuard>,
     pub runtime_hosts: Arc<crate::runtime_hosts::RuntimeHostManager>,
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
     pub isolation_availability: harness_core::config::isolation::IsolationAvailability,

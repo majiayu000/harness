@@ -157,8 +157,12 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_storage_stores_open() {
+        let database_url = match harness_core::db::resolve_test_database_url(None) {
+            Ok(url) => url,
+            Err(_) => return,
+        };
         let dir = tempfile::tempdir().expect("tempdir");
-        let bundle = build_storage(dir.path())
+        let bundle = build_storage_with_database_url(dir.path(), Some(&database_url))
             .await
             .expect("build_storage should succeed");
         assert!(
@@ -175,7 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_storage_opens_task_store_from_shared_schema() {
-        let database_url = match harness_core::db::resolve_database_url(None) {
+        let database_url = match harness_core::db::resolve_test_database_url(None) {
             Ok(url) => url,
             Err(_) => return,
         };
@@ -197,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_storage_opens_eval_store_from_shared_schema() {
-        let database_url = match harness_core::db::resolve_database_url(None) {
+        let database_url = match harness_core::db::resolve_test_database_url(None) {
             Ok(url) => url,
             Err(_) => return,
         };

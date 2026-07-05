@@ -165,10 +165,10 @@ fn quote_pg_ident(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::db::{pg_schema_for_path, resolve_database_url};
+    use harness_core::db::{pg_schema_for_path, resolve_test_database_url};
 
     async fn configured_database_url_and_setup_pool() -> anyhow::Result<Option<(String, PgPool)>> {
-        let database_url = match resolve_database_url(None) {
+        let database_url = match resolve_test_database_url(None) {
             Ok(url) => url,
             Err(_) => return Ok(None),
         };
@@ -187,7 +187,7 @@ mod tests {
 
     async fn open_test_issue_store(
     ) -> anyhow::Result<Option<harness_workflow::issue_lifecycle::IssueWorkflowStore>> {
-        if harness_core::db::resolve_database_url(None).is_err() {
+        if resolve_test_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;

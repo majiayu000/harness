@@ -29,6 +29,15 @@ pub fn configure_test_pg_pool_defaults() {
     });
 }
 
+#[derive(Debug)]
+pub struct DbStateGuard {
+    _private: (),
+}
+
+impl Drop for DbStateGuard {
+    fn drop(&mut self) {}
+}
+
 /// RAII guard that restores `HOME` on drop, **including on panic**.
 pub struct HomeGuard {
     original: Option<String>,
@@ -102,24 +111,15 @@ pub async fn db_tests_enabled() -> bool {
         .await
 }
 
-pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
+pub async fn acquire_db_state_guard() -> DbStateGuard {
     configure_test_pg_pool_defaults();
-    Arc::new(tokio::sync::Mutex::new(())).lock_owned().await
+    DbStateGuard { _private: () }
 }
 
 pub fn test_database_url() -> anyhow::Result<String> {
     configure_test_pg_pool_defaults();
     if let Some(database_url) = TEST_DATABASE_URL.get() {
         return Ok(database_url.clone());
-    }
-
-    if let Ok(url) = std::env::var("HARNESS_DATABASE_URL") {
-        let url = url.trim();
-        if !url.is_empty() {
-            let url = url.to_string();
-            let _ = TEST_DATABASE_URL.set(url.clone());
-            return Ok(url);
-        }
     }
 
     let url = resolve_test_database_url(None)?;
