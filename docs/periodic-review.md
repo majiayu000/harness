@@ -32,7 +32,7 @@ Scheduler::start()
   ├─ spawn health_loop      (existing)
   └─ spawn review_loop      (NEW)
        │
-       ├─ git log --since=<last_review> → any new commits?
+       ├─ local commit gate since <last_review> → any new commits?
        │   no  → skip, sleep
        │   yes → continue
        │
@@ -213,6 +213,10 @@ Before spawning the review agent:
 3. If no output → no new commits → skip this cycle
 4. If no prior review event exists (first boot) → always run
 
+If the local commit gate cannot determine the answer, the scheduler logs the
+failure and falls back to the prompt-side `REVIEW_SKIPPED` sentinel so review
+coverage is preserved.
+
 ## Report Format
 
 The agent outputs a structured markdown report:
@@ -241,7 +245,7 @@ Ending with a summary table:
 ```
 review_loop tick
   → check EventStore for last "periodic_review" timestamp
-  → git log --since → skip if empty
+  → local commit gate since watermark → skip if empty
   → gather context (repo structure, diff stat, recent commits)
   → prompts::periodic_review_prompt() → build prompt
   → enqueue_task() → existing task pipeline

@@ -53,7 +53,7 @@ fn git_binary() -> String {
     std::env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string())
 }
 
-fn git_command() -> tokio::process::Command {
+pub(crate) fn git_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(git_binary());
     for key in GIT_LOCAL_ENV_VARS {
         cmd.env_remove(key);
@@ -634,7 +634,7 @@ mod entries_tests;
 
 #[cfg(test)]
 #[path = "workspace_test_support.rs"]
-mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "workspace_disk_reconcile_tests.rs"]
