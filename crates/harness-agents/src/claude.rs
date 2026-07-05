@@ -94,15 +94,22 @@ impl ClaudeCodeAgent {
     /// "Input must be provided" errors.
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
         let model = self.resolve_model(req);
+        let prompt = req.claude_main_prompt();
         let mut base_args = vec![
             OsString::from("-p"),
-            OsString::from(&req.prompt), // prompt MUST follow -p immediately
+            OsString::from(prompt.as_ref()), // prompt MUST follow -p immediately
             OsString::from("--output-format"),
             OsString::from("stream-json"),
             OsString::from("--model"),
             OsString::from(model),
             OsString::from("--verbose"),
         ];
+
+        if let Some(system_prompt) = req.claude_system_prompt() {
+            base_args.push(OsString::from("--append-system-prompt"));
+            base_args.push(OsString::from(system_prompt.as_ref()));
+            base_args.push(OsString::from("--exclude-dynamic-system-prompt-sections"));
+        }
 
         // Hard tool enforcement at the CLI boundary (issue #514):
         //   Full profile  (allowed_tools = None)    → --dangerously-skip-permissions
@@ -221,14 +228,29 @@ impl CodeAgent for ClaudeCodeAgent {
             )
             .await?;
 
-        let child = cmd.spawn().map_err(|error| {
-            let message = crate::classify_missing_workspace_spawn_failure(
-                &error,
-                &req.project_root,
-                format!("failed to run claude: {error}"),
-            );
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
+        let spawn_result = cmd.spawn();
+        let child = match spawn_result {
+            Ok(child) => child,
+            Err(ref error) if error.raw_os_error() == Some(26) => {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                cmd.spawn().map_err(|error| {
+                    let message = crate::classify_missing_workspace_spawn_failure(
+                        &error,
+                        &req.project_root,
+                        format!("failed to run claude: {error}"),
+                    );
+                    harness_core::error::HarnessError::AgentExecution(message)
+                })?
+            }
+            Err(error) => {
+                let message = crate::classify_missing_workspace_spawn_failure(
+                    &error,
+                    &req.project_root,
+                    format!("failed to run claude: {error}"),
+                );
+                return Err(harness_core::error::HarnessError::AgentExecution(message));
+            }
+        };
         if let Some(pid) = child.id() {
             crate::write_provisional_agent_run_binding(
                 &run_identity,
@@ -487,3 +509,7 @@ fn provider_wait_message(phase: ProviderPhase) -> String {
 #[cfg(test)]
 #[path = "claude_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "claude_prompt_layer_tests.rs"]
+mod prompt_layer_tests;

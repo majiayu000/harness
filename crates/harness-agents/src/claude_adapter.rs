@@ -64,11 +64,12 @@ impl AgentAdapter for ClaudeAdapter {
         }
 
         let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let prompt = req.claude_main_prompt();
         let run_identity = crate::resolve_agent_run_identity(&HashMap::new());
         let mut cmd = Command::new(&self.cli_path);
         // Prompt MUST follow -p immediately: Claude CLI parses `-p <VALUE>`.
         cmd.arg("-p")
-            .arg(&req.prompt)
+            .arg(prompt.as_ref())
             .arg("--dangerously-skip-permissions")
             .arg("--output-format")
             .arg("stream-json")
@@ -80,6 +81,11 @@ impl AgentAdapter for ClaudeAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(system_prompt) = req.claude_system_prompt() {
+            cmd.arg("--append-system-prompt")
+                .arg::<&str>(system_prompt.as_ref())
+                .arg("--exclude-dynamic-system-prompt-sections");
+        }
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::strip_claude_env(&mut cmd);
@@ -393,7 +399,7 @@ pub fn parse_stream_json_usage(line: &str) -> Option<TokenUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::agent::ApprovalDecision;
+    use harness_core::agent::{AgentPromptLayers, ApprovalDecision};
     use harness_core::config::agents::ClaudeProviderBackpressureConfig;
     use harness_core::types::ExecutionPhase;
     use std::fs;
@@ -554,6 +560,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_turn_sends_layered_static_prompt_through_system_prompt_args(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let args_path = dir.path().join("args.txt");
+        let script = dir.path().join("mock-claude-layered.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\n: > '{}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":\"done\"}}'\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":\"done\"}}'\n",
+                args_path.display(),
+                args_path.display()
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms)?;
+        }
+
+        let adapter = ClaudeAdapter::new(script, "test-model".into());
+        let mut request = turn_request("static-context-dynamic", dir.path().to_path_buf());
+        request.prompt_layers = Some(AgentPromptLayers::new("static", "context-", "dynamic"));
+        let (tx, mut rx) = mpsc::channel(8);
+
+        adapter.start_turn(request, tx).await?;
+        while rx.recv().await.is_some() {}
+
+        let args: Vec<String> = fs::read_to_string(args_path)?
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(args[0], "-p");
+        assert_eq!(args[1], "context-dynamic");
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--append-system-prompt", "static"]));
+        assert!(args.contains(&"--exclude-dynamic-system-prompt-sections".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn start_turn_emits_provider_wait_warning_before_spawn() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let started = dir.path().join("started.txt");
@@ -647,6 +696,7 @@ mod tests {
     fn turn_request(prompt: &str, project_root: PathBuf) -> TurnRequest {
         TurnRequest {
             prompt: prompt.to_string(),
+            prompt_layers: None,
             project_root,
             model: None,
             reasoning_effort: None,

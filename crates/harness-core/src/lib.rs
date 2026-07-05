@@ -1,4 +1,6 @@
 pub mod agent;
+#[cfg(test)]
+mod agent_tests;
 pub mod agents_md;
 pub mod capability;
 pub mod config;

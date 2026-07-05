@@ -246,6 +246,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         });
         let turn_req = TurnRequest {
             prompt,
+            prompt_layers: None,
             project_root,
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),

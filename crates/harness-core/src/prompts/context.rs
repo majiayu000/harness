@@ -1,5 +1,7 @@
 use super::issue::wrap_external_data;
 
+pub const DEFAULT_AVAILABLE_SKILLS_LIMIT: usize = 20;
+
 /// Describes a sibling task running in parallel on the same project.
 ///
 /// Used by [`sibling_task_context`] to build a constraint block for the agent.
@@ -45,17 +47,29 @@ pub fn sibling_task_context(siblings: &[SiblingTask]) -> String {
 pub fn build_available_skills_listing<'a>(
     skills: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> String {
-    let mut iter = skills.into_iter().peekable();
-    if iter.peek().is_none() {
+    let mut skills: Vec<(&str, &str)> = skills.into_iter().collect();
+    if skills.is_empty() {
         return String::new();
     }
+    skills.sort_by(|(left_name, left_desc), (right_name, right_desc)| {
+        left_name
+            .cmp(right_name)
+            .then_with(|| left_desc.cmp(right_desc))
+    });
     let mut out = "\n\n## Available Skills\n".to_string();
-    for (name, desc) in iter {
+    let visible_count = skills.len().min(DEFAULT_AVAILABLE_SKILLS_LIMIT);
+    for (name, desc) in skills.iter().take(visible_count) {
         out.push_str("- **");
         out.push_str(name);
         out.push_str("**: ");
         out.push_str(desc);
         out.push('\n');
+    }
+    let omitted = skills.len().saturating_sub(visible_count);
+    if omitted > 0 {
+        out.push_str(&format!(
+            "- ... {omitted} additional skills omitted from this broad listing. Matched skills still appear in full below.\n"
+        ));
     }
     out
 }
@@ -212,6 +226,25 @@ mod tests {
         assert!(result.contains("Code review tool"));
         assert!(result.contains("**deploy**"));
         assert!(result.contains("Deploy to production"));
+    }
+
+    #[test]
+    fn build_available_skills_listing_caps_broad_listing() {
+        let mut skills: Vec<(String, String)> = (0..25)
+            .map(|i| (format!("skill-{i:02}"), format!("description {i}")))
+            .collect();
+        skills.reverse();
+        let result = build_available_skills_listing(
+            skills
+                .iter()
+                .map(|(name, description)| (name.as_str(), description.as_str())),
+        );
+
+        assert!(result.contains("**skill-00**"));
+        assert!(result.contains("**skill-19**"));
+        assert!(!result.contains("**skill-20**"));
+        assert!(result.contains("5 additional skills omitted"));
+        assert!(result.contains("Matched skills still appear in full below"));
     }
 
     #[test]
