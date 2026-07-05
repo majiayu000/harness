@@ -89,7 +89,7 @@ impl GitHubRateLimitThrottle {
         if retry_after.as_ref().is_some_and(|at| *at <= now) {
             *retry_after = None;
         }
-        Ok(retry_after.to_owned())
+        Ok(*retry_after)
     }
 
     fn record_retry_after(&self, retry_at: DateTime<Utc>) -> anyhow::Result<()> {
@@ -568,7 +568,7 @@ fn retry_after_header_time(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Da
         .trim()
         .parse::<i64>()
         .ok()?;
-    Some(now + chrono::Duration::seconds(seconds.max(0)))
+    retry_at_from_seconds(now, seconds)
 }
 
 fn x_rate_limit_reset_time(headers: &HeaderMap) -> Option<DateTime<Utc>> {
@@ -590,7 +590,12 @@ fn x_rate_limit_remaining_is_zero(headers: &HeaderMap) -> bool {
 }
 
 fn default_rate_limit_retry_at(now: DateTime<Utc>) -> DateTime<Utc> {
-    now + chrono::Duration::seconds(DEFAULT_RATE_LIMIT_RETRY_SECS)
+    retry_at_from_seconds(now, DEFAULT_RATE_LIMIT_RETRY_SECS).unwrap_or(now)
+}
+
+fn retry_at_from_seconds(now: DateTime<Utc>, seconds: i64) -> Option<DateTime<Utc>> {
+    let duration = chrono::Duration::try_seconds(seconds.max(0))?;
+    now.checked_add_signed(duration)
 }
 
 fn next_link_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {

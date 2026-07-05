@@ -1,4 +1,5 @@
 use super::*;
+use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn repo_config_for(repo: &str) -> harness_core::config::intake::GitHubRepoConfig {
@@ -12,6 +13,19 @@ fn repo_config_for(repo: &str) -> harness_core::config::intake::GitHubRepoConfig
         require_review_threads_resolved: None,
         require_clean_merge_state: None,
     }
+}
+
+#[test]
+fn retry_after_header_time_rejects_overflowing_duration() {
+    let mut headers = HeaderMap::new();
+    headers.insert(RETRY_AFTER, HeaderValue::from_static("9223372036854775807"));
+    let now = Utc::now();
+
+    assert_eq!(retry_after_header_time(&headers, now), None);
+    assert_eq!(
+        rate_limit_retry_at(StatusCode::TOO_MANY_REQUESTS, &headers, now),
+        Some(default_rate_limit_retry_at(now))
+    );
 }
 
 #[tokio::test]
