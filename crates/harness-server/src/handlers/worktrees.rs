@@ -731,7 +731,7 @@ mod tests {
         assert_eq!(payload[0]["repo"], "owner/repo");
         assert_eq!(payload[0]["runtime_workflow_id"], "workflow-1");
         assert_eq!(payload[0]["turn"], 0);
-        assert_eq!(payload[0]["max_turns"], serde_json::Value::Null);
+        assert_eq!(payload[0]["max_turns"], 20);
         assert_eq!(
             payload[0]["project"].as_str(),
             Some(source_repo.to_string_lossy().as_ref())

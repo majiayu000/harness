@@ -466,6 +466,7 @@ Tempo walkthrough.
 |-------|---------|-------------|
 | `max_concurrent_tasks` | `4` | Global maximum concurrent tasks across all projects |
 | `max_queue_size` | `32` | Maximum queued tasks before rejecting |
+| `max_turns` | `20` | Default per-task agent invocation budget across implementation, validation retries, and review loops; request-level `max_turns` overrides this value |
 
 ### `[validation]`
 
