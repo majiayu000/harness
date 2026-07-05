@@ -9,7 +9,7 @@ check:
 
 lint:
 	cargo fmt --all -- --check
-	RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets
+	cargo clippy --workspace --all-targets -- -D warnings
 
 test:
 	cargo test --workspace

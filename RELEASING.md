@@ -36,7 +36,8 @@ across parallel PRs.
 5. Verify locally:
    ```bash
    cargo fmt --all -- --check
-   RUSTFLAGS="-Dwarnings" cargo check --workspace --all-targets
+   cargo check --workspace --all-targets
+   cargo clippy --workspace --all-targets -- -D warnings
    cargo test --workspace
    ```
 6. Commit (`-s` for DCO), open a PR titled `chore(release): vX.Y.Z`, wait for CI

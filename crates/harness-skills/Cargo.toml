@@ -6,6 +6,9 @@ description = "Skill discovery and management for the Harness agent orchestratio
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 serde = { workspace = true }

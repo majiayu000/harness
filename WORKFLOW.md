@@ -75,7 +75,8 @@ activities:
       - cargo fmt --all -- --check
       - cargo check
       - cargo test
-      - RUSTFLAGS="-Dwarnings" cargo check --workspace --all-targets
+      - cargo check --workspace --all-targets
+      - cargo clippy --workspace --all-targets -- -D warnings
   run_local_review:
     prompt: pr_feedback
   inspect_pr_feedback:

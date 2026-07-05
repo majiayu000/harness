@@ -6,6 +6,9 @@ description = "Agent adapters (Claude Code, Codex) for the Harness orchestration
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 harness-observe = { workspace = true }

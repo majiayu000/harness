@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
 
 jobs:
   # ── Step 1: Detect changed paths ──────────────────────────────────────
@@ -121,7 +120,7 @@ jobs:
         with:
           name: web-dist
           path: web/dist
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # ── Step 4: Tests (scoped to affected crates) ─────────────────────────
   test:

@@ -6,6 +6,9 @@ description = "Protocol and message types for the Harness agent orchestration la
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 harness-core = { workspace = true }

@@ -6,6 +6,9 @@ description = "Observability (logging, tracing, metrics) for the Harness agent o
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { workspace = true }
 serde = { workspace = true }
