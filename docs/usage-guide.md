@@ -419,13 +419,16 @@ deliberate local-only deployment.
 
 When enabled, the scheduler runs a background loop that:
 
-1. Checks for new commits since the last review (`git log --since=<last_review>`)
+1. Locally checks for new commits since the last review before enqueueing an agent
 2. If new commits exist, gathers repo structure, diff stats, and commit log
 3. Constructs a comprehensive review prompt and enqueues it as a task
 4. The agent reviews the entire codebase and may create a PR with fixes
 5. Logs a `periodic_review` event as checkpoint for the next cycle
 
-If no new commits have landed since the last review, the cycle is skipped.
+If no new commits have landed since the last review, the cycle is skipped
+locally and no review agent is spawned. If the local commit check is
+unavailable, the scheduler falls back to the existing agent-side
+`REVIEW_SKIPPED` sentinel instead of silently skipping review work.
 
 ### `[gc]`
 
@@ -520,10 +523,10 @@ interval_hours = 24
 ```
 
 **What happens when enabled:**
-- Every `interval_hours`, checks if new commits exist since the last review
+- Every `interval_hours`, locally checks if new commits exist since the last review
 - If yes: gathers repo structure + diff stats + commit log → constructs review prompt → enqueues as a task
 - Agent reviews the entire codebase, may create a PR with fixes
-- If no new commits: cycle is skipped (no wasted resources)
+- If no new commits: cycle is skipped before any review agent is spawned
 - Review events are logged to EventStore for audit trail
 
 ### 2. Health Tick (always on)
