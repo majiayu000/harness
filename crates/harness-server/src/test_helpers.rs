@@ -15,7 +15,6 @@ use tokio::sync::OnceCell;
 /// spurious "project root must be within HOME" failures.
 pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
-static DB_STATE_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 static TEST_DATABASE_URL: OnceLock<String> = OnceLock::new();
 static TEST_PG_POOL_CONFIGURED: OnceLock<()> = OnceLock::new();
 
@@ -28,12 +27,6 @@ pub fn configure_test_pg_pool_defaults() {
         };
         harness_core::db::configure_pg_pool_from_server(&server);
     });
-}
-
-fn db_state_lock() -> Arc<tokio::sync::Mutex<()>> {
-    DB_STATE_LOCK
-        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
 }
 
 /// RAII guard that restores `HOME` on drop, **including on panic**.
@@ -111,7 +104,7 @@ pub async fn db_tests_enabled() -> bool {
 
 pub async fn acquire_db_state_guard() -> tokio::sync::OwnedMutexGuard<()> {
     configure_test_pg_pool_defaults();
-    db_state_lock().lock_owned().await
+    Arc::new(tokio::sync::Mutex::new(())).lock_owned().await
 }
 
 pub fn test_database_url() -> anyhow::Result<String> {
@@ -193,7 +186,6 @@ async fn make_state_inner(
     agent_registry: AgentRegistry,
     mut config: HarnessConfig,
 ) -> anyhow::Result<AppState> {
-    let db_setup_guard = acquire_db_state_guard().await;
     let database_url = test_database_url()?;
     config.server.database_url = Some(database_url.clone());
     let server = Arc::new(HarnessServer::new(
@@ -257,8 +249,6 @@ async fn make_state_inner(
         None,
         vec![],
     );
-    drop(db_setup_guard);
-
     Ok(AppState {
         core: crate::http::CoreServices {
             server,
@@ -330,4 +320,20 @@ async fn make_state_inner(
         task_svc,
         execution_svc,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn db_state_guard_compatibility_shim_does_not_serialize() {
+        let _first = acquire_db_state_guard().await;
+        let second =
+            tokio::time::timeout(Duration::from_millis(50), acquire_db_state_guard()).await;
+        assert!(
+            second.is_ok(),
+            "legacy DB guard compatibility shim must not serialize callers"
+        );
+    }
 }

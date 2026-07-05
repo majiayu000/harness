@@ -407,6 +407,48 @@ async fn reaper_inventory_includes_legacy_path_derived_schema_owner_rows() -> an
     Ok(())
 }
 
+#[tokio::test]
+async fn concurrent_schema_registry_ensure_is_idempotent() -> anyhow::Result<()> {
+    let database_url = {
+        let _lock = crate::test_support::process_env_lock();
+        let Ok(database_url) = crate::db_test_safety::resolve_test_database_url(None) else {
+            return Ok(());
+        };
+        database_url
+    };
+    let pool = match pg_open_pool(&database_url).await {
+        Ok(pool) => pool,
+        Err(_) => return Ok(()),
+    };
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            ensure_pg_schema_registry(&pool).await
+        }));
+    }
+    for handle in handles {
+        handle.await??;
+    }
+
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = $1 AND table_name = $2
+        )",
+    )
+    .bind(PG_SCHEMA_REGISTRY_SCHEMA)
+    .bind(PG_SCHEMA_REGISTRY_TABLE)
+    .fetch_one(&pool)
+    .await?;
+    assert!(table_exists);
+
+    pool.close().await;
+    Ok(())
+}
+
 #[test]
 fn normalize_path_lexically_preserves_root_and_leading_parent() {
     assert_eq!(
