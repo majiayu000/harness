@@ -6,6 +6,7 @@ pub mod db;
 pub mod db_pg;
 pub mod db_pg_schema_registry;
 mod db_pg_split;
+pub mod db_test_safety;
 pub mod error;
 pub mod interceptor;
 pub mod lang_detect;

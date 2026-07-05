@@ -46,6 +46,9 @@ where
         .enable_all()
         .build()?;
     let _lock = crate::test_support::process_env_lock();
+    if crate::db_test_safety::resolve_test_database_url(None).is_err() {
+        return Ok(());
+    }
     runtime.block_on(test())
 }
 

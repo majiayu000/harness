@@ -1,22 +1,14 @@
 use super::*;
 use chrono::Utc;
-use harness_core::db::{pg_open_pool, resolve_database_url, PgStoreContext};
+use harness_core::db::{pg_open_pool, resolve_test_database_url, PgStoreContext, TestSchemaGuard};
 
 async fn open_test_store() -> anyhow::Result<Option<ReviewStore>> {
-    if resolve_database_url(None).is_err() {
+    if resolve_test_database_url(None).is_err() {
         return Ok(None);
     }
     let dir = tempfile::tempdir()?;
     let store = ReviewStore::open(&dir.path().join("review.db")).await?;
     Ok(Some(store))
-}
-
-fn unique_test_schema(prefix: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_nanos();
-    format!("{prefix}_{nanos}")
 }
 
 fn make_finding(id: &str, rule_id: &str, file: &str, priority: &str) -> ReviewFinding {
@@ -38,7 +30,7 @@ fn make_finding(id: &str, rule_id: &str, file: &str, priority: &str) -> ReviewFi
 
 #[tokio::test]
 async fn legacy_review_store_migration_backfills_shared_schema() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
@@ -47,9 +39,9 @@ async fn legacy_review_store_migration_backfills_shared_schema() -> anyhow::Resu
     let legacy_schema = PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
-    let target_schema = unique_test_schema("review_store_test");
     let setup_pool = pg_open_pool(&database_url).await?;
-    let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+    let mut target_schema = TestSchemaGuard::new(&database_url, "review_store_test")?;
+    let target_context = PgStoreContext::from_schema(target_schema.schema(), Some(&database_url))?;
     let target_store = ReviewStore::open_with_context(&target_context, &setup_pool).await?;
     let legacy_store =
         ReviewStore::open_with_database_url(&legacy_path, Some(&database_url)).await?;
@@ -89,11 +81,7 @@ async fn legacy_review_store_migration_backfills_shared_schema() -> anyhow::Resu
     ))
     .execute(&setup_pool)
     .await?;
-    sqlx::query(&format!(
-        "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
-    ))
-    .execute(&setup_pool)
-    .await?;
+    target_schema.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;
 
     result

@@ -314,21 +314,11 @@ impl ThreadRow {
 mod tests {
     use super::*;
     use futures::FutureExt;
-    use harness_core::db::{pg_open_pool, resolve_database_url};
+    use harness_core::db::{pg_open_pool, resolve_test_database_url, TestSchemaGuard};
     use std::path::PathBuf;
 
-    fn unique_test_schema(prefix: &str) -> String {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_nanos();
-        format!("{prefix}_{nanos}_{count}")
-    }
-
     async fn open_test_db() -> anyhow::Result<Option<ThreadDb>> {
-        if resolve_database_url(None).is_err() {
+        if resolve_test_database_url(None).is_err() {
             return Ok(None);
         }
         let dir = tempfile::tempdir()?;
@@ -377,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_db_survives_reopen() -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
+        if resolve_test_database_url(None).is_err() {
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -488,14 +478,15 @@ mod tests {
 
     #[tokio::test]
     async fn shared_schema_thread_db_keeps_store_rows_isolated() -> anyhow::Result<()> {
-        let database_url = match resolve_database_url(None) {
+        let database_url = match resolve_test_database_url(None) {
             Ok(url) => url,
             Err(_) => return Ok(()),
         };
         let dir = tempfile::tempdir()?;
         let setup_pool = pg_open_pool(&database_url).await?;
-        let shared_schema = unique_test_schema("thread_db_shared_scope_test");
-        let shared_context = PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+        let mut shared_schema = TestSchemaGuard::new(&database_url, "thread_db_shared_scope_test")?;
+        let shared_context =
+            PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
         let store_a_dir = dir.path().join("store-a");
         let store_b_dir = dir.path().join("store-b");
         let store_a =
@@ -559,15 +550,14 @@ mod tests {
 
         store_a.pool.close().await;
         store_b.pool.close().await;
-        let _ = sqlx::query(&format!(
-            "DROP SCHEMA IF EXISTS \"{shared_schema}\" CASCADE"
-        ))
-        .execute(&setup_pool)
-        .await;
+        let cleanup_result = shared_schema.cleanup_with_pool(&setup_pool).await;
         setup_pool.close().await;
 
         match result {
-            Ok(result) => result,
+            Ok(result) => {
+                cleanup_result?;
+                result
+            }
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }
@@ -586,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_thread_db_migration_backfills_shared_schema() -> anyhow::Result<()> {
-        let database_url = match resolve_database_url(None) {
+        let database_url = match resolve_test_database_url(None) {
             Ok(url) => url,
             Err(_) => return Ok(()),
         };
@@ -598,9 +588,10 @@ mod tests {
             PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
                 .schema()
                 .to_owned();
-        let target_schema = unique_test_schema("thread_db_test");
         let setup_pool = pg_open_pool(&database_url).await?;
-        let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+        let mut target_schema = TestSchemaGuard::new(&database_url, "thread_db_test")?;
+        let target_context =
+            PgStoreContext::from_schema(target_schema.schema(), Some(&database_url))?;
         let target_db =
             ThreadDb::open_shared_with_data_dir(&target_context, &setup_pool, &target_data_dir)
                 .await?;
@@ -663,15 +654,14 @@ mod tests {
         ))
         .execute(&setup_pool)
         .await;
-        let _ = sqlx::query(&format!(
-            "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
-        ))
-        .execute(&setup_pool)
-        .await;
+        let cleanup_result = target_schema.cleanup_with_pool(&setup_pool).await;
         setup_pool.close().await;
 
         match result {
-            Ok(result) => result,
+            Ok(result) => {
+                cleanup_result?;
+                result
+            }
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }

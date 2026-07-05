@@ -160,24 +160,28 @@ database_url = "postgres://user:password@host:5432/dbname"
 **Running tests against a real database:**
 
 ```bash
-HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness cargo test --workspace
+createdb harness_test
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test cargo test --workspace
 ```
 
 Integration tests that require a database (e.g. `runtime_state_store`,
 `thread_db`, `q_value_store`) skip automatically when no Harness database URL
-is configured.
+is configured. Postgres-backed tests reject non-test database names by default;
+use `harness_test`, a name ending in `_test`, or a name starting with `test_`.
+For intentionally disposable databases with a different name, set
+`HARNESS_ALLOW_NON_TEST_DATABASE_FOR_TESTS=1`.
 
 **Harness-server validation ladder:**
 
 ```bash
 # Routine server work: fast module and lightweight route path.
-HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-fast.sh
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-fast.sh
 
 # Full server DB, startup, recovery, route, and workflow profile.
-HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-db.sh
 
 # Final PR handoff: full workspace coverage.
-HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness cargo test --workspace
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test cargo test --workspace
 ```
 
 `scripts/test-server-fast.sh` is the warm local feedback path for routine

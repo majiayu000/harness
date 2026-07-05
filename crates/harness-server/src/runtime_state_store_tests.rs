@@ -7,18 +7,8 @@ use chrono::Utc;
 use futures::FutureExt;
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
-use harness_core::db::{pg_open_pool, resolve_database_url, PgStoreContext};
+use harness_core::db::{pg_open_pool, resolve_test_database_url, PgStoreContext, TestSchemaGuard};
 use std::sync::Arc;
-
-fn unique_test_schema(prefix: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_nanos();
-    format!("{prefix}_{nanos}_{count}")
-}
 
 #[test]
 fn shared_schema_context_uses_fixed_runtime_state_store_schema() -> anyhow::Result<()> {
@@ -35,6 +25,9 @@ fn shared_schema_context_uses_fixed_runtime_state_store_schema() -> anyhow::Resu
 
 #[tokio::test]
 async fn build_app_state_opens_runtime_state_store_from_shared_schema() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
     let project_root = crate::test_helpers::tempdir_in_home("runtime-state-root-")?;
     let data_dir = tempfile::tempdir()?;
@@ -61,7 +54,7 @@ async fn build_app_state_opens_runtime_state_store_from_shared_schema() -> anyho
 
 #[tokio::test]
 async fn legacy_runtime_state_migration_backfills_once() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
@@ -72,9 +65,9 @@ async fn legacy_runtime_state_migration_backfills_once() -> anyhow::Result<()> {
     let legacy_schema = PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
-    let target_schema = unique_test_schema("runtime_state_store_test");
     let setup_pool = pg_open_pool(&database_url).await?;
-    let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+    let mut target_schema = TestSchemaGuard::new(&database_url, "runtime_state_store_test")?;
+    let target_context = PgStoreContext::from_schema(target_schema.schema(), Some(&database_url))?;
     let target_store = RuntimeStateStore::open_shared_with_data_dir(
         &target_context,
         &setup_pool,
@@ -167,15 +160,14 @@ async fn legacy_runtime_state_migration_backfills_once() -> anyhow::Result<()> {
     ))
     .execute(&setup_pool)
     .await;
-    let _ = sqlx::query(&format!(
-        "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
-    ))
-    .execute(&setup_pool)
-    .await;
+    let cleanup_result = target_schema.cleanup_with_pool(&setup_pool).await;
     setup_pool.close().await;
 
     match result {
-        Ok(result) => result,
+        Ok(result) => {
+            cleanup_result?;
+            result
+        }
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }

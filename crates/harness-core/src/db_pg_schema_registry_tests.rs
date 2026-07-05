@@ -1,5 +1,5 @@
 use super::*;
-use crate::db_pg::{pg_open_pool, resolve_database_url};
+use crate::db_pg::pg_open_pool;
 use std::collections::HashSet;
 
 fn create_normalized_workspace_root(parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
@@ -346,7 +346,7 @@ fn orphaned_path_schema_names_ignores_opaque_legacy_schema_owner_key() {
 async fn reaper_inventory_includes_legacy_path_derived_schema_owner_rows() -> anyhow::Result<()> {
     let database_url = {
         let _lock = crate::test_support::process_env_lock();
-        let Ok(database_url) = resolve_database_url(None) else {
+        let Ok(database_url) = crate::db_test_safety::resolve_test_database_url(None) else {
             return Ok(());
         };
         database_url

@@ -17,6 +17,13 @@ pub use crate::db_pg_schema_registry::{
     PgSchemaOwnership, PgSchemaReapReport, DEFAULT_ORPHAN_REAPER_LEGACY_BATCH,
     PG_SCHEMA_REGISTRY_SCHEMA, PG_SCHEMA_REGISTRY_TABLE,
 };
+pub use crate::db_test_safety::{
+    apply_pg_test_schema_cleanup, drop_test_schema_if_exists, is_known_test_schema_name,
+    is_test_database_url, pg_test_schema_cleanup_plan, redact_database_url,
+    resolve_test_database_url, unique_test_schema_name, validate_test_database_url,
+    PgTestSchemaCleanupCandidate, PgTestSchemaCleanupPlan, TestSchemaGuard,
+    ALLOW_NON_TEST_DATABASE_FOR_TESTS_ENV, KNOWN_TEST_SCHEMA_PREFIXES,
+};
 
 /// Create a legacy path-derived Postgres connection pool for the logical store at `path`.
 ///

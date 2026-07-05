@@ -1,18 +1,8 @@
 use super::*;
 use futures::FutureExt;
-use harness_core::db::{pg_open_pool, resolve_database_url, PgStoreContext};
+use harness_core::db::{pg_open_pool, resolve_test_database_url, PgStoreContext, TestSchemaGuard};
 use serde_json::json;
 use tempfile::tempdir;
-
-fn unique_test_schema(prefix: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_nanos();
-    format!("{prefix}_{nanos}_{count}")
-}
 
 #[test]
 fn shared_schema_context_uses_fixed_eval_store_schema() -> anyhow::Result<()> {
@@ -42,14 +32,14 @@ fn store_key_for_missing_data_dir_errors() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn shared_schema_eval_store_keeps_store_rows_isolated() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
     let dir = tempdir()?;
     let setup_pool = pg_open_pool(&database_url).await?;
-    let shared_schema = unique_test_schema("eval_store_scope_test");
-    let shared_context = PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "eval_store_scope_test")?;
+    let shared_context = PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
     let store_a_dir = dir.path().join("store-a");
     let store_b_dir = dir.path().join("store-b");
     std::fs::create_dir_all(&store_a_dir)?;
@@ -60,8 +50,8 @@ async fn shared_schema_eval_store_keeps_store_rows_isolated() -> anyhow::Result<
         EvalStore::open_shared_with_data_dir(&shared_context, &setup_pool, &store_b_dir).await?;
 
     let result = std::panic::AssertUnwindSafe(async {
-        assert_eq!(store_a.schema(), shared_schema);
-        assert_eq!(store_b.schema(), shared_schema);
+        assert_eq!(store_a.schema(), shared_schema.schema());
+        assert_eq!(store_b.schema(), shared_schema.schema());
         assert_ne!(store_a.store_key(), store_b.store_key());
 
         let run_a = store_a.create_run(pr_repair_run()).await?;
@@ -134,22 +124,21 @@ async fn shared_schema_eval_store_keeps_store_rows_isolated() -> anyhow::Result<
 
     store_a.pool.close().await;
     store_b.pool.close().await;
-    let _ = sqlx::query(&format!(
-        "DROP SCHEMA IF EXISTS \"{shared_schema}\" CASCADE"
-    ))
-    .execute(&setup_pool)
-    .await;
+    let cleanup_result = shared_schema.cleanup_with_pool(&setup_pool).await;
     setup_pool.close().await;
 
     match result {
-        Ok(result) => result,
+        Ok(result) => {
+            cleanup_result?;
+            result
+        }
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
 #[tokio::test]
 async fn legacy_eval_store_migration_backfills_once() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
@@ -162,9 +151,9 @@ async fn legacy_eval_store_migration_backfills_once() -> anyhow::Result<()> {
     let legacy_schema = PgStoreContext::from_legacy_path_schema(&legacy_path, Some(&database_url))?
         .schema()
         .to_owned();
-    let target_schema = unique_test_schema("eval_store_migration_test");
     let setup_pool = pg_open_pool(&database_url).await?;
-    let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+    let mut target_schema = TestSchemaGuard::new(&database_url, "eval_store_migration_test")?;
+    let target_context = PgStoreContext::from_schema(target_schema.schema(), Some(&database_url))?;
     let target_store =
         EvalStore::open_shared_with_data_dir(&target_context, &setup_pool, &target_data_dir)
             .await?;
@@ -251,22 +240,21 @@ async fn legacy_eval_store_migration_backfills_once() -> anyhow::Result<()> {
     ))
     .execute(&setup_pool)
     .await;
-    let _ = sqlx::query(&format!(
-        "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
-    ))
-    .execute(&setup_pool)
-    .await;
+    let cleanup_result = target_schema.cleanup_with_pool(&setup_pool).await;
     setup_pool.close().await;
 
     match result {
-        Ok(result) => result,
+        Ok(result) => {
+            cleanup_result?;
+            result
+        }
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
 #[tokio::test]
 async fn legacy_eval_store_migration_ignores_missing_legacy_schema() -> anyhow::Result<()> {
-    let database_url = match resolve_database_url(None) {
+    let database_url = match resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
@@ -274,9 +262,9 @@ async fn legacy_eval_store_migration_ignores_missing_legacy_schema() -> anyhow::
     let target_data_dir = dir.path().join("target-data");
     std::fs::create_dir_all(&target_data_dir)?;
     let missing_legacy_path = dir.path().join("missing-legacy").join("evals.db");
-    let target_schema = unique_test_schema("eval_store_missing_legacy_test");
     let setup_pool = pg_open_pool(&database_url).await?;
-    let target_context = PgStoreContext::from_schema(&target_schema, Some(&database_url))?;
+    let mut target_schema = TestSchemaGuard::new(&database_url, "eval_store_missing_legacy_test")?;
+    let target_context = PgStoreContext::from_schema(target_schema.schema(), Some(&database_url))?;
     let target_store =
         EvalStore::open_shared_with_data_dir(&target_context, &setup_pool, &target_data_dir)
             .await?;
@@ -295,15 +283,14 @@ async fn legacy_eval_store_migration_ignores_missing_legacy_schema() -> anyhow::
     .await;
 
     target_store.pool.close().await;
-    let _ = sqlx::query(&format!(
-        "DROP SCHEMA IF EXISTS \"{target_schema}\" CASCADE"
-    ))
-    .execute(&setup_pool)
-    .await;
+    let cleanup_result = target_schema.cleanup_with_pool(&setup_pool).await;
     setup_pool.close().await;
 
     match result {
-        Ok(result) => result,
+        Ok(result) => {
+            cleanup_result?;
+            result
+        }
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }

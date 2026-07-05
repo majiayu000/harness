@@ -1,15 +1,6 @@
 use super::test_support::*;
 use super::*;
-
-fn unique_test_schema(prefix: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_nanos();
-    format!("{prefix}_{nanos}_{count}")
-}
+use harness_core::db::TestSchemaGuard;
 
 #[tokio::test]
 async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::Result<()> {
@@ -57,15 +48,15 @@ async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::R
 
 #[tokio::test]
 async fn workspace_lease_store_shared_schema_keeps_data_dirs_isolated() -> anyhow::Result<()> {
-    let database_url = match harness_core::db::resolve_database_url(None) {
+    let database_url = match harness_core::db::resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let setup_pool = harness_core::db::pg_open_pool(&database_url).await?;
-    let shared_schema = unique_test_schema("workspace_lease_scope_test");
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "workspace_lease_scope_test")?;
     let shared_context =
-        harness_core::db::PgStoreContext::from_schema(&shared_schema, Some(&database_url))?;
+        harness_core::db::PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
     let store_a_dir = dir.path().join("store-a");
     let store_b_dir = dir.path().join("store-b");
     std::fs::create_dir_all(&store_a_dir)?;
@@ -119,6 +110,7 @@ async fn workspace_lease_store_shared_schema_keeps_data_dirs_isolated() -> anyho
     assert_eq!(leased_a[0].task_id, record_a.task_id);
     assert_eq!(leased_b[0].task_id, record_b.task_id);
 
+    shared_schema.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;
     Ok(())
 }

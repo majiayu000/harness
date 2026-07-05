@@ -1,9 +1,10 @@
 use clap::Parser;
 use harness_core::config::HarnessConfig;
 use harness_core::db::{
-    apply_pg_schema_cleanup, configure_pg_pool_from_server, pg_open_pool, pg_schema_cleanup_plan,
+    apply_pg_schema_cleanup, apply_pg_test_schema_cleanup, configure_pg_pool_from_server,
+    pg_open_pool, pg_schema_cleanup_plan, pg_test_schema_cleanup_plan,
     reap_orphaned_path_schemas_with_workspace_roots, resolve_database_url, PgSchemaCleanupAction,
-    PgSchemaCleanupPlan,
+    PgSchemaCleanupPlan, PgTestSchemaCleanupPlan,
 };
 use std::path::PathBuf;
 
@@ -35,6 +36,16 @@ struct Args {
     /// longer exists. Dry-run unless combined with --confirm-drop.
     #[arg(long)]
     reap_orphans: bool,
+    /// Dry-run known Harness test schemas such as event_store_*_test_*.
+    #[arg(long)]
+    test_schemas: bool,
+    /// Explicit test schema to drop with --apply. Repeatable.
+    #[arg(long = "test-schema")]
+    test_schema: Vec<String>,
+    /// With --apply and --confirm-drop, drop every known test schema in the
+    /// dry-run plan.
+    #[arg(long)]
+    drop_test_schemas: bool,
     /// Print JSON output.
     #[arg(long)]
     json: bool,
@@ -85,6 +96,45 @@ async fn main() -> anyhow::Result<()> {
             if !report.dropped {
                 println!("Re-run with --confirm-drop to drop them.");
             }
+        }
+        pool.close().await;
+        return Ok(());
+    }
+
+    if args.test_schemas || args.drop_test_schemas || !args.test_schema.is_empty() {
+        let plan = pg_test_schema_cleanup_plan(&pool).await?;
+        if args.apply {
+            if !args.confirm_drop {
+                anyhow::bail!("--apply for test schemas requires --confirm-drop");
+            }
+            let schemas = if args.drop_test_schemas {
+                plan.candidates
+                    .iter()
+                    .map(|candidate| candidate.schema_name.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                args.test_schema.clone()
+            };
+            if schemas.is_empty() {
+                anyhow::bail!(
+                    "--apply for test schemas requires --test-schema or --drop-test-schemas"
+                );
+            }
+            let dropped = apply_pg_test_schema_cleanup(&pool, &schemas).await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&dropped)?);
+            } else if dropped.is_empty() {
+                println!("No test schemas dropped");
+            } else {
+                println!("Dropped {} test schema(s):", dropped.len());
+                for result in dropped {
+                    println!("  {}", result.schema_name);
+                }
+            }
+        } else if args.json {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            print_test_schema_plan(&plan);
         }
         pool.close().await;
         return Ok(());
@@ -193,6 +243,23 @@ fn print_plan(plan: &PgSchemaCleanupPlan) {
     }
 }
 
+fn print_test_schema_plan(plan: &PgTestSchemaCleanupPlan) {
+    println!("Postgres test schema cleanup dry-run");
+    println!("  drop candidates: {}", plan.candidates.len());
+    for candidate in &plan.candidates {
+        println!(
+            "DROP_CANDIDATE\t{}\ttables={}\testimated_rows={}\tknown Harness test schema",
+            candidate.schema_name, candidate.table_count, candidate.estimated_row_count
+        );
+    }
+    if !plan.candidates.is_empty() {
+        println!("Re-run with --test-schemas --apply --confirm-drop --drop-test-schemas to drop all listed schemas.");
+        println!(
+            "Or pass --test-schema <name> with --apply --confirm-drop to drop selected schemas."
+        );
+    }
+}
+
 fn print_legacy_scan_errors(errors: &[String]) {
     for error in errors {
         println!("Legacy scan skipped: {error}");
@@ -219,6 +286,26 @@ mod tests {
         assert_eq!(
             configured_workspace_roots(&config),
             vec![PathBuf::from("/tmp/harness-workspaces")]
+        );
+    }
+
+    #[test]
+    fn parses_test_schema_cleanup_flags() {
+        let args = Args::parse_from([
+            "harness-pg-schema-cleanup",
+            "--test-schemas",
+            "--apply",
+            "--confirm-drop",
+            "--test-schema",
+            "event_store_scope_test_1783054126968028000_0",
+        ]);
+
+        assert!(args.test_schemas);
+        assert!(args.apply);
+        assert!(args.confirm_drop);
+        assert_eq!(
+            args.test_schema,
+            vec!["event_store_scope_test_1783054126968028000_0"]
         );
     }
 }
