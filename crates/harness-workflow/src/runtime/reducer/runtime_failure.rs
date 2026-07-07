@@ -1,6 +1,6 @@
 use super::support::{
     event_command_type, event_field_string, event_workflow_command, optional_json_string,
-    runtime_completion_evidence,
+    runtime_blocked_command, runtime_completion_evidence, runtime_failed_command,
 };
 use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
@@ -26,9 +26,11 @@ pub(super) fn runtime_blocked_decision(
         "blocked",
         &reason,
     )
-    .with_command(WorkflowCommand::mark_blocked(
+    .with_command(runtime_blocked_command(
         &reason,
         format!("runtime-completion:{}:blocked", event.id),
+        event,
+        result,
     ))
     .with_evidence(runtime_completion_evidence(event, result))
     .high_confidence()
@@ -40,12 +42,6 @@ pub(super) fn runtime_failed_decision(
     result: &ActivityResult,
 ) -> WorkflowDecision {
     let reason = runtime_failure_reason(result, "Runtime activity failed.");
-    let mut command_payload = json!({ "reason": reason.as_str() });
-    if let Some(error_kind) = result.error_kind {
-        if let Some(object) = command_payload.as_object_mut() {
-            object.insert("error_kind".to_string(), json!(error_kind));
-        }
-    }
     WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -53,10 +49,11 @@ pub(super) fn runtime_failed_decision(
         "failed",
         &reason,
     )
-    .with_command(WorkflowCommand::new(
-        WorkflowCommandType::MarkFailed,
+    .with_command(runtime_failed_command(
+        &reason,
         format!("runtime-completion:{}:failed", event.id),
-        command_payload,
+        event,
+        result,
     ))
     .with_evidence(runtime_completion_evidence(event, result))
     .high_confidence()
