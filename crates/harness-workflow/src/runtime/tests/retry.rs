@@ -200,7 +200,85 @@ fn runtime_completion_reducer_retries_spawn_failure_when_policy_allows() {
 }
 
 #[test]
-fn runtime_completion_reducer_does_not_retry_fatal_activity_failure() {
+fn runtime_failure_blocked_decision_carries_structured_stop_metadata() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult {
+        activity: "implement_issue".to_string(),
+        status: ActivityStatus::Blocked,
+        summary: "Implementation is waiting for maintainer approval.".to_string(),
+        artifacts: Vec::new(),
+        signals: Vec::new(),
+        validation: Vec::new(),
+        error: Some("Maintainer approval is required.".to_string()),
+        error_kind: Some(ActivityErrorKind::Configuration),
+    };
+    let event = runtime_completion_event(&instance, "implement_issue", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("blocked activity should block the workflow");
+
+    assert_eq!(decision.decision, "block_after_runtime_activity");
+    assert_eq!(decision.next_state, "blocked");
+    let command = &decision.commands[0];
+    assert_eq!(
+        command.command["blocked_reason"],
+        "Maintainer approval is required."
+    );
+    assert_eq!(command.command["last_stop"]["state"], "blocked");
+    assert_eq!(command.command["last_stop"]["activity"], "implement_issue");
+    assert_eq!(command.command["last_stop"]["runtime_job_id"], "job-1");
+    assert_eq!(command.command["last_stop"]["error_kind"], "configuration");
+    assert!(command.command["unblock_hint"].as_str().is_some());
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("blocked failure decision should validate");
+}
+
+#[test]
+fn runtime_failure_scope_guard_block_carries_structured_stop_metadata() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult {
+        activity: "implement_issue".to_string(),
+        status: ActivityStatus::Blocked,
+        summary: "Scope guard rejected the implementation.".to_string(),
+        artifacts: Vec::new(),
+        signals: Vec::new(),
+        validation: Vec::new(),
+        error: None,
+        error_kind: None,
+    }
+    .with_signal(ActivitySignal::new(
+        SCOPE_TOO_LARGE_SIGNAL,
+        json!({
+            "base_ref": "origin/main",
+            "files_changed": 42,
+            "lines_added": 1600,
+            "max_files_changed": 30,
+            "max_lines_added": 1500,
+            "decomposition_skeleton": [{"title": "Split reducer behavior"}]
+        }),
+    ));
+    let event = runtime_completion_event(&instance, "implement_issue", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("scope guard should block the workflow");
+
+    assert_eq!(decision.decision, "block_scope_too_large");
+    let command = &decision.commands[0];
+    assert_eq!(command.command["blocked_reason"], decision.reason);
+    assert_eq!(command.command["last_stop"]["state"], "blocked");
+    assert_eq!(command.command["last_stop"]["activity"], "implement_issue");
+    assert_eq!(command.command["last_stop"]["runtime_job_id"], "job-1");
+}
+
+#[test]
+fn runtime_failure_does_not_retry_fatal_activity_failure() {
     let instance = issue_instance("implementing").with_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 3
@@ -233,6 +311,22 @@ fn runtime_completion_reducer_does_not_retry_fatal_activity_failure() {
     assert_eq!(decision.decision, "fail_after_runtime_activity");
     assert_eq!(decision.next_state, "failed");
     assert_eq!(decision.commands[0].command["error_kind"], "fatal");
+    assert_eq!(
+        decision.commands[0].command["failure_reason"],
+        "repository instructions forbid this operation"
+    );
+    assert_eq!(decision.commands[0].command["last_stop"]["state"], "failed");
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["activity"],
+        "implement_issue"
+    );
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["error_kind"],
+        "fatal"
+    );
+    assert!(decision.commands[0].command["retry_hint"]
+        .as_str()
+        .is_some());
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,

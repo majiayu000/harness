@@ -1,4 +1,6 @@
-use super::support::{event_field_string, non_empty_json_string, runtime_completion_evidence};
+use super::support::{
+    event_field_string, non_empty_json_string, runtime_blocked_command, runtime_completion_evidence,
+};
 use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
     ISSUE_STATE_ARTIFACT, SCOPE_TOO_LARGE_SIGNAL,
@@ -35,12 +37,14 @@ pub(super) fn issue_implementation_missing_result_decision(
             "blocked",
             reason,
         )
-        .with_command(WorkflowCommand::mark_blocked(
+        .with_command(runtime_blocked_command(
             reason,
             format!(
                 "runtime-completion:{}:missing-implementation:block",
                 event.id
             ),
+            event,
+            result,
         ))
         .with_command(WorkflowCommand::new(
             WorkflowCommandType::RequestOperatorAttention,
@@ -91,9 +95,11 @@ pub(super) fn scope_too_large_decision(
             "blocked",
             &reason,
         )
-        .with_command(WorkflowCommand::mark_blocked(
-            reason.clone(),
+        .with_command(runtime_blocked_command(
+            &reason,
             format!("runtime-completion:{}:scope-too-large:block", event.id),
+            event,
+            result,
         ))
         .with_command(WorkflowCommand::new(
             WorkflowCommandType::RequestOperatorAttention,

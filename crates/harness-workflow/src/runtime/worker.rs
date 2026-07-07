@@ -427,10 +427,7 @@ fn merge_child_completion_payload(
     payload
 }
 
-/// Persist the terminal-failure `reason` into the instance `data` under
-/// `failure_reason` so task queries surface it as the task `error`. Without
-/// this the reason lives only in the command payload/event log and the task
-/// projection reports `error: null` (silent degradation).
+/// Persist stopped-state metadata into instance data for operator surfaces.
 pub(super) fn apply_failure_reason_side_effect(
     instance: &mut WorkflowInstance,
     command: &WorkflowCommand,
@@ -441,9 +438,14 @@ pub(super) fn apply_failure_reason_side_effect(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|reason| !reason.is_empty());
-    let Some(reason) = reason else {
+    if reason.is_none()
+        && !STOP_STRING_FIELDS
+            .iter()
+            .any(|field| command_string_field(command, field).is_some())
+        && command.command.get("last_stop").is_none()
+    {
         return Ok(());
-    };
+    }
     if !instance.data.is_object() {
         instance.data = json!({});
     }
@@ -451,8 +453,38 @@ pub(super) fn apply_failure_reason_side_effect(
         .data
         .as_object_mut()
         .context("workflow instance data is not an object")?;
-    data.insert("failure_reason".to_string(), json!(reason));
+    if let Some(reason) = reason {
+        data.insert("failure_reason".to_string(), json!(reason));
+        if command.command_type == super::model::WorkflowCommandType::MarkBlocked {
+            data.insert("blocked_reason".to_string(), json!(reason));
+        }
+    }
+    for field in STOP_STRING_FIELDS {
+        if let Some(value) = command_string_field(command, field) {
+            data.insert((*field).to_string(), json!(value));
+        }
+    }
+    if let Some(last_stop) = command.command.get("last_stop") {
+        data.insert("last_stop".to_string(), last_stop.clone());
+    }
     Ok(())
+}
+
+const STOP_STRING_FIELDS: &[&str] = &[
+    "blocked_reason",
+    "unblock_hint",
+    "failure_reason",
+    "retry_hint",
+    "error_kind",
+];
+
+fn command_string_field<'a>(command: &'a WorkflowCommand, field: &str) -> Option<&'a str> {
+    command
+        .command
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn runtime_profile_for_job(job: &RuntimeJob) -> anyhow::Result<Option<RuntimeProfile>> {
@@ -716,18 +748,11 @@ mod tests {
 
     #[test]
     fn mark_failed_inline_command_persists_failure_reason_into_data() {
-        use crate::runtime::WorkflowSubject;
-
-        let mut instance = WorkflowInstance::new(
-            "prompt_task",
-            1,
-            "implementing",
-            WorkflowSubject::new("prompt", "1"),
-        );
+        let mut instance = prompt_task_instance();
         let command = WorkflowCommand::new(
             WorkflowCommandType::MarkFailed,
             "runtime-completion:evt-1:failed",
-            json!({ "reason": "Agent turn timed out after 900s" }),
+            json!({ "reason": "Agent turn timed out after 900s", "error_kind": "timeout", "retry_hint": "Retry after route repair.", "last_stop": {"state": "failed", "runtime_job_id": "job-1"} }),
         );
 
         apply_failure_reason_side_effect(&mut instance, &command).unwrap();
@@ -737,26 +762,39 @@ mod tests {
             Some("Agent turn timed out after 900s"),
             "MarkFailed must surface its reason as the queryable failure_reason"
         );
+        assert_eq!(instance.data["error_kind"], "timeout");
+        assert_eq!(instance.data["retry_hint"], "Retry after route repair.");
+        assert_eq!(instance.data["last_stop"]["runtime_job_id"], "job-1");
     }
 
     #[test]
-    fn mark_failed_without_reason_leaves_data_untouched() {
-        use crate::runtime::WorkflowSubject;
-
-        let mut instance = WorkflowInstance::new(
-            "prompt_task",
-            1,
-            "implementing",
-            WorkflowSubject::new("prompt", "1"),
-        );
+    fn mark_blocked_inline_command_persists_stop_metadata_into_data() {
+        let mut instance = prompt_task_instance();
         let command = WorkflowCommand::new(
-            WorkflowCommandType::MarkFailed,
-            "runtime-completion:evt-2:failed",
-            json!({}),
+            WorkflowCommandType::MarkBlocked,
+            "runtime-completion:evt-2:blocked",
+            json!({"reason": "Waiting for maintainer approval.", "unblock_hint": "Post approval, then call unblock.", "last_stop": {"state": "blocked", "runtime_job_id": "job-2"}}),
         );
 
         apply_failure_reason_side_effect(&mut instance, &command).unwrap();
 
-        assert!(instance.data.get("failure_reason").is_none());
+        assert_eq!(
+            instance.data["blocked_reason"],
+            "Waiting for maintainer approval."
+        );
+        assert_eq!(
+            instance.data["unblock_hint"],
+            "Post approval, then call unblock."
+        );
+        assert_eq!(instance.data["last_stop"]["runtime_job_id"], "job-2");
+    }
+
+    fn prompt_task_instance() -> WorkflowInstance {
+        WorkflowInstance::new(
+            "prompt_task",
+            1,
+            "implementing",
+            WorkflowSubject::new("p", "1"),
+        )
     }
 }

@@ -330,6 +330,10 @@ fn candidate_promotion_failure_decision_inner(
         Ok(decision) => Ok(decision),
         Err(CandidatePromotionPlanError::NoPromotableCandidate) => {
             let reason = "candidate PR promotion failed for all succeeded candidates";
+            let mut payload = failed_candidate_promotion_payload(reason, event, result);
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("failed_promotions".to_string(), json!(failures));
+            }
             Ok(WorkflowDecision::new(
                 &instance.id,
                 &instance.state,
@@ -340,11 +344,7 @@ fn candidate_promotion_failure_decision_inner(
             .with_command(WorkflowCommand::new(
                 WorkflowCommandType::MarkFailed,
                 format!("candidate-promotion:{}:all-failed", event.id),
-                json!({
-                    "reason": reason,
-                    "activity": result.activity,
-                    "failed_promotions": failures,
-                }),
+                payload,
             ))
             .with_evidence(WorkflowEvidence::new(
                 CANDIDATE_SELECTION_RECORD_TYPE,
@@ -354,6 +354,35 @@ fn candidate_promotion_failure_decision_inner(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn failed_candidate_promotion_payload(
+    reason: &str,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Value {
+    let mut payload = json!({
+        "reason": reason,
+        "failure_reason": reason,
+        "activity": result.activity,
+        "retry_hint": "Fix the candidate promotion failures, then call the workflow runtime retry API.",
+        "last_stop": {
+            "state": "failed",
+            "activity": result.activity,
+            "runtime_job_id": event.event.get("runtime_job_id").and_then(Value::as_str),
+            "event_id": event.id,
+            "recorded_at": event.created_at,
+        },
+    });
+    if let Some(error_kind) = result.error_kind {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("error_kind".to_string(), json!(error_kind));
+        }
+        if let Some(last_stop) = payload.get_mut("last_stop").and_then(Value::as_object_mut) {
+            last_stop.insert("error_kind".to_string(), json!(error_kind));
+        }
+    }
+    payload
 }
 
 fn promote_candidate_command(
@@ -635,6 +664,25 @@ mod tests {
         assert_eq!(
             decision.commands[0].command["promotion_chain"][0]["to_candidate_id"],
             "wf-1:candidate-group:issue-1449:c2"
+        );
+        let final_decision = candidate_promotion_failure_decision_inner(
+            &issue_instance(),
+            &event(decision.commands[0].clone()),
+            &result,
+            &decision.commands[0],
+        )?;
+        assert_eq!(final_decision.decision, "fail_candidate_promotion");
+        assert_eq!(
+            final_decision.commands[0].command["failure_reason"],
+            final_decision.reason
+        );
+        assert_eq!(
+            final_decision.commands[0].command["last_stop"]["state"],
+            "failed"
+        );
+        assert_eq!(
+            final_decision.commands[0].command["last_stop"]["runtime_job_id"],
+            "job-1"
         );
         Ok(())
     }
