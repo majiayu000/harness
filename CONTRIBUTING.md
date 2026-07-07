@@ -42,17 +42,18 @@ to broader gates:
 | Docs-only | `cargo test --help >/dev/null` | Add the command documented by the changed page if it names one. No Postgres is required for text-only edits. |
 | CLI (`crates/harness-cli`) | `cargo test -p harness-cli --all-targets` | Add the touched library crate test when the command delegates into shared logic. |
 | Server, API, or workflow runtime | `HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-fast.sh` | Postgres is required. Use `scripts/test-server-db.sh` for startup, recovery, persistence, full `AppState`, route, or workflow-runtime changes. |
-| SDK (`sdk/typescript`, `sdk/python`) | `cd sdk/typescript && bun install && bun run test && bun run build` for TypeScript SDK changes; run the Python package-local build or smoke import for Python SDK changes | Run the package-local build or smoke import for the SDK you changed before publishing or release work. |
+| SDK (TypeScript) (`sdk/typescript`) | `cd sdk/typescript && bun install && bun run test && bun run build` | Run the package-local build before publishing or release work. |
+| SDK (Python) (`sdk/python`) | `python3 -m unittest discover sdk/python/tests` | Run `cd sdk/python && python3 -m build` before publishing or release work. |
 | Web (`web/`) | `cd web && bun install && bun run typecheck && bun run test` | Run `cd web && bun run build` when routes, generated SDK types, or production assets changed. |
-| Workflow/spec pack | `python3 checks/check_workflow.py --repo .` | For a numbered spec packet, also run `python3 checks/check_workflow.py --repo . --spec-dir specs/GH<number>`. Run `python -m pytest tests/test_evaluate.py` when checks or templates change. |
+| Workflow/spec pack | `python3 checks/check_workflow.py --repo .` | For a numbered spec packet, also run `python3 checks/check_workflow.py --repo . --spec-dir specs/GH<number>`. Run `python3 -m pytest tests/test_evaluate.py` when checks or templates change. |
 
 For `harness-server` work, start with the fast local ladder and reserve the
 full DB profile for final handoff or changes that touch startup, recovery,
 full `AppState`, route persistence, or workflow runtime behavior:
 
 ```bash
-HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-fast.sh
-HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness scripts/test-server-db.sh
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-fast.sh
+HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-db.sh
 ```
 
 ## Target Directory Cleanup
