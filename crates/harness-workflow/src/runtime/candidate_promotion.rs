@@ -330,10 +330,7 @@ fn candidate_promotion_failure_decision_inner(
         Ok(decision) => Ok(decision),
         Err(CandidatePromotionPlanError::NoPromotableCandidate) => {
             let reason = "candidate PR promotion failed for all succeeded candidates";
-            let mut payload = failed_candidate_promotion_payload(reason, event, result);
-            if let Some(object) = payload.as_object_mut() {
-                object.insert("failed_promotions".to_string(), json!(failures));
-            }
+            let payload = failed_candidate_promotion_payload(reason, event, result, &failures);
             Ok(WorkflowDecision::new(
                 &instance.id,
                 &instance.state,
@@ -360,11 +357,13 @@ fn failed_candidate_promotion_payload(
     reason: &str,
     event: &WorkflowEvent,
     result: &ActivityResult,
+    failures: &[CandidatePromotionFailure],
 ) -> Value {
     let mut payload = json!({
         "reason": reason,
         "failure_reason": reason,
         "activity": result.activity,
+        "failed_promotions": failures,
         "retry_hint": "Fix the candidate promotion failures, then call the workflow runtime retry API.",
         "last_stop": {
             "state": "failed",
@@ -375,12 +374,8 @@ fn failed_candidate_promotion_payload(
         },
     });
     if let Some(error_kind) = result.error_kind {
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("error_kind".to_string(), json!(error_kind));
-        }
-        if let Some(last_stop) = payload.get_mut("last_stop").and_then(Value::as_object_mut) {
-            last_stop.insert("error_kind".to_string(), json!(error_kind));
-        }
+        payload["error_kind"] = json!(error_kind);
+        payload["last_stop"]["error_kind"] = json!(error_kind);
     }
     payload
 }

@@ -172,9 +172,7 @@ pub(super) fn runtime_failed_payload(
         "last_stop": runtime_stop_metadata("failed", event, result),
     });
     if let Some(error_kind) = result.error_kind {
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("error_kind".to_string(), json!(error_kind));
-        }
+        payload["error_kind"] = json!(error_kind);
     }
     payload
 }
@@ -188,9 +186,7 @@ fn runtime_stop_metadata(state: &str, event: &WorkflowEvent, result: &ActivityRe
         "recorded_at": event.created_at,
     });
     if let Some(error_kind) = result.error_kind {
-        if let Some(object) = metadata.as_object_mut() {
-            object.insert("error_kind".to_string(), json!(error_kind));
-        }
+        metadata["error_kind"] = json!(error_kind);
     }
     metadata
 }
