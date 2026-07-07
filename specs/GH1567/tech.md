@@ -68,7 +68,7 @@ Request shape:
 }
 ```
 
-Response shape on success:
+Response shape on success for unblock:
 
 ```json
 {
@@ -76,6 +76,18 @@ Response shape on success:
   "execution_path": "workflow_runtime",
   "workflow_id": "...",
   "previous_state": "blocked",
+  "state": "discovered"
+}
+```
+
+Response shape on success for retry:
+
+```json
+{
+  "status": "retried",
+  "execution_path": "workflow_runtime",
+  "workflow_id": "...",
+  "previous_state": "failed",
   "state": "discovered"
 }
 ```
@@ -106,17 +118,21 @@ existing runtime merge/cancel.
   operator-approved.
 - Must reject non-retryable `error_kind` values such as `fatal` and
   `configuration` unless the request explicitly includes a force flag and a
-  follow-up spec approves that force behavior. The first implementation should
-  omit force retry.
+  follow-up spec approves that force behavior.
+- If `error_kind` is missing or null, such as in legacy failed workflows created
+  before this feature, treat the workflow as retryable by default and rely on
+  the operator-supplied reason plus the next runtime result to record fresh
+  evidence. The first implementation should omit force retry.
 
 `cancelled`:
 
 - No action in the first implementation. Return `409 Conflict` with the current
   state if called on a cancelled workflow.
 
-Both actions must insert a workflow event or decision record that includes the
-operator-supplied reason, previous state, next state, and actor/source
-identifier available from the existing auth layer.
+Both actions must execute the state update and audit write inside one database
+transaction. The transaction must insert a workflow event or decision record
+that includes the operator-supplied reason, previous state, next state, and
+actor/source identifier available from the existing auth layer.
 
 ### Coverage Gate Behavior
 
@@ -131,9 +147,12 @@ without operator intent would violate the conservative default.
 
 ### API And Dashboard Exposure
 
-Add the structured reason fields to runtime tree nodes and operator monitor
-stuck-workflow rows. The React operator monitor should display the reason and a
-compact action affordance only when the API reports the action is allowed.
+Add the structured reason fields to runtime tree nodes, operator monitor
+`StuckWorkflow` rows, and `OperatorAction` rows. The serialized fields should
+include `blocked_reason`, `unblock_hint`, `failure_reason`, `retry_hint`,
+`last_stop`, and action eligibility booleans such as `can_unblock` and
+`can_retry`. The React operator monitor should display the reason and a compact
+action affordance only when the API reports the action is allowed.
 
 The UI implementation should call the new runtime action routes and refresh the
 operator monitor/runtime tree after success. It should not infer action
