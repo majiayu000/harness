@@ -1,0 +1,46 @@
+name: specrail-check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  specrail-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Check workflow pack
+        run: python3 checks/check_workflow.py --repo .
+
+      - name: Check spec packets
+        run: |
+          set -euo pipefail
+          for spec_dir in specs/GH*/; do
+            if [ -d "$spec_dir" ]; then
+              python3 checks/check_workflow.py --repo . --spec-dir "${spec_dir%/}"
+            fi
+          done
+
+      - name: Check committed whitespace
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+          elif git rev-parse HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git diff --check
+          fi
