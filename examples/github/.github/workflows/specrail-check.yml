@@ -25,8 +25,14 @@ jobs:
       - name: Check workflow pack
         run: python3 checks/check_workflow.py --repo .
 
-      - name: Check sample spec packet
-        run: python3 checks/check_workflow.py --repo . --spec-dir specs/GH1
+      - name: Check spec packets
+        run: |
+          set -euo pipefail
+          for spec_dir in specs/GH*/; do
+            if [ -d "$spec_dir" ]; then
+              python3 checks/check_workflow.py --repo . --spec-dir "${spec_dir%/}"
+            fi
+          done
 
       - name: Check committed whitespace
         run: |
