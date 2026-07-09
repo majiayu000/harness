@@ -472,6 +472,8 @@ pub struct ContextConfig {
     pub provider_timeout_ms: u64,
     #[serde(default)]
     pub quotas: ContextQuotasConfig,
+    #[serde(default)]
+    pub compression: crate::config::compression::CompressionConfig,
 }
 
 fn default_context_budget_tokens() -> u32 {
@@ -494,6 +496,7 @@ impl Default for ContextConfig {
             reserved_headroom: default_context_reserved_headroom(),
             provider_timeout_ms: default_context_provider_timeout_ms(),
             quotas: ContextQuotasConfig::default(),
+            compression: crate::config::compression::CompressionConfig::default(),
         }
     }
 }

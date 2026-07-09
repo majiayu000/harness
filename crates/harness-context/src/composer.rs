@@ -23,6 +23,7 @@ struct SelectedItem {
     tokens: Tokens,
     level: Option<String>,
     reason: Option<String>,
+    nap: Option<harness_core::compress::NapStatus>,
     score: f32,
 }
 
@@ -252,6 +253,7 @@ impl ContextComposer {
                     content: proposal.item.content.clone(),
                     level: None,
                     reason: None,
+                    nap: None,
                     proposal,
                 });
             } else {
@@ -349,6 +351,9 @@ impl ContextComposer {
                 tokens: item.tokens,
                 level: item.level.clone(),
                 reason: item.reason.clone(),
+                original_tokens: item.nap.is_some().then_some(item.proposal.item.est_tokens),
+                compressed_tokens: item.nap.is_some().then_some(item.tokens),
+                nap: item.nap,
             });
         }
         for proposal in excluded {
@@ -496,6 +501,7 @@ fn choose_fit(
             tokens: proposal.item.est_tokens,
             level: None,
             reason: None,
+            nap: None,
             score: score(proposal, quotas),
         });
     }
@@ -508,6 +514,7 @@ fn choose_fit(
                 tokens,
                 level: Some(degraded.level_name().to_string()),
                 reason: Some(reason.to_string()),
+                nap: degraded.nap(),
                 score: score(proposal, quotas),
             });
         }
@@ -577,6 +584,7 @@ fn apply_constraint_guard(
         selected[idx].tokens = pointer_tokens;
         selected[idx].level = Some("pointer".to_string());
         selected[idx].reason = Some("constraint_overload".to_string());
+        selected[idx].nap = None;
         instruction_count -= 1;
     }
 }
@@ -625,6 +633,9 @@ fn excluded_manifest_item(proposal: &Proposal, tokens: Tokens, reason: &str) -> 
         tokens,
         level: None,
         reason: Some(reason.to_string()),
+        original_tokens: None,
+        compressed_tokens: None,
+        nap: None,
     }
 }
 

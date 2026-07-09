@@ -1,3 +1,4 @@
+use harness_core::compress::NapStatus;
 use harness_core::run_id::RunId;
 use harness_core::types::{ProjectId, ThreadId};
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,13 @@ impl Priority {
 pub enum Degraded {
     Summary(String),
     Pointer(String),
+    /// LLM-compressed rendition with a NAP verification status
+    /// (GH1574). Produced asynchronously by the caller before compose;
+    /// the composer only selects, it never calls a model.
+    Summarized {
+        text: String,
+        nap: NapStatus,
+    },
 }
 
 impl Degraded {
@@ -140,12 +148,21 @@ impl Degraded {
         match self {
             Self::Summary(_) => "summary",
             Self::Pointer(_) => "pointer",
+            Self::Summarized { .. } => "summarized",
         }
     }
 
     pub(crate) fn content(&self) -> &str {
         match self {
             Self::Summary(content) | Self::Pointer(content) => content,
+            Self::Summarized { text, .. } => text,
+        }
+    }
+
+    pub(crate) fn nap(&self) -> Option<NapStatus> {
+        match self {
+            Self::Summarized { nap, .. } => Some(*nap),
+            _ => None,
         }
     }
 }
@@ -317,6 +334,12 @@ pub struct ManifestItem {
     pub level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_tokens: Option<Tokens>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressed_tokens: Option<Tokens>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nap: Option<NapStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

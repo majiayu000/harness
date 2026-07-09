@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod compression;
 pub mod dirs;
 pub mod intake;
 pub mod isolation;
