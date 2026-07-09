@@ -3,6 +3,7 @@ pub mod agent;
 mod agent_tests;
 pub mod agents_md;
 pub mod capability;
+pub mod compress;
 pub mod config;
 pub mod db;
 pub mod db_pg;

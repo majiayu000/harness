@@ -52,6 +52,39 @@ fn pipeline_is_deterministic_for_identical_inputs() {
 }
 
 #[test]
+fn summarized_degrade_records_nap_and_token_fields_in_manifest() {
+    use harness_core::compress::NapStatus;
+    let mut compressed_item = item("rule:a", ItemClass::Rule, 400, Priority::P1);
+    compressed_item.degrade = vec![Degraded::Summarized {
+        text: "x".repeat(40),
+        nap: NapStatus::Verified,
+    }];
+    let config = ComposeConfig {
+        reserved_headroom: 0.0,
+        ..Default::default()
+    };
+    let composer = ContextComposer::new(config).with_provider(Box::new(StaticProvider::new(
+        "rules",
+        vec![compressed_item],
+    )));
+    let mut request = req();
+    request.budget_hint = 30;
+    let result = composer.compose(&request).expect("composition succeeds");
+    let entry = result
+        .manifest
+        .items
+        .iter()
+        .find(|entry| entry.id.as_str() == "rule:a")
+        .expect("manifest entry exists");
+    assert_eq!(entry.decision, ManifestDecision::Degraded);
+    assert_eq!(entry.level.as_deref(), Some("summarized"));
+    assert_eq!(entry.nap, Some(NapStatus::Verified));
+    assert_eq!(entry.original_tokens, Some(100));
+    assert_eq!(entry.compressed_tokens, Some(10));
+    assert!(result.rendered.contains(&"x".repeat(40)));
+}
+
+#[test]
 fn pipeline_enforces_budget_and_degrades_or_excludes() {
     let config = ComposeConfig {
         reserved_headroom: 0.0,
