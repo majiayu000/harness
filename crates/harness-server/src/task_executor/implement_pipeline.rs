@@ -197,7 +197,19 @@ pub(crate) async fn run_implement_phase(
                 prompts::continue_existing_pr(issue, pr_num, &branch, &slug)
             }
             Ok(None) => {
-                prompts::implement_from_issue(issue, git, plan_output.as_deref()).to_prompt_string()
+                let plan_for_prompt = match plan_output.as_deref() {
+                    Some(raw) => Some(
+                        super::compression::compress_observation_for_prompt(
+                            &server_config.context.compression,
+                            raw,
+                            &format!("implementation phase for issue #{issue} in {repo_slug}"),
+                        )
+                        .await,
+                    ),
+                    None => None,
+                };
+                prompts::implement_from_issue(issue, git, plan_for_prompt.as_deref())
+                    .to_prompt_string()
             }
             Err(e) => {
                 return Err(e).with_context(|| {
