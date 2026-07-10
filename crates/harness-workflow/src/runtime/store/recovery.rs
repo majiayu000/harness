@@ -138,7 +138,7 @@ impl WorkflowRuntimeStore {
             &previous_state,
             request.next_state,
             &event.id,
-        )?;
+        );
         upsert_instance_tx(&mut tx, &instance).await?;
         tx.commit().await?;
 
@@ -158,26 +158,23 @@ fn persist_operator_recovery_data(
     previous_state: &str,
     state: &str,
     event_id: &str,
-) -> anyhow::Result<()> {
+) {
     if !instance.data.is_object() {
         instance.data = json!({});
     }
-    let data = instance
-        .data
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("workflow instance data is not an object"))?;
-    data.insert(
-        "last_operator_recovery".to_string(),
-        json!({
-            "action": action.as_str(),
-            "reason": reason,
-            "actor": actor,
-            "previous_state": previous_state,
-            "state": state,
-            "event_id": event_id,
-        }),
-    );
-    Ok(())
+    if let Some(data) = instance.data.as_object_mut() {
+        data.insert(
+            "last_operator_recovery".to_string(),
+            json!({
+                "action": action.as_str(),
+                "reason": reason,
+                "actor": actor,
+                "previous_state": previous_state,
+                "state": state,
+                "event_id": event_id,
+            }),
+        );
+    }
 }
 
 fn stopped_error_kind(data: &Value) -> Option<ActivityErrorKind> {
