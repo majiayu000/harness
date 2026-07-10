@@ -105,6 +105,180 @@ async fn runtime_store_dedupe_status_update_does_not_regress_dispatched_command(
 }
 
 #[tokio::test]
+async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = project_issue_instance("/project-a", 1567, "blocked").with_data(json!({
+        "project_id": "/project-a",
+        "issue_number": 1567,
+        "submission_mode": "immediate",
+    }));
+    store.upsert_instance(&instance).await?;
+
+    let pending_id = store
+        .enqueue_command(
+            &instance.id,
+            None,
+            &WorkflowCommand::enqueue_activity("implement_issue", "stale-pending-1567"),
+        )
+        .await?;
+    let dispatching_id = store
+        .enqueue_command(
+            &instance.id,
+            None,
+            &WorkflowCommand::enqueue_activity("implement_issue", "stale-dispatching-1567"),
+        )
+        .await?;
+    store
+        .mark_command_status(&dispatching_id, WorkflowCommandStatus::Dispatching)
+        .await?;
+    let dispatched_id = store
+        .enqueue_command(
+            &instance.id,
+            None,
+            &WorkflowCommand::enqueue_activity("implement_issue", "already-dispatched-1567"),
+        )
+        .await?;
+    let outcome = store
+        .enqueue_runtime_job_for_pending_command(
+            &dispatched_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({"activity": "implement_issue"}),
+            None,
+        )
+        .await?;
+    assert!(matches!(outcome, RuntimeJobEnqueueOutcome::Enqueued(_)));
+
+    let outcome = store
+        .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
+            workflow_id: &instance.id,
+            action: super::WorkflowRuntimeRecoveryAction::Unblock,
+            reason: "operator supplied approval",
+            actor: "operator",
+            next_state: "implementing",
+        })
+        .await?;
+    assert!(matches!(
+        outcome,
+        super::WorkflowRuntimeRecoveryOutcome::Recovered { .. }
+    ));
+
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(
+        command_status(&commands, &pending_id),
+        WorkflowCommandStatus::Skipped
+    );
+    assert_eq!(
+        command_status(&commands, &dispatching_id),
+        WorkflowCommandStatus::Skipped
+    );
+    assert_eq!(
+        command_status(&commands, &dispatched_id),
+        WorkflowCommandStatus::Cancelled
+    );
+    let jobs = store
+        .runtime_jobs_for_commands(std::slice::from_ref(&dispatched_id))
+        .await?;
+    let dispatched_jobs = jobs
+        .get(&dispatched_id)
+        .expect("dispatched command should have a runtime job");
+    assert_eq!(dispatched_jobs.len(), 1);
+    assert_eq!(dispatched_jobs[0].status, RuntimeJobStatus::Cancelled);
+    assert_eq!(dispatched_jobs[0].output.as_ref().unwrap()["status"], "cancelled");
+    let pending_commands: Vec<_> = commands
+        .iter()
+        .filter(|command| command.status == WorkflowCommandStatus::Pending)
+        .collect();
+    assert_eq!(pending_commands.len(), 1);
+    assert_eq!(pending_commands[0].command.activity_name(), Some("implement_issue"));
+    assert!(pending_commands[0]
+        .command
+        .dedupe_key
+        .starts_with("operator-recovery:unblock:"));
+
+    let events = store.events_for(&instance.id).await?;
+    let recovery_event = events
+        .iter()
+        .find(|event| event.event_type == "WorkflowRuntimeUnblocked")
+        .expect("recovery audit event should be recorded");
+    assert_eq!(recovery_event.event["superseded_command_count"], 3);
+    assert_eq!(recovery_event.event["superseded_runtime_job_count"], 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_recovery_waiting_on_command_does_not_lock_instance() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = Arc::new(WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?);
+    let instance = project_issue_instance("/project-a", 1568, "blocked");
+    store.upsert_instance(&instance).await?;
+    let stale_command_id = store
+        .enqueue_command(
+            &instance.id,
+            None,
+            &WorkflowCommand::enqueue_activity("implement_issue", "stale-pending-1568"),
+        )
+        .await?;
+
+    let mut command_tx = store.pool().begin().await?;
+    sqlx::query("SELECT id FROM workflow_commands WHERE id = $1 FOR UPDATE")
+        .bind(&stale_command_id)
+        .execute(&mut *command_tx)
+        .await?;
+
+    let recovery_store = Arc::clone(&store);
+    let recovery_workflow_id = instance.id.clone();
+    let recovery = tokio::spawn(async move {
+        recovery_store
+            .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
+                workflow_id: &recovery_workflow_id,
+                action: super::WorkflowRuntimeRecoveryAction::Unblock,
+                reason: "operator supplied approval",
+                actor: "operator",
+                next_state: "implementing",
+            })
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut instance_tx = store.pool().begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '250ms'")
+        .execute(&mut *instance_tx)
+        .await?;
+    sqlx::query("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
+        .bind(&instance.id)
+        .fetch_optional(&mut *instance_tx)
+        .await
+        .expect("recovery waiting on a command must not already hold the instance lock");
+    instance_tx.rollback().await?;
+
+    command_tx.rollback().await?;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), recovery).await???;
+    assert!(matches!(
+        outcome,
+        super::WorkflowRuntimeRecoveryOutcome::Recovered { .. }
+    ));
+    Ok(())
+}
+
+fn command_status(commands: &[WorkflowCommandRecord], command_id: &str) -> WorkflowCommandStatus {
+    commands
+        .iter()
+        .find(|command| command.id == command_id)
+        .map(|command| command.status)
+        .expect("command should exist")
+}
+
+#[tokio::test]
 async fn runtime_store_pending_command_enqueue_is_idempotent_across_concurrent_claims(
 ) -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {

@@ -1,10 +1,11 @@
 use super::{
-    command_store, insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx,
-    upsert_instance_tx, validator_for_definition, WorkflowInstance, WorkflowRuntimeStore,
+    command_store, enum_str, insert_decision_record_tx, insert_event_tx,
+    select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx, validator_for_definition,
+    WorkflowInstance, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
-    ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionRecord,
+    ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, WorkflowCommand,
+    WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
 };
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::status::WorkflowCommandStatus;
@@ -81,40 +82,31 @@ impl WorkflowRuntimeStore {
         request: WorkflowRuntimeRecoveryRequest<'_>,
     ) -> anyhow::Result<WorkflowRuntimeRecoveryOutcome> {
         let mut tx = self.pool.begin().await?;
-        let Some(mut instance) =
-            select_instance_for_update_tx(&mut tx, request.workflow_id).await?
-        else {
+        let Some(snapshot) = select_instance_tx(&mut tx, request.workflow_id).await? else {
             tx.commit().await?;
             return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
         };
 
+        if let Some(outcome) = recovery_rejection(&snapshot, request.action) {
+            tx.commit().await?;
+            return Ok(outcome);
+        }
+
+        let (superseded_command_count, superseded_runtime_job_count) =
+            skip_superseded_active_commands_tx(&mut tx, &snapshot.id).await?;
+
+        let Some(mut instance) =
+            select_instance_for_update_tx(&mut tx, request.workflow_id).await?
+        else {
+            tx.rollback().await?;
+            return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
+        };
+
+        if let Some(outcome) = recovery_rejection(&instance, request.action) {
+            tx.rollback().await?;
+            return Ok(outcome);
+        }
         let previous_state = instance.state.clone();
-        if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
-            tx.commit().await?;
-            return Ok(WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition {
-                workflow: instance,
-            });
-        }
-
-        if previous_state != request.action.expected_state() {
-            tx.commit().await?;
-            return Ok(WorkflowRuntimeRecoveryOutcome::WrongState { workflow: instance });
-        }
-
-        if request.action == WorkflowRuntimeRecoveryAction::Retry {
-            if let Some(error_kind) = stopped_error_kind(&instance.data).filter(|kind| {
-                matches!(
-                    kind,
-                    ActivityErrorKind::Fatal | ActivityErrorKind::Configuration
-                )
-            }) {
-                tx.commit().await?;
-                return Ok(WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
-                    workflow: instance,
-                    error_kind,
-                });
-            }
-        }
 
         let event = insert_event_tx(
             &mut tx,
@@ -128,6 +120,8 @@ impl WorkflowRuntimeStore {
                 "actor": request.actor,
                 "previous_state": previous_state,
                 "state": request.next_state,
+                "superseded_command_count": superseded_command_count,
+                "superseded_runtime_job_count": superseded_runtime_job_count,
             }),
         )
         .await?;
@@ -188,6 +182,148 @@ impl WorkflowRuntimeStore {
             event_id: event.id,
         })
     }
+}
+
+async fn select_instance_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+) -> anyhow::Result<Option<WorkflowInstance>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    row.map(|(data,)| serde_json::from_str(&data))
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn recovery_rejection(
+    instance: &WorkflowInstance,
+    action: WorkflowRuntimeRecoveryAction,
+) -> Option<WorkflowRuntimeRecoveryOutcome> {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
+        return Some(WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition {
+            workflow: instance.clone(),
+        });
+    }
+
+    if instance.state != action.expected_state() {
+        return Some(WorkflowRuntimeRecoveryOutcome::WrongState {
+            workflow: instance.clone(),
+        });
+    }
+
+    if action == WorkflowRuntimeRecoveryAction::Retry {
+        if let Some(error_kind) = stopped_error_kind(&instance.data).filter(|kind| {
+            matches!(
+                kind,
+                ActivityErrorKind::Fatal | ActivityErrorKind::Configuration
+            )
+        }) {
+            return Some(WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
+                workflow: instance.clone(),
+                error_kind,
+            });
+        }
+    }
+
+    None
+}
+
+async fn skip_superseded_active_commands_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+) -> anyhow::Result<(u64, u64)> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, status, data::text
+         FROM workflow_commands
+         WHERE workflow_id = $1
+           AND status IN ($2, $3, $4)
+         FOR UPDATE",
+    )
+    .bind(workflow_id)
+    .bind(WorkflowCommandStatus::Pending.as_str())
+    .bind(WorkflowCommandStatus::Dispatching.as_str())
+    .bind(WorkflowCommandStatus::Dispatched.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut superseded_runtime_job_count = 0u64;
+    for (command_id, status, data) in &rows {
+        let command: WorkflowCommand = serde_json::from_str(data)?;
+        let next_status = if status == WorkflowCommandStatus::Dispatched.as_str() {
+            superseded_runtime_job_count += cancel_unfinished_runtime_jobs_tx(
+                tx,
+                command_id,
+                command.runtime_activity_key(),
+                "Workflow runtime operator recovery superseded this command.",
+            )
+            .await?;
+            WorkflowCommandStatus::Cancelled
+        } else {
+            WorkflowCommandStatus::Skipped
+        };
+        sqlx::query(
+            "UPDATE workflow_commands
+             SET status = $2,
+                 dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1",
+        )
+        .bind(command_id)
+        .bind(next_status.as_str())
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok((rows.len() as u64, superseded_runtime_job_count))
+}
+
+async fn cancel_unfinished_runtime_jobs_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    command_id: &str,
+    activity: &str,
+    summary: &str,
+) -> anyhow::Result<u64> {
+    let pending_status = enum_str(&RuntimeJobStatus::Pending)?;
+    let running_status = enum_str(&RuntimeJobStatus::Running)?;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, data::text
+         FROM runtime_jobs
+         WHERE command_id = $1
+           AND status IN ($2, $3)
+         FOR UPDATE",
+    )
+    .bind(command_id)
+    .bind(&pending_status)
+    .bind(&running_status)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for (job_id, data) in &rows {
+        let mut job: RuntimeJob = serde_json::from_str(data)?;
+        job.complete(&ActivityResult::cancelled(activity, summary))?;
+        let updated = to_jsonb_string(&job)?;
+        let status = enum_str(&job.status)?;
+        sqlx::query(
+            "UPDATE runtime_jobs
+             SET status = $1,
+                 not_before = $2,
+                 data = $3::jsonb,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4",
+        )
+        .bind(&status)
+        .bind(job.not_before)
+        .bind(&updated)
+        .bind(job_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(rows.len() as u64)
 }
 
 fn persist_operator_recovery_data(
