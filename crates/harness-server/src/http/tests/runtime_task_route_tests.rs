@@ -894,6 +894,20 @@ async fn workflow_runtime_recovery_endpoints_reject_invalid_states() -> anyhow::
         "error_kind": "configuration",
         "failure_reason": "Workflow config is invalid."
     }));
+    let failed_fatal = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:61"),
+    )
+    .with_id("runtime-failed-61")
+    .with_data(serde_json::json!({
+        "last_stop": {
+            "state": "failed",
+            "error_kind": "fatal"
+        },
+        "failure_reason": "Runtime envelope was invalid."
+    }));
     let prompt_blocked = harness_workflow::runtime::WorkflowInstance::new(
         harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
         1,
@@ -903,6 +917,7 @@ async fn workflow_runtime_recovery_endpoints_reject_invalid_states() -> anyhow::
     .with_id("runtime-prompt-blocked-60");
     store.upsert_instance(&blocked).await?;
     store.upsert_instance(&failed_configuration).await?;
+    store.upsert_instance(&failed_fatal).await?;
     store.upsert_instance(&prompt_blocked).await?;
     let app = Router::new()
         .route(
@@ -984,6 +999,53 @@ async fn workflow_runtime_recovery_endpoints_reject_invalid_states() -> anyhow::
     assert_eq!(updated.state, "failed");
     assert!(updated.data.get("last_operator_recovery").is_none());
 
+    let retry_fatal = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/retry")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "workflow_id": "runtime-failed-61",
+                        "reason": "operator requested retry"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(retry_fatal.status(), StatusCode::CONFLICT);
+    let body = response_json(retry_fatal).await?;
+    assert_eq!(body["error"], "workflow failure is not retryable");
+    assert_eq!(body["error_kind"], "fatal");
+    let updated = store
+        .get_instance("runtime-failed-61")
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "failed");
+    assert!(updated.data.get("last_operator_recovery").is_none());
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/unblock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "workflow_id": "runtime-missing-62",
+                        "reason": "operator supplied input"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let body = response_json(missing).await?;
+    assert_eq!(body["error"], "workflow not found");
+
     let unsupported = app
         .oneshot(
             Request::builder()
@@ -1012,6 +1074,43 @@ async fn workflow_runtime_recovery_endpoints_reject_invalid_states() -> anyhow::
         .expect("workflow should still exist");
     assert_eq!(updated.state, "blocked");
     assert!(updated.data.get("last_operator_recovery").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_recovery_endpoints_report_unavailable_store() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_read_only_route_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/unblock",
+            post(task_mutation_routes::unblock_workflow_runtime),
+        )
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/unblock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "workflow_id": "runtime-blocked-63",
+                        "reason": "operator supplied input"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await?;
+    assert_eq!(body["error"], "workflow runtime store unavailable");
     Ok(())
 }
 
