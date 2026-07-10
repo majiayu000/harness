@@ -263,7 +263,7 @@ async fn recover_workflow_runtime(
             action,
             reason,
             actor: "operator",
-            next_state: "discovered",
+            next_state: "implementing",
         })
         .await
     {

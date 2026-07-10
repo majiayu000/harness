@@ -29,6 +29,26 @@ fn accepts_replan_decision_from_plan_issue() {
 }
 
 #[test]
+fn accepts_operator_recovery_from_blocked_issue_to_implementation() {
+    let instance = issue_instance("blocked");
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "blocked",
+        "operator_runtime_unblock",
+        "implementing",
+        "operator requested workflow runtime unblock",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "operator-recovery:issue-123",
+    ));
+
+    DecisionValidator::github_issue_pr()
+        .validate(&instance, &decision, &validation_context())
+        .expect("operator recovery should re-dispatch blocked issue workflows");
+}
+
+#[test]
 fn rejects_decision_with_stale_observed_state() {
     let instance = issue_instance("implementing");
     let decision = WorkflowDecision::new(

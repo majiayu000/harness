@@ -732,13 +732,13 @@ async fn workflow_runtime_unblock_endpoint_reopens_blocked_workflow() -> anyhow:
     assert_eq!(body["execution_path"], "workflow_runtime");
     assert_eq!(body["workflow_id"], "runtime-blocked-56");
     assert_eq!(body["previous_state"], "blocked");
-    assert_eq!(body["state"], "discovered");
+    assert_eq!(body["state"], "implementing");
 
     let updated = store
         .get_instance("runtime-blocked-56")
         .await?
         .expect("workflow should still exist");
-    assert_eq!(updated.state, "discovered");
+    assert_eq!(updated.state, "implementing");
     assert_eq!(
         updated.data["blocked_reason"],
         "Waiting for maintainer approval."
@@ -756,8 +756,26 @@ async fn workflow_runtime_unblock_endpoint_reopens_blocked_workflow() -> anyhow:
     assert!(events.iter().any(|event| {
         event.event_type == "WorkflowRuntimeUnblocked"
             && event.event["previous_state"] == "blocked"
-            && event.event["state"] == "discovered"
+            && event.event["state"] == "implementing"
     }));
+    let decisions = store.decisions_for("runtime-blocked-56").await?;
+    assert!(decisions.iter().any(|record| {
+        record.accepted
+            && record.decision.observed_state == "blocked"
+            && record.decision.next_state == "implementing"
+            && record.decision.decision == "operator_runtime_unblock"
+    }));
+    let commands = store.commands_for("runtime-blocked-56").await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].status,
+        harness_workflow::runtime::WorkflowCommandStatus::Pending
+    );
+    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    assert_eq!(
+        commands[0].command.command["dispatch_gate"]["reason"],
+        "operator_workflow_runtime_unblock"
+    );
     Ok(())
 }
 
@@ -820,17 +838,28 @@ async fn workflow_runtime_retry_endpoint_reopens_retryable_failed_workflow() -> 
     let body = response_json(response).await?;
     assert_eq!(body["status"], "retried");
     assert_eq!(body["previous_state"], "failed");
-    assert_eq!(body["state"], "discovered");
+    assert_eq!(body["state"], "implementing");
     let updated = store
         .get_instance("runtime-failed-57")
         .await?
         .expect("workflow should still exist");
-    assert_eq!(updated.state, "discovered");
+    assert_eq!(updated.state, "implementing");
     assert_eq!(updated.data["last_operator_recovery"]["action"], "retry");
     let events = store.events_for("runtime-failed-57").await?;
     assert!(events
         .iter()
         .any(|event| event.event_type == "WorkflowRuntimeRetried"));
+    let commands = store.commands_for("runtime-failed-57").await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].status,
+        harness_workflow::runtime::WorkflowCommandStatus::Pending
+    );
+    assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
+    assert_eq!(
+        commands[0].command.command["dispatch_gate"]["reason"],
+        "operator_workflow_runtime_retry"
+    );
     Ok(())
 }
 

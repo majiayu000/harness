@@ -1,9 +1,14 @@
 use super::{
-    insert_event_tx, select_instance_for_update_tx, upsert_instance_tx, WorkflowInstance,
-    WorkflowRuntimeStore,
+    command_store, insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx,
+    upsert_instance_tx, validator_for_definition, WorkflowInstance, WorkflowRuntimeStore,
 };
-use crate::runtime::model::ActivityErrorKind;
+use crate::runtime::model::{
+    ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
+    WorkflowDecisionRecord,
+};
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
+use crate::runtime::status::WorkflowCommandStatus;
+use crate::runtime::validator::ValidationContext;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +132,41 @@ impl WorkflowRuntimeStore {
         )
         .await?;
 
+        let decision = recovery_dispatch_decision(
+            &instance,
+            request.action,
+            request.reason,
+            &previous_state,
+            request.next_state,
+            &event.id,
+        );
+        let Some(validator) = validator_for_definition(&instance.definition_id) else {
+            anyhow::bail!(
+                "workflow runtime recovery cannot validate definition {}",
+                instance.definition_id
+            );
+        };
+        let validation_context = if instance.is_terminal() {
+            ValidationContext::new("workflow_runtime_operator_action", event.created_at)
+                .allow_terminal_reopen()
+        } else {
+            ValidationContext::new("workflow_runtime_operator_action", event.created_at)
+        };
+        validator.validate(&instance, &decision, &validation_context)?;
+        let decision_record =
+            WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()));
+        insert_decision_record_tx(&mut tx, &decision_record).await?;
+        for command in &decision.commands {
+            command_store::insert_tx(
+                &mut tx,
+                &instance.id,
+                Some(&decision_record.id),
+                command,
+                WorkflowCommandStatus::Pending,
+            )
+            .await?;
+        }
+
         instance.state = request.next_state.to_string();
         instance.version = instance.version.saturating_add(1);
         instance.lease = None;
@@ -177,9 +217,74 @@ fn persist_operator_recovery_data(
     }
 }
 
+fn recovery_dispatch_decision(
+    instance: &WorkflowInstance,
+    action: WorkflowRuntimeRecoveryAction,
+    reason: &str,
+    previous_state: &str,
+    next_state: &str,
+    event_id: &str,
+) -> WorkflowDecision {
+    WorkflowDecision::new(
+        &instance.id,
+        previous_state,
+        format!("operator_runtime_{}", action.as_str()),
+        next_state,
+        format!(
+            "operator requested workflow runtime {} after resolving the stopped condition",
+            action.as_str()
+        ),
+    )
+    .with_command(recovery_dispatch_command(
+        instance, action, reason, event_id,
+    ))
+}
+
+fn recovery_dispatch_command(
+    instance: &WorkflowInstance,
+    action: WorkflowRuntimeRecoveryAction,
+    reason: &str,
+    event_id: &str,
+) -> WorkflowCommand {
+    let remote_fact_hash = optional_string_field(&instance.data, "last_remote_fact_hash");
+    let dispatch_fact_hash = remote_fact_hash.clone();
+    WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        format!(
+            "operator-recovery:{}:{}:{}",
+            action.as_str(),
+            instance.id,
+            event_id
+        ),
+        json!({
+            "activity": "implement_issue",
+            "additional_prompt": format!(
+                "Operator requested workflow runtime {} after resolving the stopped condition. Recovery reason: {}",
+                action.as_str(),
+                reason
+            ),
+            "dispatch_gate": {
+                "reason": format!("operator_workflow_runtime_{}", action.as_str()),
+                "fact_hash": dispatch_fact_hash,
+            },
+            "remote_fact_hash": remote_fact_hash,
+            "submission_mode": optional_string_field(&instance.data, "submission_mode")
+                .unwrap_or_else(|| "immediate".to_string()),
+        }),
+    )
+}
+
 fn stopped_error_kind(data: &Value) -> Option<ActivityErrorKind> {
     data.get("error_kind")
         .cloned()
         .or_else(|| data.pointer("/last_stop/error_kind").cloned())
         .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn optional_string_field(data: &Value, field: &str) -> Option<String> {
+    data.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
