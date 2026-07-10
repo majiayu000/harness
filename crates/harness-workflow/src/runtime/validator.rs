@@ -131,6 +131,12 @@ impl TransitionAllowlist {
             .allow("failed", "scheduled", [EnqueueActivity, Wait])
             .allow("failed", "planning", [EnqueueActivity, Wait])
             .allow("failed", "implementing", [EnqueueActivity, Wait])
+            // Operator recovery (GH-1567): unblock re-dispatches a stopped issue
+            // workflow back into planning/implementing, mirroring the failed→
+            // recovery transitions above.
+            .allow("blocked", "scheduled", [EnqueueActivity, Wait])
+            .allow("blocked", "planning", [EnqueueActivity, Wait])
+            .allow("blocked", "implementing", [EnqueueActivity, Wait])
             .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
             .allow("cancelled", "planning", [EnqueueActivity, Wait])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])

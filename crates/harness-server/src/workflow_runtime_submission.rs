@@ -28,6 +28,8 @@ mod commit;
 mod dependencies;
 #[path = "workflow_runtime_submission/prompt_memory.rs"]
 mod prompt_memory;
+#[path = "workflow_runtime_submission/recover.rs"]
+mod recover;
 #[path = "workflow_runtime_submission/replay.rs"]
 mod replay;
 
@@ -51,6 +53,10 @@ use prompt_memory::{
 pub(crate) use prompt_memory::{
     lookup_prompt_submission_prompt, lookup_prompt_submission_prompt_durable,
     remove_terminal_prompt_submission_payload,
+};
+pub(crate) use recover::{
+    retry_submission_by_workflow_id, unblock_submission_by_workflow_id, RuntimeRecoverError,
+    RuntimeRecoverOutcome,
 };
 
 pub(crate) struct PromptSubmissionRuntimeContext<'a> {
@@ -643,6 +649,10 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "workflow_runtime_submission/dependency_tests.rs"]
 mod dependency_tests;
+
+#[cfg(test)]
+#[path = "workflow_runtime_submission/recover_tests.rs"]
+mod recover_tests;
 
 #[cfg(test)]
 #[path = "workflow_runtime_submission/replay_tests.rs"]
