@@ -516,6 +516,14 @@ fn authed_app(state: Arc<AppState>) -> Router {
         .route("/dashboard", get(crate::dashboard::index))
         .route("/health", get(health_check))
         .route("/tasks", get(list_tasks))
+        .route(
+            "/api/workflows/runtime/unblock",
+            axum::routing::post(task_mutation_routes::unblock_workflow_runtime),
+        )
+        .route(
+            "/api/workflows/runtime/retry",
+            axum::routing::post(task_mutation_routes::retry_workflow_runtime),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::api_auth_middleware,
@@ -575,6 +583,43 @@ async fn query_param_token_rejected_on_protected_endpoint() -> anyhow::Result<()
             Request::builder()
                 .uri("/tasks?token=secret123")
                 .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_recovery_routes_require_bearer_auth() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.api_token = Some("secret123".to_string());
+    let state = make_read_only_route_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = authed_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/unblock")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "workflow_id": "runtime-blocked-1",
+                        "reason": "operator supplied input"
+                    })
+                    .to_string(),
+                ))?,
         )
         .await?;
 

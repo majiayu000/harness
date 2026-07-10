@@ -132,6 +132,7 @@ pub use status::WorkflowCommandStatus;
 pub use store::{
     RuntimeHistoryPruneSummary, RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert,
     RuntimeUsageUpsertOutcome, WorkflowDecisionTransition, WorkflowRejectedDecisionTransition,
+    WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
     WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload,
 };
