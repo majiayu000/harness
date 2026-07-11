@@ -508,7 +508,7 @@ async fn intake_status_disables_feishu_when_verification_token_missing() -> anyh
 }
 
 /// Build a minimal router that includes the auth middleware, mirroring how the
-/// real server wires up the dashboard and tasks endpoints.
+/// real server wires up the dashboard, tasks, and runtime operator endpoints.
 fn authed_app(state: Arc<AppState>) -> Router {
     use axum::middleware;
     Router::new()
@@ -516,6 +516,10 @@ fn authed_app(state: Arc<AppState>) -> Router {
         .route("/dashboard", get(crate::dashboard::index))
         .route("/health", get(health_check))
         .route("/tasks", get(list_tasks))
+        .route(
+            "/api/workflows/runtime/unblock",
+            post(task_mutation_routes::unblock_workflow_runtime),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::api_auth_middleware,
@@ -573,7 +577,8 @@ async fn query_param_token_rejected_on_protected_endpoint() -> anyhow::Result<()
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/tasks?token=secret123")
+                .method("POST")
+                .uri("/api/workflows/runtime/unblock?token=secret123")
                 .body(Body::empty())?,
         )
         .await?;

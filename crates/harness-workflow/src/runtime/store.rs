@@ -24,12 +24,17 @@ use std::path::Path;
 mod command_store;
 #[path = "store/instances.rs"]
 mod instances;
+#[path = "store/recovery.rs"]
+mod recovery;
 #[path = "store/runtime_completion.rs"]
 mod runtime_completion;
 #[path = "store/runtime_usage.rs"]
 mod runtime_usage;
 #[path = "store/submission_commit.rs"]
 mod submission_commit;
+pub use recovery::{
+    WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
+};
 pub use runtime_usage::{
     RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
 };

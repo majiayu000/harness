@@ -4,6 +4,9 @@ use crate::workflow_runtime_submission::{
 };
 use axum::{extract::State, http::StatusCode, Json};
 use harness_workflow::issue_lifecycle::IssueMergeApprovalOutcome;
+use harness_workflow::runtime::{
+    WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -16,6 +19,12 @@ pub(super) struct WorkflowRuntimeMergeRequest {
 #[derive(Debug, Deserialize)]
 pub(super) struct WorkflowRuntimeCancelRequest {
     pub workflow_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkflowRuntimeRecoveryRouteRequest {
+    pub workflow_id: String,
+    pub reason: String,
 }
 
 /// POST /tasks/{id}/merge — human-gate approval to transition a `ready_to_merge`
@@ -206,6 +215,141 @@ pub(super) async fn cancel_workflow_runtime(
             )
         }
     }
+}
+
+pub(super) async fn unblock_workflow_runtime(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WorkflowRuntimeRecoveryRouteRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    recover_workflow_runtime(state, request, WorkflowRuntimeRecoveryAction::Unblock).await
+}
+
+pub(super) async fn retry_workflow_runtime(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WorkflowRuntimeRecoveryRouteRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    recover_workflow_runtime(state, request, WorkflowRuntimeRecoveryAction::Retry).await
+}
+
+async fn recover_workflow_runtime(
+    state: Arc<AppState>,
+    request: WorkflowRuntimeRecoveryRouteRequest,
+    action: WorkflowRuntimeRecoveryAction,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let workflow_id = request.workflow_id.trim();
+    if workflow_id.is_empty() {
+        return runtime_recovery_error(StatusCode::BAD_REQUEST, "workflow_id is required");
+    }
+    let reason = request.reason.trim();
+    if reason.is_empty() {
+        return runtime_recovery_error(StatusCode::BAD_REQUEST, "reason is required");
+    }
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return runtime_recovery_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workflow runtime store unavailable",
+        );
+    };
+
+    match store
+        .recover_stopped_instance(WorkflowRuntimeRecoveryRequest {
+            workflow_id,
+            action,
+            reason,
+            actor: "operator",
+        })
+        .await
+    {
+        Ok(outcome) => runtime_recovery_response(action, outcome),
+        Err(error) => {
+            tracing::error!(
+                action = action.as_str(),
+                "recover_workflow_runtime: recovery failed: {error}"
+            );
+            runtime_recovery_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to recover workflow runtime submission",
+            )
+        }
+    }
+}
+
+fn runtime_recovery_error(
+    status: StatusCode,
+    error: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(json!({ "error": error })))
+}
+
+fn runtime_recovery_response(
+    action: WorkflowRuntimeRecoveryAction,
+    outcome: WorkflowRuntimeRecoveryOutcome,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, body) = match outcome {
+        WorkflowRuntimeRecoveryOutcome::Recovered {
+            workflow,
+            previous_state,
+            ..
+        } => (
+            StatusCode::OK,
+            json!({
+                "status": match action {
+                    WorkflowRuntimeRecoveryAction::Unblock => "unblocked",
+                    WorkflowRuntimeRecoveryAction::Retry => "retried",
+                },
+                "execution_path": "workflow_runtime",
+                "workflow_id": workflow.id,
+                "previous_state": previous_state,
+                "state": workflow.state,
+            }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::WrongState { workflow } => (
+            StatusCode::CONFLICT,
+            json!({
+                "error": match action {
+                    WorkflowRuntimeRecoveryAction::Unblock => "workflow not in blocked state",
+                    WorkflowRuntimeRecoveryAction::Retry => "workflow not in failed state",
+                },
+                "workflow_id": workflow.id,
+                "state": workflow.state,
+            }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
+            workflow,
+            error_kind,
+        } => (
+            StatusCode::CONFLICT,
+            json!({
+                "error": "workflow failure is not retryable",
+                "workflow_id": workflow.id,
+                "state": workflow.state,
+                "error_kind": error_kind,
+            }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { workflow, activity } => (
+            StatusCode::CONFLICT,
+            json!({
+                "error": "workflow runtime recovery cannot determine a supported stopped activity",
+                "workflow_id": workflow.id,
+                "state": workflow.state,
+                "last_stop_activity": activity,
+            }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition { workflow } => (
+            StatusCode::CONFLICT,
+            json!({
+                "error": "workflow runtime recovery supports only GitHub issue PR workflows",
+                "workflow_id": workflow.id,
+                "definition_id": workflow.definition_id,
+                "state": workflow.state,
+            }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            json!({ "error": "workflow not found" }),
+        ),
+    };
+    (status, Json(body))
 }
 
 async fn merge_runtime_task_handle(

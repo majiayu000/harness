@@ -88,6 +88,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(task_mutation_routes::cancel_workflow_runtime),
         )
         .route(
+            "/api/workflows/runtime/unblock",
+            post(task_mutation_routes::unblock_workflow_runtime),
+        )
+        .route(
+            "/api/workflows/runtime/retry",
+            post(task_mutation_routes::retry_workflow_runtime),
+        )
+        .route(
             "/api/projects/{id}/memory",
             get(crate::handlers::repo_memory_api::list_project_repo_memory_route),
         )
