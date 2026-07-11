@@ -65,6 +65,12 @@ Classification table (initial):
 | `error_kind`: `fatal`, `configuration`, `unknown` | Terminal |
 | both absent / legacy rows | Terminal (B-002, B-014) |
 
+Naming note: the `error_kind` rows list the snake_case wire/serde codes;
+in Rust they are the corresponding `ActivityErrorKind` PascalCase variants
+(e.g. `retryable` ↔ `ActivityErrorKind::Retryable`). `classify_stop` takes
+the enum; the snake_case forms appear only in persisted JSON and audit
+events.
+
 `runtime_blocked_payload` / `runtime_failed_payload` (`support.rs:150`, `:163`)
 gain an optional `stop_reason_code` parameter threaded from decision sites and
 persist `stop_reason_code` + derived `reason_class` into instance data and
@@ -88,8 +94,10 @@ tick_interval_secs = 60
 
 Plus per-repo `auto_recovery: Option<bool>` on `GitHubRepoConfig` (mirrors
 `intake.rs:18`); effective policy = repo override else global flag. Validation
-at load (B-016): when enabled, `max_attempts >= 1`,
+at load (B-016): when enabled, `1 <= max_attempts <= 16`,
 `initial_backoff_secs <= max_backoff_secs`, `jitter_ratio` in `[0, 1]`.
+The `max_attempts <= 16` bound plus saturating arithmetic in the backoff
+computation (below) rules out integer overflow in `2^attempts`.
 
 ### 3. Attempt state (persisted in instance data)
 
@@ -123,17 +131,25 @@ Each tick:
 2. Skip unless `classify_stop(...) == Transient` (B-004, B-012).
 3. Skip if `next_attempt_at` is in the future or `attempts >= max_attempts`.
 4. Append an `AutoRecoveryAttempt` audit event (reason class, attempt number)
-   BEFORE any action (B-008), then run the recheck: re-read remote facts /
-   the transient condition where checkable, and call the existing
+   BEFORE any action (B-008). Crash consistency: an `AutoRecoveryAttempt`
+   with no matching outcome event for the same episode (server crashed or
+   the recheck hung between the two writes) is reconciled at the next tick —
+   the scheduler appends a synthetic `AutoRecoveryOutcome{interrupted}` and
+   counts the attempt as consumed, so a crash can neither orphan the audit
+   trail nor grant free retries beyond `max_attempts`. Then run the recheck:
+   re-read remote facts / the transient condition where checkable, and call
+   the existing
    `unblock_submission_by_workflow_id` / `retry_submission_by_workflow_id`
    (`recover.rs:77`, `:86`) with an automated actor reason such as
    `"auto-recovery attempt 2/3: rate_limited cooldown elapsed"` (B-005).
 5. Map outcomes: `Recovered` → append `AutoRecoveryOutcome{succeeded}`;
    `WrongState` → outcome `superseded`, stop scheduling, do not increment
    (B-009); recheck condition still failing → increment attempts, persist
-   `next_attempt_at = now + min(max, initial * 2^attempts) * (1 ± jitter)`,
-   outcome `recheck_failed` (B-015); store error → error-level log, no
-   counter consumption.
+   `next_attempt_at = now + min(max, initial.saturating_mul(1 << attempts))
+   * (1 ± jitter)` — with `attempts` bounded by `max_attempts <= 16` and
+   saturating multiplication, the shift cannot overflow — outcome
+   `recheck_failed` (B-015); store error → error-level log, no counter
+   consumption.
 6. On `attempts == max_attempts` with no success: append one
    `AutoRecoveryExhausted` event (idempotent per episode) for GH-1582
    alerting; instance stays stopped for the operator monitor (B-010).
