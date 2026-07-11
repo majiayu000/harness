@@ -38,7 +38,9 @@ pub(crate) fn runtime_issue_state_is_covered(state: &str) -> bool {
             | "awaiting_dependencies"
             | "scheduled"
             | "implementing"
+            | "replanning"
             | "pr_open"
+            | "local_review_gate"
             | "awaiting_feedback"
             | "feedback_claimed"
             | "addressing_feedback"
@@ -140,12 +142,13 @@ pub(crate) async fn check_github_issue_coverage(
 #[cfg(test)]
 mod tests {
     use harness_workflow::runtime::{
-        RuntimeKind, WorkflowCommand, WorkflowInstance, WorkflowRuntimeRecoveryAction,
-        WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowSubject,
-        GITHUB_ISSUE_PR_DEFINITION_ID,
+        RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowInstance,
+        WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
+        WorkflowRuntimeRecoveryRequest, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
     };
 
     use super::*;
+    use crate::task_runner::TaskId;
 
     #[test]
     fn lifecycle_coverage_includes_quiescent_and_terminal_states() {
@@ -164,10 +167,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_coverage_includes_ready_to_merge_and_blocked() {
+    fn runtime_coverage_includes_stopped_and_recovered_states() {
         assert!(runtime_issue_state_is_covered("ready_to_merge"));
         assert!(runtime_issue_state_is_covered("blocked"));
         assert!(runtime_issue_state_is_covered("failed"));
+        assert!(runtime_issue_state_is_covered("replanning"));
+        assert!(runtime_issue_state_is_covered("local_review_gate"));
         assert!(!runtime_issue_state_is_covered("unknown_scanning"));
     }
 
@@ -183,7 +188,9 @@ mod tests {
             Some(&crate::test_helpers::test_database_url()?),
         )
         .await?;
-        let project_id = "/project/github-coverage";
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let project_id = project_root.to_string_lossy().into_owned();
         let repo = "owner/repo";
 
         for (issue_number, stopped_state, action) in [
@@ -192,7 +199,7 @@ mod tests {
         ] {
             let workflow = store_stopped_replan_workflow(
                 &store,
-                project_id,
+                &project_id,
                 repo,
                 issue_number,
                 stopped_state,
@@ -200,7 +207,7 @@ mod tests {
             .await?;
 
             assert_eq!(
-                check_github_issue_coverage(None, Some(&store), project_id, repo, issue_number,)
+                check_github_issue_coverage(None, Some(&store), &project_id, repo, issue_number,)
                     .await?,
                 GitHubIssueCoverage::Covered {
                     source: "workflow_runtime",
@@ -221,10 +228,50 @@ mod tests {
                 WorkflowRuntimeRecoveryOutcome::Recovered { ref workflow, .. }
                     if workflow.state == "replanning"
             ));
+
+            let coverage =
+                check_github_issue_coverage(None, Some(&store), &project_id, repo, issue_number)
+                    .await?;
+            if coverage == GitHubIssueCoverage::Uncovered {
+                let task_id =
+                    TaskId::from_str(&format!("github-issue:{repo}:issue:{issue_number}"));
+                crate::workflow_runtime_submission::record_issue_submission(
+                    &store,
+                    crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+                        project_root: &project_root,
+                        repo: Some(repo),
+                        issue_number,
+                        task_id: &task_id,
+                        labels: &[],
+                        force_execute: true,
+                        additional_prompt: None,
+                        depends_on: &[],
+                        dependencies_blocked: false,
+                        source: Some("github"),
+                        external_id: Some("recovered-coverage-test"),
+                        remote_fact_hash: None,
+                        author_trust_class: None,
+                    },
+                )
+                .await?;
+            }
+
+            let pending_command_count = store
+                .commands_for(&workflow.id)
+                .await?
+                .into_iter()
+                .filter(|command| command.status == WorkflowCommandStatus::Pending)
+                .count();
             assert_eq!(
-                check_github_issue_coverage(None, Some(&store), project_id, repo, issue_number,)
-                    .await?,
-                GitHubIssueCoverage::Uncovered
+                pending_command_count, 1,
+                "the intake tick must not enqueue work beside the recovery replay"
+            );
+            assert_eq!(
+                coverage,
+                GitHubIssueCoverage::Covered {
+                    source: "workflow_runtime",
+                    state: "replanning".to_string(),
+                }
             );
         }
 

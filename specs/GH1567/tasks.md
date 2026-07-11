@@ -53,7 +53,10 @@ GH-1567
   requires URL-encoding tests.
 - Do not make `blocked` or `failed` globally uncovered in the coverage gate.
   The operator action should change the workflow state; the gate should then
-  observe that updated state.
+  observe that updated state. Recovery directly enqueues the replay command,
+  so resumed active states remain covered to prevent the next intake tick from
+  dispatching duplicate work; they are no longer covered by the old stopped
+  state.
 - Do not retry `cancelled` workflows in this issue.
 - Do not close GH-1567 until the implementation PRs satisfy the acceptance
   criteria, not merely this spec packet.
