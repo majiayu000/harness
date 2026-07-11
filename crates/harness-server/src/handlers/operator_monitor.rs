@@ -6,6 +6,7 @@
 //! worktrees.
 
 mod activity;
+mod sampling;
 
 use crate::http::AppState;
 use crate::runtime_projection::{
@@ -17,6 +18,7 @@ use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, 
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
+use sampling::{dedupe_workflows, list_operator_action_workflows, list_recent_failed_workflows};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::cmp::Reverse;
@@ -30,8 +32,7 @@ const MAX_OPERATOR_ACTIONS: usize = 40;
 const MAX_FAILURE_GROUPS: usize = 20;
 const MAX_RECENT_FAILURES: i64 = 100;
 const STALLED_AFTER_MINS: u64 = 30;
-const OPERATOR_ACTION_STATES: &[&str] =
-    &["ready_to_merge", "awaiting_feedback", "blocked", "failed"];
+const OPERATOR_ACTION_STATES: &[&str] = &["ready_to_merge", "awaiting_feedback", "blocked"];
 const WORKFLOW_DEFINITION_IDS: &[&str] = &[
     harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
     harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
@@ -351,9 +352,9 @@ async fn list_runtime_workflows(state: &AppState) -> anyhow::Result<Vec<Workflow
 async fn list_runtime_workflows_from_store(
     store: &WorkflowRuntimeStore,
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
-    let mut workflows = list_operator_action_workflows(store).await?;
-    workflows.extend(list_recent_failed_workflows(store, FAILED_WORKFLOW_SAMPLE_RESERVE).await?);
     let sample_limit = WORKFLOW_SAMPLE_LIMIT as usize;
+    let mut workflows = list_operator_action_workflows(store).await?;
+    workflows.extend(list_recent_failed_workflows(store, sample_limit).await?);
     for definition_id in WORKFLOW_DEFINITION_IDS {
         workflows.extend(
             store
@@ -404,48 +405,6 @@ fn truncate_workflow_sample(workflows: &mut Vec<WorkflowInstance>, limit: usize)
 
     selected.sort_by_key(|workflow| Reverse(workflow.updated_at));
     *workflows = selected;
-}
-
-async fn list_operator_action_workflows(
-    store: &WorkflowRuntimeStore,
-) -> anyhow::Result<Vec<WorkflowInstance>> {
-    let mut workflows = Vec::new();
-    for definition_id in WORKFLOW_DEFINITION_IDS {
-        for state in OPERATOR_ACTION_STATES {
-            workflows.extend(
-                store
-                    .list_recent_instances_by_state(definition_id, state, WORKFLOW_SAMPLE_LIMIT)
-                    .await?,
-            );
-        }
-    }
-    Ok(workflows)
-}
-
-fn dedupe_workflows(workflows: &mut Vec<WorkflowInstance>) {
-    let mut seen = HashSet::new();
-    workflows.retain(|workflow| seen.insert(workflow.id.clone()));
-}
-
-async fn list_recent_failed_workflows(
-    store: &WorkflowRuntimeStore,
-    capacity: usize,
-) -> anyhow::Result<Vec<WorkflowInstance>> {
-    if capacity == 0 {
-        return Ok(Vec::new());
-    }
-    let per_definition_limit = capacity.min(WORKFLOW_SAMPLE_LIMIT as usize) as i64;
-    let mut workflows = Vec::new();
-    for definition_id in WORKFLOW_DEFINITION_IDS {
-        workflows.extend(
-            store
-                .list_recent_instances_by_state(definition_id, "failed", per_definition_limit)
-                .await?,
-        );
-    }
-    workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
-    workflows.truncate(capacity);
-    Ok(workflows)
 }
 
 fn legacy_queue_counts(
