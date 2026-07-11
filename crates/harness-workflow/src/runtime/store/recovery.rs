@@ -45,47 +45,29 @@ impl WorkflowRuntimeRecoveryAction {
     }
 }
 
+#[rustfmt::skip]
 pub struct WorkflowRuntimeRecoveryRequest<'a> {
-    pub workflow_id: &'a str,
-    pub action: WorkflowRuntimeRecoveryAction,
-    pub reason: &'a str,
-    pub actor: &'a str,
+    pub workflow_id: &'a str, pub action: WorkflowRuntimeRecoveryAction, pub reason: &'a str, pub actor: &'a str,
 }
 
+#[rustfmt::skip]
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkflowRuntimeRecoveryOutcome {
-    Recovered {
-        workflow: WorkflowInstance,
-        previous_state: String,
-    },
-    WrongState {
-        workflow: WorkflowInstance,
-    },
-    NonRetryableFailure {
-        workflow: WorkflowInstance,
-        error_kind: ActivityErrorKind,
-    },
-    UnsupportedStoppedActivity {
-        workflow: WorkflowInstance,
-        activity: Option<String>,
-    },
-    UnsupportedDefinition {
-        workflow: WorkflowInstance,
-    },
+    Recovered { workflow: WorkflowInstance, previous_state: String },
+    WrongState { workflow: WorkflowInstance },
+    NonRetryableFailure { workflow: WorkflowInstance, error_kind: ActivityErrorKind },
+    UnsupportedStoppedActivity { workflow: WorkflowInstance, activity: Option<String> },
+    UnsupportedDefinition { workflow: WorkflowInstance },
     NotFound,
 }
 
+#[rustfmt::skip]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RecoveryDispatchTarget {
-    state: &'static str,
-    activity: &'static str,
-}
+struct RecoveryDispatchTarget { state: &'static str, activity: &'static str }
 
+#[rustfmt::skip]
 #[derive(Debug, Clone, PartialEq)]
-struct RecoveryDispatchPlan {
-    target: RecoveryDispatchTarget,
-    command_source: RecoveryDispatchCommandSource,
-}
+struct RecoveryDispatchPlan { target: RecoveryDispatchTarget, command_source: RecoveryDispatchCommandSource }
 
 #[derive(Debug, Clone, PartialEq)]
 enum RecoveryDispatchCommandSource {
@@ -593,16 +575,8 @@ fn recovery_dispatch_command(
     WorkflowCommand::new(WorkflowCommandType::EnqueueActivity, dedupe_key, payload)
 }
 
-const RECOVERY_CONTEXT_FIELDS: &[&str] = &[
-    "project_id",
-    "repo",
-    "issue_number",
-    "pr_number",
-    "pr_url",
-    "task_id",
-    "source",
-    "external_id",
-];
+#[rustfmt::skip]
+const RECOVERY_CONTEXT_FIELDS: &[&str] = &["project_id", "repo", "issue_number", "pr_number", "pr_url", "task_id", "source", "external_id"];
 
 fn stopped_error_kind(data: &Value) -> anyhow::Result<Option<ActivityErrorKind>> {
     let root = optional_error_kind(data.get("error_kind"), "error_kind")?;

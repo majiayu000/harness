@@ -352,47 +352,6 @@ fn runtime_recovery_response(
     (status, Json(body))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use harness_workflow::runtime::{
-        ActivityErrorKind, WorkflowInstance, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
-    };
-
-    #[test]
-    fn runtime_recovery_response_reports_wrong_state_and_nonretryable_failure() {
-        let (status, Json(body)) = runtime_recovery_response(
-            WorkflowRuntimeRecoveryAction::Retry,
-            WorkflowRuntimeRecoveryOutcome::WrongState {
-                workflow: issue_workflow("blocked"),
-            },
-        );
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "workflow not in failed state");
-        assert_eq!(body["state"], "blocked");
-
-        let (status, Json(body)) = runtime_recovery_response(
-            WorkflowRuntimeRecoveryAction::Retry,
-            WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
-                workflow: issue_workflow("failed"),
-                error_kind: ActivityErrorKind::Configuration,
-            },
-        );
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "workflow failure is not retryable");
-        assert_eq!(body["error_kind"], "configuration");
-    }
-
-    fn issue_workflow(state: &str) -> WorkflowInstance {
-        WorkflowInstance::new(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
-            state,
-            WorkflowSubject::new("issue", "issue:59"),
-        )
-    }
-}
-
 async fn merge_runtime_task_handle(
     state: &AppState,
     task_id: &str,

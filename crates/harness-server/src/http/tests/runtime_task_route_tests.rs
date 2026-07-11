@@ -1,5 +1,11 @@
 use super::*;
-use harness_workflow::issue_lifecycle::IssueLifecycleState;
+use harness_workflow::{
+    issue_lifecycle::IssueLifecycleState,
+    runtime::{
+        RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowInstance,
+        WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    },
+};
 
 #[tokio::test]
 async fn list_tasks_marks_runtime_submission_summaries_degraded_when_store_failed(
@@ -671,6 +677,78 @@ async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Re
     assert_eq!(body["error"], "workflow already terminal");
     assert_eq!(body["state"], "cancelled");
     Ok(())
+}
+
+#[rustfmt::skip]
+#[tokio::test]
+async fn workflow_runtime_recovery_endpoints_cover_contract() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await { return Ok(()); }
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state.core.workflow_runtime_store.as_ref().expect("workflow runtime store should be configured");
+    let app = recovery_route_app(state.clone());
+
+    for (route, state_name, status, issue_number) in [("/api/workflows/runtime/unblock", "blocked", "unblocked", 56), ("/api/workflows/runtime/retry", "failed", "retried", 57)] {
+        let workflow_id = format!("runtime-{state_name}-{issue_number}");
+        let mut data = serde_json::json!({"issue_number": issue_number});
+        if state_name == "failed" { data["error_kind"] = serde_json::json!("timeout"); }
+        let workflow = route_issue_workflow(&workflow_id, state_name, issue_number, data.clone());
+        store.upsert_instance(&workflow).await?;
+        let original = WorkflowCommand::new(WorkflowCommandType::EnqueueActivity, format!("{workflow_id}-original"), serde_json::json!({"activity": "implement_issue", "repo": "owner/repo", "issue_number": issue_number}));
+        let runtime_job_id = enqueue_route_test_runtime_job(store, &workflow.id, &original).await?;
+        data["last_stop"] = serde_json::json!({"state": state_name, "activity": "implement_issue", "runtime_job_id": runtime_job_id});
+        if state_name == "failed" { data["last_stop"]["error_kind"] = serde_json::json!("timeout"); }
+        store.upsert_instance(&workflow.with_data(data)).await?;
+        let response = post_runtime_recovery(app.clone(), route, &workflow_id).await?;
+        let actual = response.status(); let body = response_json(response).await?;
+        assert_eq!(actual, StatusCode::OK); assert_eq!(body["status"], status); assert_eq!(body["state"], "implementing"); assert_eq!(store.get_instance(&workflow_id).await?.unwrap().state, "implementing");
+        let commands = store.commands_for(&workflow_id).await?;
+        let replayed = commands.iter().find(|command| command.status == WorkflowCommandStatus::Pending).expect("replayed recovery command should be pending");
+        assert_eq!(replayed.command.command, original.command);
+    }
+
+    for workflow in [route_issue_workflow("runtime-blocked-58", "blocked", 58, serde_json::json!({})), route_issue_workflow("runtime-failed-59", "failed", 59, serde_json::json!({"error_kind": "configuration"}))] {
+        store.upsert_instance(&workflow).await?;
+    }
+    for (route, workflow_id, code, error, field, value) in [
+        ("/api/workflows/runtime/retry", "runtime-missing-60", StatusCode::NOT_FOUND, "workflow not found", "error", "workflow not found"),
+        ("/api/workflows/runtime/retry", "runtime-blocked-58", StatusCode::CONFLICT, "workflow not in failed state", "state", "blocked"),
+        ("/api/workflows/runtime/retry", "runtime-failed-59", StatusCode::CONFLICT, "workflow failure is not retryable", "error_kind", "configuration"),
+    ] {
+        let response = post_runtime_recovery(app.clone(), route, workflow_id).await?;
+        let actual = response.status(); let body = response_json(response).await?;
+        assert_eq!(actual, code); assert_eq!(body["error"], error); assert_eq!(body[field], value);
+    }
+
+    let unavailable = make_read_only_route_test_state(dir.path()).await?;
+    let response = post_runtime_recovery(recovery_route_app(unavailable), "/api/workflows/runtime/retry", "runtime-blocked-58").await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response_json(response).await?["error"], "workflow runtime store unavailable");
+    Ok(())
+}
+
+#[rustfmt::skip]
+fn recovery_route_app(state: Arc<AppState>) -> Router {
+    Router::new().route("/api/workflows/runtime/unblock", post(task_mutation_routes::unblock_workflow_runtime)).route("/api/workflows/runtime/retry", post(task_mutation_routes::retry_workflow_runtime)).with_state(state)
+}
+
+#[rustfmt::skip]
+fn route_issue_workflow(workflow_id: &str, state: &str, issue_number: u64, data: serde_json::Value) -> WorkflowInstance {
+    WorkflowInstance::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, state, WorkflowSubject::new("issue", format!("issue:{issue_number}"))).with_id(workflow_id).with_data(data)
+}
+
+#[rustfmt::skip]
+async fn post_runtime_recovery(app: Router, route: &str, workflow_id: &str) -> anyhow::Result<axum::response::Response> {
+    Ok(app.oneshot(Request::builder().method("POST").uri(route).header("content-type", "application/json").body(Body::from(serde_json::json!({"workflow_id": workflow_id, "reason": "operator supplied input"}).to_string()))?).await?)
+}
+
+#[rustfmt::skip]
+async fn enqueue_route_test_runtime_job(store: &WorkflowRuntimeStore, workflow_id: &str, command: &WorkflowCommand) -> anyhow::Result<String> {
+    let command_id = store.enqueue_command(workflow_id, None, command).await?;
+    match store.enqueue_runtime_job_for_pending_command(&command_id, RuntimeKind::CodexJsonrpc, "codex-default", command.command.clone(), None).await? {
+        harness_workflow::runtime::store::RuntimeJobEnqueueOutcome::Enqueued(job) => Ok(job.id),
+        other => anyhow::bail!("expected route test runtime job, got {other:?}"),
+    }
 }
 
 #[tokio::test]
