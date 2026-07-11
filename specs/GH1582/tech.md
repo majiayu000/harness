@@ -79,7 +79,7 @@ interval_secs = 60
 `AlertingConfig` gets a `validate()` called from config load (B-002),
 following the `FeishuIntakeConfig` env-fallback pattern for secrets.
 New field `pub alerting: AlertingConfig` on `HarnessConfig`
-(`#[serde(default)]`, B-019 compat).
+(`#[serde(default)]`, B-001 compat: existing TOML files parse unchanged).
 
 ### Contract (harness-core)
 
@@ -124,7 +124,7 @@ pub struct AlertPayload {
   `slack.rs` (payload -> Slack blocks text), `feishu.rs` (payload ->
   Feishu text message). The Feishu adapter reuses the tenant-token flow;
   extract `get_tenant_access_token`/`send_message` from
-  `intake/feishu.rs:58-99` into a shared `feishu_client` helper used by
+  `intake/feishu.rs:58-102` into a shared `feishu_client` helper used by
   both intake and alerting (single source, no duplicate client).
 - Placement rationale: harness-observe is storage/export only; the
   dispatcher needs `AppState`, config, and the Feishu client, so it lives
@@ -137,8 +137,8 @@ pub struct AlertPayload {
 | Retry exhaustion / stuck | `periodic_retry.rs:131` else-branch and stuck escalation around `:339` | `task_failure_exhausted` |
 | Workflow blocked/failed | runtime store state transitions (workflow runtime; exact transition sites to locate in `harness-workflow` runtime store during T006) | `workflow_blocked` / `workflow_failed` |
 | Circuit breaker | where `CircuitBreakerEventKind::Opened` events are persisted (`runtime_circuit_breaker.rs:275` consumers) | `circuit_breaker_open` |
-| Reconciliation | anomaly transitions in `reconciliation.rs`; aging via existing TTL fields (`reconciliation.rs:68-69`, B-019) | `reconciliation_anomaly` / `ready_to_merge_aging` |
-| Notify drops | `notify.rs:29` `record_drop` — upgrade to `tracing::error!` + structured event; when alerting enabled, sustained drops raise `notify_channel_drop` (rate-limited by dedup) | `notify_channel_drop` |
+| Reconciliation | anomaly transitions in `reconciliation.rs`; aging via existing TTL fields (`reconciliation.rs:68-69`, B-019). The once-per-TTL bound is enforced by the dispatcher's dedup machinery (B-010), not by reconciliation state: `ready_to_merge_open_alert` stays a non-destructive check, and the producer raises with `dedup_key = "<class>:<pr_url>"` and `cooldown = ready_to_merge_alert_ttl_secs`, so repeated sweeps within the window are suppressed without persisting a last-alerted timestamp | `reconciliation_anomaly` / `ready_to_merge_aging` |
+| Notify drops | `notify.rs:29` `record_drop` — upgrade to `tracing::error!` + structured event. `notify.rs` stays low-level with no `AppState`/dispatcher dependency: the alerting module owns a small watcher task that periodically reads the existing static drop counter and raises `notify_channel_drop` when the count advanced since the last poll (rate-limited by dedup). No new coupling from `notify.rs` toward alerting | `notify_channel_drop` |
 
 ### Data Flow
 
