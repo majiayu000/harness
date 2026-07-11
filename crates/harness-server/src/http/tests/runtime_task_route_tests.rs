@@ -699,6 +699,7 @@ async fn workflow_runtime_unblock_endpoint_reopens_blocked_workflow() -> anyhow:
         "blocked_reason": "Waiting for maintainer approval.",
         "last_stop": {
             "state": "blocked",
+            "activity": "implement_issue",
             "runtime_job_id": "job-blocked-56"
         }
     }));
@@ -806,6 +807,7 @@ async fn workflow_runtime_retry_endpoint_reopens_retryable_failed_workflow() -> 
         "error_kind": "timeout",
         "last_stop": {
             "state": "failed",
+            "activity": "implement_issue",
             "runtime_job_id": "job-failed-57",
             "error_kind": "timeout"
         }

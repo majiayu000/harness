@@ -53,7 +53,6 @@ pub struct WorkflowRuntimeRecoveryRequest<'a> {
     pub action: WorkflowRuntimeRecoveryAction,
     pub reason: &'a str,
     pub actor: &'a str,
-    pub next_state: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,10 +69,20 @@ pub enum WorkflowRuntimeRecoveryOutcome {
         workflow: WorkflowInstance,
         error_kind: ActivityErrorKind,
     },
+    UnsupportedStoppedActivity {
+        workflow: WorkflowInstance,
+        activity: Option<String>,
+    },
     UnsupportedDefinition {
         workflow: WorkflowInstance,
     },
     NotFound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryDispatchTarget {
+    state: &'static str,
+    activity: &'static str,
 }
 
 impl WorkflowRuntimeStore {
@@ -91,6 +100,10 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(outcome);
         }
+        if let Err(activity) = recovery_dispatch_target(&snapshot.data) {
+            tx.commit().await?;
+            return Ok(unsupported_stopped_activity(&snapshot, activity));
+        }
 
         let (superseded_command_count, superseded_runtime_job_count) =
             skip_superseded_active_commands_tx(&mut tx, &snapshot.id).await?;
@@ -106,6 +119,13 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(outcome);
         }
+        let target = match recovery_dispatch_target(&instance.data) {
+            Ok(target) => target,
+            Err(activity) => {
+                tx.rollback().await?;
+                return Ok(unsupported_stopped_activity(&instance, activity));
+            }
+        };
         let previous_state = instance.state.clone();
 
         let event = insert_event_tx(
@@ -119,7 +139,7 @@ impl WorkflowRuntimeStore {
                 "reason": request.reason,
                 "actor": request.actor,
                 "previous_state": previous_state,
-                "state": request.next_state,
+                "state": target.state,
                 "superseded_command_count": superseded_command_count,
                 "superseded_runtime_job_count": superseded_runtime_job_count,
             }),
@@ -131,7 +151,7 @@ impl WorkflowRuntimeStore {
             request.action,
             request.reason,
             &previous_state,
-            request.next_state,
+            target,
             &event.id,
         );
         let Some(validator) = validator_for_definition(&instance.definition_id) else {
@@ -161,7 +181,7 @@ impl WorkflowRuntimeStore {
             .await?;
         }
 
-        instance.state = request.next_state.to_string();
+        instance.state = target.state.to_string();
         instance.version = instance.version.saturating_add(1);
         instance.lease = None;
         persist_operator_recovery_data(
@@ -170,7 +190,7 @@ impl WorkflowRuntimeStore {
             request.reason,
             request.actor,
             &previous_state,
-            request.next_state,
+            target.state,
             &event.id,
         );
         upsert_instance_tx(&mut tx, &instance).await?;
@@ -229,6 +249,55 @@ fn recovery_rejection(
     }
 
     None
+}
+
+fn recovery_dispatch_target(data: &Value) -> Result<RecoveryDispatchTarget, Option<String>> {
+    let activity = stopped_activity(data);
+    let Some(activity_name) = activity.as_deref() else {
+        return Err(activity);
+    };
+    let target = match activity_name {
+        "implement_issue" => RecoveryDispatchTarget {
+            state: "implementing",
+            activity: "implement_issue",
+        },
+        "replan_issue" => RecoveryDispatchTarget {
+            state: "replanning",
+            activity: "replan_issue",
+        },
+        "merge_pr" => RecoveryDispatchTarget {
+            state: "merging",
+            activity: "merge_pr",
+        },
+        super::super::pr_feedback::LOCAL_REVIEW_ACTIVITY => RecoveryDispatchTarget {
+            state: "local_review_gate",
+            activity: super::super::pr_feedback::LOCAL_REVIEW_ACTIVITY,
+        },
+        "sweep_pr_feedback" => RecoveryDispatchTarget {
+            state: "awaiting_feedback",
+            activity: "sweep_pr_feedback",
+        },
+        super::super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY => RecoveryDispatchTarget {
+            state: "awaiting_feedback",
+            activity: super::super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY,
+        },
+        "address_pr_feedback" => RecoveryDispatchTarget {
+            state: "addressing_feedback",
+            activity: "address_pr_feedback",
+        },
+        _ => return Err(activity),
+    };
+    Ok(target)
+}
+
+fn unsupported_stopped_activity(
+    instance: &WorkflowInstance,
+    activity: Option<String>,
+) -> WorkflowRuntimeRecoveryOutcome {
+    WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity {
+        workflow: instance.clone(),
+        activity,
+    }
 }
 
 async fn skip_superseded_active_commands_tx(
@@ -358,21 +427,21 @@ fn recovery_dispatch_decision(
     action: WorkflowRuntimeRecoveryAction,
     reason: &str,
     previous_state: &str,
-    next_state: &str,
+    target: RecoveryDispatchTarget,
     event_id: &str,
 ) -> WorkflowDecision {
     WorkflowDecision::new(
         &instance.id,
         previous_state,
         format!("operator_runtime_{}", action.as_str()),
-        next_state,
+        target.state,
         format!(
             "operator requested workflow runtime {} after resolving the stopped condition",
             action.as_str()
         ),
     )
     .with_command(recovery_dispatch_command(
-        instance, action, reason, event_id,
+        instance, action, reason, target, event_id,
     ))
 }
 
@@ -380,10 +449,29 @@ fn recovery_dispatch_command(
     instance: &WorkflowInstance,
     action: WorkflowRuntimeRecoveryAction,
     reason: &str,
+    target: RecoveryDispatchTarget,
     event_id: &str,
 ) -> WorkflowCommand {
     let remote_fact_hash = optional_string_field(&instance.data, "last_remote_fact_hash");
     let dispatch_fact_hash = remote_fact_hash.clone();
+    let mut payload = json!({
+        "activity": target.activity,
+        "additional_prompt": format!(
+            "Operator requested workflow runtime {} after resolving the stopped condition. Recovery reason: {}",
+            action.as_str(),
+            reason
+        ),
+        "dispatch_gate": {
+            "reason": format!("operator_workflow_runtime_{}", action.as_str()),
+            "fact_hash": dispatch_fact_hash,
+        },
+        "remote_fact_hash": remote_fact_hash,
+        "submission_mode": optional_string_field(&instance.data, "submission_mode")
+            .unwrap_or_else(|| "immediate".to_string()),
+    });
+    for field in RECOVERY_CONTEXT_FIELDS {
+        copy_optional_data_field(&mut payload, &instance.data, field);
+    }
     WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         format!(
@@ -392,23 +480,20 @@ fn recovery_dispatch_command(
             instance.id,
             event_id
         ),
-        json!({
-            "activity": "implement_issue",
-            "additional_prompt": format!(
-                "Operator requested workflow runtime {} after resolving the stopped condition. Recovery reason: {}",
-                action.as_str(),
-                reason
-            ),
-            "dispatch_gate": {
-                "reason": format!("operator_workflow_runtime_{}", action.as_str()),
-                "fact_hash": dispatch_fact_hash,
-            },
-            "remote_fact_hash": remote_fact_hash,
-            "submission_mode": optional_string_field(&instance.data, "submission_mode")
-                .unwrap_or_else(|| "immediate".to_string()),
-        }),
+        payload,
     )
 }
+
+const RECOVERY_CONTEXT_FIELDS: &[&str] = &[
+    "project_id",
+    "repo",
+    "issue_number",
+    "pr_number",
+    "pr_url",
+    "task_id",
+    "source",
+    "external_id",
+];
 
 fn stopped_error_kind(data: &Value) -> Option<ActivityErrorKind> {
     data.get("error_kind")
@@ -417,10 +502,27 @@ fn stopped_error_kind(data: &Value) -> Option<ActivityErrorKind> {
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
+fn stopped_activity(data: &Value) -> Option<String> {
+    data.pointer("/last_stop/activity")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn optional_string_field(data: &Value, field: &str) -> Option<String> {
     data.get(field)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn copy_optional_data_field(payload: &mut Value, data: &Value, field: &str) {
+    let Some(value) = data.get(field).filter(|value| !value.is_null()) else {
+        return;
+    };
+    if let Some(payload) = payload.as_object_mut() {
+        payload.insert(field.to_string(), value.clone());
+    }
 }
