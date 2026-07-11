@@ -85,6 +85,18 @@ struct RecoveryDispatchTarget {
     activity: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct RecoveryDispatchPlan {
+    target: RecoveryDispatchTarget,
+    command_source: RecoveryDispatchCommandSource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum RecoveryDispatchCommandSource {
+    Replay(WorkflowCommand),
+    LegacyFailedRetry,
+}
+
 impl WorkflowRuntimeStore {
     pub async fn recover_stopped_instance(
         &self,
@@ -100,10 +112,13 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(outcome);
         }
-        if let Err(activity) = recovery_dispatch_target(&snapshot.data) {
-            tx.commit().await?;
-            return Ok(unsupported_stopped_activity(&snapshot, activity));
-        }
+        let _plan = match recovery_dispatch_plan_tx(&mut tx, &snapshot, request.action).await? {
+            Ok(plan) => plan,
+            Err(activity) => {
+                tx.commit().await?;
+                return Ok(unsupported_stopped_activity(&snapshot, activity));
+            }
+        };
 
         let (superseded_command_count, superseded_runtime_job_count) =
             skip_superseded_active_commands_tx(&mut tx, &snapshot.id).await?;
@@ -119,8 +134,8 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(outcome);
         }
-        let target = match recovery_dispatch_target(&instance.data) {
-            Ok(target) => target,
+        let plan = match recovery_dispatch_plan_tx(&mut tx, &instance, request.action).await? {
+            Ok(plan) => plan,
             Err(activity) => {
                 tx.rollback().await?;
                 return Ok(unsupported_stopped_activity(&instance, activity));
@@ -139,7 +154,7 @@ impl WorkflowRuntimeStore {
                 "reason": request.reason,
                 "actor": request.actor,
                 "previous_state": previous_state,
-                "state": target.state,
+                "state": plan.target.state,
                 "superseded_command_count": superseded_command_count,
                 "superseded_runtime_job_count": superseded_runtime_job_count,
             }),
@@ -151,7 +166,7 @@ impl WorkflowRuntimeStore {
             request.action,
             request.reason,
             &previous_state,
-            target,
+            &plan,
             &event.id,
         );
         let Some(validator) = validator_for_definition(&instance.definition_id) else {
@@ -181,7 +196,7 @@ impl WorkflowRuntimeStore {
             .await?;
         }
 
-        instance.state = target.state.to_string();
+        instance.state = plan.target.state.to_string();
         instance.version = instance.version.saturating_add(1);
         instance.lease = None;
         persist_operator_recovery_data(
@@ -190,7 +205,7 @@ impl WorkflowRuntimeStore {
             request.reason,
             request.actor,
             &previous_state,
-            target.state,
+            plan.target.state,
             &event.id,
         );
         upsert_instance_tx(&mut tx, &instance).await?;
@@ -251,9 +266,52 @@ fn recovery_rejection(
     None
 }
 
-fn recovery_dispatch_target(data: &Value) -> Result<RecoveryDispatchTarget, Option<String>> {
+async fn recovery_dispatch_plan_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+    action: WorkflowRuntimeRecoveryAction,
+) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
+    let activity = stopped_activity(&instance.data);
+    let target = match recovery_dispatch_target(&instance.data, action) {
+        Ok(target) => target,
+        Err(activity) => return Ok(Err(activity)),
+    };
+    let command_source = if activity.is_some() {
+        let Some(runtime_job_id) = stopped_runtime_job_id(&instance.data) else {
+            return Ok(Err(activity));
+        };
+        let command = select_command_for_runtime_job_tx(tx, &instance.id, &runtime_job_id)
+            .await?
+            .ok_or_else(|| activity.clone());
+        let command = match command {
+            Ok(command) => command,
+            Err(activity) => return Ok(Err(activity)),
+        };
+        if !command_matches_recovery_target(&command, target) {
+            return Ok(Err(activity));
+        }
+        RecoveryDispatchCommandSource::Replay(command)
+    } else {
+        RecoveryDispatchCommandSource::LegacyFailedRetry
+    };
+    Ok(Ok(RecoveryDispatchPlan {
+        target,
+        command_source,
+    }))
+}
+
+fn recovery_dispatch_target(
+    data: &Value,
+    action: WorkflowRuntimeRecoveryAction,
+) -> Result<RecoveryDispatchTarget, Option<String>> {
     let activity = stopped_activity(data);
     let Some(activity_name) = activity.as_deref() else {
+        if is_legacy_failed_retry(data, action) {
+            return Ok(RecoveryDispatchTarget {
+                state: "implementing",
+                activity: "implement_issue",
+            });
+        }
         return Err(activity);
     };
     let target = match activity_name {
@@ -288,6 +346,35 @@ fn recovery_dispatch_target(data: &Value) -> Result<RecoveryDispatchTarget, Opti
         _ => return Err(activity),
     };
     Ok(target)
+}
+
+async fn select_command_for_runtime_job_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+    runtime_job_id: &str,
+) -> anyhow::Result<Option<WorkflowCommand>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT command.data::text
+         FROM runtime_jobs AS job
+         JOIN workflow_commands AS command ON command.id = job.command_id
+         WHERE job.id = $1
+           AND command.workflow_id = $2",
+    )
+    .bind(runtime_job_id)
+    .bind(workflow_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|(data,)| serde_json::from_str(&data))
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn command_matches_recovery_target(
+    command: &WorkflowCommand,
+    target: RecoveryDispatchTarget,
+) -> bool {
+    command.command_type != WorkflowCommandType::EnqueueActivity
+        || command.activity_name() == Some(target.activity)
 }
 
 fn unsupported_stopped_activity(
@@ -427,21 +514,21 @@ fn recovery_dispatch_decision(
     action: WorkflowRuntimeRecoveryAction,
     reason: &str,
     previous_state: &str,
-    target: RecoveryDispatchTarget,
+    plan: &RecoveryDispatchPlan,
     event_id: &str,
 ) -> WorkflowDecision {
     WorkflowDecision::new(
         &instance.id,
         previous_state,
         format!("operator_runtime_{}", action.as_str()),
-        target.state,
+        plan.target.state,
         format!(
             "operator requested workflow runtime {} after resolving the stopped condition",
             action.as_str()
         ),
     )
     .with_command(recovery_dispatch_command(
-        instance, action, reason, target, event_id,
+        instance, action, reason, plan, event_id,
     ))
 }
 
@@ -449,13 +536,25 @@ fn recovery_dispatch_command(
     instance: &WorkflowInstance,
     action: WorkflowRuntimeRecoveryAction,
     reason: &str,
-    target: RecoveryDispatchTarget,
+    plan: &RecoveryDispatchPlan,
     event_id: &str,
 ) -> WorkflowCommand {
+    let dedupe_key = format!(
+        "operator-recovery:{}:{}:{}",
+        action.as_str(),
+        instance.id,
+        event_id
+    );
+    if let RecoveryDispatchCommandSource::Replay(command) = &plan.command_source {
+        let mut command = command.clone();
+        command.dedupe_key = dedupe_key;
+        return command;
+    }
+
     let remote_fact_hash = optional_string_field(&instance.data, "last_remote_fact_hash");
     let dispatch_fact_hash = remote_fact_hash.clone();
     let mut payload = json!({
-        "activity": target.activity,
+        "activity": plan.target.activity,
         "additional_prompt": format!(
             "Operator requested workflow runtime {} after resolving the stopped condition. Recovery reason: {}",
             action.as_str(),
@@ -472,16 +571,7 @@ fn recovery_dispatch_command(
     for field in RECOVERY_CONTEXT_FIELDS {
         copy_optional_data_field(&mut payload, &instance.data, field);
     }
-    WorkflowCommand::new(
-        WorkflowCommandType::EnqueueActivity,
-        format!(
-            "operator-recovery:{}:{}:{}",
-            action.as_str(),
-            instance.id,
-            event_id
-        ),
-        payload,
-    )
+    WorkflowCommand::new(WorkflowCommandType::EnqueueActivity, dedupe_key, payload)
 }
 
 const RECOVERY_CONTEXT_FIELDS: &[&str] = &[
@@ -508,6 +598,20 @@ fn stopped_activity(data: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn stopped_runtime_job_id(data: &Value) -> Option<String> {
+    data.pointer("/last_stop/runtime_job_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn is_legacy_failed_retry(data: &Value, action: WorkflowRuntimeRecoveryAction) -> bool {
+    action == WorkflowRuntimeRecoveryAction::Retry
+        && stopped_activity(data).is_none()
+        && stopped_error_kind(data).is_none()
 }
 
 fn optional_string_field(data: &Value, field: &str) -> Option<String> {

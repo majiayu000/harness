@@ -44,8 +44,34 @@ fn accepts_operator_recovery_from_blocked_issue_to_implementation() {
     ));
 
     DecisionValidator::github_issue_pr()
-        .validate(&instance, &decision, &validation_context())
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("workflow_runtime_operator_action", Utc::now()),
+        )
         .expect("operator recovery should re-dispatch blocked issue workflows");
+}
+
+#[test]
+fn rejects_ordinary_runtime_actor_for_stopped_state_recovery_transition() {
+    let instance = issue_instance("blocked");
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "blocked",
+        "agent_merge",
+        "merging",
+        "ordinary runtime actor tried to bypass the merge gate",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "merge_pr",
+        "issue-123-merge",
+    ));
+
+    let err = DecisionValidator::github_issue_pr()
+        .validate(&instance, &decision, &validation_context())
+        .expect_err("ordinary actors must not use operator recovery transitions");
+
+    assert_eq!(err.kind, WorkflowDecisionRejectionKind::TransitionNotAllowed);
 }
 
 #[test]
