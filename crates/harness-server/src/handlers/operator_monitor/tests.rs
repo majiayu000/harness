@@ -437,6 +437,7 @@ fn operator_monitor_actions_expose_structured_stop_metadata_and_eligibility() {
         "Runtime transport timed out."
     );
     assert_eq!(retryable_failed["error_kind"], "timeout");
+    assert_eq!(retryable_failed["next_action"], "Retry failed workflow");
     assert_eq!(
         retryable_failed["retry_hint"],
         "Fix the transient condition, then call retry."
@@ -450,6 +451,10 @@ fn operator_monitor_actions_expose_structured_stop_metadata_and_eligibility() {
 
     let configuration_failed = row("configuration-failed-workflow");
     assert_eq!(configuration_failed["error_kind"], "configuration");
+    assert_eq!(
+        configuration_failed["next_action"],
+        "Inspect failed workflow"
+    );
     assert_eq!(configuration_failed["can_unblock"], false);
     assert_eq!(configuration_failed["can_retry"], false);
     assert!(actions

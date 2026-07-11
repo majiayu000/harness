@@ -477,10 +477,11 @@ fn operator_actions(
 ) -> Vec<OperatorAction> {
     let mut actions = Vec::new();
     for workflow in workflows {
-        let Some((kind, next_action)) = workflow_action_kind(workflow.state.as_str()) else {
+        let Some(kind) = workflow_action_kind(workflow.state.as_str()) else {
             continue;
         };
         let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+        let next_action = workflow_next_action(kind, &projection.stopped_state);
         let task_id = projection
             .legacy_dedupe_task_handle
             .as_ref()
@@ -527,13 +528,24 @@ fn operator_actions(
     actions
 }
 
-fn workflow_action_kind(state: &str) -> Option<(&'static str, &'static str)> {
+fn workflow_action_kind(state: &str) -> Option<&'static str> {
     match state {
-        "ready_to_merge" => Some(("ready_to_merge", "Review and merge")),
-        "awaiting_feedback" => Some(("awaiting_feedback", "Inspect review feedback")),
-        "blocked" => Some(("blocked", "Resolve blocker")),
-        "failed" => Some(("failed", "Retry failed workflow")),
+        "ready_to_merge" => Some("ready_to_merge"),
+        "awaiting_feedback" => Some("awaiting_feedback"),
+        "blocked" => Some("blocked"),
+        "failed" => Some("failed"),
         _ => None,
+    }
+}
+
+fn workflow_next_action(kind: &str, stopped_state: &RuntimeStoppedStateProjection) -> &'static str {
+    match kind {
+        "ready_to_merge" => "Review and merge",
+        "awaiting_feedback" => "Inspect review feedback",
+        "blocked" => "Resolve blocker",
+        "failed" if stopped_state.can_retry => "Retry failed workflow",
+        "failed" => "Inspect failed workflow",
+        _ => "Inspect workflow",
     }
 }
 

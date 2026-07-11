@@ -152,6 +152,15 @@ fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
         "cancelled",
         WorkflowSubject::new("issue", "issue:1570"),
     );
+    let legacy = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        WorkflowSubject::new("issue", "issue:1571"),
+    )
+    .with_data(json!({
+        "previous_error": "Legacy workflow failed before structured metadata shipped.",
+    }));
 
     let failed = serde_json::to_value(WorkflowRuntimeTreeProjection::from_workflow(&failed))
         .expect("failed projection should serialize");
@@ -190,6 +199,13 @@ fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
         .expect("cancelled projection should serialize");
     assert_eq!(cancelled["can_unblock"], false);
     assert_eq!(cancelled["can_retry"], false);
+
+    let legacy = serde_json::to_value(WorkflowRuntimeTreeProjection::from_workflow(&legacy))
+        .expect("legacy projection should serialize");
+    assert_eq!(
+        legacy["failure_reason"],
+        "Legacy workflow failed before structured metadata shipped."
+    );
 }
 
 #[test]

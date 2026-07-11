@@ -79,7 +79,10 @@ impl RuntimeStoppedStateProjection {
         Self {
             blocked_reason: stopped_string_field(&workflow.data, "blocked_reason"),
             unblock_hint: stopped_string_field(&workflow.data, "unblock_hint"),
-            failure_reason: stopped_string_field(&workflow.data, "failure_reason"),
+            failure_reason: first_stopped_string_field(
+                &workflow.data,
+                &["failure_reason", "previous_error", "last_error", "error"],
+            ),
             retry_hint: stopped_string_field(&workflow.data, "retry_hint"),
             can_unblock: workflow.state == "blocked",
             can_retry: workflow.state == "failed" && retryable_error_kind(error_kind.as_deref()),
@@ -226,6 +229,12 @@ fn runtime_submission_handle(data: &serde_json::Value) -> Option<TaskId> {
 
 fn stopped_string_field(data: &serde_json::Value, field: &str) -> Option<String> {
     data.get(field).and_then(trimmed_string)
+}
+
+fn first_stopped_string_field(data: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| stopped_string_field(data, field))
 }
 
 fn structured_last_stop(data: &serde_json::Value) -> Option<Value> {
@@ -566,6 +575,12 @@ mod tests {
                 "failure_reason": "Operator cancelled the workflow."
             }),
         );
+        let legacy = workflow(
+            "failed",
+            serde_json::json!({
+                "previous_error": "Legacy workflow failed before structured metadata shipped."
+            }),
+        );
 
         let retryable = RuntimeWorkflowProjection::from_workflow(&retryable);
         assert_eq!(
@@ -586,6 +601,12 @@ mod tests {
         let cancelled = RuntimeWorkflowProjection::from_workflow(&cancelled);
         assert!(!cancelled.stopped_state.can_retry);
         assert!(!cancelled.stopped_state.can_unblock);
+
+        let legacy = RuntimeWorkflowProjection::from_workflow(&legacy);
+        assert_eq!(
+            legacy.stopped_state.failure_reason.as_deref(),
+            Some("Legacy workflow failed before structured metadata shipped.")
+        );
     }
 
     #[test]
