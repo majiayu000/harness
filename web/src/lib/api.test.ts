@@ -50,4 +50,18 @@ describe("apiFetch", () => {
 
     unauthorizedEvents.removeEventListener("unauthorized", handler);
   });
+
+  it("surfaces a structured API error message", async () => {
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "workflow not in blocked state" }), {
+        status: 409,
+        headers: { "Content-Type": "application/json" },
+      }),
+    ) as unknown as typeof fetch;
+
+    await expect(apiFetch("/api/workflows/runtime/unblock")).rejects.toMatchObject({
+      status: 409,
+      message: "workflow not in blocked state",
+    });
+  });
 });

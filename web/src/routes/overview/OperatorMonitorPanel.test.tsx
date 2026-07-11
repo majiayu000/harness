@@ -297,6 +297,7 @@ describe("<OperatorMonitorPanel>", () => {
       }),
     );
     await waitFor(() => expect(unblockButton).toBeEnabled());
+    await waitFor(() => expect(unblockButton).toHaveTextContent(/^Unblock$/));
 
     fireEvent.change(screen.getByLabelText("Recovery reason for workflow-retryable"), {
       target: { value: "Transport is healthy" },
@@ -335,14 +336,17 @@ describe("<OperatorMonitorPanel>", () => {
     fireEvent.change(screen.getByLabelText("Recovery reason for workflow-blocked"), {
       target: { value: "Approval was posted" },
     });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Unblock workflow workflow-blocked" }),
-    );
+    const unblockButton = screen.getByRole("button", {
+      name: "Unblock workflow workflow-blocked",
+    });
+    fireEvent.click(unblockButton);
 
     expect(
       await screen.findByText(
         "Workflow recovery failed: workflow not in blocked state",
       ),
     ).toBeInTheDocument();
+    expect(unblockButton).toBeEnabled();
+    expect(unblockButton).toHaveTextContent(/^Unblock$/);
   });
 });

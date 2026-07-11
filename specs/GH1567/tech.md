@@ -76,7 +76,7 @@ Response shape on success for unblock:
   "execution_path": "workflow_runtime",
   "workflow_id": "...",
   "previous_state": "blocked",
-  "state": "discovered"
+  "state": "implementing"
 }
 ```
 
@@ -88,9 +88,14 @@ Response shape on success for retry:
   "execution_path": "workflow_runtime",
   "workflow_id": "...",
   "previous_state": "failed",
-  "state": "discovered"
+  "state": "implementing"
 }
 ```
+
+The examples show an `implement_issue` or legacy fallback recovery. Structured
+stops resume their original phase: `replan_issue` returns `replanning`,
+`merge_pr` returns `merging`, local review returns `local_review_gate`, and PR
+feedback activities return `awaiting_feedback` or `addressing_feedback`.
 
 The issue text proposed path-style endpoints such as
 `/api/workflows/instances/{id}/unblock`. Those can be added as aliases only if
@@ -103,18 +108,19 @@ existing runtime merge/cancel.
 `unblock`:
 
 - Allowed only from `blocked`.
-- Clears the coverage hold by moving the instance to a dispatchable state.
-- For GitHub issue workflows, the target state should be the earliest safe
-  re-dispatch state already accepted by the definition, such as `discovered` or
-  another existing pre-dispatch state chosen by the implementation after
-  checking the transition registry.
+- Clears the stopped-state hold by moving the instance to the active state for
+  the stopped activity and atomically enqueueing one replay command.
+- For structured stops, derive the target state and command from
+  `last_stop.activity` and `last_stop.runtime_job_id`. Reject unsupported or
+  incomplete metadata instead of restarting an unrelated phase. A legacy row
+  with no structured stop metadata may fall back to `implement_issue`.
 - Preserves historical stop metadata under `last_stop` or an append-only audit
   event; it must not erase evidence.
 
 `retry`:
 
 - Allowed only from `failed`.
-- Reuses the same dispatchable-state strategy as `unblock` when retry is
+- Reuses the same phase-aware replay strategy as `unblock` when retry is
   operator-approved.
 - Must reject non-retryable `error_kind` values such as `fatal` and
   `configuration` unless the request explicitly includes a force flag and a
@@ -129,17 +135,19 @@ existing runtime merge/cancel.
 - No action in the first implementation. Return `409 Conflict` with the current
   state if called on a cancelled workflow.
 
-Both actions must execute the state update and audit write inside one database
-transaction. The transaction must insert a workflow event or decision record
-that includes the operator-supplied reason, previous state, next state, and
-actor/source identifier available from the existing auth layer.
+Both actions must execute the state update, audit write, stale-command
+supersession, and replay-command enqueue inside one database transaction. The
+transaction must insert a workflow event or decision record that includes the
+operator-supplied reason, previous state, next state, and actor/source
+identifier available from the existing auth layer.
 
 ### Coverage Gate Behavior
 
 After a successful operator action, the coverage gate should observe the
-updated state rather than the old stopped state. That means the next GitHub
-issue intake scan can create or continue work instead of returning
-`Covered { source: "workflow_runtime", state: "blocked" }`.
+phase-specific active state rather than the old stopped state. Because recovery
+already enqueues the replay command, the next GitHub issue intake scan should
+return `Covered` for that current active state and must not create a second
+submission beside the recovery replay.
 
 Do not make `blocked` or `failed` globally uncovered. They should remain
 covered until the operator action changes state, because automatic redispatch
@@ -178,8 +186,9 @@ the workflow into `blocked` or `failed`, derives structured stop metadata, and
 persists it in workflow instance `data` with a workflow event/decision. The
 runtime tree and operator monitor read those fields. An authenticated operator
 calls unblock or retry. The handler validates state, writes an audit event,
-updates the instance to a dispatchable state, and returns the new state. The
-next intake tick sees the updated state and can dispatch work normally.
+supersedes stale work, updates the instance to the phase-specific active state,
+and enqueues one replay command atomically. The next intake tick sees that
+active state as covered and does not duplicate the replay.
 
 ## Alternatives Considered
 
@@ -220,8 +229,9 @@ next intake tick sees the updated state and can dispatch work normally.
       structured metadata.
 - [ ] Store/action tests proving unblock is accepted only from `blocked` and
       retry is accepted only from retryable `failed` workflows.
-- [ ] Coverage-gate test proving the same issue is covered before unblock and
-      not held by the old blocked state after unblock.
+- [ ] Coverage-gate test proving the same issue is covered by the old stopped
+      state before recovery, then by the resumed active state without adding a
+      second pending command after recovery.
 - [ ] HTTP route tests for success, not found, store unavailable, wrong state,
       and non-retryable failure responses.
 - [ ] Operator monitor/runtime tree tests proving structured reason fields are

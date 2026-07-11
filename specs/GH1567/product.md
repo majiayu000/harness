@@ -23,8 +23,8 @@ which is not acceptable operator behavior.
    using structured, API-visible fields.
 2. Provide operator-authenticated HTTP actions to unblock blocked instances and
    retry failed instances without direct Postgres edits.
-3. Ensure a successful unblock makes the related GitHub issue eligible for the
-   next intake tick instead of remaining covered forever.
+3. Ensure a successful unblock or retry immediately replays the stopped
+   activity and prevents the old stopped state from holding the issue forever.
 4. Document the supported recovery flow so operators do not rely on table
    surgery.
 5. Keep automatic recovery conservative by default. A blocked workflow must not
@@ -59,10 +59,12 @@ An operator can call an authenticated HTTP action to:
 - retry a `failed` workflow when the failure is transient or after the operator
   has corrected the external condition.
 
-After a successful unblock or retry, the next GitHub issue intake scan must not
-skip the issue solely because the previous workflow state was `blocked` or
-`failed`. The workflow should either dispatch new work or report a fresh,
-structured blocker.
+After a successful unblock or retry, Harness immediately enqueues one replay of
+the supported stopped activity and moves the instance to the corresponding
+active state. The next GitHub issue intake scan may treat that active state as
+covered, but it must not observe the old `blocked` or `failed` hold or enqueue a
+second command beside the recovery replay. The replay should either continue
+the workflow or report a fresh, structured blocker.
 
 If an operator calls the wrong action for the current state, Harness returns a
 clear conflict response instead of silently doing nothing.
@@ -82,8 +84,8 @@ clear conflict response instead of silently doing nothing.
 - [ ] A successful unblock or retry records an audit event and updates the
       workflow instance so the GitHub issue coverage gate no longer treats the
       old terminal state as a permanent hold.
-- [ ] The next intake tick for the same issue can re-dispatch work or produce a
-      fresh structured blocker.
+- [ ] Recovery enqueues exactly one replay command, and the next intake tick
+      recognizes the resumed active state without dispatching duplicate work.
 - [ ] `cancelled` workflows are not automatically retried. Any support for
       cancelled workflows must be an explicit follow-up with separate
       acceptance criteria.
@@ -110,7 +112,7 @@ This feature changes operator recovery behavior and should land in small PRs:
 
 1. structured stop-reason metadata;
 2. HTTP unblock/retry actions;
-3. coverage-gate and intake re-dispatch behavior;
+3. coverage-gate recovery-state and duplicate-dispatch behavior;
 4. dashboard and usage-guide documentation.
 
 Existing blocked or failed rows may not have all structured fields. The UI and

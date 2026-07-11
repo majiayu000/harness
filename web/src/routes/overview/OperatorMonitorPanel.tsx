@@ -387,7 +387,9 @@ export function OperatorMonitorPanel() {
           data={data}
           onRecover={(input) => recovery.mutate(input)}
           recoveryDisabled={recovery.isPending}
-          recoveryPendingWorkflowId={recovery.variables?.workflowId ?? null}
+          recoveryPendingWorkflowId={
+            recovery.isPending ? (recovery.variables?.workflowId ?? null) : null
+          }
         />
       ) : (
         <p className="px-4 py-3 font-mono text-[11px] text-ink-4">Loading operator monitor.</p>
