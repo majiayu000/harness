@@ -139,6 +139,12 @@ pub(crate) async fn check_github_issue_coverage(
 
 #[cfg(test)]
 mod tests {
+    use harness_workflow::runtime::{
+        RuntimeKind, WorkflowCommand, WorkflowInstance, WorkflowRuntimeRecoveryAction,
+        WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowSubject,
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+    };
+
     use super::*;
 
     #[test]
@@ -165,6 +171,66 @@ mod tests {
         assert!(!runtime_issue_state_is_covered("unknown_scanning"));
     }
 
+    #[tokio::test]
+    async fn github_coverage_gate_observes_recovered_runtime_state() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        let dir = crate::test_helpers::tempdir_in_home("harness-test-github-coverage-")?;
+        let store = WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+            Some(&crate::test_helpers::test_database_url()?),
+        )
+        .await?;
+        let project_id = "/project/github-coverage";
+        let repo = "owner/repo";
+
+        for (issue_number, stopped_state, action) in [
+            (156_700, "blocked", WorkflowRuntimeRecoveryAction::Unblock),
+            (156_701, "failed", WorkflowRuntimeRecoveryAction::Retry),
+        ] {
+            let workflow = store_stopped_replan_workflow(
+                &store,
+                project_id,
+                repo,
+                issue_number,
+                stopped_state,
+            )
+            .await?;
+
+            assert_eq!(
+                check_github_issue_coverage(None, Some(&store), project_id, repo, issue_number,)
+                    .await?,
+                GitHubIssueCoverage::Covered {
+                    source: "workflow_runtime",
+                    state: stopped_state.to_string(),
+                }
+            );
+
+            let recovered = store
+                .recover_stopped_instance(WorkflowRuntimeRecoveryRequest {
+                    workflow_id: &workflow.id,
+                    action,
+                    reason: "external blocker resolved",
+                    actor: "operator",
+                })
+                .await?;
+            assert!(matches!(
+                recovered,
+                WorkflowRuntimeRecoveryOutcome::Recovered { ref workflow, .. }
+                    if workflow.state == "replanning"
+            ));
+            assert_eq!(
+                check_github_issue_coverage(None, Some(&store), project_id, repo, issue_number,)
+                    .await?,
+                GitHubIssueCoverage::Uncovered
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn issue_remote_fact_snapshot_hash_is_stable_for_same_issue() {
         let issue = IncomingIssue {
@@ -186,5 +252,51 @@ mod tests {
         let right = issue_remote_fact_snapshot("owner/repo", 7, &issue).expect("snapshot");
 
         assert_eq!(left.fact_hash, right.fact_hash);
+    }
+
+    async fn store_stopped_replan_workflow(
+        store: &WorkflowRuntimeStore,
+        project_id: &str,
+        repo: &str,
+        issue_number: u64,
+        stopped_state: &str,
+    ) -> anyhow::Result<WorkflowInstance> {
+        let workflow_id = workflow_id(project_id, Some(repo), issue_number);
+        let mut workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            stopped_state,
+            WorkflowSubject::new("issue", format!("issue:{issue_number}")),
+        )
+        .with_id(workflow_id)
+        .with_data(json!({
+            "project_id": project_id,
+            "repo": repo,
+            "issue_number": issue_number,
+            "error_kind": "timeout",
+            "last_stop": {
+                "state": stopped_state,
+                "activity": "replan_issue",
+                "error_kind": "timeout",
+            },
+        }));
+        store.upsert_instance(&workflow).await?;
+
+        let command = WorkflowCommand::enqueue_activity(
+            "replan_issue",
+            format!("stopped-replan-{issue_number}"),
+        );
+        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+        let runtime_job = store
+            .enqueue_runtime_job(
+                &command_id,
+                RuntimeKind::CodexJsonrpc,
+                "codex-test",
+                command.command,
+            )
+            .await?;
+        workflow.data["last_stop"]["runtime_job_id"] = json!(runtime_job.id);
+        store.upsert_instance(&workflow).await?;
+        Ok(workflow)
     }
 }
