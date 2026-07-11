@@ -354,10 +354,10 @@ fn truncate_workflow_sample(workflows: &mut Vec<WorkflowInstance>, limit: usize)
     let mut failed = Vec::new();
     let mut other = Vec::new();
     for workflow in workflows.drain(..) {
-        if workflow_action_kind(workflow.state.as_str()).is_some() {
-            operator_actions.push(workflow);
-        } else if workflow.state == "failed" {
+        if workflow.state == "failed" {
             failed.push(workflow);
+        } else if workflow_action_kind(workflow.state.as_str()).is_some() {
+            operator_actions.push(workflow);
         } else {
             other.push(workflow);
         }

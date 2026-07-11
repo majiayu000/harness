@@ -105,6 +105,44 @@ fn workflow_sample_truncation_preserves_operator_action_and_failed_states() {
 }
 
 #[test]
+fn workflow_sample_truncation_preserves_failed_reserve_before_operator_actions() {
+    let base = Utc::now();
+    let mut workflows = (0..500)
+        .map(|index| {
+            let mut workflow = workflow(
+                "ready_to_merge",
+                json!({
+                    "source": "github",
+                    "pr_number": index,
+                    "pr_url": format!("https://github.com/owner/repo/pull/{index}"),
+                }),
+            )
+            .with_id(format!("ready-{index}"));
+            workflow.updated_at = base + chrono::Duration::seconds(index);
+            workflow
+        })
+        .collect::<Vec<_>>();
+    let mut failed = workflow(
+        "failed",
+        json!({
+            "source": "quality_gate",
+            "failure_reason": "Runtime transport timed out.",
+            "error_kind": "timeout",
+        }),
+    )
+    .with_id("reserved-failed-workflow".to_string());
+    failed.updated_at = base - chrono::Duration::hours(1);
+    workflows.push(failed);
+
+    truncate_workflow_sample(&mut workflows, 500);
+
+    assert_eq!(workflows.len(), 500);
+    assert!(workflows
+        .iter()
+        .any(|workflow| workflow.id == "reserved-failed-workflow"));
+}
+
+#[test]
 fn grouped_failures_classifies_and_counts_github_fetch_failures() {
     let failures = vec![
         github_fetch_failure("task-1", 1, "2026-06-12T00:00:00Z"),
