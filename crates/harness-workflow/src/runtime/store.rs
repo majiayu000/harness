@@ -1775,8 +1775,7 @@ impl WorkflowRuntimeStore {
             "SELECT job.id, command.workflow_id, command.id, command.data::text
              FROM runtime_jobs AS job
              JOIN workflow_commands AS command ON command.id = job.command_id
-             WHERE job.id = ANY($1::text[])
-             ORDER BY job.id ASC",
+             WHERE job.id = ANY($1::text[])",
         )
         .bind(runtime_job_ids)
         .fetch_all(&self.pool)
