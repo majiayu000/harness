@@ -495,6 +495,24 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
         .with_data(data);
         store.upsert_instance(&workflow).await?;
     }
+    let blocked_runtime_job_id = set_recovery_source_job(
+        store,
+        "issue-blocked",
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            "implement_issue",
+            "issue-blocked-source",
+        ),
+    )
+    .await?;
+    let failed_runtime_job_id = set_recovery_source_job(
+        store,
+        "issue-terminal",
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            "implement_issue",
+            "issue-terminal-source",
+        ),
+    )
+    .await?;
 
     let response = workflow_runtime_app(state)
         .oneshot(
@@ -557,6 +575,10 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
         blocked["projection"]["last_stop"]["activity"],
         "implement_issue"
     );
+    assert_eq!(
+        blocked["projection"]["last_stop"]["runtime_job_id"],
+        blocked_runtime_job_id
+    );
     assert_eq!(blocked["projection"]["can_unblock"], true);
     assert_eq!(blocked["projection"]["can_retry"], false);
 
@@ -580,7 +602,7 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
     );
     assert_eq!(
         terminal["projection"]["last_stop"]["runtime_job_id"],
-        "job-failed"
+        failed_runtime_job_id
     );
     assert_eq!(terminal["projection"]["can_unblock"], false);
     assert_eq!(terminal["projection"]["can_retry"], true);
@@ -596,6 +618,30 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
     assert_eq!(cancelled["projection"]["can_retry"], false);
 
     Ok(())
+}
+
+async fn set_recovery_source_job(
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    workflow_id: &str,
+    command: harness_workflow::runtime::WorkflowCommand,
+) -> anyhow::Result<String> {
+    let command_id = store.enqueue_command(workflow_id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-test",
+            command.command.clone(),
+        )
+        .await?;
+    let runtime_job_id = job.id.clone();
+    let mut workflow = store
+        .get_instance(workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing workflow {workflow_id}"))?;
+    workflow.data["last_stop"]["runtime_job_id"] = serde_json::json!(runtime_job_id.clone());
+    store.upsert_instance(&workflow).await?;
+    Ok(runtime_job_id)
 }
 
 #[tokio::test]

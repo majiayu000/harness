@@ -8,7 +8,10 @@
 mod activity;
 
 use crate::http::AppState;
-use crate::runtime_projection::{RuntimeStoppedStateProjection, RuntimeWorkflowProjection};
+use crate::runtime_projection::{
+    stopped_action_eligibility_for_workflows, RuntimeStoppedActionEligibility,
+    RuntimeStoppedStateProjection, RuntimeWorkflowProjection,
+};
 use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary};
 use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, SourceActivity};
 use axum::{extract::State, http::StatusCode, Json};
@@ -196,6 +199,11 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
 
     let runtime_workflows = runtime_workflow_counts(&workflows);
     let workflow_legacy_task_ids = workflow_legacy_task_ids(&workflows);
+    let stopped_eligibility = stopped_action_eligibility_for_workflows(
+        state.core.workflow_runtime_store.as_deref(),
+        &workflows,
+    )
+    .await?;
     let stalled_task_count = stalled_tasks
         .iter()
         .filter(|task| !workflow_legacy_task_ids.contains(task.id.as_str()))
@@ -208,7 +216,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         dashboard_counts.global_done,
     );
     let by_source = source_activity(&workflows, &active_tasks);
-    let operator_actions = operator_actions(&workflows, generated_at);
+    let operator_actions = operator_actions(&workflows, generated_at, &stopped_eligibility);
     let stuck_workflows = list_stuck_workflows(state, generated_at).await?;
     let failures = grouped_failures(&recent_failures, &workflows);
     let capacity = state.concurrency.task_queue.global_limit() as u64;
@@ -280,12 +288,19 @@ async fn list_stuck_workflows(
             workflow_cfg.storage.workflow_watchdog_batch_size as i64,
         )
         .await?;
-    Ok(stuck_workflows_from_instances(&workflows, generated_at))
+    let stopped_eligibility =
+        stopped_action_eligibility_for_workflows(Some(store), &workflows).await?;
+    Ok(stuck_workflows_from_instances(
+        &workflows,
+        generated_at,
+        &stopped_eligibility,
+    ))
 }
 
 fn stuck_workflows_from_instances(
     workflows: &[WorkflowInstance],
     generated_at: DateTime<Utc>,
+    stopped_eligibility: &HashMap<String, RuntimeStoppedActionEligibility>,
 ) -> Vec<StuckWorkflow> {
     let mut stuck = workflows
         .iter()
@@ -312,7 +327,13 @@ fn stuck_workflows_from_instances(
                 updated_at: workflow.updated_at.to_rfc3339(),
                 url: pr_url.or(issue_url),
                 source: workflow_source(workflow),
-                stopped_state: RuntimeStoppedStateProjection::from_workflow(workflow),
+                stopped_state: RuntimeStoppedStateProjection::from_workflow(workflow)
+                    .with_action_eligibility(
+                        stopped_eligibility
+                            .get(&workflow.id)
+                            .copied()
+                            .unwrap_or_default(),
+                    ),
             }
         })
         .collect::<Vec<_>>();
@@ -474,13 +495,20 @@ fn filter_workflow_backed_tasks(
 fn operator_actions(
     workflows: &[WorkflowInstance],
     generated_at: DateTime<Utc>,
+    stopped_eligibility: &HashMap<String, RuntimeStoppedActionEligibility>,
 ) -> Vec<OperatorAction> {
     let mut actions = Vec::new();
     for workflow in workflows {
         let Some(kind) = workflow_action_kind(workflow.state.as_str()) else {
             continue;
         };
-        let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+        let projection = RuntimeWorkflowProjection::from_workflow_with_stopped_eligibility(
+            workflow,
+            stopped_eligibility
+                .get(&workflow.id)
+                .copied()
+                .unwrap_or_default(),
+        );
         let next_action = workflow_next_action(kind, &projection.stopped_state);
         let task_id = projection
             .legacy_dedupe_task_handle

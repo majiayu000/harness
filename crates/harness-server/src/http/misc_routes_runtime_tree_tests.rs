@@ -162,8 +162,16 @@ fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
         "previous_error": "Legacy workflow failed before structured metadata shipped.",
     }));
 
-    let failed = serde_json::to_value(WorkflowRuntimeTreeProjection::from_workflow(&failed))
-        .expect("failed projection should serialize");
+    let failed = serde_json::to_value(
+        WorkflowRuntimeTreeProjection::from_workflow_with_stopped_eligibility(
+            &failed,
+            crate::runtime_projection::RuntimeStoppedActionEligibility {
+                can_unblock: false,
+                can_retry: true,
+            },
+        ),
+    )
+    .expect("failed projection should serialize");
     assert_eq!(failed["failure_reason"], "Runtime transport timed out.");
     assert_eq!(failed["error_kind"], "timeout");
     assert_eq!(
@@ -174,8 +182,16 @@ fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
     assert_eq!(failed["can_unblock"], false);
     assert_eq!(failed["can_retry"], true);
 
-    let blocked = serde_json::to_value(WorkflowRuntimeTreeProjection::from_workflow(&blocked))
-        .expect("blocked projection should serialize");
+    let blocked = serde_json::to_value(
+        WorkflowRuntimeTreeProjection::from_workflow_with_stopped_eligibility(
+            &blocked,
+            crate::runtime_projection::RuntimeStoppedActionEligibility {
+                can_unblock: true,
+                can_retry: false,
+            },
+        ),
+    )
+    .expect("blocked projection should serialize");
     assert_eq!(
         blocked["blocked_reason"],
         "Waiting for maintainer approval."

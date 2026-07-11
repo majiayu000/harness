@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use crate::http::state::AppState;
 use crate::runtime_circuit_breaker::CircuitBreakerSnapshot;
-use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
+use crate::runtime_projection::{
+    stopped_action_eligibility_for_workflows, RuntimeActiveBucket, RuntimeWorkflowProjection,
+};
 #[path = "misc_routes_runtime_tree_nodes.rs"]
 mod nodes;
 #[cfg(test)]
@@ -466,6 +468,8 @@ async fn build_full_workflow_runtime_nodes(
     BTreeMap<String, WorkflowRuntimeTreeNode>,
     BTreeMap<String, Vec<String>>,
 )> {
+    let stopped_eligibility =
+        stopped_action_eligibility_for_workflows(Some(store), &instances).await?;
     let mut events_by_workflow = store.events_for_workflows(workflow_ids).await?;
     let mut decisions_by_workflow = store.decisions_for_workflows(workflow_ids).await?;
     let mut commands_by_workflow = store.commands_for_workflows(workflow_ids).await?;
@@ -532,7 +536,13 @@ async fn build_full_workflow_runtime_nodes(
         by_id.insert(
             workflow_id,
             WorkflowRuntimeTreeNode {
-                projection: WorkflowRuntimeTreeProjection::from_workflow(&instance),
+                projection: WorkflowRuntimeTreeProjection::from_workflow_with_stopped_eligibility(
+                    &instance,
+                    stopped_eligibility
+                        .get(&instance.id)
+                        .copied()
+                        .unwrap_or_default(),
+                ),
                 workflow: instance,
                 runtime_job_count,
                 event_count: events.len(),
@@ -560,6 +570,8 @@ async fn build_compact_workflow_runtime_nodes(
     BTreeMap<String, WorkflowRuntimeTreeNode>,
     BTreeMap<String, Vec<String>>,
 )> {
+    let stopped_eligibility =
+        stopped_action_eligibility_for_workflows(Some(store), &instances).await?;
     let detail_counts_by_workflow = store.detail_counts_for_workflows(workflow_ids).await?;
     let mut decisions_by_workflow = store
         .rejected_decisions_for_workflows_limited(workflow_ids, rejected_decision_limit as i64)
@@ -630,7 +642,13 @@ async fn build_compact_workflow_runtime_nodes(
         by_id.insert(
             workflow_id,
             WorkflowRuntimeTreeNode {
-                projection: WorkflowRuntimeTreeProjection::from_workflow(&instance),
+                projection: WorkflowRuntimeTreeProjection::from_workflow_with_stopped_eligibility(
+                    &instance,
+                    stopped_eligibility
+                        .get(&instance.id)
+                        .copied()
+                        .unwrap_or_default(),
+                ),
                 workflow: instance,
                 runtime_job_count: detail_counts.runtime_job_count,
                 event_count: detail_counts.event_count,

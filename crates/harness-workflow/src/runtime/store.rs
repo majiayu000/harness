@@ -118,6 +118,13 @@ pub struct RuntimeEventSummary {
     pub latest_turn_sequence: Option<u64>,
     pub latest_activity_result_sequence: Option<u64>,
 }
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeJobCommandSource {
+    pub runtime_job_id: String,
+    pub workflow_id: String,
+    pub command_id: String,
+    pub command: WorkflowCommand,
+}
 pub struct WorkflowDecisionTransition<'a> {
     pub expected_state: &'a str,
     pub create_if_missing: Option<&'a WorkflowInstance>,
@@ -1755,6 +1762,39 @@ impl WorkflowRuntimeStore {
                 .push(serde_json::from_str(&data)?);
         }
         Ok(by_command)
+    }
+
+    pub async fn command_sources_for_runtime_jobs(
+        &self,
+        runtime_job_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, RuntimeJobCommandSource>> {
+        if runtime_job_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT job.id, command.workflow_id, command.id, command.data::text
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE job.id = ANY($1::text[])
+             ORDER BY job.id ASC",
+        )
+        .bind(runtime_job_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(runtime_job_id, workflow_id, command_id, data)| {
+                let command = serde_json::from_str(&data)?;
+                Ok((
+                    runtime_job_id.clone(),
+                    RuntimeJobCommandSource {
+                        runtime_job_id,
+                        workflow_id,
+                        command_id,
+                        command,
+                    },
+                ))
+            })
+            .collect()
     }
 
     pub async fn runtime_job_counts_for_commands(
