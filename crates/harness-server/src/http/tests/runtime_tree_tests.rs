@@ -420,7 +420,54 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
             1202,
             serde_json::json!({}),
         ),
-        ("issue-terminal", "failed", 1203, serde_json::json!({})),
+        (
+            "issue-blocked",
+            "blocked",
+            1203,
+            serde_json::json!({
+                "blocked_reason": "Waiting for maintainer approval.",
+                "unblock_hint": "Post the approval comment, then call unblock.",
+                "last_stop": {
+                    "state": "blocked",
+                    "activity": "implement_issue",
+                    "runtime_job_id": "job-blocked",
+                    "event_id": 10,
+                },
+            }),
+        ),
+        (
+            "issue-terminal",
+            "failed",
+            1204,
+            serde_json::json!({
+                "failure_reason": "Runtime transport timed out.",
+                "error_kind": "timeout",
+                "retry_hint": "Fix the transient condition, then call retry.",
+                "last_stop": {
+                    "state": "failed",
+                    "activity": "implement_issue",
+                    "runtime_job_id": "job-failed",
+                    "event_id": 11,
+                },
+            }),
+        ),
+        (
+            "issue-nonretryable",
+            "failed",
+            1205,
+            serde_json::json!({
+                "failure_reason": "Missing runtime configuration.",
+                "error_kind": "configuration",
+            }),
+        ),
+        (
+            "issue-cancelled",
+            "cancelled",
+            1206,
+            serde_json::json!({
+                "failure_reason": "Operator cancelled the workflow.",
+            }),
+        ),
     ] {
         let mut data = serde_json::json!({
             "project_id": "/project-a",
@@ -448,6 +495,24 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
         .with_data(data);
         store.upsert_instance(&workflow).await?;
     }
+    let blocked_runtime_job_id = set_recovery_source_job(
+        store,
+        "issue-blocked",
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            "implement_issue",
+            "issue-blocked-source",
+        ),
+    )
+    .await?;
+    let failed_runtime_job_id = set_recovery_source_job(
+        store,
+        "issue-terminal",
+        harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+            "implement_issue",
+            "issue-terminal-source",
+        ),
+    )
+    .await?;
 
     let response = workflow_runtime_app(state)
         .oneshot(
@@ -495,6 +560,28 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
     );
     assert_eq!(review_wait["projection"]["active_bucket"], "queued");
 
+    let blocked = node("issue-blocked");
+    assert_eq!(blocked["projection"]["status"], "waiting");
+    assert_eq!(blocked["projection"]["phase"], "plan");
+    assert_eq!(
+        blocked["projection"]["blocked_reason"],
+        "Waiting for maintainer approval."
+    );
+    assert_eq!(
+        blocked["projection"]["unblock_hint"],
+        "Post the approval comment, then call unblock."
+    );
+    assert_eq!(
+        blocked["projection"]["last_stop"]["activity"],
+        "implement_issue"
+    );
+    assert_eq!(
+        blocked["projection"]["last_stop"]["runtime_job_id"],
+        blocked_runtime_job_id
+    );
+    assert_eq!(blocked["projection"]["can_unblock"], true);
+    assert_eq!(blocked["projection"]["can_retry"], false);
+
     let terminal = node("issue-terminal");
     assert_eq!(terminal["projection"]["status"], "failed");
     assert_eq!(terminal["projection"]["phase"], "terminal");
@@ -504,8 +591,57 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
     );
     assert_eq!(terminal["projection"]["failure_kind"], "task");
     assert!(terminal["projection"]["active_bucket"].is_null());
+    assert_eq!(
+        terminal["projection"]["failure_reason"],
+        "Runtime transport timed out."
+    );
+    assert_eq!(terminal["projection"]["error_kind"], "timeout");
+    assert_eq!(
+        terminal["projection"]["retry_hint"],
+        "Fix the transient condition, then call retry."
+    );
+    assert_eq!(
+        terminal["projection"]["last_stop"]["runtime_job_id"],
+        failed_runtime_job_id
+    );
+    assert_eq!(terminal["projection"]["can_unblock"], false);
+    assert_eq!(terminal["projection"]["can_retry"], true);
+
+    let nonretryable = node("issue-nonretryable");
+    assert_eq!(nonretryable["projection"]["error_kind"], "configuration");
+    assert_eq!(nonretryable["projection"]["can_unblock"], false);
+    assert_eq!(nonretryable["projection"]["can_retry"], false);
+
+    let cancelled = node("issue-cancelled");
+    assert_eq!(cancelled["projection"]["status"], "cancelled");
+    assert_eq!(cancelled["projection"]["can_unblock"], false);
+    assert_eq!(cancelled["projection"]["can_retry"], false);
 
     Ok(())
+}
+
+async fn set_recovery_source_job(
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    workflow_id: &str,
+    command: harness_workflow::runtime::WorkflowCommand,
+) -> anyhow::Result<String> {
+    let command_id = store.enqueue_command(workflow_id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-test",
+            command.command.clone(),
+        )
+        .await?;
+    let runtime_job_id = job.id.clone();
+    let mut workflow = store
+        .get_instance(workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing workflow {workflow_id}"))?;
+    workflow.data["last_stop"]["runtime_job_id"] = serde_json::json!(runtime_job_id.clone());
+    store.upsert_instance(&workflow).await?;
+    Ok(runtime_job_id)
 }
 
 #[tokio::test]

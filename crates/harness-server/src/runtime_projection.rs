@@ -1,9 +1,15 @@
+mod stopped_actions;
+
 use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskId, TaskPhase, TaskSchedulerState, TaskStatus,
 };
 use harness_workflow::runtime::{
     WorkflowInstance, WorkflowTerminalState, QUALITY_GATE_DEFINITION_ID,
 };
+use serde::Serialize;
+use serde_json::Value;
+
+pub(crate) use stopped_actions::stopped_action_eligibility_for_workflows;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeActiveBucket {
@@ -21,10 +27,39 @@ pub(crate) struct RuntimeWorkflowProjection {
     pub(crate) project_id: Option<String>,
     pub(crate) submission_handle: Option<TaskId>,
     pub(crate) legacy_dedupe_task_handle: Option<TaskId>,
+    pub(crate) stopped_state: RuntimeStoppedStateProjection,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct RuntimeStoppedStateProjection {
+    pub(crate) blocked_reason: Option<String>,
+    pub(crate) unblock_hint: Option<String>,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) error_kind: Option<String>,
+    pub(crate) retry_hint: Option<String>,
+    pub(crate) last_stop: Option<Value>,
+    pub(crate) can_unblock: bool,
+    pub(crate) can_retry: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeStoppedActionEligibility {
+    pub(crate) can_unblock: bool,
+    pub(crate) can_retry: bool,
 }
 
 impl RuntimeWorkflowProjection {
     pub(crate) fn from_workflow(workflow: &WorkflowInstance) -> Self {
+        Self::from_workflow_with_stopped_eligibility(
+            workflow,
+            RuntimeStoppedActionEligibility::default(),
+        )
+    }
+
+    pub(crate) fn from_workflow_with_stopped_eligibility(
+        workflow: &WorkflowInstance,
+        stopped_eligibility: RuntimeStoppedActionEligibility,
+    ) -> Self {
         let terminal_state = workflow.terminal_state();
         let task_status = workflow_state_to_task_status(workflow, terminal_state);
         let scheduler = workflow_scheduler_state(&workflow.state, &task_status, terminal_state);
@@ -43,11 +78,47 @@ impl RuntimeWorkflowProjection {
             project_id: runtime_string_field(&workflow.data, "project_id"),
             submission_handle: runtime_submission_handle(&workflow.data),
             legacy_dedupe_task_handle: legacy_dedupe_task_handle(&workflow.data),
+            stopped_state: RuntimeStoppedStateProjection::from_workflow(workflow)
+                .with_action_eligibility(stopped_eligibility),
         }
     }
 
     pub(crate) fn active_bucket(&self) -> Option<RuntimeActiveBucket> {
         self.active_bucket
+    }
+}
+
+impl RuntimeStoppedStateProjection {
+    pub(crate) fn from_workflow(workflow: &WorkflowInstance) -> Self {
+        let last_stop = structured_last_stop(&workflow.data);
+        let error_kind = stopped_string_field(&workflow.data, "error_kind").or_else(|| {
+            last_stop
+                .as_ref()
+                .and_then(|value| value.get("error_kind"))
+                .and_then(trimmed_string)
+        });
+        Self {
+            blocked_reason: stopped_string_field(&workflow.data, "blocked_reason"),
+            unblock_hint: stopped_string_field(&workflow.data, "unblock_hint"),
+            failure_reason: first_stopped_string_field(
+                &workflow.data,
+                &["failure_reason", "previous_error", "last_error", "error"],
+            ),
+            retry_hint: stopped_string_field(&workflow.data, "retry_hint"),
+            can_unblock: false,
+            can_retry: false,
+            error_kind,
+            last_stop,
+        }
+    }
+
+    pub(crate) fn with_action_eligibility(
+        mut self,
+        eligibility: RuntimeStoppedActionEligibility,
+    ) -> Self {
+        self.can_unblock = eligibility.can_unblock;
+        self.can_retry = eligibility.can_retry;
+        self
     }
 }
 
@@ -184,6 +255,22 @@ fn runtime_submission_handle(data: &serde_json::Value) -> Option<TaskId> {
         .or_else(|| first_string_array_field(data, "task_ids"))
         .or_else(|| trimmed_string_field(data, "task_id"))
         .map(harness_core::types::TaskId)
+}
+
+fn stopped_string_field(data: &serde_json::Value, field: &str) -> Option<String> {
+    data.get(field).and_then(trimmed_string)
+}
+
+fn first_stopped_string_field(data: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| stopped_string_field(data, field))
+}
+
+fn structured_last_stop(data: &serde_json::Value) -> Option<Value> {
+    data.get("last_stop")
+        .filter(|value| value.is_object())
+        .cloned()
 }
 
 fn legacy_dedupe_task_handle(data: &serde_json::Value) -> Option<TaskId> {
@@ -447,6 +534,102 @@ mod tests {
             SchedulerAuthorityState::Queued
         );
         assert_eq!(projection.active_bucket(), None);
+    }
+
+    #[test]
+    fn projection_exposes_structured_blocked_stop_metadata() {
+        let workflow = workflow(
+            "blocked",
+            serde_json::json!({
+                "blocked_reason": "Waiting for maintainer approval.",
+                "unblock_hint": "Post the approval comment, then call unblock.",
+                "last_stop": {
+                    "state": "blocked",
+                    "activity": "implement_issue",
+                    "runtime_job_id": "job-1",
+                    "event_id": 10
+                }
+            }),
+        );
+
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+        assert_eq!(
+            projection.stopped_state.blocked_reason.as_deref(),
+            Some("Waiting for maintainer approval.")
+        );
+        assert_eq!(
+            projection.stopped_state.unblock_hint.as_deref(),
+            Some("Post the approval comment, then call unblock.")
+        );
+        assert_eq!(
+            projection.stopped_state.last_stop.as_ref().unwrap()["activity"],
+            "implement_issue"
+        );
+        assert!(!projection.stopped_state.can_unblock);
+        assert!(!projection.stopped_state.can_retry);
+    }
+
+    #[test]
+    fn projection_exposes_stop_metadata_without_store_backed_retry_eligibility() {
+        let retryable = workflow(
+            "failed",
+            serde_json::json!({
+                "failure_reason": "Runtime transport timed out.",
+                "error_kind": "timeout",
+                "retry_hint": "Fix the transient condition, then call retry.",
+                "last_stop": {
+                    "state": "failed",
+                    "activity": "implement_issue",
+                    "runtime_job_id": "job-2"
+                }
+            }),
+        );
+        let configuration = workflow(
+            "failed",
+            serde_json::json!({
+                "failure_reason": "Missing configuration.",
+                "error_kind": "configuration"
+            }),
+        );
+        let cancelled = workflow(
+            "cancelled",
+            serde_json::json!({
+                "failure_reason": "Operator cancelled the workflow."
+            }),
+        );
+        let legacy = workflow(
+            "failed",
+            serde_json::json!({
+                "previous_error": "Legacy workflow failed before structured metadata shipped."
+            }),
+        );
+
+        let retryable = RuntimeWorkflowProjection::from_workflow(&retryable);
+        assert_eq!(
+            retryable.stopped_state.failure_reason.as_deref(),
+            Some("Runtime transport timed out.")
+        );
+        assert_eq!(
+            retryable.stopped_state.error_kind.as_deref(),
+            Some("timeout")
+        );
+        assert!(!retryable.stopped_state.can_retry);
+        assert!(!retryable.stopped_state.can_unblock);
+
+        let configuration = RuntimeWorkflowProjection::from_workflow(&configuration);
+        assert!(!configuration.stopped_state.can_retry);
+        assert!(!configuration.stopped_state.can_unblock);
+
+        let cancelled = RuntimeWorkflowProjection::from_workflow(&cancelled);
+        assert!(!cancelled.stopped_state.can_retry);
+        assert!(!cancelled.stopped_state.can_unblock);
+
+        let legacy = RuntimeWorkflowProjection::from_workflow(&legacy);
+        assert_eq!(
+            legacy.stopped_state.failure_reason.as_deref(),
+            Some("Legacy workflow failed before structured metadata shipped.")
+        );
     }
 
     #[test]

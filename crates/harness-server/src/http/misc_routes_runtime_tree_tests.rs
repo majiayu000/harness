@@ -1,6 +1,7 @@
 use super::*;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeEvent, RuntimeJob, RuntimeKind,
+    ActivityArtifact, ActivityResult, RuntimeEvent, RuntimeJob, RuntimeKind, WorkflowInstance,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde_json::json;
 
@@ -100,6 +101,127 @@ fn runtime_activity_summary_counts_all_loaded_jobs() {
     assert_eq!(summary.activity_outcomes["accepted"], 1);
     assert_eq!(summary.activity_outcomes["repaired_structured_output"], 1);
     assert_eq!(summary.jobs_without_activity_envelope, 1);
+}
+
+#[test]
+fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
+    let failed = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        WorkflowSubject::new("issue", "issue:1567"),
+    )
+    .with_data(json!({
+        "failure_reason": "Runtime transport timed out.",
+        "error_kind": "timeout",
+        "retry_hint": "Fix the transient condition, then call retry.",
+        "last_stop": {
+            "state": "failed",
+            "activity": "implement_issue",
+            "runtime_job_id": "job-failed",
+        },
+    }));
+    let blocked = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "blocked",
+        WorkflowSubject::new("issue", "issue:1568"),
+    )
+    .with_data(json!({
+        "blocked_reason": "Waiting for maintainer approval.",
+        "unblock_hint": "Post the approval comment, then call unblock.",
+        "last_stop": {
+            "state": "blocked",
+            "activity": "implement_issue",
+            "runtime_job_id": "job-blocked",
+        },
+    }));
+    let nonretryable = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        WorkflowSubject::new("issue", "issue:1569"),
+    )
+    .with_data(json!({
+        "failure_reason": "Missing runtime configuration.",
+        "error_kind": "configuration",
+    }));
+    let cancelled = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "cancelled",
+        WorkflowSubject::new("issue", "issue:1570"),
+    );
+    let legacy = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        WorkflowSubject::new("issue", "issue:1571"),
+    )
+    .with_data(json!({
+        "previous_error": "Legacy workflow failed before structured metadata shipped.",
+    }));
+
+    let failed = serde_json::to_value(
+        WorkflowRuntimeTreeProjection::from_workflow_with_stopped_eligibility(
+            &failed,
+            crate::runtime_projection::RuntimeStoppedActionEligibility {
+                can_unblock: false,
+                can_retry: true,
+            },
+        ),
+    )
+    .expect("failed projection should serialize");
+    assert_eq!(failed["failure_reason"], "Runtime transport timed out.");
+    assert_eq!(failed["error_kind"], "timeout");
+    assert_eq!(
+        failed["retry_hint"],
+        "Fix the transient condition, then call retry."
+    );
+    assert_eq!(failed["last_stop"]["runtime_job_id"], "job-failed");
+    assert_eq!(failed["can_unblock"], false);
+    assert_eq!(failed["can_retry"], true);
+
+    let blocked = serde_json::to_value(
+        WorkflowRuntimeTreeProjection::from_workflow_with_stopped_eligibility(
+            &blocked,
+            crate::runtime_projection::RuntimeStoppedActionEligibility {
+                can_unblock: true,
+                can_retry: false,
+            },
+        ),
+    )
+    .expect("blocked projection should serialize");
+    assert_eq!(
+        blocked["blocked_reason"],
+        "Waiting for maintainer approval."
+    );
+    assert_eq!(
+        blocked["unblock_hint"],
+        "Post the approval comment, then call unblock."
+    );
+    assert_eq!(blocked["last_stop"]["runtime_job_id"], "job-blocked");
+    assert_eq!(blocked["can_unblock"], true);
+    assert_eq!(blocked["can_retry"], false);
+
+    let nonretryable =
+        serde_json::to_value(WorkflowRuntimeTreeProjection::from_workflow(&nonretryable))
+            .expect("nonretryable projection should serialize");
+    assert_eq!(nonretryable["error_kind"], "configuration");
+    assert_eq!(nonretryable["can_unblock"], false);
+    assert_eq!(nonretryable["can_retry"], false);
+
+    let cancelled = serde_json::to_value(WorkflowRuntimeTreeProjection::from_workflow(&cancelled))
+        .expect("cancelled projection should serialize");
+    assert_eq!(cancelled["can_unblock"], false);
+    assert_eq!(cancelled["can_retry"], false);
+
+    let legacy = serde_json::to_value(WorkflowRuntimeTreeProjection::from_workflow(&legacy))
+        .expect("legacy projection should serialize");
+    assert_eq!(
+        legacy["failure_reason"],
+        "Legacy workflow failed before structured metadata shipped."
+    );
 }
 
 #[test]

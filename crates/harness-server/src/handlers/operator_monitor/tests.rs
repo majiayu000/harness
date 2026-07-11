@@ -3,8 +3,8 @@ use crate::test_helpers;
 use axum::{body::to_bytes, routing::get, Router};
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
-    QUALITY_GATE_DEFINITION_ID,
+    RuntimeKind, WorkflowCommand, WorkflowRuntimeStore, WorkflowSubject,
+    GITHUB_ISSUE_PR_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 
 fn workflow(state: &str, data: Value) -> WorkflowInstance {
@@ -102,6 +102,44 @@ fn workflow_sample_truncation_preserves_operator_action_and_failed_states() {
         .iter()
         .any(|workflow| workflow.id == "older-failed"));
     assert_eq!(workflows.len(), 500);
+}
+
+#[test]
+fn workflow_sample_truncation_preserves_failed_reserve_before_operator_actions() {
+    let base = Utc::now();
+    let mut workflows = (0..500)
+        .map(|index| {
+            let mut workflow = workflow(
+                "ready_to_merge",
+                json!({
+                    "source": "github",
+                    "pr_number": index,
+                    "pr_url": format!("https://github.com/owner/repo/pull/{index}"),
+                }),
+            )
+            .with_id(format!("ready-{index}"));
+            workflow.updated_at = base + chrono::Duration::seconds(index);
+            workflow
+        })
+        .collect::<Vec<_>>();
+    let mut failed = workflow(
+        "failed",
+        json!({
+            "source": "quality_gate",
+            "failure_reason": "Runtime transport timed out.",
+            "error_kind": "timeout",
+        }),
+    )
+    .with_id("reserved-failed-workflow".to_string());
+    failed.updated_at = base - chrono::Duration::hours(1);
+    workflows.push(failed);
+
+    truncate_workflow_sample(&mut workflows, 500);
+
+    assert_eq!(workflows.len(), 500);
+    assert!(workflows
+        .iter()
+        .any(|workflow| workflow.id == "reserved-failed-workflow"));
 }
 
 #[test]
@@ -302,7 +340,7 @@ fn operator_actions_link_evidence_to_current_legacy_task_id() {
     .with_id("ready-workflow".to_string());
     ready.updated_at = Utc::now();
 
-    let actions = operator_actions(&[ready], Utc::now());
+    let actions = operator_actions(&[ready], Utc::now(), &std::collections::HashMap::new());
 
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].task_id.as_deref(), Some("current-task"));
@@ -310,6 +348,471 @@ fn operator_actions_link_evidence_to_current_legacy_task_id() {
         actions[0].evidence_url.as_deref(),
         Some("/tasks/current-task")
     );
+}
+
+#[test]
+fn operator_monitor_actions_expose_structured_stop_metadata_and_eligibility() {
+    let blocked = workflow(
+        "blocked",
+        json!({
+            "repo": "owner/repo",
+            "issue_number": 1567,
+            "blocked_reason": "Waiting for maintainer approval.",
+            "unblock_hint": "Post the approval comment, then call unblock.",
+            "last_stop": {
+                "state": "blocked",
+                "activity": "implement_issue",
+                "runtime_job_id": "job-blocked"
+            },
+        }),
+    )
+    .with_id("blocked-workflow".to_string());
+    let retryable_failed = workflow(
+        "failed",
+        json!({
+            "repo": "owner/repo",
+            "issue_number": 1568,
+            "failure_reason": "Runtime transport timed out.",
+            "error_kind": "timeout",
+            "retry_hint": "Fix the transient condition, then call retry.",
+            "last_stop": {
+                "state": "failed",
+                "activity": "implement_issue",
+                "runtime_job_id": "job-failed"
+            },
+        }),
+    )
+    .with_id("retryable-failed-workflow".to_string());
+    let configuration_failed = workflow(
+        "failed",
+        json!({
+            "repo": "owner/repo",
+            "issue_number": 1569,
+            "failure_reason": "Missing runtime configuration.",
+            "error_kind": "configuration",
+            "retry_hint": "Fix the non-retryable failure before retrying.",
+        }),
+    )
+    .with_id("configuration-failed-workflow".to_string());
+    let cancelled = workflow(
+        "cancelled",
+        json!({
+            "repo": "owner/repo",
+            "issue_number": 1570,
+            "failure_reason": "Operator cancelled the workflow.",
+        }),
+    )
+    .with_id("cancelled-workflow".to_string());
+
+    let mut stopped_eligibility = std::collections::HashMap::new();
+    stopped_eligibility.insert(
+        "blocked-workflow".to_string(),
+        RuntimeStoppedActionEligibility {
+            can_unblock: true,
+            can_retry: false,
+        },
+    );
+    stopped_eligibility.insert(
+        "retryable-failed-workflow".to_string(),
+        RuntimeStoppedActionEligibility {
+            can_unblock: false,
+            can_retry: true,
+        },
+    );
+    let actions = operator_actions(
+        &[blocked, retryable_failed, configuration_failed, cancelled],
+        Utc::now(),
+        &stopped_eligibility,
+    );
+    let row = |workflow_id: &str| {
+        actions
+            .iter()
+            .find(|action| action.workflow_id == workflow_id)
+            .map(|action| serde_json::to_value(action).expect("action should serialize"))
+            .unwrap_or_else(|| panic!("missing operator action for {workflow_id}"))
+    };
+
+    let blocked = row("blocked-workflow");
+    assert_eq!(blocked["kind"], "blocked");
+    assert_eq!(
+        blocked["blocked_reason"],
+        "Waiting for maintainer approval."
+    );
+    assert_eq!(
+        blocked["unblock_hint"],
+        "Post the approval comment, then call unblock."
+    );
+    assert_eq!(blocked["last_stop"]["activity"], "implement_issue");
+    assert_eq!(blocked["can_unblock"], true);
+    assert_eq!(blocked["can_retry"], false);
+
+    let retryable_failed = row("retryable-failed-workflow");
+    assert_eq!(retryable_failed["kind"], "failed");
+    assert_eq!(
+        retryable_failed["failure_reason"],
+        "Runtime transport timed out."
+    );
+    assert_eq!(retryable_failed["error_kind"], "timeout");
+    assert_eq!(retryable_failed["next_action"], "Retry failed workflow");
+    assert_eq!(
+        retryable_failed["retry_hint"],
+        "Fix the transient condition, then call retry."
+    );
+    assert_eq!(
+        retryable_failed["last_stop"]["runtime_job_id"],
+        "job-failed"
+    );
+    assert_eq!(retryable_failed["can_unblock"], false);
+    assert_eq!(retryable_failed["can_retry"], true);
+
+    let configuration_failed = row("configuration-failed-workflow");
+    assert_eq!(configuration_failed["error_kind"], "configuration");
+    assert_eq!(
+        configuration_failed["next_action"],
+        "Inspect failed workflow"
+    );
+    assert_eq!(configuration_failed["can_unblock"], false);
+    assert_eq!(configuration_failed["can_retry"], false);
+    assert!(actions
+        .iter()
+        .all(|action| action.workflow_id != "cancelled-workflow"));
+}
+
+#[test]
+fn operator_monitor_stuck_workflows_expose_structured_stop_metadata() {
+    let blocked = workflow(
+        "blocked",
+        json!({
+            "repo": "owner/repo",
+            "issue_number": 1567,
+            "blocked_reason": "Waiting for maintainer approval.",
+            "unblock_hint": "Post the approval comment, then call unblock.",
+            "last_stop": {
+                "state": "blocked",
+                "activity": "implement_issue",
+                "runtime_job_id": "job-blocked",
+            },
+        }),
+    )
+    .with_id("stuck-blocked-workflow".to_string());
+
+    let mut stopped_eligibility = std::collections::HashMap::new();
+    stopped_eligibility.insert(
+        "stuck-blocked-workflow".to_string(),
+        RuntimeStoppedActionEligibility {
+            can_unblock: true,
+            can_retry: false,
+        },
+    );
+    let stuck = stuck_workflows_from_instances(&[blocked], Utc::now(), &stopped_eligibility);
+    let row = serde_json::to_value(&stuck[0]).expect("stuck workflow should serialize");
+
+    assert_eq!(row["workflow_id"], "stuck-blocked-workflow");
+    assert_eq!(row["blocked_reason"], "Waiting for maintainer approval.");
+    assert_eq!(
+        row["unblock_hint"],
+        "Post the approval comment, then call unblock."
+    );
+    assert_eq!(row["last_stop"]["runtime_job_id"], "job-blocked");
+    assert_eq!(row["can_unblock"], true);
+    assert_eq!(row["can_retry"], false);
+}
+
+#[tokio::test]
+async fn stopped_action_eligibility_matches_recovery_contract_rejections() -> anyhow::Result<()> {
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-stopped-action-eligibility-")?;
+    let store = WorkflowRuntimeStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+        Some(&test_helpers::test_database_url()?),
+    )
+    .await?;
+
+    let legacy_blocked = store_workflow(
+        &store,
+        workflow("blocked", json!({ "blocked_reason": "legacy blocked row" }))
+            .with_id("legacy-blocked".to_string()),
+    )
+    .await?;
+    let legacy_null_last_stop = store_workflow(
+        &store,
+        workflow(
+            "failed",
+            json!({
+                "failure_reason": "Legacy workflow failed before structured metadata shipped.",
+                "last_stop": null,
+            }),
+        )
+        .with_id("legacy-null-last-stop".to_string()),
+    )
+    .await?;
+    let valid_blocked = store_stopped_workflow_with_source(
+        &store,
+        "valid-blocked",
+        "blocked",
+        json!({
+            "blocked_reason": "Waiting for maintainer approval.",
+            "last_stop": {
+                "state": "blocked",
+                "activity": "implement_issue",
+            },
+        }),
+        WorkflowCommand::enqueue_activity("implement_issue", "valid-blocked-source"),
+    )
+    .await?;
+    let valid_unknown = store_stopped_workflow_with_source(
+        &store,
+        "valid-unknown",
+        "failed",
+        json!({
+            "error_kind": "unknown",
+            "last_stop": {
+                "state": "failed",
+                "activity": "implement_issue",
+                "error_kind": "unknown",
+            },
+        }),
+        WorkflowCommand::enqueue_activity("implement_issue", "valid-unknown-source"),
+    )
+    .await?;
+    let non_github = store_quality_gate_workflow(
+        &store,
+        "non-github",
+        "blocked",
+        json!({
+            "last_stop": {
+                "state": "blocked",
+                "activity": "implement_issue",
+            },
+        }),
+        WorkflowCommand::enqueue_activity("implement_issue", "non-github-source"),
+    )
+    .await?;
+    let empty_last_stop = store_workflow(
+        &store,
+        workflow("blocked", json!({ "last_stop": {} })).with_id("empty-last-stop".to_string()),
+    )
+    .await?;
+    let partial_last_stop = store_workflow(
+        &store,
+        workflow(
+            "failed",
+            json!({
+                "error_kind": "timeout",
+                "last_stop": {
+                    "state": "failed",
+                    "activity": "implement_issue",
+                },
+            }),
+        )
+        .with_id("partial-last-stop".to_string()),
+    )
+    .await?;
+    let non_object_last_stop = store_workflow(
+        &store,
+        workflow("blocked", json!({ "last_stop": 42 })).with_id("non-object-last-stop".to_string()),
+    )
+    .await?;
+    let invalid_error_kind = store_stopped_workflow_with_source(
+        &store,
+        "invalid-error-kind",
+        "failed",
+        json!({
+            "error_kind": "not_a_kind",
+            "last_stop": {
+                "state": "failed",
+                "activity": "implement_issue",
+            },
+        }),
+        WorkflowCommand::enqueue_activity("implement_issue", "invalid-error-kind-source"),
+    )
+    .await?;
+    let unsupported_activity = store_stopped_workflow_with_source(
+        &store,
+        "unsupported-activity",
+        "failed",
+        json!({
+            "error_kind": "timeout",
+            "last_stop": {
+                "state": "failed",
+                "activity": "quality_gate",
+            },
+        }),
+        WorkflowCommand::enqueue_activity("quality_gate", "unsupported-activity-source"),
+    )
+    .await?;
+    let missing_runtime_job_id = store_workflow(
+        &store,
+        workflow(
+            "blocked",
+            json!({
+                "last_stop": {
+                    "state": "blocked",
+                    "activity": "implement_issue",
+                },
+            }),
+        )
+        .with_id("missing-runtime-job-id".to_string()),
+    )
+    .await?;
+    let missing_source_command = store_workflow(
+        &store,
+        workflow(
+            "failed",
+            json!({
+                "error_kind": "timeout",
+                "last_stop": {
+                    "state": "failed",
+                    "activity": "implement_issue",
+                    "runtime_job_id": "missing-runtime-job",
+                },
+            }),
+        )
+        .with_id("missing-source-command".to_string()),
+    )
+    .await?;
+    let command_target_mismatch = store_stopped_workflow_with_source(
+        &store,
+        "command-target-mismatch",
+        "failed",
+        json!({
+            "error_kind": "timeout",
+            "last_stop": {
+                "state": "failed",
+                "activity": "implement_issue",
+            },
+        }),
+        WorkflowCommand::enqueue_activity("replan_issue", "command-target-mismatch-source"),
+    )
+    .await?;
+
+    let workflows = vec![
+        legacy_blocked,
+        legacy_null_last_stop,
+        valid_blocked,
+        valid_unknown,
+        non_github,
+        empty_last_stop,
+        partial_last_stop,
+        non_object_last_stop,
+        invalid_error_kind,
+        unsupported_activity,
+        missing_runtime_job_id,
+        missing_source_command,
+        command_target_mismatch,
+    ];
+    let eligibility = stopped_action_eligibility_for_workflows(Some(&store), &workflows).await?;
+    let flags = |workflow_id: &str| eligibility.get(workflow_id).copied().unwrap_or_default();
+
+    assert_eq!(
+        flags("legacy-blocked"),
+        RuntimeStoppedActionEligibility {
+            can_unblock: true,
+            can_retry: false,
+        }
+    );
+    assert_eq!(
+        flags("legacy-null-last-stop"),
+        RuntimeStoppedActionEligibility {
+            can_unblock: false,
+            can_retry: true,
+        }
+    );
+    assert_eq!(
+        flags("valid-blocked"),
+        RuntimeStoppedActionEligibility {
+            can_unblock: true,
+            can_retry: false,
+        }
+    );
+    assert_eq!(
+        flags("valid-unknown"),
+        RuntimeStoppedActionEligibility {
+            can_unblock: false,
+            can_retry: true,
+        }
+    );
+    for workflow_id in [
+        "non-github",
+        "empty-last-stop",
+        "partial-last-stop",
+        "non-object-last-stop",
+        "invalid-error-kind",
+        "unsupported-activity",
+        "missing-runtime-job-id",
+        "missing-source-command",
+        "command-target-mismatch",
+    ] {
+        assert_eq!(
+            flags(workflow_id),
+            RuntimeStoppedActionEligibility::default(),
+            "{workflow_id}"
+        );
+    }
+    Ok(())
+}
+
+async fn store_workflow(
+    store: &WorkflowRuntimeStore,
+    workflow: WorkflowInstance,
+) -> anyhow::Result<WorkflowInstance> {
+    store.upsert_instance(&workflow).await?;
+    Ok(workflow)
+}
+
+async fn store_stopped_workflow_with_source(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    state: &str,
+    data: Value,
+    command: WorkflowCommand,
+) -> anyhow::Result<WorkflowInstance> {
+    let workflow = workflow(state, data).with_id(workflow_id.to_string());
+    store.upsert_instance(&workflow).await?;
+    let workflow = attach_recovery_source_job(store, workflow, command).await?;
+    Ok(workflow)
+}
+
+async fn store_quality_gate_workflow(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    state: &str,
+    data: Value,
+    command: WorkflowCommand,
+) -> anyhow::Result<WorkflowInstance> {
+    let workflow = WorkflowInstance::new(
+        QUALITY_GATE_DEFINITION_ID,
+        1,
+        state,
+        WorkflowSubject::new("quality_gate", workflow_id),
+    )
+    .with_id(workflow_id.to_string())
+    .with_data(data);
+    store.upsert_instance(&workflow).await?;
+    attach_recovery_source_job(store, workflow, command).await
+}
+
+async fn attach_recovery_source_job(
+    store: &WorkflowRuntimeStore,
+    mut workflow: WorkflowInstance,
+    command: WorkflowCommand,
+) -> anyhow::Result<WorkflowInstance> {
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-test",
+            command.command.clone(),
+        )
+        .await?;
+    workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
+    store.upsert_instance(&workflow).await?;
+    Ok(workflow)
 }
 
 #[test]
@@ -518,7 +1021,7 @@ async fn operator_action_age_uses_store_updated_at() -> anyhow::Result<()> {
         .await?;
 
     let workflows = list_runtime_workflows_from_store(&workflow_runtime_store).await?;
-    let actions = operator_actions(&workflows, Utc::now());
+    let actions = operator_actions(&workflows, Utc::now(), &std::collections::HashMap::new());
 
     let action = actions
         .iter()

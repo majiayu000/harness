@@ -1,6 +1,8 @@
 use serde_json::Value;
 
-use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
+use crate::runtime_projection::{
+    RuntimeActiveBucket, RuntimeStoppedActionEligibility, RuntimeWorkflowProjection,
+};
 use crate::task_runner;
 use harness_workflow::runtime::store::{RuntimeEventSummary, RuntimeJobCompactRecord};
 use harness_workflow::runtime::{
@@ -191,11 +193,27 @@ pub(super) struct WorkflowRuntimeTreeProjection {
     pub submission_handle: Option<String>,
     pub legacy_dedupe_task_handle: Option<String>,
     pub active_bucket: Option<&'static str>,
+    #[serde(flatten)]
+    pub stopped_state: crate::runtime_projection::RuntimeStoppedStateProjection,
 }
 
 impl WorkflowRuntimeTreeProjection {
+    #[cfg(test)]
     pub(super) fn from_workflow(workflow: &WorkflowInstance) -> Self {
-        let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+        Self::from_workflow_with_stopped_eligibility(
+            workflow,
+            RuntimeStoppedActionEligibility::default(),
+        )
+    }
+
+    pub(super) fn from_workflow_with_stopped_eligibility(
+        workflow: &WorkflowInstance,
+        stopped_eligibility: RuntimeStoppedActionEligibility,
+    ) -> Self {
+        let projection = RuntimeWorkflowProjection::from_workflow_with_stopped_eligibility(
+            workflow,
+            stopped_eligibility,
+        );
         let active_bucket = projection.active_bucket().map(runtime_active_bucket_label);
         Self {
             status: projection.task_status,
@@ -208,6 +226,7 @@ impl WorkflowRuntimeTreeProjection {
                 .legacy_dedupe_task_handle
                 .map(|task_id| task_id.0),
             active_bucket,
+            stopped_state: projection.stopped_state,
         }
     }
 }
