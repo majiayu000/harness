@@ -72,7 +72,7 @@ struct RecoveryDispatchPlan { target: RecoveryDispatchTarget, command_source: Re
 #[derive(Debug, Clone, PartialEq)]
 enum RecoveryDispatchCommandSource {
     Replay(WorkflowCommand),
-    LegacyFailedRetry,
+    LegacyFallback,
 }
 
 impl WorkflowRuntimeStore {
@@ -90,7 +90,7 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(outcome);
         }
-        let _plan = match recovery_dispatch_plan_tx(&mut tx, &snapshot, request.action).await? {
+        let _plan = match recovery_dispatch_plan_tx(&mut tx, &snapshot).await? {
             Ok(plan) => plan,
             Err(activity) => {
                 tx.commit().await?;
@@ -112,7 +112,7 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(outcome);
         }
-        let plan = match recovery_dispatch_plan_tx(&mut tx, &instance, request.action).await? {
+        let plan = match recovery_dispatch_plan_tx(&mut tx, &instance).await? {
             Ok(plan) => plan,
             Err(activity) => {
                 tx.rollback().await?;
@@ -247,10 +247,10 @@ fn recovery_rejection(
 async fn recovery_dispatch_plan_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
-    action: WorkflowRuntimeRecoveryAction,
 ) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
+    validate_stopped_metadata(&instance.data)?;
     let activity = stopped_activity(&instance.data)?;
-    let target = match recovery_dispatch_target(&instance.data, action, activity.as_deref())? {
+    let target = match recovery_dispatch_target(&instance.data, activity.as_deref())? {
         Ok(target) => target,
         Err(activity) => return Ok(Err(activity)),
     };
@@ -270,7 +270,7 @@ async fn recovery_dispatch_plan_tx(
         }
         RecoveryDispatchCommandSource::Replay(command)
     } else {
-        RecoveryDispatchCommandSource::LegacyFailedRetry
+        RecoveryDispatchCommandSource::LegacyFallback
     };
     Ok(Ok(RecoveryDispatchPlan {
         target,
@@ -280,12 +280,11 @@ async fn recovery_dispatch_plan_tx(
 
 fn recovery_dispatch_target(
     data: &Value,
-    action: WorkflowRuntimeRecoveryAction,
     activity_name: Option<&str>,
 ) -> anyhow::Result<Result<RecoveryDispatchTarget, Option<String>>> {
     let activity = activity_name.map(ToOwned::to_owned);
     let Some(activity_name) = activity.as_deref() else {
-        if is_legacy_failed_retry(data, action)? {
+        if has_no_structured_stop_metadata(data)? {
             return Ok(Ok(RecoveryDispatchTarget {
                 state: "implementing",
                 activity: "implement_issue",
@@ -348,36 +347,20 @@ async fn select_command_for_runtime_job_tx(
         .map_err(Into::into)
 }
 
-fn command_matches_recovery_target(
-    command: &WorkflowCommand,
-    target: RecoveryDispatchTarget,
-) -> bool {
+#[rustfmt::skip]
+fn command_matches_recovery_target(command: &WorkflowCommand, target: RecoveryDispatchTarget) -> bool {
     match command.command_type {
         WorkflowCommandType::EnqueueActivity => {
             command.activity_name() == Some(target.activity)
                 && enqueue_payload_matches_target(&command.command)
         }
         WorkflowCommandType::StartChildWorkflow => {
-            matches!(
-                target.activity,
-                "start_child_workflow" | "sweep_pr_feedback"
-            ) && command.command.get("definition_id").and_then(Value::as_str)
-                == Some(PR_FEEDBACK_DEFINITION_ID)
-                && command
-                    .command
-                    .get("child_activity")
-                    .and_then(Value::as_str)
-                    == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
-                && command
-                    .command
-                    .get("pr_number")
-                    .and_then(Value::as_u64)
-                    .is_some()
-                && command
-                    .command
-                    .get("subject_key")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty())
+            let payload = &command.command;
+            matches!(target.activity, "start_child_workflow" | "sweep_pr_feedback")
+                && payload.get("definition_id").and_then(Value::as_str) == Some(PR_FEEDBACK_DEFINITION_ID)
+                && payload.get("child_activity").and_then(Value::as_str) == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
+                && payload.get("pr_number").and_then(Value::as_u64).is_some()
+                && payload.get("subject_key").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
         }
         _ => false,
     }
@@ -396,14 +379,9 @@ fn enqueue_payload_matches_target(payload: &Value) -> bool {
         || (payload.get("pr_number").and_then(Value::as_u64).is_some() && review_summary && hygiene)
 }
 
-fn unsupported_stopped_activity(
-    instance: &WorkflowInstance,
-    activity: Option<String>,
-) -> WorkflowRuntimeRecoveryOutcome {
-    WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity {
-        workflow: instance.clone(),
-        activity,
-    }
+#[rustfmt::skip]
+fn unsupported_stopped_activity(instance: &WorkflowInstance, activity: Option<String>) -> WorkflowRuntimeRecoveryOutcome {
+    WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { workflow: instance.clone(), activity }
 }
 
 async fn skip_superseded_active_commands_tx(
@@ -587,24 +565,31 @@ fn stopped_error_kind(data: &Value) -> anyhow::Result<Option<ActivityErrorKind>>
     Ok(root.or(last_stop))
 }
 
+fn stopped_state(data: &Value) -> anyhow::Result<Option<String>> {
+    optional_metadata_string(data.pointer("/last_stop/state"), "last_stop.state")
+}
+
 fn stopped_activity(data: &Value) -> anyhow::Result<Option<String>> {
     optional_metadata_string(data.pointer("/last_stop/activity"), "last_stop.activity")
 }
 
+#[rustfmt::skip]
 fn stopped_runtime_job_id(data: &Value) -> anyhow::Result<Option<String>> {
-    optional_metadata_string(
-        data.pointer("/last_stop/runtime_job_id"),
-        "last_stop.runtime_job_id",
-    )
+    optional_metadata_string(data.pointer("/last_stop/runtime_job_id"), "last_stop.runtime_job_id")
 }
 
-fn is_legacy_failed_retry(
-    data: &Value,
-    action: WorkflowRuntimeRecoveryAction,
-) -> anyhow::Result<bool> {
-    Ok(action == WorkflowRuntimeRecoveryAction::Retry
-        && stopped_activity(data)?.is_none()
-        && stopped_error_kind(data)?.is_none())
+#[rustfmt::skip]
+fn validate_stopped_metadata(data: &Value) -> anyhow::Result<()> {
+    if data.get("last_stop").filter(|value| !value.is_null()).is_some_and(|value| !value.is_object()) {
+        bail!("workflow runtime recovery stop metadata `last_stop` must be an object");
+    }
+    let (_state, _activity, _runtime_job_id, _error_kind) = (stopped_state(data)?, stopped_activity(data)?, stopped_runtime_job_id(data)?, stopped_error_kind(data)?);
+    Ok(())
+}
+
+#[rustfmt::skip]
+fn has_no_structured_stop_metadata(data: &Value) -> anyhow::Result<bool> {
+    Ok(stopped_state(data)?.is_none() && stopped_activity(data)?.is_none() && stopped_runtime_job_id(data)?.is_none() && stopped_error_kind(data)?.is_none())
 }
 
 fn optional_metadata_string(value: Option<&Value>, field: &str) -> anyhow::Result<Option<String>> {

@@ -200,6 +200,23 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
     Ok(())
 }
 
+#[rustfmt::skip]
+#[tokio::test]
+async fn runtime_recovery_unblocks_legacy_blocked_without_stop_metadata() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() { return Ok(()); }
+    let dir = tempfile::tempdir()?; let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let legacy = project_issue_instance("/project-a", 1693, "blocked").with_data(json!({"project_id": "/project-a", "issue_number": 1693, "blocked_reason": "legacy blocked row without structured stop metadata", "source": "github"}));
+    store.upsert_instance(&legacy).await?; let workflow = recovered_workflow(recover(&store, &legacy.id, super::WorkflowRuntimeRecoveryAction::Unblock).await?, "legacy unblock")?;
+    assert_eq!(workflow.state, "implementing"); assert_eq!(workflow.data["blocked_reason"], legacy.data["blocked_reason"]); assert!(workflow.data.get("last_stop").is_none());
+    assert_operator_recovery_audit(&store, &legacy.id, "WorkflowRuntimeUnblocked", "unblock", "blocked", "implementing").await?;
+    let commands = store.commands_for(&legacy.id).await?;
+    assert_eq!(commands.len(), 1); assert_eq!(commands[0].status, WorkflowCommandStatus::Pending); let command = &commands[0].command;
+    assert_eq!(command.command_type, WorkflowCommandType::EnqueueActivity); assert_eq!(command.activity_name(), Some("implement_issue"));
+    assert_eq!(command.command["project_id"], "/project-a"); assert_eq!(command.command["issue_number"], 1693); assert_eq!(command.command["dispatch_gate"]["reason"], "operator_workflow_runtime_unblock");
+    assert!(command.command["additional_prompt"].as_str().is_some_and(|prompt| prompt.contains("Recovery reason: operator fixed transient failure")));
+    Ok(())
+}
+
 #[tokio::test]
 async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
@@ -312,36 +329,20 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
         assert_unsupported_activity(outcome, "start_child_workflow");
     }
 
-    for (issue_number, data, field) in [
-        (
-            1694,
-            json!({
-                "error_kind": "timeout",
-                "last_stop": {"state": "failed", "activity": 42}
-            }),
-            "last_stop.activity",
-        ),
-        (
-            1695,
-            json!({
-                "last_stop": {"state": "failed", "error_kind": "not_a_kind"}
-            }),
-            "last_stop.error_kind",
-        ),
-    ] {
-        let malformed = project_issue_instance("/project-a", issue_number, "failed").with_data(data);
+    for (issue_number, state, action, data, field) in malformed_stop_metadata_cases() {
+        let malformed = project_issue_instance("/project-a", issue_number, state).with_data(data);
         store.upsert_instance(&malformed).await?;
         let err = recover(
             &store,
             &malformed.id,
-            super::WorkflowRuntimeRecoveryAction::Retry,
+            action,
         )
         .await
             .expect_err("malformed stop metadata must fail recovery");
         assert!(err.to_string().contains(field), "{err}");
         assert_eq!(
             store.get_instance(&malformed.id).await?.unwrap().state,
-            "failed"
+            state
         );
         assert!(store.commands_for(&malformed.id).await?.is_empty());
     }
@@ -490,6 +491,17 @@ fn assert_unsupported_activity(outcome: super::WorkflowRuntimeRecoveryOutcome, e
     ));
 }
 
+#[rustfmt::skip]
+fn malformed_stop_metadata_cases() -> [(u64, &'static str, super::WorkflowRuntimeRecoveryAction, serde_json::Value, &'static str); 4] {
+    use super::WorkflowRuntimeRecoveryAction::{Retry, Unblock};
+    [
+        (1688, "blocked", Unblock, json!({"last_stop": {"state": "blocked", "runtime_job_id": 42}}), "last_stop.runtime_job_id"),
+        (1689, "blocked", Unblock, json!({"last_stop": {"state": "blocked", "error_kind": "not_a_kind"}}), "last_stop.error_kind"),
+        (1694, "failed", Retry, json!({"error_kind": "timeout", "last_stop": {"state": "failed", "activity": 42}}), "last_stop.activity"),
+        (1695, "failed", Retry, json!({"last_stop": {"state": "failed", "error_kind": "not_a_kind"}}), "last_stop.error_kind"),
+    ]
+}
+
 fn pr_feedback_child_command(
     dedupe_key: &str,
     subject_key: &str,
@@ -560,6 +572,8 @@ async fn assert_operator_recovery_audit(
         assert_eq!(event.event[field], expected);
         assert_eq!(recovery[field], expected);
     }
+    assert_eq!(event.event["reason"], "operator fixed transient failure");
+    assert_eq!(recovery["reason"], "operator fixed transient failure");
     assert_eq!(recovery["actor"], "operator");
     assert_eq!(recovery["event_id"], event.id);
     Ok(())
