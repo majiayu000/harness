@@ -528,6 +528,100 @@ Tempo walkthrough.
 10. Task status → done/failed
 ```
 
+## Workflow Runtime Recovery API
+
+Use the recovery API when a GitHub issue workflow has stopped and an operator
+has resolved the external condition. Recovery is manual by default: Harness
+does not periodically retry stopped workflows, and these routes do not change
+GitHub labels, comments, or issue state.
+
+### Authentication
+
+The recovery routes use the same API authentication as other non-public HTTP
+routes. Configure `[server].api_token` or `HARNESS_API_TOKEN`, then send the
+token as a bearer credential. Tokenless access is available only when the
+server was deliberately started with `allow_unauthenticated = true` for local
+development.
+
+### Requests
+
+Both routes accept a JSON object with a non-empty workflow id and a non-empty
+operator reason. The reason is written to the workflow audit trail.
+
+```bash
+curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/unblock \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "github-issue-workflow-id",
+    "reason": "maintainer supplied the requested approval"
+  }'
+
+curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/retry \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "github-issue-workflow-id",
+    "reason": "the transient backend outage has been repaired"
+  }'
+```
+
+| Route | Required current state | Additional rules |
+|-------|------------------------|------------------|
+| `POST /api/workflows/runtime/unblock` | `blocked` | The stopped activity must be recoverable. |
+| `POST /api/workflows/runtime/retry` | `failed` | Failures classified as `fatal` or `configuration` are not retryable. |
+
+The first implementation supports only `github_issue_pr` workflow instances.
+`cancelled` and active workflows are not supported by either action. A legacy
+stopped instance with no structured stop metadata resumes at `implement_issue`;
+partial, malformed, or unsupported stop metadata fails closed without mutating
+the workflow.
+
+When structured stop metadata is present, Harness replays the original command
+for these activities and returns the corresponding dispatch state:
+
+| Stopped activity | New state |
+|------------------|-----------|
+| `implement_issue` | `implementing` |
+| `replan_issue` | `replanning` |
+| `merge_pr` | `merging` |
+| `run_local_review` | `local_review_gate` |
+| `sweep_pr_feedback`, `inspect_pr_feedback`, or `start_child_workflow` | `awaiting_feedback` |
+| `address_pr_feedback` | `addressing_feedback` |
+
+### Responses
+
+A successful request returns HTTP `200`. The `state` value depends on the
+replayed activity described above.
+
+```json
+{
+  "status": "unblocked",
+  "execution_path": "workflow_runtime",
+  "workflow_id": "github-issue-workflow-id",
+  "previous_state": "blocked",
+  "state": "implementing"
+}
+```
+
+Retry responses use `"status": "retried"` and
+`"previous_state": "failed"`.
+
+| HTTP status | Meaning |
+|-------------|---------|
+| `400 Bad Request` | `workflow_id` or `reason` is blank. |
+| `401 Unauthorized` | The bearer token is missing or invalid. |
+| `404 Not Found` | The workflow id does not exist. |
+| `409 Conflict` | The action does not match the current state, the failure is non-retryable, the workflow definition is unsupported, or the stopped activity cannot be reconstructed safely. |
+| `503 Service Unavailable` | The workflow runtime store is unavailable. |
+| `500 Internal Server Error` | Recovery failed while committing the transactional audit/state update. |
+
+Do not delete or edit workflow runtime rows to recover a stopped workflow.
+Direct database edits are unsupported and can break the event, decision,
+command, and runtime-job audit chain. Use the authenticated API so Harness can
+preserve stop evidence, supersede stale work safely, record the operator reason,
+and enqueue the correct follow-up command atomically.
+
 ## Scheduled Background Systems
 
 Harness runs several background schedulers automatically when the server starts:
