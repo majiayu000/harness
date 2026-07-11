@@ -56,8 +56,19 @@ export interface SourceActivity {
   ready_to_merge: number;
 }
 
-export interface OperatorAction {
-  kind: "ready_to_merge" | "awaiting_feedback" | "blocked" | string;
+export interface RuntimeStoppedState {
+  blocked_reason?: string | null;
+  unblock_hint?: string | null;
+  failure_reason?: string | null;
+  error_kind?: string | null;
+  retry_hint?: string | null;
+  last_stop?: Record<string, unknown> | null;
+  can_unblock?: boolean;
+  can_retry?: boolean;
+}
+
+export interface OperatorAction extends RuntimeStoppedState {
+  kind: "ready_to_merge" | "awaiting_feedback" | "blocked" | "failed" | string;
   repo: string | null;
   issue: number | null;
   pr: number | null;
@@ -71,7 +82,7 @@ export interface OperatorAction {
   source: string;
 }
 
-export interface StuckWorkflow {
+export interface StuckWorkflow extends RuntimeStoppedState {
   workflow_id: string;
   definition_id: string;
   state: string;
