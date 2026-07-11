@@ -58,7 +58,10 @@ def _json_loads(text: str) -> Any:
 
 
 def _open_directory(path: Path, *, private: bool) -> int:
-    resolved = path.resolve(strict=True)
+    try:
+        resolved = path.resolve(strict=True)
+    except RuntimeError as exc:
+        raise ReplayValidationError("directory path cannot be resolved safely") from exc
     expected = resolved.stat()
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(resolved, flags)

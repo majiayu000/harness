@@ -470,6 +470,32 @@ class OutputAndCliTests(unittest.TestCase):
         self.assertIn("error:", stderr.getvalue())
         self.assertNotIn("/missing/private/path", stderr.getvalue())
 
+    def test_cli_intermediate_symlink_loop_is_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first"
+            second = root / "second"
+            os.symlink("second", first)
+            os.symlink("first", second)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = NAP.main(
+                    [
+                        "summarize-evidence",
+                        "--manifest",
+                        str(first / "nested" / "manifest.json"),
+                        "--evidence",
+                        str(first / "nested" / "evidence.json"),
+                        "--output",
+                        str(root / "report.json"),
+                    ]
+                )
+
+        self.assertEqual(result, 2)
+        self.assertIn("error:", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertNotIn(str(root), stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
