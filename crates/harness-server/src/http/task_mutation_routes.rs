@@ -238,22 +238,16 @@ async fn recover_workflow_runtime(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let workflow_id = request.workflow_id.trim();
     if workflow_id.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "workflow_id is required" })),
-        );
+        return runtime_recovery_error(StatusCode::BAD_REQUEST, "workflow_id is required");
     }
     let reason = request.reason.trim();
     if reason.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "reason is required" })),
-        );
+        return runtime_recovery_error(StatusCode::BAD_REQUEST, "reason is required");
     }
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (
+        return runtime_recovery_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workflow runtime store unavailable" })),
+            "workflow runtime store unavailable",
         );
     };
 
@@ -272,26 +266,33 @@ async fn recover_workflow_runtime(
                 action = action.as_str(),
                 "recover_workflow_runtime: recovery failed: {error}"
             );
-            (
+            runtime_recovery_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "failed to recover workflow runtime submission" })),
+                "failed to recover workflow runtime submission",
             )
         }
     }
+}
+
+fn runtime_recovery_error(
+    status: StatusCode,
+    error: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(json!({ "error": error })))
 }
 
 fn runtime_recovery_response(
     action: WorkflowRuntimeRecoveryAction,
     outcome: WorkflowRuntimeRecoveryOutcome,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match outcome {
+    let (status, body) = match outcome {
         WorkflowRuntimeRecoveryOutcome::Recovered {
             workflow,
             previous_state,
             ..
         } => (
             StatusCode::OK,
-            Json(json!({
+            json!({
                 "status": match action {
                     WorkflowRuntimeRecoveryAction::Unblock => "unblocked",
                     WorkflowRuntimeRecoveryAction::Retry => "retried",
@@ -300,53 +301,95 @@ fn runtime_recovery_response(
                 "workflow_id": workflow.id,
                 "previous_state": previous_state,
                 "state": workflow.state,
-            })),
+            }),
         ),
         WorkflowRuntimeRecoveryOutcome::WrongState { workflow } => (
             StatusCode::CONFLICT,
-            Json(json!({
+            json!({
                 "error": match action {
                     WorkflowRuntimeRecoveryAction::Unblock => "workflow not in blocked state",
                     WorkflowRuntimeRecoveryAction::Retry => "workflow not in failed state",
                 },
                 "workflow_id": workflow.id,
                 "state": workflow.state,
-            })),
+            }),
         ),
         WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
             workflow,
             error_kind,
         } => (
             StatusCode::CONFLICT,
-            Json(json!({
+            json!({
                 "error": "workflow failure is not retryable",
                 "workflow_id": workflow.id,
                 "state": workflow.state,
                 "error_kind": error_kind,
-            })),
+            }),
         ),
         WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { workflow, activity } => (
             StatusCode::CONFLICT,
-            Json(json!({
+            json!({
                 "error": "workflow runtime recovery cannot determine a supported stopped activity",
                 "workflow_id": workflow.id,
                 "state": workflow.state,
                 "last_stop_activity": activity,
-            })),
+            }),
         ),
         WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition { workflow } => (
             StatusCode::CONFLICT,
-            Json(json!({
+            json!({
                 "error": "workflow runtime recovery supports only GitHub issue PR workflows",
                 "workflow_id": workflow.id,
                 "definition_id": workflow.definition_id,
                 "state": workflow.state,
-            })),
+            }),
         ),
         WorkflowRuntimeRecoveryOutcome::NotFound => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "workflow not found" })),
+            json!({ "error": "workflow not found" }),
         ),
+    };
+    (status, Json(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_workflow::runtime::{
+        ActivityErrorKind, WorkflowInstance, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    };
+
+    #[test]
+    fn runtime_recovery_response_reports_wrong_state_and_nonretryable_failure() {
+        let (status, Json(body)) = runtime_recovery_response(
+            WorkflowRuntimeRecoveryAction::Retry,
+            WorkflowRuntimeRecoveryOutcome::WrongState {
+                workflow: issue_workflow("blocked"),
+            },
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "workflow not in failed state");
+        assert_eq!(body["state"], "blocked");
+
+        let (status, Json(body)) = runtime_recovery_response(
+            WorkflowRuntimeRecoveryAction::Retry,
+            WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
+                workflow: issue_workflow("failed"),
+                error_kind: ActivityErrorKind::Configuration,
+            },
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "workflow failure is not retryable");
+        assert_eq!(body["error_kind"], "configuration");
+    }
+
+    fn issue_workflow(state: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            state,
+            WorkflowSubject::new("issue", "issue:59"),
+        )
     }
 }
 

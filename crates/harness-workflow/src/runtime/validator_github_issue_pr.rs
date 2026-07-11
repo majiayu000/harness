@@ -16,25 +16,7 @@ fn validate_operator_recovery_transition(
     decision: &WorkflowDecision,
     context: &ValidationContext,
 ) -> Result<(), WorkflowDecisionRejection> {
-    if !is_operator_recovery_transition(decision) {
-        return Ok(());
-    }
-    if context.actor == "workflow_runtime_operator_action"
-        && matches!(
-            decision.decision.as_str(),
-            "operator_runtime_unblock" | "operator_runtime_retry"
-        )
-    {
-        return Ok(());
-    }
-    Err(WorkflowDecisionRejection::new(
-        WorkflowDecisionRejectionKind::TransitionNotAllowed,
-        "stopped-state recovery transitions require workflow runtime operator action context",
-    ))
-}
-
-fn is_operator_recovery_transition(decision: &WorkflowDecision) -> bool {
-    matches!(
+    let is_operator_recovery = matches!(
         (
             decision.observed_state.as_str(),
             decision.next_state.as_str()
@@ -55,7 +37,22 @@ fn is_operator_recovery_transition(decision: &WorkflowDecision) -> bool {
                 | "addressing_feedback"
                 | "merging"
         )
-    )
+    );
+    if !is_operator_recovery {
+        return Ok(());
+    }
+    if context.actor == "workflow_runtime_operator_action"
+        && matches!(
+            decision.decision.as_str(),
+            "operator_runtime_unblock" | "operator_runtime_retry"
+        )
+    {
+        return Ok(());
+    }
+    Err(WorkflowDecisionRejection::new(
+        WorkflowDecisionRejectionKind::TransitionNotAllowed,
+        "stopped-state recovery transitions require workflow runtime operator action context",
+    ))
 }
 
 pub(super) fn validate_reconciliation_only_pr_merge_done(

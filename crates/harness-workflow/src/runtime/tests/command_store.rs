@@ -145,14 +145,12 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
     }));
     store.upsert_instance(&instance).await?;
 
-    let outcome = store
-        .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
-            workflow_id: &instance.id,
-            action: super::WorkflowRuntimeRecoveryAction::Unblock,
-            reason: "operator supplied approval",
-            actor: "operator",
-        })
-        .await?;
+    let outcome = recover(
+        &store,
+        &instance.id,
+        super::WorkflowRuntimeRecoveryAction::Unblock,
+    )
+    .await?;
     assert!(matches!(
         outcome,
         super::WorkflowRuntimeRecoveryOutcome::Recovered { .. }
@@ -190,6 +188,15 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
         .command
         .dedupe_key
         .starts_with("operator-recovery:unblock:"));
+    assert_operator_recovery_audit(
+        &store,
+        &instance.id,
+        "WorkflowRuntimeUnblocked",
+        "unblock",
+        "blocked",
+        "implementing",
+    )
+    .await?;
     Ok(())
 }
 
@@ -209,15 +216,10 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
             json!({"activity": "merge_pr", "approved_by": "dashboard", "pr_number": 77}),
         ),
         (
-            "sweep_pr_feedback",
+            "start_child_workflow",
             "awaiting_feedback",
             WorkflowCommandType::StartChildWorkflow,
-            json!({
-                "definition_id": PR_FEEDBACK_DEFINITION_ID,
-                "subject_key": "pr:77",
-                "child_activity": PR_FEEDBACK_INSPECT_ACTIVITY,
-                "pr_number": 77
-            }),
+            pr_feedback_child_payload("pr:77", PR_FEEDBACK_INSPECT_ACTIVITY),
         ),
         (
             "address_pr_feedback",
@@ -241,40 +243,21 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
 
     for (index, (stopped_activity, expected_state, command_type, payload)) in cases.into_iter().enumerate() {
         let issue_number = 1700 + index as u64;
-        let instance = project_issue_instance("/project-a", issue_number, "failed").with_data(json!({
-            "error_kind": "timeout",
-        }));
-        store.upsert_instance(&instance).await?;
         let original = WorkflowCommand::new(
             command_type,
             format!("original-{stopped_activity}-{issue_number}"),
             payload.clone(),
         );
-        let (_command_id, runtime_job_id) =
-            enqueue_original_runtime_job(&store, &instance.id, &original).await?;
-        let instance = instance.with_data(json!({
-            "error_kind": "timeout",
-            "last_stop": {
-                "state": "failed",
-                "activity": stopped_activity,
-                "runtime_job_id": runtime_job_id,
-                "error_kind": "timeout"
-            }
-        }));
-        store.upsert_instance(&instance).await?;
+        let instance =
+            store_stopped_failed_command(&store, issue_number, stopped_activity, &original).await?;
 
-        let outcome = store
-            .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
-                workflow_id: &instance.id,
-                action: super::WorkflowRuntimeRecoveryAction::Retry,
-                reason: "operator fixed transient failure",
-                actor: "operator",
-            })
-            .await?;
-        let workflow = match outcome {
-            super::WorkflowRuntimeRecoveryOutcome::Recovered { workflow, .. } => workflow,
-            other => anyhow::bail!("expected recovered outcome, got {other:?}"),
-        };
+        let outcome = recover(
+            &store,
+            &instance.id,
+            super::WorkflowRuntimeRecoveryAction::Retry,
+        )
+        .await?;
+        let workflow = recovered_workflow(outcome, "lifecycle recovery")?;
         assert_eq!(workflow.state, expected_state);
         let commands = store.commands_for(&instance.id).await?;
         let recovery_command = commands
@@ -288,49 +271,80 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
             .command
             .dedupe_key
             .starts_with("operator-recovery:retry:"));
+        assert_operator_recovery_audit(
+            &store,
+            &instance.id,
+            "WorkflowRuntimeRetried",
+            "retry",
+            "failed",
+            expected_state,
+        )
+        .await?;
     }
 
-    let bad_child = project_issue_instance("/project-a", 1696, "failed").with_data(json!({
-        "error_kind": "timeout",
-    }));
-    store.upsert_instance(&bad_child).await?;
-    let bad_command = WorkflowCommand::new(
-        WorkflowCommandType::StartChildWorkflow,
-        "bad-sweep-child",
-        json!({
-            "definition_id": PR_FEEDBACK_DEFINITION_ID,
-            "child_activity": "wrong_activity",
-            "subject_key": "pr:77",
-            "pr_number": 77
-        }),
-    );
-    let (_command_id, runtime_job_id) =
-        enqueue_original_runtime_job(&store, &bad_child.id, &bad_command).await?;
-    let bad_child = bad_child.with_data(json!({
-        "error_kind": "timeout",
-        "last_stop": {
-            "state": "failed",
-            "activity": "sweep_pr_feedback",
-            "runtime_job_id": runtime_job_id,
-            "error_kind": "timeout"
-        }
-    }));
-    store.upsert_instance(&bad_child).await?;
-    let outcome = store
-        .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
-            workflow_id: &bad_child.id,
-            action: super::WorkflowRuntimeRecoveryAction::Retry,
-            reason: "operator fixed transient failure",
-            actor: "operator",
-        })
+    for (issue_number, bad_command) in [
+        (
+            1696,
+            pr_feedback_child_command(
+                "bad-sweep-child-activity",
+                "pr:77",
+                "wrong_activity",
+            ),
+        ),
+        (
+            1697,
+            pr_feedback_child_command(
+                "bad-sweep-child-subject",
+                " ",
+                PR_FEEDBACK_INSPECT_ACTIVITY,
+            ),
+        ),
+    ] {
+        let bad_child =
+            store_stopped_failed_command(&store, issue_number, "start_child_workflow", &bad_command)
+                .await?;
+        let outcome = recover(
+            &store,
+            &bad_child.id,
+            super::WorkflowRuntimeRecoveryAction::Retry,
+        )
         .await?;
-    assert!(matches!(
-        outcome,
-        super::WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity {
-            activity: Some(activity),
-            ..
-        } if activity == "sweep_pr_feedback"
-    ));
+        assert_unsupported_activity(outcome, "start_child_workflow");
+    }
+
+    for (issue_number, data, field) in [
+        (
+            1694,
+            json!({
+                "error_kind": "timeout",
+                "last_stop": {"state": "failed", "activity": 42}
+            }),
+            "last_stop.activity",
+        ),
+        (
+            1695,
+            json!({
+                "last_stop": {"state": "failed", "error_kind": "not_a_kind"}
+            }),
+            "last_stop.error_kind",
+        ),
+    ] {
+        let malformed = project_issue_instance("/project-a", issue_number, "failed").with_data(data);
+        store.upsert_instance(&malformed).await?;
+        let err = recover(
+            &store,
+            &malformed.id,
+            super::WorkflowRuntimeRecoveryAction::Retry,
+        )
+        .await
+            .expect_err("malformed stop metadata must fail recovery");
+        assert!(err.to_string().contains(field), "{err}");
+        assert_eq!(
+            store.get_instance(&malformed.id).await?.unwrap().state,
+            "failed"
+        );
+        assert!(store.commands_for(&malformed.id).await?.is_empty());
+    }
 
     let legacy = project_issue_instance("/project-a", 1698, "failed").with_data(json!({
         "project_id": "/project-a",
@@ -338,18 +352,13 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
         "failure_reason": "legacy failed row without structured stop metadata",
     }));
     store.upsert_instance(&legacy).await?;
-    let outcome = store
-        .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
-            workflow_id: &legacy.id,
-            action: super::WorkflowRuntimeRecoveryAction::Retry,
-            reason: "operator retried legacy failure",
-            actor: "operator",
-        })
-        .await?;
-    let workflow = match outcome {
-        super::WorkflowRuntimeRecoveryOutcome::Recovered { workflow, .. } => workflow,
-        other => anyhow::bail!("expected legacy recovery, got {other:?}"),
-    };
+    let outcome = recover(
+        &store,
+        &legacy.id,
+        super::WorkflowRuntimeRecoveryAction::Retry,
+    )
+    .await?;
+    let workflow = recovered_workflow(outcome, "legacy recovery")?;
     assert_eq!(workflow.state, "implementing");
     let commands = store.commands_for(&legacy.id).await?;
     assert_eq!(commands.len(), 1);
@@ -365,22 +374,14 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
         },
     }));
     store.upsert_instance(&unsupported).await?;
-    let outcome = store
-        .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
-            workflow_id: &unsupported.id,
-            action: super::WorkflowRuntimeRecoveryAction::Retry,
-            reason: "operator fixed transient failure",
-            actor: "operator",
-        })
-        .await?;
+    let outcome = recover(
+        &store,
+        &unsupported.id,
+        super::WorkflowRuntimeRecoveryAction::Retry,
+    )
+    .await?;
 
-    assert!(matches!(
-        outcome,
-        super::WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity {
-            activity: Some(activity),
-            ..
-        } if activity == "quality_gate"
-    ));
+    assert_unsupported_activity(outcome, "quality_gate");
     assert!(store.commands_for(&unsupported.id).await?.is_empty());
     Ok(())
 }
@@ -417,14 +418,12 @@ async fn runtime_recovery_waiting_on_command_does_not_lock_instance() -> anyhow:
     let recovery_store = Arc::clone(&store);
     let recovery_workflow_id = instance.id.clone();
     let recovery = tokio::spawn(async move {
-        recovery_store
-            .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
-                workflow_id: &recovery_workflow_id,
-                action: super::WorkflowRuntimeRecoveryAction::Unblock,
-                reason: "operator supplied approval",
-                actor: "operator",
-            })
-            .await
+        recover(
+            &recovery_store,
+            &recovery_workflow_id,
+            super::WorkflowRuntimeRecoveryAction::Unblock,
+        )
+        .await
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -454,6 +453,116 @@ fn command_status(commands: &[WorkflowCommandRecord], command_id: &str) -> Workf
         .find(|command| command.id == command_id)
         .map(|command| command.status)
         .expect("command should exist")
+}
+
+async fn recover(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    action: super::WorkflowRuntimeRecoveryAction,
+) -> anyhow::Result<super::WorkflowRuntimeRecoveryOutcome> {
+    store
+        .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
+            workflow_id,
+            action,
+            reason: "operator fixed transient failure",
+            actor: "operator",
+        })
+        .await
+}
+
+fn recovered_workflow(
+    outcome: super::WorkflowRuntimeRecoveryOutcome,
+    context: &str,
+) -> anyhow::Result<WorkflowInstance> {
+    match outcome {
+        super::WorkflowRuntimeRecoveryOutcome::Recovered { workflow, .. } => Ok(workflow),
+        other => anyhow::bail!("expected {context}, got {other:?}"),
+    }
+}
+
+fn assert_unsupported_activity(outcome: super::WorkflowRuntimeRecoveryOutcome, expected: &str) {
+    assert!(matches!(
+        outcome,
+        super::WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity {
+            activity: Some(activity),
+            ..
+        } if activity == expected
+    ));
+}
+
+fn pr_feedback_child_command(
+    dedupe_key: &str,
+    subject_key: &str,
+    child_activity: &str,
+) -> WorkflowCommand {
+    WorkflowCommand::new(
+        WorkflowCommandType::StartChildWorkflow,
+        dedupe_key,
+        pr_feedback_child_payload(subject_key, child_activity),
+    )
+}
+
+fn pr_feedback_child_payload(subject_key: &str, child_activity: &str) -> serde_json::Value {
+    json!({
+        "definition_id": PR_FEEDBACK_DEFINITION_ID,
+        "child_activity": child_activity,
+        "subject_key": subject_key,
+        "pr_number": 77
+    })
+}
+
+async fn store_stopped_failed_command(
+    store: &WorkflowRuntimeStore,
+    issue_number: u64,
+    stopped_activity: &str,
+    command: &WorkflowCommand,
+) -> anyhow::Result<WorkflowInstance> {
+    let instance = project_issue_instance("/project-a", issue_number, "failed");
+    store.upsert_instance(&instance).await?;
+    let (_command_id, runtime_job_id) =
+        enqueue_original_runtime_job(store, &instance.id, command).await?;
+    let instance = instance.with_data(json!({
+        "error_kind": "timeout",
+        "last_stop": {
+            "state": "failed",
+            "activity": stopped_activity,
+            "runtime_job_id": runtime_job_id,
+            "error_kind": "timeout"
+        }
+    }));
+    store.upsert_instance(&instance).await?;
+    Ok(instance)
+}
+
+async fn assert_operator_recovery_audit(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    event_type: &str,
+    action: &str,
+    previous_state: &str,
+    state: &str,
+) -> anyhow::Result<()> {
+    let event = store
+        .latest_event_for_type(workflow_id, event_type)
+        .await?
+        .expect("operator recovery event should be recorded");
+    assert_eq!(event.source, "workflow_runtime_operator_action");
+    let workflow = store
+        .get_instance(workflow_id)
+        .await?
+        .expect("workflow should still exist");
+    let recovery = &workflow.data["last_operator_recovery"];
+    for (field, expected) in [
+        ("action", action),
+        ("previous_state", previous_state),
+        ("state", state),
+    ] {
+        assert_eq!(event.event[field], expected);
+        assert_eq!(recovery[field], expected);
+    }
+    assert_eq!(recovery["actor"], "operator");
+    assert_eq!(recovery["event_id"], event.id);
+    Ok(())
 }
 
 async fn enqueue_original_runtime_job(

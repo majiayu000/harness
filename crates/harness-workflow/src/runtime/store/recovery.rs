@@ -13,6 +13,7 @@ use crate::runtime::pr_feedback::{
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::ValidationContext;
+use anyhow::{bail, Context};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +104,7 @@ impl WorkflowRuntimeStore {
             return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
         };
 
-        if let Some(outcome) = recovery_rejection(&snapshot, request.action) {
+        if let Some(outcome) = recovery_rejection(&snapshot, request.action)? {
             tx.commit().await?;
             return Ok(outcome);
         }
@@ -125,7 +126,7 @@ impl WorkflowRuntimeStore {
             return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
         };
 
-        if let Some(outcome) = recovery_rejection(&instance, request.action) {
+        if let Some(outcome) = recovery_rejection(&instance, request.action)? {
             tx.rollback().await?;
             return Ok(outcome);
         }
@@ -229,34 +230,36 @@ async fn select_instance_tx(
 fn recovery_rejection(
     instance: &WorkflowInstance,
     action: WorkflowRuntimeRecoveryAction,
-) -> Option<WorkflowRuntimeRecoveryOutcome> {
+) -> anyhow::Result<Option<WorkflowRuntimeRecoveryOutcome>> {
     if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
-        return Some(WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition {
-            workflow: instance.clone(),
-        });
+        return Ok(Some(
+            WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition {
+                workflow: instance.clone(),
+            },
+        ));
     }
 
     if instance.state != action.expected_state() {
-        return Some(WorkflowRuntimeRecoveryOutcome::WrongState {
+        return Ok(Some(WorkflowRuntimeRecoveryOutcome::WrongState {
             workflow: instance.clone(),
-        });
+        }));
     }
 
     if action == WorkflowRuntimeRecoveryAction::Retry {
-        if let Some(error_kind) = stopped_error_kind(&instance.data).filter(|kind| {
+        if let Some(error_kind) = stopped_error_kind(&instance.data)?.filter(|kind| {
             matches!(
                 kind,
                 ActivityErrorKind::Fatal | ActivityErrorKind::Configuration
             )
         }) {
-            return Some(WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
+            return Ok(Some(WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
                 workflow: instance.clone(),
                 error_kind,
-            });
+            }));
         }
     }
 
-    None
+    Ok(None)
 }
 
 async fn recovery_dispatch_plan_tx(
@@ -264,13 +267,13 @@ async fn recovery_dispatch_plan_tx(
     instance: &WorkflowInstance,
     action: WorkflowRuntimeRecoveryAction,
 ) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
-    let activity = stopped_activity(&instance.data);
-    let target = match recovery_dispatch_target(&instance.data, action) {
+    let activity = stopped_activity(&instance.data)?;
+    let target = match recovery_dispatch_target(&instance.data, action, activity.as_deref())? {
         Ok(target) => target,
         Err(activity) => return Ok(Err(activity)),
     };
     let command_source = if activity.is_some() {
-        let Some(runtime_job_id) = stopped_runtime_job_id(&instance.data) else {
+        let Some(runtime_job_id) = stopped_runtime_job_id(&instance.data)? else {
             return Ok(Err(activity));
         };
         let command = select_command_for_runtime_job_tx(tx, &instance.id, &runtime_job_id)
@@ -296,16 +299,17 @@ async fn recovery_dispatch_plan_tx(
 fn recovery_dispatch_target(
     data: &Value,
     action: WorkflowRuntimeRecoveryAction,
-) -> Result<RecoveryDispatchTarget, Option<String>> {
-    let activity = stopped_activity(data);
+    activity_name: Option<&str>,
+) -> anyhow::Result<Result<RecoveryDispatchTarget, Option<String>>> {
+    let activity = activity_name.map(ToOwned::to_owned);
     let Some(activity_name) = activity.as_deref() else {
-        if is_legacy_failed_retry(data, action) {
-            return Ok(RecoveryDispatchTarget {
+        if is_legacy_failed_retry(data, action)? {
+            return Ok(Ok(RecoveryDispatchTarget {
                 state: "implementing",
                 activity: "implement_issue",
-            });
+            }));
         }
-        return Err(activity);
+        return Ok(Err(activity));
     };
     let target = match activity_name {
         "implement_issue" => RecoveryDispatchTarget {
@@ -332,13 +336,17 @@ fn recovery_dispatch_target(
             state: "awaiting_feedback",
             activity: PR_FEEDBACK_INSPECT_ACTIVITY,
         },
+        "start_child_workflow" => RecoveryDispatchTarget {
+            state: "awaiting_feedback",
+            activity: "start_child_workflow",
+        },
         "address_pr_feedback" => RecoveryDispatchTarget {
             state: "addressing_feedback",
             activity: "address_pr_feedback",
         },
-        _ => return Err(activity),
+        _ => return Ok(Err(activity)),
     };
-    Ok(target)
+    Ok(Ok(target))
 }
 
 async fn select_command_for_runtime_job_tx(
@@ -347,11 +355,7 @@ async fn select_command_for_runtime_job_tx(
     runtime_job_id: &str,
 ) -> anyhow::Result<Option<WorkflowCommand>> {
     let row: Option<(String,)> = sqlx::query_as(
-        "SELECT command.data::text
-         FROM runtime_jobs AS job
-         JOIN workflow_commands AS command ON command.id = job.command_id
-         WHERE job.id = $1
-           AND command.workflow_id = $2",
+        "SELECT command.data::text FROM runtime_jobs AS job JOIN workflow_commands AS command ON command.id = job.command_id WHERE job.id = $1 AND command.workflow_id = $2",
     )
     .bind(runtime_job_id)
     .bind(workflow_id)
@@ -372,9 +376,11 @@ fn command_matches_recovery_target(
                 && enqueue_payload_matches_target(&command.command)
         }
         WorkflowCommandType::StartChildWorkflow => {
-            target.activity == "sweep_pr_feedback"
-                && command.command.get("definition_id").and_then(Value::as_str)
-                    == Some(PR_FEEDBACK_DEFINITION_ID)
+            matches!(
+                target.activity,
+                "start_child_workflow" | "sweep_pr_feedback"
+            ) && command.command.get("definition_id").and_then(Value::as_str)
+                == Some(PR_FEEDBACK_DEFINITION_ID)
                 && command
                     .command
                     .get("child_activity")
@@ -385,6 +391,11 @@ fn command_matches_recovery_target(
                     .get("pr_number")
                     .and_then(Value::as_u64)
                     .is_some()
+                && command
+                    .command
+                    .get("subject_key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
         }
         _ => false,
     }
@@ -418,11 +429,7 @@ async fn skip_superseded_active_commands_tx(
     workflow_id: &str,
 ) -> anyhow::Result<(u64, u64)> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id, status, data::text
-         FROM workflow_commands
-         WHERE workflow_id = $1
-           AND status IN ($2, $3, $4)
-         FOR UPDATE",
+        "SELECT id, status, data::text FROM workflow_commands WHERE workflow_id = $1 AND status IN ($2, $3, $4) FOR UPDATE",
     )
     .bind(workflow_id)
     .bind(WorkflowCommandStatus::Pending.as_str())
@@ -447,12 +454,7 @@ async fn skip_superseded_active_commands_tx(
             WorkflowCommandStatus::Skipped
         };
         sqlx::query(
-            "UPDATE workflow_commands
-             SET status = $2,
-                 dispatch_owner = NULL,
-                 dispatch_lease_expires_at = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1",
+            "UPDATE workflow_commands SET status = $2, dispatch_owner = NULL, dispatch_lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
         )
         .bind(command_id)
         .bind(next_status.as_str())
@@ -472,11 +474,7 @@ async fn cancel_unfinished_runtime_jobs_tx(
     let pending_status = enum_str(&RuntimeJobStatus::Pending)?;
     let running_status = enum_str(&RuntimeJobStatus::Running)?;
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, data::text
-         FROM runtime_jobs
-         WHERE command_id = $1
-           AND status IN ($2, $3)
-         FOR UPDATE",
+        "SELECT id, data::text FROM runtime_jobs WHERE command_id = $1 AND status IN ($2, $3) FOR UPDATE",
     )
     .bind(command_id)
     .bind(&pending_status)
@@ -490,12 +488,7 @@ async fn cancel_unfinished_runtime_jobs_tx(
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         sqlx::query(
-            "UPDATE runtime_jobs
-             SET status = $1,
-                 not_before = $2,
-                 data = $3::jsonb,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $4",
+            "UPDATE runtime_jobs SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $4",
         )
         .bind(&status)
         .bind(job.not_before)
@@ -611,33 +604,62 @@ const RECOVERY_CONTEXT_FIELDS: &[&str] = &[
     "external_id",
 ];
 
-fn stopped_error_kind(data: &Value) -> Option<ActivityErrorKind> {
-    data.get("error_kind")
-        .cloned()
-        .or_else(|| data.pointer("/last_stop/error_kind").cloned())
-        .and_then(|value| serde_json::from_value(value).ok())
+fn stopped_error_kind(data: &Value) -> anyhow::Result<Option<ActivityErrorKind>> {
+    let root = optional_error_kind(data.get("error_kind"), "error_kind")?;
+    let last_stop = optional_error_kind(
+        data.pointer("/last_stop/error_kind"),
+        "last_stop.error_kind",
+    )?;
+    Ok(root.or(last_stop))
 }
 
-fn stopped_activity(data: &Value) -> Option<String> {
-    data.pointer("/last_stop/activity")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+fn stopped_activity(data: &Value) -> anyhow::Result<Option<String>> {
+    optional_metadata_string(data.pointer("/last_stop/activity"), "last_stop.activity")
 }
 
-fn stopped_runtime_job_id(data: &Value) -> Option<String> {
-    data.pointer("/last_stop/runtime_job_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+fn stopped_runtime_job_id(data: &Value) -> anyhow::Result<Option<String>> {
+    optional_metadata_string(
+        data.pointer("/last_stop/runtime_job_id"),
+        "last_stop.runtime_job_id",
+    )
 }
 
-fn is_legacy_failed_retry(data: &Value, action: WorkflowRuntimeRecoveryAction) -> bool {
-    action == WorkflowRuntimeRecoveryAction::Retry
-        && stopped_activity(data).is_none()
-        && stopped_error_kind(data).is_none()
+fn is_legacy_failed_retry(
+    data: &Value,
+    action: WorkflowRuntimeRecoveryAction,
+) -> anyhow::Result<bool> {
+    Ok(action == WorkflowRuntimeRecoveryAction::Retry
+        && stopped_activity(data)?.is_none()
+        && stopped_error_kind(data)?.is_none())
+}
+
+fn optional_metadata_string(value: Option<&Value>, field: &str) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        bail!("workflow runtime recovery stop metadata `{field}` must be a string");
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("workflow runtime recovery stop metadata `{field}` must be non-empty");
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn optional_error_kind(
+    value: Option<&Value>,
+    field: &str,
+) -> anyhow::Result<Option<ActivityErrorKind>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if value.as_str().is_some_and(|value| value.trim().is_empty()) {
+        bail!("workflow runtime recovery stop metadata `{field}` must be non-empty");
+    }
+    serde_json::from_value(value.clone())
+        .with_context(|| format!("workflow runtime recovery stop metadata `{field}` is invalid"))
+        .map(Some)
 }
 
 fn optional_string_field(data: &Value, field: &str) -> Option<String> {
