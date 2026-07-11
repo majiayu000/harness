@@ -707,6 +707,11 @@ async fn workflow_runtime_recovery_endpoints_cover_contract() -> anyhow::Result<
         assert_eq!(replayed.command.command, original.command);
     }
 
+    for (route, workflow_id, state_name, issue_number, last_stop) in [("/api/workflows/runtime/unblock", "runtime-blocked-partial-empty", "blocked", 61, serde_json::json!({})), ("/api/workflows/runtime/unblock", "runtime-blocked-partial-event", "blocked", 62, serde_json::json!({"event_id": 123})), ("/api/workflows/runtime/unblock", "runtime-blocked-partial-null", "blocked", 63, serde_json::json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null})), ("/api/workflows/runtime/retry", "runtime-failed-partial-empty", "failed", 64, serde_json::json!({})), ("/api/workflows/runtime/retry", "runtime-failed-partial-event", "failed", 65, serde_json::json!({"event_id": 123})), ("/api/workflows/runtime/retry", "runtime-failed-partial-null", "failed", 66, serde_json::json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null}))] {
+        let data = serde_json::json!({"issue_number": issue_number, "last_stop": last_stop}); let workflow = route_issue_workflow(workflow_id, state_name, issue_number, data.clone()); store.upsert_instance(&workflow).await?; let response = post_runtime_recovery(app.clone(), route, workflow_id).await?; let actual = response.status(); let body = response_json(response).await?;
+        assert_eq!(actual, StatusCode::CONFLICT); assert_eq!(body["error"], "workflow runtime recovery cannot determine a supported stopped activity"); assert_eq!(body["last_stop_activity"], serde_json::Value::Null); let stored = store.get_instance(workflow_id).await?.unwrap(); assert_eq!(stored.state, state_name); assert_eq!(stored.data, data); assert!(store.commands_for(workflow_id).await?.is_empty());
+    }
+
     for workflow in [route_issue_workflow("runtime-blocked-58", "blocked", 58, serde_json::json!({})), route_issue_workflow("runtime-failed-59", "failed", 59, serde_json::json!({"error_kind": "configuration"}))] {
         store.upsert_instance(&workflow).await?;
     }

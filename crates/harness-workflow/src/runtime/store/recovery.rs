@@ -589,7 +589,7 @@ fn validate_stopped_metadata(data: &Value) -> anyhow::Result<()> {
 
 #[rustfmt::skip]
 fn has_no_structured_stop_metadata(data: &Value) -> anyhow::Result<bool> {
-    Ok(stopped_state(data)?.is_none() && stopped_activity(data)?.is_none() && stopped_runtime_job_id(data)?.is_none() && stopped_error_kind(data)?.is_none())
+    Ok(data.get("last_stop").is_none_or(Value::is_null) && stopped_error_kind(data)?.is_none())
 }
 
 fn optional_metadata_string(value: Option<&Value>, field: &str) -> anyhow::Result<Option<String>> {
