@@ -699,6 +699,7 @@ async fn workflow_runtime_unblock_endpoint_reopens_blocked_workflow() -> anyhow:
         "blocked_reason": "Waiting for maintainer approval.",
         "last_stop": {
             "state": "blocked",
+            "activity": "implement_issue",
             "runtime_job_id": "job-blocked-56"
         }
     }));
@@ -806,6 +807,7 @@ async fn workflow_runtime_retry_endpoint_reopens_retryable_failed_workflow() -> 
         "error_kind": "timeout",
         "last_stop": {
             "state": "failed",
+            "activity": "implement_issue",
             "runtime_job_id": "job-failed-57",
             "error_kind": "timeout"
         }
@@ -860,6 +862,78 @@ async fn workflow_runtime_retry_endpoint_reopens_retryable_failed_workflow() -> 
         commands[0].command.command["dispatch_gate"]["reason"],
         "operator_workflow_runtime_retry"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_recovery_endpoint_rejects_unsupported_stopped_activity(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:62"),
+    )
+    .with_id("runtime-failed-62")
+    .with_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 62,
+        "error_kind": "timeout",
+        "last_stop": {
+            "state": "failed",
+            "activity": "quality_gate",
+            "runtime_job_id": "job-failed-62",
+            "error_kind": "timeout"
+        }
+    }));
+    store.upsert_instance(&workflow).await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/retry",
+            post(task_mutation_routes::retry_workflow_runtime),
+        )
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/retry")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "workflow_id": "runtime-failed-62",
+                        "reason": "operator requested retry"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_json(response).await?;
+    assert_eq!(
+        body["error"],
+        "workflow runtime recovery cannot determine a supported stopped activity"
+    );
+    assert_eq!(body["last_stop_activity"], "quality_gate");
+    let updated = store
+        .get_instance("runtime-failed-62")
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "failed");
+    assert!(store.commands_for("runtime-failed-62").await?.is_empty());
     Ok(())
 }
 

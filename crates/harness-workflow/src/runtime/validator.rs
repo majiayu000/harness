@@ -131,7 +131,33 @@ impl TransitionAllowlist {
             .allow("failed", "scheduled", [EnqueueActivity, Wait])
             .allow("failed", "planning", [EnqueueActivity, Wait])
             .allow("failed", "implementing", [EnqueueActivity, Wait])
+            .allow("failed", "replanning", [EnqueueActivity, Wait])
+            .allow("failed", "local_review_gate", [EnqueueActivity, Wait])
+            .allow(
+                "failed",
+                "awaiting_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "failed",
+                "addressing_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow("failed", "merging", [EnqueueActivity])
             .allow("blocked", "implementing", [EnqueueActivity, Wait])
+            .allow("blocked", "replanning", [EnqueueActivity, Wait])
+            .allow("blocked", "local_review_gate", [EnqueueActivity, Wait])
+            .allow(
+                "blocked",
+                "awaiting_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "blocked",
+                "addressing_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow("blocked", "merging", [EnqueueActivity])
             .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
             .allow("cancelled", "planning", [EnqueueActivity, Wait])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])

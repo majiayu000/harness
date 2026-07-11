@@ -263,7 +263,6 @@ async fn recover_workflow_runtime(
             action,
             reason,
             actor: "operator",
-            next_state: "implementing",
         })
         .await
     {
@@ -324,6 +323,15 @@ fn runtime_recovery_response(
                 "workflow_id": workflow.id,
                 "state": workflow.state,
                 "error_kind": error_kind,
+            })),
+        ),
+        WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { workflow, activity } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "workflow runtime recovery cannot determine a supported stopped activity",
+                "workflow_id": workflow.id,
+                "state": workflow.state,
+                "last_stop_activity": activity,
             })),
         ),
         WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition { workflow } => (
