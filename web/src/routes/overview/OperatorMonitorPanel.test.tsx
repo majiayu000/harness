@@ -205,7 +205,7 @@ describe("<OperatorMonitorPanel>", () => {
     expect(screen.queryByText("No current operator actions.")).not.toBeInTheDocument();
   });
 
-  it("renders structured stop details and invokes only eligible recovery actions", async () => {
+  it("renders current-state stop details and invokes only eligible recovery actions", async () => {
     const monitor = makeMonitor();
     const baseAction = monitor.operator_actions[0];
     monitor.operator_actions = [
@@ -216,6 +216,9 @@ describe("<OperatorMonitorPanel>", () => {
         state: "blocked",
         blocked_reason: "Waiting for maintainer approval.",
         unblock_hint: "Post the approval comment, then unblock.",
+        failure_reason: "Stale failed reason.",
+        retry_hint: "Stale retry hint.",
+        last_stop: { state: "failed" },
         can_unblock: true,
         can_retry: false,
       },
@@ -224,8 +227,11 @@ describe("<OperatorMonitorPanel>", () => {
         kind: "failed",
         workflow_id: "workflow-retryable",
         state: "failed",
+        blocked_reason: "Stale blocked reason.",
+        unblock_hint: "Stale unblock hint.",
         failure_reason: "Runtime transport timed out.",
         retry_hint: "Retry after transport recovers.",
+        last_stop: { state: "blocked" },
         can_unblock: false,
         can_retry: true,
       },
@@ -241,8 +247,9 @@ describe("<OperatorMonitorPanel>", () => {
     ];
     monitor.stuck_workflows[0] = {
       ...monitor.stuck_workflows[0],
-      state: "blocked",
       blocked_reason: "Aged workflow still needs approval.",
+      failure_reason: "Stale aged failure.",
+      last_stop: { state: "blocked" },
     };
     mockUseOperatorMonitor.mockReturnValue({ data: monitor, isError: false });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -251,8 +258,19 @@ describe("<OperatorMonitorPanel>", () => {
     wrap(<OperatorMonitorPanel />, queryClient);
 
     expect(screen.getByText("Waiting for maintainer approval.")).toBeInTheDocument();
+    expect(screen.getByText("Post the approval comment, then unblock.")).toBeInTheDocument();
     expect(screen.getByText("Runtime transport timed out.")).toBeInTheDocument();
+    expect(screen.getByText("Retry after transport recovers.")).toBeInTheDocument();
     expect(screen.getByText("Aged workflow still needs approval.")).toBeInTheDocument();
+    for (const staleText of [
+      "Stale failed reason.",
+      "Stale retry hint.",
+      "Stale blocked reason.",
+      "Stale unblock hint.",
+      "Stale aged failure.",
+    ]) {
+      expect(screen.queryByText(staleText)).not.toBeInTheDocument();
+    }
     expect(
       screen.queryByRole("button", { name: "Retry workflow workflow-nonretryable" }),
     ).not.toBeInTheDocument();

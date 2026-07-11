@@ -42,9 +42,32 @@ function Metric({ label, value, tone = "default" }: { label: string; value: stri
   );
 }
 
-function StructuredStopDetails({ stopped }: { stopped: RuntimeStoppedState }) {
-  const reason = stopped.blocked_reason?.trim() || stopped.failure_reason?.trim();
-  const hint = stopped.unblock_hint?.trim() || stopped.retry_hint?.trim();
+function StructuredStopDetails({
+  state,
+  stopped,
+}: {
+  state: string;
+  stopped: RuntimeStoppedState;
+}) {
+  const lastStopState = stopped.last_stop?.state;
+  const displayState =
+    state === "blocked" || state === "failed"
+      ? state
+      : lastStopState === "blocked" || lastStopState === "failed"
+        ? lastStopState
+        : null;
+  const reason =
+    displayState === "blocked"
+      ? stopped.blocked_reason?.trim()
+      : displayState === "failed"
+        ? stopped.failure_reason?.trim()
+        : null;
+  const hint =
+    displayState === "blocked"
+      ? stopped.unblock_hint?.trim()
+      : displayState === "failed"
+        ? stopped.retry_hint?.trim()
+        : null;
   if (!reason && !hint) return null;
 
   return (
@@ -138,7 +161,7 @@ function ActionRow({
       </td>
       <td className="px-3 py-2 font-mono text-[11px] text-ink-2">
         <div>{action.state}</div>
-        <StructuredStopDetails stopped={action} />
+        <StructuredStopDetails state={action.state} stopped={action} />
       </td>
       <td className="px-3 py-2 font-mono text-[11px] text-ink-4">{fmtDuration(action.age_secs)}</td>
       <td className="px-3 py-2 text-right font-mono text-[11px]">
@@ -187,7 +210,7 @@ function StuckWorkflowRow({ workflow }: { workflow: StuckWorkflow }) {
     <tr className="border-b border-line last:border-b-0">
       <td className="px-3 py-2 font-mono text-[11px] text-warn">
         <div>{workflow.state.replace(/_/g, " ")}</div>
-        <StructuredStopDetails stopped={workflow} />
+        <StructuredStopDetails state={workflow.state} stopped={workflow} />
       </td>
       <td className="px-3 py-2 font-mono text-[11px] text-ink-3">{workflow.repo ?? "untracked"}</td>
       <td className="px-3 py-2 font-mono text-[11px] text-ink-3">
