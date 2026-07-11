@@ -369,7 +369,7 @@ fn command_matches_recovery_target(
     match command.command_type {
         WorkflowCommandType::EnqueueActivity => {
             command.activity_name() == Some(target.activity)
-                && enqueue_payload_matches_target(&command.command, target)
+                && enqueue_payload_matches_target(&command.command)
         }
         WorkflowCommandType::StartChildWorkflow => {
             target.activity == "sweep_pr_feedback"
@@ -390,8 +390,7 @@ fn command_matches_recovery_target(
     }
 }
 
-fn enqueue_payload_matches_target(payload: &Value, target: RecoveryDispatchTarget) -> bool {
-    let pr_number = payload.get("pr_number").and_then(Value::as_u64).is_some();
+fn enqueue_payload_matches_target(payload: &Value) -> bool {
     let review_summary = payload
         .get("review_summary")
         .and_then(Value::as_str)
@@ -400,12 +399,8 @@ fn enqueue_payload_matches_target(payload: &Value, target: RecoveryDispatchTarge
         .get("hygiene")
         .or_else(|| payload.get("hygiene_context"))
         .is_some_and(|value| !value.is_null());
-    (!matches!(
-        target.activity,
-        "merge_pr" | "address_pr_feedback" | LOCAL_REVIEW_ACTIVITY
-    ) || pr_number)
-        && (payload.get("source").and_then(Value::as_str) != Some("pr_hygiene")
-            || (review_summary && hygiene))
+    payload.get("source").and_then(Value::as_str) != Some("pr_hygiene")
+        || (payload.get("pr_number").and_then(Value::as_u64).is_some() && review_summary && hygiene)
 }
 
 fn unsupported_stopped_activity(

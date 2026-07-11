@@ -223,6 +223,12 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
             "address_pr_feedback",
             "addressing_feedback",
             WorkflowCommandType::EnqueueActivity,
+            json!({"activity": "address_pr_feedback"}),
+        ),
+        (
+            "address_pr_feedback",
+            "addressing_feedback",
+            WorkflowCommandType::EnqueueActivity,
             json!({
                 "activity": "address_pr_feedback",
                 "source": "pr_hygiene",
