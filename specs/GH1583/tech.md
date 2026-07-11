@@ -50,13 +50,22 @@ GitHub issue: `#1583`
 ### Aging function
 
 ```text
+waited = now.saturating_duration_since(w.enqueued_at)
 effective_priority(w, now) =
-    min(w.priority + floor((now - w.enqueued_at) / interval), 
+    min(w.priority + floor(waited / interval),
         min(w.priority + max_boost_levels, MAX_LEVEL))
 ```
 
-- `MAX_LEVEL` is the queue-local max observed level ceiling (u8 space; the
-  server already caps requests at 2, the queue stays generic).
+- `MAX_LEVEL` is a static ceiling fixed at queue construction (the server
+  passes `MAX_TASK_PRIORITY`, `request.rs:9`; the queue stays generic over
+  u8). It is deliberately NOT derived from currently-enqueued waiters: a
+  dynamic observed ceiling would decrease when a high-priority waiter is
+  granted and leaves the queue, making effective priority non-monotonic
+  over wait time and violating B-001.
+- `saturating_duration_since` guards the `Instant` subtraction: a waiter
+  whose `enqueued_at` races ahead of the single `now` read in `release()`
+  (concurrent enqueue, paused-clock test anomalies) contributes zero wait
+  instead of panicking on `Instant` underflow.
 - Ordering key: `(effective_priority DESC, seq ASC)`. Aged-equal ties break
   by seq, so a long-waiting priority-0 waiter beats a fresh same-level
   arrival deterministically (B-004).
@@ -91,9 +100,15 @@ instants — same constraint the tests already satisfy.
 ### Wait-time metrics
 
 - `PriorityPermitQueue` gains a small per-base-priority-level aggregate:
-  grant count, max wait, and a fixed ring buffer (e.g. 128 samples) for p95,
-  recorded in `release()` at grant time (successful `tx.send`). Cancelled
-  waiters and CAS-reclaimed sends are excluded (B-006).
+  grant count, max wait, and a fixed ring buffer (e.g. 128 samples) for p95.
+  Recording happens on the waiter side, after `rx.await` resolves and the
+  grant is actually consumed — not in `release()` at `tx.send` time. This
+  closes the mid-send race: if a waiter is cancelled after `tx.send`
+  succeeds but before `rx.await` completes, the permit is CAS-reclaimed by
+  `AcquireGuard::drop` and no sample is ever recorded for that waiter, so
+  cancelled and reclaimed grants are structurally excluded (B-006) rather
+  than filtered after the fact. The waiter records via the shared queue
+  handle it already holds.
 - `QueueStats` gains `wait_ms_by_priority: Vec<PriorityWaitStats>` with
   `#[serde(default)]`-safe additive fields (`QueueStats` derives
   `Serialize` only, so consumers at `dashboard.rs:165`,
