@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import stat
@@ -46,11 +47,19 @@ def _bounded_json_int(raw: str) -> int:
     return value
 
 
+def _bounded_json_float(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or abs(value) > MAX_METRIC_VALUE:
+        raise ReplayValidationError("JSON float exceeds the supported range")
+    return value
+
+
 def _json_loads(text: str) -> Any:
     return json.loads(
         text,
         object_pairs_hook=_reject_duplicate_keys,
         parse_int=_bounded_json_int,
+        parse_float=_bounded_json_float,
         parse_constant=lambda value: (_ for _ in ()).throw(
             ReplayValidationError(f"non-finite JSON number: {value}")
         ),

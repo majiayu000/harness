@@ -127,8 +127,8 @@ def _require_object(value: Any, label: str, keys: set[str]) -> dict[str, Any]:
     actual = set(value)
     if actual != keys:
         raise ReplayValidationError(
-            f"{label} schema mismatch; missing={sorted(keys - actual)}, "
-            f"extra={sorted(actual - keys)}"
+            f"{label} schema mismatch; missing_count={len(keys - actual)}, "
+            f"extra_count={len(actual - keys)}"
         )
     return value
 

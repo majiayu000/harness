@@ -246,6 +246,18 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(NAP.ReplayValidationError, "integer"):
             NAP._json_loads('{"value":10000000000000000}')
 
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "2026/06/01/overflow.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                '{"type":"response_item","payload":{"type":"tool_search_output",'
+                '"execution":"search","tools":[{"score":1e10000}]}}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(NAP.ReplayValidationError, "float"):
+                NAP.build_manifest(root, SALT, 1, SINCE, THROUGH)
+
 
 class EvidenceTests(unittest.TestCase):
     @classmethod
@@ -347,9 +359,13 @@ class EvidenceTests(unittest.TestCase):
             NAP.summarize_evidence(self.manifest, evidence)
 
         evidence = evidence_for(self.manifest)
-        evidence["sessions"][0]["raw_observation"] = "/private/source/path"
-        with self.assertRaisesRegex(NAP.ReplayValidationError, "schema mismatch"):
+        unsafe_key = "/private/source/path"
+        evidence["sessions"][0][unsafe_key] = True
+        with self.assertRaisesRegex(
+            NAP.ReplayValidationError, "schema mismatch"
+        ) as captured:
             NAP.summarize_evidence(self.manifest, evidence)
+        self.assertNotIn(unsafe_key, str(captured.exception))
 
         with self.assertRaisesRegex(NAP.ReplayValidationError, "secret-like"):
             NAP._assert_no_leaks({"value": "github_pat_private"})
