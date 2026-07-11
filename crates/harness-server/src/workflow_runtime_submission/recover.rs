@@ -185,13 +185,12 @@ async fn recover_submission(
     .with_command(plan_command)
     .high_confidence();
 
+    // `commit_runtime_decision` persists this cleared data as the accepted
+    // instance data; it only additionally merges a `last_decision` marker, which
+    // does not re-introduce the stop fields, so no second write is needed.
     let recovered_data = clear_active_stop_fields(instance.data.clone(), kind, &operator_reason);
-    let mut recovered =
+    let recovered =
         commit_runtime_decision(store, instance, decision, event.id, Some(recovered_data)).await?;
-    // `commit_runtime_decision` merges `last_decision` into the accepted data,
-    // so re-assert the cleared shape after the transition is persisted.
-    recovered.data = clear_active_stop_fields(recovered.data, kind, &operator_reason);
-    store.upsert_instance(&recovered).await?;
 
     Ok(RuntimeRecoverOutcome::Recovered {
         instance: Box::new(recovered),
