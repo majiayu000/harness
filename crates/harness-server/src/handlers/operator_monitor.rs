@@ -8,7 +8,7 @@
 mod activity;
 
 use crate::http::AppState;
-use crate::runtime_projection::RuntimeWorkflowProjection;
+use crate::runtime_projection::{RuntimeStoppedStateProjection, RuntimeWorkflowProjection};
 use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary};
 use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, SourceActivity};
 use axum::{extract::State, http::StatusCode, Json};
@@ -27,7 +27,8 @@ const MAX_OPERATOR_ACTIONS: usize = 40;
 const MAX_FAILURE_GROUPS: usize = 20;
 const MAX_RECENT_FAILURES: i64 = 100;
 const STALLED_AFTER_MINS: u64 = 30;
-const OPERATOR_ACTION_STATES: &[&str] = &["ready_to_merge", "awaiting_feedback", "blocked"];
+const OPERATOR_ACTION_STATES: &[&str] =
+    &["ready_to_merge", "awaiting_feedback", "blocked", "failed"];
 const WORKFLOW_DEFINITION_IDS: &[&str] = &[
     harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
     harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
@@ -89,6 +90,8 @@ struct OperatorAction {
     evidence_url: Option<String>,
     next_action: &'static str,
     source: String,
+    #[serde(flatten)]
+    stopped_state: RuntimeStoppedStateProjection,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +106,8 @@ struct StuckWorkflow {
     updated_at: String,
     url: Option<String>,
     source: String,
+    #[serde(flatten)]
+    stopped_state: RuntimeStoppedStateProjection,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -307,6 +312,7 @@ fn stuck_workflows_from_instances(
                 updated_at: workflow.updated_at.to_rfc3339(),
                 url: pr_url.or(issue_url),
                 source: workflow_source(workflow),
+                stopped_state: RuntimeStoppedStateProjection::from_workflow(workflow),
             }
         })
         .collect::<Vec<_>>();
@@ -509,6 +515,7 @@ fn operator_actions(
             url: pr_url.or(issue_url),
             next_action,
             source: workflow_source(workflow),
+            stopped_state: projection.stopped_state,
         });
     }
     actions.sort_by(|a, b| {
@@ -525,6 +532,7 @@ fn workflow_action_kind(state: &str) -> Option<(&'static str, &'static str)> {
         "ready_to_merge" => Some(("ready_to_merge", "Review and merge")),
         "awaiting_feedback" => Some(("awaiting_feedback", "Inspect review feedback")),
         "blocked" => Some(("blocked", "Resolve blocker")),
+        "failed" => Some(("failed", "Retry failed workflow")),
         _ => None,
     }
 }
@@ -533,7 +541,8 @@ fn action_priority(kind: &str) -> u8 {
     match kind {
         "ready_to_merge" => 0,
         "blocked" => 1,
-        "awaiting_feedback" => 2,
+        "failed" => 2,
+        "awaiting_feedback" => 3,
         _ => 3,
     }
 }

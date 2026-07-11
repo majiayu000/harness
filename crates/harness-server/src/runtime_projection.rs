@@ -4,6 +4,8 @@ use crate::task_runner::{
 use harness_workflow::runtime::{
     WorkflowInstance, WorkflowTerminalState, QUALITY_GATE_DEFINITION_ID,
 };
+use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeActiveBucket {
@@ -21,6 +23,19 @@ pub(crate) struct RuntimeWorkflowProjection {
     pub(crate) project_id: Option<String>,
     pub(crate) submission_handle: Option<TaskId>,
     pub(crate) legacy_dedupe_task_handle: Option<TaskId>,
+    pub(crate) stopped_state: RuntimeStoppedStateProjection,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct RuntimeStoppedStateProjection {
+    pub(crate) blocked_reason: Option<String>,
+    pub(crate) unblock_hint: Option<String>,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) error_kind: Option<String>,
+    pub(crate) retry_hint: Option<String>,
+    pub(crate) last_stop: Option<Value>,
+    pub(crate) can_unblock: bool,
+    pub(crate) can_retry: bool,
 }
 
 impl RuntimeWorkflowProjection {
@@ -43,11 +58,34 @@ impl RuntimeWorkflowProjection {
             project_id: runtime_string_field(&workflow.data, "project_id"),
             submission_handle: runtime_submission_handle(&workflow.data),
             legacy_dedupe_task_handle: legacy_dedupe_task_handle(&workflow.data),
+            stopped_state: RuntimeStoppedStateProjection::from_workflow(workflow),
         }
     }
 
     pub(crate) fn active_bucket(&self) -> Option<RuntimeActiveBucket> {
         self.active_bucket
+    }
+}
+
+impl RuntimeStoppedStateProjection {
+    pub(crate) fn from_workflow(workflow: &WorkflowInstance) -> Self {
+        let last_stop = structured_last_stop(&workflow.data);
+        let error_kind = stopped_string_field(&workflow.data, "error_kind").or_else(|| {
+            last_stop
+                .as_ref()
+                .and_then(|value| value.get("error_kind"))
+                .and_then(trimmed_string)
+        });
+        Self {
+            blocked_reason: stopped_string_field(&workflow.data, "blocked_reason"),
+            unblock_hint: stopped_string_field(&workflow.data, "unblock_hint"),
+            failure_reason: stopped_string_field(&workflow.data, "failure_reason"),
+            retry_hint: stopped_string_field(&workflow.data, "retry_hint"),
+            can_unblock: workflow.state == "blocked",
+            can_retry: workflow.state == "failed" && retryable_error_kind(error_kind.as_deref()),
+            error_kind,
+            last_stop,
+        }
     }
 }
 
@@ -184,6 +222,23 @@ fn runtime_submission_handle(data: &serde_json::Value) -> Option<TaskId> {
         .or_else(|| first_string_array_field(data, "task_ids"))
         .or_else(|| trimmed_string_field(data, "task_id"))
         .map(harness_core::types::TaskId)
+}
+
+fn stopped_string_field(data: &serde_json::Value, field: &str) -> Option<String> {
+    data.get(field).and_then(trimmed_string)
+}
+
+fn structured_last_stop(data: &serde_json::Value) -> Option<Value> {
+    data.get("last_stop")
+        .filter(|value| value.is_object())
+        .cloned()
+}
+
+fn retryable_error_kind(error_kind: Option<&str>) -> bool {
+    !matches!(
+        error_kind.map(str::to_ascii_lowercase).as_deref(),
+        Some("fatal" | "configuration")
+    )
 }
 
 fn legacy_dedupe_task_handle(data: &serde_json::Value) -> Option<TaskId> {
@@ -447,6 +502,90 @@ mod tests {
             SchedulerAuthorityState::Queued
         );
         assert_eq!(projection.active_bucket(), None);
+    }
+
+    #[test]
+    fn projection_exposes_structured_blocked_stop_metadata() {
+        let workflow = workflow(
+            "blocked",
+            serde_json::json!({
+                "blocked_reason": "Waiting for maintainer approval.",
+                "unblock_hint": "Post the approval comment, then call unblock.",
+                "last_stop": {
+                    "state": "blocked",
+                    "activity": "implement_issue",
+                    "runtime_job_id": "job-1",
+                    "event_id": 10
+                }
+            }),
+        );
+
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+        assert_eq!(
+            projection.stopped_state.blocked_reason.as_deref(),
+            Some("Waiting for maintainer approval.")
+        );
+        assert_eq!(
+            projection.stopped_state.unblock_hint.as_deref(),
+            Some("Post the approval comment, then call unblock.")
+        );
+        assert_eq!(
+            projection.stopped_state.last_stop.as_ref().unwrap()["activity"],
+            "implement_issue"
+        );
+        assert!(projection.stopped_state.can_unblock);
+        assert!(!projection.stopped_state.can_retry);
+    }
+
+    #[test]
+    fn projection_exposes_retry_eligibility_from_structured_error_kind() {
+        let retryable = workflow(
+            "failed",
+            serde_json::json!({
+                "failure_reason": "Runtime transport timed out.",
+                "error_kind": "timeout",
+                "retry_hint": "Fix the transient condition, then call retry.",
+                "last_stop": {
+                    "state": "failed",
+                    "activity": "implement_issue",
+                    "runtime_job_id": "job-2"
+                }
+            }),
+        );
+        let configuration = workflow(
+            "failed",
+            serde_json::json!({
+                "failure_reason": "Missing configuration.",
+                "error_kind": "configuration"
+            }),
+        );
+        let cancelled = workflow(
+            "cancelled",
+            serde_json::json!({
+                "failure_reason": "Operator cancelled the workflow."
+            }),
+        );
+
+        let retryable = RuntimeWorkflowProjection::from_workflow(&retryable);
+        assert_eq!(
+            retryable.stopped_state.failure_reason.as_deref(),
+            Some("Runtime transport timed out.")
+        );
+        assert_eq!(
+            retryable.stopped_state.error_kind.as_deref(),
+            Some("timeout")
+        );
+        assert!(retryable.stopped_state.can_retry);
+        assert!(!retryable.stopped_state.can_unblock);
+
+        let configuration = RuntimeWorkflowProjection::from_workflow(&configuration);
+        assert!(!configuration.stopped_state.can_retry);
+        assert!(!configuration.stopped_state.can_unblock);
+
+        let cancelled = RuntimeWorkflowProjection::from_workflow(&cancelled);
+        assert!(!cancelled.stopped_state.can_retry);
+        assert!(!cancelled.stopped_state.can_unblock);
     }
 
     #[test]

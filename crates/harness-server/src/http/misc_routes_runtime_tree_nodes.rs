@@ -191,6 +191,8 @@ pub(super) struct WorkflowRuntimeTreeProjection {
     pub submission_handle: Option<String>,
     pub legacy_dedupe_task_handle: Option<String>,
     pub active_bucket: Option<&'static str>,
+    #[serde(flatten)]
+    pub stopped_state: crate::runtime_projection::RuntimeStoppedStateProjection,
 }
 
 impl WorkflowRuntimeTreeProjection {
@@ -208,6 +210,7 @@ impl WorkflowRuntimeTreeProjection {
                 .legacy_dedupe_task_handle
                 .map(|task_id| task_id.0),
             active_bucket,
+            stopped_state: projection.stopped_state,
         }
     }
 }
