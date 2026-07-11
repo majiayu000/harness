@@ -25,6 +25,26 @@ function authHeaders(): Record<string, string> {
   return tok ? { Authorization: `Bearer ${tok}` } : {};
 }
 
+async function apiErrorMessage(resp: Response, path: string): Promise<string> {
+  const fallback = `${path} → HTTP ${resp.status}`;
+  if (!resp.headers.get("Content-Type")?.toLowerCase().includes("json")) {
+    return fallback;
+  }
+
+  let payload: unknown;
+  try {
+    payload = await resp.json();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `${fallback} (invalid JSON error response: ${detail})`;
+  }
+  if (typeof payload !== "object" || payload === null || !("error" in payload)) {
+    return fallback;
+  }
+  const detail = (payload as { error?: unknown }).error;
+  return typeof detail === "string" && detail.trim() ? detail.trim() : fallback;
+}
+
 export async function apiFetch(
   path: string,
   init: RequestInit = {},
@@ -43,7 +63,7 @@ export async function apiFetch(
     throw new ApiError(401, `${path} → 401`);
   }
   if (!resp.ok) {
-    throw new ApiError(resp.status, `${path} → HTTP ${resp.status}`);
+    throw new ApiError(resp.status, await apiErrorMessage(resp, path));
   }
   return resp;
 }

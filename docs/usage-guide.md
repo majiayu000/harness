@@ -528,27 +528,41 @@ Tempo walkthrough.
 10. Task status → done/failed
 ```
 
+## Workflow Runtime Recovery API
+
+Use authenticated `POST /api/workflows/runtime/unblock` for `blocked` GitHub
+issue workflows and `POST /api/workflows/runtime/retry` for retryable `failed`
+workflows. Both requests require JSON `workflow_id` and `reason` fields.
+`cancelled`, active, unsupported, and non-retryable workflows fail closed.
+
+Harness replays the supported stopped activity directly and resumes at its
+corresponding active state (`implementing`, `replanning`, `merging`,
+`local_review_gate`, `awaiting_feedback`, or `addressing_feedback`). The next
+intake tick treats that active state as covered so it cannot duplicate the
+recovery command.
+
+| Response class | Meaning |
+|----------------|---------|
+| `200` | Recovery and replay command were committed. |
+| `400`, `415`, `422` | The JSON request is malformed, has the wrong content type, or has invalid fields. |
+| `401`, `404` | Authentication failed or the workflow was not found. |
+| `409` | State, retry eligibility, definition, or stopped activity is unsupported. |
+| `500`, `503` | The transaction failed or the runtime store is unavailable. |
+
+Direct database edits are not a supported recovery path because they break the
+runtime audit chain. See [Workflow Runtime Operations](workflow-runtime-operations.md)
+for authentication, request examples, activity mappings, exact response
+classes, and safe rollout guidance.
+
 ## Scheduled Background Systems
 
 Harness runs several background schedulers automatically when the server starts:
 
 ### 1. Periodic Review (`[review]`)
 
-Whole-repo code review on a timer. Disabled by default.
-
-```toml
-[review]
-enabled = true
-interval_hours = 24
-# strategy = "cross"
-```
-
-**What happens when enabled:**
-- Every `interval_hours`, locally checks if new commits exist since the last review
-- If yes: gathers repo structure + diff stats + commit log → constructs review prompt → enqueues as a task
-- Agent reviews the entire codebase, may create a PR with fixes
-- If no new commits: cycle is skipped before any review agent is spawned
-- Review events are logged to EventStore for audit trail
+Whole-repo review is disabled by default. When enabled, Harness checks for new
+commits before enqueueing an agent and records its watermark in EventStore. See
+[Periodic Review](periodic-review.md) for configuration and execution details.
 
 ### 2. Health Tick (always on)
 
@@ -560,48 +574,10 @@ Every 24 hours, runs `RuleEngine::scan()` on the project root:
 
 ### Workflow Runtime Sweepers
 
-Workflow-runtime watchdog and retention sweepers are configured in
-`WORKFLOW.md` under `storage`. Both are disabled by default on first rollout:
-
-```yaml
-storage:
-  orphan_reaper_enabled: true
-  orphan_reaper_interval_secs: 3600
-  orphan_reaper_legacy_enabled: true
-  orphan_reaper_legacy_batch: 200
-  workflow_watchdog_enabled: false
-  workflow_watchdog_age_minutes: 240
-  workflow_watchdog_interval_secs: 300
-  workflow_watchdog_batch_size: 100
-  runtime_retention_enabled: false
-  runtime_retention_days: 30
-  runtime_retention_batch_size: 1000
-  runtime_retention_interval_secs: 3600
-  task_retention_enabled: false
-  task_retention_days: 30
-  task_retention_batch_size: 1000
-  task_retention_interval_secs: 3600
-```
-
-The orphan schema reaper is enabled by default. It drops registered
-path-derived schemas with dead owner paths and, in bounded batches, legacy
-unregistered `h<16-hex>` schemas that cannot be matched to a live workspace
-directory or known store path under the configured workspace root.
-
-Enable `workflow_watchdog_enabled` first. It is read-only: aged `blocked` and
-`awaiting_feedback` workflow instances appear in `/api/operator-monitor` under
-`stuck_workflows` and are logged at error level.
-
-Enable `runtime_retention_enabled` only after the stuck list is clean. Retention
-deletes terminal workflow families older than `runtime_retention_days` in
-bounded batches and relies on the Postgres runtime-store cascade constraints to
-remove events, decisions, commands, jobs, runtime events, and artifacts. Active
-workflow families are never pruned.
-
-Enable `task_retention_enabled` only when historical task rows can be deleted.
-Retention deletes terminal tasks older than `task_retention_days` in bounded
-batches, including task-owned artifacts, prompts, and checkpoints. Active,
-pending, dependency-blocked, and resumable tasks are never pruned.
+The watchdog is read-only; runtime and task retention remain disabled by
+default. Configure and roll them out in that order using
+[Workflow Runtime Operations](workflow-runtime-operations.md). See
+[Postgres Schema Cleanup](postgres-schema-cleanup.md) for orphan schema reaping.
 
 ### 3. GC Runner (always on)
 

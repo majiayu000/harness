@@ -14,11 +14,11 @@ GH-1567
 - [x] `SP1567-T001` Owner: `workflow-runtime` | Dependencies: none | Done when: blocked and failed reducer paths derive structured stop metadata (`blocked_reason`, `unblock_hint`, `failure_reason`, `retry_hint`, and `last_stop`) from activity results and persist it in workflow instance `data` without schema migration | Verify: `cargo test -p harness-workflow runtime_failure`
 - [x] `SP1567-T002` Owner: `server-api` | Dependencies: `SP1567-T001` | Done when: `/api/workflows/runtime/unblock` exists, is authenticated by existing middleware, accepts `workflow_id` and `reason`, accepts only `blocked` workflows, records an audit event, and moves the workflow to a dispatchable state | Verify: `cargo test -p harness-server unblock`
 - [x] `SP1567-T003` Owner: `server-api` | Dependencies: `SP1567-T001` | Done when: `/api/workflows/runtime/retry` exists, is authenticated by existing middleware, accepts only retryable `failed` workflows, rejects wrong-state and non-retryable failures, records an audit event, and moves the workflow to a dispatchable state | Verify: `cargo test -p harness-server retry`
-- [ ] `SP1567-T004` Owner: `intake` | Dependencies: `SP1567-T002`, `SP1567-T003` | Done when: GitHub issue coverage remains conservative for untouched `blocked`/`failed` workflows, but a workflow updated by unblock or retry no longer causes the next intake tick to skip the issue because of the old stopped state | Verify: `cargo test -p harness-server github_coverage_gate`
+- [x] `SP1567-T004` Owner: `intake` | Dependencies: `SP1567-T002`, `SP1567-T003` | Done when: GitHub issue coverage remains conservative for untouched `blocked`/`failed` workflows, but a workflow updated by unblock or retry no longer causes the next intake tick to skip the issue because of the old stopped state | Verify: `cargo test -p harness-server github_coverage_gate`
 - [x] `SP1567-T005` Owner: `observe` | Dependencies: `SP1567-T001` | Done when: runtime tree and operator monitor payloads expose structured stopped-state fields and action eligibility without relying on free-text parsing | Verify: `cargo test -p harness-server operator_monitor runtime_tree`
-- [ ] `SP1567-T006` Owner: `web` | Dependencies: `SP1567-T002`, `SP1567-T003`, `SP1567-T005` | Done when: the operator monitor renders structured reason text, shows unblock/retry actions only when allowed, calls the new routes, and refreshes state after success | Verify: project web test command for `OperatorMonitorPanel`
-- [ ] `SP1567-T007` Owner: `docs` | Dependencies: `SP1567-T002`, `SP1567-T003` | Done when: `docs/usage-guide.md` documents the recovery API, response classes, supported states, and the rule that direct DB edits are not supported recovery | Verify: reviewer checks usage-guide section
-- [ ] `SP1567-T008` Owner: `policy` | Dependencies: all previous tasks | Done when: optional blocked recheck policy is either explicitly deferred or implemented behind disabled-by-default configuration with evidence-writing tests | Verify: implementation PR states the decision and matching tests or non-goal evidence
+- [x] `SP1567-T006` Owner: `web` | Dependencies: `SP1567-T002`, `SP1567-T003`, `SP1567-T005` | Done when: the operator monitor renders structured reason text, shows unblock/retry actions only when allowed, calls the new routes, and refreshes state after success | Verify: project web test command for `OperatorMonitorPanel`
+- [x] `SP1567-T007` Owner: `docs` | Dependencies: `SP1567-T002`, `SP1567-T003` | Done when: `docs/usage-guide.md` documents the recovery API, response classes, supported states, and the rule that direct DB edits are not supported recovery | Verify: reviewer checks usage-guide section
+- [x] `SP1567-T008` Owner: `policy` | Dependencies: all previous tasks | Done when: optional blocked recheck policy is either explicitly deferred or implemented behind disabled-by-default configuration with evidence-writing tests | Verify: implementation PR states the decision and matching tests or non-goal evidence
 
 ## Parallelization
 
@@ -45,15 +45,18 @@ GH-1567
 
 ## Handoff Notes
 
-- This spec intentionally keeps the first implementation manual/operator-driven.
-  Automatic blocked recheck is deferred unless a follow-up PR explicitly
-  enables it behind disabled-by-default configuration.
+- This implementation remains manual/operator-driven. Automatic blocked
+  recheck is explicitly deferred to GH-1584 and stays disabled unless that
+  follow-up is approved and lands with evidence-writing policy tests.
 - Use body-based runtime action routes for the first implementation because
   current workflow ids can contain project paths and slashes. A path-style alias
   requires URL-encoding tests.
 - Do not make `blocked` or `failed` globally uncovered in the coverage gate.
   The operator action should change the workflow state; the gate should then
-  observe that updated state.
+  observe that updated state. Recovery directly enqueues the replay command,
+  so resumed active states remain covered to prevent the next intake tick from
+  dispatching duplicate work; they are no longer covered by the old stopped
+  state.
 - Do not retry `cancelled` workflows in this issue.
 - Do not close GH-1567 until the implementation PRs satisfy the acceptance
   criteria, not merely this spec packet.

@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { OperatorMonitorPanel } from "./OperatorMonitorPanel";
 import type { OperatorMonitorPayload } from "@/types";
 
@@ -8,12 +8,20 @@ vi.mock("@/lib/queries", () => ({
   useOperatorMonitor: vi.fn(),
 }));
 
+vi.mock("@/lib/api", () => ({
+  apiFetch: vi.fn(),
+}));
+
 import { useOperatorMonitor } from "@/lib/queries";
+import { apiFetch } from "@/lib/api";
 
 const mockUseOperatorMonitor = useOperatorMonitor as ReturnType<typeof vi.fn>;
+const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 
-function wrap(ui: React.ReactElement) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function wrap(
+  ui: React.ReactElement,
+  qc = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>);
 }
 
@@ -136,6 +144,11 @@ function makeMonitor(): OperatorMonitorPayload {
 }
 
 describe("<OperatorMonitorPanel>", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApiFetch.mockResolvedValue(new Response("{}", { status: 200 }));
+  });
+
   it("renders active runtime work and ready-to-merge operator actions", () => {
     mockUseOperatorMonitor.mockReturnValue({
       data: makeMonitor(),
@@ -190,5 +203,150 @@ describe("<OperatorMonitorPanel>", () => {
 
     expect(screen.getByText("Operator monitor unavailable.")).toBeInTheDocument();
     expect(screen.queryByText("No current operator actions.")).not.toBeInTheDocument();
+  });
+
+  it("renders current-state stop details and invokes only eligible recovery actions", async () => {
+    const monitor = makeMonitor();
+    const baseAction = monitor.operator_actions[0];
+    monitor.operator_actions = [
+      {
+        ...baseAction,
+        kind: "blocked",
+        workflow_id: "workflow-blocked",
+        state: "blocked",
+        blocked_reason: "Waiting for maintainer approval.",
+        unblock_hint: "Post the approval comment, then unblock.",
+        failure_reason: "Stale failed reason.",
+        retry_hint: "Stale retry hint.",
+        last_stop: { state: "failed" },
+        can_unblock: true,
+        can_retry: false,
+      },
+      {
+        ...baseAction,
+        kind: "failed",
+        workflow_id: "workflow-retryable",
+        state: "failed",
+        blocked_reason: "Stale blocked reason.",
+        unblock_hint: "Stale unblock hint.",
+        failure_reason: "Runtime transport timed out.",
+        retry_hint: "Retry after transport recovers.",
+        last_stop: { state: "blocked" },
+        can_unblock: false,
+        can_retry: true,
+      },
+      {
+        ...baseAction,
+        kind: "failed",
+        workflow_id: "workflow-nonretryable",
+        state: "failed",
+        failure_reason: "Runtime configuration is invalid.",
+        can_unblock: false,
+        can_retry: false,
+      },
+    ];
+    monitor.stuck_workflows[0] = {
+      ...monitor.stuck_workflows[0],
+      blocked_reason: "Aged workflow still needs approval.",
+      failure_reason: "Stale aged failure.",
+      last_stop: { state: "blocked" },
+    };
+    mockUseOperatorMonitor.mockReturnValue({ data: monitor, isError: false });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+
+    wrap(<OperatorMonitorPanel />, queryClient);
+
+    expect(screen.getByText("Waiting for maintainer approval.")).toBeInTheDocument();
+    expect(screen.getByText("Post the approval comment, then unblock.")).toBeInTheDocument();
+    expect(screen.getByText("Runtime transport timed out.")).toBeInTheDocument();
+    expect(screen.getByText("Retry after transport recovers.")).toBeInTheDocument();
+    expect(screen.getByText("Aged workflow still needs approval.")).toBeInTheDocument();
+    for (const staleText of [
+      "Stale failed reason.",
+      "Stale retry hint.",
+      "Stale blocked reason.",
+      "Stale unblock hint.",
+      "Stale aged failure.",
+    ]) {
+      expect(screen.queryByText(staleText)).not.toBeInTheDocument();
+    }
+    expect(
+      screen.queryByRole("button", { name: "Retry workflow workflow-nonretryable" }),
+    ).not.toBeInTheDocument();
+
+    const unblockButton = screen.getByRole("button", {
+      name: "Unblock workflow workflow-blocked",
+    });
+    fireEvent.click(unblockButton);
+    expect(screen.getByText("Recovery reason is required.")).toBeInTheDocument();
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("Recovery reason for workflow-blocked"), {
+      target: { value: "  Approval was posted  " },
+    });
+    fireEvent.click(unblockButton);
+
+    await waitFor(() =>
+      expect(mockApiFetch).toHaveBeenNthCalledWith(1, "/api/workflows/runtime/unblock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workflow_id: "workflow-blocked",
+          reason: "Approval was posted",
+        }),
+      }),
+    );
+    await waitFor(() => expect(unblockButton).toBeEnabled());
+    await waitFor(() => expect(unblockButton).toHaveTextContent(/^Unblock$/));
+
+    fireEvent.change(screen.getByLabelText("Recovery reason for workflow-retryable"), {
+      target: { value: "Transport is healthy" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry workflow workflow-retryable" }),
+    );
+
+    await waitFor(() =>
+      expect(mockApiFetch).toHaveBeenNthCalledWith(2, "/api/workflows/runtime/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workflow_id: "workflow-retryable",
+          reason: "Transport is healthy",
+        }),
+      }),
+    );
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["operator-monitor"] });
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workflow-runtime-tree"] });
+  });
+
+  it("shows recovery failures instead of swallowing them", async () => {
+    const monitor = makeMonitor();
+    monitor.operator_actions[0] = {
+      ...monitor.operator_actions[0],
+      kind: "blocked",
+      workflow_id: "workflow-blocked",
+      state: "blocked",
+      can_unblock: true,
+    };
+    mockUseOperatorMonitor.mockReturnValue({ data: monitor, isError: false });
+    mockApiFetch.mockRejectedValueOnce(new Error("workflow not in blocked state"));
+
+    wrap(<OperatorMonitorPanel />);
+    fireEvent.change(screen.getByLabelText("Recovery reason for workflow-blocked"), {
+      target: { value: "Approval was posted" },
+    });
+    const unblockButton = screen.getByRole("button", {
+      name: "Unblock workflow workflow-blocked",
+    });
+    fireEvent.click(unblockButton);
+
+    expect(
+      await screen.findByText(
+        "Workflow recovery failed: workflow not in blocked state",
+      ),
+    ).toBeInTheDocument();
+    expect(unblockButton).toBeEnabled();
+    expect(unblockButton).toHaveTextContent(/^Unblock$/);
   });
 });
