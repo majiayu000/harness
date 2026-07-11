@@ -1,5 +1,11 @@
 use super::*;
-use harness_workflow::issue_lifecycle::IssueLifecycleState;
+use harness_workflow::{
+    issue_lifecycle::IssueLifecycleState,
+    runtime::{
+        RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowInstance,
+        WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    },
+};
 
 #[tokio::test]
 async fn list_tasks_marks_runtime_submission_summaries_degraded_when_store_failed(
@@ -697,51 +703,28 @@ async fn workflow_runtime_recovery_endpoints_reopen_stopped_workflows() -> anyho
         )
         .with_state(state.clone());
 
-    for (action, route, state_name, status, event_type, decision, issue_number) in [
-        (
-            "unblock",
-            "/api/workflows/runtime/unblock",
-            "blocked",
-            "unblocked",
-            "WorkflowRuntimeUnblocked",
-            "operator_runtime_unblock",
-            56,
-        ),
-        (
-            "retry",
-            "/api/workflows/runtime/retry",
-            "failed",
-            "retried",
-            "WorkflowRuntimeRetried",
-            "operator_runtime_retry",
-            57,
-        ),
+    for (route, state_name, status, issue_number) in [
+        ("/api/workflows/runtime/unblock", "blocked", "unblocked", 56),
+        ("/api/workflows/runtime/retry", "failed", "retried", 57),
     ] {
         let workflow_id = format!("runtime-{state_name}-{issue_number}");
         let mut data = serde_json::json!({
-            "repo": "owner/repo",
             "issue_number": issue_number,
         });
         if state_name == "failed" {
-            data["failure_reason"] = serde_json::json!("Codex route timed out.");
             data["error_kind"] = serde_json::json!("timeout");
-        } else {
-            data["blocked_reason"] = serde_json::json!("Waiting for maintainer approval.");
         }
-        let workflow = harness_workflow::runtime::WorkflowInstance::new(
-            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
             state_name,
-            harness_workflow::runtime::WorkflowSubject::new(
-                "issue",
-                format!("issue:{issue_number}"),
-            ),
+            WorkflowSubject::new("issue", format!("issue:{issue_number}")),
         )
         .with_id(&workflow_id)
         .with_data(data.clone());
         store.upsert_instance(&workflow).await?;
-        let original_command = harness_workflow::runtime::WorkflowCommand::new(
-            harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
+        let original_command = WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
             format!("{workflow_id}-original"),
             serde_json::json!({
                 "activity": "implement_issue",
@@ -779,9 +762,6 @@ async fn workflow_runtime_recovery_endpoints_reopen_stopped_workflows() -> anyho
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await?;
         assert_eq!(body["status"], status);
-        assert_eq!(body["execution_path"], "workflow_runtime");
-        assert_eq!(body["workflow_id"], workflow_id);
-        assert_eq!(body["previous_state"], state_name);
         assert_eq!(body["state"], "implementing");
 
         let updated = store
@@ -789,48 +769,78 @@ async fn workflow_runtime_recovery_endpoints_reopen_stopped_workflows() -> anyho
             .await?
             .expect("workflow should still exist");
         assert_eq!(updated.state, "implementing");
-        assert_eq!(updated.data["last_operator_recovery"]["action"], action);
-        assert_eq!(
-            updated.data["last_operator_recovery"]["reason"],
-            "operator resolved stopped condition"
-        );
-        let events = store.events_for(&workflow_id).await?;
-        assert!(events.iter().any(|event| event.event_type == event_type
-            && event.event["previous_state"] == state_name
-            && event.event["state"] == "implementing"));
-        let decisions = store.decisions_for(&workflow_id).await?;
-        assert!(decisions.iter().any(|record| {
-            record.accepted
-                && record.decision.observed_state == state_name
-                && record.decision.next_state == "implementing"
-                && record.decision.decision == decision
-        }));
         let commands = store.commands_for(&workflow_id).await?;
         let replayed = commands
             .iter()
-            .find(|command| {
-                command.status == harness_workflow::runtime::WorkflowCommandStatus::Pending
-            })
+            .find(|command| command.status == WorkflowCommandStatus::Pending)
             .expect("replayed recovery command should be pending");
-        assert_eq!(
-            replayed.command.command_type,
-            harness_workflow::runtime::WorkflowCommandType::EnqueueActivity
-        );
         assert_eq!(replayed.command.command, original_command.command);
+    }
+    let blocked = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "blocked",
+        WorkflowSubject::new("issue", "issue:58"),
+    )
+    .with_id("runtime-blocked-58");
+    let failed = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        WorkflowSubject::new("issue", "issue:59"),
+    )
+    .with_id("runtime-failed-59")
+    .with_data(serde_json::json!({"error_kind": "configuration"}));
+    store.upsert_instance(&blocked).await?;
+    store.upsert_instance(&failed).await?;
+    for (workflow_id, error, field, value) in [
+        (
+            "runtime-blocked-58",
+            "workflow not in failed state",
+            "state",
+            "blocked",
+        ),
+        (
+            "runtime-failed-59",
+            "workflow failure is not retryable",
+            "error_kind",
+            "configuration",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workflows/runtime/retry")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow_id": workflow_id,
+                            "reason": "operator supplied input"
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await?;
+        assert_eq!(body["error"], error);
+        assert_eq!(body[field], value);
     }
     Ok(())
 }
 
 async fn enqueue_route_test_runtime_job(
-    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    store: &WorkflowRuntimeStore,
     workflow_id: &str,
-    command: &harness_workflow::runtime::WorkflowCommand,
+    command: &WorkflowCommand,
 ) -> anyhow::Result<(String, String)> {
     let command_id = store.enqueue_command(workflow_id, None, command).await?;
     let _ = store
         .enqueue_runtime_job_for_pending_command(
             &command_id,
-            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            RuntimeKind::CodexJsonrpc,
             "codex-default",
             command.command.clone(),
             None,

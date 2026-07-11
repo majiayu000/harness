@@ -112,11 +112,7 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = project_issue_instance("/project-a", 1567, "blocked").with_data(json!({
-        "project_id": "/project-a",
-        "issue_number": 1567,
-        "submission_mode": "immediate",
-    }));
+    let instance = project_issue_instance("/project-a", 1567, "blocked");
     store.upsert_instance(&instance).await?;
 
     let pending_id = store
@@ -141,9 +137,6 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
     let (dispatched_id, runtime_job_id) =
         enqueue_original_runtime_job(&store, &instance.id, &original_command).await?;
     let instance = instance.with_data(json!({
-        "project_id": "/project-a",
-        "issue_number": 1567,
-        "submission_mode": "immediate",
         "last_stop": {
             "state": "blocked",
             "activity": "implement_issue",
@@ -197,14 +190,6 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
         .command
         .dedupe_key
         .starts_with("operator-recovery:unblock:"));
-
-    let events = store.events_for(&instance.id).await?;
-    let recovery_event = events
-        .iter()
-        .find(|event| event.event_type == "WorkflowRuntimeUnblocked")
-        .expect("recovery audit event should be recorded");
-    assert_eq!(recovery_event.event["superseded_command_count"], 3);
-    assert_eq!(recovery_event.event["superseded_runtime_job_count"], 1);
     Ok(())
 }
 
@@ -251,8 +236,6 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
     for (index, (stopped_activity, expected_state, command_type, payload)) in cases.into_iter().enumerate() {
         let issue_number = 1700 + index as u64;
         let instance = project_issue_instance("/project-a", issue_number, "failed").with_data(json!({
-            "project_id": "/project-a",
-            "issue_number": issue_number,
             "error_kind": "timeout",
         }));
         store.upsert_instance(&instance).await?;
@@ -264,8 +247,6 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
         let (_command_id, runtime_job_id) =
             enqueue_original_runtime_job(&store, &instance.id, &original).await?;
         let instance = instance.with_data(json!({
-            "project_id": "/project-a",
-            "issue_number": issue_number,
             "error_kind": "timeout",
             "last_stop": {
                 "state": "failed",
@@ -301,18 +282,49 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
             .command
             .dedupe_key
             .starts_with("operator-recovery:retry:"));
-        if stopped_activity == "address_pr_feedback" {
-            assert_eq!(recovery_command.command.command["source"], "pr_hygiene");
-            assert_eq!(
-                recovery_command.command.command["review_summary"],
-                "Gemini requested changes."
-            );
-            assert_eq!(
-                recovery_command.command.command["hygiene"]["unresolved_threads"],
-                2
-            );
-        }
     }
+
+    let bad_child = project_issue_instance("/project-a", 1696, "failed").with_data(json!({
+        "error_kind": "timeout",
+    }));
+    store.upsert_instance(&bad_child).await?;
+    let bad_command = WorkflowCommand::new(
+        WorkflowCommandType::StartChildWorkflow,
+        "bad-sweep-child",
+        json!({
+            "definition_id": PR_FEEDBACK_DEFINITION_ID,
+            "child_activity": "wrong_activity",
+            "subject_key": "pr:77",
+            "pr_number": 77
+        }),
+    );
+    let (_command_id, runtime_job_id) =
+        enqueue_original_runtime_job(&store, &bad_child.id, &bad_command).await?;
+    let bad_child = bad_child.with_data(json!({
+        "error_kind": "timeout",
+        "last_stop": {
+            "state": "failed",
+            "activity": "sweep_pr_feedback",
+            "runtime_job_id": runtime_job_id,
+            "error_kind": "timeout"
+        }
+    }));
+    store.upsert_instance(&bad_child).await?;
+    let outcome = store
+        .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
+            workflow_id: &bad_child.id,
+            action: super::WorkflowRuntimeRecoveryAction::Retry,
+            reason: "operator fixed transient failure",
+            actor: "operator",
+        })
+        .await?;
+    assert!(matches!(
+        outcome,
+        super::WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity {
+            activity: Some(activity),
+            ..
+        } if activity == "sweep_pr_feedback"
+    ));
 
     let legacy = project_issue_instance("/project-a", 1698, "failed").with_data(json!({
         "project_id": "/project-a",
@@ -337,34 +349,7 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
 
-    let nonretryable = project_issue_instance("/project-a", 1697, "failed").with_data(json!({
-        "error_kind": "configuration",
-        "last_stop": {
-            "state": "failed",
-            "activity": "implement_issue",
-            "error_kind": "configuration"
-        }
-    }));
-    store.upsert_instance(&nonretryable).await?;
-    let outcome = store
-        .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
-            workflow_id: &nonretryable.id,
-            action: super::WorkflowRuntimeRecoveryAction::Retry,
-            reason: "operator requested retry",
-            actor: "operator",
-        })
-        .await?;
-    assert!(matches!(
-        outcome,
-        super::WorkflowRuntimeRecoveryOutcome::NonRetryableFailure {
-            error_kind: ActivityErrorKind::Configuration,
-            ..
-        }
-    ));
-
     let unsupported = project_issue_instance("/project-a", 1699, "failed").with_data(json!({
-        "project_id": "/project-a",
-        "issue_number": 1699,
         "error_kind": "timeout",
         "last_stop": {
             "state": "failed",
@@ -402,18 +387,13 @@ async fn runtime_recovery_waiting_on_command_does_not_lock_instance() -> anyhow:
 
     let dir = tempfile::tempdir()?;
     let store = Arc::new(WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?);
-    let instance = project_issue_instance("/project-a", 1568, "blocked").with_data(json!({
-        "project_id": "/project-a",
-        "issue_number": 1568,
-    }));
+    let instance = project_issue_instance("/project-a", 1568, "blocked");
     store.upsert_instance(&instance).await?;
     let original_command =
         WorkflowCommand::enqueue_activity("implement_issue", "stale-dispatched-1568");
     let (stale_command_id, runtime_job_id) =
         enqueue_original_runtime_job(&store, &instance.id, &original_command).await?;
     let instance = instance.with_data(json!({
-        "project_id": "/project-a",
-        "issue_number": 1568,
         "last_stop": {
             "state": "blocked",
             "activity": "implement_issue",

@@ -7,6 +7,9 @@ use crate::runtime::model::{
     ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, WorkflowCommand,
     WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
 };
+use crate::runtime::pr_feedback::{
+    LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+};
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::ValidationContext;
@@ -33,13 +36,6 @@ impl WorkflowRuntimeRecoveryAction {
         }
     }
 
-    fn success_status(self) -> &'static str {
-        match self {
-            Self::Unblock => "unblocked",
-            Self::Retry => "retried",
-        }
-    }
-
     fn event_type(self) -> &'static str {
         match self {
             Self::Unblock => "WorkflowRuntimeUnblocked",
@@ -60,7 +56,6 @@ pub enum WorkflowRuntimeRecoveryOutcome {
     Recovered {
         workflow: WorkflowInstance,
         previous_state: String,
-        event_id: String,
     },
     WrongState {
         workflow: WorkflowInstance,
@@ -150,7 +145,6 @@ impl WorkflowRuntimeStore {
             "workflow_runtime_operator_action",
             json!({
                 "action": request.action.as_str(),
-                "status": request.action.success_status(),
                 "reason": request.reason,
                 "actor": request.actor,
                 "previous_state": previous_state,
@@ -214,7 +208,6 @@ impl WorkflowRuntimeStore {
         Ok(WorkflowRuntimeRecoveryOutcome::Recovered {
             workflow: instance,
             previous_state,
-            event_id: event.id,
         })
     }
 }
@@ -327,17 +320,17 @@ fn recovery_dispatch_target(
             state: "merging",
             activity: "merge_pr",
         },
-        super::super::pr_feedback::LOCAL_REVIEW_ACTIVITY => RecoveryDispatchTarget {
+        LOCAL_REVIEW_ACTIVITY => RecoveryDispatchTarget {
             state: "local_review_gate",
-            activity: super::super::pr_feedback::LOCAL_REVIEW_ACTIVITY,
+            activity: LOCAL_REVIEW_ACTIVITY,
         },
         "sweep_pr_feedback" => RecoveryDispatchTarget {
             state: "awaiting_feedback",
             activity: "sweep_pr_feedback",
         },
-        super::super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY => RecoveryDispatchTarget {
+        PR_FEEDBACK_INSPECT_ACTIVITY => RecoveryDispatchTarget {
             state: "awaiting_feedback",
-            activity: super::super::pr_feedback::PR_FEEDBACK_INSPECT_ACTIVITY,
+            activity: PR_FEEDBACK_INSPECT_ACTIVITY,
         },
         "address_pr_feedback" => RecoveryDispatchTarget {
             state: "addressing_feedback",
@@ -373,8 +366,46 @@ fn command_matches_recovery_target(
     command: &WorkflowCommand,
     target: RecoveryDispatchTarget,
 ) -> bool {
-    command.command_type != WorkflowCommandType::EnqueueActivity
-        || command.activity_name() == Some(target.activity)
+    match command.command_type {
+        WorkflowCommandType::EnqueueActivity => {
+            command.activity_name() == Some(target.activity)
+                && enqueue_payload_matches_target(&command.command, target)
+        }
+        WorkflowCommandType::StartChildWorkflow => {
+            target.activity == "sweep_pr_feedback"
+                && command.command.get("definition_id").and_then(Value::as_str)
+                    == Some(PR_FEEDBACK_DEFINITION_ID)
+                && command
+                    .command
+                    .get("child_activity")
+                    .and_then(Value::as_str)
+                    == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
+                && command
+                    .command
+                    .get("pr_number")
+                    .and_then(Value::as_u64)
+                    .is_some()
+        }
+        _ => false,
+    }
+}
+
+fn enqueue_payload_matches_target(payload: &Value, target: RecoveryDispatchTarget) -> bool {
+    let pr_number = payload.get("pr_number").and_then(Value::as_u64).is_some();
+    let review_summary = payload
+        .get("review_summary")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let hygiene = payload
+        .get("hygiene")
+        .or_else(|| payload.get("hygiene_context"))
+        .is_some_and(|value| !value.is_null());
+    (!matches!(
+        target.activity,
+        "merge_pr" | "address_pr_feedback" | LOCAL_REVIEW_ACTIVITY
+    ) || pr_number)
+        && (payload.get("source").and_then(Value::as_str) != Some("pr_hygiene")
+            || (review_summary && hygiene))
 }
 
 fn unsupported_stopped_activity(
