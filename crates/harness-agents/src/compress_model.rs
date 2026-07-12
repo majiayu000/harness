@@ -7,9 +7,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_core::agent::{AgentRequest, CodeAgent};
+use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent};
 use harness_core::compress::{
-    ActionSketch, CompressHint, CompressModel, ObservationCompressor, PromptCompressor,
+    ActionSketch, CompressHint, CompressModel, CompressModelError, CompressModelOutput,
+    CompressorCallUsage, ObservationCompressor, PromptCompressor,
 };
 use harness_core::config::compression::CompressionConfig;
 
@@ -37,7 +38,7 @@ impl ApiCompressModel {
         }
     }
 
-    async fn ask(&self, prompt: String) -> Result<String, String> {
+    async fn ask(&self, prompt: String) -> Result<CompressModelOutput<String>, CompressModelError> {
         let req = AgentRequest {
             prompt,
             model: Some(self.model.clone()),
@@ -46,8 +47,22 @@ impl ApiCompressModel {
         self.agent
             .execute(req)
             .await
-            .map(|resp| resp.output)
-            .map_err(|e| e.to_string())
+            .map(response_to_model_output)
+            .map_err(|error| CompressModelError {
+                message: error.to_string(),
+                usage: None,
+            })
+    }
+}
+
+fn response_to_model_output(response: AgentResponse) -> CompressModelOutput<String> {
+    CompressModelOutput {
+        output: response.output,
+        usage: CompressorCallUsage {
+            input_tokens: response.token_usage.input_tokens,
+            output_tokens: response.token_usage.output_tokens,
+            model: response.model,
+        },
     }
 }
 
@@ -86,15 +101,38 @@ fn parse_sketch(reply: &str) -> Result<ActionSketch, String> {
     serde_json::from_str(&reply[start..=end]).map_err(|e| e.to_string())
 }
 
+fn parse_sketch_output(
+    reply: CompressModelOutput<String>,
+) -> Result<CompressModelOutput<ActionSketch>, CompressModelError> {
+    match parse_sketch(&reply.output) {
+        Ok(output) => Ok(CompressModelOutput {
+            output,
+            usage: reply.usage,
+        }),
+        Err(message) => Err(CompressModelError {
+            message,
+            usage: Some(reply.usage),
+        }),
+    }
+}
+
 #[async_trait]
 impl CompressModel for ApiCompressModel {
-    async fn summarize(&self, raw: &str, hint: &CompressHint) -> Result<String, String> {
+    async fn summarize(
+        &self,
+        raw: &str,
+        hint: &CompressHint,
+    ) -> Result<CompressModelOutput<String>, CompressModelError> {
         self.ask(summarize_prompt(raw, hint)).await
     }
 
-    async fn sketch(&self, observation: &str, hint: &CompressHint) -> Result<ActionSketch, String> {
+    async fn sketch(
+        &self,
+        observation: &str,
+        hint: &CompressHint,
+    ) -> Result<CompressModelOutput<ActionSketch>, CompressModelError> {
         let reply = self.ask(sketch_prompt(observation, hint)).await?;
-        parse_sketch(&reply)
+        parse_sketch_output(reply)
     }
 }
 
@@ -122,11 +160,28 @@ pub fn build_observation_compressor(
 mod tests {
     use super::*;
     use harness_core::compress::ObsSource;
+    use harness_core::types::TokenUsage;
 
     fn hint() -> CompressHint {
         CompressHint {
             task_summary: "plan phase for issue #7".into(),
             source: ObsSource::AgentResult,
+        }
+    }
+
+    fn agent_response(output: &str) -> AgentResponse {
+        AgentResponse {
+            output: output.into(),
+            stderr: String::new(),
+            items: Vec::new(),
+            token_usage: TokenUsage {
+                input_tokens: 41,
+                output_tokens: 7,
+                total_tokens: 48,
+                cost_usd: 12.34,
+            },
+            model: "provider-returned-model".into(),
+            exit_code: Some(0),
         }
     }
 
@@ -152,6 +207,30 @@ mod tests {
     #[test]
     fn parse_sketch_rejects_non_json() {
         assert!(parse_sketch("no json here").is_err());
+    }
+
+    #[test]
+    fn response_mapping_uses_provider_tokens_and_actual_model() {
+        let output = response_to_model_output(agent_response("summary"));
+        assert_eq!(output.output, "summary");
+        assert_eq!(output.usage.input_tokens, 41);
+        assert_eq!(output.usage.output_tokens, 7);
+        assert_eq!(output.usage.model, "provider-returned-model");
+    }
+
+    #[test]
+    fn sketch_parse_error_retains_completed_call_usage() {
+        let reply = response_to_model_output(agent_response("not JSON"));
+        let err = parse_sketch_output(reply).unwrap_err();
+        assert!(err.message.contains("no JSON object"));
+        assert_eq!(
+            err.usage,
+            Some(CompressorCallUsage {
+                input_tokens: 41,
+                output_tokens: 7,
+                model: "provider-returned-model".into(),
+            })
+        );
     }
 
     #[test]

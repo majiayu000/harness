@@ -50,9 +50,76 @@ pub enum NapStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Compressed {
     pub text: String,
+    /// Byte-based estimate for the raw observation, not provider usage.
     pub original_tokens: u32,
+    /// Byte-based estimate for the returned text, not provider usage.
     pub compressed_tokens: u32,
+    /// Provider-reported usage for every completed compressor model call.
+    #[serde(default)]
+    pub compressor_usage: CompressorUsage,
     pub nap: NapStatus,
+}
+
+/// Provider-reported usage for one completed compressor model call.
+///
+/// Pricing is intentionally absent: the compressor does not have an approved
+/// pricing oracle, and [`crate::types::TokenUsage::cost_usd`] must not be
+/// inferred here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressorCallUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Actual model identifier returned by the provider.
+    pub model: String,
+}
+
+/// Provider-reported usage accumulated across completed compressor calls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressorUsage {
+    pub calls: Vec<CompressorCallUsage>,
+}
+
+impl CompressorUsage {
+    /// Sum provider-reported input tokens without wrapping on overflow.
+    pub fn input_tokens(&self) -> u64 {
+        self.calls
+            .iter()
+            .fold(0, |total, call| total.saturating_add(call.input_tokens))
+    }
+
+    /// Sum provider-reported output tokens without wrapping on overflow.
+    pub fn output_tokens(&self) -> u64 {
+        self.calls
+            .iter()
+            .fold(0, |total, call| total.saturating_add(call.output_tokens))
+    }
+
+    /// Actual provider-returned model identifier for each completed call.
+    pub fn models(&self) -> Vec<&str> {
+        self.calls.iter().map(|call| call.model.as_str()).collect()
+    }
+
+    fn push(&mut self, call: CompressorCallUsage) {
+        self.calls.push(call);
+    }
+}
+
+/// Successful compressor model output paired with provider-reported usage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressModelOutput<T> {
+    pub output: T,
+    pub usage: CompressorCallUsage,
+}
+
+/// Compressor model failure, optionally after a provider call completed.
+///
+/// `usage` is present for post-processing failures such as invalid sketch
+/// JSON, because the provider completed and reported usage for that call.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct CompressModelError {
+    pub message: String,
+    pub usage: Option<CompressorCallUsage>,
 }
 
 #[derive(Debug, Error)]
@@ -65,8 +132,11 @@ pub enum CompressError {
     /// Callers must surface this at error level once per handle.
     #[error("compression bypassed: NAP failure rate {rate:.2} over {checks} checks")]
     BreakerOpen { rate: f64, checks: u64 },
-    #[error("compressor model error: {0}")]
-    Model(String),
+    #[error("compressor model error: {message}")]
+    Model {
+        message: String,
+        usage: CompressorUsage,
+    },
     /// The model returned a sketch that could not be parsed.
     #[error("unparseable next-action sketch: {0}")]
     BadSketch(String),
@@ -111,10 +181,39 @@ impl ActionSketch {
 #[async_trait]
 pub trait CompressModel: Send + Sync {
     /// Return a compressed rendition of `raw` for the given task framing.
-    async fn summarize(&self, raw: &str, hint: &CompressHint) -> Result<String, String>;
+    async fn summarize(
+        &self,
+        raw: &str,
+        hint: &CompressHint,
+    ) -> Result<CompressModelOutput<String>, CompressModelError>;
 
     /// Return a next-action sketch given an observation and task framing.
-    async fn sketch(&self, observation: &str, hint: &CompressHint) -> Result<ActionSketch, String>;
+    async fn sketch(
+        &self,
+        observation: &str,
+        hint: &CompressHint,
+    ) -> Result<CompressModelOutput<ActionSketch>, CompressModelError>;
+}
+
+fn collect_model_output<T>(
+    result: Result<CompressModelOutput<T>, CompressModelError>,
+    usage: &mut CompressorUsage,
+) -> Result<T, CompressError> {
+    match result {
+        Ok(output) => {
+            usage.push(output.usage);
+            Ok(output.output)
+        }
+        Err(error) => {
+            if let Some(call) = error.usage {
+                usage.push(call);
+            }
+            Err(CompressError::Model {
+                message: error.message,
+                usage: std::mem::take(usage),
+            })
+        }
+    }
 }
 
 /// Compression entry point used by the seams.
@@ -223,11 +322,9 @@ impl<M: CompressModel, S: NapSampler> ObservationCompressor for PromptCompressor
             return Err(CompressError::BreakerOpen { rate, checks });
         }
 
-        let text = self
-            .model
-            .summarize(obs, hint)
-            .await
-            .map_err(CompressError::Model)?;
+        let mut compressor_usage = CompressorUsage::default();
+        let text =
+            collect_model_output(self.model.summarize(obs, hint).await, &mut compressor_usage)?;
         let original_tokens = estimate_tokens(obs);
         let compressed_tokens = estimate_tokens(&text);
 
@@ -237,27 +334,23 @@ impl<M: CompressModel, S: NapSampler> ObservationCompressor for PromptCompressor
                 text,
                 original_tokens,
                 compressed_tokens,
+                compressor_usage,
                 nap: NapStatus::SkippedSample,
             });
         }
 
+        let raw_sketch =
+            collect_model_output(self.model.sketch(obs, hint).await, &mut compressor_usage)?;
+        let compressed_sketch =
+            collect_model_output(self.model.sketch(&text, hint).await, &mut compressor_usage)?;
         self.nap_checked.fetch_add(1, Ordering::Relaxed);
-        let raw_sketch = self
-            .model
-            .sketch(obs, hint)
-            .await
-            .map_err(CompressError::Model)?;
-        let compressed_sketch = self
-            .model
-            .sketch(&text, hint)
-            .await
-            .map_err(CompressError::Model)?;
 
         if raw_sketch.agreement(&compressed_sketch) >= 2 {
             Ok(Compressed {
                 text,
                 original_tokens,
                 compressed_tokens,
+                compressor_usage,
                 nap: NapStatus::Verified,
             })
         } else {
@@ -269,6 +362,7 @@ impl<M: CompressModel, S: NapSampler> ObservationCompressor for PromptCompressor
                 text: obs.to_string(),
                 original_tokens,
                 compressed_tokens: original_tokens,
+                compressor_usage,
                 nap: NapStatus::Failed { fell_back: true },
             })
         }
@@ -283,6 +377,7 @@ mod tests {
         summary: String,
         raw_sketch: ActionSketch,
         compressed_sketch: ActionSketch,
+        compressed_sketch_error: Option<CompressModelError>,
     }
 
     impl FakeModel {
@@ -296,6 +391,7 @@ mod tests {
                 summary: summary.into(),
                 raw_sketch: sketch.clone(),
                 compressed_sketch: sketch,
+                compressed_sketch_error: None,
             }
         }
 
@@ -308,23 +404,66 @@ mod tests {
             };
             this
         }
+
+        fn failing_after_summary_and_raw_sketch(summary: &str) -> Self {
+            let mut this = Self::agreeing(summary);
+            this.compressed_sketch_error = Some(CompressModelError {
+                message: "invalid sketch JSON".into(),
+                usage: Some(call_usage(4, 1, "compressed-sketch-model")),
+            });
+            this
+        }
+
+        fn request_failing_after_summary_and_raw_sketch(summary: &str) -> Self {
+            let mut this = Self::agreeing(summary);
+            this.compressed_sketch_error = Some(CompressModelError {
+                message: "provider request failed".into(),
+                usage: None,
+            });
+            this
+        }
+    }
+
+    fn call_usage(input_tokens: u64, output_tokens: u64, model: &str) -> CompressorCallUsage {
+        CompressorCallUsage {
+            input_tokens,
+            output_tokens,
+            model: model.into(),
+        }
     }
 
     #[async_trait]
     impl CompressModel for FakeModel {
-        async fn summarize(&self, _raw: &str, _hint: &CompressHint) -> Result<String, String> {
-            Ok(self.summary.clone())
+        async fn summarize(
+            &self,
+            _raw: &str,
+            _hint: &CompressHint,
+        ) -> Result<CompressModelOutput<String>, CompressModelError> {
+            Ok(CompressModelOutput {
+                output: self.summary.clone(),
+                usage: call_usage(10, 2, "summary-model"),
+            })
         }
 
         async fn sketch(
             &self,
             observation: &str,
             _hint: &CompressHint,
-        ) -> Result<ActionSketch, String> {
+        ) -> Result<CompressModelOutput<ActionSketch>, CompressModelError> {
             if observation == self.summary {
-                Ok(self.compressed_sketch.clone())
+                let usage = call_usage(4, 1, "compressed-sketch-model");
+                if let Some(error) = &self.compressed_sketch_error {
+                    return Err(error.clone());
+                }
+                Ok(CompressModelOutput {
+                    output: self.compressed_sketch.clone(),
+                    usage,
+                })
             } else {
-                Ok(self.raw_sketch.clone())
+                Ok(CompressModelOutput {
+                    output: self.raw_sketch.clone(),
+                    usage: call_usage(6, 1, "raw-sketch-model"),
+                })
             }
         }
     }
@@ -354,6 +493,10 @@ mod tests {
         assert_eq!(out.text, "summary text");
         assert_eq!(out.nap, NapStatus::Verified);
         assert!(out.compressed_tokens < out.original_tokens);
+        assert_eq!(out.compressor_usage.calls.len(), 3);
+        assert_eq!(out.compressor_usage.input_tokens(), 20);
+        assert_eq!(out.compressor_usage.output_tokens(), 4);
+        assert_eq!(c.nap_checked(), 1);
     }
 
     #[tokio::test]
@@ -362,8 +505,11 @@ mod tests {
         let c = PromptCompressor::with_sampler(FakeModel::agreeing("summary text"), EveryN(2), 16);
         let first = c.compress(&raw_obs(), &hint()).await.unwrap();
         assert_eq!(first.nap, NapStatus::SkippedSample);
+        assert_eq!(first.compressor_usage.calls.len(), 1);
+        assert_eq!(first.compressor_usage.models(), vec!["summary-model"]);
         let second = c.compress(&raw_obs(), &hint()).await.unwrap();
         assert_eq!(second.nap, NapStatus::Verified);
+        assert_eq!(second.compressor_usage.calls.len(), 3);
     }
 
     #[tokio::test]
@@ -373,7 +519,54 @@ mod tests {
         let out = c.compress(&obs, &hint()).await.unwrap();
         assert_eq!(out.text, obs);
         assert_eq!(out.nap, NapStatus::Failed { fell_back: true });
+        assert_eq!(out.compressor_usage.calls.len(), 3);
+        assert_eq!(c.nap_checked(), 1);
         assert_eq!(c.nap_failed(), 1);
+    }
+
+    #[tokio::test]
+    async fn later_post_processing_failure_retains_completed_and_failed_call_usage() {
+        let c = PromptCompressor::new(
+            FakeModel::failing_after_summary_and_raw_sketch("summary text"),
+            1.0,
+            16,
+        );
+        let err = c.compress(&raw_obs(), &hint()).await.unwrap_err();
+        let CompressError::Model { message, usage } = err else {
+            panic!("expected model error");
+        };
+        assert_eq!(message, "invalid sketch JSON");
+        assert_eq!(usage.calls.len(), 3);
+        assert_eq!(usage.input_tokens(), 20);
+        assert_eq!(usage.output_tokens(), 4);
+        assert_eq!(
+            usage.models(),
+            vec![
+                "summary-model",
+                "raw-sketch-model",
+                "compressed-sketch-model"
+            ]
+        );
+        assert_eq!(c.nap_checked(), 0);
+    }
+
+    #[tokio::test]
+    async fn later_request_failure_retains_only_completed_call_usage() {
+        let c = PromptCompressor::new(
+            FakeModel::request_failing_after_summary_and_raw_sketch("summary text"),
+            1.0,
+            16,
+        );
+        let err = c.compress(&raw_obs(), &hint()).await.unwrap_err();
+        let CompressError::Model { message, usage } = err else {
+            panic!("expected model error");
+        };
+        assert_eq!(message, "provider request failed");
+        assert_eq!(usage.calls.len(), 2);
+        assert_eq!(usage.input_tokens(), 16);
+        assert_eq!(usage.output_tokens(), 3);
+        assert_eq!(usage.models(), vec!["summary-model", "raw-sketch-model"]);
+        assert_eq!(c.nap_checked(), 0);
     }
 
     #[tokio::test]
