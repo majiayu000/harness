@@ -29,12 +29,18 @@ pub(crate) async fn compress_observation_for_prompt(
     };
     match compressor.compress(raw, &hint).await {
         Ok(compressed) => {
+            let compressor_provider_input_tokens = compressed.compressor_usage.input_tokens();
+            let compressor_provider_output_tokens = compressed.compressor_usage.output_tokens();
+            let compressor_models = compressed.compressor_usage.models();
             match compressed.nap {
                 NapStatus::Failed { .. } => {
                     // Compressed.text already carries the raw fallback.
                     tracing::warn!(
                         task_summary,
                         original_tokens = compressed.original_tokens,
+                        compressor_provider_input_tokens,
+                        compressor_provider_output_tokens,
+                        compressor_models = ?compressor_models,
                         "NAP verification failed; using raw observation"
                     );
                 }
@@ -43,6 +49,9 @@ pub(crate) async fn compress_observation_for_prompt(
                         task_summary,
                         original_tokens = compressed.original_tokens,
                         compressed_tokens = compressed.compressed_tokens,
+                        compressor_provider_input_tokens,
+                        compressor_provider_output_tokens,
+                        compressor_models = ?compressor_models,
                         nap = ?nap,
                         "observation compressed for prompt injection"
                     );
@@ -53,6 +62,20 @@ pub(crate) async fn compress_observation_for_prompt(
         Err(CompressError::TooSmall { .. }) => raw.to_string(),
         Err(err @ CompressError::BreakerOpen { .. }) => {
             tracing::error!(%err, task_summary, "compression bypassed by circuit breaker");
+            raw.to_string()
+        }
+        Err(CompressError::Model { message, usage }) => {
+            let compressor_provider_input_tokens = usage.input_tokens();
+            let compressor_provider_output_tokens = usage.output_tokens();
+            let compressor_models = usage.models();
+            tracing::warn!(
+                error = %message,
+                task_summary,
+                compressor_provider_input_tokens,
+                compressor_provider_output_tokens,
+                compressor_models = ?compressor_models,
+                "compressor model failed; using raw observation"
+            );
             raw.to_string()
         }
         Err(err) => {
