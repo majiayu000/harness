@@ -161,6 +161,58 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(manifest["sessions"][0]["observation_records"], 5)
             self.assertGreater(manifest["sessions"][0]["observation_bytes"], 20)
 
+    def test_finite_json_primitive_observations_are_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            path = root / "2026/06/01/rollout-primitives.jsonl"
+            path.parent.mkdir(parents=True)
+            values = [True, 7, 1.25]
+            records = [
+                {
+                    "type": "response_item",
+                    "payload": {"type": "function_call_output", "output": value},
+                }
+                for value in values
+            ]
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            manifest = NAP.build_manifest(root, SALT, 1, SINCE, THROUGH)
+
+            expected_bytes = sum(
+                len(
+                    json.dumps(
+                        value,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                )
+                for value in values
+            )
+            self.assertEqual(manifest["sessions"][0]["observation_records"], 3)
+            self.assertEqual(
+                manifest["sessions"][0]["observation_bytes"], expected_bytes
+            )
+            with self.assertRaisesRegex(NAP.ReplayValidationError, "unsupported JSON"):
+                NAP._content_bytes(float("nan"))
+
+    def test_nested_date_directories_are_parsed_from_the_path_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            write_session(
+                root / "tenant/archive/2026/06/03/session.jsonl",
+                "nested-date",
+            )
+
+            manifest = NAP.build_manifest(root, SALT, 1, SINCE, THROUGH)
+
+            self.assertEqual(manifest["selection"]["candidate_sessions"], 1)
+            self.assertEqual(manifest["sessions"][0]["observation_bytes"], 11)
+
     def test_manifest_changes_when_same_path_content_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"
@@ -245,6 +297,8 @@ class ManifestTests(unittest.TestCase):
 
         with self.assertRaisesRegex(NAP.ReplayValidationError, "integer"):
             NAP._json_loads('{"value":10000000000000000}')
+        with self.assertRaisesRegex(NAP.ReplayValidationError, "non-finite"):
+            NAP._json_loads('{"value":NaN}')
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"
@@ -402,6 +456,19 @@ class OutputAndCliTests(unittest.TestCase):
                 NAP._load_salt(NAP.DEFAULT_SALT_ENV)
         with self.assertRaisesRegex(NAP.ReplayValidationError, "duplicate"):
             NAP._json_loads('{"a":1,"a":2}')
+
+    def test_missing_or_empty_salt_environment_variable_is_reported(self) -> None:
+        expected = (
+            f"operator salt environment variable {NAP.DEFAULT_SALT_ENV} "
+            "is missing or empty"
+        )
+        for environment in ({}, {NAP.DEFAULT_SALT_ENV: ""}):
+            with self.subTest(environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(
+                        NAP.ReplayValidationError, f"^{expected}$"
+                    ):
+                        NAP._load_salt(NAP.DEFAULT_SALT_ENV)
 
     def test_cli_build_and_summarize_returns_zero_or_three(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

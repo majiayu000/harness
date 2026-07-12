@@ -54,15 +54,17 @@ def _bounded_json_float(raw: str) -> float:
     return value
 
 
+def _reject_non_finite_constant(value: str) -> None:
+    raise ReplayValidationError(f"non-finite JSON number: {value}")
+
+
 def _json_loads(text: str) -> Any:
     return json.loads(
         text,
         object_pairs_hook=_reject_duplicate_keys,
         parse_int=_bounded_json_int,
         parse_float=_bounded_json_float,
-        parse_constant=lambda value: (_ for _ in ()).throw(
-            ReplayValidationError(f"non-finite JSON number: {value}")
-        ),
+        parse_constant=_reject_non_finite_constant,
     )
 
 
@@ -166,8 +168,13 @@ def _validate_salt(salt: bytes) -> None:
 
 
 def _load_salt(env_name: str) -> bytes:
+    raw = os.environ.get(env_name)
+    if not raw:
+        raise ReplayValidationError(
+            f"operator salt environment variable {env_name} is missing or empty"
+        )
     try:
-        salt = bytes.fromhex(os.environ.get(env_name, ""))
+        salt = bytes.fromhex(raw)
     except ValueError as exc:
         raise ReplayValidationError(
             f"operator salt in {env_name} must be 64 hexadecimal characters"

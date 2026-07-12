@@ -177,9 +177,9 @@ def _parse_date(raw: str) -> date:
 
 def _session_date(relative_path: str) -> date:
     parts = Path(relative_path).parts
-    if len(parts) >= 3:
+    if len(parts) >= 4:
         try:
-            parsed = date(int(parts[0]), int(parts[1]), int(parts[2]))
+            parsed = date(int(parts[-4]), int(parts[-3]), int(parts[-2]))
         except (TypeError, ValueError):
             parsed = None
         if parsed is not None:
@@ -260,10 +260,19 @@ def _walk_jsonl(
 def _content_bytes(value: Any) -> int:
     if isinstance(value, str):
         return len(value.encode("utf-8"))
-    if isinstance(value, (list, dict)):
-        encoded = json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        )
+    if isinstance(value, (list, dict, bool, int, float)):
+        try:
+            encoded = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ReplayValidationError(
+                "observation content has an unsupported JSON type"
+            ) from exc
         return len(encoded.encode("utf-8"))
     if value is None:
         return 0
