@@ -339,11 +339,11 @@ impl<M: CompressModel, S: NapSampler> ObservationCompressor for PromptCompressor
             });
         }
 
-        self.nap_checked.fetch_add(1, Ordering::Relaxed);
         let raw_sketch =
             collect_model_output(self.model.sketch(obs, hint).await, &mut compressor_usage)?;
         let compressed_sketch =
             collect_model_output(self.model.sketch(&text, hint).await, &mut compressor_usage)?;
+        self.nap_checked.fetch_add(1, Ordering::Relaxed);
 
         if raw_sketch.agreement(&compressed_sketch) >= 2 {
             Ok(Compressed {
@@ -496,6 +496,7 @@ mod tests {
         assert_eq!(out.compressor_usage.calls.len(), 3);
         assert_eq!(out.compressor_usage.input_tokens(), 20);
         assert_eq!(out.compressor_usage.output_tokens(), 4);
+        assert_eq!(c.nap_checked(), 1);
     }
 
     #[tokio::test]
@@ -519,6 +520,7 @@ mod tests {
         assert_eq!(out.text, obs);
         assert_eq!(out.nap, NapStatus::Failed { fell_back: true });
         assert_eq!(out.compressor_usage.calls.len(), 3);
+        assert_eq!(c.nap_checked(), 1);
         assert_eq!(c.nap_failed(), 1);
     }
 
@@ -545,6 +547,7 @@ mod tests {
                 "compressed-sketch-model"
             ]
         );
+        assert_eq!(c.nap_checked(), 0);
     }
 
     #[tokio::test]
@@ -563,6 +566,7 @@ mod tests {
         assert_eq!(usage.input_tokens(), 16);
         assert_eq!(usage.output_tokens(), 3);
         assert_eq!(usage.models(), vec!["summary-model", "raw-sketch-model"]);
+        assert_eq!(c.nap_checked(), 0);
     }
 
     #[tokio::test]
