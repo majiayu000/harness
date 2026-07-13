@@ -116,7 +116,8 @@ pub(in crate::http) fn spawn_auto_recovery(state: &Arc<AppState>) {
             let Some(store) = state.core.workflow_runtime_store.as_ref() else {
                 continue;
             };
-            match run_auto_recovery_tick(store, &github, Utc::now()).await {
+            let alerts = &state.observability.alerts;
+            match run_auto_recovery_tick(store, &github, alerts, Utc::now()).await {
                 Ok(tick) if tick.touched_anything() => {
                     tracing::info!(?tick, "workflow runtime auto-recovery tick");
                 }
@@ -136,6 +137,7 @@ pub(in crate::http) fn spawn_auto_recovery(state: &Arc<AppState>) {
 pub(crate) async fn run_auto_recovery_tick(
     store: &WorkflowRuntimeStore,
     github: &GitHubIntakeConfig,
+    alerts: &crate::alerting::AlertHandle,
     now: DateTime<Utc>,
 ) -> anyhow::Result<AutoRecoveryTick> {
     let mut tick = AutoRecoveryTick::default();
@@ -153,7 +155,7 @@ pub(crate) async fn run_auto_recovery_tick(
             )
             .await?;
         for instance in instances {
-            match process_instance(store, github, &instance, now).await {
+            match process_instance(store, github, alerts, &instance, now).await {
                 Ok(outcome) => outcome.record(&mut tick),
                 Err(error) => {
                     tick.errored += 1;
@@ -198,6 +200,7 @@ impl InstanceOutcome {
 async fn process_instance(
     store: &WorkflowRuntimeStore,
     github: &GitHubIntakeConfig,
+    alerts: &crate::alerting::AlertHandle,
     instance: &WorkflowInstance,
     now: DateTime<Utc>,
 ) -> anyhow::Result<InstanceOutcome> {
@@ -229,7 +232,8 @@ async fn process_instance(
         .unwrap_or_else(|| AutoRecoveryState::new_episode(&episode_event_id));
 
     if attempt_state.pending_attempt_event_id.is_some() {
-        return reconcile_interrupted_attempt(store, policy, instance, attempt_state, now).await;
+        return reconcile_interrupted_attempt(store, policy, alerts, instance, attempt_state, now)
+            .await;
     }
     if attempt_state.exhausted {
         return Ok(InstanceOutcome::Skipped);
@@ -237,7 +241,7 @@ async fn process_instance(
     if attempt_state.attempts >= policy.max_attempts {
         // Restart safety: attempts were exhausted but the exhaustion event
         // was never emitted (e.g. crash). Emit it exactly once (B-010).
-        emit_exhausted_once(store, instance, &mut attempt_state).await?;
+        emit_exhausted_once(store, alerts, instance, &mut attempt_state).await?;
         return Ok(InstanceOutcome::ExhaustedEmitted);
     }
     if attempt_state
@@ -250,6 +254,7 @@ async fn process_instance(
     run_recovery_attempt(
         store,
         policy,
+        alerts,
         instance,
         attempt_state,
         stop_reason_code.as_deref(),
@@ -264,6 +269,7 @@ async fn process_instance(
 async fn reconcile_interrupted_attempt(
     store: &WorkflowRuntimeStore,
     policy: &GitHubAutoRecoveryConfig,
+    alerts: &crate::alerting::AlertHandle,
     instance: &WorkflowInstance,
     mut attempt_state: AutoRecoveryState,
     now: DateTime<Utc>,
@@ -292,7 +298,7 @@ async fn reconcile_interrupted_attempt(
         )
         .await?;
     if attempt_state.attempts >= policy.max_attempts {
-        emit_exhausted_once(store, instance, &mut attempt_state).await?;
+        emit_exhausted_once(store, alerts, instance, &mut attempt_state).await?;
     }
     store
         .set_auto_recovery_state_if_state(
@@ -307,6 +313,7 @@ async fn reconcile_interrupted_attempt(
 async fn run_recovery_attempt(
     store: &WorkflowRuntimeStore,
     policy: &GitHubAutoRecoveryConfig,
+    alerts: &crate::alerting::AlertHandle,
     instance: &WorkflowInstance,
     mut attempt_state: AutoRecoveryState,
     stop_reason_code: Option<&str>,
@@ -428,6 +435,7 @@ async fn run_recovery_attempt(
             record_recheck_failure(
                 store,
                 policy,
+                alerts,
                 instance,
                 attempt_state,
                 attempt_number,
@@ -440,6 +448,7 @@ async fn run_recovery_attempt(
             record_recheck_failure(
                 store,
                 policy,
+                alerts,
                 instance,
                 attempt_state,
                 attempt_number,
@@ -452,6 +461,7 @@ async fn run_recovery_attempt(
             record_recheck_failure(
                 store,
                 policy,
+                alerts,
                 instance,
                 attempt_state,
                 attempt_number,
@@ -468,6 +478,7 @@ async fn run_recovery_attempt(
 async fn record_recheck_failure(
     store: &WorkflowRuntimeStore,
     policy: &GitHubAutoRecoveryConfig,
+    alerts: &crate::alerting::AlertHandle,
     instance: &WorkflowInstance,
     mut attempt_state: AutoRecoveryState,
     attempt_number: u32,
@@ -490,7 +501,7 @@ async fn record_recheck_failure(
     )
     .await?;
     if attempt_state.attempts >= policy.max_attempts {
-        emit_exhausted_once(store, instance, &mut attempt_state).await?;
+        emit_exhausted_once(store, alerts, instance, &mut attempt_state).await?;
     }
     store
         .set_auto_recovery_state_if_state(
@@ -535,6 +546,7 @@ async fn append_outcome_event(
 /// the operator monitor exactly like an unrecovered GH-1567 instance.
 async fn emit_exhausted_once(
     store: &WorkflowRuntimeStore,
+    alerts: &crate::alerting::AlertHandle,
     instance: &WorkflowInstance,
     attempt_state: &mut AutoRecoveryState,
 ) -> anyhow::Result<()> {
@@ -542,9 +554,6 @@ async fn emit_exhausted_once(
         return Ok(());
     }
     attempt_state.exhausted = true;
-    // TODO(GH-1582): raise task/workflow alert on exhaustion once the
-    // external alerting channel lands; this event is its stable consumer
-    // contract.
     store
         .append_event(
             &instance.id,
@@ -558,6 +567,32 @@ async fn emit_exhausted_once(
             }),
         )
         .await?;
+    // GH-1582 escalation: raise the external alert exactly once per episode,
+    // gated on the same idempotency flag as the exhaustion event.
+    let class = if instance.state == "failed" {
+        harness_core::alert::AlertClass::WorkflowFailed
+    } else {
+        harness_core::alert::AlertClass::WorkflowBlocked
+    };
+    let reason = format!(
+        "auto-recovery exhausted after {} attempts: {}",
+        attempt_state.attempts,
+        stop_reason_code(&instance.data)
+            .as_deref()
+            .unwrap_or("transient stop"),
+    );
+    alerts.raise(crate::alerting::producers::workflow_stopped(
+        class,
+        &instance.id,
+        instance
+            .data
+            .get("issue_number")
+            .and_then(Value::as_u64)
+            .map(|issue| issue.to_string())
+            .as_deref(),
+        data_string(&instance.data, "repo").as_deref(),
+        &reason,
+    ));
     store
         .set_auto_recovery_state_if_state(
             &instance.id,

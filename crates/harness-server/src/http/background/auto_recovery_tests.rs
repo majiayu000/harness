@@ -141,7 +141,13 @@ async fn auto_recovery_disabled_default_config_never_touches_instances() -> anyh
     let disabled = GitHubIntakeConfig::default();
     assert!(!disabled.auto_recovery.enabled, "policy must default OFF");
     for _ in 0..3 {
-        let tick = run_auto_recovery_tick(&store, &disabled, Utc::now()).await?;
+        let tick = run_auto_recovery_tick(
+            &store,
+            &disabled,
+            &crate::alerting::AlertHandle::disabled(),
+            Utc::now(),
+        )
+        .await?;
         assert_eq!(tick, AutoRecoveryTick::default());
     }
     let after = refreshed(&store, &instance.id).await?;
@@ -218,7 +224,13 @@ async fn auto_recovery_selects_transient_and_skips_terminal_and_legacy() -> anyh
         workflow
     };
 
-    let tick = run_auto_recovery_tick(&store, &github, Utc::now()).await?;
+    let tick = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        Utc::now(),
+    )
+    .await?;
     assert_eq!(tick.recovered, 1);
     assert_eq!(tick.selected, 1);
 
@@ -269,7 +281,13 @@ async fn auto_recovery_transition_matches_manual_unblock_except_actor() -> anyho
     manual_data["repo"] = json!("owner/manual");
     let manual = seed_stopped_instance(&store, "ar-parity-manual", "blocked", manual_data).await?;
 
-    let tick = run_auto_recovery_tick(&store, &github, Utc::now()).await?;
+    let tick = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        Utc::now(),
+    )
+    .await?;
     assert_eq!(tick.recovered, 1);
     let manual_outcome = store
         .recover_stopped_instance(WorkflowRuntimeRecoveryRequest {
@@ -340,14 +358,61 @@ async fn auto_recovery_state_attempt_bound_survives_restart_and_exhaustion_is_id
     });
     let instance = seed_stopped_instance(&store, "ar-exhaust-1", "blocked", data).await?;
 
+    // Enabled alerting (GH-1582) with a mock transport and a zero dedup
+    // window: a duplicate raise would surface as a second delivery.
+    let events =
+        std::sync::Arc::new(harness_observe::event_store::EventStore::new(_dir.path()).await?);
+    let transport =
+        std::sync::Arc::new(crate::alerting::adapters::test_support::MockTransport::ok());
+    let alerting_config = harness_core::config::alerting::AlertingConfig {
+        enabled: true,
+        event_classes: vec![
+            harness_core::alert::AlertClass::WorkflowBlocked,
+            harness_core::alert::AlertClass::WorkflowFailed,
+        ],
+        dedup_cooldown_secs: 0,
+        queue_capacity: 8,
+        shutdown_flush_secs: 5,
+        channels: vec![harness_core::config::alerting::AlertChannelConfig {
+            name: "ops".into(),
+            kind: harness_core::config::alerting::AlertChannelKind::Webhook,
+            url: Some("https://example.invalid/hook".into()),
+            receive_id: None,
+            max_attempts: 2,
+            backoff_base_ms: 1,
+        }],
+        heartbeat: Default::default(),
+    };
+    let alerts = crate::alerting::spawn_alerting(&alerting_config, None, events, transport.clone());
+
     // Every tick reads the persisted counter (a fresh scheduler after restart
     // sees the same state): the bound holds and exhaustion fires exactly once.
-    let first = run_auto_recovery_tick(&store, &github, Utc::now()).await?;
+    let first = run_auto_recovery_tick(&store, &github, &alerts, Utc::now()).await?;
     assert_eq!(first.exhausted_emitted, 1);
     assert_eq!(first.recovered, 0);
-    let second = run_auto_recovery_tick(&store, &github, Utc::now()).await?;
+    let second = run_auto_recovery_tick(&store, &github, &alerts, Utc::now()).await?;
     assert_eq!(second.exhausted_emitted, 0);
     assert_eq!(second, AutoRecoveryTick::default());
+
+    // Exactly one GH-1582 alert per episode, gated on the same idempotency
+    // as the AutoRecoveryExhausted event.
+    for _ in 0..200 {
+        if transport.call_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(transport.call_count(), 1, "exactly one exhaustion alert");
+    {
+        let calls = transport.calls.lock().unwrap();
+        let (_, _, body) = &calls[0];
+        let text = body.to_string();
+        assert!(
+            text.contains("auto-recovery exhausted after 2 attempts"),
+            "{text}"
+        );
+        assert!(text.contains("rate_limited"), "{text}");
+    }
 
     let after = refreshed(&store, &instance.id).await?;
     assert_eq!(
@@ -394,7 +459,13 @@ async fn auto_recovery_state_resets_for_new_stop_episode() -> anyhow::Result<()>
     });
     let instance = seed_stopped_instance(&store, "ar-episode-1", "blocked", data).await?;
 
-    let tick = run_auto_recovery_tick(&store, &github, Utc::now()).await?;
+    let tick = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        Utc::now(),
+    )
+    .await?;
     assert_eq!(tick.recovered, 1, "new episode starts from attempt 1");
     let after = refreshed(&store, &instance.id).await?;
     assert_eq!(after.state, "implementing");
@@ -424,12 +495,24 @@ async fn auto_recovery_state_honors_persisted_future_next_attempt() -> anyhow::R
 
     // A fresh scheduler (e.g. after restart) derives the schedule entirely
     // from persisted state: no recheck fires before next_attempt_at.
-    let early = run_auto_recovery_tick(&store, &github, now).await?;
+    let early = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        now,
+    )
+    .await?;
     assert_eq!(early, AutoRecoveryTick::default());
     assert_eq!(refreshed(&store, &instance.id).await?.state, "blocked");
 
     // Once the persisted timestamp elapses the recheck runs.
-    let due = run_auto_recovery_tick(&store, &github, now + ChronoDuration::hours(2)).await?;
+    let due = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        now + ChronoDuration::hours(2),
+    )
+    .await?;
     assert_eq!(due.recovered, 1);
     Ok(())
 }
@@ -486,7 +569,13 @@ async fn auto_recovery_audit_attempt_event_precedes_recovery_event() -> anyhow::
     )
     .await?;
 
-    let tick = run_auto_recovery_tick(&store, &github, Utc::now()).await?;
+    let tick = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        Utc::now(),
+    )
+    .await?;
     assert_eq!(tick.recovered, 1);
     let events = store.events_for(&instance.id).await?;
     let attempt_seq = events
@@ -532,7 +621,13 @@ async fn auto_recovery_reconciles_dangling_attempt_as_interrupted() -> anyhow::R
     let instance = seed_stopped_instance(&store, "ar-interrupt-1", "blocked", data).await?;
 
     let now = Utc::now();
-    let tick = run_auto_recovery_tick(&store, &github, now).await?;
+    let tick = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        now,
+    )
+    .await?;
     assert_eq!(tick.interrupted, 1);
     assert_eq!(
         tick.recovered, 0,
@@ -592,7 +687,14 @@ async fn auto_recovery_recover_race_records_superseded_without_consuming_attempt
         WorkflowRuntimeRecoveryOutcome::Recovered { .. }
     ));
 
-    let outcome = process_instance(&store, &github, &stale_snapshot, Utc::now()).await?;
+    let outcome = process_instance(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        &stale_snapshot,
+        Utc::now(),
+    )
+    .await?;
     assert_eq!(outcome, InstanceOutcome::Superseded);
 
     let after = refreshed(&store, &stale_snapshot.id).await?;
@@ -688,7 +790,13 @@ async fn auto_recovery_recheck_failure_increments_and_reschedules() -> anyhow::R
     store.upsert_instance(&workflow).await?;
 
     let now = Utc::now();
-    let tick = run_auto_recovery_tick(&store, &github, now).await?;
+    let tick = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        now,
+    )
+    .await?;
     assert_eq!(tick.recheck_failed, 1);
 
     let after = refreshed(&store, &workflow.id).await?;
@@ -707,7 +815,13 @@ async fn auto_recovery_recheck_failure_increments_and_reschedules() -> anyhow::R
 
     // Second failure grows the backoff (exponential, B-007).
     let after_first = now + ChronoDuration::seconds(400);
-    let tick = run_auto_recovery_tick(&store, &github, after_first).await?;
+    let tick = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        after_first,
+    )
+    .await?;
     assert_eq!(tick.recheck_failed, 1);
     let after = refreshed(&store, &workflow.id).await?;
     let attempt_state = instance_attempt_state(&after).expect("attempt state persists");
