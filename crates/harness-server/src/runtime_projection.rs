@@ -37,6 +37,23 @@ pub(crate) struct RuntimeStoppedStateProjection {
     pub(crate) failure_reason: Option<String>,
     pub(crate) error_kind: Option<String>,
     pub(crate) retry_hint: Option<String>,
+    /// Structured machine-stable stop reason code persisted at stop time
+    /// (GH-1584). Absent for legacy rows; never fabricated here (B-014).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stop_reason_code: Option<String>,
+    /// Persisted transient/terminal classification of the active stop
+    /// (GH-1584). Absent for legacy rows; never fabricated here (B-014).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason_class: Option<String>,
+    /// Auto-recovery attempts consumed in the current stop episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_recovery_attempts: Option<u64>,
+    /// Next scheduled auto-recovery recheck, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_recheck_at: Option<String>,
+    /// Whether auto-recovery exhausted its attempts for this episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_recovery_exhausted: Option<bool>,
     pub(crate) last_stop: Option<Value>,
     pub(crate) can_unblock: bool,
     pub(crate) can_retry: bool,
@@ -97,6 +114,23 @@ impl RuntimeStoppedStateProjection {
                 .and_then(|value| value.get("error_kind"))
                 .and_then(trimmed_string)
         });
+        let stop_reason_code =
+            stopped_string_field(&workflow.data, "stop_reason_code").or_else(|| {
+                last_stop
+                    .as_ref()
+                    .and_then(|value| value.get("stop_reason_code"))
+                    .and_then(trimmed_string)
+            });
+        let reason_class = stopped_string_field(&workflow.data, "reason_class").or_else(|| {
+            last_stop
+                .as_ref()
+                .and_then(|value| value.get("reason_class"))
+                .and_then(trimmed_string)
+        });
+        let auto_recovery = workflow
+            .data
+            .get("auto_recovery")
+            .filter(|value| value.is_object());
         Self {
             blocked_reason: stopped_string_field(&workflow.data, "blocked_reason"),
             unblock_hint: stopped_string_field(&workflow.data, "unblock_hint"),
@@ -105,6 +139,17 @@ impl RuntimeStoppedStateProjection {
                 &["failure_reason", "previous_error", "last_error", "error"],
             ),
             retry_hint: stopped_string_field(&workflow.data, "retry_hint"),
+            stop_reason_code,
+            reason_class,
+            auto_recovery_attempts: auto_recovery
+                .and_then(|value| value.get("attempts"))
+                .and_then(Value::as_u64),
+            next_recheck_at: auto_recovery
+                .and_then(|value| value.get("next_attempt_at"))
+                .and_then(trimmed_string),
+            auto_recovery_exhausted: auto_recovery
+                .and_then(|value| value.get("exhausted"))
+                .and_then(Value::as_bool),
             can_unblock: false,
             can_retry: false,
             error_kind,

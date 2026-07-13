@@ -180,6 +180,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let project_root = resolve_project_root(&server.config.server.project_root)?;
     server.config.isolation.validate_startup_support()?;
     server.config.alerting.validate()?;
+    if let Some(github) = server.config.intake.github.as_ref() {
+        github.auto_recovery.validate()?;
+    }
     let api_auth_mode = super::auth::resolve_api_auth_mode(&server.config.server)?;
     super::auth::log_api_auth_mode(&api_auth_mode, &server.config.server);
     #[cfg(test)]

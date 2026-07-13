@@ -476,6 +476,8 @@ const STOP_STRING_FIELDS: &[&str] = &[
     "failure_reason",
     "retry_hint",
     "error_kind",
+    "stop_reason_code",
+    "reason_class",
 ];
 
 fn command_string_field<'a>(command: &'a WorkflowCommand, field: &str) -> Option<&'a str> {

@@ -92,6 +92,50 @@ impl WorkflowRuntimeStore {
         Ok(Some(context))
     }
 
+    /// State-guarded write of the GH-1584 `auto_recovery` attempt-state object
+    /// in instance data (`Some` upserts the object, `None` removes it).
+    ///
+    /// The row is locked (`SELECT ... FOR UPDATE`) and the write only happens
+    /// when the instance is still in `expected_state`; otherwise the update is
+    /// dropped and `false` is returned so the caller can treat the attempt as
+    /// superseded by a concurrent transition (B-009). Returns `false` for
+    /// missing instances as well.
+    pub async fn set_auto_recovery_state_if_state(
+        &self,
+        workflow_id: &str,
+        expected_state: &str,
+        auto_recovery: Option<&serde_json::Value>,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        if instance.state != expected_state {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if !instance.data.is_object() {
+            instance.data = serde_json::json!({});
+        }
+        let data = instance
+            .data
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("workflow instance data is not an object"))?;
+        match auto_recovery {
+            Some(value) => {
+                data.insert("auto_recovery".to_string(), value.clone());
+            }
+            None => {
+                data.remove("auto_recovery");
+            }
+        }
+        instance.version = instance.version.saturating_add(1);
+        upsert_instance_tx(&mut tx, &instance).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn apply_decision_transition(
         &self,
         transition: WorkflowDecisionTransition<'_>,

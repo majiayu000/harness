@@ -1,6 +1,7 @@
 use super::support::{
     event_command_type, event_field_string, event_workflow_command, optional_json_string,
-    runtime_blocked_command, runtime_completion_evidence, runtime_failed_command,
+    result_stop_reason_code, runtime_blocked_command, runtime_completion_evidence,
+    runtime_failed_command,
 };
 use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
@@ -28,6 +29,7 @@ pub(super) fn runtime_blocked_decision(
     )
     .with_command(runtime_blocked_command(
         &reason,
+        result_stop_reason_code(result).as_deref(),
         format!("runtime-completion:{}:blocked", event.id),
         event,
         result,
@@ -51,6 +53,7 @@ pub(super) fn runtime_failed_decision(
     )
     .with_command(runtime_failed_command(
         &reason,
+        result_stop_reason_code(result).as_deref(),
         format!("runtime-completion:{}:failed", event.id),
         event,
         result,

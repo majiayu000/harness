@@ -9,6 +9,9 @@ use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
     WorkflowEvidence, WorkflowInstance,
 };
+use crate::runtime::reason_class::{
+    STOP_REASON_INVALID_AGENT_OUTPUT, STOP_REASON_MAINTAINER_INPUT_REQUIRED,
+};
 use serde_json::{json, Value};
 
 pub(super) fn issue_implementation_missing_result_decision(
@@ -39,6 +42,7 @@ pub(super) fn issue_implementation_missing_result_decision(
         )
         .with_command(runtime_blocked_command(
             reason,
+            Some(STOP_REASON_INVALID_AGENT_OUTPUT),
             format!(
                 "runtime-completion:{}:missing-implementation:block",
                 event.id
@@ -97,6 +101,7 @@ pub(super) fn scope_too_large_decision(
         )
         .with_command(runtime_blocked_command(
             &reason,
+            Some(STOP_REASON_MAINTAINER_INPUT_REQUIRED),
             format!("runtime-completion:{}:scope-too-large:block", event.id),
             event,
             result,

@@ -35,6 +35,7 @@ include!("tests/common.rs");
 include!("tests/decision_builders.rs");
 include!("tests/completion_reducer_core.rs");
 include!("tests/completion_reducer_quality.rs");
+include!("tests/runtime_failure_classification.rs");
 include!("tests/decision_validator.rs");
 include!("tests/command_bus.rs");
 include!("tests/worker_lifecycle.rs");
