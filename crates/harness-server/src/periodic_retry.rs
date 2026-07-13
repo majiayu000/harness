@@ -336,9 +336,22 @@ async fn run_retry_tick(
                 );
             }
 
+            // External alert: exactly one per terminal exhaustion (GH1582
+            // B-004); the already-escalated guard above gates re-entry.
+            let (issue_num, pr_num) = parse_external_id(task.external_id.as_deref());
+            state
+                .observability
+                .alerts
+                .raise(crate::alerting::producers::task_failure_exhausted(
+                    &task.id.0,
+                    issue_num.map(|n| n.to_string()).as_deref(),
+                    task.repo.as_deref(),
+                    attempt_count,
+                    "retry cap reached; harness:stuck label requested",
+                ));
+
             // Enqueue an agent task to apply the harness:stuck label.
             // Direct gh calls are forbidden inside harness crates (CLAUDE.md).
-            let (issue_num, pr_num) = parse_external_id(task.external_id.as_deref());
             let stuck_prompt = match (issue_num, pr_num) {
                 (Some(n), _) => Some(format!(
                     "Add the label `harness:stuck` to issue #{n}. \

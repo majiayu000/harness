@@ -2,6 +2,7 @@ pub mod agent;
 #[cfg(test)]
 mod agent_tests;
 pub mod agents_md;
+pub mod alert;
 pub mod capability;
 pub mod compress;
 pub mod config;

@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod alerting;
 pub mod compression;
 pub mod dirs;
 pub mod intake;
@@ -15,6 +16,7 @@ pub mod workflow;
 pub mod workflow_circuit_breaker;
 
 use self::agents::*;
+use self::alerting::AlertingConfig;
 use self::intake::*;
 use self::isolation::*;
 use self::maintenance::*;
@@ -73,6 +75,8 @@ pub struct HarnessConfig {
     pub workflow: WorkflowRuntimeConfig,
     #[serde(default)]
     pub isolation: IsolationConfig,
+    #[serde(default)]
+    pub alerting: AlertingConfig,
     /// Projects declared in the config file. Registered on server startup.
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
@@ -167,6 +171,7 @@ impl Default for HarnessConfig {
             maintenance_window: MaintenanceWindowConfig::default(),
             workflow: WorkflowRuntimeConfig::default(),
             isolation: IsolationConfig::default(),
+            alerting: AlertingConfig::default(),
             projects: Vec::new(),
         };
         config.apply_derived_defaults();
@@ -210,6 +215,8 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             #[serde(default)]
             isolation: IsolationConfig,
             #[serde(default)]
+            alerting: AlertingConfig,
+            #[serde(default)]
             projects: Vec<ProjectEntry>,
         }
 
@@ -232,6 +239,7 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             maintenance_window: input.maintenance_window,
             workflow: input.workflow,
             isolation: input.isolation,
+            alerting: input.alerting,
             projects: input.projects,
         };
         config.apply_derived_defaults();

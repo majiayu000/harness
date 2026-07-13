@@ -95,6 +95,7 @@ async fn make_test_state_with_config_and_registry(
             gc_agent,
         },
         observability: crate::http::ObservabilityServices {
+            alerts: crate::alerting::AlertHandle::disabled(),
             events,
             signal_rate_limiter: std::sync::Arc::new(
                 crate::http::rate_limit::SignalRateLimiter::new(100),
@@ -1860,6 +1861,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             gc_agent,
         },
         observability: crate::http::ObservabilityServices {
+            alerts: crate::alerting::AlertHandle::disabled(),
             events,
             signal_rate_limiter: std::sync::Arc::new(
                 crate::http::rate_limit::SignalRateLimiter::new(100),

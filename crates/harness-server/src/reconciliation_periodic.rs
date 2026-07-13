@@ -30,6 +30,7 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
         )
         .await;
         record_issue_workflow_reconciliation_transitions(&state, &report).await;
+        raise_reconciliation_alerts(&state, &report);
 
         // Clean up workspaces for tasks that were just terminated by reconciliation.
         if let Some(ref wmgr) = state.concurrency.workspace_mgr {
@@ -55,6 +56,54 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
             "reconciliation: tick complete"
         );
         sleep(interval).await;
+    }
+}
+
+/// External alerts for reconciliation findings (GH1582 B-019/B-020).
+///
+/// The once-per-TTL bound for `ready_to_merge` aging is enforced by the
+/// dispatcher dedup window carrying `ready_to_merge_alert_ttl_secs`;
+/// reconciliation itself stays non-destructive and stateless here.
+fn raise_reconciliation_alerts(state: &Arc<AppState>, report: &ReconciliationReport) {
+    let alerts = &state.observability.alerts;
+    if !alerts.is_enabled() {
+        return;
+    }
+    let ttl = Duration::from_secs(
+        state
+            .core
+            .server
+            .config
+            .reconciliation
+            .ready_to_merge_alert_ttl_secs,
+    );
+    for alert in &report.workflow_alerts {
+        let pr_ref = alert.pr_url.clone().unwrap_or_else(|| {
+            format!(
+                "{}#{}",
+                alert.repo.as_deref().unwrap_or("unknown"),
+                alert.pr_number
+            )
+        });
+        alerts.raise_with_cooldown_override(
+            crate::alerting::producers::ready_to_merge_aging(
+                &pr_ref,
+                alert.age_secs,
+                Some(&alert.workflow_id),
+            ),
+            Some(ttl),
+        );
+    }
+    for transition in &report.workflow_transitions {
+        if !transition.applied {
+            alerts.raise(crate::alerting::producers::reconciliation_anomaly(
+                &transition.workflow_id,
+                &format!(
+                    "transition {} -> {} failed to apply ({})",
+                    transition.from, transition.to, transition.reason
+                ),
+            ));
+        }
     }
 }
 

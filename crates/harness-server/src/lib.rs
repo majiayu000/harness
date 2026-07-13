@@ -13,6 +13,7 @@
 // paths inside this crate continue to resolve without modification.
 pub use harness_workflow::checkpoint;
 pub use harness_workflow::circuit_breaker;
+pub mod alerting;
 pub mod assets;
 pub(crate) mod command_safety;
 pub mod complexity_router;
@@ -21,6 +22,7 @@ pub mod dashboard;
 pub mod db;
 pub mod eval_store;
 pub mod event_replay;
+pub(crate) mod feishu_client;
 pub(crate) mod github_auth;
 pub(crate) mod github_pr_hygiene;
 pub(crate) mod github_pr_merge;

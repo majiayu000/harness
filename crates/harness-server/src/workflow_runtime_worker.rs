@@ -206,13 +206,27 @@ async fn emit_circuit_breaker_event(state: &AppState, event: CircuitBreakerEvent
         "cooldown_until": event.cooldown_until,
     });
     match event.kind {
-        CircuitBreakerEventKind::Opened => tracing::error!(
-            runtime_profile = %detail["profile"],
-            failure_class = ?detail["failure_class"],
-            consecutive = ?event.consecutive,
-            cooldown_until = ?event.cooldown_until,
-            "runtime circuit breaker opened"
-        ),
+        CircuitBreakerEventKind::Opened => {
+            tracing::error!(
+                runtime_profile = %detail["profile"],
+                failure_class = ?detail["failure_class"],
+                consecutive = ?event.consecutive,
+                cooldown_until = ?event.cooldown_until,
+                "runtime circuit breaker opened"
+            );
+            // External alert (GH1582 B-020): dedup key is the profile scope,
+            // so a flapping breaker is suppressed within the dedup window.
+            state
+                .observability
+                .alerts
+                .raise(crate::alerting::producers::circuit_breaker_open(
+                    &event.profile,
+                    &format!(
+                        "failure_class={:?} consecutive={:?} cooldown_until={:?}",
+                        class, event.consecutive, event.cooldown_until
+                    ),
+                ));
+        }
         CircuitBreakerEventKind::Closed | CircuitBreakerEventKind::Reset => tracing::info!(
             runtime_profile = %detail["profile"],
             failure_class = ?detail["failure_class"],

@@ -216,7 +216,19 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     let rule_fail_rate_pct = compute_rule_fail_rate_pct(&events);
 
     let feed = build_feed(&events, now);
-    let alerts = build_alerts(&events, &runtime_hosts);
+    // Exhausted outbound alert deliveries in the window (GH1582 B-008).
+    let alert_delivery_failures = state
+        .observability
+        .events
+        .query_external_signals(Some(now - chrono::Duration::hours(OVERVIEW_WINDOW_HOURS)))
+        .map(|signals| {
+            signals
+                .iter()
+                .filter(|s| s.source == "alerting" && s.payload["outcome"] == "exhausted")
+                .count()
+        })
+        .unwrap_or(0);
+    let alerts = build_alerts(&events, &runtime_hosts, alert_delivery_failures);
 
     let evolution: Value = events
         .iter()
@@ -652,8 +664,23 @@ fn build_feed(events: &[Event], now: DateTime<Utc>) -> Vec<Value> {
 }
 
 /// Derive open-alert rows from the event window and current runtime state.
-fn build_alerts(events: &[Event], hosts: &[crate::runtime_hosts::RuntimeHostInfo]) -> Vec<Value> {
+fn build_alerts(
+    events: &[Event],
+    hosts: &[crate::runtime_hosts::RuntimeHostInfo],
+    alert_delivery_failures: usize,
+) -> Vec<Value> {
     let mut out = Vec::new();
+
+    if alert_delivery_failures > 0 {
+        out.push(json!({
+            "level": "err",
+            "msg": format!(
+                "{alert_delivery_failures} outbound alert delivery failure(s) in last {OVERVIEW_WINDOW_HOURS}h"
+            ),
+            "sub": "see alerting audit trail (signals)",
+            "ts": Value::Null,
+        }));
+    }
 
     let offline: Vec<&crate::runtime_hosts::RuntimeHostInfo> =
         hosts.iter().filter(|h| !h.online).collect();

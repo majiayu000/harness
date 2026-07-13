@@ -357,6 +357,7 @@ pub(super) async fn make_test_state_with_project_root(
             gc_agent,
         },
         observability: crate::http::ObservabilityServices {
+            alerts: crate::alerting::AlertHandle::disabled(),
             events,
             signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
             password_reset_rate_limiter: Arc::new(
@@ -448,6 +449,7 @@ pub(super) async fn make_test_state_with_issue_workflows(
             gc_agent: state.engines.gc_agent.clone(),
         },
         observability: crate::http::ObservabilityServices {
+            alerts: crate::alerting::AlertHandle::disabled(),
             events: state.observability.events.clone(),
             signal_rate_limiter: state.observability.signal_rate_limiter.clone(),
             password_reset_rate_limiter: state.observability.password_reset_rate_limiter.clone(),
@@ -570,6 +572,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
             gc_agent: state.engines.gc_agent.clone(),
         },
         observability: crate::http::ObservabilityServices {
+            alerts: crate::alerting::AlertHandle::disabled(),
             events: state.observability.events.clone(),
             signal_rate_limiter: state.observability.signal_rate_limiter.clone(),
             password_reset_rate_limiter: state.observability.password_reset_rate_limiter.clone(),
