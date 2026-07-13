@@ -1,6 +1,5 @@
 use crate::types::Grade;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::dirs::dirs_data_dir;
@@ -102,99 +101,10 @@ impl WorkspaceConfig {
     }
 }
 
-/// Concurrency limiting configuration for task execution.
-///
-/// Controls how many tasks run simultaneously and how many can wait
-/// in the queue before new submissions are rejected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConcurrencyConfig {
-    /// Maximum number of tasks executing concurrently across all projects. Default: 4.
-    #[serde(default = "default_max_concurrent_tasks")]
-    pub max_concurrent_tasks: usize,
-    /// Maximum number of tasks waiting for a slot. Excess tasks are rejected. Default: 32.
-    #[serde(default = "default_max_queue_size")]
-    pub max_queue_size: usize,
-    /// Seconds of silence from the agent stream before declaring a stall. Default: 600.
-    #[serde(default = "default_stall_timeout_secs")]
-    pub stall_timeout_secs: u64,
-    /// Per-project concurrency limits.
-    ///
-    /// Maps **canonical filesystem path** → max concurrent tasks for that project.
-    /// Keys must be the absolute, canonical path to the project root — the same
-    /// value produced by `ProjectId::from_path(&root)` — because the queue and
-    /// registry both key on that form. Non-absolute keys are accepted but will
-    /// never match any project at runtime (a warning is emitted on startup).
-    ///
-    /// Projects not listed here use the global `max_concurrent_tasks` limit.
-    ///
-    /// Example:
-    /// ```toml
-    /// [concurrency.per_project]
-    /// "/home/user/my-project" = 2
-    /// ```
-    #[serde(default)]
-    pub per_project: HashMap<String, usize>,
-    /// Maximum total agent API calls across all phases (implementation + validation retries +
-    /// review rounds). `None` = unlimited. Counts every call including validation retries.
-    /// Recommended production value: 20.
-    #[serde(default = "default_max_turns")]
-    pub max_turns: Option<u32>,
-    /// Jaccard word-similarity threshold for review-loop detection.
-    /// If two consecutive non-waiting review outputs have similarity >= this value,
-    /// the task is marked Failed with "review loop detected". Default: 0.85.
-    #[serde(default = "default_loop_jaccard_threshold")]
-    pub loop_jaccard_threshold: f64,
-    /// Minimum available system memory (MB) required to admit new tasks.
-    /// When available memory falls below this threshold the task queue
-    /// rejects new `acquire()` calls until memory recovers.
-    /// `None` (default) disables the check entirely.
-    #[serde(default)]
-    pub memory_pressure_threshold_mb: Option<u64>,
-    /// How often (seconds) the memory monitor re-samples available memory.
-    /// Values below 1 are clamped to 1. Default: 5.
-    /// Only meaningful when `memory_pressure_threshold_mb` is `Some`.
-    #[serde(default = "default_memory_poll_interval_secs")]
-    pub memory_poll_interval_secs: u64,
-}
-
-fn default_max_concurrent_tasks() -> usize {
-    4
-}
-
-fn default_max_queue_size() -> usize {
-    32
-}
-
-fn default_stall_timeout_secs() -> u64 {
-    super::stall_timeout::DEFAULT_STALL_TIMEOUT_SECS
-}
-
-fn default_loop_jaccard_threshold() -> f64 {
-    0.85
-}
-
-fn default_memory_poll_interval_secs() -> u64 {
-    5
-}
-
-fn default_max_turns() -> Option<u32> {
-    Some(20)
-}
-
-impl Default for ConcurrencyConfig {
-    fn default() -> Self {
-        Self {
-            max_concurrent_tasks: default_max_concurrent_tasks(),
-            max_queue_size: default_max_queue_size(),
-            stall_timeout_secs: default_stall_timeout_secs(),
-            per_project: HashMap::new(),
-            max_turns: default_max_turns(),
-            loop_jaccard_threshold: default_loop_jaccard_threshold(),
-            memory_pressure_threshold_mb: None,
-            memory_poll_interval_secs: default_memory_poll_interval_secs(),
-        }
-    }
-}
+// Concurrency limiting (and priority aging) configuration lives in its own
+// module; re-exported here so existing `config::misc::ConcurrencyConfig`
+// import paths keep working.
+pub use super::concurrency::{ConcurrencyConfig, PriorityAgingConfig};
 
 /// Per-project post-execution validation configuration.
 ///
@@ -742,35 +652,6 @@ impl Default for ReconciliationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn config_default_disables_monitor() {
-        let cfg = ConcurrencyConfig::default();
-        assert!(
-            cfg.memory_pressure_threshold_mb.is_none(),
-            "memory monitor must be disabled by default"
-        );
-        assert_eq!(cfg.max_turns, Some(20));
-        assert_eq!(cfg.memory_poll_interval_secs, 5);
-    }
-
-    #[test]
-    fn toml_roundtrip_with_threshold() {
-        let toml = r#"
-            memory_pressure_threshold_mb = 512
-            memory_poll_interval_secs = 10
-        "#;
-        let cfg: ConcurrencyConfig = toml::from_str(toml).expect("toml parse failed");
-        assert_eq!(cfg.memory_pressure_threshold_mb, Some(512));
-        assert_eq!(cfg.memory_poll_interval_secs, 10);
-    }
-
-    #[test]
-    fn toml_roundtrip_without_threshold_uses_defaults() {
-        let cfg: ConcurrencyConfig = toml::from_str("").expect("toml parse failed");
-        assert!(cfg.memory_pressure_threshold_mb.is_none());
-        assert_eq!(cfg.memory_poll_interval_secs, 5);
-    }
 
     #[test]
     fn reconciliation_config_defaults_include_ready_to_merge_age_limits() {
