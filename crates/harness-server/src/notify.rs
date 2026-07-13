@@ -28,8 +28,11 @@ pub fn emit(tx: &Option<NotifySender>, notification: Notification) {
 
 fn record_drop(reason: &'static str) {
     let dropped_count = DROPPED_NOTIFICATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Error level (GH1582 B-012): dropped notifications are user-visible
+    // data loss on the dashboard push channel, not an optional nicety.
+    // Rate-limited to the first drop and every DROP_LOG_EVERY thereafter.
     if dropped_count == 1 || dropped_count % DROP_LOG_EVERY == 0 {
-        tracing::warn!(
+        tracing::error!(
             event = "notify_channel_drop",
             reason,
             dropped_count,
@@ -38,8 +41,9 @@ fn record_drop(reason: &'static str) {
     }
 }
 
-#[cfg(test)]
-fn dropped_notification_count() -> u64 {
+/// Total notifications dropped since process start. Polled by the alerting
+/// drop watcher (GH1582); `notify` itself never depends on the dispatcher.
+pub fn dropped_notification_count() -> u64 {
     DROPPED_NOTIFICATIONS.load(Ordering::Relaxed)
 }
 

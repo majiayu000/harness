@@ -160,10 +160,26 @@ async fn build_review_store(
 ///   storage → engines → registry (needs storage.tasks for orphan cleanup)
 ///   registry → intake  (needs engines.gc_agent + events, registry.project_registry)
 ///   intake   → services (needs interceptors wired to engines.rules + events)
+/// Feishu app credentials for the alerting Feishu adapter, shared with the
+/// intake config (single credential source, GH1582 B-014).
+fn feishu_alert_credentials(
+    config: &harness_core::config::HarnessConfig,
+) -> Option<(String, String)> {
+    let feishu = config.intake.feishu.as_ref();
+    let app_id = feishu
+        .and_then(|f| f.app_id.clone())
+        .or_else(|| std::env::var("FEISHU_APP_ID").ok())?;
+    let app_secret = feishu
+        .and_then(|f| f.app_secret.clone())
+        .or_else(|| std::env::var("FEISHU_APP_SECRET").ok())?;
+    Some((app_id, app_secret))
+}
+
 pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppState> {
     let dir = expand_tilde(&server.config.server.data_dir);
     let project_root = resolve_project_root(&server.config.server.project_root)?;
     server.config.isolation.validate_startup_support()?;
+    server.config.alerting.validate()?;
     let api_auth_mode = super::auth::resolve_api_auth_mode(&server.config.server)?;
     super::auth::log_api_auth_mode(&api_auth_mode, &server.config.server);
     #[cfg(test)]
@@ -320,6 +336,16 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         degraded_subsystems.push("isolation");
     }
 
+    let alert_handle = match engines.events.clone() {
+        Some(events) => crate::alerting::spawn_alerting(
+            &server.config.alerting,
+            feishu_alert_credentials(&server.config),
+            events,
+            std::sync::Arc::new(crate::alerting::adapters::HttpTransport::new()),
+        ),
+        None => crate::alerting::AlertHandle::disabled(),
+    };
+
     Ok(AppState {
         core: CoreServices {
             server,
@@ -356,6 +382,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             gc_agent: engines.gc_agent,
         },
         observability: ObservabilityServices {
+            alerts: alert_handle,
             events: engines
                 .events
                 .expect("critical event store should be present after startup validation"),

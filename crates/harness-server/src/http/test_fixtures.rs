@@ -214,6 +214,7 @@ async fn make_read_only_route_test_state_with_project_root(
             gc_agent,
         },
         observability: ObservabilityServices {
+            alerts: crate::alerting::AlertHandle::disabled(),
             events,
             signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
             password_reset_rate_limiter: Arc::new(

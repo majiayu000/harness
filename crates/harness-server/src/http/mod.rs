@@ -213,6 +213,14 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Spawn background watcher for AwaitingDeps tasks.
     background::spawn_awaiting_deps_watcher(&state);
 
+    // Watch the notify drop counter and raise external alerts (GH1582).
+    // The handle is registered with the dispatcher so shutdown aborts it.
+    if let Some(watcher) =
+        crate::alerting::producers::spawn_notify_drop_watcher(state.observability.alerts.clone())
+    {
+        state.observability.alerts.register_aux_task(watcher);
+    }
+
     // Run one reconciliation tick against GitHub before any recovery so that
     // recovery decisions are made on fresh GitHub truth.
     if state.core.server.config.reconciliation.enabled {
@@ -324,6 +332,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .map_err(|error| anyhow::anyhow!("HTTP server task failed: {error}"))?;
     tracing::info!("server shutting down");
     ws_shutdown_tx.send(()).ok();
+    // Bounded alert flush before the event store closes (GH1582 B-018).
+    state.observability.alerts.shutdown().await;
     state.observability.events.shutdown().await;
     force_watcher.abort();
     serve_result?;

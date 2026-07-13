@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use axum::{extract::State, http::StatusCode, Json};
 use dashmap::DashMap;
-use serde::Deserialize;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
@@ -17,11 +16,6 @@ pub struct FeishuIntake {
     dispatched: DashMap<String, TaskId>,
     /// message_id → chat_id, populated by the webhook handler before mark_dispatched.
     chat_ids: DashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    tenant_access_token: String,
 }
 
 impl FeishuIntake {
@@ -65,31 +59,27 @@ impl FeishuIntake {
 
         let resp = self
             .http
-            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
-            .json(&serde_json::json!({
-                "app_id": app_id,
-                "app_secret": app_secret,
-            }))
+            .post(crate::feishu_client::TENANT_TOKEN_URL)
+            .json(&crate::feishu_client::tenant_token_request(
+                &app_id,
+                &app_secret,
+            ))
             .send()
             .await?;
 
-        let body: TokenResponse = resp.json().await?;
-        Ok(body.tenant_access_token)
+        let body: serde_json::Value = resp.json().await?;
+        crate::feishu_client::parse_tenant_token(&body)
     }
 
     async fn send_message(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
-        let content = serde_json::to_string(&serde_json::json!({ "text": text }))?;
+        let body = crate::feishu_client::send_text_request(chat_id, text)?;
 
         let resp = self
             .http
-            .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id")
+            .post(crate::feishu_client::SEND_MESSAGE_URL)
             .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "receive_id": chat_id,
-                "msg_type": "text",
-                "content": content,
-            }))
+            .json(&body)
             .send()
             .await?;
 

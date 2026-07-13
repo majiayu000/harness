@@ -90,6 +90,9 @@ pub struct EngineServices {
 /// Observability services: event store and telemetry.
 pub struct ObservabilityServices {
     pub events: Arc<harness_observe::event_store::EventStore>,
+    /// Outbound alert dispatcher handle (GH-1582). Disabled unless
+    /// `[alerting]` is enabled in config.
+    pub alerts: crate::alerting::AlertHandle,
     pub signal_rate_limiter: Arc<rate_limit::SignalRateLimiter>,
     pub password_reset_rate_limiter: Arc<rate_limit::PasswordResetRateLimiter>,
     pub review_store: Option<Arc<crate::review_store::ReviewStore>>,

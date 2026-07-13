@@ -253,6 +253,7 @@ mod tests {
                 gc_agent,
             },
             observability: crate::http::ObservabilityServices {
+                alerts: crate::alerting::AlertHandle::disabled(),
                 events,
                 signal_rate_limiter: std::sync::Arc::new(
                     crate::http::rate_limit::SignalRateLimiter::new(100),

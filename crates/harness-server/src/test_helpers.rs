@@ -278,6 +278,7 @@ async fn make_state_inner(
             gc_agent,
         },
         observability: crate::http::ObservabilityServices {
+            alerts: crate::alerting::AlertHandle::disabled(),
             events,
             signal_rate_limiter: Arc::new(crate::http::rate_limit::SignalRateLimiter::new(100)),
             password_reset_rate_limiter: Arc::new(
