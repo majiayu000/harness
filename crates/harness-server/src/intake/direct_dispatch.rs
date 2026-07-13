@@ -316,6 +316,7 @@ mod tests {
             project_waiting_for_project: 0,
             project_awaiting_global: 0,
             project_limit: 8,
+            global_wait_ms_by_priority: Vec::new(),
         };
         assert_eq!(direct_available_slots(&diag), 1);
     }

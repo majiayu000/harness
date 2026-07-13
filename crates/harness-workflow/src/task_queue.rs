@@ -1,15 +1,15 @@
 use dashmap::DashMap;
 use harness_core::config::misc::ConcurrencyConfig;
 use serde::Serialize;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use tokio::time::Instant;
 
-/// Components returned when a caller is enqueued instead of immediately granted a permit.
-/// Contains the notification receiver, the permit-granted flag, and the cancellation flag.
-type EnqueuedWaiter = (oneshot::Receiver<()>, Arc<AtomicBool>, Arc<AtomicBool>);
+#[path = "task_queue_permits.rs"]
+mod permits;
+
+use permits::{empty_wait_stats, AgingParams, PriorityPermitQueue};
+pub use permits::{PriorityWaitStats, MAX_PRIORITY_LEVEL};
 
 /// Per-project and global queue statistics.
 #[derive(Debug, Clone, Serialize)]
@@ -20,6 +20,8 @@ pub struct QueueStats {
     pub queued: usize,
     /// Maximum concurrent tasks for this project (or globally).
     pub limit: usize,
+    /// Wait-time metrics per base priority level for the project-stage queue.
+    pub wait_ms_by_priority: Vec<PriorityWaitStats>,
 }
 
 /// Runtime queue pressure snapshot for diagnostics.
@@ -32,6 +34,8 @@ pub struct QueueDiagnostics {
     pub project_waiting_for_project: usize,
     pub project_awaiting_global: usize,
     pub project_limit: usize,
+    /// Wait-time metrics per base priority level for the global-stage queue.
+    pub global_wait_ms_by_priority: Vec<PriorityWaitStats>,
 }
 
 /// Acquired execution slot. Dropping this releases both the global and project slots.
@@ -48,7 +52,7 @@ impl std::fmt::Debug for TaskPermit {
 
 /// RAII guard that calls `PriorityPermitQueue::release()` on drop.
 ///
-/// Uses `std::sync::Mutex` (not tokio) so the critical section (heap push/pop)
+/// Uses `std::sync::Mutex` (not tokio) so the critical section (waiter scan)
 /// can be taken synchronously inside `Drop`.  The critical section is
 /// microseconds — blocking the thread briefly is acceptable.
 struct PermitReleaseHandle {
@@ -60,191 +64,6 @@ impl Drop for PermitReleaseHandle {
         // Mutex::lock().unwrap() is the right pattern here (RS-03 exemption:
         // poisoned-lock panic is correct behaviour).
         self.queue.lock().unwrap().release();
-    }
-}
-
-/// An entry waiting for a permit, ordered by (priority DESC, seq ASC) so
-/// that the `BinaryHeap` max-heap yields the highest-priority / earliest waiter.
-struct Waiter {
-    priority: u8,
-    /// Monotonically increasing sequence number; lower seq = earlier enqueue =
-    /// higher priority among equal-priority waiters (FIFO within same level).
-    seq: u64,
-    tx: oneshot::Sender<()>,
-    /// Set to `true` by `release()` before calling `tx.send()`.
-    ///
-    /// Shared with the waiting `AcquireGuard` so that Drop can detect the
-    /// "permit granted but future cancelled before rx.await completed" race
-    /// and return the permit to the pool via a CAS operation.
-    permit_granted: Arc<AtomicBool>,
-    /// Set to `true` by `AcquireGuard::Drop` when the future is cancelled
-    /// while this waiter is still sitting in the heap (before `release()` has
-    /// popped and signalled it).  Allows `release()` to skip stale entries
-    /// cheaply without attempting a channel send that is guaranteed to fail.
-    cancelled: Arc<AtomicBool>,
-}
-
-impl PartialEq for Waiter {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.seq == other.seq
-    }
-}
-
-impl Eq for Waiter {}
-
-impl PartialOrd for Waiter {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Waiter {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Higher priority wins.  Tie-break: lower seq → higher rank (FIFO).
-        match self.priority.cmp(&other.priority) {
-            Ordering::Equal => other.seq.cmp(&self.seq),
-            ord => ord,
-        }
-    }
-}
-
-/// Priority-aware permit queue.
-///
-/// Replaces `tokio::sync::Semaphore` so that high-priority waiters can skip
-/// ahead of lower-priority ones when a slot becomes free.
-///
-/// # Known limitations
-/// - **Priority inversion**: a low-priority task holding a permit blocks a
-///   high-priority waiter.  Full aging/anti-starvation is a follow-up.
-/// - **Low-priority starvation**: a continuous stream of high-priority tasks
-///   can starve priority-0 waiters indefinitely.  Callers are responsible for
-///   bounding this at a higher level.
-struct PriorityPermitQueue {
-    available: usize,
-    next_seq: u64,
-    waiters: BinaryHeap<Waiter>,
-}
-
-impl PriorityPermitQueue {
-    fn new(capacity: usize) -> Self {
-        Self {
-            available: capacity,
-            next_seq: 0,
-            waiters: BinaryHeap::new(),
-        }
-    }
-
-    /// Attempt to claim a permit immediately.
-    ///
-    /// Returns `Ok(())` when a slot is free.  Otherwise pushes a `Waiter` and
-    /// returns the `Receiver` half of the notification channel, the shared
-    /// `permit_granted` flag, and the shared `cancelled` flag; the caller
-    /// **must** `.await` the receiver **outside** this lock.
-    fn try_acquire_or_enqueue(&mut self, priority: u8) -> Result<(), EnqueuedWaiter> {
-        if self.available > 0 {
-            self.available -= 1;
-            Ok(())
-        } else {
-            let permit_granted = Arc::new(AtomicBool::new(false));
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let (tx, rx) = oneshot::channel();
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            self.waiters.push(Waiter {
-                priority,
-                seq,
-                tx,
-                permit_granted: permit_granted.clone(),
-                cancelled: cancelled.clone(),
-            });
-            Err((rx, permit_granted, cancelled))
-        }
-    }
-
-    /// Release a permit: wake the top-priority waiter, or increment `available`.
-    ///
-    /// Sets `permit_granted` on the waiter **before** sending so that the
-    /// waiter's `AcquireGuard::Drop` can detect the window where the permit
-    /// signal was already sent but the future was cancelled before `rx.await`
-    /// could complete.  A CAS is used to avoid double-release if both this
-    /// function and the guard's Drop try to reclaim the permit concurrently.
-    fn release(&mut self) {
-        let mut skipped = 0u32;
-        loop {
-            match self.waiters.pop() {
-                None => {
-                    self.available += 1;
-                    return;
-                }
-                Some(waiter) => {
-                    // Skip waiters cancelled before their permit arrived.
-                    // AcquireGuard::Drop sets this flag while the waiter is
-                    // still in the heap, avoiding a guaranteed-to-fail send.
-                    if waiter.cancelled.load(AtomicOrdering::SeqCst) {
-                        skipped += 1;
-                        if skipped >= 3 {
-                            self.drain_cancelled();
-                            skipped = 0;
-                        }
-                        continue;
-                    }
-                    // Mark granted BEFORE sending so the guard's Drop can see
-                    // it even if the future is cancelled between store and send.
-                    waiter.permit_granted.store(true, AtomicOrdering::SeqCst);
-                    if waiter.tx.send(()).is_ok() {
-                        // Permit is in transit to the waiter. If the waiter
-                        // cancels before rx.await completes, its Drop handler
-                        // uses CAS to reclaim and re-release the permit.
-                        return;
-                    }
-                    // tx.send() failed: rx was already dropped.
-                    // Try to reclaim via CAS before looping to the next waiter.
-                    // If the guard's Drop already ran and reclaimed (CAS fails),
-                    // it already called release() — return to avoid double-release.
-                    if waiter
-                        .permit_granted
-                        .compare_exchange(
-                            true,
-                            false,
-                            AtomicOrdering::SeqCst,
-                            AtomicOrdering::SeqCst,
-                        )
-                        .is_err()
-                    {
-                        // Guard's Drop won the race and called release() already.
-                        return;
-                    }
-                    // We reclaimed; continue to grant the permit to the next waiter.
-                }
-            }
-        }
-    }
-
-    /// Remove all waiters that have been marked cancelled.
-    ///
-    /// Called from `AcquireGuard::Drop` when a heap-resident waiter is
-    /// cancelled to prevent stale entries from accumulating unboundedly
-    /// under repeated enqueue/cancel patterns.  Without eager removal the
-    /// heap can grow to `max_queue_size × N` entries after N cycles because
-    /// `queued_count` (the admission gate) decrements on cancel while the
-    /// heap entry remains.
-    fn drain_cancelled(&mut self) {
-        self.waiters
-            .retain(|w| !w.cancelled.load(AtomicOrdering::SeqCst));
-    }
-
-    fn available_permits(&self) -> usize {
-        self.available
-    }
-
-    fn waiter_count(&self) -> usize {
-        self.waiters.len()
-    }
-
-    /// Reconfigure queue capacity while preserving already-issued permits.
-    fn reconfigure_capacity(&mut self, old_capacity: usize, new_capacity: usize) {
-        let issued = old_capacity.saturating_sub(self.available);
-        self.available = new_capacity.saturating_sub(issued);
     }
 }
 
@@ -275,7 +94,7 @@ enum AcquirePhase {
 /// before `rx.await` could complete.  A CAS reclaims the permit in that case.
 ///
 /// The `project_waiter_cancelled` / `global_waiter_cancelled` flags let Drop
-/// eagerly mark a heap-resident waiter as cancelled so that `release()` can
+/// eagerly mark a queue-resident waiter as cancelled so that `release()` can
 /// skip it without attempting a channel send guaranteed to fail.
 ///
 /// Call [`AcquireGuard::defuse`] before returning the permit to prevent
@@ -291,10 +110,10 @@ struct AcquireGuard<'a> {
     /// Shared flag with the global-queue Waiter; set by release() before send.
     global_permit_granted: Option<Arc<AtomicBool>>,
     /// Shared flag with the project-queue Waiter; set by Drop to signal
-    /// cancellation so `release()` can skip the heap entry eagerly.
+    /// cancellation so `release()` can skip the queue entry eagerly.
     project_waiter_cancelled: Option<Arc<AtomicBool>>,
     /// Shared flag with the global-queue Waiter; set by Drop to signal
-    /// cancellation so `release()` can skip the heap entry eagerly.
+    /// cancellation so `release()` can skip the queue entry eagerly.
     global_waiter_cancelled: Option<Arc<AtomicBool>>,
 }
 
@@ -344,9 +163,9 @@ impl<'a> Drop for AcquireGuard<'a> {
                 project_queued_counter,
             } => {
                 project_queued_counter.fetch_sub(1, AtomicOrdering::SeqCst);
-                // Mark heap-resident waiter as cancelled so release() skips it
+                // Mark queue-resident waiter as cancelled so release() skips it
                 // eagerly instead of attempting a send guaranteed to fail.
-                // Also drain all stale entries to prevent unbounded heap growth
+                // Also drain all stale entries to prevent unbounded queue growth
                 // under repeated enqueue/cancel patterns.
                 if let Some(c) = &self.project_waiter_cancelled {
                     c.store(true, AtomicOrdering::SeqCst);
@@ -374,9 +193,9 @@ impl<'a> Drop for AcquireGuard<'a> {
                 project_awaiting_counter.fetch_sub(1, AtomicOrdering::SeqCst);
                 // Project permit was already acquired; always release it.
                 self.project_queue.lock().unwrap().release();
-                // Mark heap-resident global waiter as cancelled so release()
+                // Mark queue-resident global waiter as cancelled so release()
                 // skips it eagerly instead of attempting a send guaranteed to fail.
-                // Also drain all stale entries to prevent unbounded heap growth.
+                // Also drain all stale entries to prevent unbounded queue growth.
                 if let Some(c) = &self.global_waiter_cancelled {
                     c.store(true, AtomicOrdering::SeqCst);
                     self.global_queue.lock().unwrap().drain_cancelled();
@@ -408,12 +227,16 @@ impl<'a> Drop for AcquireGuard<'a> {
 /// others.  Acquiring a slot requires holding BOTH permits simultaneously.
 ///
 /// Higher `priority` values are served first when multiple tasks are waiting.
-/// Within the same priority level, tasks are served FIFO.
+/// Within the same priority level, tasks are served FIFO.  With aging enabled
+/// (default), long-waiting low-priority tasks are gradually boosted so a
+/// steady high-priority stream cannot starve them indefinitely.
 pub struct TaskQueue {
     global_queue: Arc<Mutex<PriorityPermitQueue>>,
     global_limit: usize,
     max_queue_size: usize,
     queued_count: AtomicUsize,
+    /// Aging parameters shared by the global queue and every project queue.
+    aging: AgingParams,
     /// Per-project execution queues. Created on first use.
     project_queues: DashMap<String, Arc<Mutex<PriorityPermitQueue>>>,
     /// Configured per-project max concurrent limits. Missing entries fall back to `global_limit`.
@@ -472,13 +295,16 @@ impl TaskQueue {
                 (canonical, *v)
             })
             .collect();
+        let aging = AgingParams::from_config(&config.aging);
         Self {
             global_queue: Arc::new(Mutex::new(PriorityPermitQueue::new(
                 config.max_concurrent_tasks,
+                aging,
             ))),
             global_limit: config.max_concurrent_tasks,
             max_queue_size: config.max_queue_size,
             queued_count: AtomicUsize::new(0),
+            aging,
             project_queues: DashMap::new(),
             project_limits,
             project_queued: DashMap::new(),
@@ -499,7 +325,7 @@ impl TaskQueue {
             .entry(project_id.to_string())
             .or_insert_with(|| {
                 let limit = self.project_limit(project_id);
-                Arc::new(Mutex::new(PriorityPermitQueue::new(limit)))
+                Arc::new(Mutex::new(PriorityPermitQueue::new(limit, self.aging)))
             })
             .clone()
     }
@@ -529,6 +355,17 @@ impl TaskQueue {
     /// Returns `Err` immediately if `max_queue_size` tasks are already waiting,
     /// or if the memory-pressure flag (set by `memory_monitor`) is `true`.
     /// The returned permit releases both slots on drop (even on panic).
+    ///
+    /// # Priority aging
+    ///
+    /// With aging enabled, a waiter's effective priority rises one level per
+    /// configured interval of wait, capped at `base + max_boost_levels` and
+    /// never above [`MAX_PRIORITY_LEVEL`].  The project stage and the global
+    /// stage age **independently**: the per-stage wait bound under a steady
+    /// stream of maximum-priority arrivals is `max_boost_levels × interval`
+    /// plus one FIFO turn at the capped level, and the documented end-to-end
+    /// bound is the **sum of both stage bounds**.  A waiter that is cancelled
+    /// and retried re-enqueues with a fresh wait clock (no carryover).
     ///
     /// # Cancellation safety
     ///
@@ -582,7 +419,7 @@ impl TaskQueue {
             .lock()
             .unwrap()
             .try_acquire_or_enqueue(priority);
-        if let Err((rx, granted, cancelled)) = project_rx {
+        if let Err((rx, granted, cancelled, enqueued_at)) = project_rx {
             // Store flags so Drop can mark the waiter cancelled and detect
             // mid-send cancellation.
             guard.project_permit_granted = Some(granted);
@@ -593,6 +430,14 @@ impl TaskQueue {
             // Permit consumed successfully; clear flags so Drop skips reclaim.
             guard.project_permit_granted = None;
             guard.project_waiter_cancelled = None;
+            // Record the wait sample only after the grant is consumed, so
+            // cancelled/reclaimed grants never reach the metrics (see
+            // `record_granted_wait`).
+            let waited = Instant::now().saturating_duration_since(enqueued_at);
+            project_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_granted_wait(priority, waited);
         }
 
         // Project slot acquired; transition from "waiting for project" to
@@ -609,7 +454,7 @@ impl TaskQueue {
             .lock()
             .unwrap()
             .try_acquire_or_enqueue(priority);
-        if let Err((rx, granted, cancelled)) = global_rx {
+        if let Err((rx, granted, cancelled, enqueued_at)) = global_rx {
             // Store flags so Drop can mark the waiter cancelled and detect
             // mid-send cancellation.
             guard.global_permit_granted = Some(granted);
@@ -620,6 +465,12 @@ impl TaskQueue {
             // Permit consumed successfully; clear flags so Drop skips reclaim.
             guard.global_permit_granted = None;
             guard.global_waiter_cancelled = None;
+            // Record the wait sample only after the grant is consumed (see above).
+            let waited = Instant::now().saturating_duration_since(enqueued_at);
+            self.global_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_granted_wait(priority, waited);
         }
 
         project_awaiting_counter.fetch_sub(1, AtomicOrdering::SeqCst);
@@ -695,6 +546,11 @@ impl TaskQueue {
         let project_limit = self.project_limit(project_id);
         let global_running = self.running_count();
         let global_queued = self.queued_count();
+        let global_wait_ms_by_priority = self
+            .global_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wait_stats_snapshot();
         let project_awaiting_global = self
             .project_awaiting_global
             .get(project_id)
@@ -713,6 +569,7 @@ impl TaskQueue {
                 project_waiting_for_project,
                 project_awaiting_global,
                 project_limit,
+                global_wait_ms_by_priority,
             }
         } else {
             QueueDiagnostics {
@@ -723,6 +580,7 @@ impl TaskQueue {
                 project_waiting_for_project: 0,
                 project_awaiting_global,
                 project_limit,
+                global_wait_ms_by_priority,
             }
         }
     }
@@ -734,6 +592,7 @@ impl TaskQueue {
             let q = pq.lock().unwrap();
             let holding_project = limit.saturating_sub(q.available_permits());
             let waiting_for_project = q.waiter_count();
+            let wait_ms_by_priority = q.wait_stats_snapshot();
             drop(q);
             let awaiting_global = self
                 .project_awaiting_global
@@ -746,12 +605,14 @@ impl TaskQueue {
                 running,
                 queued,
                 limit,
+                wait_ms_by_priority,
             }
         } else {
             QueueStats {
                 running: 0,
                 queued: 0,
                 limit,
+                wait_ms_by_priority: empty_wait_stats(),
             }
         }
     }
@@ -783,3 +644,7 @@ impl TaskQueue {
 #[cfg(test)]
 #[path = "task_queue_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "task_queue_aging_tests.rs"]
+mod aging_tests;
