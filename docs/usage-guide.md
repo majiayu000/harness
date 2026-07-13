@@ -373,6 +373,46 @@ unauthenticated now fail at startup. Recover by setting `api_token` /
 `HARNESS_API_TOKEN`, or by setting `allow_unauthenticated = true` for a
 deliberate local-only deployment.
 
+### `[intake.github.auto_recovery]`
+
+Opt-in, bounded automatic recovery for stopped (`blocked` / `failed`) workflow
+runtime instances whose structured stop reason classifies as **transient**
+(`rate_limited`, `ci_backend_unavailable`, `merge_base_drift`,
+`circuit_breaker_cooldown`, or a retryable `error_kind` such as `timeout`).
+Everything else — including missing, empty, or unknown stop reasons and legacy
+rows — classifies as **terminal** and always waits for a manual operator
+unblock/retry. The feature ships globally disabled; with the default config the
+recheck scheduler is not even spawned and runtime behavior is identical to the
+manual-only recovery semantics.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Master switch for the recheck scheduler. When false the background task is never spawned. |
+| `max_attempts` | `3` | Automatic recovery attempts per stop episode (bounded to 16). A fresh stop episode resets the counter. |
+| `initial_backoff_secs` | `300` | Backoff before the first re-attempt after a failed recheck. |
+| `max_backoff_secs` | `14400` | Exponential backoff ceiling. |
+| `jitter_ratio` | `0.2` | Jitter applied to each backoff, must be within `[0, 1]`. |
+| `tick_interval_secs` | `60` | Scheduler scan cadence. |
+
+Per repo, `auto_recovery = true` / `false` on a `[[intake.github.repos]]`
+entry overrides the global `enabled` flag (same precedent as `auto_merge`);
+repos that are not configured never participate. Invalid policy values are
+rejected at startup, not at recheck time.
+
+A successful recheck re-runs exactly the same recovery path as a manual
+unblock/retry, recorded with actor `auto_recovery`. Every attempt appends an
+`AutoRecoveryAttempt` audit event before acting, followed by an
+`AutoRecoveryOutcome` event (`succeeded`, `superseded`, `recheck_failed`, or
+`interrupted`). A recheck rejected for a reason that cannot heal within the
+episode (non-retryable failure, unsupported stopped activity or definition)
+immediately marks the episode exhausted instead of burning the remaining
+attempts. When attempts are exhausted the instance stays stopped, keeps
+surfacing in the operator monitor, and a single `AutoRecoveryExhausted` event
+per episode is emitted; the same idempotent gate raises one external
+`workflow_blocked` / `workflow_failed` alert through the `[alerting]` channel
+(GH-1582). Manual unblock/retry remains
+available at all times, including while a recheck is pending.
+
 ### `[agents]`
 
 | Field | Default | Description |
@@ -548,6 +588,11 @@ recovery command.
 | `401`, `404` | Authentication failed or the workflow was not found. |
 | `409` | State, retry eligibility, definition, or stopped activity is unsupported. |
 | `500`, `503` | The transaction failed or the runtime store is unavailable. |
+
+Stopped instances persist a structured `stop_reason_code` and a derived
+`reason_class` (`transient` or `terminal`). Transient stops can additionally be
+retried automatically by the opt-in `[intake.github.auto_recovery]` policy;
+terminal stops only ever recover through this manual API.
 
 Direct database edits are not a supported recovery path because they break the
 runtime audit chain. See [Workflow Runtime Operations](workflow-runtime-operations.md)

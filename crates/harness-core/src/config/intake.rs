@@ -16,6 +16,10 @@ pub struct GitHubRepoConfig {
     /// `[intake.github.auto_merge]` policy applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_merge: Option<bool>,
+    /// Explicit per-repo auto-recovery opt-in. When omitted, the global
+    /// `[intake.github.auto_recovery]` enabled flag applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_recovery: Option<bool>,
     /// Optional per-repo merge method override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_method: Option<GitHubMergeMethod>,
@@ -87,6 +91,101 @@ pub struct GitHubAutoMergeConfig {
     /// Default true; disabling restores the legacy trust-agent behavior.
     #[serde(default = "default_true")]
     pub verify_merge_completion: bool,
+}
+
+/// Opt-in automatic recovery policy for stopped (`blocked` / `failed`)
+/// workflow-runtime instances whose stop reason classifies as transient
+/// (GH-1584). Disabled by default; repos opt in with `auto_recovery = true`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitHubAutoRecoveryConfig {
+    /// Explicitly enable the auto-recovery recheck scheduler. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum automatic recovery attempts per stop episode. Default: 3.
+    #[serde(default = "default_auto_recovery_max_attempts")]
+    pub max_attempts: u32,
+    /// Base backoff before the first recheck, in seconds. Default: 300.
+    #[serde(default = "default_auto_recovery_initial_backoff_secs")]
+    pub initial_backoff_secs: u64,
+    /// Backoff ceiling in seconds. Default: 14400 (4 hours).
+    #[serde(default = "default_auto_recovery_max_backoff_secs")]
+    pub max_backoff_secs: u64,
+    /// Jitter ratio applied to each backoff, in [0, 1]. Default: 0.2.
+    #[serde(default = "default_auto_recovery_jitter_ratio")]
+    pub jitter_ratio: f64,
+    /// Scheduler tick interval in seconds. Default: 60.
+    #[serde(default = "default_auto_recovery_tick_interval_secs")]
+    pub tick_interval_secs: u64,
+}
+
+/// Upper bound on `max_attempts`; combined with saturating arithmetic it
+/// rules out integer overflow in the `2^attempts` backoff computation.
+pub const AUTO_RECOVERY_MAX_ATTEMPTS_CEILING: u32 = 16;
+
+impl GitHubAutoRecoveryConfig {
+    /// Validate policy bounds at config load (B-016) instead of recheck time.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_attempts == 0 || self.max_attempts > AUTO_RECOVERY_MAX_ATTEMPTS_CEILING {
+            anyhow::bail!(
+                "[intake.github.auto_recovery] max_attempts must be between 1 and {} when enabled, got {}",
+                AUTO_RECOVERY_MAX_ATTEMPTS_CEILING,
+                self.max_attempts
+            );
+        }
+        if self.initial_backoff_secs > self.max_backoff_secs {
+            anyhow::bail!(
+                "[intake.github.auto_recovery] max_backoff_secs ({}) must be >= initial_backoff_secs ({})",
+                self.max_backoff_secs,
+                self.initial_backoff_secs
+            );
+        }
+        if !(0.0..=1.0).contains(&self.jitter_ratio) || self.jitter_ratio.is_nan() {
+            anyhow::bail!(
+                "[intake.github.auto_recovery] jitter_ratio must be within [0, 1], got {}",
+                self.jitter_ratio
+            );
+        }
+        if self.tick_interval_secs == 0 {
+            anyhow::bail!("[intake.github.auto_recovery] tick_interval_secs must be >= 1");
+        }
+        Ok(())
+    }
+}
+
+impl Default for GitHubAutoRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_attempts: default_auto_recovery_max_attempts(),
+            initial_backoff_secs: default_auto_recovery_initial_backoff_secs(),
+            max_backoff_secs: default_auto_recovery_max_backoff_secs(),
+            jitter_ratio: default_auto_recovery_jitter_ratio(),
+            tick_interval_secs: default_auto_recovery_tick_interval_secs(),
+        }
+    }
+}
+
+fn default_auto_recovery_max_attempts() -> u32 {
+    3
+}
+
+fn default_auto_recovery_initial_backoff_secs() -> u64 {
+    300
+}
+
+fn default_auto_recovery_max_backoff_secs() -> u64 {
+    14400
+}
+
+fn default_auto_recovery_jitter_ratio() -> f64 {
+    0.2
+}
+
+fn default_auto_recovery_tick_interval_secs() -> u64 {
+    60
 }
 
 /// How GitHub issue intake is driven.
@@ -166,6 +265,10 @@ pub struct GitHubIntakeConfig {
     /// `auto_merge = true`.
     #[serde(default)]
     pub auto_merge: GitHubAutoMergeConfig,
+    /// Global auto-recovery policy for stopped workflow-runtime instances.
+    /// Disabled by default; repos can opt in with `auto_recovery = true`.
+    #[serde(default)]
+    pub auto_recovery: GitHubAutoRecoveryConfig,
     /// Agent name for the sprint planner. None = use server default.
     #[serde(default)]
     pub planner_agent: Option<String>,
@@ -196,6 +299,7 @@ impl GitHubIntakeConfig {
                     label: self.label.clone(),
                     project_root: None,
                     auto_merge: None,
+                    auto_recovery: None,
                     merge_method: None,
                     delete_branch: None,
                     require_review_threads_resolved: None,
@@ -217,12 +321,23 @@ impl GitHubIntakeConfig {
                     label: self.label.clone(),
                     project_root: None,
                     auto_merge: None,
+                    auto_recovery: None,
                     merge_method: None,
                     delete_branch: None,
                     require_review_threads_resolved: None,
                     require_clean_merge_state: None,
                 })
             })
+    }
+
+    /// Effective auto-recovery opt-in for `repo`: the per-repo override wins,
+    /// otherwise the global `[intake.github.auto_recovery]` flag applies.
+    /// Repos that are not configured never opt in.
+    pub fn auto_recovery_enabled_for_repo(&self, repo: &str) -> bool {
+        let Some(repo_cfg) = self.find_repo_config(repo) else {
+            return false;
+        };
+        repo_cfg.auto_recovery.unwrap_or(self.auto_recovery.enabled)
     }
 
     pub fn auto_merge_policy_for_repo(&self, repo: &str) -> ResolvedGitHubAutoMergePolicy {
@@ -310,6 +425,7 @@ impl Default for GitHubIntakeConfig {
             poll_interval_secs: default_poll_interval_secs(),
             repos: Vec::new(),
             auto_merge: GitHubAutoMergeConfig::default(),
+            auto_recovery: GitHubAutoRecoveryConfig::default(),
             planner_agent: None,
             sprint_timeout_secs: default_sprint_timeout_secs(),
             retry_backoff_base_secs: default_retry_backoff_base_secs(),
@@ -426,6 +542,7 @@ mod tests {
                     label: "default".to_string(),
                     project_root: Some("/srv/default".to_string()),
                     auto_merge: None,
+                    auto_recovery: None,
                     merge_method: None,
                     delete_branch: None,
                     require_review_threads_resolved: None,
@@ -436,6 +553,7 @@ mod tests {
                     label: "other".to_string(),
                     project_root: Some("/srv/other".to_string()),
                     auto_merge: None,
+                    auto_recovery: None,
                     merge_method: None,
                     delete_branch: None,
                     require_review_threads_resolved: None,
@@ -542,6 +660,134 @@ label = "harness"
         assert!(manual.require_clean_merge_state);
         assert_eq!(manual.merge_execution, GitHubMergeExecution::Agent);
         assert!(manual.verify_merge_completion);
+    }
+    #[test]
+    fn intake_auto_recovery_defaults_are_off_and_bounded() {
+        let config = GitHubIntakeConfig::default();
+        assert!(!config.auto_recovery.enabled);
+        assert_eq!(config.auto_recovery.max_attempts, 3);
+        assert_eq!(config.auto_recovery.initial_backoff_secs, 300);
+        assert_eq!(config.auto_recovery.max_backoff_secs, 14400);
+        assert!((config.auto_recovery.jitter_ratio - 0.2).abs() < f64::EPSILON);
+        assert_eq!(config.auto_recovery.tick_interval_secs, 60);
+        config
+            .auto_recovery
+            .validate()
+            .expect("defaults must validate");
+    }
+
+    #[test]
+    fn intake_auto_recovery_repo_override_beats_global_flag() {
+        let config: GitHubIntakeConfig = toml::from_str(
+            r#"
+enabled = true
+
+[auto_recovery]
+enabled = false
+
+[[repos]]
+repo = "owner/opted-in"
+auto_recovery = true
+
+[[repos]]
+repo = "owner/opted-out"
+auto_recovery = false
+
+[[repos]]
+repo = "owner/inherits"
+"#,
+        )
+        .expect("config should parse");
+        assert!(config.auto_recovery_enabled_for_repo("owner/opted-in"));
+        assert!(!config.auto_recovery_enabled_for_repo("owner/opted-out"));
+        assert!(!config.auto_recovery_enabled_for_repo("owner/inherits"));
+        // Unconfigured repos never opt in, regardless of the global flag.
+        assert!(!config.auto_recovery_enabled_for_repo("owner/unknown"));
+    }
+
+    #[test]
+    fn intake_auto_recovery_global_flag_applies_when_repo_does_not_override() {
+        let config: GitHubIntakeConfig = toml::from_str(
+            r#"
+enabled = true
+
+[auto_recovery]
+enabled = true
+
+[[repos]]
+repo = "owner/inherits"
+"#,
+        )
+        .expect("config should parse");
+        assert!(config.auto_recovery_enabled_for_repo("owner/inherits"));
+    }
+
+    #[test]
+    fn intake_auto_recovery_validation_rejects_nonsensical_values() {
+        // B-016: invalid policy values are rejected at load, not recheck time.
+        let base = GitHubAutoRecoveryConfig {
+            enabled: true,
+            ..GitHubAutoRecoveryConfig::default()
+        };
+        base.validate().expect("enabled defaults must validate");
+
+        let zero_attempts = GitHubAutoRecoveryConfig {
+            max_attempts: 0,
+            ..base.clone()
+        };
+        assert!(zero_attempts
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_attempts"));
+
+        let too_many_attempts = GitHubAutoRecoveryConfig {
+            max_attempts: AUTO_RECOVERY_MAX_ATTEMPTS_CEILING + 1,
+            ..base.clone()
+        };
+        assert!(too_many_attempts.validate().is_err());
+
+        let ceiling_below_floor = GitHubAutoRecoveryConfig {
+            initial_backoff_secs: 600,
+            max_backoff_secs: 300,
+            ..base.clone()
+        };
+        assert!(ceiling_below_floor
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_backoff_secs"));
+
+        for jitter_ratio in [-0.1, 1.1, f64::NAN] {
+            let bad_jitter = GitHubAutoRecoveryConfig {
+                jitter_ratio,
+                ..base.clone()
+            };
+            assert!(
+                bad_jitter.validate().is_err(),
+                "jitter_ratio {jitter_ratio} must be rejected"
+            );
+        }
+
+        let zero_tick = GitHubAutoRecoveryConfig {
+            tick_interval_secs: 0,
+            ..base.clone()
+        };
+        assert!(zero_tick.validate().is_err());
+    }
+
+    #[test]
+    fn intake_auto_recovery_disabled_skips_bound_validation() {
+        // Disabled policy is inert; invalid tunables must not block startup.
+        let disabled = GitHubAutoRecoveryConfig {
+            enabled: false,
+            max_attempts: 0,
+            jitter_ratio: 5.0,
+            ..GitHubAutoRecoveryConfig::default()
+        };
+        disabled
+            .validate()
+            .expect("disabled policy is not validated");
     }
 }
 

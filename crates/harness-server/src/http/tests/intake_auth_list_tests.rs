@@ -160,6 +160,7 @@ async fn intake_status_reports_github_mode_drivers_and_effective_repos() -> anyh
             label: "bugs".to_string(),
             project_root: Some("/tmp/secondary".to_string()),
             auto_merge: None,
+            auto_recovery: None,
             merge_method: None,
             delete_branch: None,
             require_review_threads_resolved: None,

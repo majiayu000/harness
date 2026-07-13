@@ -244,6 +244,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Re-dispatch recovered review/planner tasks that have restart-safe input bundles.
     background::spawn_system_task_recovery(&state);
 
+    // Opt-in bounded auto-recovery rechecks for transient-classified stopped
+    // workflow-runtime instances (GH-1584). Not spawned when globally disabled.
+    background::spawn_auto_recovery(&state);
+
     // Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
     background::spawn_checkpoint_recovery(&state).await;
 

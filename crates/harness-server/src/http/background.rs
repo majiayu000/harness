@@ -20,6 +20,7 @@ use harness_workflow::runtime::{
 };
 use sha2::{Digest, Sha256};
 
+mod auto_recovery;
 mod awaiting_deps;
 mod checkpoint_recovery;
 mod orphan_pending_recovery;
@@ -56,6 +57,7 @@ use support::{
     task_allows_prompt_orphan_recovery, RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
 };
 
+pub(super) use auto_recovery::spawn_auto_recovery;
 pub(super) use awaiting_deps::spawn_awaiting_deps_watcher;
 pub(super) use checkpoint_recovery::spawn_checkpoint_recovery;
 pub(super) use orphan_pending_recovery::spawn_orphan_pending_recovery;

@@ -474,6 +474,9 @@ fn persist_operator_recovery_data(
         instance.data = json!({});
     }
     if let Some(data) = instance.data.as_object_mut() {
+        // A successful recovery ends the stop episode: auto-recovery attempt
+        // state (GH-1584) must not leak into a future stop episode.
+        data.remove("auto_recovery");
         data.insert(
             "last_operator_recovery".to_string(),
             json!({

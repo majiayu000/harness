@@ -518,6 +518,72 @@ fn operator_monitor_stuck_workflows_expose_structured_stop_metadata() {
     assert_eq!(row["can_retry"], false);
 }
 
+#[test]
+fn operator_monitor_stuck_workflows_expose_auto_recovery_fields() {
+    // GH-1584 exposure: persisted classification and attempt state surface
+    // as optional fields; legacy rows omit them entirely (B-014).
+    let classified = workflow(
+        "blocked",
+        json!({
+            "repo": "owner/repo",
+            "blocked_reason": "GitHub API rate limited",
+            "stop_reason_code": "rate_limited",
+            "reason_class": "transient",
+            "auto_recovery": {
+                "episode_event_id": "episode-1",
+                "attempts": 2,
+                "next_attempt_at": "2026-07-14T10:00:00Z",
+                "exhausted": false,
+            },
+            "last_stop": {
+                "state": "blocked",
+                "activity": "implement_issue",
+                "event_id": "episode-1",
+            },
+        }),
+    )
+    .with_id("stuck-auto-recovery-workflow".to_string());
+    let legacy = workflow(
+        "blocked",
+        json!({ "repo": "owner/repo", "blocked_reason": "legacy free text" }),
+    )
+    .with_id("stuck-legacy-workflow".to_string());
+
+    let stuck = stuck_workflows_from_instances(
+        &[classified, legacy],
+        Utc::now(),
+        &std::collections::HashMap::new(),
+    );
+    let by_id = |id: &str| {
+        stuck
+            .iter()
+            .find(|row| row.workflow_id == id)
+            .map(|row| serde_json::to_value(row).expect("stuck workflow should serialize"))
+            .expect("row present")
+    };
+
+    let classified_row = by_id("stuck-auto-recovery-workflow");
+    assert_eq!(classified_row["stop_reason_code"], "rate_limited");
+    assert_eq!(classified_row["reason_class"], "transient");
+    assert_eq!(classified_row["auto_recovery_attempts"], 2);
+    assert_eq!(classified_row["next_recheck_at"], "2026-07-14T10:00:00Z");
+    assert_eq!(classified_row["auto_recovery_exhausted"], false);
+
+    let legacy_row = by_id("stuck-legacy-workflow");
+    for field in [
+        "stop_reason_code",
+        "reason_class",
+        "auto_recovery_attempts",
+        "next_recheck_at",
+        "auto_recovery_exhausted",
+    ] {
+        assert!(
+            legacy_row.get(field).is_none(),
+            "legacy rows must omit {field} instead of fabricating it"
+        );
+    }
+}
+
 #[tokio::test]
 async fn stopped_action_eligibility_matches_recovery_contract_rejections() -> anyhow::Result<()> {
     if !test_helpers::db_tests_enabled().await {

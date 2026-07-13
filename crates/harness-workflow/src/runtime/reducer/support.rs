@@ -2,6 +2,7 @@ use crate::runtime::model::{
     ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
+use crate::runtime::reason_class::{classify_stop, STOP_REASON_INVALID_AGENT_OUTPUT};
 use serde_json::{json, Value};
 
 pub(super) fn invalid_agent_output_blocked_decision(
@@ -19,6 +20,7 @@ pub(super) fn invalid_agent_output_blocked_decision(
     )
     .with_command(runtime_blocked_command(
         reason,
+        Some(STOP_REASON_INVALID_AGENT_OUTPUT),
         format!("runtime-completion:{}:invalid-output:block", event.id),
         event,
         result,
@@ -121,6 +123,7 @@ pub(super) fn optional_json_string(value: Option<String>) -> Value {
 
 pub(super) fn runtime_blocked_command(
     reason: impl Into<String>,
+    stop_reason_code: Option<&str>,
     dedupe_key: impl Into<String>,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -129,12 +132,13 @@ pub(super) fn runtime_blocked_command(
     WorkflowCommand::new(
         WorkflowCommandType::MarkBlocked,
         dedupe_key,
-        runtime_blocked_payload(&reason, event, result),
+        runtime_blocked_payload(&reason, stop_reason_code, event, result),
     )
 }
 
 pub(super) fn runtime_failed_command(
     reason: impl Into<String>,
+    stop_reason_code: Option<&str>,
     dedupe_key: impl Into<String>,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -143,25 +147,35 @@ pub(super) fn runtime_failed_command(
     WorkflowCommand::new(
         WorkflowCommandType::MarkFailed,
         dedupe_key,
-        runtime_failed_payload(&reason, event, result),
+        runtime_failed_payload(&reason, stop_reason_code, event, result),
     )
+}
+
+/// Structured machine-stable stop reason code emitted by the activity, if
+/// any. Unknown or forged codes are harmless: the classifier fails closed.
+pub(super) fn result_stop_reason_code(result: &ActivityResult) -> Option<String> {
+    result_signal_string(result, "stop_reason_code")
 }
 
 pub(super) fn runtime_blocked_payload(
     reason: &str,
+    stop_reason_code: Option<&str>,
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Value {
-    json!({
+    let mut payload = json!({
         "reason": reason,
         "blocked_reason": reason,
         "unblock_hint": blocked_unblock_hint(),
-        "last_stop": runtime_stop_metadata("blocked", event, result),
-    })
+        "last_stop": runtime_stop_metadata("blocked", stop_reason_code, event, result),
+    });
+    apply_stop_classification(&mut payload, stop_reason_code, result.error_kind);
+    payload
 }
 
 pub(super) fn runtime_failed_payload(
     reason: &str,
+    stop_reason_code: Option<&str>,
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Value {
@@ -169,15 +183,21 @@ pub(super) fn runtime_failed_payload(
         "reason": reason,
         "failure_reason": reason,
         "retry_hint": failed_retry_hint(result.error_kind),
-        "last_stop": runtime_stop_metadata("failed", event, result),
+        "last_stop": runtime_stop_metadata("failed", stop_reason_code, event, result),
     });
     if let Some(error_kind) = result.error_kind {
         payload["error_kind"] = json!(error_kind);
     }
+    apply_stop_classification(&mut payload, stop_reason_code, result.error_kind);
     payload
 }
 
-fn runtime_stop_metadata(state: &str, event: &WorkflowEvent, result: &ActivityResult) -> Value {
+fn runtime_stop_metadata(
+    state: &str,
+    stop_reason_code: Option<&str>,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Value {
     let mut metadata = json!({
         "state": state,
         "activity": stop_activity_name(event, result),
@@ -188,7 +208,27 @@ fn runtime_stop_metadata(state: &str, event: &WorkflowEvent, result: &ActivityRe
     if let Some(error_kind) = result.error_kind {
         metadata["error_kind"] = json!(error_kind);
     }
+    apply_stop_classification(&mut metadata, stop_reason_code, result.error_kind);
     metadata
+}
+
+/// Persist the structured `stop_reason_code` (when present) and the derived
+/// `reason_class` (always, B-002: the fail-closed decision is visible in the
+/// payload) via the single classifier (B-001). Additive JSON only.
+fn apply_stop_classification(
+    payload: &mut Value,
+    stop_reason_code: Option<&str>,
+    error_kind: Option<ActivityErrorKind>,
+) {
+    if let Some(payload) = payload.as_object_mut() {
+        if let Some(code) = stop_reason_code {
+            payload.insert("stop_reason_code".to_string(), json!(code));
+        }
+        payload.insert(
+            "reason_class".to_string(),
+            json!(classify_stop(stop_reason_code, error_kind).as_str()),
+        );
+    }
 }
 
 fn stop_activity_name(event: &WorkflowEvent, result: &ActivityResult) -> String {

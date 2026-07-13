@@ -8,6 +8,7 @@ fn repo_config_for(repo: &str) -> harness_core::config::intake::GitHubRepoConfig
         label: "harness".to_string(),
         project_root: None,
         auto_merge: None,
+        auto_recovery: None,
         merge_method: None,
         delete_branch: None,
         require_review_threads_resolved: None,

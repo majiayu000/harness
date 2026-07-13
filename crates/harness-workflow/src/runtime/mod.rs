@@ -22,6 +22,7 @@ pub mod plan_issue;
 pub mod pr_feedback;
 pub mod prompt_task;
 pub mod quality_gate;
+pub mod reason_class;
 pub mod reducer;
 pub mod remote_facts;
 pub mod repo_memory;
@@ -109,6 +110,12 @@ pub use quality_gate::{
     QualityGateDecisionOutput, QualityGateWorkflowAction, QUALITY_BLOCKED_SIGNAL,
     QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
     QUALITY_PASSED_SIGNAL,
+};
+pub use reason_class::{
+    classify_stop, StopReasonClass, STOP_REASON_CIRCUIT_BREAKER_COOLDOWN,
+    STOP_REASON_CI_BACKEND_UNAVAILABLE, STOP_REASON_INVALID_AGENT_OUTPUT,
+    STOP_REASON_MAINTAINER_INPUT_REQUIRED, STOP_REASON_MERGE_BASE_DRIFT, STOP_REASON_RATE_LIMITED,
+    TRANSIENT_STOP_REASON_CODES,
 };
 pub use reducer::{
     activity_result_has_closed_issue_evidence, activity_result_value_has_closed_issue_evidence,
