@@ -17,10 +17,15 @@ pub enum PolicyDecision {
     Suppressed,
 }
 
+/// Prune expired dedup entries once the map grows past this size, bounding
+/// memory over long uptimes (dedup keys embed unique task/PR identifiers).
+const PRUNE_THRESHOLD: usize = 1024;
+
 pub struct AlertPolicy {
     allowed: HashSet<AlertClass>,
     default_cooldown: Duration,
-    last_sent: HashMap<String, Instant>,
+    /// dedup_key -> (last delivery, cooldown window used for that delivery).
+    last_sent: HashMap<String, (Instant, Duration)>,
     suppressed: HashMap<String, u64>,
 }
 
@@ -46,7 +51,7 @@ impl AlertPolicy {
             return PolicyDecision::FilteredClass;
         }
         let cooldown = cooldown_override.unwrap_or(self.default_cooldown);
-        if let Some(last) = self.last_sent.get(&payload.dedup_key) {
+        if let Some((last, _)) = self.last_sent.get(&payload.dedup_key) {
             if now.saturating_duration_since(*last) < cooldown {
                 *self
                     .suppressed
@@ -55,11 +60,26 @@ impl AlertPolicy {
                 return PolicyDecision::Suppressed;
             }
         }
-        self.last_sent.insert(payload.dedup_key.clone(), now);
+        self.prune_expired(now);
+        self.last_sent
+            .insert(payload.dedup_key.clone(), (now, cooldown));
         let suppressed_in_window = self.suppressed.remove(&payload.dedup_key).unwrap_or(0);
         PolicyDecision::Deliver {
             suppressed_in_window,
         }
+    }
+
+    /// Drop entries whose cooldown window has fully elapsed. Suppression
+    /// counters follow their key: an expired key would deliver (not
+    /// suppress) on its next evaluation anyway.
+    fn prune_expired(&mut self, now: Instant) {
+        if self.last_sent.len() < PRUNE_THRESHOLD {
+            return;
+        }
+        self.last_sent
+            .retain(|_, (last, cooldown)| now.saturating_duration_since(*last) < *cooldown);
+        self.suppressed
+            .retain(|key, _| self.last_sent.contains_key(key));
     }
 }
 
@@ -158,5 +178,32 @@ mod tests {
                 suppressed_in_window: 1
             }
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prune_bounds_dedup_map_growth() {
+        let mut policy =
+            AlertPolicy::new([AlertClass::TaskFailureExhausted], Duration::from_secs(10));
+        // Fill past the prune threshold with unique keys.
+        for i in 0..1100 {
+            let p = payload(AlertClass::TaskFailureExhausted, &format!("k-{i}"));
+            assert!(matches!(
+                policy.evaluate(&p, None, Instant::now()),
+                PolicyDecision::Deliver { .. }
+            ));
+        }
+        assert!(policy.last_sent.len() >= 1024);
+        // All cooldowns elapse; the next delivery triggers a prune.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let p = payload(AlertClass::TaskFailureExhausted, "k-new");
+        assert!(matches!(
+            policy.evaluate(&p, None, Instant::now()),
+            PolicyDecision::Deliver { .. }
+        ));
+        assert!(
+            policy.last_sent.len() < 16,
+            "expired entries pruned, got {}",
+            policy.last_sent.len()
+        );
     }
 }

@@ -214,7 +214,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     background::spawn_awaiting_deps_watcher(&state);
 
     // Watch the notify drop counter and raise external alerts (GH1582).
-    crate::alerting::producers::spawn_notify_drop_watcher(state.observability.alerts.clone());
+    // The handle is registered with the dispatcher so shutdown aborts it.
+    if let Some(watcher) =
+        crate::alerting::producers::spawn_notify_drop_watcher(state.observability.alerts.clone())
+    {
+        state.observability.alerts.register_aux_task(watcher);
+    }
 
     // Run one reconciliation tick against GitHub before any recovery so that
     // recovery decisions are made on fresh GitHub truth.

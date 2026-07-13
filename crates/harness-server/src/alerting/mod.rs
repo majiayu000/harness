@@ -46,6 +46,9 @@ pub struct AlertDispatcher {
     shutdown_flush: Duration,
     router: Mutex<Option<tokio::task::JoinHandle<()>>>,
     heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Auxiliary producer tasks (e.g. the notify drop watcher) aborted on
+    /// shutdown so background loops do not outlive the dispatcher.
+    aux_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     events: Arc<EventStore>,
 }
 
@@ -93,6 +96,19 @@ impl AlertHandle {
         }
     }
 
+    /// Register an auxiliary producer task to be aborted on shutdown.
+    /// No-op on a disabled handle: callers gate spawning on `is_enabled`.
+    pub fn register_aux_task(&self, task: tokio::task::JoinHandle<()>) {
+        match &self.inner {
+            Some(dispatcher) => dispatcher
+                .aux_tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(task),
+            None => task.abort(),
+        }
+    }
+
     /// Total alerts dropped at the producer boundary.
     pub fn dropped_total(&self) -> u64 {
         self.inner
@@ -110,6 +126,14 @@ impl AlertHandle {
         };
         if let Some(handle) = dispatcher.heartbeat.lock().await.take() {
             handle.abort();
+        }
+        for task in dispatcher
+            .aux_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            task.abort();
         }
         let router = dispatcher.router.lock().await.take();
         // Dropping the producer sender closes the router queue; the router
@@ -244,6 +268,7 @@ pub fn spawn_alerting(
             shutdown_flush: Duration::from_secs(config.shutdown_flush_secs),
             router: Mutex::new(Some(router)),
             heartbeat: Mutex::new(heartbeat_handle),
+            aux_tasks: std::sync::Mutex::new(Vec::new()),
             events,
         })),
     }

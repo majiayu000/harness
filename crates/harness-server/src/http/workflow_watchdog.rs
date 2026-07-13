@@ -90,6 +90,8 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                             .await
                         {
                             Ok(stopped) => {
+                                let batch_full = stopped.len() as i64
+                                    >= workflow_cfg.storage.workflow_watchdog_batch_size as i64;
                                 let mut current: std::collections::HashMap<String, String> =
                                     std::collections::HashMap::new();
                                 for workflow in stopped {
@@ -127,9 +129,20 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                                         ),
                                     );
                                 }
-                                // Drop entries for workflows that left the
-                                // stopped set so a later re-entry alerts again.
-                                alerted_states = current;
+                                if batch_full {
+                                    // Partial view: the batch limit truncated
+                                    // the stopped set, so absence from
+                                    // `current` proves nothing. Merge without
+                                    // evicting to avoid re-alert flapping as
+                                    // workflows rotate through batches.
+                                    alerted_states.extend(current);
+                                } else {
+                                    // Complete view: safe to drop entries for
+                                    // workflows that left the stopped set so
+                                    // a later re-entry alerts again. Also
+                                    // bounds the map size.
+                                    alerted_states = current;
+                                }
                             }
                             Err(error) => {
                                 tracing::warn!("workflow alert scan failed: {error}")
