@@ -434,10 +434,10 @@ impl TaskQueue {
             // cancelled/reclaimed grants never reach the metrics (see
             // `record_granted_wait`).
             let waited = Instant::now().saturating_duration_since(enqueued_at);
-            project_queue
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .record_granted_wait(priority, waited);
+            // vibeguard-disable-next-line RS-03 -- Mutex::lock().unwrap() is the repo-exempt fail-fast pattern
+            let mut pq = project_queue.lock().unwrap();
+            pq.record_granted_wait(priority, waited);
+            drop(pq);
         }
 
         // Project slot acquired; transition from "waiting for project" to
@@ -467,10 +467,10 @@ impl TaskQueue {
             guard.global_waiter_cancelled = None;
             // Record the wait sample only after the grant is consumed (see above).
             let waited = Instant::now().saturating_duration_since(enqueued_at);
-            self.global_queue
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .record_granted_wait(priority, waited);
+            // vibeguard-disable-next-line RS-03 -- Mutex::lock().unwrap() is the repo-exempt fail-fast pattern
+            let mut gq = self.global_queue.lock().unwrap();
+            gq.record_granted_wait(priority, waited);
+            drop(gq);
         }
 
         project_awaiting_counter.fetch_sub(1, AtomicOrdering::SeqCst);
@@ -546,11 +546,8 @@ impl TaskQueue {
         let project_limit = self.project_limit(project_id);
         let global_running = self.running_count();
         let global_queued = self.queued_count();
-        let global_wait_ms_by_priority = self
-            .global_queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .wait_stats_snapshot();
+        // vibeguard-disable-next-line RS-03 -- Mutex::lock().unwrap() is the repo-exempt fail-fast pattern
+        let global_wait_ms_by_priority = self.global_queue.lock().unwrap().wait_stats_snapshot();
         let project_awaiting_global = self
             .project_awaiting_global
             .get(project_id)
