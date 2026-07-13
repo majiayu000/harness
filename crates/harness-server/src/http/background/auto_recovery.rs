@@ -146,11 +146,25 @@ pub(crate) async fn run_auto_recovery_tick(
     if !github.auto_recovery.enabled {
         return Ok(tick);
     }
+    // Eligibility is pushed into the store query (opted-in repos, transient
+    // classification, non-exhausted episode) so a large backlog of ineligible
+    // stopped rows cannot occupy the bounded scan window and starve newer
+    // eligible instances. `process_instance` re-checks everything fail-closed.
+    let opted_in_repos: Vec<String> = github
+        .effective_repos()
+        .into_iter()
+        .map(|repo| repo.repo)
+        .filter(|repo| github.auto_recovery_enabled_for_repo(repo))
+        .collect();
+    if opted_in_repos.is_empty() {
+        return Ok(tick);
+    }
     for state in STOPPED_STATES {
         let instances = store
-            .list_instances_by_state(
+            .list_transient_stopped_candidates(
                 GITHUB_ISSUE_PR_DEFINITION_ID,
                 state,
+                &opted_in_repos,
                 AUTO_RECOVERY_SCAN_LIMIT,
             )
             .await?;
@@ -241,7 +255,7 @@ async fn process_instance(
     if attempt_state.attempts >= policy.max_attempts {
         // Restart safety: attempts were exhausted but the exhaustion event
         // was never emitted (e.g. crash). Emit it exactly once (B-010).
-        emit_exhausted_once(store, alerts, instance, &mut attempt_state).await?;
+        emit_exhausted_once(store, alerts, instance, &mut attempt_state, None).await?;
         return Ok(InstanceOutcome::ExhaustedEmitted);
     }
     if attempt_state
@@ -258,7 +272,6 @@ async fn process_instance(
         instance,
         attempt_state,
         stop_reason_code.as_deref(),
-        now,
     )
     .await
 }
@@ -298,15 +311,18 @@ async fn reconcile_interrupted_attempt(
         )
         .await?;
     if attempt_state.attempts >= policy.max_attempts {
-        emit_exhausted_once(store, alerts, instance, &mut attempt_state).await?;
+        // `emit_exhausted_once` persists the final attempt state itself; a
+        // second write here would be redundant.
+        emit_exhausted_once(store, alerts, instance, &mut attempt_state, None).await?;
+    } else {
+        store
+            .set_auto_recovery_state_if_state(
+                &instance.id,
+                &instance.state,
+                Some(&attempt_state.to_value()?),
+            )
+            .await?;
     }
-    store
-        .set_auto_recovery_state_if_state(
-            &instance.id,
-            &instance.state,
-            Some(&attempt_state.to_value()?),
-        )
-        .await?;
     Ok(InstanceOutcome::Interrupted)
 }
 
@@ -317,7 +333,6 @@ async fn run_recovery_attempt(
     instance: &WorkflowInstance,
     mut attempt_state: AutoRecoveryState,
     stop_reason_code: Option<&str>,
-    now: DateTime<Utc>,
 ) -> anyhow::Result<InstanceOutcome> {
     let action = match instance.state.as_str() {
         "blocked" => WorkflowRuntimeRecoveryAction::Unblock,
@@ -432,7 +447,7 @@ async fn run_recovery_attempt(
             Ok(InstanceOutcome::Superseded)
         }
         WorkflowRuntimeRecoveryOutcome::NonRetryableFailure { error_kind, .. } => {
-            record_recheck_failure(
+            record_terminal_recheck(
                 store,
                 policy,
                 alerts,
@@ -440,12 +455,11 @@ async fn run_recovery_attempt(
                 attempt_state,
                 attempt_number,
                 &format!("failure is not retryable: {error_kind:?}"),
-                now,
             )
             .await
         }
         WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { activity, .. } => {
-            record_recheck_failure(
+            record_terminal_recheck(
                 store,
                 policy,
                 alerts,
@@ -453,12 +467,11 @@ async fn run_recovery_attempt(
                 attempt_state,
                 attempt_number,
                 &format!("no supported stopped activity: {activity:?}"),
-                now,
             )
             .await
         }
         WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition { .. } => {
-            record_recheck_failure(
+            record_terminal_recheck(
                 store,
                 policy,
                 alerts,
@@ -466,16 +479,20 @@ async fn run_recovery_attempt(
                 attempt_state,
                 attempt_number,
                 "workflow definition does not support runtime recovery",
-                now,
             )
             .await
         }
     }
 }
 
-/// The recheck ran but the transient condition still holds: consume the
-/// attempt, reschedule with increased backoff, no state transition (B-015).
-async fn record_recheck_failure(
+/// The recovery path rejected the recheck for a reason that cannot heal
+/// within this stop episode (non-retryable error kind, unsupported stopped
+/// activity or definition). Retrying would be futile: record the failed
+/// attempt evidence and immediately mark the episode exhausted so the
+/// scheduler stops touching the instance; only a manual operator action or a
+/// fresh stop episode re-enables it. `emit_exhausted_once` persists the
+/// final attempt state, so no additional write is needed.
+async fn record_terminal_recheck(
     store: &WorkflowRuntimeStore,
     policy: &GitHubAutoRecoveryConfig,
     alerts: &crate::alerting::AlertHandle,
@@ -483,13 +500,12 @@ async fn record_recheck_failure(
     mut attempt_state: AutoRecoveryState,
     attempt_number: u32,
     detail: &str,
-    now: DateTime<Utc>,
 ) -> anyhow::Result<InstanceOutcome> {
     attempt_state.pending_attempt_event_id = None;
     attempt_state.pending_attempt_number = None;
     attempt_state.attempts = attempt_number;
     attempt_state.last_outcome = Some("recheck_failed".to_string());
-    attempt_state.next_attempt_at = Some(next_attempt_at(policy, &attempt_state, instance, now));
+    attempt_state.next_attempt_at = None;
     append_outcome_event(
         store,
         instance,
@@ -500,16 +516,7 @@ async fn record_recheck_failure(
         Some(detail),
     )
     .await?;
-    if attempt_state.attempts >= policy.max_attempts {
-        emit_exhausted_once(store, alerts, instance, &mut attempt_state).await?;
-    }
-    store
-        .set_auto_recovery_state_if_state(
-            &instance.id,
-            &instance.state,
-            Some(&attempt_state.to_value()?),
-        )
-        .await?;
+    emit_exhausted_once(store, alerts, instance, &mut attempt_state, Some(detail)).await?;
     Ok(InstanceOutcome::RecheckFailed)
 }
 
@@ -549,6 +556,7 @@ async fn emit_exhausted_once(
     alerts: &crate::alerting::AlertHandle,
     instance: &WorkflowInstance,
     attempt_state: &mut AutoRecoveryState,
+    detail: Option<&str>,
 ) -> anyhow::Result<()> {
     if attempt_state.exhausted {
         return Ok(());
@@ -563,6 +571,7 @@ async fn emit_exhausted_once(
                 "attempts": attempt_state.attempts,
                 "episode_event_id": attempt_state.episode_event_id,
                 "state": instance.state,
+                "detail": detail,
                 "actor": AUTO_RECOVERY_ACTOR,
             }),
         )
@@ -574,12 +583,11 @@ async fn emit_exhausted_once(
     } else {
         harness_core::alert::AlertClass::WorkflowBlocked
     };
+    let stop_code = stop_reason_code(&instance.data);
     let reason = format!(
         "auto-recovery exhausted after {} attempts: {}",
         attempt_state.attempts,
-        stop_reason_code(&instance.data)
-            .as_deref()
-            .unwrap_or("transient stop"),
+        detail.or(stop_code.as_deref()).unwrap_or("transient stop"),
     );
     alerts.raise(crate::alerting::producers::workflow_stopped(
         class,

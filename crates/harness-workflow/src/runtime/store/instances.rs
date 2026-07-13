@@ -384,6 +384,53 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
+    /// Auto-recovery candidate scan (GH-1584): stopped instances of
+    /// `definition_id` in `state` whose persisted stop classification is
+    /// `transient` and whose repo is in the opted-in allowlist.
+    ///
+    /// Eligibility is filtered in SQL so ineligible rows (opted-out repos,
+    /// terminal or legacy stops, episodes already exhausted) never occupy the
+    /// bounded scan window and cannot starve newer eligible instances. Rows
+    /// exhausted for a *previous* stop episode stay visible so a fresh
+    /// episode can reset its counter. The persisted `reason_class` is only a
+    /// coarse pre-filter; the caller re-runs the fail-closed classifier.
+    pub async fn list_transient_stopped_candidates(
+        &self,
+        definition_id: &str,
+        state: &str,
+        repos: &[String],
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND state = $2
+               AND data->'data'->>'repo' = ANY($3::text[])
+               AND (data->'data'->>'reason_class' = 'transient'
+                    OR data->'data'->'last_stop'->>'reason_class' = 'transient')
+               AND NOT (
+                    COALESCE(data->'data'->'auto_recovery'->>'exhausted', 'false') = 'true'
+                    AND data->'data'->'auto_recovery'->>'episode_event_id'
+                        IS NOT DISTINCT FROM data->'data'->'last_stop'->>'event_id'
+               )
+             ORDER BY updated_at ASC
+             LIMIT $4",
+        )
+        .bind(definition_id)
+        .bind(state)
+        .bind(repos)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     pub async fn list_recent_instances_by_state(
         &self,
         definition_id: &str,

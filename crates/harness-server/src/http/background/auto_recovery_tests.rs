@@ -651,6 +651,37 @@ async fn auto_recovery_reconciles_dangling_attempt_as_interrupted() -> anyhow::R
         .expect("interrupted outcome recorded");
     assert_eq!(outcome.event["outcome"], json!("interrupted"));
     assert_eq!(outcome.event["attempt_event_id"], json!("evt-dangling"));
+    let first_delay = (attempt_state.next_attempt_at.expect("rescheduled") - now).num_seconds();
+
+    // A second interrupted attempt consumes another attempt and reschedules
+    // with a larger backoff (exponential growth persists across attempts).
+    let mut second_state = attempt_state.clone();
+    second_state.pending_attempt_event_id = Some("evt-dangling-2".to_string());
+    second_state.pending_attempt_number = Some(2);
+    store
+        .set_auto_recovery_state_if_state(
+            &instance.id,
+            "blocked",
+            Some(&serde_json::to_value(&second_state)?),
+        )
+        .await?;
+    let later = now + ChronoDuration::seconds(1);
+    let tick = run_auto_recovery_tick(
+        &store,
+        &github,
+        &crate::alerting::AlertHandle::disabled(),
+        later,
+    )
+    .await?;
+    assert_eq!(tick.interrupted, 1);
+    let after = refreshed(&store, &instance.id).await?;
+    let attempt_state = instance_attempt_state(&after).expect("attempt state persists");
+    assert_eq!(attempt_state.attempts, 2);
+    let second_delay = (attempt_state.next_attempt_at.expect("rescheduled") - later).num_seconds();
+    assert!(
+        second_delay > first_delay,
+        "backoff must grow: first {first_delay}s, second {second_delay}s"
+    );
     Ok(())
 }
 
@@ -763,10 +794,10 @@ async fn auto_recovery_manual_unblock_wins_during_pending_backoff() -> anyhow::R
     Ok(())
 }
 
-// -- B-015: a failed recheck consumes the attempt without a transition ------
+// -- Terminal recheck outcomes stop scheduling immediately -------------------
 
 #[tokio::test]
-async fn auto_recovery_recheck_failure_increments_and_reschedules() -> anyhow::Result<()> {
+async fn auto_recovery_terminal_recheck_outcome_stops_scheduling() -> anyhow::Result<()> {
     if !test_helpers::db_tests_enabled().await {
         return Ok(());
     }
@@ -775,8 +806,8 @@ async fn auto_recovery_recheck_failure_increments_and_reschedules() -> anyhow::R
     let github = test_github_config(3);
 
     // Structured transient stop pointing at a runtime job that no longer
-    // exists: recovery cannot determine a supported stopped activity, so the
-    // recheck fails without any state transition.
+    // exists: recovery cannot determine a supported stopped activity. That
+    // cannot heal within the episode, so retrying would be futile.
     let mut data = transient_blocked_data("episode-1");
     data["last_stop"]["runtime_job_id"] = json!("job-missing");
     let workflow = WorkflowInstance::new(
@@ -810,36 +841,100 @@ async fn auto_recovery_recheck_failure_increments_and_reschedules() -> anyhow::R
         attempt_state.last_outcome.as_deref(),
         Some("recheck_failed")
     );
-    let first_next = attempt_state.next_attempt_at.expect("rescheduled");
-    assert!(first_next > now);
+    assert!(
+        attempt_state.exhausted,
+        "terminal recheck marks the episode exhausted immediately"
+    );
+    assert!(attempt_state.next_attempt_at.is_none());
+    let events = store.events_for(&workflow.id).await?;
+    let outcome = events
+        .iter()
+        .find(|event| event.event_type == AUTO_RECOVERY_OUTCOME_EVENT)
+        .expect("recheck_failed outcome recorded");
+    assert_eq!(outcome.event["outcome"], json!("recheck_failed"));
+    let exhausted = events
+        .iter()
+        .find(|event| event.event_type == AUTO_RECOVERY_EXHAUSTED_EVENT)
+        .expect("terminal recheck emits the exhaustion event");
+    assert!(exhausted.event["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("no supported stopped activity")));
 
-    // Second failure grows the backoff (exponential, B-007).
-    let after_first = now + ChronoDuration::seconds(400);
+    // Zero further recheck attempts on subsequent ticks, even far in the
+    // future: the episode is terminal until a manual operator action.
+    let event_count = events.len();
+    for offset_hours in [1, 24] {
+        let tick = run_auto_recovery_tick(
+            &store,
+            &github,
+            &crate::alerting::AlertHandle::disabled(),
+            now + ChronoDuration::hours(offset_hours),
+        )
+        .await?;
+        assert_eq!(tick, AutoRecoveryTick::default());
+    }
+    assert_eq!(
+        store.events_for(&workflow.id).await?.len(),
+        event_count,
+        "no further attempt or outcome events"
+    );
+    Ok(())
+}
+
+// -- Starvation regression: ineligible backlog cannot clog the scan window --
+
+#[tokio::test]
+async fn auto_recovery_scan_is_not_starved_by_ineligible_backlog() -> anyhow::Result<()> {
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let (_dir, store) = open_test_store("harness-test-ar-starve-").await?;
+    let github = test_github_config(3);
+
+    // More than a full scan window of older ineligible rows: terminal
+    // classification in the opted-in repo. Their updated_at never changes,
+    // so a naive updated_at ASC window would always be full of them.
+    for index in 0..AUTO_RECOVERY_SCAN_LIMIT + 10 {
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "blocked",
+            WorkflowSubject::new("issue", format!("issue:ar-starve-{index}")),
+        )
+        .with_id(format!("ar-starve-{index}"))
+        .with_data(json!({
+            "repo": TEST_REPO,
+            "stop_reason_code": "maintainer_input_required",
+            "reason_class": "terminal",
+            "last_stop": {
+                "state": "blocked",
+                "activity": "implement_issue",
+                "event_id": format!("episode-{index}"),
+            },
+        }));
+        store.upsert_instance(&workflow).await?;
+    }
+    // The eligible instance arrives last (newest updated_at).
+    let eligible = seed_stopped_instance(
+        &store,
+        "ar-starve-eligible",
+        "blocked",
+        transient_blocked_data("episode-eligible"),
+    )
+    .await?;
+
     let tick = run_auto_recovery_tick(
         &store,
         &github,
         &crate::alerting::AlertHandle::disabled(),
-        after_first,
+        Utc::now(),
     )
     .await?;
-    assert_eq!(tick.recheck_failed, 1);
-    let after = refreshed(&store, &workflow.id).await?;
-    let attempt_state = instance_attempt_state(&after).expect("attempt state persists");
-    assert_eq!(attempt_state.attempts, 2);
-    let second_delay =
-        (attempt_state.next_attempt_at.expect("rescheduled") - after_first).num_seconds();
-    let first_delay = (first_next - now).num_seconds();
-    assert!(
-        second_delay > first_delay,
-        "backoff must grow: first {first_delay}s, second {second_delay}s"
-    );
-    let events = store.events_for(&workflow.id).await?;
     assert_eq!(
-        event_types(&events)
-            .iter()
-            .filter(|event_type| **event_type == AUTO_RECOVERY_OUTCOME_EVENT)
-            .count(),
-        2
+        tick.recovered, 1,
+        "the newest eligible instance must not be starved by the backlog"
     );
+    assert_eq!(refreshed(&store, &eligible.id).await?.state, "implementing");
     Ok(())
 }

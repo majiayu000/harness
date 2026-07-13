@@ -403,7 +403,10 @@ A successful recheck re-runs exactly the same recovery path as a manual
 unblock/retry, recorded with actor `auto_recovery`. Every attempt appends an
 `AutoRecoveryAttempt` audit event before acting, followed by an
 `AutoRecoveryOutcome` event (`succeeded`, `superseded`, `recheck_failed`, or
-`interrupted`). When attempts are exhausted the instance stays stopped, keeps
+`interrupted`). A recheck rejected for a reason that cannot heal within the
+episode (non-retryable failure, unsupported stopped activity or definition)
+immediately marks the episode exhausted instead of burning the remaining
+attempts. When attempts are exhausted the instance stays stopped, keeps
 surfacing in the operator monitor, and a single `AutoRecoveryExhausted` event
 per episode is emitted; the same idempotent gate raises one external
 `workflow_blocked` / `workflow_failed` alert through the `[alerting]` channel
