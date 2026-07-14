@@ -10,6 +10,7 @@ use crate::task_runner::{
 };
 use anyhow::Context;
 use harness_core::agent::CodeAgent;
+use harness_core::compress::ObservationCompressor;
 use harness_core::types::{Decision, Event, SessionId};
 use harness_core::{lang_detect, prompts};
 use std::collections::HashMap;
@@ -40,6 +41,7 @@ pub(crate) async fn run_implement_phase(
     repo_slug: &str,
     project: &Path,
     project_root: &Path,
+    observation_compressor: Option<&dyn ObservationCompressor>,
     plan_output: Option<String>,
     resumed_pr_url: Option<String>,
     resumed_review_prep: Option<prompts::PrReviewPrepOutcome>,
@@ -73,7 +75,7 @@ pub(crate) async fn run_implement_phase(
                 let plan_for_prompt = match plan_output.as_deref() {
                     Some(raw) => Some(
                         super::super::compression::compress_observation_for_prompt(
-                            &server_config.context.compression,
+                            observation_compressor,
                             raw,
                             &format!("implementation phase for issue #{issue} in {repo_slug}"),
                         )

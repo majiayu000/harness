@@ -11,8 +11,8 @@ pub(super) use super::run_policy::{
     should_run_issue_triage,
 };
 use super::{
-    agent_review, agent_review_provider_gate, gates, implement_pipeline, non_implementation,
-    review_loop, triage_pipeline,
+    agent_review, agent_review_provider_gate, compression, gates, implement_pipeline,
+    non_implementation, review_loop, triage_pipeline,
 };
 use crate::task_executor::SharedTurnInterceptors;
 use crate::task_runner::{
@@ -98,6 +98,8 @@ pub(crate) async fn run_task(
         )
     })?;
     let resolved = harness_core::config::resolve::resolve_config(server_config, &project_config);
+    let observation_compressor =
+        compression::build_task_observation_compressor(&server_config.context.compression);
     let git = Some(&project_config.git);
     let repo_slug = detect_repo_slug(&project)
         .await
@@ -340,6 +342,7 @@ pub(crate) async fn run_task(
             &repo_slug,
             &project,
             &project_root,
+            observation_compressor.as_deref(),
             current_plan_output.clone(),
             resumed_pr_url.clone(),
             resumed_review_prep.clone(),
