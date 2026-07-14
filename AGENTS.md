@@ -2,7 +2,7 @@
 
 ## Language
 
-All outputs MUST be in English, including:
+Use the user's language for conversation. Keep repository artifacts in English, including:
 - Code comments and documentation
 - Commit messages and PR titles/descriptions
 - Prompt templates in `prompts.rs`
@@ -11,15 +11,19 @@ All outputs MUST be in English, including:
 
 ## Build
 
-- During implementation, prefer the smallest validation command that covers the changed surface:
-  - Single crate change: `cargo check -p <crate> --all-targets`
-  - Cross-crate API change: `cargo check --workspace --all-targets`
-  - Targeted behavior change: run the relevant `cargo test -p <crate> <test_filter>`
-- Do not run the CI-equivalent workspace check after every edit. Use it for final PR readiness or when warning-sensitive code changed.
-- Before committing, run `cargo fmt --all -- --check` plus the relevant package tests for behavior-changing code. Run full workspace tests when the change affects shared behavior, persistence, workflow runtime, or agent adapters.
-- Before pushing a PR, ALWAYS run `cargo clippy --workspace --all-targets -- -D warnings` to catch CI-equivalent warnings and lints (dead code, unused imports, missing match arms, clippy findings)
+| Changed surface | During implementation |
+|---|---|
+| Single crate | `cargo check -p <crate> --all-targets` |
+| Cross-crate API | `cargo check --workspace --all-targets` |
+| Targeted behavior | `cargo test -p <crate> <test_filter>` |
+
+Validation workflow:
+
+1. During implementation, run the smallest command from the table that covers the changed surface. Do not run the CI-equivalent workspace check after every edit.
+2. Before committing, run `cargo fmt --all` and `cargo fmt --all -- --check`. For behavior-changing code, run the relevant package tests; run full workspace tests when the change affects shared behavior, persistence, workflow runtime, or agent adapters.
+3. Before pushing a PR, run `cargo clippy --workspace --all-targets -- -D warnings` to catch CI-equivalent warnings and lints.
+
 - When adding a new enum variant, grep ALL match sites for that enum and update them — CI uses exhaustive match checks
-- Run `cargo fmt --all` before every commit — CI enforces `cargo fmt --all -- --check`
 - Dead code in `#[cfg(test)]` modules still triggers `-D warnings` in CI; delete unused test helpers instead of suppressing with `#[allow(dead_code)]`
 - Pre-commit hook (`.githooks/pre-commit`) runs fmt + staged-scope clippy as a fast commit gate. After cloning, activate with: `git config core.hooksPath .githooks`
 - Pre-push hook (`.githooks/pre-push`) runs full workspace clippy, non-server workspace lib tests, and `harness-server` lib tests when `HARNESS_DATABASE_URL` is configured.
@@ -58,12 +62,15 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 - If Gemini leaves review comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
 
-## Codex CLI Argument Order (CRITICAL)
+## Codex Integration
 
-- Codex CLI `-p` takes its prompt as the NEXT token: `Codex -p <PROMPT> [other flags...]`
-- The prompt MUST immediately follow `-p`. Placing it at the end of the arg list causes "Input must be provided" errors
-- Both `Codex.rs` (CodeAgent) and `claude_adapter.rs` (AgentAdapter) spawn Codex CLI — changes to CLI arg construction MUST be applied to BOTH files
-- After modifying either adapter's arg construction, verify with: `cargo test --package harness-agents` (86 tests)
+| Surface | Implementation | Invocation |
+|---|---|---|
+| `CodeAgent` | `crates/harness-agents/src/codex.rs` | `codex exec`; the prompt is the final positional argument |
+| `AgentAdapter` | `crates/harness-agents/src/codex_adapter.rs` | `codex app-server` over stdio JSON-RPC |
+
+- Keep changes scoped to the affected integration surface; they do not share the same CLI argument contract.
+- After modifying either surface, run `cargo test --package harness-agents`.
 
 ## Server Operation
 

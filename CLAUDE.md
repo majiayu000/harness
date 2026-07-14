@@ -2,7 +2,6 @@
 
 ## Language
 
-All outputs MUST be in English, including:
 - Code comments and documentation
 - Commit messages and PR titles/descriptions
 - Prompt templates in `prompts.rs`
