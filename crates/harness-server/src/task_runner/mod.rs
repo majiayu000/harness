@@ -1,3 +1,4 @@
+mod artifacts;
 mod metrics;
 mod request;
 pub(super) mod spawn;
@@ -14,6 +15,7 @@ pub type CompletionCallback =
     Arc<dyn Fn(TaskState) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 // Re-export everything that was previously public from the flat task_runner.rs.
+pub(crate) use artifacts::TaskArtifactSink;
 pub use metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
 pub use request::{
     fill_missing_repo_from_project, CreateTaskRequest, PersistedRequestSettings, SystemTaskInput,

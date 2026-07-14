@@ -23,7 +23,7 @@ pub(crate) struct IntakeBundle {
 /// `registry` (project_registry) — must follow all three.
 pub(crate) async fn build_intake(
     server: &Arc<HarnessServer>,
-    _storage: &StorageBundle,
+    storage: &StorageBundle,
     engines: &EnginesBundle,
     registry: &RegistryBundle,
     project_root: &Path,
@@ -193,6 +193,7 @@ pub(crate) async fn build_intake(
         &github_pollers,
         server.config.agents.review.clone(),
         Some(quality_trigger),
+        storage.tasks.clone(),
         server.config.server.github_token.clone(),
         registry.issue_workflow_store.clone(),
     );

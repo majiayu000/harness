@@ -267,6 +267,11 @@ where
     };
 
     let id = task_id.clone();
+    let observation_session = crate::observation_compression::start_task_observation_session(
+        &server_config.context.compression,
+        &id,
+    );
+    let observation_session_for_run = observation_session.clone();
     let store_watcher = store.clone();
     let events_watcher = events.clone();
     let id_watcher = id.clone();
@@ -553,15 +558,7 @@ where
             project_root
         };
 
-        // Retry loop: on transient errors, back off and retry up to MAX_TRANSIENT_RETRIES.
-        // Retrying inside the spawn means the stream stays open and the task actually re-runs.
-        // Keep the observation compressor outside the retry loop so NAP sampling and
-        // breaker state span the complete task lifecycle rather than one attempt.
-        let observation_compressor =
-            crate::task_executor::compression::build_task_observation_compressor(
-                &server_config.context.compression,
-                &id,
-            );
+        // Retrying inside the spawn keeps one task-scoped compressor and stream alive.
         let mut transient_attempts = 0u32;
         // Track total turns used across all transient-retry attempts so the
         // max_turns budget is enforced globally over the full task lifecycle.
@@ -601,7 +598,9 @@ where
                 server_config.as_ref(),
                 issue_workflow_store.clone(),
                 workflow_runtime_store.clone(),
-                observation_compressor.as_deref(),
+                observation_session_for_run
+                    .as_deref()
+                    .map(|session| session.compressor()),
                 &mut total_turns_used,
             )
             .await;
@@ -735,6 +734,7 @@ where
     }
 
     tokio::spawn(async move {
+        // Keep the exact task session live until the completion callback returns.
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -777,7 +777,17 @@ where
         store_watcher.close_task_stream(&id_watcher);
         if let Some(cb) = completion_callback {
             match store_watcher.get(&id_watcher) {
-                Some(final_state) => cb(final_state).await,
+                Some(final_state) => {
+                    let callback = cb(final_state);
+                    if let Some(session) = observation_session {
+                        crate::observation_compression::scope_completion_observation_session(
+                            session, callback,
+                        )
+                        .await;
+                    } else {
+                        callback.await;
+                    }
+                }
                 None => tracing::warn!(
                     "completion_callback: task {:?} not found in store after completion",
                     id_watcher

@@ -446,6 +446,7 @@ pub(crate) fn build_completion_callback(
     github_pollers: &[(String, Arc<dyn crate::intake::IntakeSource>)],
     review_config: harness_core::config::agents::AgentReviewConfig,
     quality_trigger: Option<Arc<crate::quality_trigger::QualityTrigger>>,
+    task_store: Option<Arc<task_runner::TaskStore>>,
     config_github_token: Option<String>,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
 ) -> Option<task_runner::CompletionCallback> {
@@ -473,6 +474,7 @@ pub(crate) fn build_completion_callback(
         let sources = sources.clone();
         let review_config = review_config.clone();
         let quality_trigger = quality_trigger.clone();
+        let task_store = task_store.clone();
         let github_token = config_github_token.clone();
         let issue_workflow_store = issue_workflow_store.clone();
         Box::pin(async move {
@@ -510,7 +512,17 @@ pub(crate) fn build_completion_callback(
                         })
                     }
                 });
-                qt.check_and_maybe_trigger(task_ctx.as_ref()).await;
+                let raw_sink = task_store.map(|store| {
+                    Arc::new(task_runner::TaskArtifactSink::new(store))
+                        as Arc<dyn crate::observation_compression::RawObservationSink>
+                });
+                qt.check_and_maybe_trigger_for_task(
+                    task_ctx.as_ref(),
+                    &task.id,
+                    task.turn,
+                    raw_sink,
+                )
+                .await;
             }
 
             // Auto-trigger review bot comment when task completes with a PR URL.

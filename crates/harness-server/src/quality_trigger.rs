@@ -1,4 +1,6 @@
-use crate::handlers::cross_review::run_cross_review;
+use crate::handlers::cross_review::run_cross_review_with_context;
+use crate::observation_compression::{completion_observation_session, RawObservationSink};
+use crate::task_runner::TaskId;
 use chrono::{Duration as ChronoDuration, Utc};
 use harness_core::agent::CodeAgent;
 use harness_core::config::misc::AutoAdoptPolicy;
@@ -100,6 +102,35 @@ impl QualityTrigger {
     /// Grade recent events, run optional cross-review, log the result, and
     /// auto-trigger GC if warranted.
     pub async fn check_and_maybe_trigger(&self, task_ctx: Option<&TaskReviewContext>) {
+        self.check_and_maybe_trigger_inner(task_ctx, None).await;
+    }
+
+    pub(crate) async fn check_and_maybe_trigger_for_task(
+        &self,
+        task_ctx: Option<&TaskReviewContext>,
+        task_id: &TaskId,
+        turn: u32,
+        raw_sink: Option<Arc<dyn RawObservationSink>>,
+    ) {
+        let compression = completion_observation_session()
+            .zip(raw_sink)
+            .map(|(session, sink)| {
+                crate::handlers::cross_review::CrossReviewCompressionContext::new(
+                    task_id.clone(),
+                    turn,
+                    session,
+                    sink,
+                )
+            });
+        self.check_and_maybe_trigger_inner(task_ctx, compression.as_ref())
+            .await;
+    }
+
+    async fn check_and_maybe_trigger_inner(
+        &self,
+        task_ctx: Option<&TaskReviewContext>,
+        compression: Option<&crate::handlers::cross_review::CrossReviewCompressionContext>,
+    ) {
         // Grade only events from the recent window so that a single task's
         // failures affect the grade rather than being averaged over lifetime
         // history. See `QUALITY_WINDOW_HOURS` docstring.
@@ -207,15 +238,14 @@ impl QualityTrigger {
                             const CROSS_REVIEW_TIMEOUT_SECS: u64 = 120;
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(CROSS_REVIEW_TIMEOUT_SECS),
-                                run_cross_review(
+                                run_cross_review_with_context(
                                     primary,
                                     Some(rc),
                                     self.project_root.clone(),
                                     target,
                                     2,
-                                    // Deny all tools: review is text-only, agents must not
-                                    // mutate the repo during this background quality gate.
                                     Some(vec![]),
+                                    compression,
                                 ),
                             )
                             .await

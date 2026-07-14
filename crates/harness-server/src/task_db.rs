@@ -7,6 +7,7 @@ mod queries_tasks;
 mod raw_column_test_overrides;
 mod types;
 
+pub(crate) use types::ARTIFACT_MAX_BYTES;
 pub use types::{
     RecoveryResult, TaskArtifact, TaskCheckpoint, TaskPrompt, TaskRetentionPruneSummary,
 };
