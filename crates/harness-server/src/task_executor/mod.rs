@@ -23,6 +23,7 @@ pub(crate) mod pr_detection;
 pub(crate) mod review_loop;
 #[cfg(test)]
 mod review_loop_wait_budget_tests;
+mod run_policy;
 mod run_task;
 pub(crate) mod triage_pipeline;
 mod validation_gate;
