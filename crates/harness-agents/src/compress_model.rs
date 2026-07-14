@@ -141,6 +141,30 @@ impl CompressModel for ApiCompressModel {
 pub fn build_observation_compressor(
     config: &CompressionConfig,
 ) -> Option<Arc<dyn ObservationCompressor>> {
+    let model = configured_model(config)?;
+    Some(Arc::new(PromptCompressor::new(
+        model,
+        config.sample_rate,
+        config.min_size_bytes,
+    )))
+}
+
+/// Build a configured compressor with a stable task/request sampling phase.
+/// Each returned handle retains independent NAP counters and breaker state.
+pub fn build_seeded_observation_compressor(
+    config: &CompressionConfig,
+    seed: &str,
+) -> Option<Arc<dyn ObservationCompressor>> {
+    let model = configured_model(config)?;
+    Some(Arc::new(PromptCompressor::new_seeded(
+        model,
+        config.sample_rate,
+        config.min_size_bytes,
+        seed,
+    )))
+}
+
+fn configured_model(config: &CompressionConfig) -> Option<ApiCompressModel> {
     if !config.is_active() {
         return None;
     }
@@ -148,12 +172,11 @@ pub fn build_observation_compressor(
     if api_key.trim().is_empty() {
         return None;
     }
-    let model = ApiCompressModel::new(api_key, config.endpoint.clone(), config.model.clone());
-    Some(Arc::new(PromptCompressor::new(
-        model,
-        config.sample_rate,
-        config.min_size_bytes,
-    )))
+    Some(ApiCompressModel::new(
+        api_key,
+        config.endpoint.clone(),
+        config.model.clone(),
+    ))
 }
 
 #[cfg(test)]

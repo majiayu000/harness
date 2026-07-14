@@ -4,12 +4,16 @@
 //! `state.plan_output`); compression only affects what is injected into the
 //! next agent's prompt, so every failure path falls back to raw text.
 
+#[cfg(test)]
 use harness_agents::compress_model::build_observation_compressor;
+use harness_agents::compress_model::build_seeded_observation_compressor;
 use harness_core::compress::{
     CompressError, CompressHint, NapStatus, ObsSource, ObservationCompressor,
 };
 use harness_core::config::compression::CompressionConfig;
 use std::sync::Arc;
+
+use crate::task_runner::TaskId;
 
 pub(crate) type TaskObservationCompressor = Arc<dyn ObservationCompressor>;
 
@@ -21,8 +25,9 @@ pub(crate) type TaskObservationCompressor = Arc<dyn ObservationCompressor>;
 /// compression only at plan-to-implement (including replan retries).
 pub(crate) fn build_task_observation_compressor(
     config: &CompressionConfig,
+    task_id: &TaskId,
 ) -> Option<TaskObservationCompressor> {
-    build_observation_compressor(config)
+    build_seeded_observation_compressor(config, task_id.as_str())
 }
 
 /// Compress a prior agent's output before injecting it into the next

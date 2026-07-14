@@ -560,6 +560,7 @@ where
         let observation_compressor =
             crate::task_executor::compression::build_task_observation_compressor(
                 &server_config.context.compression,
+                &id,
             );
         let mut transient_attempts = 0u32;
         // Track total turns used across all transient-retry attempts so the

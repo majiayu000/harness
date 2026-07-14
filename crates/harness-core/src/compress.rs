@@ -250,6 +250,47 @@ impl NapSampler for EveryN {
     }
 }
 
+/// Verifies one seed-selected position in each `n`-call window.
+///
+/// The seed is mapped with 64-bit FNV-1a, whose constants and byte-wise
+/// algorithm are fixed here to keep replay behavior stable across processes
+/// and Rust releases. This hash is only for deterministic sampling, not
+/// security. Distinct task/request IDs therefore spread short-lived handles
+/// across the configured sampling window instead of all starting at the same
+/// unsampled sequence position.
+#[derive(Debug, Clone, Copy)]
+pub struct SeededEveryN {
+    every: u64,
+    position: u64,
+}
+
+impl SeededEveryN {
+    pub fn from_rate(rate: f64, seed: &str) -> Self {
+        let every = EveryN::from_rate(rate).0;
+        let position = if every == u64::MAX {
+            0
+        } else {
+            stable_seed_hash(seed) % every
+        };
+        Self { every, position }
+    }
+}
+
+impl NapSampler for SeededEveryN {
+    fn should_verify(&self, seq: u64) -> bool {
+        self.every != u64::MAX && seq.wrapping_sub(1) % self.every == self.position
+    }
+}
+
+fn stable_seed_hash(seed: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    seed.as_bytes().iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
 /// Token estimate mirroring `BytesDivFourEstimator` in harness-context.
 /// Canonical core-level helper; downstream crates with private variants
 /// (harness-workflow memory_retrieval) can migrate to this.
@@ -275,6 +316,18 @@ pub struct PromptCompressor<M: CompressModel, S: NapSampler = EveryN> {
 impl<M: CompressModel> PromptCompressor<M, EveryN> {
     pub fn new(model: M, sample_rate: f64, min_size_bytes: usize) -> Self {
         Self::with_sampler(model, EveryN::from_rate(sample_rate), min_size_bytes)
+    }
+}
+
+impl<M: CompressModel> PromptCompressor<M, SeededEveryN> {
+    /// Construct a compressor whose deterministic verification phase is
+    /// derived from a stable task/request identifier.
+    pub fn new_seeded(model: M, sample_rate: f64, min_size_bytes: usize, seed: &str) -> Self {
+        Self::with_sampler(
+            model,
+            SeededEveryN::from_rate(sample_rate, seed),
+            min_size_bytes,
+        )
     }
 }
 
@@ -510,6 +563,33 @@ mod tests {
         let second = c.compress(&raw_obs(), &hint()).await.unwrap();
         assert_eq!(second.nap, NapStatus::Verified);
         assert_eq!(second.compressor_usage.calls.len(), 3);
+    }
+
+    #[test]
+    fn seeded_sampler_is_stable_and_distributes_first_calls() {
+        let decisions: Vec<bool> = (0..1_000)
+            .map(|seed| SeededEveryN::from_rate(0.1, &format!("task-{seed}")).should_verify(1))
+            .collect();
+        let repeated: Vec<bool> = (0..1_000)
+            .map(|seed| SeededEveryN::from_rate(0.1, &format!("task-{seed}")).should_verify(1))
+            .collect();
+        let selected = decisions.iter().filter(|decision| **decision).count();
+
+        assert_eq!(decisions, repeated);
+        assert!(
+            (80..=120).contains(&selected),
+            "expected about 100 sampled task seeds, got {selected}"
+        );
+    }
+
+    #[test]
+    fn seeded_sampler_verifies_once_per_window() {
+        let sampler = SeededEveryN::from_rate(0.1, "task-1574");
+        assert_eq!(
+            (1..=20).filter(|seq| sampler.should_verify(*seq)).count(),
+            2
+        );
+        assert!(!SeededEveryN::from_rate(0.0, "task-1574").should_verify(1));
     }
 
     #[tokio::test]
