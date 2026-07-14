@@ -6,6 +6,7 @@ use crate::{http::AppState, validate_root};
 use harness_core::{agent::AgentRequest, agent::CodeAgent};
 use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -153,7 +154,7 @@ pub(crate) async fn run_cross_review_with_context(
     let mut consensus_issues: Vec<String> =
         harness_core::prompts::extract_review_issues(&primary_review);
     let primary_for_challenger = if max_rounds <= 1 {
-        primary_review.clone()
+        Cow::Borrowed(primary_review.as_str())
     } else {
         match compression {
             Some(context) => {
@@ -167,14 +168,14 @@ pub(crate) async fn run_cross_review_with_context(
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(()) => Cow::Owned(
                         compress_observation_for_prompt(
                             Some(context.session.compressor()),
                             &primary_review,
                             &format!("cross-review primary output for task {}", context.task_id.0),
                         )
-                        .await
-                    }
+                        .await,
+                    ),
                     Err(error) => {
                         tracing::error!(
                             task_id = %context.task_id.0,
@@ -182,14 +183,14 @@ pub(crate) async fn run_cross_review_with_context(
                             %error,
                             "raw cross-review primary output was not persisted; bypassing compression"
                         );
-                        primary_review.clone()
+                        Cow::Borrowed(primary_review.as_str())
                     }
                 }
             }
-            None => primary_review.clone(),
+            None => Cow::Borrowed(primary_review.as_str()),
         }
     };
-    let safe_primary = harness_core::prompts::wrap_external_data(&primary_for_challenger);
+    let safe_primary = harness_core::prompts::wrap_external_data(primary_for_challenger.as_ref());
 
     for _ in 0..max_rounds.saturating_sub(1) {
         rounds_done += 1;
@@ -532,13 +533,12 @@ mod tests {
         let persisted = Arc::new(AtomicBool::new(false));
         let raw = Arc::new(Mutex::new(Vec::new()));
         let prompts = Arc::new(Mutex::new(Vec::new()));
-        let session = crate::observation_compression::register_task_observation_session(
-            task_id.clone(),
-            Arc::new(RecordingCompressor {
+        let session = crate::observation_compression::test_task_observation_session(Arc::new(
+            RecordingCompressor {
                 calls: Arc::clone(&calls),
                 persisted: Arc::clone(&persisted),
-            }),
-        );
+            },
+        ));
         let context = CrossReviewCompressionContext::new(
             task_id,
             7,
@@ -578,13 +578,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let persisted = Arc::new(AtomicBool::new(false));
         let prompts = Arc::new(Mutex::new(Vec::new()));
-        let session = crate::observation_compression::register_task_observation_session(
-            task_id.clone(),
-            Arc::new(RecordingCompressor {
+        let session = crate::observation_compression::test_task_observation_session(Arc::new(
+            RecordingCompressor {
                 calls: Arc::clone(&calls),
                 persisted: Arc::clone(&persisted),
-            }),
-        );
+            },
+        ));
         let context = CrossReviewCompressionContext::new(
             task_id,
             8,
@@ -626,13 +625,12 @@ mod tests {
         let persisted = Arc::new(AtomicBool::new(false));
         let raw = Arc::new(Mutex::new(Vec::new()));
         let prompts = Arc::new(Mutex::new(Vec::new()));
-        let session = crate::observation_compression::register_task_observation_session(
-            task_id.clone(),
-            Arc::new(RecordingCompressor {
+        let session = crate::observation_compression::test_task_observation_session(Arc::new(
+            RecordingCompressor {
                 calls: Arc::clone(&calls),
                 persisted: Arc::clone(&persisted),
-            }),
-        );
+            },
+        ));
         let context = CrossReviewCompressionContext::new(
             task_id,
             9,

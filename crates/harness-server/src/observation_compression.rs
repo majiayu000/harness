@@ -12,28 +12,17 @@ use harness_core::compress::{
 };
 use harness_core::config::compression::CompressionConfig;
 use std::sync::Arc;
-use std::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex, Weak},
-};
 
 use crate::task_runner::TaskId;
 
 pub(crate) type TaskObservationCompressor = Arc<dyn ObservationCompressor>;
 
-struct RegistryEntry {
-    generation: u64,
-    session: Weak<TaskObservationCompressionSession>,
+tokio::task_local! {
+    static COMPLETION_OBSERVATION_SESSION: Arc<TaskObservationCompressionSession>;
 }
-
-static SESSIONS: LazyLock<Mutex<HashMap<TaskId, RegistryEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A compressor whose sampling and breaker counters belong to exactly one task.
 pub(crate) struct TaskObservationCompressionSession {
-    task_id: TaskId,
-    generation: u64,
     compressor: TaskObservationCompressor,
 }
 
@@ -43,55 +32,33 @@ impl TaskObservationCompressionSession {
     }
 }
 
-impl Drop for TaskObservationCompressionSession {
-    fn drop(&mut self) {
-        let mut sessions = SESSIONS.lock().unwrap();
-        if sessions
-            .get(&self.task_id)
-            .is_some_and(|entry| entry.generation == self.generation)
-        {
-            sessions.remove(&self.task_id);
-        }
-    }
-}
-
 pub(crate) fn start_task_observation_session(
     config: &CompressionConfig,
     task_id: &TaskId,
 ) -> Option<Arc<TaskObservationCompressionSession>> {
     build_task_observation_compressor(config, task_id)
-        .map(|compressor| register_task_observation_session(task_id.clone(), compressor))
+        .map(|compressor| Arc::new(TaskObservationCompressionSession { compressor }))
 }
 
-pub(crate) fn register_task_observation_session(
-    task_id: TaskId,
+pub(crate) async fn scope_completion_observation_session<F>(
+    session: Arc<TaskObservationCompressionSession>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    COMPLETION_OBSERVATION_SESSION.scope(session, future).await
+}
+
+pub(crate) fn completion_observation_session() -> Option<Arc<TaskObservationCompressionSession>> {
+    COMPLETION_OBSERVATION_SESSION.try_with(Arc::clone).ok()
+}
+
+#[cfg(test)]
+pub(crate) fn test_task_observation_session(
     compressor: TaskObservationCompressor,
 ) -> Arc<TaskObservationCompressionSession> {
-    let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let session = Arc::new(TaskObservationCompressionSession {
-        task_id: task_id.clone(),
-        generation,
-        compressor,
-    });
-    SESSIONS.lock().unwrap().insert(
-        task_id,
-        RegistryEntry {
-            generation,
-            session: Arc::downgrade(&session),
-        },
-    );
-    session
-}
-
-pub(crate) fn active_task_observation_session(
-    task_id: &TaskId,
-) -> Option<Arc<TaskObservationCompressionSession>> {
-    let mut sessions = SESSIONS.lock().unwrap();
-    let session = sessions.get(task_id)?.session.upgrade();
-    if session.is_none() {
-        sessions.remove(task_id);
-    }
-    session
+    Arc::new(TaskObservationCompressionSession { compressor })
 }
 
 #[async_trait::async_trait]
@@ -305,60 +272,50 @@ mod tests {
         assert_eq!(summaries.load(Ordering::Relaxed), 5);
     }
 
-    #[test]
-    fn task_sessions_are_isolated_and_removed_after_the_last_owner_drops() {
-        let task_a = TaskId::from_str("task-a");
-        let task_b = TaskId::from_str("task-b");
-        let session_a =
-            register_task_observation_session(task_a.clone(), Arc::new(StaticCompressor("a")));
-        let session_b =
-            register_task_observation_session(task_b.clone(), Arc::new(StaticCompressor("b")));
+    #[tokio::test]
+    async fn completion_scope_exposes_only_the_exact_session() {
+        let old = test_task_observation_session(Arc::new(StaticCompressor("old")));
+        let new = test_task_observation_session(Arc::new(StaticCompressor("new")));
 
-        assert!(Arc::ptr_eq(
-            &session_a,
-            &active_task_observation_session(&task_a).unwrap()
-        ));
-        assert!(Arc::ptr_eq(
-            &session_b,
-            &active_task_observation_session(&task_b).unwrap()
-        ));
-
-        drop(session_a);
-        assert!(active_task_observation_session(&task_a).is_none());
-        assert!(active_task_observation_session(&task_b).is_some());
-        drop(session_b);
-        assert!(active_task_observation_session(&task_b).is_none());
+        assert!(completion_observation_session().is_none());
+        scope_completion_observation_session(Arc::clone(&old), async {
+            assert!(Arc::ptr_eq(
+                &old,
+                &completion_observation_session().unwrap()
+            ));
+            scope_completion_observation_session(Arc::clone(&new), async {
+                assert!(Arc::ptr_eq(
+                    &new,
+                    &completion_observation_session().unwrap()
+                ));
+            })
+            .await;
+            assert!(Arc::ptr_eq(
+                &old,
+                &completion_observation_session().unwrap()
+            ));
+        })
+        .await;
+        assert!(completion_observation_session().is_none());
     }
 
-    #[test]
-    fn dropping_an_old_session_does_not_remove_a_newer_overlapping_session() {
-        let task_id = TaskId::from_str("overlap");
-        let old =
-            register_task_observation_session(task_id.clone(), Arc::new(StaticCompressor("old")));
-        let new =
-            register_task_observation_session(task_id.clone(), Arc::new(StaticCompressor("new")));
+    #[tokio::test]
+    async fn concurrent_completion_scopes_do_not_cross_sessions() {
+        let first = test_task_observation_session(Arc::new(StaticCompressor("first")));
+        let second = test_task_observation_session(Arc::new(StaticCompressor("second")));
 
-        drop(old);
-        assert!(Arc::ptr_eq(
-            &new,
-            &active_task_observation_session(&task_id).unwrap()
-        ));
-        drop(new);
-        assert!(active_task_observation_session(&task_id).is_none());
-    }
+        let first_scope = scope_completion_observation_session(Arc::clone(&first), async {
+            tokio::task::yield_now().await;
+            Arc::ptr_eq(&first, &completion_observation_session().unwrap())
+        });
+        let second_scope = scope_completion_observation_session(Arc::clone(&second), async {
+            tokio::task::yield_now().await;
+            Arc::ptr_eq(&second, &completion_observation_session().unwrap())
+        });
 
-    #[test]
-    fn completion_owner_keeps_session_registered_until_callback_finishes() {
-        let task_id = TaskId::from_str("completion-lifetime");
-        let task_owner = register_task_observation_session(
-            task_id.clone(),
-            Arc::new(StaticCompressor("compressed")),
-        );
-        let completion_owner = Arc::clone(&task_owner);
-
-        drop(task_owner);
-        assert!(active_task_observation_session(&task_id).is_some());
-        drop(completion_owner);
-        assert!(active_task_observation_session(&task_id).is_none());
+        let (first_isolated, second_isolated) = tokio::join!(first_scope, second_scope);
+        assert!(first_isolated);
+        assert!(second_isolated);
+        assert!(completion_observation_session().is_none());
     }
 }

@@ -734,8 +734,7 @@ where
     }
 
     tokio::spawn(async move {
-        // Keep the registry's weak entry live until the completion callback returns.
-        let _observation_session = observation_session;
+        // Keep the exact task session live until the completion callback returns.
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -778,7 +777,17 @@ where
         store_watcher.close_task_stream(&id_watcher);
         if let Some(cb) = completion_callback {
             match store_watcher.get(&id_watcher) {
-                Some(final_state) => cb(final_state).await,
+                Some(final_state) => {
+                    let callback = cb(final_state);
+                    if let Some(session) = observation_session {
+                        crate::observation_compression::scope_completion_observation_session(
+                            session, callback,
+                        )
+                        .await;
+                    } else {
+                        callback.await;
+                    }
+                }
                 None => tracing::warn!(
                     "completion_callback: task {:?} not found in store after completion",
                     id_watcher

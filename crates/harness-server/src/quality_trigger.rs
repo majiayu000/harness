@@ -1,5 +1,5 @@
-use crate::handlers::cross_review::{run_cross_review, run_cross_review_with_context};
-use crate::observation_compression::{active_task_observation_session, RawObservationSink};
+use crate::handlers::cross_review::run_cross_review_with_context;
+use crate::observation_compression::{completion_observation_session, RawObservationSink};
 use crate::task_runner::TaskId;
 use chrono::{Duration as ChronoDuration, Utc};
 use harness_core::agent::CodeAgent;
@@ -112,17 +112,16 @@ impl QualityTrigger {
         turn: u32,
         raw_sink: Option<Arc<dyn RawObservationSink>>,
     ) {
-        let compression =
-            active_task_observation_session(task_id)
-                .zip(raw_sink)
-                .map(|(session, sink)| {
-                    crate::handlers::cross_review::CrossReviewCompressionContext::new(
-                        task_id.clone(),
-                        turn,
-                        session,
-                        sink,
-                    )
-                });
+        let compression = completion_observation_session()
+            .zip(raw_sink)
+            .map(|(session, sink)| {
+                crate::handlers::cross_review::CrossReviewCompressionContext::new(
+                    task_id.clone(),
+                    turn,
+                    session,
+                    sink,
+                )
+            });
         self.check_and_maybe_trigger_inner(task_ctx, compression.as_ref())
             .await;
     }
@@ -239,30 +238,15 @@ impl QualityTrigger {
                             const CROSS_REVIEW_TIMEOUT_SECS: u64 = 120;
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(CROSS_REVIEW_TIMEOUT_SECS),
-                                async {
-                                    if let Some(context) = compression {
-                                        run_cross_review_with_context(
-                                            primary,
-                                            Some(rc),
-                                            self.project_root.clone(),
-                                            target,
-                                            2,
-                                            Some(vec![]),
-                                            Some(context),
-                                        )
-                                        .await
-                                    } else {
-                                        run_cross_review(
-                                            primary,
-                                            Some(rc),
-                                            self.project_root.clone(),
-                                            target,
-                                            2,
-                                            Some(vec![]),
-                                        )
-                                        .await
-                                    }
-                                },
+                                run_cross_review_with_context(
+                                    primary,
+                                    Some(rc),
+                                    self.project_root.clone(),
+                                    target,
+                                    2,
+                                    Some(vec![]),
+                                    compression,
+                                ),
                             )
                             .await
                             {
