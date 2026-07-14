@@ -250,35 +250,55 @@ impl NapSampler for EveryN {
     }
 }
 
-/// Verifies one seed-selected position in each `n`-call window.
+/// Applies the configured verification rate with a seed-selected phase.
 ///
 /// The seed is mapped with 64-bit FNV-1a, whose constants and byte-wise
 /// algorithm are fixed here to keep replay behavior stable across processes
 /// and Rust releases. This hash is only for deterministic sampling, not
-/// security. Distinct task/request IDs therefore spread short-lived handles
-/// across the configured sampling window instead of all starting at the same
-/// unsampled sequence position.
+/// security. The phase gives each call the configured selection probability
+/// across distinct task/request IDs while systematic sampling keeps the
+/// long-run rate close to the configured value for each handle.
 #[derive(Debug, Clone, Copy)]
-pub struct SeededEveryN {
-    every: u64,
-    position: u64,
+pub struct SeededRateSampler {
+    rate_units: u64,
+    phase_units: u64,
 }
 
-impl SeededEveryN {
+const SAMPLING_UNITS: u64 = 1_u64 << 53;
+
+impl SeededRateSampler {
     pub fn from_rate(rate: f64, seed: &str) -> Self {
-        let every = EveryN::from_rate(rate).0;
-        let position = if every == u64::MAX {
-            0
+        let rate = if rate.is_nan() {
+            0.0
         } else {
-            stable_seed_hash(seed) % every
+            rate.clamp(0.0, 1.0)
         };
-        Self { every, position }
+        // Use 53-bit fixed-point units so arbitrary f64 rates retain their
+        // configured precision without floating-point sequence drift.
+        let rate_units = (rate * SAMPLING_UNITS as f64).round() as u64;
+        let phase_units = stable_seed_hash(seed) >> 11;
+        Self {
+            rate_units,
+            phase_units,
+        }
     }
 }
 
-impl NapSampler for SeededEveryN {
+impl NapSampler for SeededRateSampler {
     fn should_verify(&self, seq: u64) -> bool {
-        self.every != u64::MAX && seq.wrapping_sub(1) % self.every == self.position
+        if seq == 0 || self.rate_units == 0 {
+            return false;
+        }
+        if self.rate_units >= SAMPLING_UNITS {
+            return true;
+        }
+
+        let scale = u128::from(SAMPLING_UNITS);
+        let rate = u128::from(self.rate_units);
+        let phase = u128::from(self.phase_units);
+        let current = (u128::from(seq) * rate + phase) / scale;
+        let previous = (u128::from(seq - 1) * rate + phase) / scale;
+        current > previous
     }
 }
 
@@ -319,13 +339,13 @@ impl<M: CompressModel> PromptCompressor<M, EveryN> {
     }
 }
 
-impl<M: CompressModel> PromptCompressor<M, SeededEveryN> {
+impl<M: CompressModel> PromptCompressor<M, SeededRateSampler> {
     /// Construct a compressor whose deterministic verification phase is
     /// derived from a stable task/request identifier.
     pub fn new_seeded(model: M, sample_rate: f64, min_size_bytes: usize, seed: &str) -> Self {
         Self::with_sampler(
             model,
-            SeededEveryN::from_rate(sample_rate, seed),
+            SeededRateSampler::from_rate(sample_rate, seed),
             min_size_bytes,
         )
     }
@@ -568,10 +588,10 @@ mod tests {
     #[test]
     fn seeded_sampler_is_stable_and_distributes_first_calls() {
         let decisions: Vec<bool> = (0..1_000)
-            .map(|seed| SeededEveryN::from_rate(0.1, &format!("task-{seed}")).should_verify(1))
+            .map(|seed| SeededRateSampler::from_rate(0.1, &format!("task-{seed}")).should_verify(1))
             .collect();
         let repeated: Vec<bool> = (0..1_000)
-            .map(|seed| SeededEveryN::from_rate(0.1, &format!("task-{seed}")).should_verify(1))
+            .map(|seed| SeededRateSampler::from_rate(0.1, &format!("task-{seed}")).should_verify(1))
             .collect();
         let selected = decisions.iter().filter(|decision| **decision).count();
 
@@ -583,13 +603,19 @@ mod tests {
     }
 
     #[test]
-    fn seeded_sampler_verifies_once_per_window() {
-        let sampler = SeededEveryN::from_rate(0.1, "task-1574");
-        assert_eq!(
-            (1..=20).filter(|seq| sampler.should_verify(*seq)).count(),
-            2
-        );
-        assert!(!SeededEveryN::from_rate(0.0, "task-1574").should_verify(1));
+    fn seeded_sampler_honors_arbitrary_rates() {
+        for rate in [0.1, 0.6, 0.75] {
+            let sampler = SeededRateSampler::from_rate(rate, "task-1574");
+            let selected = (1..=10_000)
+                .filter(|seq| sampler.should_verify(*seq))
+                .count();
+            let expected = (10_000.0 * rate) as usize;
+            assert!(selected.abs_diff(expected) <= 1, "rate={rate}");
+        }
+
+        assert!(!SeededRateSampler::from_rate(0.0, "task-1574").should_verify(1));
+        assert!(SeededRateSampler::from_rate(2.0, "task-1574").should_verify(1));
+        assert!(!SeededRateSampler::from_rate(f64::NAN, "task-1574").should_verify(1));
     }
 
     #[tokio::test]
