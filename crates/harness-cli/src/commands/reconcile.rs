@@ -5,7 +5,7 @@ use harness_server::reconciliation::ReconciliationReport;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const REQUEST_TIMEOUT_SECS: u64 = 30;
+const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig) -> Result<()> {
     if let Some(project_root) = project {
@@ -18,7 +18,10 @@ pub async fn run(dry_run: bool, project: Option<PathBuf>, config: &HarnessConfig
     let base_url = status::server_base_url(config, None)?;
     let token = status::resolve_api_token(config);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        // Reconciliation deliberately sleeps between GitHub rate-limit windows.
+        // Bound connection setup, but let the synchronous admin operation return
+        // its complete report instead of timing out after partially applying work.
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .no_proxy()
         .build()
         .context("failed to build HTTP client")?;
