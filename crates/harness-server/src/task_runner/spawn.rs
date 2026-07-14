@@ -555,6 +555,12 @@ where
 
         // Retry loop: on transient errors, back off and retry up to MAX_TRANSIENT_RETRIES.
         // Retrying inside the spawn means the stream stays open and the task actually re-runs.
+        // Keep the observation compressor outside the retry loop so NAP sampling and
+        // breaker state span the complete task lifecycle rather than one attempt.
+        let observation_compressor =
+            crate::task_executor::compression::build_task_observation_compressor(
+                &server_config.context.compression,
+            );
         let mut transient_attempts = 0u32;
         // Track total turns used across all transient-retry attempts so the
         // max_turns budget is enforced globally over the full task lifecycle.
@@ -594,6 +600,7 @@ where
                 server_config.as_ref(),
                 issue_workflow_store.clone(),
                 workflow_runtime_store.clone(),
+                observation_compressor.as_deref(),
                 &mut total_turns_used,
             )
             .await;

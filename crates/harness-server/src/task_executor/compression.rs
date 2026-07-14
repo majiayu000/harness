@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub(crate) type TaskObservationCompressor = Arc<dyn ObservationCompressor>;
 
 /// Build one compressor for the full task lifecycle so sampling and breaker
-/// state accumulate across prompt-injection seams.
+/// state accumulate across prompt-injection seams and transient retries.
 ///
 /// GH-1574 still needs separate wiring for triage-to-plan, cross-review,
 /// workflow-runtime, and composer seams; this legacy path currently injects
