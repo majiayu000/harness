@@ -27,8 +27,8 @@ pub(super) struct ExecutedImplementation {
 pub(super) async fn execute_implementation_turn(
     agent: &dyn CodeAgent,
     first_prompt: String,
-    context_items: Vec<ContextItem>,
-    initial_allowed_tools: Option<Vec<String>>,
+    context_items: &[ContextItem],
+    initial_allowed_tools: Option<&[String]>,
     cargo_env: &HashMap<String, String>,
     req: &CreateTaskRequest,
     store: &TaskStore,
@@ -46,10 +46,10 @@ pub(super) async fn execute_implementation_turn(
     let initial_req = AgentRequest {
         prompt: first_prompt,
         project_root: project.to_path_buf(),
-        context: context_items.clone(),
+        context: context_items.to_vec(),
         max_budget_usd: req.max_budget_usd,
         execution_phase: Some(ExecutionPhase::Execution),
-        allowed_tools: initial_allowed_tools.clone(),
+        allowed_tools: initial_allowed_tools.map(<[String]>::to_vec),
         env_vars: cargo_env.clone(),
         ..Default::default()
     };

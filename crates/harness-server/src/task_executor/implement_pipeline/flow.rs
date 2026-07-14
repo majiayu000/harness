@@ -276,8 +276,8 @@ pub(crate) async fn run_implement_phase(
     let executed = turn::execute_implementation_turn(
         agent,
         first_prompt,
-        context_items.clone(),
-        initial_allowed_tools.clone(),
+        &context_items,
+        initial_allowed_tools.as_deref(),
         cargo_env,
         req,
         store,
