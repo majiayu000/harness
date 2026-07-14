@@ -70,6 +70,7 @@ pub(crate) async fn run_task(
     server_config: &harness_core::config::HarnessConfig,
     issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
+    observation_compressor: Option<&dyn harness_core::compress::ObservationCompressor>,
     turns_used_acc: &mut u32,
 ) -> anyhow::Result<()> {
     harness_core::usage_probe::record_usage(
@@ -89,6 +90,7 @@ pub(crate) async fn run_task(
         server_config,
         issue_workflow_store,
         workflow_runtime_store,
+        observation_compressor,
         turns_used_acc,
     )
     .await
