@@ -2,6 +2,7 @@
 
 ## Language
 
+Use the user's language for conversation. Keep repository artifacts in English, including:
 - Code comments and documentation
 - Commit messages and PR titles/descriptions
 - Prompt templates in `prompts.rs`
