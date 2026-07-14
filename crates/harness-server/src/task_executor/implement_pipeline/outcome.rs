@@ -177,9 +177,7 @@ pub(super) async fn process_implementation_output(
     let (pr_url, pr_num, created_issue_num, pushed_commit, review_prep) =
         match parse_implementation_outcome(&output) {
             Ok(ImplementationOutcome::PlanIssue(plan_issue)) => {
-                if let (Some(workflows), Some(issue_number)) =
-                    (issue_workflow_store.as_ref(), req.issue)
-                {
+                if let (Some(workflows), Some(issue_number)) = (issue_workflow_store, req.issue) {
                     let project_id = project_root.to_string_lossy().into_owned();
                     if let Err(e) = workflows
                         .record_plan_issue_detected(
@@ -503,7 +501,7 @@ pub(super) async fn process_implementation_output(
     // Emit PrDetected event so crash recovery can reconstruct pr_url.
     if let Some(pr_url_str) = pr_url.as_deref() {
         if let (Some(workflows), Some(issue_number), Some(pr_number)) =
-            (issue_workflow_store.as_ref(), req.issue, pr_num)
+            (issue_workflow_store, req.issue, pr_num)
         {
             let project_id = project.to_string_lossy().into_owned();
             if let Err(e) = workflows
@@ -526,7 +524,7 @@ pub(super) async fn process_implementation_output(
             }
         }
         if let (Some(workflow_runtime), Some(issue_number), Some(pr_number)) =
-            (workflow_runtime_store.as_ref(), req.issue, pr_num)
+            (workflow_runtime_store, req.issue, pr_num)
         {
             crate::workflow_runtime_pr_feedback::record_pr_detected(
                 Some(workflow_runtime),
