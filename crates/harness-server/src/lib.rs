@@ -34,6 +34,7 @@ pub mod intake;
 pub(crate) mod isolation_health;
 pub mod memory_monitor;
 pub mod notify;
+pub(crate) mod observation_compression;
 pub mod overview;
 pub mod parallel_dispatch;
 pub mod periodic_retry;

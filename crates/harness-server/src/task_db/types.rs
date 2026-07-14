@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Maximum artifact content size in bytes before truncation.
-pub(super) const ARTIFACT_MAX_BYTES: usize = 65_536;
+pub(crate) const ARTIFACT_MAX_BYTES: usize = 65_536;
 
 /// Maximum prompt content size in bytes before truncation (2 MB).
 pub(super) const PROMPT_MAX_BYTES: usize = 2 * 1024 * 1024;
