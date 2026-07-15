@@ -56,13 +56,13 @@ impl WorkflowStateDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkflowDefinition {
+pub struct RegisteredWorkflowDefinition {
     pub id: String,
     pub states: Vec<WorkflowStateDefinition>,
     pub allowlist: TransitionAllowlist,
 }
 
-impl WorkflowDefinition {
+impl RegisteredWorkflowDefinition {
     pub fn new(
         id: impl Into<String>,
         states: Vec<WorkflowStateDefinition>,
@@ -78,18 +78,22 @@ impl WorkflowDefinition {
 
 #[derive(Debug)]
 pub struct WorkflowDefinitionRegistry {
-    definitions: HashMap<String, Arc<WorkflowDefinition>>,
+    definitions: HashMap<String, Arc<RegisteredWorkflowDefinition>>,
     definition_ids: Vec<String>,
     frozen: bool,
 }
 
 impl WorkflowDefinitionRegistry {
-    fn with_builtins() -> Self {
-        let mut registry = Self {
+    pub fn new() -> Self {
+        Self {
             definitions: HashMap::new(),
             definition_ids: Vec::new(),
             frozen: false,
-        };
+        }
+    }
+
+    fn with_builtins() -> Self {
+        let mut registry = Self::new();
         for definition in builtin_definitions() {
             registry
                 .register(definition)
@@ -100,14 +104,10 @@ impl WorkflowDefinitionRegistry {
 
     #[cfg(test)]
     pub fn new_for_tests() -> Self {
-        Self {
-            definitions: HashMap::new(),
-            definition_ids: Vec::new(),
-            frozen: false,
-        }
+        Self::new()
     }
 
-    pub fn register(&mut self, definition: WorkflowDefinition) -> anyhow::Result<()> {
+    pub fn register(&mut self, definition: RegisteredWorkflowDefinition) -> anyhow::Result<()> {
         if self.frozen {
             anyhow::bail!(
                 "workflow definition registry is frozen; cannot register '{}'",
@@ -134,12 +134,27 @@ impl WorkflowDefinitionRegistry {
         self.frozen
     }
 
-    pub fn definition(&self, definition_id: &str) -> Option<Arc<WorkflowDefinition>> {
+    pub fn definition(&self, definition_id: &str) -> Option<Arc<RegisteredWorkflowDefinition>> {
         self.definitions.get(definition_id).cloned()
+    }
+
+    pub fn decision_validator_for_definition(
+        &self,
+        definition_id: &str,
+    ) -> Option<DecisionValidator> {
+        self.definition(definition_id).map(|definition| {
+            DecisionValidator::for_definition(definition_id, definition.allowlist.clone())
+        })
     }
 
     pub fn known_definition_ids(&self) -> Vec<String> {
         self.definition_ids.clone()
+    }
+}
+
+impl Default for WorkflowDefinitionRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -149,7 +164,9 @@ fn registry() -> &'static RwLock<WorkflowDefinitionRegistry> {
     REGISTRY.get_or_init(|| RwLock::new(WorkflowDefinitionRegistry::with_builtins()))
 }
 
-pub fn register_workflow_definition(definition: WorkflowDefinition) -> anyhow::Result<()> {
+pub fn register_workflow_definition(
+    definition: RegisteredWorkflowDefinition,
+) -> anyhow::Result<()> {
     registry()
         .write()
         .expect("workflow definition registry lock poisoned")
@@ -163,7 +180,7 @@ pub fn freeze_workflow_definition_registry() {
         .freeze();
 }
 
-pub fn workflow_definition(definition_id: &str) -> Option<Arc<WorkflowDefinition>> {
+pub fn workflow_definition(definition_id: &str) -> Option<Arc<RegisteredWorkflowDefinition>> {
     registry()
         .read()
         .expect("workflow definition registry lock poisoned")
@@ -171,9 +188,10 @@ pub fn workflow_definition(definition_id: &str) -> Option<Arc<WorkflowDefinition
 }
 
 pub fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
-    workflow_definition(definition_id).map(|definition| {
-        DecisionValidator::for_definition(definition_id, definition.allowlist.clone())
-    })
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .decision_validator_for_definition(definition_id)
 }
 
 pub fn known_workflow_definition_ids() -> Vec<String> {
@@ -226,7 +244,7 @@ pub fn workflow_state_terminal_state(
     workflow_state_definition(definition_id, state)?.terminal_state
 }
 
-fn builtin_definitions() -> [WorkflowDefinition; 4] {
+fn builtin_definitions() -> [RegisteredWorkflowDefinition; 4] {
     [
         github_issue_pr_definition(),
         prompt_task_definition(),
@@ -235,7 +253,7 @@ fn builtin_definitions() -> [WorkflowDefinition; 4] {
     ]
 }
 
-fn github_issue_pr_definition() -> WorkflowDefinition {
+fn github_issue_pr_definition() -> RegisteredWorkflowDefinition {
     definition(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         &[
@@ -261,7 +279,7 @@ fn github_issue_pr_definition() -> WorkflowDefinition {
     )
 }
 
-fn prompt_task_definition() -> WorkflowDefinition {
+fn prompt_task_definition() -> RegisteredWorkflowDefinition {
     definition(
         PROMPT_TASK_DEFINITION_ID,
         &[
@@ -277,7 +295,7 @@ fn prompt_task_definition() -> WorkflowDefinition {
     )
 }
 
-fn quality_gate_definition() -> WorkflowDefinition {
+fn quality_gate_definition() -> RegisteredWorkflowDefinition {
     definition(
         QUALITY_GATE_DEFINITION_ID,
         &[
@@ -292,7 +310,7 @@ fn quality_gate_definition() -> WorkflowDefinition {
     )
 }
 
-fn pr_feedback_definition() -> WorkflowDefinition {
+fn pr_feedback_definition() -> RegisteredWorkflowDefinition {
     definition(
         PR_FEEDBACK_DEFINITION_ID,
         &[
@@ -314,8 +332,8 @@ fn definition(
     id: &'static str,
     states: &[(&'static str, Option<WorkflowTerminalState>)],
     allowlist: TransitionAllowlist,
-) -> WorkflowDefinition {
-    WorkflowDefinition::new(
+) -> RegisteredWorkflowDefinition {
+    RegisteredWorkflowDefinition::new(
         id,
         states
             .iter()
@@ -329,6 +347,10 @@ fn definition(
         allowlist,
     )
 }
+
+#[cfg(test)]
+#[path = "state_registry_equivalence_tests.rs"]
+mod equivalence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -421,17 +443,6 @@ mod tests {
                     rule.to_state
                 );
             }
-        }
-    }
-
-    #[test]
-    fn builtins_preserve_states_terminal_mappings_and_allowlists() {
-        let expected = builtin_definitions();
-
-        for expected_definition in expected {
-            let actual = workflow_definition(&expected_definition.id)
-                .expect("built-in definition should be registered");
-            assert_eq!(actual.as_ref(), &expected_definition);
         }
     }
 
