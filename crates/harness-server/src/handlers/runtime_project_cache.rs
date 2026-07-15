@@ -1,5 +1,6 @@
 use crate::http::AppState;
 use crate::project_registry::{check_allowed_roots, validate_project_root};
+use crate::runtime_hosts::RuntimeHostLifecycle;
 use crate::runtime_project_cache::WatchedProjectInput;
 use axum::{
     extract::{Path, State},
@@ -47,18 +48,11 @@ pub async fn sync_runtime_host_projects(
     if let Err(response) = ensure_runtime_state_persistence_available(&state) {
         return response;
     }
-    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
-    if !host_exists(&state, &host_id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "runtime host not found"})),
-        );
-    }
-    if !state.runtime_hosts.is_active(&host_id) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "runtime host is draining"})),
-        );
+    {
+        let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
+        if let Err(response) = ensure_active_host(&state, &host_id) {
+            return response;
+        }
     }
 
     let mut inputs: Vec<WatchedProjectInput> = Vec::with_capacity(req.projects.len());
@@ -83,6 +77,10 @@ pub async fn sync_runtime_host_projects(
         });
     }
 
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
+    if let Err(response) = ensure_active_host(&state, &host_id) {
+        return response;
+    }
     let snapshot = state
         .runtime_project_cache
         .sync_host_projects(&host_id, inputs);
@@ -94,6 +92,23 @@ pub async fn sync_runtime_host_projects(
 
 fn host_exists(state: &AppState, host_id: &str) -> bool {
     state.runtime_hosts.hosts.contains_key(host_id)
+}
+
+fn ensure_active_host(
+    state: &AppState,
+    host_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match state.runtime_hosts.lifecycle(host_id) {
+        Some(RuntimeHostLifecycle::Active) => Ok(()),
+        Some(RuntimeHostLifecycle::Draining) => Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "runtime host is draining"})),
+        )),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime host not found"})),
+        )),
+    }
 }
 
 async fn resolve_project_token(
