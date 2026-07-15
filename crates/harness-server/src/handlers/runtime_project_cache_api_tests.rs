@@ -323,3 +323,74 @@ async fn sync_after_deregister_does_not_recreate_cache() -> anyhow::Result<()> {
         .is_none());
     Ok(())
 }
+
+#[tokio::test]
+async fn draining_host_cannot_repopulate_cache_after_partial_deregister() -> anyhow::Result<()> {
+    let data_dir = tempfile::tempdir()?;
+    let project_dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(project_dir.path().join(".git"))?;
+
+    let Some((state, runtime_store)) =
+        super::runtime_hosts_workflow_api_tests::make_test_state_with_runtime_store(
+            data_dir.path(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let app = runtime_project_cache_app(state.clone());
+
+    let register = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"host_id": "host-a"}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(register.status(), StatusCode::OK);
+
+    sqlx::query("DROP TABLE runtime_jobs CASCADE")
+        .execute(runtime_store.pool())
+        .await?;
+    let deregister = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/deregister")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(deregister.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        state.runtime_hosts.lifecycle("host-a"),
+        Some(crate::runtime_hosts::RuntimeHostLifecycle::Draining)
+    );
+
+    state.runtime_project_cache.clear_host("host-a");
+    let stale_sync = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/projects/sync")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "projects": [{"project": project_dir.path().to_string_lossy()}]
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(stale_sync.status(), StatusCode::CONFLICT);
+    assert!(state
+        .runtime_project_cache
+        .get_host_cache("host-a")
+        .is_none());
+    Ok(())
+}

@@ -47,10 +47,17 @@ pub async fn sync_runtime_host_projects(
     if let Err(response) = ensure_runtime_state_persistence_available(&state) {
         return response;
     }
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     if !host_exists(&state, &host_id) {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "runtime host not found"})),
+        );
+    }
+    if !state.runtime_hosts.is_active(&host_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "runtime host is draining"})),
         );
     }
 
@@ -76,14 +83,6 @@ pub async fn sync_runtime_host_projects(
         });
     }
 
-    // Keep a read guard while writing cache to prevent concurrent deregister()
-    // from deleting the host between validation and cache sync.
-    let Some(_host_guard) = state.runtime_hosts.hosts.get(&host_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "runtime host not found"})),
-        );
-    };
     let snapshot = state
         .runtime_project_cache
         .sync_host_projects(&host_id, inputs);
