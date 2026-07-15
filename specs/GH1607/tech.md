@@ -103,8 +103,11 @@ arm with a function `prompt_task_success_decision(instance, event, result)`:
        `continue_prompt_task`, command
        `enqueue_activity(implement_prompt, "prompt-task:{id}:attempt:{n+1}")`
        plus a data patch updating `attempt`, `last_external_state`,
-       `same_state_count` (B-004, B-009). Attempt-scoped dedupe keys make
-       restart-resume idempotent.
+       `last_summary` from `result.summary`, and `same_state_count`
+       (B-004, B-009, B-011). The patch and enqueue command commit in the
+       same completion transaction, so the next prompt packet can read its
+       complete continuation context from persisted instance data.
+       Attempt-scoped dedupe keys make restart-resume idempotent.
 3. Every branch attaches the parsed signal as `WorkflowEvidence`
    (`kind: "external_state"`) on the decision (B-013).
 
@@ -113,9 +116,10 @@ mutate `instance.data` through decision commands; if no such mechanism
 exists for data patches inside a decision, add a
 `WorkflowCommandType::PatchInstanceData`-free approach: the completion
 transaction already persists the instance, so the store applies the
-`continuation` counters when committing a `continue_prompt_task`
-decision (implementation detail to pin in T002; the invariant is
-atomicity with the transition, B-004/B-009).
+`continuation` counters and `last_summary` when committing a
+`continue_prompt_task` decision (implementation detail to pin in T002;
+the invariant is atomic persistence with the transition and enqueue,
+B-004/B-009/B-011).
 
 ### Validator changes (`validator.rs`)
 
@@ -177,9 +181,11 @@ scheduler.
   the instance; the completion reducer observes a terminal instance and
   produces no continuation (stale-completion guard, `reducer.rs:384-399`
   pattern) (B-012).
-- `active_states` values that never match because the tracker renamed a
-  state: loop ends via no-progress guard (B-008) rather than running the
-  full budget.
+- If the tracker renames an active state and the reported value is absent
+  from configured `active_states`, the reducer follows the settled branch
+  and transitions to `done` (B-005). Operators must update the policy when
+  tracker state names change; this case does not enter the no-progress
+  guard.
 
 ## Migration / Compatibility
 
@@ -198,6 +204,8 @@ scheduler.
   self-transition contract. Named validator tests prove the positive
   `continue_prompt_task` case and reject an arbitrary decision ID, no
   command, `Wait` only, wrong activity, and multiple enqueue commands.
+  The continue-branch test also reloads the committed instance and asserts
+  that `last_summary == result.summary` before prompt construction.
 - Persistence (`cargo test -p harness-workflow store`): counters and
   policy survive a store round-trip; attempt-scoped dedupe key idempotency
   (B-009).
