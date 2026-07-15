@@ -290,6 +290,7 @@ impl super::store::WorkflowRuntimeStore {
             if current_owner.is_some()
                 || current_lease_expires_at.is_some()
                 || attempt == 0
+                || current_generation <= 0
                 || !matches_deferred_row(
                     &persisted,
                     command_id,

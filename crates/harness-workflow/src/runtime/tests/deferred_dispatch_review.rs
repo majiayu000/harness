@@ -280,6 +280,31 @@ async fn deferred_command_rejects_incomplete_or_mismatched_evidence() -> anyhow:
             "{name} must fail closed"
         );
     }
+    let mut coherent_zero_generation = serde_json::to_value(&barrier)?;
+    coherent_zero_generation["claim_generation"] = json!(0);
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = $2, dispatch_attempt_count = 1,
+             dispatch_claim_generation = 0, dispatch_barrier = $3::jsonb,
+             dispatch_owner = NULL, dispatch_lease_expires_at = NULL
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .bind(due)
+    .bind(coherent_zero_generation.to_string())
+    .execute(store.pool())
+    .await?;
+    assert!(store
+        .defer_claimed_command_if_owned(
+            &command_id,
+            "evidence-owner",
+            0,
+            test_dispatch_barrier("must reject generation zero replay"),
+            Utc::now(),
+            DispatchBackoffPolicy::default(),
+        )
+        .await
+        .is_err());
     sqlx::query(
         "UPDATE workflow_commands
          SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
