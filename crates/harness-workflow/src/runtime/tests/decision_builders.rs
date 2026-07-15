@@ -1,5 +1,5 @@
 #[test]
-fn issue_submission_decision_starts_discovered_issue_planning() {
+fn submission_driver_dedupe_key() {
     let labels = vec!["bug".to_string(), "p1".to_string()];
     let instance = issue_instance("discovered");
     let output = build_issue_submission_decision(
@@ -29,7 +29,7 @@ fn issue_submission_decision_starts_discovered_issue_planning() {
     );
     assert_eq!(
         output.decision.commands[0].dedupe_key,
-        "issue-submit:owner/repo:issue:123:task:task-1:plan"
+        format!("{}:discovered:submit", instance.id)
     );
     assert_eq!(
         output.decision.commands[0].command["additional_prompt"],

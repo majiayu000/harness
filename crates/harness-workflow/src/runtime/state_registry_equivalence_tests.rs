@@ -455,6 +455,7 @@ const GITHUB_ISSUE_PR_RULES: &[ExpectedRule] = &[
     (Some("scheduled"), "pr_open", &[B, E, S, W]),
     (Some("pr_open"), "pr_open", &[B, W]),
     (Some("pr_open"), "local_review_gate", &[E, W]),
+    (Some("pr_open"), "awaiting_feedback", &[W]),
     (Some("local_review_gate"), "local_review_gate", &[E, W]),
     (Some("local_review_gate"), "awaiting_feedback", &[W]),
     (

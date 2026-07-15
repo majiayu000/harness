@@ -1,5 +1,5 @@
 #[test]
-fn runtime_completion_reducer_resumes_after_replan() {
+fn event_transition_dedupe_keys() {
     let instance = issue_instance("replanning");
     let result = ActivityResult::succeeded("replan_issue", "Replan completed.");
     let event = WorkflowEvent::new(
@@ -20,6 +20,15 @@ fn runtime_completion_reducer_resumes_after_replan() {
 
     assert_eq!(decision.decision, "resume_implementation_after_replan");
     assert_eq!(decision.next_state, "implementing");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("implement_issue")
+    );
+    assert_eq!(
+        decision.commands[0].dedupe_key,
+        format!("issue-replan:{}:implement:command-1", instance.id)
+    );
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,

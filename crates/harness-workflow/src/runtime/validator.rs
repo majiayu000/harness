@@ -1,4 +1,5 @@
 use super::model::{WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowInstance};
+use super::validator_progress;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -202,6 +203,7 @@ impl TransitionAllowlist {
             )
             .allow("pr_open", "pr_open", [BindPr, Wait])
             .allow("pr_open", "local_review_gate", [EnqueueActivity, Wait])
+            .allow("pr_open", "awaiting_feedback", [Wait])
             .allow(
                 "local_review_gate",
                 "local_review_gate",
@@ -390,6 +392,7 @@ pub enum WorkflowDecisionRejectionKind {
     TerminalReopenDenied,
     RequiredCommandMissing,
     InvalidCommandPayload,
+    ProgressDriverMissing,
     MissingTerminalEvidence,
 }
 
@@ -400,7 +403,7 @@ pub struct WorkflowDecisionRejection {
 }
 
 impl WorkflowDecisionRejection {
-    fn new(kind: WorkflowDecisionRejectionKind, message: impl Into<String>) -> Self {
+    pub(super) fn new(kind: WorkflowDecisionRejectionKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -528,7 +531,7 @@ impl DecisionValidator {
             }
         }
 
-        if self.validate_hidden_workflow_transition(decision, context)? {
+        if self.validate_hidden_workflow_transition(instance, decision, context)? {
             return Ok(());
         }
 
@@ -546,6 +549,7 @@ impl DecisionValidator {
         };
 
         self.validate_commands(rule, decision, context)?;
+        validator_progress::validate_target_progress_contract(instance, decision)?;
         self.validate_workflow_specific_rules(decision, context)
     }
 
@@ -565,6 +569,13 @@ impl DecisionValidator {
         let mut seen_dedupe_keys = BTreeSet::new();
 
         for command in &decision.commands {
+            let Some(payload) = command.command.as_object() else {
+                return Err(WorkflowDecisionRejection::new(
+                    WorkflowDecisionRejectionKind::InvalidCommandPayload,
+                    "workflow command payload must be a JSON object",
+                ));
+            };
+
             if !rule.allowed_commands.contains(&command.command_type) {
                 return Err(WorkflowDecisionRejection::new(
                     WorkflowDecisionRejectionKind::CommandNotAllowed,
@@ -575,8 +586,8 @@ impl DecisionValidator {
                 ));
             }
 
+            self.validate_command_payload(command, payload)?;
             self.validate_dedupe(command, &mut seen_dedupe_keys, context)?;
-            self.validate_command_payload(command)?;
 
             if command.requires_runtime_job() && !context.resource_budget_available {
                 return Err(WorkflowDecisionRejection::new(
@@ -641,6 +652,7 @@ impl DecisionValidator {
 
     fn validate_hidden_workflow_transition(
         &self,
+        instance: &WorkflowInstance,
         decision: &WorkflowDecision,
         context: &ValidationContext,
     ) -> Result<bool, WorkflowDecisionRejection> {
@@ -658,6 +670,7 @@ impl DecisionValidator {
             [WorkflowCommandType::MarkDone],
         );
         self.validate_commands(&rule, decision, context)?;
+        validator_progress::validate_target_progress_contract(instance, decision)?;
         github_issue_pr_validation::validate_reconciliation_only_pr_merge_done(decision, context)?;
         Ok(true)
     }
@@ -665,13 +678,13 @@ impl DecisionValidator {
     fn validate_command_payload(
         &self,
         command: &WorkflowCommand,
+        payload: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), WorkflowDecisionRejection> {
         if command.command_type != WorkflowCommandType::BindPr {
             return Ok(());
         }
 
-        if command
-            .command
+        if payload
             .get("pr_number")
             .and_then(serde_json::Value::as_u64)
             .is_none()
@@ -682,8 +695,7 @@ impl DecisionValidator {
             ));
         }
 
-        if command
-            .command
+        if payload
             .get("pr_url")
             .and_then(serde_json::Value::as_str)
             .is_none_or(|value| value.trim().is_empty())

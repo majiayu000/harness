@@ -37,6 +37,7 @@ pub mod submission;
 pub mod terminal_state;
 pub mod tier_resolution;
 pub mod validator;
+mod validator_progress;
 pub mod worker;
 
 #[cfg(test)]
