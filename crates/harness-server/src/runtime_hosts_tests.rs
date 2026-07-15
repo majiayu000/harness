@@ -1,6 +1,7 @@
 use crate::runtime_hosts::{RuntimeHostLifecycle, RuntimeHostManager};
 use chrono::{TimeDelta, Utc};
-use std::sync::Arc;
+use std::future::{poll_fn, Future};
+use std::task::Poll;
 
 #[test]
 fn register_upserts_host_metadata() {
@@ -117,29 +118,45 @@ fn persisted_legacy_host_defaults_to_active() {
     assert_eq!(host.lifecycle, RuntimeHostLifecycle::Active);
 }
 
-#[test]
-fn operation_lock_is_stable_across_deregistration_and_host_id_reuse() {
-    let manager = RuntimeHostManager::with_heartbeat_timeout(60);
-    manager.register("host-a".to_string(), None, vec![]);
-
-    let before = manager.operation_lock("host-a");
-    assert!(manager.deregister("host-a"));
-    manager.register("host-a".to_string(), None, vec![]);
-    let after = manager.operation_lock("host-a");
-    let other = manager.operation_lock("host-b");
-
-    assert!(Arc::ptr_eq(&before, &after));
-    assert!(!Arc::ptr_eq(&before, &other));
-}
-
 #[tokio::test]
 async fn operation_lock_serializes_same_host_without_blocking_other_hosts() {
     let manager = RuntimeHostManager::with_heartbeat_timeout(60);
     let first = manager.lock_operation("host-a").await;
-
-    assert!(manager.operation_lock("host-a").try_lock().is_err());
-    assert!(manager.operation_lock("host-b").try_lock().is_ok());
-
+    let other = manager.lock_operation("host-b").await;
+    assert_eq!(manager.operation_lock_count(), 2);
+    drop(other);
+    assert_eq!(manager.operation_lock_count(), 1);
     drop(first);
-    assert!(manager.operation_lock("host-a").try_lock().is_ok());
+    assert_eq!(manager.operation_lock_count(), 0);
+}
+
+#[tokio::test]
+async fn operation_lock_preserves_queued_order_across_deregister_and_reuse() {
+    let manager = std::sync::Arc::new(RuntimeHostManager::with_heartbeat_timeout(60));
+    manager.register("host-a".to_string(), None, vec![]);
+    let first = manager.lock_operation("host-a").await;
+    assert!(manager.deregister("host-a"));
+    manager.register("host-a".to_string(), None, vec![]);
+
+    let mut queued = Box::pin(manager.lock_operation("host-a"));
+    poll_fn(|context| match queued.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("queued operation acquired the held lock"),
+    })
+    .await;
+    drop(first);
+    let second = queued.await;
+    assert_eq!(manager.operation_lock_count(), 1);
+    drop(second);
+    assert_eq!(manager.operation_lock_count(), 0);
+}
+
+#[tokio::test]
+async fn operation_lock_unknown_host_churn_does_not_accumulate_entries() {
+    let manager = RuntimeHostManager::with_heartbeat_timeout(60);
+    for index in 0..1_000 {
+        let guard = manager.lock_operation(&format!("unknown-{index}")).await;
+        drop(guard);
+    }
+    assert_eq!(manager.operation_lock_count(), 0);
 }

@@ -7,14 +7,14 @@ use uuid::Uuid;
 
 static REMOTE_LEASE_DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn remote_lease_store() -> anyhow::Result<Option<WorkflowRuntimeStore>> {
+async fn remote_lease_store() -> anyhow::Result<WorkflowRuntimeStore> {
     if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
-        return Ok(None);
+        anyhow::bail!(
+            "GH1602 PostgreSQL tests require HARNESS_DATABASE_URL pointing to an isolated disposable database"
+        );
     }
     let dir = tempfile::tempdir()?;
-    Ok(Some(
-        WorkflowRuntimeStore::open(&dir.path().join("remote-host-lease.db")).await?,
-    ))
+    WorkflowRuntimeStore::open(&dir.path().join("remote-host-lease.db")).await
 }
 
 async fn enqueue_remote_lease_job(
@@ -111,9 +111,7 @@ fn assert_rejected(
 #[tokio::test]
 async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Result<()> {
     let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
-    let Some(store) = remote_lease_store().await? else {
-        return Ok(());
-    };
+    let store = remote_lease_store().await?;
     let now = Utc::now();
     let original_expiry = now + Duration::seconds(60);
     let pending = enqueue_remote_lease_job(&store, "ttl-receipts").await?;
@@ -250,9 +248,7 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
 async fn runtime_store_remote_host_lease_reclaim_cleans_receipts_and_fences_generation(
 ) -> anyhow::Result<()> {
     let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
-    let Some(store) = remote_lease_store().await? else {
-        return Ok(());
-    };
+    let store = remote_lease_store().await?;
     let now = Utc::now();
     let expiry = now + Duration::seconds(60);
     let pending = enqueue_remote_lease_job(&store, "same-host-reclaim").await?;
@@ -340,9 +336,7 @@ async fn runtime_store_remote_host_lease_reclaim_cleans_receipts_and_fences_gene
 async fn runtime_store_remote_host_lease_concurrent_renew_and_complete_have_one_winner(
 ) -> anyhow::Result<()> {
     let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
-    let Some(store) = remote_lease_store().await? else {
-        return Ok(());
-    };
+    let store = remote_lease_store().await?;
     let store = Arc::new(store);
     let now = Utc::now();
     let expiry = now + Duration::seconds(60);
@@ -408,12 +402,94 @@ async fn runtime_store_remote_host_lease_concurrent_renew_and_complete_have_one_
 }
 
 #[tokio::test]
+async fn runtime_store_remote_host_lease_concurrent_renew_and_reclaim_have_one_mutation_winner(
+) -> anyhow::Result<()> {
+    let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
+    let store = Arc::new(remote_lease_store().await?);
+    let now = Utc::now();
+    let expired_at = now - Duration::seconds(1);
+    enqueue_remote_lease_job(&store, "renew-reclaim-race").await?;
+    let claimed = store
+        .claim_next_runtime_job_for_runtime_kind(RuntimeKind::RemoteHost, "host-a", expired_at)
+        .await?
+        .expect("job should be initially claimed");
+
+    let barrier = Arc::new(Barrier::new(3));
+    let renew_store = store.clone();
+    let renew_barrier = barrier.clone();
+    let renew_job = claimed.clone();
+    let renew = tokio::spawn(async move {
+        renew_barrier.wait().await;
+        renew_store
+            .renew_remote_host_runtime_job_lease(renewal(
+                &renew_job,
+                "host-a",
+                expired_at,
+                Uuid::new_v4(),
+                60,
+                now,
+            ))
+            .await
+    });
+    let reclaim_store = store.clone();
+    let reclaim_barrier = barrier.clone();
+    let reclaim = tokio::spawn(async move {
+        reclaim_barrier.wait().await;
+        reclaim_store
+            .claim_next_runtime_job_for_runtime_kind(
+                RuntimeKind::RemoteHost,
+                "host-b",
+                now + Duration::seconds(60),
+            )
+            .await
+    });
+    barrier.wait().await;
+
+    let renewal_outcome = renew.await??;
+    assert!(matches!(
+        renewal_outcome,
+        RuntimeJobLeaseRenewalOutcome::LeaseLost {
+            reason: RuntimeJobLeaseRenewalRejection::Expired
+                | RuntimeJobLeaseRenewalRejection::WrongGeneration
+                | RuntimeJobLeaseRenewalRejection::WrongOwner
+        }
+    ));
+    let reclaimed = reclaim.await??.expect("expired job must be reclaimed");
+    assert_eq!(reclaimed.lease_generation, claimed.lease_generation + 1);
+    assert_eq!(
+        reclaimed.lease.as_ref().map(|lease| lease.owner.as_str()),
+        Some("host-b")
+    );
+
+    let persisted = store
+        .get_runtime_job(&claimed.id)
+        .await?
+        .expect("reclaimed job must remain readable");
+    assert_eq!(persisted.lease_generation, reclaimed.lease_generation);
+    assert_eq!(persisted.lease, reclaimed.lease);
+    let events = store.runtime_events_for(&claimed.id).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "RuntimeJobReclaimed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "RuntimeJobLeaseRenewalRejected")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_store_remote_host_lease_expired_receipt_is_cleaned_before_rejection(
 ) -> anyhow::Result<()> {
     let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
-    let Some(store) = remote_lease_store().await? else {
-        return Ok(());
-    };
+    let store = remote_lease_store().await?;
     let now = Utc::now();
     let expiry = now + Duration::seconds(1);
     enqueue_remote_lease_job(&store, "receipt-expiry").await?;
@@ -495,9 +571,7 @@ impl FenceCase {
 async fn runtime_store_remote_host_lease_full_state_and_horizon_fence_matrix() -> anyhow::Result<()>
 {
     let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
-    let Some(store) = remote_lease_store().await? else {
-        return Ok(());
-    };
+    let store = remote_lease_store().await?;
     let now = Utc::now();
     let cases = [
         FenceCase::Draining,

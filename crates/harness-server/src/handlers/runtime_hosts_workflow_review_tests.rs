@@ -3,18 +3,46 @@ use axum::{body::Body, http::Request};
 use chrono::Utc;
 use harness_workflow::runtime::{RuntimeJobStatus, RuntimeKind};
 use serde_json::json;
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use tokio::sync::{oneshot, Barrier};
 use tower::ServiceExt;
+
+async fn poll_to_pending<F: Future>(mut future: Pin<&mut F>) {
+    poll_fn(|context| match future.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("handler unexpectedly completed before race barrier release"),
+    })
+    .await;
+}
+
+async fn required_runtime_store_state(
+    dir: &std::path::Path,
+) -> anyhow::Result<(
+    Arc<crate::http::AppState>,
+    Arc<harness_workflow::runtime::WorkflowRuntimeStore>,
+)> {
+    if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
+        anyhow::bail!(
+            "GH1602 PostgreSQL tests require HARNESS_DATABASE_URL pointing to an isolated disposable database"
+        );
+    }
+    support::make_test_state_with_runtime_store(dir)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "GH1602 PostgreSQL test database is configured but unavailable or timed out"
+            )
+        })
+}
 
 #[tokio::test]
 async fn runtime_job_lease_renewal_for_draining_host_is_audited_and_sanitized() -> anyhow::Result<()>
 {
     let dir = tempfile::tempdir()?;
-    let Some((state, store)) = support::make_test_state_with_runtime_store(dir.path()).await?
-    else {
-        return Ok(());
-    };
+    let (state, store) = required_runtime_store_state(dir.path()).await?;
     let app = support::runtime_hosts_workflow_app(state.clone());
     support::register_host(&app, "host-a").await?;
     let job = support::enqueue_runtime_host_test_job(
@@ -75,10 +103,7 @@ async fn runtime_job_lease_renewal_for_draining_host_is_audited_and_sanitized() 
 #[tokio::test]
 async fn runtime_job_lease_renew_route_requires_api_authentication() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((mut state, _store)) = support::make_test_state_with_runtime_store(dir.path()).await?
-    else {
-        return Ok(());
-    };
+    let (mut state, _store) = required_runtime_store_state(dir.path()).await?;
     let state_mut = Arc::get_mut(&mut state).expect("test state must be uniquely owned");
     let mut config = state_mut.core.server.config.clone();
     config.server.api_token = Some("runtime-host-secret".to_string());
@@ -127,10 +152,7 @@ async fn runtime_job_lease_renew_route_requires_api_authentication() -> anyhow::
 #[tokio::test]
 async fn runtime_host_operation_boundary_orders_claim_before_deregister() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((state, store)) = support::make_test_state_with_runtime_store(dir.path()).await?
-    else {
-        return Ok(());
-    };
+    let (state, store) = required_runtime_store_state(dir.path()).await?;
     state
         .runtime_hosts
         .register("host-a".to_string(), None, vec![]);
@@ -209,10 +231,7 @@ async fn runtime_host_operation_boundary_orders_claim_before_deregister() -> any
 #[tokio::test]
 async fn runtime_host_partial_deregister_remains_draining_and_retryable() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let Some((state, store)) = support::make_test_state_with_runtime_store(dir.path()).await?
-    else {
-        return Ok(());
-    };
+    let (state, store) = required_runtime_store_state(dir.path()).await?;
     let app = support::runtime_hosts_workflow_app(state.clone());
     support::register_host(&app, "host-a").await?;
     sqlx::query("DROP TABLE runtime_jobs CASCADE")
@@ -238,5 +257,91 @@ async fn runtime_host_partial_deregister_remains_draining_and_retryable() -> any
             Some(crate::runtime_hosts::RuntimeHostLifecycle::Draining)
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_host_handler_barrier_orders_deregister_before_renew_without_orphan(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, store) = required_runtime_store_state(dir.path()).await?;
+    let app = support::runtime_hosts_workflow_app(state.clone());
+    support::register_host(&app, "host-a").await?;
+    let job = support::enqueue_runtime_host_test_job(
+        &store,
+        "deregister-renew-handler-race",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "remote_check" }),
+    )
+    .await?;
+    let claimed = support::post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    let renewal_body = json!({
+        "lease_generation": claimed["lease_generation"],
+        "lease_expires_at": claimed["lease_expires_at"],
+        "renewal_id": uuid::Uuid::new_v4(),
+        "lease_secs": 120,
+    });
+
+    let barrier = state.runtime_hosts.lock_operation("host-a").await;
+    let mut deregister = Box::pin(
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime-hosts/host-a/deregister")
+                .body(Body::empty())?,
+        ),
+    );
+    poll_to_pending(deregister.as_mut()).await;
+    let mut renew = Box::pin(
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/runtime-hosts/host-a/runtime-jobs/{}/lease/renew",
+                    job.id
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(renewal_body.to_string()))?,
+        ),
+    );
+    poll_to_pending(renew.as_mut()).await;
+    drop(barrier);
+
+    let (deregister, renew) = tokio::join!(deregister, renew);
+    assert_eq!(deregister?.status(), axum::http::StatusCode::OK);
+    assert_eq!(renew?.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(state.runtime_hosts.lifecycle("host-a"), None);
+
+    let persisted = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("deregistered job must remain reclaimable");
+    assert_eq!(persisted.status, RuntimeJobStatus::Pending);
+    assert!(persisted.lease.is_none());
+    assert_eq!(
+        store.count_remote_host_runtime_job_leases("host-a").await?,
+        0
+    );
+    let events = store.runtime_events_for(&job.id).await?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "RuntimeJobLeaseRevoked")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "RuntimeJobLeaseRenewed")
+            .count(),
+        0
+    );
     Ok(())
 }

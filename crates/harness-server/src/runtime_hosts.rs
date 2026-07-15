@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
@@ -45,8 +45,31 @@ pub(crate) struct RuntimeHostRecord {
 
 pub struct RuntimeHostManager {
     pub(crate) hosts: DashMap<String, RuntimeHostRecord>,
-    operation_locks: DashMap<String, Arc<Mutex<()>>>,
+    operation_locks: Arc<DashMap<String, Weak<Mutex<()>>>>,
     pub(crate) heartbeat_timeout_secs: i64,
+}
+
+pub struct RuntimeHostOperationGuard {
+    guard: Option<OwnedMutexGuard<()>>,
+    operation_locks: Arc<DashMap<String, Weak<Mutex<()>>>>,
+    host_id: String,
+    operation_lock: Weak<Mutex<()>>,
+}
+
+impl Drop for RuntimeHostOperationGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if self.operation_lock.strong_count() != 0 {
+            return;
+        }
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.operation_locks.entry(self.host_id.clone())
+        {
+            if Weak::ptr_eq(entry.get(), &self.operation_lock) && entry.get().strong_count() == 0 {
+                entry.remove();
+            }
+        }
+    }
 }
 
 impl RuntimeHostManager {
@@ -57,7 +80,7 @@ impl RuntimeHostManager {
     pub fn with_heartbeat_timeout(heartbeat_timeout_secs: i64) -> Self {
         Self {
             hosts: DashMap::new(),
-            operation_locks: DashMap::new(),
+            operation_locks: Arc::new(DashMap::new()),
             heartbeat_timeout_secs,
         }
     }
@@ -67,15 +90,31 @@ impl RuntimeHostManager {
     /// The lock entry intentionally outlives deregistration. Reusing a host ID
     /// must retain the same ordering boundary as requests that were queued
     /// before the previous registration was removed.
-    pub async fn lock_operation(&self, host_id: &str) -> OwnedMutexGuard<()> {
-        self.operation_lock(host_id).lock_owned().await
+    pub async fn lock_operation(&self, host_id: &str) -> RuntimeHostOperationGuard {
+        let operation_lock = self.operation_lock(host_id);
+        let operation_lock_weak = Arc::downgrade(&operation_lock);
+        let guard = operation_lock.lock_owned().await;
+        RuntimeHostOperationGuard {
+            guard: Some(guard),
+            operation_locks: self.operation_locks.clone(),
+            host_id: host_id.to_string(),
+            operation_lock: operation_lock_weak,
+        }
     }
 
-    pub(crate) fn operation_lock(&self, host_id: &str) -> Arc<Mutex<()>> {
-        self.operation_locks
-            .entry(host_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    fn operation_lock(&self, host_id: &str) -> Arc<Mutex<()>> {
+        let mut entry = self.operation_locks.entry(host_id.to_string()).or_default();
+        if let Some(operation_lock) = entry.upgrade() {
+            return operation_lock;
+        }
+        let operation_lock = Arc::new(Mutex::new(()));
+        *entry = Arc::downgrade(&operation_lock);
+        operation_lock
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operation_lock_count(&self) -> usize {
+        self.operation_locks.len()
     }
 
     pub fn register(
