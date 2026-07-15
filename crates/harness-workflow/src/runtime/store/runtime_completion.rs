@@ -42,6 +42,33 @@ impl WorkflowRuntimeStore {
         }
         Ok(decision)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn commit_runtime_completion_decision_for_test(
+        &self,
+        workflow_id: &str,
+        source: &str,
+        payload: Value,
+        decision: &crate::runtime::model::WorkflowDecision,
+    ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let event =
+            insert_event_tx(&mut tx, workflow_id, "RuntimeJobCompleted", source, payload).await?;
+        let record = persist_runtime_completion_decision_tx(
+            &mut tx,
+            instance,
+            source,
+            &event,
+            decision.clone(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(record))
+    }
 }
 
 pub(super) async fn apply_runtime_completion_decision_tx(
@@ -58,7 +85,7 @@ pub(super) async fn apply_runtime_completion_decision_tx(
 
 async fn apply_runtime_completion_decision_for_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
@@ -66,6 +93,18 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         return Ok(None);
     };
 
+    persist_runtime_completion_decision_tx(tx, instance, source, event, decision)
+        .await
+        .map(Some)
+}
+
+async fn persist_runtime_completion_decision_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mut instance: WorkflowInstance,
+    source: &str,
+    event: &WorkflowEvent,
+    decision: crate::runtime::model::WorkflowDecision,
+) -> anyhow::Result<WorkflowDecisionRecord> {
     let record = match validator_for_definition(&instance.definition_id) {
         Some(validator) => match validator.validate(
             &instance,
@@ -104,5 +143,5 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         upsert_instance_tx(tx, &instance).await?;
     }
 
-    Ok(Some(record))
+    Ok(record)
 }

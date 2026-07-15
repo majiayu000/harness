@@ -388,3 +388,112 @@ async fn durable_store_lists_nonterminal_instances_by_definition() -> anyhow::Re
     assert!(!ids.contains(&other_project.id));
     Ok(())
 }
+
+#[tokio::test]
+async fn driverless_completion_is_rejected_atomically() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("replanning")
+        .with_id("issue-driverless-completion")
+        .with_data(json!({ "marker": "must-remain" }));
+    store.upsert_instance(&instance).await?;
+
+    let stale_command = WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "stale-active-work-from-an-older-decision",
+    );
+    let stale_command_id = store
+        .enqueue_command(&instance.id, None, &stale_command)
+        .await?;
+    let stale_job = store
+        .enqueue_runtime_job(
+            &stale_command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            json!({ "workflow_id": instance.id, "activity": "implement_issue" }),
+        )
+        .await?;
+    let driverless = WorkflowDecision::new(
+        &instance.id,
+        "replanning",
+        "resume_implementation_after_replan",
+        "implementing",
+        "Resume implementation without durable work.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "Waiting is not a progress driver.",
+        "driverless-completion-wait",
+    ));
+
+    let first_completion = store.commit_runtime_completion_decision_for_test(
+        &instance.id,
+        "runtime-1",
+        json!({
+            "command_id": "completed-command",
+            "runtime_job_id": "completed-job",
+        }),
+        &driverless,
+    );
+    let replayed_completion = store.commit_runtime_completion_decision_for_test(
+        &instance.id,
+        "runtime-2",
+        json!({
+            "command_id": "replayed-command",
+            "runtime_job_id": "replayed-job",
+        }),
+        &driverless,
+    );
+    let (first_record, replayed_record) = tokio::join!(first_completion, replayed_completion);
+    let record = first_record?
+        .expect("completion should persist a rejected decision");
+    let replayed_record = replayed_record?
+        .expect("replayed completion should persist a rejected decision");
+
+    for rejected in [&record, &replayed_record] {
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.decision, driverless);
+        assert!(rejected
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("ProgressDriverMissing:")));
+    }
+    let after = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("workflow instance should remain visible");
+    assert_eq!(after.state, instance.state);
+    assert_eq!(after.version, instance.version);
+    assert_eq!(after.data, instance.data);
+
+    let decisions = store.decisions_for(&instance.id).await?;
+    assert_eq!(decisions.len(), 2);
+    assert!(decisions.iter().all(|decision| !decision.accepted));
+    assert!(decisions
+        .iter()
+        .any(|decision| decision.id == record.id));
+    assert!(decisions
+        .iter()
+        .any(|decision| decision.id == replayed_record.id));
+    assert_eq!(store.events_for(&instance.id).await?.len(), 2);
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].id, stale_command_id);
+    assert_eq!(commands[0].decision_id, None);
+    let jobs = store.runtime_jobs_for_command(&stale_command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, stale_job.id);
+    assert_eq!(jobs[0].status, RuntimeJobStatus::Pending);
+    let counts = store
+        .detail_counts_for_workflows(std::slice::from_ref(&instance.id))
+        .await?
+        .remove(&instance.id)
+        .expect("workflow detail counts should be present");
+    assert_eq!(counts.rejected_decision_count, 2);
+    assert_eq!(counts.command_count, 1);
+    assert_eq!(counts.runtime_job_count, 1);
+    Ok(())
+}
