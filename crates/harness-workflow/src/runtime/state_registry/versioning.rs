@@ -171,6 +171,14 @@ impl WorkflowDefinitionRegistry {
         &self,
         instance: &WorkflowInstance,
     ) -> Option<Arc<RegisteredWorkflowDefinition>> {
+        if self.definitions.contains_key(&instance.definition_id)
+            && !self
+                .current_declarative_versions
+                .contains_key(&instance.definition_id)
+        {
+            return self.definition(&instance.definition_id);
+        }
+
         match instance.data.get("definition_hash") {
             Some(serde_json::Value::String(expected_hash)) if !expected_hash.trim().is_empty() => {
                 let definition = self
@@ -187,13 +195,7 @@ impl WorkflowDefinitionRegistry {
                 {
                     return Some(Arc::new(definition.registered().clone()));
                 }
-                if self
-                    .current_declarative_versions
-                    .contains_key(&instance.definition_id)
-                {
-                    return None;
-                }
-                self.definition(&instance.definition_id)
+                None
             }
         }
     }
