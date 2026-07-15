@@ -1,5 +1,4 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
-use super::status::WorkflowCommandStatus;
 use super::store::{ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
 use super::tier_resolution::{
     resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution,
@@ -16,8 +15,6 @@ use harness_core::config::isolation::{
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
-
-const COMMAND_STATUS_SKIPPED: WorkflowCommandStatus = WorkflowCommandStatus::Skipped;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandDispatchOutcome {
@@ -214,12 +211,24 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         command: WorkflowCommandRecord,
     ) -> anyhow::Result<CommandDispatchOutcome> {
         if !command.command.requires_runtime_job() {
-            self.store
-                .mark_command_status(&command.id, COMMAND_STATUS_SKIPPED)
-                .await?;
+            let reason = if self
+                .store
+                .skip_claimed_command_if_owned(
+                    &command.id,
+                    super::DispatchClaim {
+                        owner: &self.dispatcher_id,
+                        generation: command.dispatch_claim_generation,
+                    },
+                )
+                .await?
+            {
+                "command does not require runtime execution"
+            } else {
+                "dispatch claim became stale before non-runtime skip"
+            };
             return Ok(CommandDispatchOutcome::Skipped {
                 command_id: command.id,
-                reason: "command does not require runtime execution".to_string(),
+                reason: reason.to_string(),
             });
         }
 
