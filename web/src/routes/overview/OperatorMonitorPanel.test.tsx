@@ -100,6 +100,16 @@ function makeMonitor(): OperatorMonitorPayload {
         source: "github",
       },
     ],
+    driverless_progress: [
+      {
+        classification: "driverless_progress",
+        workflow_id: "workflow-driverless",
+        definition_id: "github_issue_pr",
+        state: "implementing",
+        age_secs: 21_600,
+        provenance_status: "missing_state_entry_provenance",
+      },
+    ],
     failures: [
       {
         family: "github_fetch",
@@ -166,6 +176,8 @@ describe("<OperatorMonitorPanel>", () => {
     );
     expect(screen.getByText("awaiting feedback")).toBeInTheDocument();
     expect(screen.getByText("#44 -> PR #45")).toBeInTheDocument();
+    expect(screen.getByText("workflow-driverless")).toBeInTheDocument();
+    expect(screen.getByText("missing state entry provenance")).toBeInTheDocument();
   });
 
   it("renders grouped retryable GitHub fetch failures", () => {

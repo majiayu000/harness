@@ -147,6 +147,7 @@ function makeMonitor(): OperatorMonitorPayload {
     },
     operator_actions: [],
     stuck_workflows: [],
+    driverless_progress: [],
     failures: [],
     worktrees: {
       used: 0,

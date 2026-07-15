@@ -137,6 +137,12 @@ Enable `workflow_watchdog_enabled` first. It is read-only: aged `blocked` and
 `awaiting_feedback` workflow instances appear in `/api/operator-monitor` under
 `stuck_workflows` and are logged at error level.
 
+The same operator-monitor response always includes the bounded
+`driverless_progress` diagnostic, even when the watchdog is disabled. Each row
+reports its workflow, definition, state, age, and state-entry provenance without
+changing workflow state or history. Enabling the watchdog also emits these rows
+at error level; recovery remains an explicit operator action.
+
 Enable `runtime_retention_enabled` only after the stuck list is clean. Retention
 deletes terminal workflow families older than `runtime_retention_days` in
 bounded batches and relies on the Postgres runtime-store cascade constraints to

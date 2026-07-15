@@ -6,6 +6,7 @@
 //! worktrees.
 
 mod activity;
+mod driverless_progress;
 mod sampling;
 
 use crate::http::AppState;
@@ -25,6 +26,8 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+
+use driverless_progress::{list_driverless_progress, DriverlessProgressEvidence};
 
 const WORKFLOW_SAMPLE_LIMIT: i64 = 500;
 const FAILED_WORKFLOW_SAMPLE_RESERVE: usize = 100;
@@ -48,6 +51,7 @@ struct OperatorMonitorPayload {
     activity: OperatorActivity,
     operator_actions: Vec<OperatorAction>,
     stuck_workflows: Vec<StuckWorkflow>,
+    driverless_progress: Vec<DriverlessProgressEvidence>,
     failures: Vec<FailureGroup>,
     worktrees: WorktreeSummary,
 }
@@ -219,6 +223,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     let by_source = source_activity(&workflows, &active_tasks);
     let operator_actions = operator_actions(&workflows, generated_at, &stopped_eligibility);
     let stuck_workflows = list_stuck_workflows(state, generated_at).await?;
+    let driverless_progress = list_driverless_progress(state).await?;
     let failures = grouped_failures(&recent_failures, &workflows);
     let capacity = state.concurrency.task_queue.global_limit() as u64;
     let local_live_worktrees = state
@@ -256,6 +261,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         },
         operator_actions,
         stuck_workflows,
+        driverless_progress,
         failures,
         worktrees: WorktreeSummary {
             used: worktree_used_count(local_live_worktrees, worktree_cards.len())

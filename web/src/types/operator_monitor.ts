@@ -5,6 +5,7 @@ export interface OperatorMonitorPayload {
   activity: OperatorActivity;
   operator_actions: OperatorAction[];
   stuck_workflows: StuckWorkflow[];
+  driverless_progress: DriverlessProgressEvidence[];
   failures: FailureGroup[];
   worktrees: OperatorWorktreeSummary;
 }
@@ -93,6 +94,18 @@ export interface StuckWorkflow extends RuntimeStoppedState {
   updated_at: string;
   url: string | null;
   source: string;
+}
+
+export interface DriverlessProgressEvidence {
+  classification: "driverless_progress";
+  workflow_id: string;
+  definition_id: string;
+  state: string;
+  age_secs: number;
+  provenance_status:
+    | "established"
+    | "missing_state_entry_provenance"
+    | "ambiguous_state_entry_provenance";
 }
 
 export interface GitHubTokenDispatchCounter {
