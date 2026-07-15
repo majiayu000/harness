@@ -92,20 +92,28 @@ async fn apply_runtime_completion_decision_for_instance_tx(
     source: &str,
     event: &WorkflowEvent,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
-    // Preserve the requested liveness rejection before the reducer can replace
-    // invalid structured output with a separate blocked policy decision.
-    if let Some(decision) = driverless_structured_completion_decision(&instance, source, event)? {
-        return persist_runtime_completion_decision_tx(tx, instance, source, event, decision)
-            .await
-            .map(Some);
-    }
-    let Some(decision) = reduce_runtime_job_completed(&instance, event)? else {
+    let driverless_decision = driverless_structured_completion_decision(&instance, source, event)?;
+    let Some(mut decision) = reduce_runtime_job_completed(&instance, event)? else {
         return Ok(None);
     };
+    // Preserve the requested liveness rejection only when the reducer found no
+    // authoritative domain outcome and would apply its generic invalid-output policy.
+    if is_generic_invalid_structured_fallback(&decision) {
+        if let Some(driverless_decision) = driverless_decision {
+            decision = driverless_decision;
+        }
+    }
 
     persist_runtime_completion_decision_tx(tx, instance, source, event, decision)
         .await
         .map(Some)
+}
+
+fn is_generic_invalid_structured_fallback(decision: &WorkflowDecision) -> bool {
+    decision.decision == "block_invalid_agent_output"
+        && decision
+            .reason
+            .contains("did not validate and no domain fallback was available")
 }
 
 fn driverless_structured_completion_decision(

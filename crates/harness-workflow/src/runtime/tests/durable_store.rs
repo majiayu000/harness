@@ -626,3 +626,74 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("implementing").with_id("issue-closed-domain-winner");
+    store.upsert_instance(&instance).await?;
+    let driverless = WorkflowDecision::new(
+        &instance.id,
+        "implementing",
+        "run_replan",
+        "replanning",
+        "The agent requested replanning without durable work.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "Waiting is not a progress driver.",
+        "closed-domain-driverless-wait",
+    ));
+    let result = ActivityResult::succeeded(
+        "implement_issue",
+        "The issue was already closed before implementation completed.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&driverless)?,
+    ));
+
+    let record = store
+        .commit_parent_runtime_completion(
+            &instance.id,
+            "runtime-1",
+            json!({
+                "command_id": "closed-domain-command",
+                "runtime_job_id": "closed-domain-job",
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("closed issue evidence should produce a domain decision");
+
+    assert!(record.accepted);
+    assert_eq!(record.decision.decision, "finish_closed_issue");
+    assert_eq!(record.decision.next_state, "done");
+    assert_eq!(record.rejection_reason, None);
+    let after = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("workflow instance should remain visible");
+    assert_eq!(after.state, "done");
+    assert_eq!(after.version, instance.version.saturating_add(1));
+    let decisions = store.decisions_for(&instance.id).await?;
+    assert_eq!(decisions.len(), 1);
+    assert!(decisions[0].accepted);
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.command_type, WorkflowCommandType::MarkDone);
+    assert_eq!(commands[0].decision_id.as_deref(), Some(record.id.as_str()));
+    Ok(())
+}
