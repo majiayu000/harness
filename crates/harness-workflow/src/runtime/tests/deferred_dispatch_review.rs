@@ -293,6 +293,17 @@ async fn deferred_command_rejects_incomplete_or_mismatched_evidence() -> anyhow:
     .execute(store.pool())
     .await?;
     assert!(store
+        .defer_claimed_command_if_owned(
+            &command_id,
+            "evidence-owner",
+            1,
+            test_dispatch_barrier("must reject corrupt replay"),
+            Utc::now(),
+            DispatchBackoffPolicy::default(),
+        )
+        .await
+        .is_err());
+    assert!(store
         .claim_pending_commands("must-not-run", Utc::now() + Duration::minutes(1), 10)
         .await?
         .is_empty());

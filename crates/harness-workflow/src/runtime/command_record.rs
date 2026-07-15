@@ -1,4 +1,4 @@
-use super::dispatch_barrier::DispatchBarrier;
+use super::dispatch_barrier::{matches_deferred_row, DispatchBarrier};
 use super::model::WorkflowCommand;
 use super::status::WorkflowCommandStatus;
 use chrono::{DateTime, Utc};
@@ -88,12 +88,14 @@ pub(super) fn from_row(
         if dispatch_attempt_count == 0 || dispatch_claim_generation == 0 {
             anyhow::bail!("deferred workflow command attempt and generation must be positive");
         }
-        if barrier.command_id != id
-            || barrier.workflow_id != workflow_id
-            || barrier.attempt != dispatch_attempt_count
-            || barrier.claim_generation != dispatch_claim_generation
-            || &barrier.next_dispatch_at != due
-        {
+        if !matches_deferred_row(
+            barrier,
+            &id,
+            &workflow_id,
+            *due,
+            dispatch_attempt_count,
+            dispatch_claim_generation,
+        ) {
             anyhow::bail!("deferred workflow command barrier evidence does not match its row");
         }
     }

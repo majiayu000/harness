@@ -24,7 +24,7 @@ use super::{
     QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, SCOPE_TOO_LARGE_SIGNAL,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use harness_core::db::resolve_database_url;
 use serde_json::json;
 use std::sync::{

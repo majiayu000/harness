@@ -156,7 +156,9 @@ async fn deferred_command_dispatcher_race_has_one_winner() -> anyhow::Result<()>
     let (workflow, command_id, claim) =
         claimed_deferred_test_command(&store, "race", "dispatcher-race").await?;
     let generation = claim.dispatch_claim_generation;
-    let now = Utc::now();
+    let now = Utc::now()
+        .with_nanosecond(123_456_789)
+        .expect("valid non-microsecond timestamp");
     let backoff = DispatchBackoffPolicy::from_seconds(5, 20)?;
     let first = store.defer_claimed_command_if_owned(
         &command_id,

@@ -132,7 +132,31 @@ pub enum DeferClaimedCommandOutcome {
     },
 }
 
-type ClaimedCommandRow = (String, Option<String>, i64, i64, Option<String>);
+type ClaimedCommandRow = (
+    String,
+    String,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    i64,
+    i64,
+    Option<String>,
+);
+
+pub(super) fn matches_deferred_row(
+    barrier: &DispatchBarrier,
+    command_id: &str,
+    workflow_id: &str,
+    due: DateTime<Utc>,
+    attempt: u64,
+    generation: u64,
+) -> bool {
+    barrier.command_id == command_id
+        && barrier.workflow_id == workflow_id
+        && barrier.attempt == attempt
+        && barrier.claim_generation == generation
+        && barrier.next_dispatch_at.timestamp_micros() == due.timestamp_micros()
+}
 
 impl DispatchBarrier {
     #[allow(clippy::too_many_arguments)]
@@ -231,25 +255,52 @@ impl super::store::WorkflowRuntimeStore {
             .map(|(data,)| serde_json::from_str::<WorkflowInstance>(&data))
             .transpose()?;
         let row: Option<ClaimedCommandRow> = sqlx::query_as(
-            "SELECT status, dispatch_owner, dispatch_claim_generation,
+            "SELECT workflow_id, status, dispatch_owner, dispatch_lease_expires_at,
+                    dispatch_not_before, dispatch_claim_generation,
                     dispatch_attempt_count, dispatch_barrier::text
              FROM workflow_commands WHERE id = $1 FOR UPDATE",
         )
         .bind(command_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((status, current_owner, current_generation, attempt_count, persisted_barrier)) =
-            row
+        let Some((
+            row_workflow_id,
+            status,
+            current_owner,
+            current_lease_expires_at,
+            current_not_before,
+            current_generation,
+            attempt_count,
+            persisted_barrier,
+        )) = row
         else {
             anyhow::bail!("workflow command not found: {command_id}");
         };
         let status = WorkflowCommandStatus::try_from(status.as_str())?;
 
         if status == WorkflowCommandStatus::Deferred && current_generation == generation {
+            let attempt = u64::try_from(attempt_count)
+                .map_err(|_| anyhow::anyhow!("dispatch attempt count is negative"))?;
+            let due = current_not_before
+                .ok_or_else(|| anyhow::anyhow!("deferred command is missing schedule evidence"))?;
             let persisted: DispatchBarrier = persisted_barrier
                 .ok_or_else(|| anyhow::anyhow!("deferred command is missing barrier evidence"))
                 .and_then(|data| serde_json::from_str(&data).map_err(Into::into))?;
             persisted.validate()?;
+            if current_owner.is_some()
+                || current_lease_expires_at.is_some()
+                || attempt == 0
+                || !matches_deferred_row(
+                    &persisted,
+                    command_id,
+                    &row_workflow_id,
+                    due,
+                    attempt,
+                    dispatch_claim_generation,
+                )
+            {
+                anyhow::bail!("deferred command barrier evidence does not match its row");
+            }
             if persisted.dispatch_owner == dispatch_owner
                 && persisted.claim_generation == dispatch_claim_generation
             {
@@ -300,6 +351,11 @@ impl super::store::WorkflowRuntimeStore {
         let next_dispatch_at = now
             .checked_add_signed(backoff.delay_for_attempt(attempt))
             .ok_or_else(|| anyhow::anyhow!("next dispatch timestamp overflow"))?;
+        let next_dispatch_at =
+            DateTime::<Utc>::from_timestamp_micros(next_dispatch_at.timestamp_micros())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("next dispatch timestamp exceeds PostgreSQL precision")
+                })?;
         let barrier = DispatchBarrier::new(
             barrier.reason_code,
             barrier.reason,
