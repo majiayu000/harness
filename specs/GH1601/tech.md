@@ -16,8 +16,9 @@ GH-1601
 | Project policy selection | `crates/harness-server/src/http/background/runtime_command_dispatch.rs:262-309` | Loads per-project workflow config and returns `None` when either runtime loop is disabled. | Supplies the `runtime_policy_disabled` barrier. |
 | Isolation dispatch | `crates/harness-workflow/src/runtime/dispatcher.rs:199-312` | Required-tier unavailability marks the command `failed`, then appends a separate isolation event; successful dispatch calls the claimed-command enqueue API. | Must become fail-closed deferral without weakening tier selection. |
 | Command claim | `crates/harness-workflow/src/runtime/store.rs:741-806` | Claims only `pending` and expired `dispatching` commands using `FOR UPDATE ... SKIP LOCKED`; no scheduled deferred state exists. | Extend eligibility with persisted due time and retain concurrent claiming. |
+| Reused dispatcher identity | `crates/harness-workflow/src/runtime/dispatcher.rs:112-194` | One `RuntimeCommandDispatcher` stores one `dispatcher_id` and reuses it across `dispatch_once` and every command in `dispatch_pending`. | Owner equality cannot distinguish an expired attempt from a later claim by the same dispatcher; every claim needs a persisted generation fence. |
 | Unfenced status update | `crates/harness-workflow/src/runtime/store.rs:809-827` | `mark_command_status` clears owner and lease by command ID only. | Cannot provide B-002/B-003/B-008. |
-| Atomic job enqueue | `crates/harness-workflow/src/runtime/store.rs:916-1025` | Locks the command, checks status and optional owner, dedupes an existing job, inserts a job, and marks the command dispatched in one transaction. | Model for fenced deferral and B-007 at-most-one enqueue. |
+| Atomic job enqueue | `crates/harness-workflow/src/runtime/store.rs:916-1025` | Locks the command and checks status plus optional owner, but a reused owner can satisfy a later claim; the existing-job replay path also does not identify the generation that inserted the job. | Require owner plus generation for claimed enqueue and define generation-aware replay before relying on B-007 at-most-one enqueue. |
 | Event append | `crates/harness-workflow/src/runtime/store.rs:350-385` | Allocates workflow event sequence and commits in its own transaction. | Deferral must use transaction-scoped event insertion instead of this standalone API. |
 | Status type | `crates/harness-workflow/src/runtime/status.rs:4-60` | Typed command vocabulary has no `Deferred` variant. | Additive Rust and wire-state change; exhaustive matches must be audited. |
 | Command schema | `crates/harness-workflow/src/runtime/store_migrations.rs:51-62,135-143` | Commands have status and dispatch lease columns but no defer scheduling or reason columns. | Migration surface for B-006/B-010. |
@@ -33,6 +34,7 @@ persisted command record and table with:
 
 - `dispatch_not_before TIMESTAMPTZ NULL`
 - `dispatch_attempt_count BIGINT NOT NULL DEFAULT 0`
+- `dispatch_claim_generation BIGINT NOT NULL DEFAULT 0`
 - `dispatch_barrier JSONB NULL`
 
 `dispatch_barrier` is a typed serialized object, not an open-ended replacement
@@ -45,6 +47,8 @@ for status:
   "project_id": "/repo",
   "required_tier": "container",
   "trust_class": "non_collaborator",
+  "dispatch_owner": "dispatcher:2f3f...",
+  "claim_generation": 3,
   "attempt": 2,
   "next_dispatch_at": "2026-07-15T12:00:00Z"
 }
@@ -56,11 +60,16 @@ The Rust reason enum is a closed set with snake_case serialization:
 isolation reason. Constructors reject empty reason/project identity and any
 reason/field mismatch (B-004, B-012).
 
-Use a new migration to add the columns, replace the named status constraint
-with the same vocabulary plus `deferred`, and replace the claim index with a
+Use a new migration to add the columns, constrain `dispatch_claim_generation`
+to a non-negative PostgreSQL `BIGINT`, replace the named status constraint with
+the same vocabulary plus `deferred`, and replace the claim index with a
 partial/covering index suitable for `(status, dispatch_not_before,
-dispatch_lease_expires_at, created_at)`. Existing rows receive zero attempts,
-NULL schedule, and NULL barrier; their existing status is unchanged (B-011).
+dispatch_lease_expires_at, created_at)`. Existing rows receive zero attempts
+and generation, NULL schedule, and NULL barrier; their existing status is
+unchanged (B-011). Each successful claim increments generation in the same SQL
+statement that sets `dispatching`, owner, and lease. Overflow fails the claim
+transaction closed; generation is never reset by deferral, enqueue, restart,
+or legacy-row migration.
 
 `WorkflowCommandRecord` exposes the typed optional barrier and scheduling
 fields. `Deferred` is an active continuation in all active-command predicates,
@@ -75,6 +84,7 @@ Add a store operation conceptually shaped as:
 defer_claimed_command_if_owned(
     command_id,
     dispatch_owner,
+    dispatch_claim_generation,
     barrier_reason,
     now,
     backoff_policy,
@@ -86,22 +96,35 @@ The operation runs one transaction:
 1. Lock the workflow instance and command in the repository's established lock
    order; load command status, owner, lease, attempt, and workflow terminal
    state.
-2. If the workflow is terminal, apply the existing terminal-command disposition
+2. If status is `deferred`, the command generation equals the supplied
+   generation, and the persisted barrier identifies the same owner and
+   generation, return `AlreadyDeferred` without writes. This is the only
+   successful deferral replay case.
+3. Otherwise require command status `dispatching`, matching `dispatch_owner`, and exact
+   `dispatch_claim_generation`. Generation is an unconditional fence because
+   `RuntimeCommandDispatcher` reuses its dispatcher ID. Owner equality alone is
+   forbidden, and lease timestamps are not substitutes for generation.
+   Otherwise return `StaleClaim` without writes or events (B-003/B-008).
+4. If the workflow is terminal, apply the existing terminal-command disposition
    and return `WorkflowTerminal`; do not defer or create a job (B-009).
-3. Require command status `dispatching`, matching `dispatch_owner`, and a claim
-   still owned by that generation. Otherwise return `StaleClaim` without writes
-   or events (B-003/B-008). Owner equality is the minimum fence; if the final
-   implementation finds owner IDs reusable, add a persisted claim-generation
-   token rather than relying on timestamps.
-4. Compute the next attempt from persisted count using saturating exponential
+5. Compute the next attempt from persisted count using saturating exponential
    backoff with configured floor and finite ceiling. Update status to
    `deferred`, increment count, set `dispatch_not_before`, write the typed
    barrier, and clear owner/lease.
-5. Insert `WorkflowRuntimeDispatchDeferred` through the existing
+6. Store the dispatch owner and claim generation in the barrier and insert
+   `WorkflowRuntimeDispatchDeferred` through the existing
    transaction-scoped event helper with command/workflow/project IDs, reason
-   code, explanation, attempt, next time, and isolation fields when applicable.
-6. Commit once and return `Deferred`. Any error rolls back all fields and the
+   code, explanation, dispatch owner, claim generation, attempt, next time, and
+   isolation fields when applicable.
+7. Commit once and return `Deferred`. Any error rolls back all fields and the
    event (B-002/B-013).
+
+An exact replay of a committed deferral for the same command and generation
+returns `AlreadyDeferred` without changing backoff, barrier data, or audit
+events. A replay after a later claim observes a different generation and
+returns `StaleClaim`, even when the owner string is identical. This makes
+retries after a lost response idempotent without allowing an old attempt to
+overwrite a newer one.
 
 No workflow business-state transition occurs. The invariant is that an active
 workflow retains a live deferred command, not that infrastructure policy should
@@ -117,11 +140,12 @@ Extend `claim_pending_commands` so candidates are:
 - `dispatching` with an expired lease.
 
 All candidates remain protected by `FOR UPDATE OF command SKIP LOCKED`. The
-claim update sets `dispatching`, owner, and lease but preserves attempt/barrier
-metadata until successful job enqueue. Keeping the last barrier during the
-claim makes concurrent reads explain why the retry exists; successful enqueue
-atomically clears schedule/barrier and leaves attempt count available for
-historical projection, or records it in the dispatch event before clearing.
+claim update atomically increments `dispatch_claim_generation` and returns that
+value with the command while setting `dispatching`, owner, and lease. It
+preserves attempt/barrier metadata until successful job enqueue. Keeping the
+last barrier during the claim makes concurrent reads explain why the retry
+exists; successful enqueue atomically clears schedule/barrier and leaves
+attempt count and generation available for replay and historical projection.
 
 Backoff uses repository workflow-runtime dispatch configuration rather than a
 new global service. Add validated positive floor/ceiling fields with conservative
@@ -159,14 +183,25 @@ availability observation never authorizes a weaker tier (B-005).
 
 The current pre-dispatch terminal check and later standalone status update have
 a race. Both the atomic deferral operation and
-`enqueue_runtime_job_for_claimed_command` must verify terminal workflow state
-under the same transaction/lock discipline as their command mutation. If the
-terminal state wins, no job insert occurs (B-009).
+`enqueue_runtime_job_for_claimed_command` must accept the claim generation and
+verify owner plus exact generation and terminal workflow state under the same
+transaction/lock discipline as their command mutation. If the fence does not
+match, the operation returns `StaleClaim` before any job, command, or event
+write. If the terminal state wins, no job insert occurs (B-008/B-009).
 
 Successful retry continues using the original `command.id` and
-`(workflow_id, dedupe_key)` identity. Existing job lookup inside the enqueue
-transaction remains the idempotency fence: a job found for the command yields
-`AlreadyExists` and the command converges to `dispatched` (B-007/B-008).
+`(workflow_id, dedupe_key)` identity. The enqueue transaction records the
+dispatch owner and claim generation with the runtime job evidence before
+clearing owner/lease and keeps the generation on the command. After locking the
+workflow and command it first recognizes an exact committed replay only when
+status is `dispatched`, the command generation equals the supplied generation,
+and the existing job evidence names the same owner and generation; it then
+returns `AlreadyExists` without a second insert or command update. Otherwise it
+requires current `dispatching` status plus the supplied owner and generation
+before checking terminal state or mutating. A job or command from a different
+generation does not authenticate the caller: the old caller receives
+`StaleClaim` and performs no mutation. Fence validation, job lookup, job insert,
+and the `dispatched` command update share one transaction (B-007/B-008).
 
 ### 6. Projection and observability
 
@@ -175,6 +210,7 @@ Runtime tree/summary and any command serialization expose:
 - status `deferred`
 - `dispatch_barrier.reason_code` and non-empty reason
 - `dispatch_attempt_count`
+- `dispatch_claim_generation`
 - `dispatch_not_before`
 - required isolation tier/trust class when applicable
 
@@ -187,15 +223,15 @@ audit source for each committed attempt (B-004/B-012).
 
 ```text
 pending/deferred-due command
-  -> transactional claim (dispatching + owner + lease)
+  -> transactional claim (dispatching + owner + incremented generation + lease)
   -> load project policy/config and resolve required isolation
   -> barrier present
-       -> fenced atomic defer transaction
+       -> owner+generation-fenced atomic defer transaction
           (deferred + attempt + due time + typed barrier + audit event)
        -> no job / no agent / workflow state unchanged
   -> later eligible claim
   -> barrier cleared
-       -> fenced atomic job enqueue for original command
+       -> owner+generation-fenced atomic job enqueue for original command
           (one runtime job + command dispatched + defer metadata cleared)
        -> existing worker/reducer flow
 ```
@@ -228,12 +264,12 @@ status and timestamps (B-010/B-013).
 | --- | --- | --- |
 | B-001 durable continuation for all three barriers | Server dispatch classification plus workflow dispatcher | `cargo test -p harness-server runtime_command_dispatch_tick_defers_` runs disabled-policy, malformed-config, and unavailable-isolation DB cases; each asserts active workflow, one deferred command, zero jobs. |
 | B-002 atomic disposition and evidence | `WorkflowRuntimeStore::defer_claimed_command_if_owned` | `cargo test -p harness-workflow defer_claimed_command_is_atomic` forces event insertion failure and asserts command, lease, attempt, schedule, and event log all remain pre-transaction. |
-| B-003 live-owner fence | Store defer API | `cargo test -p harness-workflow defer_claimed_command_rejects_stale_owner` covers missing, wrong, repeated, and superseded owners with zero mutation/events. |
+| B-003 live-owner fence | Store defer API | `cargo test -p harness-workflow defer_claimed_command_rejects_stale_owner` covers missing/wrong owners, exact-generation replay, and the same owner reused after generation advances; stale cases produce zero mutation/events and exact replay produces no additional mutation/event. |
 | B-004 typed complete reason evidence | Barrier reason type and event serialization | `cargo test -p harness-workflow dispatch_barrier_reason` table-tests all variants, rejects empty/mismatched fields, and round-trips event payloads. |
 | B-005 no isolation downgrade | Workflow dispatcher | `cargo test -p harness-server runtime_command_dispatch_tick_defers_unavailable_isolation_without_fallback` asserts required container tier, available host tier, zero jobs/agent calls on initial and retry attempts. |
 | B-006 bounded scheduled retry | Claim SQL and backoff calculator | `cargo test -p harness-workflow deferred_command_backoff` proves not-before exclusion, exact exponential steps, saturation at ceiling, and later eligibility. |
-| B-007 original identity and one job | Claim plus atomic enqueue | `cargo test -p harness-workflow deferred_command_dispatches_original_command_once` retries the same ID/dedupe key concurrently and asserts one job. |
-| B-008 competing dispatchers | Claim/defer/enqueue fencing | `cargo test -p harness-workflow deferred_command_dispatcher_race_has_one_winner` uses two owners and asserts one disposition/event or one job, never both from stale work. |
+| B-007 original identity and one job | Claim plus atomic enqueue | `cargo test -p harness-workflow deferred_command_dispatches_original_command_once` retries the same ID/dedupe key and exact generation, asserts one job, and verifies exact replay returns `AlreadyExists` without another write. |
+| B-008 competing dispatchers | Claim/defer/enqueue fencing | `cargo test -p harness-workflow deferred_command_dispatcher_race_has_one_winner` covers different owners and the same reused owner across two generations; it asserts one winning disposition/event or job, `StaleClaim` for the old generation, and no stale mutation. |
 | B-009 terminal workflow wins | Store deferral and enqueue terminal guard | `cargo test -p harness-workflow terminal_workflow_wins_dispatch_race` terminalizes between claim and mutation, then asserts no reopen/job and existing terminal command disposition. |
 | B-010 restart durability | PostgreSQL command fields and due-time claim | `cargo test -p harness-workflow deferred_command_survives_store_restart` drops the store handle, reconnects, and asserts preserved status/reason/attempt/time and no early claim. |
 | B-011 legacy compatibility | Migration, status parsing, exhaustive matches | `cargo test -p harness-workflow runtime_store_migrates_deferred_commands` seeds all old statuses before migration and asserts unchanged meanings plus NULL new fields; `cargo check --workspace --all-targets` catches missed matches. |
@@ -251,8 +287,11 @@ status and timestamps (B-010/B-013).
   list; compile with `-D warnings` and exercise cancel, replay, PR feedback, and
   retention paths.
 - **Concurrency:** Inconsistent lock order could deadlock with enqueue,
-  cancellation, or completion. Reuse the established store lock order and add
-  two-transaction race tests before implementation is accepted.
+  cancellation, or completion. Owner-only fencing would also admit an old
+  attempt after the same dispatcher ID is reused. Reuse the established store
+  lock order, require generation on both claimed mutations, and add
+  two-transaction same-owner/different-generation race tests before
+  implementation is accepted.
 - **Compatibility:** Old binaries cannot parse `deferred` and the old DB check
   constraint rejects it. Require migration and binary rollout together; do not
   write deferred rows until migration succeeds.
@@ -266,6 +305,10 @@ status and timestamps (B-010/B-013).
 
 - [ ] Store unit/integration tests named in B-002, B-003, B-006 through B-011,
   and B-013 run against PostgreSQL.
+- [ ] Claim-generation tests prove every claim atomically increments the
+  persisted generation, overflow rolls back, same-generation replays are
+  idempotent, and a reused owner with an older generation cannot defer or
+  enqueue.
 - [ ] Server dispatch tests named in B-001, B-005, B-012, and B-014 cover the
   full project-policy path.
 - [ ] `cargo test -p harness-workflow command_dispatcher`
@@ -280,8 +323,11 @@ status and timestamps (B-010/B-013).
 
 ## Rollout Plan
 
-1. Land the migration, typed status/reason, store atomic API, and tests in one
-   compatibility unit so no code path can write an unsupported status.
+1. Stop dispatch claimers, let current claims drain or expire, then land the
+   migration, typed status/reason, persisted claim generation, store atomic API,
+   and tests in one compatibility unit. Pre-migration `dispatching` rows at
+   generation zero must be reclaimed by the new code before mutation; no
+   owner-only compatibility path is allowed.
 2. Switch the three dispatcher barriers to the new API and expose projection
    fields.
 3. Deploy through the normal migration-capable server startup and monitor
