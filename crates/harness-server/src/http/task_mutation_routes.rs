@@ -5,7 +5,8 @@ use crate::workflow_runtime_submission::{
 use axum::{extract::State, http::StatusCode, Json};
 use harness_workflow::issue_lifecycle::IssueMergeApprovalOutcome;
 use harness_workflow::runtime::{
-    WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
+    WorkflowEvidence, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
+    WorkflowRuntimeRecoveryRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -25,6 +26,10 @@ pub(super) struct WorkflowRuntimeCancelRequest {
 pub(super) struct WorkflowRuntimeRecoveryRouteRequest {
     pub workflow_id: String,
     pub reason: String,
+    #[serde(default)]
+    pub target_state: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<WorkflowEvidence>,
 }
 
 /// POST /tasks/{id}/merge — human-gate approval to transition a `ready_to_merge`
@@ -257,6 +262,8 @@ async fn recover_workflow_runtime(
             action,
             reason,
             actor: "operator",
+            target_state: request.target_state.as_deref(),
+            evidence: &request.evidence,
         })
         .await
     {
@@ -343,6 +350,30 @@ fn runtime_recovery_response(
                 "definition_id": workflow.definition_id,
                 "state": workflow.state,
             }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::InvalidDefinitionPin { workflow, error } => (
+            StatusCode::CONFLICT,
+            json!({
+                "error": "workflow declarative definition pin is invalid",
+                "workflow_id": workflow.id,
+                "state": workflow.state,
+                "pin_error": format!("{error:?}"),
+            }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::OperatorRequired { workflow } => (
+            StatusCode::FORBIDDEN,
+            json!({ "error": "declarative workflow recovery requires an operator", "workflow_id": workflow.id }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::TargetRequired { workflow } => (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "target_state is required when multiple recovery targets are declared", "workflow_id": workflow.id }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::TargetNotAllowed {
+            workflow,
+            target_state,
+        } => (
+            StatusCode::CONFLICT,
+            json!({ "error": "target_state is not an allowed pinned recovery target", "workflow_id": workflow.id, "target_state": target_state }),
         ),
         WorkflowRuntimeRecoveryOutcome::NotFound => (
             StatusCode::NOT_FOUND,

@@ -18,6 +18,9 @@ pub struct TransitionRule {
     pub from_state: Option<String>,
     pub to_state: String,
     pub allowed_commands: BTreeSet<WorkflowCommandType>,
+    pub required_command: Option<WorkflowCommandType>,
+    pub required_evidence: BTreeSet<String>,
+    pub operator_recovery_only: bool,
 }
 
 impl TransitionRule {
@@ -30,6 +33,9 @@ impl TransitionRule {
             from_state: Some(from_state.into()),
             to_state: to_state.into(),
             allowed_commands: allowed_commands.into_iter().collect(),
+            required_command: None,
+            required_evidence: BTreeSet::new(),
+            operator_recovery_only: false,
         }
     }
 
@@ -41,6 +47,9 @@ impl TransitionRule {
             from_state: None,
             to_state: to_state.into(),
             allowed_commands: allowed_commands.into_iter().collect(),
+            required_command: None,
+            required_evidence: BTreeSet::new(),
+            operator_recovery_only: false,
         }
     }
 
@@ -397,6 +406,8 @@ pub enum WorkflowDecisionRejectionKind {
     InvalidDecisionContract,
     ProgressDriverMissing,
     MissingTerminalEvidence,
+    MissingRequiredEvidence,
+    OperatorRecoveryDenied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,6 +562,8 @@ impl DecisionValidator {
                 ),
             ));
         };
+
+        validator_progress::validate_declarative_transition_metadata(rule, decision, context)?;
 
         if self.kind == DecisionValidatorKind::PromptTask
             && decision.observed_state == "implementing"

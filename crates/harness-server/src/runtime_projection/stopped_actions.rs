@@ -1,7 +1,7 @@
-use super::RuntimeStoppedActionEligibility;
+use super::{RuntimeRecoveryTargetProjection, RuntimeStoppedActionEligibility};
 use harness_workflow::runtime::{
-    ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowInstance,
-    WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
+    workflow_declarative_definition, ActivityErrorKind, WorkflowCommand, WorkflowCommandType,
+    WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::Value;
@@ -60,6 +60,49 @@ pub(crate) async fn stopped_action_eligibility_for_workflows(
     Ok(by_workflow)
 }
 
+pub(super) fn pinned_recovery_targets(
+    workflow: &WorkflowInstance,
+) -> Vec<RuntimeRecoveryTargetProjection> {
+    if workflow.state != "blocked" {
+        return Vec::new();
+    }
+    let Some(definition) =
+        workflow_declarative_definition(&workflow.definition_id, workflow.definition_version)
+    else {
+        return Vec::new();
+    };
+    recovery_targets_for_definition(workflow, &definition)
+}
+
+fn recovery_targets_for_definition(
+    workflow: &WorkflowInstance,
+    definition: &harness_workflow::runtime::DeclarativeWorkflowDefinition,
+) -> Vec<RuntimeRecoveryTargetProjection> {
+    if workflow.state != "blocked" {
+        return Vec::new();
+    }
+    let Some(pinned_hash) = workflow.data.get("definition_hash").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    if pinned_hash != definition.definition_hash() {
+        return Vec::new();
+    }
+    definition
+        .policy()
+        .recovery_targets
+        .iter()
+        .map(|state| RuntimeRecoveryTargetProjection {
+            state: state.clone(),
+            required_evidence: definition
+                .policy()
+                .evidence_required
+                .get(state)
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoppedActionPlan {
     action: StoppedRecoveryAction,
@@ -81,7 +124,15 @@ struct RecoveryDispatchTarget {
 
 fn stopped_action_plan(workflow: &WorkflowInstance) -> Option<StoppedActionPlan> {
     if workflow.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
-        return None;
+        if workflow.state != "blocked" || pinned_recovery_targets(workflow).is_empty() {
+            return None;
+        }
+        return Some(StoppedActionPlan {
+            action: StoppedRecoveryAction::Unblock,
+            target: RecoveryDispatchTarget { activity: "" },
+            runtime_job_id: None,
+            legacy_fallback: true,
+        });
     }
     let action = match workflow.state.as_str() {
         "blocked" => StoppedRecoveryAction::Unblock,
@@ -255,14 +306,93 @@ fn enqueue_payload_matches_target(payload: &Value) -> bool {
 mod tests {
     use super::*;
     use crate::test_helpers;
+    use harness_core::config::workflow::{
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    };
+    use harness_workflow::runtime::build_declarative_definition;
     use harness_workflow::runtime::{RuntimeKind, WorkflowSubject};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn operator_monitor_enqueue_payload_rejects_non_objects() {
         for payload in [Value::Null, Value::String("implement_issue".to_string())] {
             assert!(!enqueue_payload_matches_target(&payload));
         }
+    }
+
+    #[test]
+    fn declarative_projection_exposes_only_exact_pinned_recovery_metadata() {
+        let policy = WorkflowDefinitionPolicy {
+            id: "projection_recovery".to_string(),
+            initial: "running".to_string(),
+            states: BTreeMap::from([
+                (
+                    "blocked".to_string(),
+                    DeclaredState {
+                        progress: Some(DeclaredProgressMode::OperatorGate),
+                        ..DeclaredState::default()
+                    },
+                ),
+                (
+                    "running".to_string(),
+                    DeclaredState {
+                        activity: Some("run".to_string()),
+                        on_success: Some("done".to_string()),
+                        on_failure: Some("failed".to_string()),
+                        on_signal: BTreeMap::from([(
+                            "cancel".to_string(),
+                            "cancelled".to_string(),
+                        )]),
+                        ..DeclaredState::default()
+                    },
+                ),
+            ]),
+            terminal: BTreeMap::from([
+                ("done".to_string(), "succeeded".to_string()),
+                ("failed".to_string(), "failed".to_string()),
+                ("cancelled".to_string(), "cancelled".to_string()),
+            ]),
+            evidence_required: BTreeMap::from([(
+                "running".to_string(),
+                vec!["operator_ticket".to_string()],
+            )]),
+            recovery_targets: vec!["running".to_string()],
+        };
+        let definition = build_declarative_definition(
+            &policy,
+            &BTreeMap::from([("run".to_string(), WorkflowActivityPolicy::default())]),
+        )
+        .expect("fixture definition should compile");
+        let pinned = WorkflowInstance::new(
+            "projection_recovery",
+            definition.definition_version(),
+            "blocked",
+            WorkflowSubject::new("test", "one"),
+        )
+        .with_data(json!({ "definition_hash": definition.definition_hash() }));
+        assert_eq!(
+            recovery_targets_for_definition(&pinned, &definition),
+            [RuntimeRecoveryTargetProjection {
+                state: "running".to_string(),
+                required_evidence: vec!["operator_ticket".to_string()],
+            }]
+        );
+        let missing_hash = WorkflowInstance {
+            data: json!({}),
+            ..pinned.clone()
+        };
+        assert!(recovery_targets_for_definition(&missing_hash, &definition).is_empty());
+        let mismatch = WorkflowInstance {
+            data: json!({ "definition_hash": "sha256:wrong" }),
+            ..pinned.clone()
+        };
+        assert!(recovery_targets_for_definition(&mismatch, &definition).is_empty());
+        let nonblocked = WorkflowInstance {
+            state: "failed".to_string(),
+            ..pinned
+        };
+        assert!(recovery_targets_for_definition(&nonblocked, &definition).is_empty());
     }
 
     #[tokio::test]

@@ -67,10 +67,20 @@ pub(super) fn retry_failed_activity_decision(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
+    retry_failed_activity_decision_inner(instance, event, result, false)
+}
+
+fn retry_failed_activity_decision_inner(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    declarative: bool,
+) -> Option<WorkflowDecision> {
     if !is_retryable_error_kind(result.error_kind) {
         return None;
     }
-    if !supports_same_state_activity_retry(&instance.definition_id, &instance.state) {
+    if !declarative && !supports_same_state_activity_retry(&instance.definition_id, &instance.state)
+    {
         return None;
     }
     let retry_attempt = failed_activity_retry_attempt(event);
@@ -105,6 +115,14 @@ pub(super) fn retry_failed_activity_decision(
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
+}
+
+pub(super) fn retry_failed_declarative_activity_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    retry_failed_activity_decision_inner(instance, event, result, true)
 }
 
 fn is_retryable_error_kind(error_kind: Option<ActivityErrorKind>) -> bool {

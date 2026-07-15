@@ -1,17 +1,21 @@
+use super::runtime_completion::validator_for_instance;
 use super::runtime_job_leases::delete_runtime_job_lease_receipts_tx;
 use super::{
-    command_store, enum_str, insert_decision_record_tx, insert_event_tx,
-    select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx, validator_for_definition,
+    apply_inline_command_side_effect, command_store, enum_str, insert_decision_record_tx,
+    insert_event_tx, select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx,
     WorkflowInstance, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, WorkflowCommand,
-    WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord, WorkflowEvidence,
 };
 use crate::runtime::pr_feedback::{
     LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
+use crate::runtime::state_registry::{
+    DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, WorkflowProgressMode,
+};
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::ValidationContext;
 use anyhow::{bail, Context};
@@ -48,7 +52,7 @@ impl WorkflowRuntimeRecoveryAction {
 
 #[rustfmt::skip]
 pub struct WorkflowRuntimeRecoveryRequest<'a> {
-    pub workflow_id: &'a str, pub action: WorkflowRuntimeRecoveryAction, pub reason: &'a str, pub actor: &'a str,
+    pub workflow_id: &'a str, pub action: WorkflowRuntimeRecoveryAction, pub reason: &'a str, pub actor: &'a str, pub target_state: Option<&'a str>, pub evidence: &'a [WorkflowEvidence],
 }
 
 #[rustfmt::skip]
@@ -59,12 +63,16 @@ pub enum WorkflowRuntimeRecoveryOutcome {
     NonRetryableFailure { workflow: WorkflowInstance, error_kind: ActivityErrorKind },
     UnsupportedStoppedActivity { workflow: WorkflowInstance, activity: Option<String> },
     UnsupportedDefinition { workflow: WorkflowInstance },
+    InvalidDefinitionPin { workflow: WorkflowInstance, error: DeclarativeDefinitionPinError },
+    OperatorRequired { workflow: WorkflowInstance },
+    TargetRequired { workflow: WorkflowInstance },
+    TargetNotAllowed { workflow: WorkflowInstance, target_state: String },
     NotFound,
 }
 
 #[rustfmt::skip]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RecoveryDispatchTarget { state: &'static str, activity: &'static str }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryDispatchTarget { state: String, activity: Option<String> }
 
 #[rustfmt::skip]
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +82,7 @@ struct RecoveryDispatchPlan { target: RecoveryDispatchTarget, command_source: Re
 enum RecoveryDispatchCommandSource {
     Replay(WorkflowCommand),
     LegacyFallback,
+    DeclarativeProgress(WorkflowCommandType),
 }
 
 impl WorkflowRuntimeStore {
@@ -86,22 +95,36 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
         };
-
-        if let Some(outcome) = recovery_rejection(&snapshot, request.action)? {
+        let declarative = !matches!(
+            crate::runtime::state_registry::resolve_declarative_definition(&snapshot),
+            DeclarativeDefinitionResolution::NotDeclarative
+        );
+        if let Some(outcome) = recovery_rejection(&snapshot, &request)? {
+            if declarative {
+                audit_recovery_rejection_tx(&mut tx, &snapshot, &request, "eligibility_rejected")
+                    .await?;
+            }
             tx.commit().await?;
             return Ok(outcome);
         }
-        let _plan = match recovery_dispatch_plan_tx(&mut tx, &snapshot).await? {
+        let plan = match recovery_dispatch_plan_tx(&mut tx, &snapshot, &request).await? {
             Ok(plan) => plan,
             Err(activity) => {
+                if declarative {
+                    audit_recovery_rejection_tx(
+                        &mut tx,
+                        &snapshot,
+                        &request,
+                        "target_driver_unavailable",
+                    )
+                    .await?;
+                }
                 tx.commit().await?;
                 return Ok(unsupported_stopped_activity(&snapshot, activity));
             }
         };
-
         let (superseded_command_count, superseded_runtime_job_count) =
             skip_superseded_active_commands_tx(&mut tx, &snapshot.id).await?;
-
         let Some(mut instance) =
             select_instance_for_update_tx(&mut tx, request.workflow_id).await?
         else {
@@ -109,17 +132,14 @@ impl WorkflowRuntimeStore {
             return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
         };
 
-        if let Some(outcome) = recovery_rejection(&instance, request.action)? {
+        if let Some(outcome) = recovery_rejection(&instance, &request)? {
             tx.rollback().await?;
             return Ok(outcome);
         }
-        let plan = match recovery_dispatch_plan_tx(&mut tx, &instance).await? {
-            Ok(plan) => plan,
-            Err(activity) => {
-                tx.rollback().await?;
-                return Ok(unsupported_stopped_activity(&instance, activity));
-            }
-        };
+        if recovery_dispatch_plan_tx(&mut tx, &instance, &request).await? != Ok(plan.clone()) {
+            tx.rollback().await?;
+            return Ok(unsupported_stopped_activity(&instance, None));
+        }
         let previous_state = instance.state.clone();
 
         let event = insert_event_tx(
@@ -146,8 +166,9 @@ impl WorkflowRuntimeStore {
             &previous_state,
             &plan,
             &event.id,
+            request.evidence,
         );
-        let Some(validator) = validator_for_definition(&instance.definition_id) else {
+        let Some(validator) = validator_for_instance(&instance)? else {
             anyhow::bail!(
                 "workflow runtime recovery cannot validate definition {}",
                 instance.definition_id
@@ -164,14 +185,18 @@ impl WorkflowRuntimeStore {
             WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()));
         insert_decision_record_tx(&mut tx, &decision_record).await?;
         for command in &decision.commands {
+            let status = recovery_command_status(command);
             command_store::insert_tx(
                 &mut tx,
                 &instance.id,
                 Some(&decision_record.id),
                 command,
-                WorkflowCommandStatus::Pending,
+                status,
             )
             .await?;
+            if status == WorkflowCommandStatus::HandledInline {
+                apply_inline_command_side_effect(&mut instance, command)?;
+            }
         }
 
         instance.state = plan.target.state.to_string();
@@ -183,7 +208,7 @@ impl WorkflowRuntimeStore {
             request.reason,
             request.actor,
             &previous_state,
-            plan.target.state,
+            &plan.target.state,
             &event.id,
         );
         upsert_instance_tx(&mut tx, &instance).await?;
@@ -196,24 +221,46 @@ impl WorkflowRuntimeStore {
     }
 }
 
-async fn select_instance_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_id: &str,
-) -> anyhow::Result<Option<WorkflowInstance>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1")
-            .bind(workflow_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    row.map(|(data,)| serde_json::from_str(&data))
-        .transpose()
-        .map_err(Into::into)
+fn recovery_command_status(command: &WorkflowCommand) -> WorkflowCommandStatus {
+    if command.requires_runtime_job() {
+        WorkflowCommandStatus::Pending
+    } else {
+        WorkflowCommandStatus::HandledInline
+    }
+}
+
+#[rustfmt::skip]
+async fn select_instance_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, workflow_id: &str) -> anyhow::Result<Option<WorkflowInstance>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1").bind(workflow_id).fetch_optional(&mut **tx).await?;
+    row.map(|(data,)| serde_json::from_str(&data)).transpose().map_err(Into::into)
+}
+
+#[rustfmt::skip]
+async fn audit_recovery_rejection_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, instance: &WorkflowInstance, request: &WorkflowRuntimeRecoveryRequest<'_>, reason_code: &str) -> anyhow::Result<()> {
+    insert_event_tx(tx, &instance.id, "WorkflowRuntimeRecoveryRejected", "workflow_runtime_operator_action", json!({ "action": request.action.as_str(), "actor": request.actor, "reason": request.reason, "reason_code": reason_code, "state": instance.state })).await?;
+    Ok(())
 }
 
 fn recovery_rejection(
     instance: &WorkflowInstance,
-    action: WorkflowRuntimeRecoveryAction,
+    request: &WorkflowRuntimeRecoveryRequest<'_>,
 ) -> anyhow::Result<Option<WorkflowRuntimeRecoveryOutcome>> {
+    match crate::runtime::state_registry::resolve_declarative_definition(instance) {
+        DeclarativeDefinitionResolution::PinError(error) => {
+            return Ok(Some(WorkflowRuntimeRecoveryOutcome::InvalidDefinitionPin {
+                workflow: instance.clone(),
+                error,
+            }));
+        }
+        DeclarativeDefinitionResolution::Resolved(definition) => {
+            return Ok(declarative_recovery_rejection(
+                instance,
+                request,
+                &definition,
+            ));
+        }
+        DeclarativeDefinitionResolution::NotDeclarative => {}
+    }
     if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
         return Ok(Some(
             WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition {
@@ -222,13 +269,13 @@ fn recovery_rejection(
         ));
     }
 
-    if instance.state != action.expected_state() {
+    if instance.state != request.action.expected_state() {
         return Ok(Some(WorkflowRuntimeRecoveryOutcome::WrongState {
             workflow: instance.clone(),
         }));
     }
 
-    if action == WorkflowRuntimeRecoveryAction::Retry {
+    if request.action == WorkflowRuntimeRecoveryAction::Retry {
         if let Some(error_kind) = stopped_error_kind(&instance.data)?.filter(|kind| {
             matches!(
                 kind,
@@ -245,10 +292,24 @@ fn recovery_rejection(
     Ok(None)
 }
 
+#[rustfmt::skip]
+fn declarative_recovery_rejection(instance: &WorkflowInstance, request: &WorkflowRuntimeRecoveryRequest<'_>, definition: &crate::runtime::declarative::DeclarativeWorkflowDefinition) -> Option<WorkflowRuntimeRecoveryOutcome> {
+    if request.actor != "operator" { return Some(WorkflowRuntimeRecoveryOutcome::OperatorRequired { workflow: instance.clone() }); }
+    if request.action != WorkflowRuntimeRecoveryAction::Unblock || instance.state != "blocked" { return Some(WorkflowRuntimeRecoveryOutcome::WrongState { workflow: instance.clone() }); }
+    if request.target_state.is_none() && definition.policy().recovery_targets.len() != 1 { return Some(WorkflowRuntimeRecoveryOutcome::TargetRequired { workflow: instance.clone() }); }
+    request.target_state.filter(|target| !definition.policy().recovery_targets.iter().any(|allowed| allowed == target)).map(|target_state| WorkflowRuntimeRecoveryOutcome::TargetNotAllowed { workflow: instance.clone(), target_state: target_state.to_string() })
+}
+
 async fn recovery_dispatch_plan_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
+    request: &WorkflowRuntimeRecoveryRequest<'_>,
 ) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
+    if let DeclarativeDefinitionResolution::Resolved(definition) =
+        crate::runtime::state_registry::resolve_declarative_definition(instance)
+    {
+        return declarative_recovery_dispatch_plan(request, &definition);
+    }
     validate_stopped_metadata(&instance.data)?;
     let activity = stopped_activity(&instance.data)?;
     let target = match recovery_dispatch_target(&instance.data, activity.as_deref())? {
@@ -266,7 +327,7 @@ async fn recovery_dispatch_plan_tx(
             Ok(command) => command,
             Err(activity) => return Ok(Err(activity)),
         };
-        if !command_matches_recovery_target(&command, target) {
+        if !command_matches_recovery_target(&command, &target) {
             return Ok(Err(activity));
         }
         RecoveryDispatchCommandSource::Replay(command)
@@ -274,8 +335,43 @@ async fn recovery_dispatch_plan_tx(
         RecoveryDispatchCommandSource::LegacyFallback
     };
     Ok(Ok(RecoveryDispatchPlan {
-        target,
+        target: target.clone(),
         command_source,
+    }))
+}
+
+fn declarative_recovery_dispatch_plan(
+    request: &WorkflowRuntimeRecoveryRequest<'_>,
+    definition: &crate::runtime::declarative::DeclarativeWorkflowDefinition,
+) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
+    let target = request
+        .target_state
+        .unwrap_or_else(|| definition.policy().recovery_targets[0].as_str());
+    let state = &definition.policy().states[target];
+    let target = RecoveryDispatchTarget {
+        state: target.to_string(),
+        activity: state.activity.clone(),
+    };
+    let command_type = if state.activity.is_some() {
+        WorkflowCommandType::EnqueueActivity
+    } else {
+        match definition
+            .registered()
+            .states
+            .iter()
+            .find(|candidate| candidate.key.state.as_ref() == target.state)
+            .and_then(|candidate| candidate.progress_mode)
+        {
+            Some(WorkflowProgressMode::ExternalWait) => WorkflowCommandType::Wait,
+            Some(WorkflowProgressMode::OperatorGate) => {
+                WorkflowCommandType::RequestOperatorAttention
+            }
+            _ => return Ok(Err(None)),
+        }
+    };
+    Ok(Ok(RecoveryDispatchPlan {
+        target,
+        command_source: RecoveryDispatchCommandSource::DeclarativeProgress(command_type),
     }))
 }
 
@@ -287,44 +383,44 @@ fn recovery_dispatch_target(
     let Some(activity_name) = activity.as_deref() else {
         if has_no_structured_stop_metadata(data)? {
             return Ok(Ok(RecoveryDispatchTarget {
-                state: "implementing",
-                activity: "implement_issue",
+                state: "implementing".to_string(),
+                activity: Some("implement_issue".to_string()),
             }));
         }
         return Ok(Err(activity));
     };
     let target = match activity_name {
         "implement_issue" => RecoveryDispatchTarget {
-            state: "implementing",
-            activity: "implement_issue",
+            state: "implementing".to_string(),
+            activity: Some("implement_issue".to_string()),
         },
         "replan_issue" => RecoveryDispatchTarget {
-            state: "replanning",
-            activity: "replan_issue",
+            state: "replanning".to_string(),
+            activity: Some("replan_issue".to_string()),
         },
         "merge_pr" => RecoveryDispatchTarget {
-            state: "merging",
-            activity: "merge_pr",
+            state: "merging".to_string(),
+            activity: Some("merge_pr".to_string()),
         },
         LOCAL_REVIEW_ACTIVITY => RecoveryDispatchTarget {
-            state: "local_review_gate",
-            activity: LOCAL_REVIEW_ACTIVITY,
+            state: "local_review_gate".to_string(),
+            activity: Some(LOCAL_REVIEW_ACTIVITY.to_string()),
         },
         "sweep_pr_feedback" => RecoveryDispatchTarget {
-            state: "awaiting_feedback",
-            activity: "sweep_pr_feedback",
+            state: "awaiting_feedback".to_string(),
+            activity: Some("sweep_pr_feedback".to_string()),
         },
         PR_FEEDBACK_INSPECT_ACTIVITY => RecoveryDispatchTarget {
-            state: "awaiting_feedback",
-            activity: PR_FEEDBACK_INSPECT_ACTIVITY,
+            state: "awaiting_feedback".to_string(),
+            activity: Some(PR_FEEDBACK_INSPECT_ACTIVITY.to_string()),
         },
         "start_child_workflow" => RecoveryDispatchTarget {
-            state: "awaiting_feedback",
-            activity: "start_child_workflow",
+            state: "awaiting_feedback".to_string(),
+            activity: Some("start_child_workflow".to_string()),
         },
         "address_pr_feedback" => RecoveryDispatchTarget {
-            state: "addressing_feedback",
-            activity: "address_pr_feedback",
+            state: "addressing_feedback".to_string(),
+            activity: Some("address_pr_feedback".to_string()),
         },
         _ => return Ok(Err(activity)),
     };
@@ -349,15 +445,15 @@ async fn select_command_for_runtime_job_tx(
 }
 
 #[rustfmt::skip]
-fn command_matches_recovery_target(command: &WorkflowCommand, target: RecoveryDispatchTarget) -> bool {
+fn command_matches_recovery_target(command: &WorkflowCommand, target: &RecoveryDispatchTarget) -> bool {
     match command.command_type {
         WorkflowCommandType::EnqueueActivity => {
-            command.activity_name() == Some(target.activity)
+            command.activity_name() == target.activity.as_deref()
                 && enqueue_payload_matches_target(&command.command)
         }
         WorkflowCommandType::StartChildWorkflow => {
             let payload = &command.command;
-            matches!(target.activity, "start_child_workflow" | "sweep_pr_feedback")
+            matches!(target.activity.as_deref(), Some("start_child_workflow" | "sweep_pr_feedback"))
                 && payload.get("definition_id").and_then(Value::as_str) == Some(PR_FEEDBACK_DEFINITION_ID)
                 && payload.get("child_activity").and_then(Value::as_str) == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
                 && payload.get("pr_number").and_then(Value::as_u64).is_some()
@@ -503,12 +599,13 @@ fn recovery_dispatch_decision(
     previous_state: &str,
     plan: &RecoveryDispatchPlan,
     event_id: &str,
+    evidence: &[WorkflowEvidence],
 ) -> WorkflowDecision {
-    WorkflowDecision::new(
+    let mut decision = WorkflowDecision::new(
         &instance.id,
         previous_state,
         format!("operator_runtime_{}", action.as_str()),
-        plan.target.state,
+        &plan.target.state,
         format!(
             "operator requested workflow runtime {} after resolving the stopped condition",
             action.as_str()
@@ -516,7 +613,11 @@ fn recovery_dispatch_decision(
     )
     .with_command(recovery_dispatch_command(
         instance, action, reason, plan, event_id,
-    ))
+    ));
+    for item in evidence {
+        decision = decision.with_evidence(item.clone());
+    }
+    decision
 }
 
 fn recovery_dispatch_command(
@@ -536,6 +637,17 @@ fn recovery_dispatch_command(
         let mut command = command.clone();
         command.dedupe_key = dedupe_key;
         return command;
+    }
+    if let RecoveryDispatchCommandSource::DeclarativeProgress(command_type) = plan.command_source {
+        return WorkflowCommand::new(
+            command_type,
+            dedupe_key,
+            json!({
+                "reason": reason,
+                "recovery_target": plan.target.state,
+                "activity": plan.target.activity,
+            }),
+        );
     }
 
     let remote_fact_hash = optional_string_field(&instance.data, "last_remote_fact_hash");
@@ -645,3 +757,7 @@ fn copy_optional_data_field(payload: &mut Value, data: &Value, field: &str) {
         payload.insert(field.to_string(), value.clone());
     }
 }
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod tests;
