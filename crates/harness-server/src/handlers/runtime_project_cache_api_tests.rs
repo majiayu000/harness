@@ -246,7 +246,12 @@ async fn sync_after_deregister_does_not_recreate_cache() -> anyhow::Result<()> {
     let project_dir = tempfile::tempdir()?;
     std::fs::create_dir_all(project_dir.path().join(".git"))?;
 
-    let Some(state) = make_test_state(data_dir.path()).await? else {
+    let Some((state, _runtime_store)) =
+        super::runtime_hosts_workflow_api_tests::make_test_state_with_runtime_store(
+            data_dir.path(),
+        )
+        .await?
+    else {
         return Ok(());
     };
     let app = runtime_project_cache_app(state.clone());

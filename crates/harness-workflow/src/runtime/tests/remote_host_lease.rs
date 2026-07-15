@@ -268,7 +268,7 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
             .iter()
             .filter(|event| event.event_type == "RuntimeJobLeaseRenewalRejected")
             .count(),
-        3
+        4
     );
     Ok(())
 }
