@@ -497,3 +497,132 @@ async fn driverless_completion_is_rejected_atomically() -> anyhow::Result<()> {
     assert_eq!(counts.runtime_job_count, 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("replanning")
+        .with_id("issue-driverless-production-completion")
+        .with_data(json!({ "marker": "must-remain" }));
+    store.upsert_instance(&instance).await?;
+
+    let state_entry = WorkflowDecision::new(
+        &instance.id,
+        "implementing",
+        "run_replan",
+        "replanning",
+        "Replan before resuming implementation.",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "replan_issue",
+        "driverless-production-replan",
+    ));
+    let state_entry_record = WorkflowDecisionRecord::accepted(state_entry.clone(), None);
+    store.record_decision(&state_entry_record).await?;
+    let command_id = store
+        .enqueue_command(
+            &instance.id,
+            Some(&state_entry_record.id),
+            &state_entry.commands[0],
+        )
+        .await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            json!({ "workflow_id": instance.id, "activity": "replan_issue" }),
+        )
+        .await?;
+    let claimed = store
+        .claim_next_runtime_job("runtime-1", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("runtime job should be claimable");
+    assert_eq!(claimed.id, job.id);
+    let lease_expires_at = claimed
+        .lease
+        .as_ref()
+        .expect("claimed runtime job should have a lease")
+        .expires_at;
+
+    let driverless = WorkflowDecision::new(
+        &instance.id,
+        "replanning",
+        "resume_implementation_after_replan",
+        "implementing",
+        "Resume implementation without durable work.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "Waiting is not a progress driver.",
+        "driverless-production-wait",
+    ));
+    let result = ActivityResult::succeeded("replan_issue", "Replan completed.").with_artifact(
+        ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&driverless)?,
+        ),
+    );
+
+    let first = store.commit_runtime_activity_completion_if_owned(
+        &claimed.id,
+        "runtime-1",
+        lease_expires_at,
+        &result,
+    );
+    let replay = store.commit_runtime_activity_completion_if_owned(
+        &claimed.id,
+        "runtime-1",
+        lease_expires_at,
+        &result,
+    );
+    let (first, replay) = tokio::join!(first, replay);
+    let first = first?;
+    let replay = replay?;
+    assert!(
+        first.is_some() ^ replay.is_some(),
+        "the runtime job lease must admit exactly one completion"
+    );
+    let winner = first.or(replay).expect("one completion should win");
+    let rejected = winner
+        .decision
+        .expect("the winning completion should persist a decision");
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.decision, driverless);
+    assert!(rejected
+        .rejection_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("ProgressDriverMissing:")));
+
+    let after = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("workflow instance should remain visible");
+    assert_eq!(after.state, instance.state);
+    assert_eq!(after.version, instance.version);
+    assert_eq!(after.data, instance.data);
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].id, command_id);
+    assert_eq!(
+        commands[0].decision_id.as_deref(),
+        Some(state_entry_record.id.as_str())
+    );
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, RuntimeJobStatus::Succeeded);
+    assert_eq!(store.events_for(&instance.id).await?.len(), 1);
+    let decisions = store.decisions_for(&instance.id).await?;
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions.iter().filter(|decision| decision.accepted).count(), 1);
+    assert_eq!(
+        decisions.iter().filter(|decision| !decision.accepted).count(),
+        1
+    );
+    Ok(())
+}

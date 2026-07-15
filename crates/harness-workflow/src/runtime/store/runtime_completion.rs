@@ -3,10 +3,13 @@ use super::{
     select_instance_for_update_tx, upsert_instance_tx, validator_for_definition,
     WorkflowRuntimeStore,
 };
-use crate::runtime::model::{WorkflowDecisionRecord, WorkflowEvent, WorkflowInstance};
+use crate::runtime::model::{
+    ActivityResult, ActivityStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowEvent,
+    WorkflowInstance,
+};
 use crate::runtime::reducer::reduce_runtime_job_completed;
 use crate::runtime::status::WorkflowCommandStatus;
-use crate::runtime::validator::ValidationContext;
+use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
 use serde_json::Value;
 
 impl WorkflowRuntimeStore {
@@ -89,6 +92,13 @@ async fn apply_runtime_completion_decision_for_instance_tx(
     source: &str,
     event: &WorkflowEvent,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+    // Preserve the requested liveness rejection before the reducer can replace
+    // invalid structured output with a separate blocked policy decision.
+    if let Some(decision) = driverless_structured_completion_decision(&instance, source, event)? {
+        return persist_runtime_completion_decision_tx(tx, instance, source, event, decision)
+            .await
+            .map(Some);
+    }
     let Some(decision) = reduce_runtime_job_completed(&instance, event)? else {
         return Ok(None);
     };
@@ -98,12 +108,50 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         .map(Some)
 }
 
+fn driverless_structured_completion_decision(
+    instance: &WorkflowInstance,
+    source: &str,
+    event: &WorkflowEvent,
+) -> anyhow::Result<Option<WorkflowDecision>> {
+    let Some(result) = event.event.get("activity_result") else {
+        return Ok(None);
+    };
+    let result: ActivityResult = serde_json::from_value(result.clone())?;
+    if result.status != ActivityStatus::Succeeded {
+        return Ok(None);
+    }
+    let Some(decision) = result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "workflow_decision")
+        .find_map(|artifact| {
+            serde_json::from_value::<WorkflowDecision>(artifact.artifact.clone()).ok()
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(validator) = validator_for_definition(&instance.definition_id) else {
+        return Ok(None);
+    };
+    let rejection = validator.validate(
+        instance,
+        &decision,
+        &ValidationContext::new(source, event.created_at),
+    );
+    match rejection {
+        Err(error) if error.kind == WorkflowDecisionRejectionKind::ProgressDriverMissing => {
+            Ok(Some(decision))
+        }
+        _ => Ok(None),
+    }
+}
+
 async fn persist_runtime_completion_decision_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mut instance: WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
-    decision: crate::runtime::model::WorkflowDecision,
+    decision: WorkflowDecision,
 ) -> anyhow::Result<WorkflowDecisionRecord> {
     let record = match validator_for_definition(&instance.definition_id) {
         Some(validator) => match validator.validate(
