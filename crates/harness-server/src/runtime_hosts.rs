@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
 pub const DEFAULT_LEASE_SECS: i64 = 60;
@@ -43,6 +45,7 @@ pub(crate) struct RuntimeHostRecord {
 
 pub struct RuntimeHostManager {
     pub(crate) hosts: DashMap<String, RuntimeHostRecord>,
+    operation_locks: DashMap<String, Arc<Mutex<()>>>,
     pub(crate) heartbeat_timeout_secs: i64,
 }
 
@@ -54,8 +57,25 @@ impl RuntimeHostManager {
     pub fn with_heartbeat_timeout(heartbeat_timeout_secs: i64) -> Self {
         Self {
             hosts: DashMap::new(),
+            operation_locks: DashMap::new(),
             heartbeat_timeout_secs,
         }
+    }
+
+    /// Serializes lifecycle validation with every host-owned durable operation.
+    ///
+    /// The lock entry intentionally outlives deregistration. Reusing a host ID
+    /// must retain the same ordering boundary as requests that were queued
+    /// before the previous registration was removed.
+    pub async fn lock_operation(&self, host_id: &str) -> OwnedMutexGuard<()> {
+        self.operation_lock(host_id).lock_owned().await
+    }
+
+    pub(crate) fn operation_lock(&self, host_id: &str) -> Arc<Mutex<()>> {
+        self.operation_locks
+            .entry(host_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub fn register(
@@ -115,6 +135,10 @@ impl RuntimeHostManager {
         self.hosts
             .get(host_id)
             .is_some_and(|host| host.lifecycle == RuntimeHostLifecycle::Active)
+    }
+
+    pub fn lifecycle(&self, host_id: &str) -> Option<RuntimeHostLifecycle> {
+        self.hosts.get(host_id).map(|host| host.lifecycle)
     }
 
     pub fn list_hosts(&self) -> Vec<RuntimeHostInfo> {

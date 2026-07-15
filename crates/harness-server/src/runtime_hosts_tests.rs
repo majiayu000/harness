@@ -1,5 +1,6 @@
 use crate::runtime_hosts::{RuntimeHostLifecycle, RuntimeHostManager};
 use chrono::{TimeDelta, Utc};
+use std::sync::Arc;
 
 #[test]
 fn register_upserts_host_metadata() {
@@ -114,4 +115,31 @@ fn persisted_legacy_host_defaults_to_active() {
     let host: crate::runtime_hosts_state::PersistedRuntimeHost =
         serde_json::from_value(value).expect("legacy host record must deserialize");
     assert_eq!(host.lifecycle, RuntimeHostLifecycle::Active);
+}
+
+#[test]
+fn operation_lock_is_stable_across_deregistration_and_host_id_reuse() {
+    let manager = RuntimeHostManager::with_heartbeat_timeout(60);
+    manager.register("host-a".to_string(), None, vec![]);
+
+    let before = manager.operation_lock("host-a");
+    assert!(manager.deregister("host-a"));
+    manager.register("host-a".to_string(), None, vec![]);
+    let after = manager.operation_lock("host-a");
+    let other = manager.operation_lock("host-b");
+
+    assert!(Arc::ptr_eq(&before, &after));
+    assert!(!Arc::ptr_eq(&before, &other));
+}
+
+#[tokio::test]
+async fn operation_lock_serializes_same_host_without_blocking_other_hosts() {
+    let manager = RuntimeHostManager::with_heartbeat_timeout(60);
+    let first = manager.lock_operation("host-a").await;
+
+    assert!(manager.operation_lock("host-a").try_lock().is_err());
+    assert!(manager.operation_lock("host-b").try_lock().is_ok());
+
+    drop(first);
+    assert!(manager.operation_lock("host-a").try_lock().is_ok());
 }

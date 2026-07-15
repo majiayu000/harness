@@ -1,4 +1,5 @@
 use crate::http::AppState;
+use crate::runtime_hosts::RuntimeHostLifecycle;
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
     http::StatusCode,
@@ -61,15 +62,17 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             )
         }
     };
-    if !state.runtime_hosts.hosts.contains_key(&host_id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "runtime host not found" })),
-        );
-    }
-    if !state.runtime_hosts.is_active(&host_id) {
-        return lease_lost_response();
-    }
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
+    let owner_active = match state.runtime_hosts.lifecycle(&host_id) {
+        Some(RuntimeHostLifecycle::Active) => true,
+        Some(RuntimeHostLifecycle::Draining) => false,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "runtime host not found" })),
+            )
+        }
+    };
     let lease_secs = match validated_runtime_host_lease_secs(req.lease_secs.value()) {
         Ok(value) => value,
         Err(response) => return response,
@@ -87,7 +90,7 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             lease_secs,
             now: Utc::now(),
             max_lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
-            owner_active: true,
+            owner_active,
         })
         .await;
     match outcome {

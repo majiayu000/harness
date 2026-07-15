@@ -59,6 +59,7 @@ pub async fn register_runtime_host(
     if let Err(response) = ensure_runtime_state_persistence_available(&state) {
         return response;
     }
+    let _host_operation = state.runtime_hosts.lock_operation(host_id).await;
     let host = state.runtime_hosts.register(
         host_id.to_string(),
         req.display_name.map(|v| v.trim().to_string()),
@@ -74,6 +75,7 @@ pub async fn heartbeat_runtime_host(
     State(state): State<Arc<AppState>>,
     Path(host_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     match state.runtime_hosts.heartbeat(&host_id) {
         Ok(host) => {
             // Heartbeat is intentionally not persisted (transient data, self-healing
@@ -104,6 +106,7 @@ pub async fn deregister_runtime_host(
     if let Err(response) = ensure_runtime_state_persistence_available(&state) {
         return response;
     }
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         // Host already gone from memory (idempotent retry).  If a prior
         // deregister mutated memory but failed to persist, converge now.
@@ -226,6 +229,7 @@ pub async fn claim_task_for_runtime_host(
     Path(host_id): Path<String>,
     Json(req): Json<ClaimTaskRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
             StatusCode::NOT_FOUND,
@@ -332,6 +336,7 @@ pub async fn claim_runtime_job_for_runtime_host(
             )
         }
     };
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
             StatusCode::NOT_FOUND,
@@ -461,6 +466,7 @@ pub async fn complete_runtime_job_for_runtime_host(
     Path((host_id, runtime_job_id)): Path<(String, String)>,
     Json(req): Json<CompleteRuntimeJobRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
             StatusCode::NOT_FOUND,

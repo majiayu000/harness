@@ -15,7 +15,7 @@ use harness_workflow::runtime::{
     WorkflowRuntimeStore, WorkflowSubject,
 };
 
-fn runtime_hosts_workflow_app(state: Arc<crate::http::AppState>) -> Router {
+pub(super) fn runtime_hosts_workflow_app(state: Arc<crate::http::AppState>) -> Router {
     Router::new()
         .route(
             "/api/runtime-hosts/register",
@@ -40,7 +40,7 @@ fn runtime_hosts_workflow_app(state: Arc<crate::http::AppState>) -> Router {
         .with_state(state)
 }
 
-async fn make_test_state_with_runtime_store(
+pub(super) async fn make_test_state_with_runtime_store(
     dir: &std::path::Path,
 ) -> anyhow::Result<Option<(Arc<crate::http::AppState>, Arc<WorkflowRuntimeStore>)>> {
     if !crate::test_helpers::db_tests_enabled().await {
@@ -60,7 +60,7 @@ async fn make_test_state_with_runtime_store(
     Ok(Some((state, store)))
 }
 
-async fn register_host(app: &Router, host_id: &str) -> anyhow::Result<()> {
+pub(super) async fn register_host(app: &Router, host_id: &str) -> anyhow::Result<()> {
     let response = app
         .clone()
         .oneshot(
@@ -75,7 +75,7 @@ async fn register_host(app: &Router, host_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn enqueue_runtime_host_test_job(
+pub(super) async fn enqueue_runtime_host_test_job(
     store: &WorkflowRuntimeStore,
     key: &str,
     runtime_kind: RuntimeKind,
@@ -101,7 +101,7 @@ async fn enqueue_runtime_host_test_job(
         .await
 }
 
-async fn post_json(
+pub(super) async fn post_json(
     app: &Router,
     uri: String,
     body: serde_json::Value,
@@ -111,7 +111,7 @@ async fn post_json(
     Ok(json)
 }
 
-async fn post_json_with_status(
+pub(super) async fn post_json_with_status(
     app: &Router,
     uri: String,
     body: serde_json::Value,
