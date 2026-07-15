@@ -375,6 +375,10 @@ fn runtime_recovery_response(
             StatusCode::CONFLICT,
             json!({ "error": "target_state is not an allowed pinned recovery target", "workflow_id": workflow.id, "target_state": target_state }),
         ),
+        WorkflowRuntimeRecoveryOutcome::MissingRequiredEvidence { workflow, detail } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "error": "declarative workflow recovery is missing required evidence", "workflow_id": workflow.id, "detail": detail }),
+        ),
         WorkflowRuntimeRecoveryOutcome::NotFound => (
             StatusCode::NOT_FOUND,
             json!({ "error": "workflow not found" }),

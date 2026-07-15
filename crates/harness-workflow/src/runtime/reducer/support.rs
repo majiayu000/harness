@@ -5,7 +5,7 @@ use crate::runtime::model::{
 use crate::runtime::reason_class::{classify_stop, STOP_REASON_INVALID_AGENT_OUTPUT};
 use serde_json::{json, Value};
 
-pub(super) fn invalid_agent_output_blocked_decision(
+pub(crate) fn invalid_agent_output_blocked_decision(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,

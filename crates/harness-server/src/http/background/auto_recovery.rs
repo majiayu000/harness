@@ -498,7 +498,8 @@ async fn run_recovery_attempt(
         }
         WorkflowRuntimeRecoveryOutcome::OperatorRequired { .. }
         | WorkflowRuntimeRecoveryOutcome::TargetRequired { .. }
-        | WorkflowRuntimeRecoveryOutcome::TargetNotAllowed { .. } => {
+        | WorkflowRuntimeRecoveryOutcome::TargetNotAllowed { .. }
+        | WorkflowRuntimeRecoveryOutcome::MissingRequiredEvidence { .. } => {
             record_terminal_recheck(
                 store,
                 policy,

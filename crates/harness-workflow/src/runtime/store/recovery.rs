@@ -21,6 +21,9 @@ use crate::runtime::validator::ValidationContext;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
 
+#[path = "recovery_validation.rs"]
+mod recovery_validation;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowRuntimeRecoveryAction {
     Unblock,
@@ -67,6 +70,7 @@ pub enum WorkflowRuntimeRecoveryOutcome {
     OperatorRequired { workflow: WorkflowInstance },
     TargetRequired { workflow: WorkflowInstance },
     TargetNotAllowed { workflow: WorkflowInstance, target_state: String },
+    MissingRequiredEvidence { workflow: WorkflowInstance, detail: String },
     NotFound,
 }
 
@@ -123,6 +127,15 @@ impl WorkflowRuntimeStore {
                 return Ok(unsupported_stopped_activity(&snapshot, activity));
             }
         };
+        if declarative {
+            if let Some(outcome) =
+                recovery_validation::validate_request_tx(&mut tx, &snapshot, &request, &plan)
+                    .await?
+            {
+                tx.commit().await?;
+                return Ok(outcome);
+            }
+        }
         let (superseded_command_count, superseded_runtime_job_count) =
             skip_superseded_active_commands_tx(&mut tx, &snapshot.id).await?;
         let Some(mut instance) =

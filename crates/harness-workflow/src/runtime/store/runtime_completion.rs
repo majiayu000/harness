@@ -9,7 +9,12 @@ use crate::runtime::model::{
 use crate::runtime::prompt_task::{
     prompt_continuation_state_from_data, PromptContinuationState, PROMPT_TASK_DEFINITION_ID,
 };
-use crate::runtime::reducer::reduce_runtime_job_completed;
+use crate::runtime::reducer::{
+    invalid_agent_output_blocked_decision, reduce_runtime_job_completed,
+};
+use crate::runtime::state_registry::{
+    resolve_declarative_definition, DeclarativeDefinitionResolution,
+};
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
 use serde_json::Value;
@@ -161,9 +166,79 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         }
     }
 
+    if declarative_decision_missing_required_evidence(&instance, source, event, &decision) {
+        let rejected =
+            persist_runtime_completion_decision_tx(tx, instance.clone(), source, event, decision)
+                .await?;
+        if rejected.accepted {
+            anyhow::bail!("missing-evidence declarative decision unexpectedly passed validation");
+        }
+        let result: ActivityResult =
+            serde_json::from_value(event.event.get("activity_result").cloned().ok_or_else(
+                || anyhow::anyhow!("RuntimeJobCompleted event missing activity_result"),
+            )?)?;
+        let rejection_reason = rejected
+            .rejection_reason
+            .as_deref()
+            .unwrap_or("missing rejection reason");
+        let policy_decision = invalid_agent_output_blocked_decision(
+            &instance,
+            event,
+            &result,
+            &format!(
+                "declarative transition was rejected for missing evidence: {rejection_reason}"
+            ),
+        )
+        .with_evidence(WorkflowEvidence::new(
+            "rejected_workflow_decision",
+            format!(
+                "Rejected decision record `{}` before applying blocked policy: {rejection_reason}",
+                rejected.id
+            ),
+        ));
+        let policy =
+            persist_runtime_completion_decision_tx(tx, instance, source, event, policy_decision)
+                .await?;
+        if !policy.accepted {
+            anyhow::bail!(
+                "blocked policy decision was rejected after missing declarative evidence: {}",
+                policy
+                    .rejection_reason
+                    .as_deref()
+                    .unwrap_or("missing rejection reason")
+            );
+        }
+        return Ok(Some(policy));
+    }
+
     persist_runtime_completion_decision_tx(tx, instance, source, event, decision)
         .await
         .map(Some)
+}
+
+fn declarative_decision_missing_required_evidence(
+    instance: &WorkflowInstance,
+    source: &str,
+    event: &WorkflowEvent,
+    decision: &WorkflowDecision,
+) -> bool {
+    if !matches!(
+        resolve_declarative_definition(instance),
+        DeclarativeDefinitionResolution::Resolved(_)
+    ) {
+        return false;
+    }
+    let Ok(Some(validator)) = validator_for_instance(instance) else {
+        return false;
+    };
+    matches!(
+        validator.validate(
+            instance,
+            decision,
+            &ValidationContext::new(source, event.created_at),
+        ),
+        Err(error) if error.kind == WorkflowDecisionRejectionKind::MissingRequiredEvidence
+    )
 }
 
 fn is_generic_invalid_structured_fallback(decision: &WorkflowDecision) -> bool {

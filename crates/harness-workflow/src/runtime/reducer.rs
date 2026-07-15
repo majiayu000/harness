@@ -32,9 +32,9 @@ use self::runtime_failure::{
     retry_failed_activity_decision, runtime_blocked_decision, runtime_cancelled_decision,
     runtime_failed_decision,
 };
+pub(crate) use self::support::invalid_agent_output_blocked_decision;
 use self::support::{
-    event_command_type, event_field_string, event_workflow_command,
-    invalid_agent_output_blocked_decision, runtime_completion_evidence,
+    event_command_type, event_field_string, event_workflow_command, runtime_completion_evidence,
 };
 use super::candidate_promotion::{
     build_candidate_promotion_decision, candidate_promotion_failure_decision,

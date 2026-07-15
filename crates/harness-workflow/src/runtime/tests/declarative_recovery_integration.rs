@@ -39,10 +39,13 @@ fn declarative_recovery_definition(
             ("failed".to_string(), "failed".to_string()),
             ("cancelled".to_string(), "cancelled".to_string()),
         ]),
-        evidence_required: BTreeMap::from([(
-            "running".to_string(),
-            vec!["operator_ticket".to_string()],
-        )]),
+        evidence_required: BTreeMap::from([
+            (
+                "running".to_string(),
+                vec!["operator_ticket".to_string()],
+            ),
+            ("done".to_string(), vec!["release_report".to_string()]),
+        ]),
         recovery_targets: vec!["running".to_string(), "waiting".to_string()],
     };
     super::build_declarative_definition(
@@ -84,11 +87,17 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
             target_state: Some("running"),
             evidence: &[],
         })
-        .await
-        .expect_err("required recovery evidence must fail closed");
-    assert!(missing_evidence.to_string().contains("missing required evidence"));
+        .await?;
+    assert!(matches!(
+        missing_evidence,
+        super::WorkflowRuntimeRecoveryOutcome::MissingRequiredEvidence { ref detail, .. }
+            if detail.contains("missing required evidence")
+    ));
     assert_eq!(store.get_instance(&running.id).await?.unwrap().state, "blocked");
-    assert!(store.events_for(&running.id).await?.is_empty());
+    let rejection_events = store.events_for(&running.id).await?;
+    assert_eq!(rejection_events.len(), 1);
+    assert_eq!(rejection_events[0].event_type, "WorkflowRuntimeRecoveryRejected");
+    assert_eq!(rejection_events[0].event["reason_code"], "missing_required_evidence");
     assert!(store.decisions_for(&running.id).await?.is_empty());
     assert!(store.commands_for(&running.id).await?.is_empty());
 
@@ -130,5 +139,50 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
     assert_eq!(waiting_commands[0].command.command_type, WorkflowCommandType::Wait);
     assert_eq!(waiting_commands[0].status, WorkflowCommandStatus::HandledInline);
     assert!(store.pending_commands(10).await?.iter().all(|command| command.workflow_id != waiting.id));
+
+    let completion = WorkflowInstance::new(
+        definition.policy().id.clone(),
+        definition.definition_version(),
+        "running",
+        WorkflowSubject::new("test", "declarative-completion-missing-evidence"),
+    )
+    .with_id("declarative-completion-missing-evidence")
+    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    store.upsert_instance(&completion).await?;
+    let result = ActivityResult::succeeded("run", "completed without the release report");
+    let command = WorkflowCommand::enqueue_activity("run", "declarative-completion-command");
+    let policy = store
+        .commit_parent_runtime_completion(
+            &completion.id,
+            "workflow_runtime_worker",
+            json!({
+                "runtime_job_id": "declarative-completion-job",
+                "command": command,
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("completion should persist a blocked policy decision");
+    assert!(policy.accepted);
+    assert_eq!(policy.decision.decision, "block_invalid_agent_output");
+    assert_eq!(store.get_instance(&completion.id).await?.unwrap().state, "blocked");
+    let completion_decisions = store.decisions_for(&completion.id).await?;
+    assert_eq!(completion_decisions.len(), 2);
+    assert!(!completion_decisions[0].accepted);
+    assert!(completion_decisions[0]
+        .rejection_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("MissingRequiredEvidence")));
+    assert!(completion_decisions[1].accepted);
+    let completion_commands = store.commands_for(&completion.id).await?;
+    assert_eq!(completion_commands.len(), 2);
+    assert!(completion_commands.iter().all(|record| {
+        record.status == WorkflowCommandStatus::HandledInline
+            && matches!(
+                record.command.command_type,
+                WorkflowCommandType::MarkBlocked
+                    | WorkflowCommandType::RequestOperatorAttention
+            )
+    }));
     Ok(())
 }
