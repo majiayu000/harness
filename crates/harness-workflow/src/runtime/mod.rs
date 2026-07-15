@@ -10,6 +10,7 @@ mod candidate_promotion;
 mod candidate_selection;
 mod candidate_terminal;
 mod command_record;
+pub mod declarative;
 mod dispatch_barrier;
 pub mod dispatcher;
 pub mod errors;
@@ -62,6 +63,7 @@ pub use candidate_selection::{
     CandidateOutcome, CandidatePromotionRecord, CandidateRankingRecord, CandidateSelectionInput,
     CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
 };
+pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
 pub use dispatch_barrier::{
     DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrier, DispatchBarrierInput,
     DispatchBarrierReasonCode, DispatchClaim,
