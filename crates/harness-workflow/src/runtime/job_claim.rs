@@ -1,3 +1,6 @@
+use super::store::runtime_job_leases::{
+    append_runtime_event_tx, delete_all_runtime_job_lease_receipts_tx,
+};
 use super::store::{enum_str, to_jsonb_string};
 use super::{RuntimeJob, RuntimeKind, WorkflowRuntimeStore};
 use chrono::{DateTime, Utc};
@@ -30,6 +33,7 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
+        let records_remote_host_audit = only_runtime_kind == Some(RuntimeKind::RemoteHost);
         let only_runtime_kind = only_runtime_kind
             .map(|runtime_kind| enum_str(&runtime_kind))
             .transpose()?;
@@ -80,6 +84,7 @@ impl WorkflowRuntimeStore {
         };
 
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let reclaimed = job.status == super::RuntimeJobStatus::Running;
         job.claim(owner, expires_at);
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
@@ -94,6 +99,25 @@ impl WorkflowRuntimeStore {
         .bind(&id)
         .execute(&mut *tx)
         .await?;
+        if records_remote_host_audit {
+            delete_all_runtime_job_lease_receipts_tx(&mut tx, &id).await?;
+            append_runtime_event_tx(
+                &mut tx,
+                &id,
+                if reclaimed {
+                    "RuntimeJobReclaimed"
+                } else {
+                    "RuntimeJobClaimed"
+                },
+                serde_json::json!({
+                    "owner": owner,
+                    "lease_generation": job.lease_generation,
+                    "lease_expires_at": expires_at,
+                    "claim_api": "runtime_host",
+                }),
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(Some(job))
     }

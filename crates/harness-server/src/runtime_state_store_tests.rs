@@ -247,5 +247,6 @@ fn make_host(id: &str) -> crate::runtime_hosts_state::PersistedRuntimeHost {
         capabilities: vec!["codex".to_string()],
         registered_at: Utc::now(),
         last_heartbeat_at: Utc::now(),
+        lifecycle: crate::runtime_hosts::RuntimeHostLifecycle::Active,
     }
 }

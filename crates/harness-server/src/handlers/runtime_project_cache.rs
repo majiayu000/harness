@@ -1,5 +1,6 @@
 use crate::http::AppState;
 use crate::project_registry::{check_allowed_roots, validate_project_root};
+use crate::runtime_hosts::RuntimeHostLifecycle;
 use crate::runtime_project_cache::WatchedProjectInput;
 use axum::{
     extract::{Path, State},
@@ -47,12 +48,13 @@ pub async fn sync_runtime_host_projects(
     if let Err(response) = ensure_runtime_state_persistence_available(&state) {
         return response;
     }
-    if !host_exists(&state, &host_id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "runtime host not found"})),
-        );
-    }
+    let registration_id = {
+        let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
+        match active_host_registration_id(&state, &host_id) {
+            Ok(registration_id) => registration_id,
+            Err(response) => return response,
+        }
+    };
 
     let mut inputs: Vec<WatchedProjectInput> = Vec::with_capacity(req.projects.len());
     for item in req.projects {
@@ -76,14 +78,17 @@ pub async fn sync_runtime_host_projects(
         });
     }
 
-    // Keep a read guard while writing cache to prevent concurrent deregister()
-    // from deleting the host between validation and cache sync.
-    let Some(_host_guard) = state.runtime_hosts.hosts.get(&host_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "runtime host not found"})),
-        );
-    };
+    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
+    match active_host_registration_id(&state, &host_id) {
+        Ok(current_registration_id) if current_registration_id == registration_id => {}
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "runtime host registration changed during project sync"})),
+            )
+        }
+        Err(response) => return response,
+    }
     let snapshot = state
         .runtime_project_cache
         .sync_host_projects(&host_id, inputs);
@@ -95,6 +100,39 @@ pub async fn sync_runtime_host_projects(
 
 fn host_exists(state: &AppState, host_id: &str) -> bool {
     state.runtime_hosts.hosts.contains_key(host_id)
+}
+
+fn ensure_active_host(
+    state: &AppState,
+    host_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match state.runtime_hosts.lifecycle(host_id) {
+        Some(RuntimeHostLifecycle::Active) => Ok(()),
+        Some(RuntimeHostLifecycle::Draining) => Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "runtime host is draining"})),
+        )),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime host not found"})),
+        )),
+    }
+}
+
+fn active_host_registration_id(
+    state: &AppState,
+    host_id: &str,
+) -> Result<uuid::Uuid, (StatusCode, Json<serde_json::Value>)> {
+    ensure_active_host(state, host_id)?;
+    state
+        .runtime_hosts
+        .active_registration_id(host_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "runtime host not found"})),
+            )
+        })
 }
 
 async fn resolve_project_token(

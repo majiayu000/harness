@@ -31,6 +31,8 @@ mod instances;
 mod recovery;
 #[path = "store/runtime_completion.rs"]
 mod runtime_completion;
+#[path = "store/runtime_job_leases.rs"]
+pub mod runtime_job_leases;
 #[path = "store/runtime_usage.rs"]
 mod runtime_usage;
 #[path = "store/submission_commit.rs"]
@@ -1031,29 +1033,12 @@ impl WorkflowRuntimeStore {
         payload: Value,
     ) -> anyhow::Result<RuntimeEvent> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("runtime_events:{runtime_job_id}"))
-            .execute(&mut *tx)
-            .await?;
-        let (next_sequence,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM runtime_events WHERE runtime_job_id = $1",
+        let event = runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            event_type,
+            payload,
         )
-        .bind(runtime_job_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let event = RuntimeEvent::new(runtime_job_id, next_sequence as u64, event_type, payload);
-        let data = to_jsonb_string(&event)?;
-        sqlx::query(
-            "INSERT INTO runtime_events
-                (id, runtime_job_id, sequence, event_type, data)
-             VALUES ($1, $2, $3, $4, $5::jsonb)",
-        )
-        .bind(&event.id)
-        .bind(&event.runtime_job_id)
-        .bind(event.sequence as i64)
-        .bind(&event.event_type)
-        .bind(&data)
-        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(event)
@@ -1218,6 +1203,12 @@ impl WorkflowRuntimeStore {
         .bind(runtime_job_id)
         .execute(&mut *tx)
         .await?;
+        runtime_job_leases::delete_runtime_job_lease_receipts_tx(
+            &mut tx,
+            runtime_job_id,
+            job.lease_generation,
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(job))
     }
@@ -1227,6 +1218,24 @@ impl WorkflowRuntimeStore {
         runtime_job_id: &str,
         owner: &str,
         lease_expires_at: DateTime<Utc>,
+        result: &ActivityResult,
+    ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
+        self.commit_runtime_activity_completion_if_owned_with_generation(
+            runtime_job_id,
+            owner,
+            lease_expires_at,
+            None,
+            result,
+        )
+        .await
+    }
+
+    pub async fn commit_runtime_activity_completion_if_owned_with_generation(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
+        lease_generation: Option<u64>,
         result: &ActivityResult,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         let mut tx = self.pool.begin().await?;
@@ -1260,10 +1269,12 @@ impl WorkflowRuntimeStore {
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
         let is_current_lease = job.status == RuntimeJobStatus::Running
-            && job
-                .lease
-                .as_ref()
-                .is_some_and(|lease| lease.owner == owner && lease.expires_at == lease_expires_at);
+            && lease_generation.is_none_or(|generation| generation == job.lease_generation)
+            && job.lease.as_ref().is_some_and(|lease| {
+                lease.owner == owner
+                    && lease.expires_at == lease_expires_at
+                    && lease.expires_at > Utc::now()
+            });
         if !is_current_lease {
             tx.commit().await?;
             return Ok(None);
@@ -1282,6 +1293,12 @@ impl WorkflowRuntimeStore {
         .bind(&updated)
         .bind(runtime_job_id)
         .execute(&mut *tx)
+        .await?;
+        runtime_job_leases::delete_runtime_job_lease_receipts_tx(
+            &mut tx,
+            runtime_job_id,
+            job.lease_generation,
+        )
         .await?;
         let Some(command_row) = command_row else {
             tx.commit().await?;
@@ -1497,6 +1514,12 @@ impl WorkflowRuntimeStore {
         .bind(runtime_job_id)
         .execute(&mut *tx)
         .await?;
+        runtime_job_leases::delete_runtime_job_lease_receipts_tx(
+            &mut tx,
+            runtime_job_id,
+            job.lease_generation,
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(job))
     }
@@ -1662,6 +1685,12 @@ impl WorkflowRuntimeStore {
             .bind(&updated)
             .bind(&id)
             .execute(&mut *tx)
+            .await?;
+            runtime_job_leases::delete_runtime_job_lease_receipts_tx(
+                &mut tx,
+                &id,
+                job.lease_generation,
+            )
             .await?;
             cancelled += 1;
         }

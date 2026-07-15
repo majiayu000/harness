@@ -1,4 +1,4 @@
-use crate::runtime_hosts::{RuntimeHostManager, RuntimeHostRecord};
+use crate::runtime_hosts::{RuntimeHostLifecycle, RuntimeHostManager, RuntimeHostRecord};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +9,8 @@ pub struct PersistedRuntimeHost {
     pub capabilities: Vec<String>,
     pub registered_at: DateTime<Utc>,
     pub last_heartbeat_at: DateTime<Utc>,
+    #[serde(default)]
+    pub lifecycle: RuntimeHostLifecycle,
 }
 
 impl RuntimeHostManager {
@@ -23,6 +25,7 @@ impl RuntimeHostManager {
                     capabilities: host.capabilities.clone(),
                     registered_at: host.registered_at,
                     last_heartbeat_at: host.last_heartbeat_at,
+                    lifecycle: host.lifecycle,
                 }
             })
             .collect()
@@ -36,10 +39,12 @@ impl RuntimeHostManager {
                 host.id.clone(),
                 RuntimeHostRecord {
                     id: host.id,
+                    registration_id: uuid::Uuid::new_v4(),
                     display_name: host.display_name,
                     capabilities: host.capabilities,
                     registered_at: host.registered_at,
                     last_heartbeat_at: host.last_heartbeat_at,
+                    lifecycle: host.lifecycle,
                 },
             );
         }
