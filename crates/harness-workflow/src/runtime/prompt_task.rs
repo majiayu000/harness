@@ -93,6 +93,8 @@ pub struct PromptContinuationState {
     pub last_external_state: Option<String>,
     pub last_summary: Option<String>,
     pub same_state_count: u32,
+    #[serde(default)]
+    pub last_progress_fingerprint: Option<String>,
 }
 
 impl PromptContinuationState {
@@ -103,6 +105,7 @@ impl PromptContinuationState {
             last_external_state: None,
             last_summary: None,
             same_state_count: 0,
+            last_progress_fingerprint: None,
         }
     }
 }
@@ -175,6 +178,7 @@ pub fn continuation_value(policy: &PromptContinuationPolicy) -> Value {
         "last_external_state": null,
         "last_summary": null,
         "same_state_count": 0,
+        "last_progress_fingerprint": null,
     })
 }
 
@@ -348,5 +352,20 @@ mod tests {
                 json!({ "state": "Done" }),
             ));
         assert!(parse_external_state_signal(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn prompt_continuation_state_accepts_legacy_data_without_progress_fingerprint() {
+        let state: PromptContinuationState = serde_json::from_value(json!({
+            "policy": policy(),
+            "attempt": 2,
+            "last_external_state": "In Progress",
+            "last_summary": "legacy attempt",
+            "same_state_count": 1
+        }))
+        .expect("legacy continuation state should remain readable");
+
+        assert_eq!(state.attempt, 2);
+        assert_eq!(state.last_progress_fingerprint, None);
     }
 }

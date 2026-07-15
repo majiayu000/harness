@@ -7,8 +7,16 @@ use crate::runtime::prompt_task::{
     parse_external_state_signal, prompt_continuation_state_from_data, ExternalStateSignal,
     PromptContinuationState, PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
+use crate::runtime::remote_facts::stable_remote_fact_hash;
 use chrono::Duration;
 use serde_json::{json, Value};
+
+const SERVER_GENERATED_ARTIFACTS: [&str; 4] = [
+    "activity_result_envelope",
+    "runtime_prompt_packet",
+    "runtime_turn",
+    "repo_memory_config",
+];
 
 pub(super) fn prompt_task_success_decision(
     instance: &WorkflowInstance,
@@ -29,6 +37,19 @@ pub(super) fn prompt_task_success_decision(
             ));
         }
     };
+    if let Some(scope_signal) = result
+        .signals
+        .iter()
+        .find(|signal| signal.signal_type == super::SCOPE_TOO_LARGE_SIGNAL)
+    {
+        return Some(scope_too_large_decision(
+            instance,
+            event,
+            result,
+            &continuation,
+            &scope_signal.signal,
+        ));
+    }
     let signal = match parse_external_state_signal(result) {
         Ok(signal) => signal,
         Err(reason) => {
@@ -76,9 +97,68 @@ pub(super) fn prompt_task_success_decision(
             Some((&signal, &observed)),
         ));
     }
+    let prompt_ref = match continuation_prompt_ref(instance) {
+        Ok(prompt_ref) => prompt_ref,
+        Err(reason) => {
+            return Some(blocked_decision(
+                instance,
+                event,
+                result,
+                "prompt_continuation_prompt_ref_missing",
+                &reason,
+                Some((&signal, &observed)),
+            ));
+        }
+    };
     Some(continue_decision(
-        instance, event, result, &signal, observed,
+        instance, event, result, &signal, observed, prompt_ref,
     ))
+}
+
+fn scope_too_large_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    continuation: &PromptContinuationState,
+    scope: &Value,
+) -> WorkflowDecision {
+    let reason = format!(
+        "prompt continuation reported SCOPE_TOO_LARGE before the external state settled: {scope}"
+    );
+    let mut block = runtime_blocked_command(
+        &reason,
+        None,
+        format!(
+            "runtime-completion:{}:prompt-scope-too-large:block",
+            event.id
+        ),
+        event,
+        result,
+    );
+    block.command["continuation"] = json!(continuation);
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "prompt_continuation_scope_too_large",
+        "blocked",
+        &reason,
+    )
+    .with_command(block)
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::RequestOperatorAttention,
+        format!(
+            "runtime-completion:{}:prompt-scope-too-large:operator",
+            event.id
+        ),
+        json!({
+            "reason": reason,
+            "activity": result.activity,
+            "scope_guard": scope,
+        }),
+    ))
+    .with_evidence(runtime_completion_evidence(event, result))
+    .with_evidence(WorkflowEvidence::new("scope_too_large", scope.to_string()))
+    .high_confidence()
 }
 
 fn single_shot_done_decision(
@@ -127,10 +207,12 @@ fn continue_decision(
     result: &ActivityResult,
     signal: &ExternalStateSignal,
     mut continuation: PromptContinuationState,
+    prompt_ref: &str,
 ) -> WorkflowDecision {
     continuation.attempt = continuation.attempt.saturating_add(1);
     let mut command = json!({
         "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "prompt_ref": prompt_ref,
         "continuation": &continuation,
     });
     if continuation.policy.attempt_delay_secs > 0 {
@@ -158,6 +240,18 @@ fn continue_decision(
     .with_evidence(runtime_completion_evidence(event, result))
     .with_evidence(signal.evidence())
     .high_confidence()
+}
+
+fn continuation_prompt_ref(instance: &WorkflowInstance) -> Result<&str, String> {
+    instance
+        .data
+        .get("prompt_ref")
+        .and_then(Value::as_str)
+        .filter(|prompt_ref| !prompt_ref.trim().is_empty())
+        .ok_or_else(|| {
+            "prompt continuation cannot enqueue another attempt without a non-empty prompt_ref"
+                .to_string()
+        })
 }
 
 fn blocked_decision(
@@ -210,9 +304,9 @@ fn observed_state(
     result: &ActivityResult,
     signal: &ExternalStateSignal,
 ) -> PromptContinuationState {
+    let progress_fingerprint = progress_fingerprint(result);
     let no_progress = previous.last_external_state.as_deref() == Some(signal.state.as_str())
-        && result.artifacts.is_empty()
-        && result.validation.is_empty();
+        && previous.last_progress_fingerprint.as_deref() == Some(progress_fingerprint.as_str());
     PromptContinuationState {
         policy: previous.policy.clone(),
         attempt: previous.attempt,
@@ -223,7 +317,41 @@ fn observed_state(
         } else {
             0
         },
+        last_progress_fingerprint: Some(progress_fingerprint),
     }
+}
+
+fn progress_fingerprint(result: &ActivityResult) -> String {
+    let mut artifacts = result
+        .artifacts
+        .iter()
+        .filter(|artifact| !SERVER_GENERATED_ARTIFACTS.contains(&artifact.artifact_type.as_str()))
+        .map(|artifact| {
+            json!({
+                "artifact_type": artifact.artifact_type,
+                "artifact": artifact.artifact,
+            })
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by_key(stable_remote_fact_hash);
+
+    let mut validation = result
+        .validation
+        .iter()
+        .map(|record| {
+            json!({
+                "command": record.command,
+                "status": record.status,
+                "reason": record.reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    validation.sort_by_key(stable_remote_fact_hash);
+
+    stable_remote_fact_hash(&json!({
+        "artifacts": artifacts,
+        "validation": validation,
+    }))
 }
 
 fn mark_done_command(
@@ -272,7 +400,7 @@ mod tests {
     }
 
     fn instance(continuation: Option<PromptContinuationState>) -> WorkflowInstance {
-        let mut data = json!({});
+        let mut data = json!({ "prompt_ref": "prompt-ref-1" });
         if let Some(continuation) = continuation {
             data["continuation"] = json!(continuation);
         }
@@ -348,6 +476,7 @@ mod tests {
             decision.commands[0].command["continuation"]["last_summary"],
             "attempt summary"
         );
+        assert_eq!(decision.commands[0].command["prompt_ref"], "prompt-ref-1");
         assert_eq!(
             decision.commands[0].command["retry_not_before"],
             expected_not_before
@@ -383,6 +512,7 @@ mod tests {
             attempt: 2,
             last_external_state: Some("In Progress".to_string()),
             same_state_count: 1,
+            last_progress_fingerprint: Some(progress_fingerprint(&active)),
             ..PromptContinuationState::initial(&policy(4, 2))
         };
         let stalled_decision =
@@ -393,5 +523,30 @@ mod tests {
             stalled_decision.commands[0].command["continuation"]["same_state_count"],
             2
         );
+    }
+
+    #[test]
+    fn prompt_continuation_blocks_when_prompt_ref_is_missing() {
+        let active = result(Some("In Progress"));
+        let missing_prompt_ref = WorkflowInstance::new(
+            "prompt_task",
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "task-1"),
+        )
+        .with_id("workflow-1")
+        .with_data(json!({
+            "continuation": PromptContinuationState::initial(&policy(4, 3)),
+        }));
+
+        let decision = prompt_task_success_decision(&missing_prompt_ref, &event(&active), &active)
+            .expect("missing prompt_ref should fail closed");
+
+        assert_eq!(decision.decision, "prompt_continuation_prompt_ref_missing");
+        assert_eq!(decision.next_state, "blocked");
+        assert!(decision
+            .commands
+            .iter()
+            .all(|command| command.command_type != WorkflowCommandType::EnqueueActivity));
     }
 }
