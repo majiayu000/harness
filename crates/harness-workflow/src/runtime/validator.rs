@@ -6,6 +6,8 @@ use std::fmt;
 
 #[path = "validator_github_issue_pr.rs"]
 mod github_issue_pr_validation;
+#[path = "validator_prompt_task.rs"]
+mod prompt_task_validation;
 
 #[cfg(test)]
 #[path = "validator_tests.rs"]
@@ -315,7 +317,7 @@ impl TransitionAllowlist {
             .allow("submitted", "implementing", [EnqueueActivity, Wait])
             .allow("failed", "implementing", [EnqueueActivity, Wait])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])
-            .allow("implementing", "implementing", [EnqueueActivity, Wait])
+            .allow("implementing", "implementing", [EnqueueActivity])
             .allow("blocked", "awaiting_dependencies", [Wait])
             .allow("blocked", "implementing", [EnqueueActivity, Wait])
             .allow("implementing", "done", [MarkDone])
@@ -392,6 +394,7 @@ pub enum WorkflowDecisionRejectionKind {
     TerminalReopenDenied,
     RequiredCommandMissing,
     InvalidCommandPayload,
+    InvalidDecisionContract,
     ProgressDriverMissing,
     MissingTerminalEvidence,
 }
@@ -429,6 +432,7 @@ pub struct DecisionValidator {
 enum DecisionValidatorKind {
     Generic,
     GithubIssuePr,
+    PromptTask,
 }
 
 impl DecisionValidator {
@@ -468,10 +472,10 @@ impl DecisionValidator {
     }
 
     pub(crate) fn for_definition(definition_id: &str, allowlist: TransitionAllowlist) -> Self {
-        let kind = if definition_id == super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID {
-            DecisionValidatorKind::GithubIssuePr
-        } else {
-            DecisionValidatorKind::Generic
+        let kind = match definition_id {
+            super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidatorKind::GithubIssuePr,
+            super::prompt_task::PROMPT_TASK_DEFINITION_ID => DecisionValidatorKind::PromptTask,
+            _ => DecisionValidatorKind::Generic,
         };
         Self { allowlist, kind }
     }
@@ -548,6 +552,12 @@ impl DecisionValidator {
             ));
         };
 
+        if self.kind == DecisionValidatorKind::PromptTask
+            && decision.observed_state == "implementing"
+            && decision.next_state == "implementing"
+        {
+            prompt_task_validation::validate_decision(decision)?;
+        }
         self.validate_commands(rule, decision, context)?;
         validator_progress::validate_target_progress_contract(instance, decision)?;
         self.validate_workflow_specific_rules(decision, context)
@@ -646,6 +656,11 @@ impl DecisionValidator {
     ) -> Result<(), WorkflowDecisionRejection> {
         if self.kind == DecisionValidatorKind::GithubIssuePr {
             github_issue_pr_validation::validate_decision(decision, context)?;
+        }
+        if self.kind == DecisionValidatorKind::PromptTask
+            && !(decision.observed_state == "implementing" && decision.next_state == "implementing")
+        {
+            prompt_task_validation::validate_decision(decision)?;
         }
         Ok(())
     }

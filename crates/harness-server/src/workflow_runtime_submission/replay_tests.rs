@@ -117,6 +117,7 @@ async fn prompt_resubmission_after_completed_command_creates_fresh_attempt() -> 
             dependencies_blocked: false,
             source: Some("dashboard"),
             external_id: Some(external_id),
+            continuation: None,
         },
     )
     .await?;
@@ -140,6 +141,7 @@ async fn prompt_resubmission_after_completed_command_creates_fresh_attempt() -> 
             dependencies_blocked: false,
             source: Some("dashboard"),
             external_id: Some(external_id),
+            continuation: None,
         },
     )
     .await?;

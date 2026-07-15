@@ -14,14 +14,15 @@ use super::{
     DispatchBarrierInput, DispatchBarrierReasonCode, DispatchClaim, InMemoryWorkflowBus,
     IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction, PlanIssueDecisionInput,
     PlanIssueWorkflowAction, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
-    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PromptSubmissionDecisionInput,
-    QualityGateDecisionInput, QualityGateWorkflowAction, RuntimeCommandDispatcher,
-    RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker, SubmissionMode,
-    WorkflowCommandStatus, WorkflowDecisionTransition, WorkflowRuntimeStore,
-    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID,
-    PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
-    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
-    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, SCOPE_TOO_LARGE_SIGNAL,
+    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PromptContinuationPolicy,
+    PromptContinuationState, PromptSubmissionDecisionInput, QualityGateDecisionInput,
+    QualityGateWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
+    RuntimeProfileSelector, RuntimeWorker, SubmissionMode, WorkflowCommandStatus,
+    WorkflowDecisionTransition, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
+    LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
+    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    QUALITY_PASSED_SIGNAL, RUNTIME_JOB_COMPLETED_EVENT, SCOPE_TOO_LARGE_SIGNAL,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Timelike, Utc};

@@ -65,6 +65,7 @@ pub(super) async fn execute_start_prompt_task_child_workflow(
             dependencies_blocked: false,
             source: Some(source.as_str()),
             external_id: Some(external_id.as_str()),
+            continuation: None,
         },
     )
     .await?;

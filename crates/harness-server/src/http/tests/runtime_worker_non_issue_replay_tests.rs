@@ -76,6 +76,7 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
             dependencies_blocked: false,
             source: Some("github_pr_feedback"),
             external_id: Some("pr-feedback:owner/repo:1120"),
+            continuation: None,
         },
     )
     .await?;

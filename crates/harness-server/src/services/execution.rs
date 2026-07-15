@@ -371,6 +371,16 @@ impl DefaultExecutionService {
                 task_runner::MAX_TASK_PRIORITY,
             )));
         }
+        if let Some(policy) = req.continuation.as_ref() {
+            if req.issue.is_some() || req.pr.is_some() || req.prompt.is_none() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "continuation is only supported for prompt-only tasks".to_string(),
+                ));
+            }
+            policy
+                .validate()
+                .map_err(|error| EnqueueTaskError::BadRequest(error.to_string()))?;
+        }
         Ok(())
     }
 
@@ -761,6 +771,7 @@ impl DefaultExecutionService {
                 dependencies_blocked,
                 source: prepared.req.source.as_deref(),
                 external_id: prepared.req.external_id.as_deref(),
+                continuation: prepared.req.continuation.as_ref(),
             },
         )
         .await
@@ -1267,3 +1278,7 @@ impl ExecutionService for DefaultExecutionService {
 #[cfg(test)]
 #[path = "execution_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "execution_continuation_tests.rs"]
+mod continuation_tests;

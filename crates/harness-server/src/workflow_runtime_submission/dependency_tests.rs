@@ -38,6 +38,7 @@ async fn prompt_submission_waits_for_dependencies_then_releases_runtime_command(
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            continuation: None,
         },
     )
     .await?;
@@ -107,6 +108,7 @@ async fn prompt_submission_releases_after_failed_serialization_dependency() -> a
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            continuation: None,
         },
     )
     .await?;
@@ -167,6 +169,7 @@ async fn prompt_submission_recovers_release_when_in_memory_prompt_is_missing() -
             dependencies_blocked: true,
             source: None,
             external_id: None,
+            continuation: None,
         },
     )
     .await?;

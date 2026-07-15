@@ -454,6 +454,7 @@ mod tests {
                 dependencies_blocked: false,
                 source: Some("test"),
                 external_id: Some("manual:restart-safe"),
+                continuation: None,
             },
         )
         .await?;

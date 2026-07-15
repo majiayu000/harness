@@ -4,8 +4,11 @@ use super::{
     WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
-    ActivityResult, ActivityStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowEvent,
-    WorkflowEvidence, WorkflowInstance,
+    ActivityResult, ActivityStatus, WorkflowCommand, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowEvent, WorkflowEvidence, WorkflowInstance,
+};
+use crate::runtime::prompt_task::{
+    prompt_continuation_state_from_data, PromptContinuationState, PROMPT_TASK_DEFINITION_ID,
 };
 use crate::runtime::reducer::reduce_runtime_job_completed;
 use crate::runtime::status::WorkflowCommandStatus;
@@ -226,6 +229,11 @@ async fn persist_runtime_completion_decision_tx(
     insert_decision_record_tx(tx, &record).await?;
 
     if record.accepted {
+        if apply_prompt_continuation_side_effect(tx, &mut instance, &record.decision).await?
+            == PromptContinuationSideEffect::DurableReplay
+        {
+            return Ok(record);
+        }
         for followup in &record.decision.commands {
             let status = if followup.requires_runtime_job() {
                 WorkflowCommandStatus::Pending
@@ -243,4 +251,123 @@ async fn persist_runtime_completion_decision_tx(
     }
 
     Ok(record)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptContinuationSideEffect {
+    Applied,
+    DurableReplay,
+}
+
+async fn apply_prompt_continuation_side_effect(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &mut WorkflowInstance,
+    decision: &WorkflowDecision,
+) -> anyhow::Result<PromptContinuationSideEffect> {
+    if instance.definition_id != PROMPT_TASK_DEFINITION_ID
+        || !matches!(
+            decision.decision.as_str(),
+            "continue_prompt_task"
+                | "finish_prompt_task_external_settled"
+                | "prompt_continuation_exhausted"
+                | "prompt_continuation_no_progress"
+        )
+    {
+        return Ok(PromptContinuationSideEffect::Applied);
+    }
+    let previous = prompt_continuation_state_from_data(&instance.data)
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "prompt continuation decision `{}` requires authoritative persisted continuation state",
+                decision.decision
+            )
+        })?;
+    let continuation_values = decision
+        .commands
+        .iter()
+        .filter_map(|command| command.command.get("continuation"))
+        .collect::<Vec<_>>();
+    if continuation_values.len() != 1 {
+        anyhow::bail!(
+            "prompt continuation decision `{}` must persist exactly one continuation state",
+            decision.decision
+        );
+    }
+    let continuation: PromptContinuationState =
+        serde_json::from_value(continuation_values[0].clone())?;
+    continuation.policy.validate()?;
+    if continuation.policy != previous.policy {
+        anyhow::bail!(
+            "prompt continuation decision `{}` cannot replace the persisted policy",
+            decision.decision
+        );
+    }
+    if decision.decision == "continue_prompt_task" && continuation == previous {
+        require_durable_continuation_replay(tx, instance, decision).await?;
+        return Ok(PromptContinuationSideEffect::DurableReplay);
+    }
+    let expected_attempt = if decision.decision == "continue_prompt_task" {
+        previous.attempt.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("prompt continuation attempt overflowed the persisted counter")
+        })?
+    } else {
+        previous.attempt
+    };
+    if continuation.attempt != expected_attempt {
+        anyhow::bail!(
+            "prompt continuation decision `{}` expected attempt {}, got {}",
+            decision.decision,
+            expected_attempt,
+            continuation.attempt
+        );
+    }
+    if continuation.attempt == 0 || continuation.attempt > continuation.policy.max_attempts {
+        anyhow::bail!(
+            "prompt continuation decision `{}` has invalid attempt {}",
+            decision.decision,
+            continuation.attempt
+        );
+    }
+    let data = instance
+        .data
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("prompt task instance data must be a JSON object"))?;
+    data.insert(
+        "continuation".to_string(),
+        serde_json::to_value(continuation)?,
+    );
+    Ok(PromptContinuationSideEffect::Applied)
+}
+
+async fn require_durable_continuation_replay(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+    decision: &WorkflowDecision,
+) -> anyhow::Result<()> {
+    let command = decision.commands.first().ok_or_else(|| {
+        anyhow::anyhow!("prompt continuation replay requires its attempt-scoped command")
+    })?;
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT data::text FROM workflow_commands
+         WHERE workflow_id = $1 AND dedupe_key = $2",
+    )
+    .bind(&instance.id)
+    .bind(&command.dedupe_key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((data,)) = existing else {
+        anyhow::bail!(
+            "prompt continuation replay is missing durable command `{}`",
+            command.dedupe_key
+        );
+    };
+    let existing_command: WorkflowCommand = serde_json::from_str(&data)?;
+    if existing_command != *command {
+        anyhow::bail!(
+            "prompt continuation replay command `{}` does not match durable state",
+            command.dedupe_key
+        );
+    }
+    Ok(())
 }

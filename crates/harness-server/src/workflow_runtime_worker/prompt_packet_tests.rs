@@ -443,6 +443,62 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
 }
 
 #[test]
+fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
+    let job = RuntimeJob::pending(
+        "command-continue",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY }),
+    );
+    let workflow = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "TEAM-123"),
+    )
+    .with_id("prompt-workflow-1")
+    .with_data(json!({
+        "continuation": {
+            "policy": {
+                "max_attempts": 4,
+                "attempt_delay_secs": 30,
+                "active_states": ["In Progress"],
+                "no_progress_limit": 3
+            },
+            "attempt": 2,
+            "last_external_state": "In Progress",
+            "last_summary": "Created the implementation branch.",
+            "same_state_count": 0
+        }
+    }));
+    let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    let packet = build_runtime_prompt_packet(
+        &job,
+        Some(&workflow),
+        Path::new("/workspaces/job-continue"),
+        Path::new("/repo"),
+        &runtime_profile,
+        &WorkflowDocument::default(),
+        &[],
+    );
+
+    assert_eq!(packet["continuation_context"]["attempt"], 2);
+    assert_eq!(
+        packet["continuation_context"]["previous_external_state"],
+        "In Progress"
+    );
+    assert_eq!(
+        packet["activity_result_schema"]["continuation_signal_contract"]["required_signal_type"],
+        "external_state"
+    );
+    let prompt = build_runtime_job_prompt(&packet, Some("Continue TEAM-123."));
+    assert!(prompt.contains("Continuation context:"));
+    assert!(prompt.contains("Attempt: 2"));
+    assert!(prompt.contains("Previous external state: In Progress"));
+    assert!(prompt.contains("Previous attempt summary: Created the implementation branch."));
+}
+
+#[test]
 fn runtime_prompt_packet_describes_deferred_candidate_submission_contract() {
     let job = RuntimeJob::pending(
         "command-1",

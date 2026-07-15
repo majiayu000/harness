@@ -500,7 +500,7 @@ const PROMPT_TASK_RULES: &[ExpectedRule] = &[
     (Some("submitted"), "implementing", &[E, W]),
     (Some("failed"), "implementing", &[E, W]),
     (Some("cancelled"), "implementing", &[E, W]),
-    (Some("implementing"), "implementing", &[E, W]),
+    (Some("implementing"), "implementing", &[E]),
     (Some("blocked"), "awaiting_dependencies", &[W]),
     (Some("blocked"), "implementing", &[E, W]),
     (Some("implementing"), "done", &[MD]),

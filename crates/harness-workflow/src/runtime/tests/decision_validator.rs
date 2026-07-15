@@ -412,6 +412,7 @@ fn rejects_driverless_command_driven_transitions() {
             issue_instance("implementing"),
             "implementing",
             "replanning",
+            WorkflowDecisionRejectionKind::ProgressDriverMissing,
         ),
         (
             "prompt_task",
@@ -419,6 +420,7 @@ fn rejects_driverless_command_driven_transitions() {
             prompt_task_instance("implementing"),
             "implementing",
             "implementing",
+            WorkflowDecisionRejectionKind::InvalidDecisionContract,
         ),
         (
             "quality_gate",
@@ -426,6 +428,7 @@ fn rejects_driverless_command_driven_transitions() {
             quality_gate_instance("pending"),
             "pending",
             "checking",
+            WorkflowDecisionRejectionKind::ProgressDriverMissing,
         ),
         (
             "pr_feedback",
@@ -438,10 +441,11 @@ fn rejects_driverless_command_driven_transitions() {
             ),
             "pending",
             "inspecting",
+            WorkflowDecisionRejectionKind::ProgressDriverMissing,
         ),
     ];
 
-    for (case_name, validator, instance, observed_state, next_state) in cases {
+    for (case_name, validator, instance, observed_state, next_state, expected_kind) in cases {
         let decision = WorkflowDecision::new(
             instance.id.clone(),
             observed_state,
@@ -454,7 +458,7 @@ fn rejects_driverless_command_driven_transitions() {
             .expect_err("command-driven targets must reject driverless decisions");
         assert_eq!(
             err.kind,
-            WorkflowDecisionRejectionKind::ProgressDriverMissing,
+            expected_kind,
             "failed case: {case_name}"
         );
     }
