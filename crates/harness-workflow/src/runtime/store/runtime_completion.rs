@@ -5,7 +5,7 @@ use super::{
 };
 use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowEvent,
-    WorkflowInstance,
+    WorkflowEvidence, WorkflowInstance,
 };
 use crate::runtime::reducer::reduce_runtime_job_completed;
 use crate::runtime::status::WorkflowCommandStatus;
@@ -93,14 +93,57 @@ async fn apply_runtime_completion_decision_for_instance_tx(
     event: &WorkflowEvent,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
     let driverless_decision = driverless_structured_completion_decision(&instance, source, event)?;
-    let Some(mut decision) = reduce_runtime_job_completed(&instance, event)? else {
+    let Some(decision) = reduce_runtime_job_completed(&instance, event)? else {
         return Ok(None);
     };
     // Preserve the requested liveness rejection only when the reducer found no
     // authoritative domain outcome and would apply its generic invalid-output policy.
+    // The separate blocked policy decision remains the committed outcome, so the
+    // completed driver cannot leave the workflow in an unowned progress state.
     if is_generic_invalid_structured_fallback(&decision) {
         if let Some(driverless_decision) = driverless_decision {
-            decision = driverless_decision;
+            let rejected = persist_runtime_completion_decision_tx(
+                tx,
+                instance.clone(),
+                source,
+                event,
+                driverless_decision,
+            )
+            .await?;
+            if rejected.accepted {
+                anyhow::bail!(
+                    "driverless completion candidate unexpectedly passed progress validation"
+                );
+            }
+            let rejection_reason = rejected
+                .rejection_reason
+                .as_deref()
+                .unwrap_or("missing rejection reason");
+            let policy_decision = decision.with_evidence(WorkflowEvidence::new(
+                "rejected_workflow_decision",
+                format!(
+                    "Rejected decision record `{}` before applying blocked policy: {rejection_reason}",
+                    rejected.id
+                ),
+            ));
+            let policy = persist_runtime_completion_decision_tx(
+                tx,
+                instance,
+                source,
+                event,
+                policy_decision,
+            )
+            .await?;
+            if !policy.accepted {
+                anyhow::bail!(
+                    "blocked policy decision was rejected after driverless completion: {}",
+                    policy
+                        .rejection_reason
+                        .as_deref()
+                        .unwrap_or("missing rejection reason")
+                );
+            }
+            return Ok(Some(policy));
         }
     }
 

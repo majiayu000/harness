@@ -5,6 +5,7 @@ import { apiFetch } from "@/lib/api";
 import { useOperatorMonitor } from "@/lib/queries";
 import { fmtInt } from "@/lib/format";
 import type {
+  DriverlessProgressEvidence,
   FailureGroup,
   OperatorAction,
   OperatorMonitorPayload,
@@ -231,6 +232,18 @@ function StuckWorkflowRow({ workflow }: { workflow: StuckWorkflow }) {
   );
 }
 
+function DriverlessProgressRow({ workflow }: { workflow: DriverlessProgressEvidence }) {
+  return (
+    <tr className="border-b border-line last:border-b-0">
+      <td className="px-3 py-2 font-mono text-[11px] text-danger">{workflow.state.replace(/_/g, " ")}</td>
+      <td className="px-3 py-2 font-mono text-[11px] text-ink-3">{workflow.definition_id}</td>
+      <td className="px-3 py-2 font-mono text-[11px] text-ink-3">{workflow.workflow_id}</td>
+      <td className="px-3 py-2 font-mono text-[11px] text-ink-4">{fmtDuration(workflow.age_secs)}</td>
+      <td className="px-3 py-2 text-right font-mono text-[11px] text-warn">{workflow.provenance_status.replace(/_/g, " ")}</td>
+    </tr>
+  );
+}
+
 function SourceRow({ source }: { source: SourceActivity }) {
   return (
     <tr className="border-b border-line last:border-b-0">
@@ -318,6 +331,16 @@ function MonitorBody({
             ) : (
               <table className="w-full border-t border-line">
                 <tbody>{data.stuck_workflows.map((workflow) => <StuckWorkflowRow key={workflow.workflow_id} workflow={workflow} />)}</tbody>
+              </table>
+            )}
+          </div>
+          <div className="border-b border-line">
+            <div className="px-4 py-2 font-mono text-[10px] uppercase tracking-[0.1em] text-ink-3">Driverless progress</div>
+            {data.driverless_progress.length === 0 ? (
+              <p className="border-t border-line px-4 py-3 font-mono text-[11px] text-ink-4">No driverless progress workflows.</p>
+            ) : (
+              <table className="w-full border-t border-line">
+                <tbody>{data.driverless_progress.map((workflow) => <DriverlessProgressRow key={workflow.workflow_id} workflow={workflow} />)}</tbody>
               </table>
             )}
           </div>

@@ -79,6 +79,32 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                         Err(error) => tracing::warn!("workflow watchdog tick failed: {error}"),
                     }
 
+                    match store
+                        .list_driverless_progress_instances(
+                            workflow_cfg.storage.workflow_watchdog_batch_size as i64,
+                        )
+                        .await
+                    {
+                        Ok(workflows) => {
+                            for workflow in workflows {
+                                tracing::error!(
+                                    classification = "driverless_progress",
+                                    workflow_id = %workflow.workflow_id,
+                                    definition_id = %workflow.definition_id,
+                                    state = %workflow.state,
+                                    age_secs = workflow.age_secs,
+                                    provenance_status = workflow.provenance_status.as_str(),
+                                    "workflow watchdog found driverless progress workflow"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                "workflow watchdog driverless-progress scan failed: {error}"
+                            );
+                        }
+                    }
+
                     // External alerts for stopped workflows (GH1582 T006).
                     if state.observability.alerts.is_enabled() {
                         match store

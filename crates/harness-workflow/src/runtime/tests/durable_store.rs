@@ -588,42 +588,69 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
         "the runtime job lease must admit exactly one completion"
     );
     let winner = first.or(replay).expect("one completion should win");
-    let rejected = winner
+    let policy = winner
         .decision
         .expect("the winning completion should persist a decision");
-    assert!(!rejected.accepted);
-    assert_eq!(rejected.decision, driverless);
-    assert!(rejected
-        .rejection_reason
-        .as_deref()
-        .is_some_and(|reason| reason.starts_with("ProgressDriverMissing:")));
+    assert!(policy.accepted);
+    assert_eq!(policy.decision.decision, "block_invalid_agent_output");
+    assert_eq!(policy.decision.next_state, "blocked");
 
     let after = store
         .get_instance(&instance.id)
         .await?
         .expect("workflow instance should remain visible");
-    assert_eq!(after.state, instance.state);
-    assert_eq!(after.version, instance.version);
-    assert_eq!(after.data, instance.data);
+    assert_eq!(after.state, "blocked");
+    assert_eq!(after.version, instance.version.saturating_add(1));
+    assert_eq!(after.data["marker"], instance.data["marker"]);
     let commands = store.commands_for(&instance.id).await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].id, command_id);
+    assert_eq!(commands.len(), 3);
+    let completed_driver = commands
+        .iter()
+        .find(|command| command.id == command_id)
+        .expect("the completed state-entry driver should remain visible");
     assert_eq!(
-        commands[0].decision_id.as_deref(),
+        completed_driver.decision_id.as_deref(),
         Some(state_entry_record.id.as_str())
     );
-    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
+    assert_eq!(completed_driver.status, WorkflowCommandStatus::Completed);
+    let policy_commands = commands
+        .iter()
+        .filter(|command| command.decision_id.as_deref() == Some(policy.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(policy_commands.len(), 2);
+    assert!(policy_commands.iter().all(|command| {
+        command.status == WorkflowCommandStatus::HandledInline
+            && matches!(
+                command.command.command_type,
+                WorkflowCommandType::MarkBlocked
+                    | WorkflowCommandType::RequestOperatorAttention
+            )
+    }));
     let jobs = store.runtime_jobs_for_command(&command_id).await?;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].status, RuntimeJobStatus::Succeeded);
     assert_eq!(store.events_for(&instance.id).await?.len(), 1);
     let decisions = store.decisions_for(&instance.id).await?;
-    assert_eq!(decisions.len(), 2);
-    assert_eq!(decisions.iter().filter(|decision| decision.accepted).count(), 1);
-    assert_eq!(
-        decisions.iter().filter(|decision| !decision.accepted).count(),
-        1
-    );
+    assert_eq!(decisions.len(), 3);
+    assert_eq!(decisions.iter().filter(|decision| decision.accepted).count(), 2);
+    let rejected = decisions
+        .iter()
+        .find(|decision| !decision.accepted)
+        .expect("the driverless candidate should remain auditable");
+    assert_eq!(rejected.decision, driverless);
+    assert!(rejected
+        .rejection_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("ProgressDriverMissing:")));
+    assert_eq!(rejected.event_id, policy.event_id);
+    let rejection_link = policy
+        .decision
+        .evidence
+        .iter()
+        .find(|evidence| evidence.kind == "rejected_workflow_decision")
+        .expect("the blocked policy should link the rejected candidate");
+    assert!(rejection_link.summary.contains(&rejected.id));
+    assert!(rejection_link.summary.contains("ProgressDriverMissing:"));
     Ok(())
 }
 
