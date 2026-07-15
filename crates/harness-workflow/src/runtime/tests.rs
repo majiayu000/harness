@@ -10,9 +10,10 @@ use super::{
     build_issue_submission_decision, build_plan_issue_decision, build_pr_detected_decision,
     build_pr_feedback_decision, build_pr_feedback_sweep_decision, build_prompt_submission_decision,
     build_quality_gate_run_decision, reduce_runtime_job_completed, CandidateFanoutRequest,
-    CommandDispatchOutcome, InMemoryWorkflowBus, IssueSubmissionDecisionInput,
-    IssueSubmissionWorkflowAction, PlanIssueDecisionInput, PlanIssueWorkflowAction,
-    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
+    CommandDispatchOutcome, DeferClaimedCommandOutcome, DispatchBackoffPolicy,
+    DispatchBarrierInput, DispatchBarrierReasonCode, DispatchClaim, InMemoryWorkflowBus,
+    IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction, PlanIssueDecisionInput,
+    PlanIssueWorkflowAction, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PromptSubmissionDecisionInput,
     QualityGateDecisionInput, QualityGateWorkflowAction, RuntimeCommandDispatcher,
     RuntimeJobExecutor, RuntimeProfileSelector, RuntimeWorker, SubmissionMode,
@@ -44,6 +45,7 @@ include!("tests/worker_limits.rs");
 include!("tests/durable_store.rs");
 include!("tests/command_dispatcher.rs");
 include!("tests/command_store.rs");
+include!("tests/deferred_dispatch.rs");
 
 mod issue_planning;
 mod local_review;

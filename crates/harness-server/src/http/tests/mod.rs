@@ -33,6 +33,7 @@ mod queue_stats_route_tests;
 mod recovery_followup_tests;
 mod recovery_tests;
 mod repo_memory_api_tests;
+mod runtime_deferred_tree_tests;
 mod runtime_dispatch_tests;
 mod runtime_task_route_tests;
 mod runtime_tree_tests;

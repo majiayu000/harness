@@ -196,6 +196,54 @@ async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fall
         .as_str()
         .expect("reason should be a string")
         .contains("docker missing"));
+
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .execute(store.pool())
+    .await?;
+    Arc::get_mut(&mut state)
+        .expect("state remains unique during the test")
+        .isolation_availability =
+        harness_core::config::isolation::IsolationAvailability::new(vec![
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Host,
+            ),
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Container,
+            ),
+        ]);
+    let repaired = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+    assert_eq!(repaired.enqueued, 1);
+    assert_eq!(repaired.deferred, 0);
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should remain configured");
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].command_id, command_id);
+    let repaired_command = store
+        .get_command(&command_id)
+        .await?
+        .expect("command exists");
+    assert_eq!(repaired_command.status, "dispatched");
+    assert_eq!(repaired_command.dispatch_attempt_count, 1);
+    assert_eq!(repaired_command.dispatch_claim_generation, 2);
+    assert!(repaired_command.dispatch_barrier.is_none());
+    assert!(repaired_command.dispatch_not_before.is_none());
     Ok(())
 }
 
@@ -280,6 +328,41 @@ async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> any
         .as_str()
         .expect("reason should be a string")
         .contains("failed to load WORKFLOW.md"));
+
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .execute(store.pool())
+    .await?;
+    let repaired = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+    assert_eq!(repaired.enqueued, 1);
+    assert_eq!(repaired.deferred, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].command_id, command_id);
+    let repaired_command = store
+        .get_command(&command_id)
+        .await?
+        .expect("command exists");
+    assert_eq!(repaired_command.status, "dispatched");
+    assert_eq!(repaired_command.dispatch_attempt_count, 1);
+    assert_eq!(repaired_command.dispatch_claim_generation, 2);
+    assert!(repaired_command.dispatch_barrier.is_none());
     Ok(())
 }
 
@@ -730,7 +813,47 @@ async fn runtime_command_dispatch_tick_defers_disabled_policy_without_agent_metr
             .as_str(),
         "runtime_policy_disabled"
     );
-    assert!(state.intake.github_token_dispatch_snapshot().is_empty());
+    let metrics_while_disabled = state.intake.github_token_dispatch_snapshot();
+    assert!(metrics_while_disabled.is_empty());
+
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: project-runtime\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .execute(store.pool())
+    .await?;
+    let repaired = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+    assert_eq!(repaired.enqueued, 1);
+    assert_eq!(repaired.deferred, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].command_id, command_id);
+    assert_eq!(jobs[0].runtime_profile, "project-runtime");
+    let repaired_command = store
+        .get_command(&command_id)
+        .await?
+        .expect("command exists");
+    assert_eq!(repaired_command.status, "dispatched");
+    assert_eq!(repaired_command.dispatch_attempt_count, 1);
+    assert_eq!(repaired_command.dispatch_claim_generation, 2);
+    assert!(repaired_command.dispatch_barrier.is_none());
+    let metrics_after_repair = state.intake.github_token_dispatch_snapshot();
+    assert_eq!(metrics_after_repair.len(), 1);
+    assert_eq!(metrics_after_repair[0].agent_implement_issue_count, 1);
     Ok(())
 }
 
