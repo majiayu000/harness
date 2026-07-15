@@ -33,7 +33,7 @@ fn issue_submission_decision_force_execute_starts_implementation() {
     );
     assert_eq!(
         output.decision.commands[0].dedupe_key,
-        "issue-submit:owner/repo:issue:123:task:task-force:implement"
+        format!("{}:discovered:submit", instance.id)
     );
     DecisionValidator::github_issue_pr()
         .validate(
@@ -45,7 +45,7 @@ fn issue_submission_decision_force_execute_starts_implementation() {
 }
 
 #[test]
-fn issue_submission_decision_uses_remote_fact_hash_for_implementation_dedupe() {
+fn issue_submission_decision_keeps_remote_fact_hash_out_of_initial_dedupe() {
     let labels = Vec::new();
     let instance = issue_instance("discovered");
     let output = build_issue_submission_decision(
@@ -67,7 +67,7 @@ fn issue_submission_decision_uses_remote_fact_hash_for_implementation_dedupe() {
 
     assert_eq!(
         output.decision.commands[0].dedupe_key,
-        "implement_issue:sha256:abc"
+        format!("{}:discovered:submit", instance.id)
     );
     assert_eq!(
         output.decision.commands[0].command["dispatch_gate"]["reason"],
@@ -152,11 +152,11 @@ fn candidate_fanout_force_execute_starts_deferred_candidate_commands() -> anyhow
     assert_eq!(output.decision.commands.len(), 2);
     assert_eq!(
         output.decision.commands[0].dedupe_key,
-        "implement_issue:sha256:fanout:candidate:c1"
+        format!("{}:discovered:submit:candidate:c1", instance.id)
     );
     assert_eq!(
         output.decision.commands[1].dedupe_key,
-        "implement_issue:sha256:fanout:candidate:c2"
+        format!("{}:discovered:submit:candidate:c2", instance.id)
     );
     for (index, command) in output.decision.commands.iter().enumerate() {
         let candidate_index = index + 1;

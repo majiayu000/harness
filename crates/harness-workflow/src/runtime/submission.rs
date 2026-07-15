@@ -3,7 +3,6 @@ use super::model::{
     WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
 };
 use super::plan_issue::ISSUE_PLAN_ACTIVITY;
-use super::remote_facts::remote_fact_command_dedupe_key;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -93,16 +92,7 @@ pub fn build_issue_submission_decision(
         reason,
     );
     if !input.dependencies_blocked && input.force_execute {
-        let dedupe_key = submission_command_dedupe_key(
-            "implement_issue",
-            input.remote_fact_hash,
-            format!(
-                "issue-submit:{}:issue:{}:task:{}:implement",
-                repo_key(input.repo),
-                input.issue_number,
-                input.task_id
-            ),
-        );
+        let dedupe_key = format!("{}:{}:submit", instance.id, instance.state);
         let command = WorkflowCommand::new(
             WorkflowCommandType::EnqueueActivity,
             dedupe_key,
@@ -119,16 +109,7 @@ pub fn build_issue_submission_decision(
         );
         decision = append_candidate_commands(decision, command, input.candidate_fanout.as_ref());
     } else if !input.dependencies_blocked {
-        let dedupe_key = submission_command_dedupe_key(
-            ISSUE_PLAN_ACTIVITY,
-            input.remote_fact_hash,
-            format!(
-                "issue-submit:{}:issue:{}:task:{}:plan",
-                repo_key(input.repo),
-                input.issue_number,
-                input.task_id
-            ),
-        );
+        let dedupe_key = format!("{}:{}:submit", instance.id, instance.state);
         decision = decision.with_command(WorkflowCommand::new(
             WorkflowCommandType::EnqueueActivity,
             dedupe_key,
@@ -224,14 +205,4 @@ fn depends_on_summary(depends_on: &[String]) -> String {
 
 fn repo_key(repo: Option<&str>) -> &str {
     repo.unwrap_or("<none>")
-}
-
-fn submission_command_dedupe_key(
-    activity: &str,
-    remote_fact_hash: Option<&str>,
-    fallback: String,
-) -> String {
-    remote_fact_hash
-        .map(|fact_hash| remote_fact_command_dedupe_key(activity, fact_hash))
-        .unwrap_or(fallback)
 }

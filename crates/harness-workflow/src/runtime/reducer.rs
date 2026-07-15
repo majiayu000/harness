@@ -325,6 +325,21 @@ fn reduce_success(
     let mut workflow_decision =
         WorkflowDecision::new(&instance.id, &instance.state, decision, next_state, reason)
             .with_evidence(runtime_completion_evidence(event, result));
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "replanning"
+        && result.activity == "replan_issue"
+        && next_state == "implementing"
+    {
+        let completion_command_id =
+            event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+        workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
+            "implement_issue",
+            format!(
+                "issue-replan:{}:implement:{completion_command_id}",
+                instance.id
+            ),
+        ));
+    }
     if instance.definition_id == PROMPT_TASK_DEFINITION_ID
         && instance.state == "implementing"
         && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
