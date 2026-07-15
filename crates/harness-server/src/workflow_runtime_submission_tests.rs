@@ -118,6 +118,7 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
             dependencies_blocked: false,
             source: Some("dashboard"),
             external_id: Some("manual:prompt:1"),
+            continuation: None,
         },
     )
     .await?;
@@ -164,9 +165,11 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
     );
 
     let events = store.events_for(&workflow_id).await?;
-    assert!(events
+    let submitted_event = events
         .iter()
-        .any(|event| event.event_type == "PromptSubmitted"));
+        .find(|event| event.event_type == "PromptSubmitted")
+        .expect("prompt submission event");
+    assert!(submitted_event.event.get("continuation").is_none());
 
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
@@ -251,6 +254,7 @@ async fn prompt_resubmission_removes_previous_cached_prompt() -> anyhow::Result<
             dependencies_blocked: false,
             source: Some("dashboard"),
             external_id: Some(external_id),
+            continuation: None,
         },
     )
     .await?;
@@ -580,6 +584,7 @@ async fn cancel_prompt_submission_cancels_dispatched_runtime_jobs() -> anyhow::R
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            continuation: None,
         },
     )
     .await?;

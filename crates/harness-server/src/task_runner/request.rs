@@ -1,3 +1,4 @@
+use harness_workflow::runtime::PromptContinuationPolicy;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -83,6 +84,9 @@ pub struct CreateTaskRequest {
     /// Higher values are served first when multiple tasks are waiting for a slot.
     #[serde(default)]
     pub priority: u8,
+    /// Optional bounded external-state loop for prompt-only workflow submissions.
+    #[serde(default)]
+    pub continuation: Option<PromptContinuationPolicy>,
     /// Restart-safe metadata for trusted system-generated prompt tasks.
     /// Never accepted from or exposed to external HTTP callers.
     #[serde(skip)]
@@ -159,6 +163,8 @@ pub struct PersistedRequestSettings {
     /// Pure prompt tasks and PR tasks leave this `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<PromptContinuationPolicy>,
     /// Primary prompt for prompt-only tasks (no issue or pr).
     ///
     /// Kept in memory so that `AwaitingDeps` tasks can reconstruct the original
@@ -199,6 +205,7 @@ impl PersistedRequestSettings {
             } else {
                 None
             },
+            continuation: req.continuation.clone(),
             // For prompt-only tasks (no issue/pr), store the prompt so that
             // AwaitingDeps tasks can reconstruct the original request when deps resolve.
             prompt: if req.issue.is_none() && req.pr.is_none() {
@@ -236,6 +243,7 @@ impl PersistedRequestSettings {
         if self.prompt.is_some() {
             req.prompt = self.prompt.clone();
         }
+        req.continuation = self.continuation.clone();
     }
 }
 
@@ -265,6 +273,7 @@ impl Default for CreateTaskRequest {
             depends_on: Vec::new(),
             serialization_depends_on: Vec::new(),
             priority: 0,
+            continuation: None,
             system_input: None,
         }
     }
@@ -419,6 +428,30 @@ mod tests {
         let req = CreateTaskRequest::default();
         assert!(!req.skip_triage);
         assert!(!req.force_execute);
+    }
+
+    #[test]
+    fn create_task_request_deserializes_and_persists_continuation_policy() {
+        let req: CreateTaskRequest = serde_json::from_str(
+            r#"{
+                "prompt": "Continue TEAM-123",
+                "continuation": {
+                    "max_attempts": 4,
+                    "attempt_delay_secs": 30,
+                    "active_states": ["In Progress"],
+                    "no_progress_limit": 2
+                }
+            }"#,
+        )
+        .expect("deserialize continuation request");
+        let policy = req.continuation.as_ref().expect("continuation policy");
+        assert!(policy.validate().is_ok());
+        assert!(policy.active_states.contains("In Progress"));
+
+        let settings = PersistedRequestSettings::from_req(&req);
+        let mut restored = CreateTaskRequest::default();
+        settings.apply_to_req(&mut restored);
+        assert_eq!(restored.continuation, req.continuation);
     }
 
     #[test]

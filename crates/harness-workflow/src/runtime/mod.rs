@@ -108,9 +108,12 @@ pub use pr_feedback::{
     PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 pub use prompt_task::{
-    build_prompt_submission_decision, PromptSubmissionDecisionInput,
-    PromptSubmissionDecisionOutput, PromptTaskWorkflowAction, PROMPT_TASK_DEFINITION_ID,
-    PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    build_prompt_submission_decision, continuation_value, parse_external_state_signal,
+    prompt_continuation_state_from_data, ExternalStateSignal, PromptContinuationPolicy,
+    PromptContinuationPolicyError, PromptContinuationState, PromptSubmissionDecisionInput,
+    PromptSubmissionDecisionOutput, PromptTaskWorkflowAction,
+    PROMPT_CONTINUATION_DEFAULT_NO_PROGRESS_LIMIT, PROMPT_CONTINUATION_MAX_ATTEMPTS,
+    PROMPT_CONTINUATION_MAX_DELAY_SECS, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 pub use quality_gate::{
     build_quality_gate_run_decision, quality_gate_workflow_id, QualityGateDecisionInput,

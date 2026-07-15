@@ -439,8 +439,9 @@ async fn release_prompt_after_dependencies(
             external_id: fields.external_id.as_deref(),
             depends_on: &depends_on_strings(depends_on),
             dependencies_blocked: false,
+            continuation: fields.continuation.as_ref(),
         },
-    );
+    )?;
     let event = store
         .append_event(
             &instance.id,

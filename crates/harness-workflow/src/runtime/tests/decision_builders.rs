@@ -198,8 +198,10 @@ fn prompt_submission_decision_starts_runtime_implementation() {
             external_id: Some("manual-prompt-1"),
             depends_on: &[],
             dependencies_blocked: false,
+            continuation: None,
         },
-    );
+    )
+    .expect("valid prompt submission policy");
 
     assert_eq!(output.decision.decision, "submit_prompt");
     assert_eq!(output.decision.next_state, "implementing");
@@ -240,8 +242,10 @@ fn prompt_submission_decision_waits_for_dependencies_without_runtime_command() {
             external_id: None,
             depends_on: &depends_on,
             dependencies_blocked: true,
+            continuation: None,
         },
-    );
+    )
+    .expect("valid prompt submission policy");
 
     assert_eq!(output.decision.next_state, "awaiting_dependencies");
     assert!(output.decision.commands.is_empty());
@@ -267,8 +271,10 @@ fn prompt_submission_decision_reopens_blocked_prompt_task() {
             external_id: Some("manual-prompt-retry"),
             depends_on: &[],
             dependencies_blocked: false,
+            continuation: None,
         },
-    );
+    )
+    .expect("valid prompt submission policy");
 
     assert_eq!(output.decision.next_state, "implementing");
     assert_eq!(output.decision.commands.len(), 1);

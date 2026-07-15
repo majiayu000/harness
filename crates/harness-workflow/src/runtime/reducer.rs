@@ -1,6 +1,7 @@
 mod github_issue_completion;
 mod plan_issue_completion;
 mod pr_feedback_completion;
+mod prompt_task_completion;
 mod quality_gate_completion;
 mod runtime_failure;
 mod support;
@@ -18,6 +19,7 @@ use self::pr_feedback_completion::{
     pr_feedback_child_decision_from_activity_result, pr_feedback_success_contract_error,
     pr_feedback_sweep_decision_from_activity_result,
 };
+use self::prompt_task_completion::prompt_task_success_decision;
 use self::quality_gate_completion::{
     parent_quality_gate_pass_decision, quality_gate_activity_matches,
     quality_gate_success_contract_error, quality_gate_success_decision,
@@ -41,7 +43,10 @@ use super::model::{
     WorkflowEvent, WorkflowInstance,
 };
 use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
-use super::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
+use super::prompt_task::{
+    parse_external_state_signal, prompt_continuation_state_from_data, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY,
+};
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use super::state_registry::decision_validator_for_definition;
 use super::validator::ValidationContext;
@@ -225,11 +230,12 @@ fn reduce_success(
     }
 
     if prompt_task_activity_matches(instance, result) {
-        if let Some(reason) = prompt_task_success_contract_error(result) {
+        if let Some(reason) = prompt_task_success_contract_error(instance, result) {
             return Some(invalid_agent_output_blocked_decision(
                 instance, event, result, reason,
             ));
         }
+        return prompt_task_success_decision(instance, event, result);
     }
 
     if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
@@ -304,11 +310,6 @@ fn reduce_success(
             "passed",
             "quality_passed",
             "quality gate activity completed successfully",
-        ),
-        (PROMPT_TASK_DEFINITION_ID, "implementing", PROMPT_TASK_IMPLEMENT_ACTIVITY) => (
-            "done",
-            "finish_prompt_task",
-            "prompt implementation activity completed successfully",
         ),
         _ if known_success_without_decision(instance, event, result) => return None,
         _ => {
@@ -447,6 +448,10 @@ fn structured_decision_validates(
     result: &ActivityResult,
     decision: &WorkflowDecision,
 ) -> bool {
+    if prompt_task_activity_matches(instance, result) && instance.data.get("continuation").is_some()
+    {
+        return false;
+    }
     if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
         && instance.state == "implementing"
         && result.activity == "implement_issue"
@@ -463,7 +468,7 @@ fn structured_decision_validates(
     }
     if prompt_task_activity_matches(instance, result)
         && decision.next_state == "done"
-        && prompt_task_success_contract_error(result).is_some()
+        && prompt_task_success_contract_error(instance, result).is_some()
     {
         return false;
     }
@@ -492,11 +497,21 @@ fn prompt_task_activity_matches(instance: &WorkflowInstance, result: &ActivityRe
     )
 }
 
-fn prompt_task_success_contract_error(result: &ActivityResult) -> Option<&'static str> {
+fn prompt_task_success_contract_error(
+    instance: &WorkflowInstance,
+    result: &ActivityResult,
+) -> Option<&'static str> {
     if prompt_task_has_validation_evidence(result) {
-        None
-    } else {
-        Some("implement_prompt succeeded without validation evidence")
+        return None;
+    }
+    match prompt_continuation_state_from_data(&instance.data) {
+        Ok(Some(continuation)) => match parse_external_state_signal(result) {
+            Ok(signal) if continuation.policy.active_states.contains(&signal.state) => None,
+            Err(_) => None,
+            _ => Some("implement_prompt succeeded without validation evidence"),
+        },
+        Ok(None) => Some("implement_prompt succeeded without validation evidence"),
+        Err(_) => None,
     }
 }
 

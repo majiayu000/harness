@@ -82,7 +82,23 @@ pub(super) fn build_runtime_prompt_packet(
         packet["repo_memory"] = repo_memory_prompt_value(repo_memory);
     }
     apply_candidate_submission_contract(&mut packet, job);
+    if let Some(context) = prompt_continuation_context(workflow) {
+        packet["continuation_context"] = context;
+    }
     packet
+}
+
+fn prompt_continuation_context(workflow: Option<&WorkflowInstance>) -> Option<Value> {
+    let continuation = workflow?.data.get("continuation")?;
+    let attempt = continuation.get("attempt")?.as_u64()?;
+    if attempt <= 1 {
+        return None;
+    }
+    Some(json!({
+        "attempt": attempt,
+        "previous_external_state": continuation.get("last_external_state").cloned().unwrap_or(Value::Null),
+        "previous_summary": continuation.get("last_summary").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn apply_candidate_submission_contract(packet: &mut Value, job: &RuntimeJob) {
@@ -177,6 +193,20 @@ pub(super) fn build_runtime_job_prompt(
          Activity: {activity}\n\n\
          Prompt packet:\n{prompt_packet_json}\n",
     );
+    if let Some(context) = prompt_packet.get("continuation_context") {
+        let attempt = context.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+        let previous_state = context
+            .get("previous_external_state")
+            .and_then(Value::as_str)
+            .unwrap_or("<none>");
+        let previous_summary = context
+            .get("previous_summary")
+            .and_then(Value::as_str)
+            .unwrap_or("<none>");
+        prompt.push_str(&format!(
+            "\nContinuation context:\n- Attempt: {attempt}\n- Previous external state: {previous_state}\n- Previous attempt summary: {previous_summary}\n"
+        ));
+    }
     if let Some(repo_memory_section) = repo_memory_prompt_section(prompt_packet) {
         prompt.push_str(&repo_memory_section);
     }
@@ -252,7 +282,7 @@ pub(super) fn activity_result_schema(
     let summary_contract = agent_summary_contract(workflow_definition, &activity);
     let decision_contract = workflow_decision_contract(workflow);
     let command_examples = workflow_decision_command_examples(workflow_definition, &activity);
-    json!({
+    let mut schema = json!({
         "schema": "harness.runtime.activity_result.v1",
         "activity": activity,
         "workflow_definition": workflow_definition,
@@ -318,7 +348,36 @@ pub(super) fn activity_result_schema(
                 "Omit `artifacts`, `signals`, or `validation` entirely if there is nothing to report — empty arrays or missing fields are both fine."
             ]
         },
-    })
+    });
+    if workflow
+        .and_then(|workflow| workflow.data.get("continuation"))
+        .is_some()
+        && workflow_definition == PROMPT_TASK_DEFINITION_ID
+        && activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
+    {
+        schema["continuation_signal_contract"] = json!({
+            "required_signal_type": "external_state",
+            "exact_count": 1,
+            "payload": {
+                "type": "object",
+                "required_fields": { "state": "non-empty string" },
+                "optional_fields": ["subject"]
+            },
+            "decision_owner": "Harness runtime; the agent reports state and must not emit a continuation workflow_decision"
+        });
+        schema["transition_contract"]["on_succeeded"] = json!({
+            "reducer_next_state": "implementing_when_external_state_is_active_else_done; malformed_or_missing_signal_blocks",
+            "accepted_signals": ["external_state"],
+            "success_requires": "Exactly one external_state signal with an object payload containing a non-empty string state. Active states continue within the configured attempt and no-progress bounds. Settled states still require validation evidence before done."
+        });
+        schema["activity_contract"]["accepted_signals"] = json!(["external_state"]);
+        schema["activity_contract"]["success_requires"] = json!(
+            "exactly_one_external_state_signal; settled external states also require validation evidence"
+        );
+        schema["agent_summary_contract"]["artifacts"]["validation_report"]["required_when"] =
+            json!("The reported external_state is settled and no validation records are present.");
+    }
+    schema
 }
 
 fn workflow_decision_command_examples(_workflow_definition: &str, _activity: &str) -> Value {

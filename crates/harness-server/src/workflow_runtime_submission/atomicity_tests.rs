@@ -183,6 +183,7 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
         dependencies_blocked: false,
         source: None,
         external_id: None,
+        continuation: None,
     };
     let accepted_data =
         prompt_submission_data(&ctx, &project_id, &stale_instance.data, &prompt_ref, &[]);
@@ -196,8 +197,9 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
             external_id: None,
             depends_on: &[],
             dependencies_blocked: false,
+            continuation: None,
         },
-    );
+    )?;
 
     let result = commit::apply_prompt_decision(
         &store,
@@ -239,6 +241,7 @@ async fn accepted_prompt_replay_with_new_prompt_keeps_referenced_payload() -> an
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            continuation: None,
         },
     )
     .await?;
@@ -268,6 +271,7 @@ async fn accepted_prompt_replay_with_new_prompt_keeps_referenced_payload() -> an
             dependencies_blocked: false,
             source: None,
             external_id: None,
+            continuation: None,
         },
     )
     .await?;

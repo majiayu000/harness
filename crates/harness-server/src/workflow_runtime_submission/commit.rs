@@ -309,7 +309,7 @@ fn issue_submission_event_payload(ctx: &IssueSubmissionRuntimeContext<'_>) -> se
 }
 
 fn prompt_submission_event_payload(ctx: &PromptSubmissionRuntimeContext<'_>) -> serde_json::Value {
-    json!({
+    let mut payload = json!({
         "task_id": ctx.task_id.as_str(),
         "prompt_chars": ctx.prompt.chars().count(),
         "depends_on": depends_on_strings(ctx.depends_on),
@@ -318,7 +318,11 @@ fn prompt_submission_event_payload(ctx: &PromptSubmissionRuntimeContext<'_>) -> 
         "source": ctx.source,
         "external_id": ctx.external_id,
         "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
-    })
+    });
+    if let Some(policy) = ctx.continuation {
+        payload["continuation"] = json!(policy);
+    }
+    payload
 }
 
 fn accepted_submission_instance(

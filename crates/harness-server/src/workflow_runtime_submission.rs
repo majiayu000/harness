@@ -2,10 +2,12 @@ use crate::task_runner::TaskId;
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
     build_issue_submission_decision, build_prompt_submission_decision,
-    candidate_fanout_from_policy, candidate_fanout_from_value, CandidateFanoutRequest,
-    DecisionValidator, IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, SubmissionMode,
-    ValidationContext, WorkflowDecision, WorkflowDecisionRecord, WorkflowDefinition,
-    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
+    candidate_fanout_from_policy, candidate_fanout_from_value, continuation_value,
+    prompt_continuation_state_from_data, CandidateFanoutRequest, DecisionValidator,
+    IssueSubmissionDecisionInput, PromptContinuationPolicy, PromptSubmissionDecisionInput,
+    SubmissionMode, ValidationContext, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -62,6 +64,7 @@ pub(crate) struct PromptSubmissionRuntimeContext<'a> {
     pub dependencies_blocked: bool,
     pub source: Option<&'a str>,
     pub external_id: Option<&'a str>,
+    pub continuation: Option<&'a PromptContinuationPolicy>,
 }
 
 pub(crate) struct IssueSubmissionRuntimeContext<'a> {
@@ -205,8 +208,9 @@ async fn persist_prompt_submission(
             external_id: ctx.external_id,
             depends_on: &depends_on_strings(&depends_on),
             dependencies_blocked: ctx.dependencies_blocked,
+            continuation: ctx.continuation,
         },
-    );
+    )?;
     apply_prompt_decision(
         store,
         instance,
@@ -436,7 +440,7 @@ fn prompt_submission_data(
     prompt_ref: &str,
     depends_on: &[TaskId],
 ) -> serde_json::Value {
-    crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let mut data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
         json!({
             "project_id": project_id,
@@ -453,7 +457,11 @@ fn prompt_submission_data(
             "source": ctx.source,
             "external_id": ctx.external_id,
         }),
-    )
+    );
+    if let (Some(object), Some(policy)) = (data.as_object_mut(), ctx.continuation) {
+        object.insert("continuation".to_string(), continuation_value(policy));
+    }
+    data
 }
 
 fn merge_last_decision(mut data: serde_json::Value, decision: &str) -> serde_json::Value {
@@ -526,14 +534,19 @@ struct PromptSubmissionFields {
     prompt_ref: String,
     source: Option<String>,
     external_id: Option<String>,
+    continuation: Option<PromptContinuationPolicy>,
 }
 
 fn prompt_submission_fields(instance: &WorkflowInstance) -> anyhow::Result<PromptSubmissionFields> {
+    let continuation = prompt_continuation_state_from_data(&instance.data)
+        .map_err(anyhow::Error::msg)?
+        .map(|state| state.policy);
     Ok(PromptSubmissionFields {
         task_id: string_field(&instance.data, "task_id")?,
         prompt_ref: string_field(&instance.data, "prompt_ref")?,
         source: optional_string_field(&instance.data, "source"),
         external_id: optional_string_field(&instance.data, "external_id"),
+        continuation,
     })
 }
 
@@ -643,6 +656,10 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "workflow_runtime_submission/dependency_tests.rs"]
 mod dependency_tests;
+
+#[cfg(test)]
+#[path = "workflow_runtime_submission/continuation_tests.rs"]
+mod continuation_tests;
 
 #[cfg(test)]
 #[path = "workflow_runtime_submission/replay_tests.rs"]

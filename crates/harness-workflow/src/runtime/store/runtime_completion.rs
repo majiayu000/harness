@@ -7,6 +7,7 @@ use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowEvent,
     WorkflowEvidence, WorkflowInstance,
 };
+use crate::runtime::prompt_task::{PromptContinuationState, PROMPT_TASK_DEFINITION_ID};
 use crate::runtime::reducer::reduce_runtime_job_completed;
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
@@ -226,6 +227,7 @@ async fn persist_runtime_completion_decision_tx(
     insert_decision_record_tx(tx, &record).await?;
 
     if record.accepted {
+        apply_prompt_continuation_side_effect(&mut instance, &record.decision)?;
         for followup in &record.decision.commands {
             let status = if followup.requires_runtime_job() {
                 WorkflowCommandStatus::Pending
@@ -243,4 +245,51 @@ async fn persist_runtime_completion_decision_tx(
     }
 
     Ok(record)
+}
+
+fn apply_prompt_continuation_side_effect(
+    instance: &mut WorkflowInstance,
+    decision: &WorkflowDecision,
+) -> anyhow::Result<()> {
+    if instance.definition_id != PROMPT_TASK_DEFINITION_ID
+        || !matches!(
+            decision.decision.as_str(),
+            "continue_prompt_task"
+                | "finish_prompt_task_external_settled"
+                | "prompt_continuation_exhausted"
+                | "prompt_continuation_no_progress"
+        )
+    {
+        return Ok(());
+    }
+    let continuation_values = decision
+        .commands
+        .iter()
+        .filter_map(|command| command.command.get("continuation"))
+        .collect::<Vec<_>>();
+    if continuation_values.len() != 1 {
+        anyhow::bail!(
+            "prompt continuation decision `{}` must persist exactly one continuation state",
+            decision.decision
+        );
+    }
+    let continuation: PromptContinuationState =
+        serde_json::from_value(continuation_values[0].clone())?;
+    continuation.policy.validate()?;
+    if continuation.attempt == 0 || continuation.attempt > continuation.policy.max_attempts {
+        anyhow::bail!(
+            "prompt continuation decision `{}` has invalid attempt {}",
+            decision.decision,
+            continuation.attempt
+        );
+    }
+    let data = instance
+        .data
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("prompt task instance data must be a JSON object"))?;
+    data.insert(
+        "continuation".to_string(),
+        serde_json::to_value(continuation)?,
+    );
+    Ok(())
 }

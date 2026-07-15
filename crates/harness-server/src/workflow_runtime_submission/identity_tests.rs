@@ -94,6 +94,7 @@ async fn prompt_submission_records_explicit_submission_id() -> anyhow::Result<()
             dependencies_blocked: false,
             source: Some("dashboard"),
             external_id: Some("manual:prompt:1129"),
+            continuation: None,
         },
     )
     .await?;
