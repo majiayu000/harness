@@ -658,6 +658,16 @@ fn load_workflow_document_with_base(
         })?,
     };
     config.runtime_dispatch.apply_default_activity_profiles();
+    if config.runtime_dispatch.defer_backoff_secs == 0
+        || config.runtime_dispatch.defer_backoff_max_secs
+            < config.runtime_dispatch.defer_backoff_secs
+        || config.runtime_dispatch.defer_backoff_secs > i64::MAX as u64
+        || config.runtime_dispatch.defer_backoff_max_secs > i64::MAX as u64
+    {
+        anyhow::bail!(
+            "runtime_dispatch defer backoff requires positive BIGINT-compatible seconds and max >= floor"
+        );
+    }
 
     Ok(WorkflowDocument {
         config,
