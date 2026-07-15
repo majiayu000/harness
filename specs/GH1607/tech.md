@@ -41,7 +41,7 @@ Related: GH-1609 (declarative definitions reuse the signal-mapping shape), GH-16
 pub struct PromptContinuationPolicy {
     pub max_attempts: u32,        // >= 1, server cap 20 (B-002)
     pub attempt_delay_secs: u64,  // cap 3600 (B-002)
-    pub active_states: Vec<String>, // non-empty (B-002)
+    pub active_states: BTreeSet<String>, // non-empty; set semantics: no duplicates, O(log n) lookup (B-002)
     pub no_progress_limit: u32,   // default 3 (B-008)
 }
 ```
@@ -49,8 +49,12 @@ pub struct PromptContinuationPolicy {
 - Carried on `PromptSubmissionDecisionInput` as `Option<&PromptContinuationPolicy>`;
   validated by a `validate()` with explicit errors (B-002).
 - Persisted under `instance.data["continuation"]` at submission:
-  `{ policy, attempt: 1, last_external_state: null, same_state_count: 0 }`
-  (B-009). Absent key = single-shot semantics (B-001).
+  `{ policy, attempt: 1, last_external_state: null, last_summary: null,
+  same_state_count: 0 }` (B-009). `last_external_state` and
+  `last_summary` are updated by every continue decision so the prompt
+  packet builder reads attempt context from instance data alone, without
+  querying past job outputs (B-011). Absent key = single-shot semantics
+  (B-001).
 
 ### Signal contract
 
@@ -61,9 +65,12 @@ The implement activity's `ActivityResult` must carry:
   "signal": { "state": "In Progress", "subject": "TEAM-123" } }
 ```
 
-`signal.state` is compared (case-sensitive, exact) against
-`policy.active_states`. Zero or multiple `external_state` signals, or a
-missing/non-string `state` field, is a contract violation (B-006).
+Payload validation is strict: the `signal` value must be a JSON object
+(`is_object()` checked before any field access), with a string `state`
+field. `signal.state` is compared (case-sensitive, exact) against
+`policy.active_states`. Zero or multiple `external_state` signals, a
+non-object payload, or a missing/non-string `state` field is a contract
+violation (B-006).
 
 ### Reducer changes (`reducer.rs`)
 
@@ -80,9 +87,11 @@ arm with a function `prompt_task_success_decision(instance, event, result)`:
    - state ∈ `active_states`:
      - `attempt >= max_attempts` → `blocked`, decision
        `prompt_continuation_exhausted`, reason carries last state (B-007);
-     - same reported state as `last_external_state` and no new evidence
-       for `no_progress_limit` consecutive attempts → `blocked`, decision
-       `prompt_continuation_no_progress` (B-008);
+     - no-progress attempt (same reported state as `last_external_state`
+       AND `result.artifacts` empty AND `result.validation` empty — the
+       B-008 definition) for `no_progress_limit` consecutive attempts →
+       `blocked`, decision `prompt_continuation_no_progress`; any
+       progress attempt resets `same_state_count` (B-008);
      - otherwise → next_state `implementing`, decision
        `continue_prompt_task`, command
        `enqueue_activity(implement_prompt, "prompt-task:{id}:attempt:{n+1}")`

@@ -59,10 +59,13 @@ GitHub issue: `#1607`
 - `B-007` Attempt budget exhaustion (`attempt > max_attempts` would be
   required to continue) transitions to `blocked` with a reason carrying
   the last observed external state; it never reports success.
-- `B-008` No-progress guard: `no_progress_limit` (default 3) consecutive
-  attempts reporting the same external state value with no new evidence
-  transition to `blocked` for operator attention instead of consuming the
-  remaining attempt budget.
+- `B-008` No-progress guard: an attempt counts as no-progress when its
+  reported `external_state` value is identical to the previous attempt's
+  AND its `ActivityResult` carries no new artifacts and no new validation
+  records (both mechanically checkable on the result; summary text
+  changes alone do not count as progress). `no_progress_limit` (default
+  3) consecutive no-progress attempts transition to `blocked` for
+  operator attention instead of consuming the remaining attempt budget.
 - `B-009` The attempt counter, last observed external state, and the
   policy itself are persisted on the workflow instance and survive server
   restart; a restarted server resumes the loop with the same bounds.
