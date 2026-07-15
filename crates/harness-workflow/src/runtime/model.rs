@@ -1,4 +1,4 @@
-use super::terminal_state::{workflow_terminal_state, WorkflowTerminalState};
+use super::terminal_state::{workflow_terminal_state_for_instance, WorkflowTerminalState};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -119,7 +119,7 @@ impl WorkflowInstance {
     }
 
     pub fn terminal_state(&self) -> Option<WorkflowTerminalState> {
-        workflow_terminal_state(&self.definition_id, &self.state)
+        workflow_terminal_state_for_instance(self)
     }
 
     pub fn with_id(mut self, id: impl Into<String>) -> Self {

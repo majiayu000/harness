@@ -6,7 +6,9 @@ pub(super) fn validate_target_progress_contract(
     instance: &WorkflowInstance,
     decision: &WorkflowDecision,
 ) -> Result<(), WorkflowDecisionRejection> {
-    if !state_registry::workflow_state_exists(&instance.definition_id, &decision.next_state) {
+    if state_registry::workflow_state_definition_for_instance(instance, &decision.next_state)
+        .is_none()
+    {
         return Err(WorkflowDecisionRejection::new(
             WorkflowDecisionRejectionKind::TransitionNotAllowed,
             format!(
@@ -16,7 +18,8 @@ pub(super) fn validate_target_progress_contract(
         ));
     }
     let progress_mode =
-        state_registry::workflow_state_progress_mode(&instance.definition_id, &decision.next_state);
+        state_registry::workflow_state_definition_for_instance(instance, &decision.next_state)
+            .and_then(|state| state.progress_mode);
     let has_driver = decision
         .commands
         .iter()
