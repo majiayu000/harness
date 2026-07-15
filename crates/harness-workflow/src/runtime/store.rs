@@ -21,6 +21,8 @@ use std::path::Path;
 
 #[path = "store/commands.rs"]
 mod command_store;
+#[path = "store/driverless_progress.rs"]
+mod driverless_progress;
 #[path = "store/instance_helpers.rs"]
 mod instance_helpers;
 #[path = "store/instances.rs"]
@@ -33,6 +35,7 @@ mod runtime_completion;
 mod runtime_usage;
 #[path = "store/submission_commit.rs"]
 mod submission_commit;
+pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
 pub use recovery::{
     WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
 };

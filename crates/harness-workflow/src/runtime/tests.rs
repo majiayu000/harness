@@ -47,6 +47,7 @@ include!("tests/command_dispatcher.rs");
 include!("tests/command_store.rs");
 include!("tests/deferred_dispatch.rs");
 include!("tests/deferred_dispatch_review.rs");
+include!("tests/driverless_progress.rs");
 
 mod issue_planning;
 mod local_review;
