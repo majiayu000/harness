@@ -1,3 +1,4 @@
+use super::runtime_job_leases::delete_runtime_job_lease_receipts_tx;
 use super::{
     command_store, enum_str, insert_decision_record_tx, insert_event_tx,
     select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx, validator_for_definition,
@@ -459,6 +460,7 @@ async fn cancel_unfinished_runtime_jobs_tx(
         .bind(job_id)
         .execute(&mut **tx)
         .await?;
+        delete_runtime_job_lease_receipts_tx(tx, job_id, job.lease_generation).await?;
     }
 
     Ok(rows.len() as u64)

@@ -508,4 +508,29 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               )
               WHERE status IN ('pending', 'dispatching', 'deferred')",
     },
+    Migration {
+        version: 20,
+        description: "create runtime job lease renewal receipts",
+        sql: "CREATE TABLE IF NOT EXISTS runtime_job_lease_renewal_receipts (
+            runtime_job_id       TEXT NOT NULL,
+            renewal_id           UUID NOT NULL,
+            owner                TEXT NOT NULL,
+            lease_generation     BIGINT NOT NULL,
+            previous_expires_at  TIMESTAMPTZ NOT NULL,
+            renewed_expires_at   TIMESTAMPTZ NOT NULL,
+            lease_secs           BIGINT NOT NULL,
+            created_at           TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (runtime_job_id, lease_generation, renewal_id),
+            CONSTRAINT runtime_job_lease_renewal_receipts_job_fkey
+                FOREIGN KEY (runtime_job_id)
+                REFERENCES runtime_jobs(id)
+                ON DELETE CASCADE,
+            CONSTRAINT runtime_job_lease_renewal_receipts_generation_nonnegative
+                CHECK (lease_generation >= 0),
+            CONSTRAINT runtime_job_lease_renewal_receipts_lease_secs_positive
+                CHECK (lease_secs > 0)
+        );
+        CREATE INDEX IF NOT EXISTS idx_runtime_job_lease_receipts_expiry
+          ON runtime_job_lease_renewal_receipts (runtime_job_id, renewed_expires_at)",
+    },
 ];
