@@ -105,6 +105,23 @@ fn draining_host_cannot_be_reactivated_by_registration() {
 }
 
 #[test]
+fn registration_identity_changes_on_same_id_reregistration() {
+    let manager = RuntimeHostManager::with_heartbeat_timeout(60);
+    manager.register("host-a".to_string(), None, vec![]);
+    let first = manager
+        .active_registration_id("host-a")
+        .expect("first registration must have an identity");
+
+    assert!(manager.deregister("host-a"));
+    manager.register("host-a".to_string(), None, vec![]);
+    let second = manager
+        .active_registration_id("host-a")
+        .expect("replacement registration must have an identity");
+
+    assert_ne!(first, second);
+}
+
+#[test]
 fn persisted_legacy_host_defaults_to_active() {
     let value = serde_json::json!({
         "id": "host-a",

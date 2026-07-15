@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use uuid::Uuid;
 
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
 pub const DEFAULT_LEASE_SECS: i64 = 60;
@@ -36,6 +37,7 @@ pub struct TaskClaimResult {
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeHostRecord {
     pub(crate) id: String,
+    pub(crate) registration_id: Uuid,
     pub(crate) display_name: String,
     pub(crate) capabilities: Vec<String>,
     pub(crate) registered_at: DateTime<Utc>,
@@ -131,6 +133,7 @@ impl RuntimeHostManager {
             .unwrap_or_default();
         let record = RuntimeHostRecord {
             id: host_id.clone(),
+            registration_id: Uuid::new_v4(),
             display_name: display_name.unwrap_or_else(|| host_id.clone()),
             capabilities,
             registered_at: now,
@@ -178,6 +181,12 @@ impl RuntimeHostManager {
 
     pub fn lifecycle(&self, host_id: &str) -> Option<RuntimeHostLifecycle> {
         self.hosts.get(host_id).map(|host| host.lifecycle)
+    }
+
+    pub fn active_registration_id(&self, host_id: &str) -> Option<Uuid> {
+        self.hosts.get(host_id).and_then(|host| {
+            (host.lifecycle == RuntimeHostLifecycle::Active).then_some(host.registration_id)
+        })
     }
 
     pub fn list_hosts(&self) -> Vec<RuntimeHostInfo> {

@@ -48,12 +48,13 @@ pub async fn sync_runtime_host_projects(
     if let Err(response) = ensure_runtime_state_persistence_available(&state) {
         return response;
     }
-    {
+    let registration_id = {
         let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
-        if let Err(response) = ensure_active_host(&state, &host_id) {
-            return response;
+        match active_host_registration_id(&state, &host_id) {
+            Ok(registration_id) => registration_id,
+            Err(response) => return response,
         }
-    }
+    };
 
     let mut inputs: Vec<WatchedProjectInput> = Vec::with_capacity(req.projects.len());
     for item in req.projects {
@@ -78,8 +79,15 @@ pub async fn sync_runtime_host_projects(
     }
 
     let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
-    if let Err(response) = ensure_active_host(&state, &host_id) {
-        return response;
+    match active_host_registration_id(&state, &host_id) {
+        Ok(current_registration_id) if current_registration_id == registration_id => {}
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "runtime host registration changed during project sync"})),
+            )
+        }
+        Err(response) => return response,
     }
     let snapshot = state
         .runtime_project_cache
@@ -109,6 +117,22 @@ fn ensure_active_host(
             Json(json!({"error": "runtime host not found"})),
         )),
     }
+}
+
+fn active_host_registration_id(
+    state: &AppState,
+    host_id: &str,
+) -> Result<uuid::Uuid, (StatusCode, Json<serde_json::Value>)> {
+    ensure_active_host(state, host_id)?;
+    state
+        .runtime_hosts
+        .active_registration_id(host_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "runtime host not found"})),
+            )
+        })
 }
 
 async fn resolve_project_token(

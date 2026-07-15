@@ -39,6 +39,7 @@ impl RuntimeHostManager {
                 host.id.clone(),
                 RuntimeHostRecord {
                     id: host.id,
+                    registration_id: uuid::Uuid::new_v4(),
                     display_name: host.display_name,
                     capabilities: host.capabilities,
                     registered_at: host.registered_at,
