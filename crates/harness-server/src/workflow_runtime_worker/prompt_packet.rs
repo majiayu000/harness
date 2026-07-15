@@ -1,13 +1,14 @@
 use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
-    ActivityArtifact, DecisionValidator, RetrievedRepoMemoryRecord, RuntimeJob, RuntimeProfile,
-    WorkflowInstance, CANDIDATE_BRANCH_ARTIFACT, CANDIDATE_CLEANUP_ACTIVITY,
-    CANDIDATE_PROMOTION_ACTIVITY, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
-    ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, ISSUE_STATE_ARTIFACT,
-    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL,
-    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL, SCOPE_TOO_LARGE_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
+    decision_validator_for_definition, ActivityArtifact, DecisionValidator,
+    RetrievedRepoMemoryRecord, RuntimeJob, RuntimeProfile, WorkflowInstance,
+    CANDIDATE_BRANCH_ARTIFACT, CANDIDATE_CLEANUP_ACTIVITY, CANDIDATE_PROMOTION_ACTIVITY,
+    ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT,
+    ISSUE_PLAN_READY_SIGNAL, ISSUE_STATE_ARTIFACT, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
+    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
+    SCOPE_TOO_LARGE_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -334,13 +335,20 @@ fn workflow_decision_command_examples(_workflow_definition: &str, _activity: &st
 }
 
 fn workflow_decision_contract(workflow: Option<&WorkflowInstance>) -> Value {
+    workflow_decision_contract_with_resolver(workflow, decision_validator_for_definition)
+}
+
+fn workflow_decision_contract_with_resolver(
+    workflow: Option<&WorkflowInstance>,
+    validator_for_definition: impl FnOnce(&str) -> Option<DecisionValidator>,
+) -> Value {
     let Some(workflow) = workflow else {
         return json!({
             "available": false,
             "reason": "No workflow instance was loaded for this runtime job."
         });
     };
-    let Some(validator) = decision_validator_for_definition(&workflow.definition_id) else {
+    let Some(validator) = validator_for_definition(&workflow.definition_id) else {
         return json!({
             "available": false,
             "workflow_id": workflow.id.as_str(),
@@ -371,16 +379,6 @@ fn workflow_decision_contract(workflow: Option<&WorkflowInstance>) -> Value {
         "observed_state": workflow.state.as_str(),
         "allowed_transitions": allowed_transitions,
     })
-}
-
-fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
-    match definition_id {
-        "github_issue_pr" => Some(DecisionValidator::github_issue_pr()),
-        QUALITY_GATE_DEFINITION_ID => Some(DecisionValidator::quality_gate()),
-        PR_FEEDBACK_DEFINITION_ID => Some(DecisionValidator::pr_feedback()),
-        PROMPT_TASK_DEFINITION_ID => Some(DecisionValidator::prompt_task()),
-        _ => None,
-    }
 }
 
 fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Value {

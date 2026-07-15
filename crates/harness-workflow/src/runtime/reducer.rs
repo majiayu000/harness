@@ -43,7 +43,8 @@ use super::model::{
 use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
 use super::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
-use super::validator::{DecisionValidator, ValidationContext};
+use super::state_registry::decision_validator_for_definition;
+use super::validator::ValidationContext;
 use serde_json::{json, Value};
 
 pub const RUNTIME_JOB_COMPLETED_EVENT: &str = "RuntimeJobCompleted";
@@ -452,12 +453,8 @@ fn structured_decision_validates(
         return false;
     }
 
-    let validator = match instance.definition_id.as_str() {
-        GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidator::github_issue_pr(),
-        QUALITY_GATE_DEFINITION_ID => DecisionValidator::quality_gate(),
-        PR_FEEDBACK_DEFINITION_ID => DecisionValidator::pr_feedback(),
-        PROMPT_TASK_DEFINITION_ID => DecisionValidator::prompt_task(),
-        _ => return true,
+    let Some(validator) = decision_validator_for_definition(&instance.definition_id) else {
+        return true;
     };
     validator
         .validate(

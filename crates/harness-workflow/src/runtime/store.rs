@@ -4,10 +4,6 @@ use super::model::{
     WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision,
     WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowInstance, WorkflowLease,
 };
-use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
-use super::prompt_task::PROMPT_TASK_DEFINITION_ID;
-use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
-use super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
 use super::validator::DecisionValidator;
@@ -22,6 +18,8 @@ use std::path::Path;
 
 #[path = "store/commands.rs"]
 mod command_store;
+#[path = "store/instance_helpers.rs"]
+mod instance_helpers;
 #[path = "store/instances.rs"]
 mod instances;
 #[path = "store/recovery.rs"]
@@ -2275,11 +2273,5 @@ fn command_status_for_activity(status: ActivityStatus) -> WorkflowCommandStatus 
 }
 
 fn validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
-    match definition_id {
-        GITHUB_ISSUE_PR_DEFINITION_ID => Some(DecisionValidator::github_issue_pr()),
-        QUALITY_GATE_DEFINITION_ID => Some(DecisionValidator::quality_gate()),
-        PR_FEEDBACK_DEFINITION_ID => Some(DecisionValidator::pr_feedback()),
-        PROMPT_TASK_DEFINITION_ID => Some(DecisionValidator::prompt_task()),
-        _ => None,
-    }
+    super::state_registry::decision_validator_for_definition(definition_id)
 }

@@ -1,24 +1,16 @@
 use super::{
     command_store, insert_decision_record_tx, insert_event_tx, insert_instance_if_absent_tx,
+    instance_helpers::{otel_trace_context_from_data, terminal_state_pairs},
     load_or_insert_initial_instance_tx, select_instance_for_update_tx, to_jsonb_string,
     upsert_instance_tx, workflow_instance_from_row, RuntimeHistoryPruneSummary,
     WorkflowDecisionTransition, WorkflowInstancePage, WorkflowRejectedDecisionTransition,
     WorkflowRuntimeStore,
 };
 use crate::runtime::model::{WorkflowDecisionRecord, WorkflowInstance};
-use crate::runtime::state_registry::{
-    known_workflow_definition_ids, workflow_terminal_state_names_for_definition,
-};
+use crate::runtime::state_registry::workflow_terminal_state_names_for_definition;
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::WorkflowOtelTraceContext;
 use chrono::{DateTime, Utc};
-
-fn otel_trace_context_from_data(data: &serde_json::Value) -> Option<WorkflowOtelTraceContext> {
-    let context =
-        serde_json::from_value::<WorkflowOtelTraceContext>(data.get("otel_trace_context")?.clone())
-            .ok()?;
-    context.has_valid_trace_ids().then_some(context)
-}
 
 impl WorkflowRuntimeStore {
     pub async fn insert_instance_if_absent(
@@ -805,16 +797,4 @@ impl WorkflowRuntimeStore {
             .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
             .collect()
     }
-}
-
-fn terminal_state_pairs() -> (Vec<&'static str>, Vec<&'static str>) {
-    let mut definition_ids = Vec::new();
-    let mut states = Vec::new();
-    for definition_id in known_workflow_definition_ids() {
-        for state in workflow_terminal_state_names_for_definition(definition_id) {
-            definition_ids.push(*definition_id);
-            states.push(state);
-        }
-    }
-    (definition_ids, states)
 }
