@@ -1,8 +1,10 @@
 use super::*;
 use harness_workflow::runtime::{
-    RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, RetrievedRepoMemoryRecord, RuntimeKind,
-    WorkflowSubject, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL,
-    PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
+    RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord,
+    RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
+    WorkflowDefinitionRegistry, WorkflowStateDefinition, WorkflowSubject, ISSUE_PLAN_ACTIVITY,
+    ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 
 #[test]
@@ -243,6 +245,44 @@ fn activity_result_schema_describes_quality_gate_contract() {
         .expect("allowed transitions should be an array")
         .iter()
         .any(|transition| transition["next_state"] == "passed"));
+}
+
+#[test]
+fn workflow_decision_contract_uses_a_registered_non_builtin_definition() {
+    let mut registry = WorkflowDefinitionRegistry::new();
+    registry
+        .register(RegisteredWorkflowDefinition::new(
+            "custom_review",
+            vec![
+                WorkflowStateDefinition::active("custom_review", "queued"),
+                WorkflowStateDefinition::active("custom_review", "reviewing"),
+            ],
+            TransitionAllowlist::new(vec![TransitionRule::new("queued", "reviewing", [])]),
+        ))
+        .expect("custom workflow definition should register");
+    let workflow = WorkflowInstance::new(
+        "custom_review",
+        1,
+        "queued",
+        WorkflowSubject::new("review", "review:123"),
+    )
+    .with_id("custom-review-1");
+
+    let contract = workflow_decision_contract_with_resolver(Some(&workflow), |definition_id| {
+        registry.decision_validator_for_definition(definition_id)
+    });
+
+    assert_eq!(contract["available"], true);
+    assert_eq!(contract["workflow_definition"], "custom_review");
+    assert_eq!(contract["allowed_transitions"][0]["from_state"], "queued");
+    assert_eq!(
+        contract["allowed_transitions"][0]["next_state"],
+        "reviewing"
+    );
+    assert_eq!(
+        contract["allowed_transitions"][0]["allowed_commands"],
+        json!([])
+    );
 }
 #[test]
 fn activity_result_schema_describes_pr_feedback_child_contract() {

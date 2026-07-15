@@ -437,22 +437,40 @@ impl DecisionValidator {
     }
 
     pub fn github_issue_pr() -> Self {
-        Self {
-            allowlist: TransitionAllowlist::github_issue_pr_defaults(),
-            kind: DecisionValidatorKind::GithubIssuePr,
-        }
+        super::state_registry::decision_validator_for_definition(
+            super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
+        )
+        .expect("built-in github_issue_pr workflow definition must be registered")
     }
 
     pub fn quality_gate() -> Self {
-        Self::new(TransitionAllowlist::quality_gate_defaults())
+        super::state_registry::decision_validator_for_definition(
+            super::quality_gate::QUALITY_GATE_DEFINITION_ID,
+        )
+        .expect("built-in quality_gate workflow definition must be registered")
     }
 
     pub fn pr_feedback() -> Self {
-        Self::new(TransitionAllowlist::pr_feedback_defaults())
+        super::state_registry::decision_validator_for_definition(
+            super::pr_feedback::PR_FEEDBACK_DEFINITION_ID,
+        )
+        .expect("built-in pr_feedback workflow definition must be registered")
     }
 
     pub fn prompt_task() -> Self {
-        Self::new(TransitionAllowlist::prompt_task_defaults())
+        super::state_registry::decision_validator_for_definition(
+            super::prompt_task::PROMPT_TASK_DEFINITION_ID,
+        )
+        .expect("built-in prompt_task workflow definition must be registered")
+    }
+
+    pub(crate) fn for_definition(definition_id: &str, allowlist: TransitionAllowlist) -> Self {
+        let kind = if definition_id == super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID {
+            DecisionValidatorKind::GithubIssuePr
+        } else {
+            DecisionValidatorKind::Generic
+        };
+        Self { allowlist, kind }
     }
 
     pub fn validate(

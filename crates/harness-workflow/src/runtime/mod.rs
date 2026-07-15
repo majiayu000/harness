@@ -137,9 +137,11 @@ pub use repo_memory::{
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
 pub use state_registry::{
-    known_workflow_definition_ids, workflow_state_definition, workflow_state_exists,
-    workflow_states_for_definition, workflow_terminal_state_names_for_definition,
-    WorkflowStateDefinition, WorkflowStateKey,
+    decision_validator_for_definition, freeze_workflow_definition_registry,
+    known_workflow_definition_ids, register_workflow_definition, workflow_definition,
+    workflow_state_definition, workflow_state_exists, workflow_states_for_definition,
+    workflow_terminal_state_names_for_definition, RegisteredWorkflowDefinition,
+    WorkflowDefinitionRegistry, WorkflowStateDefinition, WorkflowStateKey,
 };
 pub use status::WorkflowCommandStatus;
 pub use store::{

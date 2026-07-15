@@ -105,12 +105,14 @@ impl HarnessServer {
 
     /// Start in stdio mode (JSON-RPC over stdin/stdout).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        harness_workflow::runtime::freeze_workflow_definition_registry();
         let state = crate::http::build_app_state(Arc::new(self)).await?;
         crate::stdio::serve(state).await
     }
 
     /// Start in HTTP + WebSocket mode.
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
+        harness_workflow::runtime::freeze_workflow_definition_registry();
         crate::http::serve(self, addr).await
     }
 }
