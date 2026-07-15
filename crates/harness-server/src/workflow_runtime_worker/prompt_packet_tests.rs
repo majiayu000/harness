@@ -2,7 +2,8 @@ use super::*;
 use harness_workflow::runtime::{
     RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord,
     RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
-    WorkflowDefinitionRegistry, WorkflowStateDefinition, WorkflowSubject, ISSUE_PLAN_ACTIVITY,
+    WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowRuntimeRecoveryAction,
+    WorkflowRuntimeStore, WorkflowStateDefinition, WorkflowSubject, ISSUE_PLAN_ACTIVITY,
     ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
@@ -254,8 +255,16 @@ fn workflow_decision_contract_uses_a_registered_non_builtin_definition() {
         .register(RegisteredWorkflowDefinition::new(
             "custom_review",
             vec![
-                WorkflowStateDefinition::active("custom_review", "queued"),
-                WorkflowStateDefinition::active("custom_review", "reviewing"),
+                WorkflowStateDefinition::active(
+                    "custom_review",
+                    "queued",
+                    WorkflowProgressMode::ExternalWait,
+                ),
+                WorkflowStateDefinition::active(
+                    "custom_review",
+                    "reviewing",
+                    WorkflowProgressMode::OperatorGate,
+                ),
             ],
             TransitionAllowlist::new(vec![TransitionRule::new("queued", "reviewing", [])]),
         ))
@@ -282,6 +291,38 @@ fn workflow_decision_contract_uses_a_registered_non_builtin_definition() {
     assert_eq!(
         contract["allowed_transitions"][0]["allowed_commands"],
         json!([])
+    );
+}
+
+#[test]
+fn progress_wake_paths_are_callable_for_non_command_modes() {
+    let config = harness_core::config::workflow::WorkflowConfig::default();
+    assert!(config.pr_feedback.enabled);
+    assert!(config.runtime_dispatch.enabled);
+    assert!(config.runtime_worker.enabled);
+
+    let _issue_dependency_observer =
+        crate::workflow_runtime_submission::release_ready_issue_dependencies;
+    let _prompt_dependency_observer =
+        crate::workflow_runtime_submission::release_ready_prompt_dependencies;
+    let _local_review_selector = crate::workflow_runtime_pr_feedback::request_local_review;
+    let _feedback_selector = crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep;
+    let _merge_approval = crate::workflow_runtime_pr_feedback::approve_runtime_merge_by_workflow_id;
+    let _recovery_action = WorkflowRuntimeStore::recover_stopped_instance;
+    let _parent_propagation = WorkflowRuntimeStore::commit_parent_runtime_completion;
+
+    assert_eq!(WorkflowRuntimeRecoveryAction::Unblock.as_str(), "unblock");
+    assert_eq!(WorkflowRuntimeRecoveryAction::Retry.as_str(), "retry");
+    let child = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "feedback_found",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_parent("github-issue-parent");
+    assert_eq!(
+        child.parent_workflow_id.as_deref(),
+        Some("github-issue-parent")
     );
 }
 #[test]
