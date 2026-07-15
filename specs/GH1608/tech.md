@@ -40,8 +40,8 @@ contracts will attach per-state metadata to registry entries)
 ```rust
 // state_registry.rs
 pub struct WorkflowStateKey {
-    pub definition_id: String,
-    pub state: String,
+    pub definition_id: Arc<str>, // cheap clone on hot-path lookups (B-006)
+    pub state: Arc<str>,
 }
 
 pub struct WorkflowStateDefinition {
