@@ -51,9 +51,16 @@ pub struct WorkflowDefinitionPolicy {
     pub recovery_targets: Vec<String>,      // states operators may unblock into
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredProgressMode {
+    ExternalWait,
+    OperatorGate,
+}
+
 pub struct DeclaredState {
     pub activity: Option<String>,
-    pub progress: Option<DeclaredProgressMode>, // external_wait | operator_gate
+    pub progress: Option<DeclaredProgressMode>,
     pub on_success: Option<String>,
     pub on_failure: Option<String>,
     pub on_blocked: Option<String>,
@@ -104,6 +111,14 @@ WORKFLOW.md, build + `register()` declarative definitions, then
   canonical JSON serialization of `WorkflowDefinitionPolicy`; the full
   hex hash is stored in `instance.data["definition_hash"]` at creation
   for collision-proof auditing (B-005).
+- Truncation-collision guard: at startup, if two distinct declarations
+  for the same `id` (full SHA-256 differs) truncate to the same u32
+  `definition_version`, startup aborts with an actionable error naming
+  both hashes — a collision must never make version lookup ambiguous or
+  silently reinterpret a pinned instance (B-005). Interpretation
+  cross-checks the full hash in `instance.data["definition_hash"]` when
+  present, so even an undetected collision fails closed to
+  `definition_version_missing`.
 - The registry keeps `(id, version) -> Arc<WorkflowDefinition>` for every
   version seen at startup. Interpretation looks up the instance's pinned
   version; a missing version (WORKFLOW.md edited between restarts while
@@ -129,8 +144,11 @@ result)`:
 - Emitted decision: next state + driving command derived from the target
   state's progress mode — `enqueue_activity` for activity states (dedupe
   key `"{id}:{state}:{event.id}"`), `Wait` for `external_wait`,
-  `RequestOperatorAttention` for `operator_gate`, `Mark*` for terminal
-  states — always in the same decision (B-007).
+  `RequestOperatorAttention` for `operator_gate`, and for terminal
+  states the existing command per terminal class — `succeeded` →
+  `MarkDone` (there is no `MarkSucceeded`; see
+  `WorkflowCommandType`, `model.rs:197-208`), `failed` → `MarkFailed`,
+  `cancelled` → `MarkCancelled` — always in the same decision (B-007).
 - Built-in ids never resolve as declarative (registry namespaces are
   disjoint by B-003 collision check), so the hardcoded paths are
   untouched (B-006).
@@ -149,7 +167,11 @@ registry drives `DecisionValidator` for declarative ids (selection seam
 naming a registered declarative `definition_id` creates an instance in
 the declaration's `initial` state (pinned version/hash) and emits the
 initial state's driving command, following the prompt-task submission
-shape at `:198`. Dependencies (`depends_on`) reuse the existing
+shape at `:198`. The initial command has no completion event, so its
+dedupe key uses the submission form `"{workflow_id}:{initial_state}:submit"`
+— unique per instance, stable across submission retries for the same
+instance id (the `{event.id}` form applies only to completion-driven
+transitions). Dependencies (`depends_on`) reuse the existing
 `awaiting_dependencies` handling only if declared; v1 keeps dependency
 gating out of declarative definitions (submission rejects `depends_on`
 for declarative ids with a clear error).
@@ -161,8 +183,10 @@ for declarative ids with a clear error).
   (B-002/B-010) instead of stranding dispatch.
 - Signal type declared both in `on_signal` and produced alongside
   success: declared mapping wins deterministically; multiple mapped
-  signals on one result → the first in declaration order wins and the
-  decision reason records the tie (deterministic, auditable).
+  signals on one result → the lexicographically smallest mapped
+  `signal_type` wins (matching `BTreeMap` iteration order, so precedence
+  needs no extra dependency and cannot drift from the data structure) and
+  the decision reason records the tie (deterministic, auditable).
 - Two repos declare the same definition id: second registration fails
   startup (B-003) — ids are process-global in v1; the error message
   tells operators to namespace ids per repo.
