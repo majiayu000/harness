@@ -273,7 +273,10 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             .store
             .enqueue_runtime_job_for_claimed_command(
                 &command.id,
-                &self.dispatcher_id,
+                super::DispatchClaim {
+                    owner: &self.dispatcher_id,
+                    generation: command.dispatch_claim_generation,
+                },
                 runtime_profile.kind,
                 &runtime_profile.name,
                 json!({
@@ -306,6 +309,16 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                 Ok(CommandDispatchOutcome::Skipped {
                     command_id: command.id,
                     reason: format!("command status changed to `{status}` before dispatch"),
+                })
+            }
+            RuntimeJobEnqueueOutcome::StaleClaim => Ok(CommandDispatchOutcome::Skipped {
+                command_id: command.id,
+                reason: "dispatch claim became stale before enqueue".to_string(),
+            }),
+            RuntimeJobEnqueueOutcome::WorkflowTerminal { status } => {
+                Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: format!("workflow became terminal; command is `{status}`"),
                 })
             }
         }

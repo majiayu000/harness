@@ -179,6 +179,8 @@ type RuntimeJobCompactRecordRow = (
 pub enum RuntimeJobEnqueueOutcome {
     Enqueued(RuntimeJob),
     AlreadyExists(RuntimeJob),
+    StaleClaim,
+    WorkflowTerminal { status: WorkflowCommandStatus },
     CommandNotPending { status: WorkflowCommandStatus },
 }
 #[derive(Debug, Clone, PartialEq)]
@@ -750,20 +752,25 @@ impl WorkflowRuntimeStore {
                  SELECT command.id
                  FROM workflow_commands AS command
                  JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
-                 WHERE command.status = $3
+             WHERE command.status = $3
                     OR (
                         command.status = $4
                         AND COALESCE(command.dispatch_lease_expires_at, '-infinity'::timestamptz)
                             <= CURRENT_TIMESTAMP
                     )
+                    OR (
+                        command.status = $5
+                        AND command.dispatch_not_before <= CURRENT_TIMESTAMP
+                    )
                  ORDER BY command.created_at ASC
-                 LIMIT $5
+                 LIMIT $6
                  FOR UPDATE OF command SKIP LOCKED
              )
              UPDATE workflow_commands AS command
              SET status = $4,
                  dispatch_owner = $1,
                  dispatch_lease_expires_at = $2,
+                 dispatch_claim_generation = command.dispatch_claim_generation + 1,
                  updated_at = CURRENT_TIMESTAMP
              FROM candidates
              WHERE command.id = candidates.id
@@ -777,6 +784,7 @@ impl WorkflowRuntimeStore {
         .bind(expires_at)
         .bind(WorkflowCommandStatus::Pending.as_str())
         .bind(WorkflowCommandStatus::Dispatching.as_str())
+        .bind(WorkflowCommandStatus::Deferred.as_str())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -884,7 +892,8 @@ impl WorkflowRuntimeStore {
         input: Value,
         not_before: Option<DateTime<Utc>>,
     ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
-        self.enqueue_runtime_job_for_command(
+        command_store::enqueue_runtime_job_for_command(
+            &self.pool,
             command_id,
             None,
             runtime_kind,
@@ -898,113 +907,22 @@ impl WorkflowRuntimeStore {
     pub async fn enqueue_runtime_job_for_claimed_command(
         &self,
         command_id: &str,
-        dispatch_owner: &str,
+        dispatch_claim: super::DispatchClaim<'_>,
         runtime_kind: RuntimeKind,
         runtime_profile: &str,
         input: Value,
         not_before: Option<DateTime<Utc>>,
     ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
-        self.enqueue_runtime_job_for_command(
+        command_store::enqueue_runtime_job_for_command(
+            &self.pool,
             command_id,
-            Some(dispatch_owner),
+            Some(dispatch_claim),
             runtime_kind,
             runtime_profile,
             input,
             not_before,
         )
         .await
-    }
-
-    async fn enqueue_runtime_job_for_command(
-        &self,
-        command_id: &str,
-        dispatch_owner: Option<&str>,
-        runtime_kind: RuntimeKind,
-        runtime_profile: &str,
-        input: Value,
-        not_before: Option<DateTime<Utc>>,
-    ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
-        let mut job = RuntimeJob::pending(command_id, runtime_kind, runtime_profile, input);
-        job.not_before = not_before;
-        let data = to_jsonb_string(&job)?;
-        let status = enum_str(&job.status)?;
-        let runtime_kind = enum_str(&job.runtime_kind)?;
-        let mut tx = self.pool.begin().await?;
-        let command_row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT status, dispatch_owner FROM workflow_commands WHERE id = $1 FOR UPDATE",
-        )
-        .bind(command_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((command_status, command_dispatch_owner)) = command_row else {
-            anyhow::bail!("workflow command not found: {command_id}");
-        };
-        let command_status = WorkflowCommandStatus::try_from(command_status.as_str())?;
-
-        let eligible = match dispatch_owner {
-            Some(owner) => {
-                command_status == WorkflowCommandStatus::Dispatching
-                    && command_dispatch_owner.as_deref() == Some(owner)
-            }
-            None => command_status == WorkflowCommandStatus::Pending,
-        };
-
-        if !eligible {
-            let existing = runtime_job_for_command_tx(&mut tx, command_id).await?;
-            tx.commit().await?;
-            return Ok(match existing {
-                Some(runtime_job) => RuntimeJobEnqueueOutcome::AlreadyExists(runtime_job),
-                None => RuntimeJobEnqueueOutcome::CommandNotPending {
-                    status: command_status,
-                },
-            });
-        }
-
-        if let Some(existing) = runtime_job_for_command_tx(&mut tx, command_id).await? {
-            sqlx::query(
-                "UPDATE workflow_commands
-                 SET status = $2,
-                     dispatch_owner = NULL,
-                     dispatch_lease_expires_at = NULL,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $1",
-            )
-            .bind(command_id)
-            .bind(WorkflowCommandStatus::Dispatched.as_str())
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            return Ok(RuntimeJobEnqueueOutcome::AlreadyExists(existing));
-        }
-
-        sqlx::query(
-            "INSERT INTO runtime_jobs
-                (id, command_id, runtime_kind, runtime_profile, status, not_before, data)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
-        )
-        .bind(&job.id)
-        .bind(&job.command_id)
-        .bind(&runtime_kind)
-        .bind(&job.runtime_profile)
-        .bind(&status)
-        .bind(job.not_before)
-        .bind(&data)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE workflow_commands
-             SET status = $2,
-                 dispatch_owner = NULL,
-                 dispatch_lease_expires_at = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1",
-        )
-        .bind(command_id)
-        .bind(WorkflowCommandStatus::Dispatched.as_str())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(RuntimeJobEnqueueOutcome::Enqueued(job))
     }
 
     pub async fn claim_next_runtime_job(
@@ -2082,7 +2000,7 @@ async fn select_instance_for_update_tx(
         .map_err(Into::into)
 }
 
-async fn insert_event_tx(
+pub(super) async fn insert_event_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
     event_type: &str,
