@@ -36,6 +36,8 @@ GH-1602
 
 ## Verification
 
+- `cargo test -p harness-server runtime_job_lease_duration`
+- `cargo test -p harness-workflow runtime_model`
 - `cargo test -p harness-workflow runtime_store_remote_host_lease`
 - `cargo test -p harness-server runtime_job_lease_renewal`
 - `cargo test -p harness-server runtime_host_deregister`
