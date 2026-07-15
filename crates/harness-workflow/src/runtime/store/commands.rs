@@ -12,6 +12,31 @@ use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
 impl WorkflowRuntimeStore {
+    pub async fn skip_claimed_command_if_owned(
+        &self,
+        command_id: &str,
+        dispatch_claim: DispatchClaim<'_>,
+    ) -> anyhow::Result<bool> {
+        let generation = i64::try_from(dispatch_claim.generation)
+            .map_err(|_| anyhow::anyhow!("dispatch claim generation exceeds PostgreSQL BIGINT"))?;
+        let result = sqlx::query(
+            "UPDATE workflow_commands
+             SET status = $2, dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
+                 dispatch_barrier = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status = $3 AND dispatch_owner = $4
+               AND dispatch_claim_generation = $5",
+        )
+        .bind(command_id)
+        .bind(WorkflowCommandStatus::Skipped.as_str())
+        .bind(WorkflowCommandStatus::Dispatching.as_str())
+        .bind(dispatch_claim.owner)
+        .bind(generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn finish_claimed_command_for_terminal_workflow(
         &self,
         command_id: &str,
