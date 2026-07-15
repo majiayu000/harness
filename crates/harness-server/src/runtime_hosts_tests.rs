@@ -1,4 +1,4 @@
-use crate::runtime_hosts::RuntimeHostManager;
+use crate::runtime_hosts::{RuntimeHostLifecycle, RuntimeHostManager};
 use chrono::{TimeDelta, Utc};
 
 #[test]
@@ -81,4 +81,37 @@ fn deregister_removes_host_only() {
     assert!(manager.deregister("host-a"));
     assert!(!manager.deregister("host-a"));
     assert!(manager.list_hosts().is_empty());
+}
+
+#[test]
+fn draining_host_cannot_be_reactivated_by_registration() {
+    let manager = RuntimeHostManager::with_heartbeat_timeout(60);
+    manager.register("host-a".to_string(), None, vec![]);
+
+    assert_eq!(
+        manager.mark_draining("host-a"),
+        Some(RuntimeHostLifecycle::Active)
+    );
+    let updated = manager.register(
+        "host-a".to_string(),
+        Some("Updated host".to_string()),
+        vec!["rust".to_string()],
+    );
+
+    assert_eq!(updated.lifecycle, RuntimeHostLifecycle::Draining);
+    assert!(!manager.is_active("host-a"));
+}
+
+#[test]
+fn persisted_legacy_host_defaults_to_active() {
+    let value = serde_json::json!({
+        "id": "host-a",
+        "display_name": "Host A",
+        "capabilities": [],
+        "registered_at": "2026-07-16T00:00:00Z",
+        "last_heartbeat_at": "2026-07-16T00:00:00Z"
+    });
+    let host: crate::runtime_hosts_state::PersistedRuntimeHost =
+        serde_json::from_value(value).expect("legacy host record must deserialize");
+    assert_eq!(host.lifecycle, RuntimeHostLifecycle::Active);
 }

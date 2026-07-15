@@ -5,6 +5,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use harness_workflow::runtime::WorkflowRuntimeStore;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -37,7 +38,16 @@ async fn make_test_state(
         return Ok(None);
     }
     match crate::test_helpers::make_test_state(dir).await {
-        Ok(state) => Ok(Some(Arc::new(state))),
+        Ok(state) => {
+            let store =
+                Arc::new(WorkflowRuntimeStore::open(&dir.join("workflow_runtime.db")).await?);
+            let mut state = Arc::new(state);
+            Arc::get_mut(&mut state)
+                .ok_or_else(|| anyhow::anyhow!("expected unique test state"))?
+                .core
+                .workflow_runtime_store = Some(store);
+            Ok(Some(state))
+        }
         Err(err) if crate::test_helpers::is_pool_timeout(&err) => Ok(None),
         Err(err) => Err(err),
     }
@@ -193,7 +203,9 @@ async fn claim_endpoint_blocks_double_claim() -> anyhow::Result<()> {
 #[tokio::test]
 async fn deregister_releases_scheduler_owned_pending_tasks() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
     let mut task = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
         status: crate::task_runner::TaskStatus::Pending,
@@ -693,7 +705,9 @@ async fn claim_endpoint_rejects_overflowing_lease_ttl() -> anyhow::Result<()> {
 #[tokio::test]
 async fn deregister_keeps_host_registered_when_claim_release_fails() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let Some(state) = make_test_state(dir.path()).await? else {
+        return Ok(());
+    };
     let mut task = crate::task_runner::TaskState {
         id: crate::task_runner::TaskId::new(),
         status: crate::task_runner::TaskStatus::Pending,
@@ -761,7 +775,7 @@ async fn deregister_keeps_host_registered_when_claim_release_fails() -> anyhow::
         .await?;
     assert_eq!(
         response.status(),
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
     assert!(state.runtime_hosts.hosts.contains_key("host-a"));
 

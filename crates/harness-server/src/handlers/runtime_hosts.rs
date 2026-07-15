@@ -1,10 +1,10 @@
 use crate::http::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{rejection::JsonRejection, Path, State},
     http::StatusCode,
     Json,
 };
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{
     ActivityResult, RuntimeJobClaimDecision, RuntimeJobClaimGuard, RuntimeJobNotFoundError,
     RuntimeKind, WorkflowRuntimeStore,
@@ -12,6 +12,9 @@ use harness_workflow::runtime::{
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+
+mod lease;
+pub use lease::renew_runtime_job_lease_for_runtime_host;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRuntimeHostRequest {
@@ -30,6 +33,8 @@ pub struct ClaimTaskRequest {
 #[derive(Debug, Deserialize)]
 pub struct CompleteRuntimeJobRequest {
     pub lease_expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub lease_generation: Option<u64>,
     pub result: ActivityResult,
 }
 
@@ -112,6 +117,63 @@ pub async fn deregister_runtime_host(
             Json(json!({ "error": "runtime host not found" })),
         )
     } else {
+        let Some(previous_lifecycle) = state.runtime_hosts.mark_draining(&host_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "runtime host not found" })),
+            );
+        };
+        if let Err(response) = persist_runtime_state(&state).await {
+            state
+                .runtime_hosts
+                .set_lifecycle(&host_id, previous_lifecycle);
+            return response;
+        }
+
+        let store = match workflow_runtime_store(&state) {
+            Ok(store) => store,
+            Err(response) => return response,
+        };
+        if let Err(error) = store
+            .revoke_remote_host_runtime_job_leases(&host_id, Utc::now())
+            .await
+        {
+            tracing::error!(
+                host_id = %host_id,
+                error = %error,
+                "failed to revoke workflow runtime-job leases during deregistration"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "workflow runtime store unavailable" })),
+            );
+        }
+        match store.count_remote_host_runtime_job_leases(&host_id).await {
+            Ok(0) => {}
+            Ok(remaining) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    remaining_leases = remaining,
+                    "runtime host remains draining because workflow leases remain owned"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "runtime host lease revocation incomplete" })),
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    error = %error,
+                    "failed to confirm workflow runtime-job revocation"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "workflow runtime store unavailable" })),
+                );
+            }
+        }
+
         match state.core.tasks.release_runtime_host_claims(&host_id).await {
             Ok(released) => {
                 if !released.is_empty() {
@@ -129,7 +191,7 @@ pub async fn deregister_runtime_host(
                     "failed to release runtime-host-owned task leases during deregistration"
                 );
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({
                         "error": format!("failed to release task leases for runtime host: {e}")
                     })),
@@ -137,6 +199,11 @@ pub async fn deregister_runtime_host(
             }
         }
 
+        let draining_record = state
+            .runtime_hosts
+            .hosts
+            .get(&host_id)
+            .map(|host| host.clone());
         if !state.runtime_hosts.deregister(&host_id) {
             tracing::warn!(
                 host_id = %host_id,
@@ -145,6 +212,9 @@ pub async fn deregister_runtime_host(
         }
         state.runtime_project_cache.clear_host(&host_id);
         if let Err(response) = persist_runtime_state(&state).await {
+            if let Some(record) = draining_record {
+                state.runtime_hosts.hosts.insert(host_id.clone(), record);
+            }
             return response;
         }
         (StatusCode::OK, Json(json!({ "deregistered": true })))
@@ -160,6 +230,12 @@ pub async fn claim_task_for_runtime_host(
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
+        );
+    }
+    if !state.runtime_hosts.is_active(&host_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "runtime host is draining" })),
         );
     }
 
@@ -245,12 +321,27 @@ pub async fn claim_task_for_runtime_host(
 pub async fn claim_runtime_job_for_runtime_host(
     State(state): State<Arc<AppState>>,
     Path(host_id): Path<String>,
-    Json(req): Json<ClaimTaskRequest>,
+    payload: Result<Json<lease::ClaimRuntimeJobRequest>, JsonRejection>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid runtime job claim request" })),
+            )
+        }
+    };
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
+        );
+    }
+    if !state.runtime_hosts.is_active(&host_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "runtime host is draining" })),
         );
     }
     let store = match workflow_runtime_store(&state) {
@@ -267,7 +358,7 @@ pub async fn claim_runtime_job_for_runtime_host(
             );
         }
     }
-    let lease_expires_at = match runtime_host_lease_expires_at(req.lease_secs) {
+    let lease_expires_at = match lease::runtime_host_lease_expires_at(req.lease_secs.value()) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -351,26 +442,8 @@ pub async fn claim_runtime_job_for_runtime_host(
         }
     }
 
-    if let Err(e) = store
-        .record_runtime_event(
-            &job.id,
-            "RuntimeJobClaimed",
-            json!({
-                "owner": host_id.as_str(),
-                "lease_expires_at": lease_expires_at,
-                "claim_api": "runtime_host",
-            }),
-        )
-        .await
-    {
-        tracing::warn!(
-            runtime_job_id = %job.id,
-            error = %e,
-            "runtime host claim succeeded but runtime event recording failed"
-        );
-    }
-
     let runtime_job_id = job.id.clone();
+    let lease_generation = job.lease_generation;
     (
         StatusCode::OK,
         Json(json!({
@@ -378,6 +451,7 @@ pub async fn claim_runtime_job_for_runtime_host(
             "runtime_job": job,
             "runtime_job_id": runtime_job_id,
             "lease_expires_at": lease_expires_at,
+            "lease_generation": lease_generation,
         })),
     )
 }
@@ -392,6 +466,9 @@ pub async fn complete_runtime_job_for_runtime_host(
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
         );
+    }
+    if !state.runtime_hosts.is_active(&host_id) {
+        return lease::lease_lost_response();
     }
     let store = match workflow_runtime_store(&state) {
         Ok(store) => store,
@@ -408,10 +485,11 @@ pub async fn complete_runtime_job_for_runtime_host(
     };
 
     let completion = match store
-        .commit_runtime_activity_completion_if_owned(
+        .commit_runtime_activity_completion_if_owned_with_generation(
             &runtime_job_id,
             &host_id,
             req.lease_expires_at,
+            req.lease_generation,
             &req.result,
         )
         .await
@@ -512,47 +590,6 @@ fn workflow_runtime_store(
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "workflow runtime store unavailable" })),
-        )
-    })
-}
-
-fn runtime_host_lease_expires_at(
-    lease_secs: Option<u64>,
-) -> Result<DateTime<Utc>, (StatusCode, Json<serde_json::Value>)> {
-    let lease_secs = match lease_secs {
-        Some(value) => match i64::try_from(value) {
-            Ok(value) => value,
-            Err(_) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "lease_secs must be <= i64::MAX" })),
-                ));
-            }
-        },
-        None => crate::runtime_hosts::DEFAULT_LEASE_SECS,
-    }
-    .max(0);
-    let lease_duration = match TimeDelta::try_seconds(lease_secs) {
-        Some(value) => value,
-        None => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!(
-                        "lease_secs value {lease_secs} is too large to compute a valid expiration timestamp"
-                    )
-                })),
-            ));
-        }
-    };
-    Utc::now().checked_add_signed(lease_duration).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!(
-                    "lease_secs value {lease_secs} is too large to compute a valid expiration timestamp"
-                )
-            })),
         )
     })
 }

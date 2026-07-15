@@ -134,6 +134,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(crate::handlers::runtime_hosts::complete_runtime_job_for_runtime_host),
         )
         .route(
+            "/api/runtime-hosts/{host_id}/runtime-jobs/{runtime_job_id}/lease/renew",
+            post(crate::handlers::runtime_hosts::renew_runtime_job_lease_for_runtime_host),
+        )
+        .route(
             "/api/runtime-hosts/{host_id}/projects",
             get(crate::handlers::runtime_project_cache::list_runtime_host_projects),
         )

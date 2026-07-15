@@ -1,9 +1,18 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
 pub const DEFAULT_LEASE_SECS: i64 = 60;
+pub const MAX_LEASE_SECS: i64 = 3600;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHostLifecycle {
+    #[default]
+    Active,
+    Draining,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeHostInfo {
@@ -13,6 +22,7 @@ pub struct RuntimeHostInfo {
     pub registered_at: String,
     pub last_heartbeat_at: String,
     pub online: bool,
+    pub lifecycle: RuntimeHostLifecycle,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +38,7 @@ pub(crate) struct RuntimeHostRecord {
     pub(crate) capabilities: Vec<String>,
     pub(crate) registered_at: DateTime<Utc>,
     pub(crate) last_heartbeat_at: DateTime<Utc>,
+    pub(crate) lifecycle: RuntimeHostLifecycle,
 }
 
 pub struct RuntimeHostManager {
@@ -54,12 +65,18 @@ impl RuntimeHostManager {
         capabilities: Vec<String>,
     ) -> RuntimeHostInfo {
         let now = Utc::now();
+        let lifecycle = self
+            .hosts
+            .get(&host_id)
+            .map(|record| record.lifecycle)
+            .unwrap_or_default();
         let record = RuntimeHostRecord {
             id: host_id.clone(),
             display_name: display_name.unwrap_or_else(|| host_id.clone()),
             capabilities,
             registered_at: now,
             last_heartbeat_at: now,
+            lifecycle,
         };
         self.hosts.insert(host_id, record.clone());
         self.to_info(&record, now)
@@ -77,6 +94,27 @@ impl RuntimeHostManager {
 
     pub fn deregister(&self, host_id: &str) -> bool {
         self.hosts.remove(host_id).is_some()
+    }
+
+    pub fn mark_draining(&self, host_id: &str) -> Option<RuntimeHostLifecycle> {
+        let mut host = self.hosts.get_mut(host_id)?;
+        let previous = host.lifecycle;
+        host.lifecycle = RuntimeHostLifecycle::Draining;
+        Some(previous)
+    }
+
+    pub fn set_lifecycle(&self, host_id: &str, lifecycle: RuntimeHostLifecycle) -> bool {
+        let Some(mut host) = self.hosts.get_mut(host_id) else {
+            return false;
+        };
+        host.lifecycle = lifecycle;
+        true
+    }
+
+    pub fn is_active(&self, host_id: &str) -> bool {
+        self.hosts
+            .get(host_id)
+            .is_some_and(|host| host.lifecycle == RuntimeHostLifecycle::Active)
     }
 
     pub fn list_hosts(&self) -> Vec<RuntimeHostInfo> {
@@ -99,6 +137,7 @@ impl RuntimeHostManager {
             registered_at: record.registered_at.to_rfc3339(),
             last_heartbeat_at: record.last_heartbeat_at.to_rfc3339(),
             online,
+            lifecycle: record.lifecycle,
         }
     }
 }
